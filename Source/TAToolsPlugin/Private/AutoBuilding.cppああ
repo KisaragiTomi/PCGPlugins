@@ -1,0 +1,321 @@
+// Fill out your copyright notice in the Description page of Project Settings.
+
+
+#include "AutoBuilding.h"
+#include "Uobject/Object.h"
+#include "Engine/StaticMesh.h"
+#include "LevelEditorViewport.h"
+#include "Kismet/GameplayStatics.h"
+#include "Kismet/KismetSystemLibrary.h"
+#include "Kismet/KismetMathLibrary.h"
+#include "Components/StaticMeshComponent.h"
+#include "FoliageType.h"
+#include "IntVectorTypes.h"
+
+#define NormalSize 1.5 
+#define NormalHeight 4.5 
+#define OverlapExtent FVector(5,5,5)
+#define CollisionType { UEngineTypes::ConvertToObjectType(ECollisionChannel::ECC_Destructible) };
+
+using namespace std;
+using namespace UE::Geometry;
+
+WallConvertor::WallConvertor(AComponentManager2* CM)
+	: CM(CM)
+{
+}
+
+ABuildingCube::ABuildingCube()
+{
+	Root = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
+	Cube = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Cube"));
+	Cube->SetupAttachment(Root, TEXT("Cube"));
+	Cube->SetRelativeLocation(FVector(50, 50, 50));
+	//Cube->setcollision
+	Cube->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Overlap);
+	Cube->SetCollisionObjectType(ECollisionChannel::ECC_Destructible);
+	UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	if (Mesh)
+	{
+		Cube->SetStaticMesh(Mesh);
+	}
+}
+
+void UAutoBuilding::Covert(AComponentManager2* CM)
+{
+	TSharedPtr<WallConvertor> Convertor = MakeShared<WallConvertor>(CM);
+	Convertor->Convert();
+}
+
+void WallConvertor::Convert()
+{
+	RemoveSubActorRecursion(CM, false);
+	if (CM->Overlap > 0)
+	{
+		
+	}
+}
+
+void WallConvertor::RemoveSubActorRecursion(AActor* CheckActor, bool RemoveOwn)
+{
+	TArray<AActor*> AttachedActors;
+	CM->GetAttachedActors(AttachedActors, true);
+	for (AActor* Actor : AttachedActors)
+	{
+		RemoveSubActorRecursion(Actor, RemoveOwn);
+		if (RemoveOwn)
+		{
+			Actor->Destroy();
+		}
+		else
+		{
+			AComponentManager2* ComponentManager = Cast<AComponentManager2>(Actor);
+			if (!ComponentManager)
+			{
+				Actor->Destroy();
+			}
+		}
+		if (Cast<ATopRoof>(Actor))
+		{
+			Actor->Destroy();
+		}
+	}
+}
+
+void UAutoBuilding::MaximalRectangle(TArray<TArray<int32>> Array2D, FVector2i& orig, FVector2i& scale, int32 Check)
+{
+	if (Array2D.Num() == 0)
+	{
+		return;
+	}
+	const int32 c = Array2D.Num();
+	TArray<int32> Height;
+	for (int32 i = 0; i < Array2D.Num(); i++)
+	{
+		Height.Add(0);
+	}
+
+	int32 res = 0;
+	int32 rco = 1;
+	//FVector2i orig; //原点
+	//FVector2i scale; //尺寸
+	for (int32 i = 0; i < Array2D.Num(); i++)
+	{
+		
+		for (int32 n = 0; n < Array2D[0].Num(); n++)
+		{
+			if (Array2D[i][n] == Check)
+			{
+				Height[i] = Height[i] + 1;
+			}
+			else
+			{
+				Height[i] = 0;
+			}
+		}
+		TArray<int32> Stack;
+		Stack.Add(-1);
+		//int a = Stack[-1];
+		for (int32 idx = 0; idx < Height.Num(); idx++)
+		{
+			int32 val = Height[idx];
+			int32 refidx = Stack[Stack.Num()-1]% Height.Num();
+			if (refidx == -1)
+			{
+				refidx = Height.Num() - 1;
+			}
+			int32 ref = Height[refidx];
+			while (val < ref)
+			{
+				int32 h = Height[Stack.Pop()];
+				int32 area = h * (idx - Stack[Stack.Num() - 1] - 1);
+				if (area > res)
+				{
+					res = area;
+					scale = FVector2i(h, idx - Stack[Stack.Num() - 1] - 1);
+					orig = FVector2i(rco - h, Stack[Stack.Num() - 1] + 1);
+				}
+			}
+			Stack.Add(idx);
+		}
+		rco += 1;
+		
+	}
+	//memset(dp, 0, sizeof(dp));
+}
+
+void UAutoBuilding::DeoverlapBox()
+{
+	auto NormalizeVector = [&](FVector& Vector)
+	{
+		float X = UKismetMathLibrary::Round(Vector.X / NormalSize / 100) * NormalSize * 100;
+		float Y = UKismetMathLibrary::Round(Vector.Y / NormalSize / 100) * NormalSize * 100;
+		float Z = UKismetMathLibrary::Round(Vector.Z / NormalSize / 100) * NormalSize * 100;
+		Vector = FVector(X ,Y ,Z);
+	};
+	auto NormalizeScale = [&](FVector& Vector)
+	{
+		Vector = FVector(FMath::Max(UKismetMathLibrary::Round(Vector.X / NormalSize), 1) * NormalSize, FMath::Max(UKismetMathLibrary::Round(Vector.Y / NormalSize), 1) * NormalSize, FMath::Max(UKismetMathLibrary::Round(Vector.Z / NormalSize), 1) * NormalSize);
+	};
+	//float NormalSize = 1.5;
+	TArray<AActor*> Cubes;
+	UGameplayStatics::GetAllActorsOfClass(GWorld, ABuildingCube::StaticClass(), Cubes);
+	for (AActor* Cube : Cubes)
+	{
+		ABuildingCube* BCube = Cast<ABuildingCube>(Cube);
+		if (!BCube)
+		{
+			continue;
+		}
+
+		FVector Origin, BoxExtent;
+		BCube->Cube->SetRelativeLocation(FVector(50, 50, 50));
+		BCube->Cube->SetRelativeRotation(FRotator(0, 0, 0));
+		BCube->GetActorBounds(true, Origin, BoxExtent, false);
+		FVector RootLocation = Origin - BoxExtent;
+		FVector Scale = BoxExtent / 50;
+
+		NormalizeVector(RootLocation);
+		NormalizeScale(Scale);
+		BCube->SetActorLocationAndRotation(RootLocation, FRotator(0, 0, 0));
+		BCube->SetActorScale3D(Scale);
+		//float a = floor(NormalHeight);
+		if (Scale.Z / NormalHeight > 1)
+		{
+			BCube->SetActorScale3D(FVector(Scale.X, Scale.Y, NormalHeight));
+			for (int32 i = 0; i < floor(Scale.Z / NormalHeight); i++)
+			{
+				FActorSpawnParameters Params;
+				ABuildingCube* NewActor = BCube->GetWorld()->SpawnActor<ABuildingCube>(RootLocation + FVector(0, 0, (i+1) * NormalHeight * 100), FRotator(0,0,0), Params);
+				NewActor->SetActorScale3D(FVector(Scale.X, Scale.Y, NormalHeight));
+			}
+		}
+		else 
+		{
+			BCube->SetActorScale3D(FVector(Scale.X, Scale.Y, FMath::Max(Scale.Z, float(3.0))));
+		}
+		
+	}
+	for (AActor* Cube : Cubes)
+	{
+		ABuildingCube* BCube = Cast<ABuildingCube>(Cube);
+		if (!BCube)
+		{
+			continue;
+		}
+		FVector CubeActorScale = BCube->GetActorScale();
+		FVector CubeActorLocation = BCube->GetActorLocation();
+		FVector Original, BoxExtent;
+		BCube->GetActorBounds(true, Original, BoxExtent, false);
+		TArray<AActor*> OverlapActors;
+		TArray<TEnumAsByte<EObjectTypeQuery>> ObjectTypes{ UEngineTypes::ConvertToObjectType(ECollisionChannel::ECC_Destructible) };
+		TArray<AActor*> Ignore;
+		if (!UKismetSystemLibrary::BoxOverlapActors(BCube->GetWorld(), Original, BoxExtent + OverlapExtent, ObjectTypes, ABuildingCube::StaticClass(), Ignore, OverlapActors))
+		{
+			continue;
+		}
+		TArray<AActor*> UnGenerateBox;
+		TArray<AActor*> DestoryCubes;
+		for (AActor* OverlapActor : OverlapActors)
+		{
+			ABuildingCube* OverlapCube = Cast<ABuildingCube>(OverlapActor);
+			if (!OverlapCube)
+			{
+				continue;
+			}
+			FVector OverlapCubeActorScale = OverlapCube->GetActorScale3D();
+			FVector OverlapCubeActorLocation = OverlapCube->GetActorLocation();
+			UnGenerateBox.Add(OverlapCube);
+			if (OverlapCubeActorScale.Z == CubeActorScale.Z && OverlapCubeActorLocation.Z == CubeActorLocation.Z)
+			{
+				DestoryCubes.Add(OverlapCube);
+			}
+		}
+		FVector OverlapsOriginal, OverlapsBoxExtent;
+		UGameplayStatics::GetActorArrayBounds(UnGenerateBox, true, OverlapsOriginal, OverlapsBoxExtent);
+		FVector OverlapsScale = OverlapsBoxExtent * 2;
+		FVector BoxMin = OverlapsOriginal - OverlapsBoxExtent * FVector(1, 1, 0);
+		int32 CheckArrayX = floor(OverlapsScale.X / NormalSize / 100);
+		int32 CheckArrayY = floor(OverlapsScale.Y / NormalSize / 100);
+		TArray<TArray<int32>> Array2D;
+		for (int32 i = 0; i < CheckArrayX; i++)
+		{
+			TArray<int32> ArrayTemp;
+			for (int32 n = 0; n < CheckArrayY; n++)
+			{
+				ArrayTemp.Add(-1);
+			}
+			Array2D.Add(ArrayTemp);
+		}
+		for (AActor* OverlapActor : UnGenerateBox)
+		{
+			if (!OverlapActor)
+			{
+				continue;
+			}
+			FVector OverlapActorNormalScale = OverlapActor->GetActorScale3D();
+			FVector OverlapActorLocation = OverlapActor->GetActorLocation();
+			NormalizeScale(OverlapActorNormalScale);
+			NormalizeVector(OverlapActorLocation);
+			int32 OverlapCheckX = floor(OverlapActorNormalScale.X / 1.5);
+			int32 OverlapCheckY = floor(OverlapActorNormalScale.Y / 1.5);
+			FVector2i ArrayLocation = FVector2i(int32(OverlapActorLocation.X / 150), int32(OverlapActorLocation.Y / 150));
+			FVector2i Offset = FVector2i(int32(ArrayLocation.X - BoxMin.X / 150), int32(ArrayLocation.Y - BoxMin.Y / 150));
+			//数组中-1为不可放置, 1为可以放置
+			int32 ArrayCurrent = -1;
+			if (OverlapActorNormalScale.Z == CubeActorScale.Z && OverlapActorLocation.Z == CubeActorLocation.Z)
+			{
+				ArrayCurrent = 1;
+			}
+			for (int32 i = 0; i < OverlapCheckX; i++)
+			{
+				for (int32 n = 0; n < OverlapCheckY; n++)
+				{
+					Array2D[i + Offset.X][n + Offset.Y] = ArrayCurrent;
+				}
+			}
+			bool Check = false;
+			for (int32 i = 0; i < Array2D.Num(); i++)
+			{
+				Array2D[i].Contains(1);
+				Check = true;
+				break;
+			}
+			while (Check)
+			{
+				FVector2i orig, scale;
+				UAutoBuilding::MaximalRectangle(Array2D, orig, scale);
+				
+				for (int32 c = 0; c < scale.X; c++)
+				{
+					for (int32 n = 0; n < scale.Y; n++)
+					{
+						Array2D[orig.X + c][orig.Y + n] = -1;
+					}
+				}
+				float PosX = (orig.X) / Array2D.Num() * OverlapsScale.X;
+				float PosY = (orig.Y) / Array2D[0].Num() * OverlapsScale.Y;
+				float SizeX = (scale.X) * NormalSize;
+				float SizeY = (scale.Y) * NormalSize;
+				FVector Pos = FVector(BoxMin.X + PosX, BoxMin.Y + PosY, CubeActorLocation.Z);
+				FActorSpawnParameters Params;
+				AActor* NewActor = Cube->GetWorld()->SpawnActor<ABuildingCube>(Pos, FRotator(0, 0, 0), Params);
+				NewActor->SetActorScale3D(FVector(SizeX, SizeY, CubeActorScale.Z));
+
+				Check = false;
+				for (int32 i = 0; i < Array2D.Num(); i++)
+				{
+					Array2D[i].Contains(1);
+					Check = true;
+					break;
+				}
+			}
+			for (AActor* Overlapactor : DestoryCubes)
+			{
+				Overlapactor->Destroy();
+			}
+
+		}                  
+
+	}
+}

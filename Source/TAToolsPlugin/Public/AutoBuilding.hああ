@@ -1,0 +1,338 @@
+// Fill out your copyright notice in the Description page of Project Settings.
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Kismet/BlueprintFunctionLibrary.h"
+#include "Components/SceneComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "Materials/MaterialInterface.h"
+#include "Engine/CollisionProfile.h"
+#include "Engine/StaticMesh.h"
+#include "VectorTypes.h" 
+#include "AutoBuilding.generated.h"
+
+class AComponentManager2;
+
+//using namespace UE::Geometry;
+namespace UE
+{
+	namespace Geometry
+	{
+		struct FVector2i;
+	}
+}
+
+/**
+ * 
+ */
+UCLASS()
+class TATOOLSPLUGIN_API UAutoBuilding : public UBlueprintFunctionLibrary
+{
+	GENERATED_BODY()
+public:
+	UFUNCTION(BlueprintCallable, Category = ScreenGenerate)
+	static void Covert(AComponentManager2* CM);
+
+	UFUNCTION(BlueprintCallable, Category = ScreenGenerate)
+	static void DeoverlapBox();
+
+	static void MaximalRectangle(TArray<TArray<int32>> Array2D, UE::Geometry::FVector2i& orig, UE::Geometry::FVector2i& scale, int32 Check = 1);
+};
+
+
+
+class TATOOLSPLUGIN_API WallConvertor
+{
+public:
+	WallConvertor(AComponentManager2* CM);
+
+	AComponentManager2* CM;
+
+	void Convert();
+	void RemoveSubActorRecursion(AActor* CheckActor, bool RemoveOwn);
+
+
+};
+
+
+UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
+class TATOOLSPLUGIN_API UBuildingContainer : public USceneComponent
+{
+	GENERATED_BODY()
+
+public:
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComponentAttrib")
+	FVector Dir = FVector::ZeroVector;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComponentAttrib")
+	FVector2D RandomScale = FVector2D(1, 1);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComponentAttrib")
+	float Random = 1;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComponentAttrib")
+	bool Force = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComponentAttrib")
+	bool CollisionCheck = false;
+
+
+};
+
+UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
+class TATOOLSPLUGIN_API UWallContainer : public UBuildingContainer
+{
+	GENERATED_BODY()
+
+public:
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "WallContainer")
+		TArray<UStaticMesh*> GeneralAssets;
+
+};
+
+UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
+class TATOOLSPLUGIN_API URoofContainer : public UBuildingContainer
+{
+	GENERATED_BODY()
+
+public:
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	TArray<UStaticMesh*> AssetRoofs;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	TArray<UStaticMesh*> AssetGrids;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	TArray<UStaticMesh*> AssetPillars;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	TArray<FVector> PillarPoss;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	TArray<int32> Offset;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	int32 PillarInterval = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	int32 GridLength = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	int32 GridWidth = 0;
+};
+
+
+UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
+class TATOOLSPLUGIN_API ABuildingActor : public AActor
+{
+	GENERATED_BODY()
+
+};
+
+UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
+class TATOOLSPLUGIN_API ABuildingCube : public ABuildingActor
+{
+	GENERATED_BODY()
+public:
+	ABuildingCube();
+
+	UPROPERTY(BlueprintReadWrite, Category = "CubeAttrib")
+	USceneComponent* Root;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CubeAttrib")
+	UStaticMeshComponent* Cube;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CubeAttrib")
+	int32 CubeStat = 1;
+};
+
+UCLASS()
+class TATOOLSPLUGIN_API AComponentManager2 : public ABuildingActor
+{
+	GENERATED_BODY()
+public:
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	TArray<UStaticMeshComponent*> WallStaticMesh;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	TArray<UStaticMeshComponent*> StaticMeshComponent;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	TArray<USceneComponent*> ChildrenComponent;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	int32 IsWall = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	int32 DoorWidth = 3;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	int32 IsDoor = -1;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	int32 Overlap = 0;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	TArray<int32> DirIndex;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	float WindowAmount = 0;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	bool Unchecked = true;
+
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	bool Remove = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	UMaterialInterface* MaterialCheck;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	UStaticMesh* DefaultMesh;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	FVector RailScale;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	bool Generate = false;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	AComponentManager2* SourceActor;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	TArray<AComponentManager2*> OutComponent;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	TArray<AComponentManager2*> BreakWalls;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	TArray<AActor*> OverlapWalls;
+
+	
+
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	FVector BoxExtent = FVector(5, 5, 5);
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	TArray<TEnumAsByte<EObjectTypeQuery>> ObjectTypes;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	TArray<AComponentManager2*> CreateConnerSet;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	TArray<UStaticMeshComponent*> ConnecterStaticMeshs;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	int32 Amount = 0;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	int32 Count = 0;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	int32 ArrayCurrent = 0;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	TArray<AComponentManager2*>FindActorTemp;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	TArray<AComponentManager2*>BreakCMs;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	FVector4 CustomData = FVector4(0, 0, 0, 0);
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	UStaticMesh* VisStaticMesh;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	int32 RailType = 0;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RoofContainer")
+	int32 SubComponent = 0;
+};
+
+UCLASS()
+class TATOOLSPLUGIN_API AWallComponent : public AComponentManager2
+{
+	GENERATED_BODY()
+public:
+
+};
+
+
+UCLASS()
+class TATOOLSPLUGIN_API AWallNormal : public AWallComponent
+{
+	GENERATED_BODY()
+public:
+
+};
+
+UCLASS()
+class TATOOLSPLUGIN_API AWallRail : public AWallComponent
+{
+	GENERATED_BODY()
+public:
+	AWallRail()
+	{
+		SubComponent = 1;
+	}
+};
+
+UCLASS()
+class TATOOLSPLUGIN_API ATop : public AWallComponent
+{
+	GENERATED_BODY()
+public:
+
+};
+
+UCLASS()
+class TATOOLSPLUGIN_API AGrid : public AWallComponent
+{
+	GENERATED_BODY()
+public:
+
+};
+
+UCLASS()
+class TATOOLSPLUGIN_API ATopRoof : public AComponentManager2
+{
+	GENERATED_BODY()
+public:
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	int32 Offset;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	int32 Width;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	int32 PillarInterval = 1;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	TArray<UStaticMesh*> RoofGrid;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RoofContainer")
+	TArray<UStaticMesh*> RoofPillar;
+	
+	ATopRoof()
+	{
+		SubComponent = 1;
+	}
+	 
+};
+
+
+UCLASS()
+class TATOOLSPLUGIN_API APillar : public AComponentManager2
+{
+	GENERATED_BODY()
+public:
+	APillar()
+	{
+		SubComponent = 1;
+	}
+};

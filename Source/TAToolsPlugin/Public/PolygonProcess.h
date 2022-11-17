@@ -35,7 +35,7 @@ public:
 	static void FixOpenAssetAsync(TArray<UStaticMesh*> StaticMeshs, int32 NumberOfCheck = 1, bool DebugBox = false, bool OpenVertexDir = false,  bool MultiThread = true);
 	
 	UFUNCTION(BlueprintCallable, Category = "TopologyAPI")
-	static void StopFixOpenAssetAsync(TArray<UStaticMesh*> StaticMeshs);
+	static void StopFixOpenAssetAsync(TArray<UStaticMesh*> StaticMeshs, FVector Dir = FVector(0,0,1));
 
 
 
@@ -90,7 +90,7 @@ public:
 };
 
 
-//ÒòÎª»ñÈ¡±ßÔµµãµÄ·½·¨ÊÇ±»±£»¤µÄ.ÎÒÖ»ÄÜ¼Ì³ĞFGroupTopologyÀ´×öÊÂÇé
+//å› ä¸ºè·å–è¾¹ç¼˜ç‚¹çš„æ–¹æ³•æ˜¯è¢«ä¿æŠ¤çš„.æˆ‘åªèƒ½ç»§æ‰¿FGroupTopologyæ¥åšäº‹æƒ…
 class FBasicTopologyFindPosition : public FGroupTopology
 {
 public:

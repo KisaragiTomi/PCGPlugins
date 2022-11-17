@@ -28,6 +28,11 @@
       "Name": "FoliageCluster",
       "Type": "Editor",
       "LoadingPhase": "Default"
+    },
+    {
+      "Name": "WFC",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
     }
   ],
   "Plugins": [
@@ -37,6 +42,14 @@
       "TargetAllowList": [
         "Editor"
       ]
+    },
+    {
+      "Name": "WaveFunctionCollapse",
+      "Enabled": true
+    },
+    {
+      "Name": "ModelingToolsEditorMode",
+      "Enabled": true
     }
   ]
 }

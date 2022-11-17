@@ -19,7 +19,7 @@
  * 
  */
 UCLASS()
-class TATOOLSPLUGIN_API UFoliageConverter : public UBlueprintFunctionLibrary
+class FOLIAGECLUSTER_API UFoliageConverter : public UBlueprintFunctionLibrary
 {
 	GENERATED_BODY()
 public:

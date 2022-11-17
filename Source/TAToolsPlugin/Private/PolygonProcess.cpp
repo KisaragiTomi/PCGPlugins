@@ -57,6 +57,10 @@ void UPolygonProcess::FixOpenAssetAsync(TArray<UStaticMesh*> StaticMeshs, int32 
 	MeshOpenVertex = TransformManager->MeshOpenVertex;
 	for (UStaticMesh* StaticMesh : StaticMeshs)
 	{
+		if(!StaticMesh)
+		{
+			continue;
+		}
 		TArray<FVector> Vertices;
 		TSharedPtr<FDynamicMesh3> OriginalMesh = MakeShared<FDynamicMesh3>();
 		FMeshDescriptionToDynamicMesh Converter;
@@ -161,11 +165,15 @@ void OpenAssetProcess::CalculateResult()
 
 
 
-void UPolygonProcess::StopFixOpenAssetAsync(TArray<UStaticMesh*> StaticMeshs)
+void UPolygonProcess::StopFixOpenAssetAsync(TArray<UStaticMesh*> StaticMeshs, FVector Dir)
 {
 	TMap<UStaticMesh*, TArray<FVector>> MeshOpenVertex;
 	for (UStaticMesh* StaticMesh : StaticMeshs)
 	{
+		if(!StaticMesh)
+		{
+			continue;
+		}
 		TArray<FVector> Vertices;
 		TSharedPtr<FDynamicMesh3> OriginalMesh = MakeShared<FDynamicMesh3>();
 		FMeshDescriptionToDynamicMesh Converter;

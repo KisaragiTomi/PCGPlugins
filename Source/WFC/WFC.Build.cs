@@ -1,8 +1,8 @@
 ﻿using UnrealBuildTool;
 
-public class FoliageCluster : ModuleRules
+public class WFC : ModuleRules
 {
-    public FoliageCluster(ReadOnlyTargetRules Target) : base(Target)
+    public WFC(ReadOnlyTargetRules Target) : base(Target)
     {
         PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 
@@ -10,7 +10,8 @@ public class FoliageCluster : ModuleRules
             new string[]
             {
                 "Core", 
-                "Foliage",
+                "UnrealEd",
+                "WaveFunctionCollapse",
             }
         );
 

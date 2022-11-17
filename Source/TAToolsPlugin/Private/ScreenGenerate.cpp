@@ -36,6 +36,8 @@
 #include "MinVolumeSphere3.h"
 #include "MinVolumeBox3.h"
 #include "Math/TransformCalculus3D.h"
+#include "Interfaces/IPluginManager.h"
+//#include "Modules/ModuleManager.h"
 
 //创建ObjectTransform的类型
 #define ObjectTransformType_Forward 0 //这类物体面向x轴, 如爬山虎, 悬崖峭壁类资产
@@ -189,6 +191,7 @@ bool ScreenProcess::Setup()
 	SceneCaptureContainter->PickActors = PickActors;
 	SceneCaptureContainter->DivdeSize = DivdeSize;
 	SceneCaptureContainter->Block = Block;
+	SceneCaptureContainter->debugimg = DebugImg;
 	
 	if (SceneCaptureContainter->StoreCaptureTransforms.Num() == 0)
 	{
@@ -223,6 +226,7 @@ bool ScreenProcess::Setup()
 			break;
 		}
 	}
+	CurrentTransform.SetScale3D(SceneCapture->GetActorScale());
 	SceneCapture->SetActorTransform(CurrentTransform);
 	//DynamicMeshData
 	DynamicMeshData = SceneCaptureContainter->DynamicMeshData;
@@ -369,7 +373,6 @@ bool ProcessFoliage::ProcessImg()
 		//循环5次 没检测出来算了;
 		for (int32 c = 0; c < FMath::Min(PickPixelArrayErode.Num(), 5); c++)
 		{
-
 			FVector2i PickPixel = PickPixelArrayErode[FMath::RandRange(0, PickPixelArrayErode.Num() - 1)];
 			//FVector2i PickPixel = PickPixelArrayErode[c];
 			
@@ -420,6 +423,8 @@ bool ProcessLineFoliage::ProcessImg()
 	ErodeNumPixels = FMath::Min(ErodeBoundPixels.X, ErodeBoundPixels.Y);
 
 	OtherSides.Empty();
+
+	OutReferenceImg = Mat(Height, Width, CV_8UC1, Scalar::all(0));
 	//岛屿计算. 找到一个岛屿就判断一次是否可以放物体进去.
 	//因为需要按照像素法线与镜头法线夹角的顺序去检查图像.而不是从某个角落开始检查. 所以这里增添了SortIdx的设定.
 	for (TTuple<FVector2i, float>& Pair : SortIdx)
@@ -441,28 +446,24 @@ bool ProcessLineFoliage::ProcessImg()
 	}
 	
 	OutReferenceTArray = MatBinarizationToVector2D(OutReferenceImg);
-	//有关于PickPixelArraya的可视化
+	//有关于PickPixelArray的可视化
 	SceneCaptureContainter->ReferenceImg1 = Array2DToMatBinarization(PickPixelArray);
 	//有关于直线检测的可视化
 	SceneCaptureContainter->ReferenceImg2 = OutReferenceImg;
 	AsyncTask(ENamedThreads::GameThread, [&]()
 		{
 			SpawnStaticMesh();
-			if(DebugImg)
+			TArray<AActor*> ContainerActors;
+			UGameplayStatics::GetAllActorsOfClass(GWorld, ASceneCaptureContainter::StaticClass(), ContainerActors);
+			if(ContainerActors.Num() > 0)
 			{
-				
-				TArray<AActor*> ContainerActors;
-				UGameplayStatics::GetAllActorsOfClass(GWorld, ASceneCaptureContainter::StaticClass(), ContainerActors);
-				if(ContainerActors.Num() > 0)
+				ASceneCaptureContainter* SceneCaptureContainter = Cast<ASceneCaptureContainter>(ContainerActors[0]);
+				if(SceneCaptureContainter->debugimg)
 				{
-					ASceneCaptureContainter* SceneCaptureContainter = Cast<ASceneCaptureContainter>(ContainerActors[0]);
 					DrawDebugTexture(SceneCaptureContainter->ReferenceImg1, 1);
 					DrawDebugTexture(SceneCaptureContainter->ReferenceImg2, 2);
-											
 				}
 			}
-			
-
 		});
 	return true;
 }
@@ -680,6 +681,7 @@ void ScreenProcess::LineDetection()
 	fld->detect(LineDetectImg, lines_fld);
 	for (size_t i = 0; i < lines_fld.Num(); i++)
 	{
+		//得到直线两点之间的距离
 		FVector2D ScreenPosStart = FVector2D(FMath::Clamp(lines_fld[i][1], float(0.), float(Width)), FMath::Clamp(lines_fld[i][0], float(0.), float(Height)));
 		FVector2D ScreenPosEnd = FVector2D(FMath::Clamp(lines_fld[i][3], float(0.), float(Width)), FMath::Clamp(lines_fld[i][2], float(0.), float(Height)));
 
@@ -689,14 +691,19 @@ void ScreenProcess::LineDetection()
 		FVector LineObjectDir = -(WorldDirStart + WorldPosEnd - 2 * SceneCapture->GetActorLocation()).GetSafeNormal();
 		FVector2D PixelDistFloat = ScreenPosStart - ScreenPosEnd;
 		FVector2i PixelDistInt = FVector2i(PixelDistFloat.X, PixelDistFloat.Y);
+		//像素空间距离
 		float PixelDist = (FVector2D(PixelDistInt.X, PixelDistInt.Y)).Size();
+		//世界空间距离
 		float WorldSize = PixelDist * PixelSize;
 		FBoxSphereBounds Bounds = CurrenStaticMesh->GetBounds();
+
 		int32 PlaceNum = FMath::Max(int32(WorldSize / Bounds.BoxExtent.Z), 1);
+		
 		if (WorldSize < Bounds.BoxExtent.Z/.7)
 		{
 			continue;
 		}
+		//这里为什么要交换它们的位置呢?
 		if (WorldPosStart.Z < WorldPosEnd.Z)
 		{
 			FVector Temp = WorldPosStart;
@@ -837,15 +844,17 @@ void ScreenProcess::DrawDebugTexture(Mat Img, int32 index)
 {
 	if (Img.rows > 0)
 	{
-		FString ContentPath = FPaths::ProjectPluginsDir() + TEXT("TAToolsPlugin/Content/");
-		FString TestImgPath = FPaths::Combine(ContentPath, TEXT("Test.png"));
+		//FName ModuleName = FModuleManager::GetModuleFilename();
+		FString ContentPath = FPaths::ConvertRelativePathToFull(IPluginManager::Get().FindPlugin(TEXT("TAToolsPlugin"))->GetBaseDir()) + TEXT("/Content/");
 
-		//string temp(TCHAR_TO_UTF8(*TestImgPath));
+		//直接输出mat会报错.所以这里我新建了一个mat输出这个TempImg就不会崩溃了
+		Mat TempImg(Height, Width, CV_8UC1, Scalar::all(0));
+		TempImg =  Array2DToMatBinarization((MatBinarizationToVector2D(Img)));
 		FString ts = ContentPath + "Test" + FString::Printf(TEXT("%d"), index) +  ".png";
-		imwrite(TCHAR_TO_UTF8(*ts), Img);
-
+		imwrite(TCHAR_TO_UTF8(*ts), TempImg);
+		
 		//namedWindow("Example", WINDOW_AUTOSIZE);
-		//imshow("Example", OutReferenceImg);
+		//imshow("Example", TempImg);
 	}
 
 }
@@ -1005,16 +1014,17 @@ void ASceneCaptureContainter::GenerateTransforms()
 	//收集相机的transform
 	if (StoreCaptureTransforms.Num() == 0)
 	{
+		//这是一个过去的做法。从content中读取staticmesh。但是这样做是不稳定的。因为很有可能会换路径。就很烦
+		// UObject* loadObj = StaticLoadObject(UStaticMesh::StaticClass(), NULL, TEXT("StaticMesh'/TAToolsPlugin/ScreenProcess/Component/Plane.Plane'"));
+		// UStaticMesh* PlaneStatic = nullptr;
+		// if (loadObj != nullptr)
+		// {
+		// 	PlaneStatic = Cast<UStaticMesh>(loadObj);
+		// }
 		//我要用一个片检测相机视野是否与场景产生过多overlap. 产生碰撞的话就意味着相机的拍摄也是与物体穿插的
-		UObject* loadObj = StaticLoadObject(UStaticMesh::StaticClass(), NULL, TEXT("StaticMesh'/TAToolsPlugin/Plane.Plane'"));
-		UStaticMesh* PlaneStatic = nullptr;
-		if (loadObj != nullptr)
-		{
-			PlaneStatic = Cast<UStaticMesh>(loadObj);
-		}
 		FActorSpawnParameters Params;
 		AStaticMeshActor* PlaneStaticActor = GetWorld()->SpawnActor<AStaticMeshActor>(FVector::ZeroVector, FRotator::ZeroRotator, Params);
-		PlaneStaticActor->GetStaticMeshComponent()->SetStaticMesh(PlaneStatic);
+		PlaneStaticActor->GetStaticMeshComponent()->SetStaticMesh(CollisionMesh);
 		PlaneStaticActor->SetMobility(EComponentMobility::Movable);
 		//PlaneStaticActor->SetActorHiddenInGame(true);
 		TArray<FName> PlaneTags;
@@ -1033,9 +1043,6 @@ void ASceneCaptureContainter::GenerateTransforms()
 					}
 					for (FVector Dir : Dirs)
 					{
-
-
-						
 						FVector PlaneScale = FVector(DivdeSize, DivdeSize, DivdeSize) * .01 * 0.1; //这里把片缩小十倍是不希望碰撞检测过大的区域. 不然没得生成了. 
 						float RandomDist = FMath::FRandRange(0, DivdeSize * 0.2);
 						FVector RandomVector = FMath::VRandCone(FVector(0, 0, 1), 360, 360);

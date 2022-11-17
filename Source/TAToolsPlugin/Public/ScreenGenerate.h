@@ -277,19 +277,30 @@ class TATOOLSPLUGIN_API ASceneCaptureContainter : public AActor
 	}
 	
 public:
-	UPROPERTY(BlueprintReadWrite, Category = "CubeAttrib")
-	USceneComponent* Root;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CubeAttrib")
-	TArray<FTransform> StoreCaptureTransforms;
-	
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CubeAttrib")
-	UInstancedStaticMeshComponent* InstanceBlockMesh;
 
 	TArray<FMeshData> MeshData;
 	TArray<UStaticMesh*> InputMeshs;
 	TMap<UStaticMesh*, TArray<FVector>> MeshOpenVertexMap;
 	TMap<UStaticMesh*, TSharedPtr<FDynamicMesh3>> DynamicMeshData;
+
+	float ExtentMult = 1.2;
+	float ScreenDepthMax = 100000;
+	bool debugimg = false;
+	
+	Mat ReferenceImg1;
+	Mat ReferenceImg2;
+	
+	UPROPERTY(BlueprintReadWrite, Category = "CubeAttrib")
+	USceneComponent* Root;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CubeAttrib")
+	UStaticMesh* CollisionMesh;
+	
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CubeAttrib")
+	TArray<FTransform> StoreCaptureTransforms;
+	
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CubeAttrib")
+	UInstancedStaticMeshComponent* InstanceBlockMesh;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CubeAttrib")
 	FVector SourceCenter;
@@ -309,11 +320,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CubeAttrib")
 	float Block = 0;
 
-	float ExtentMult = 1.2;
-	float ScreenDepthMax = 100000;
-	
-	Mat ReferenceImg1;
-	Mat ReferenceImg2;
+
 
 	UFUNCTION(BlueprintCallable, Category = SceneCaptureContainter)
 	void GenerateTransforms();

@@ -217,7 +217,8 @@ bool ScreenProcess::Setup()
 	//}
 	//?????????б??????Transform???????. ???????????д????.
 	CamIndex = -1;
-	for(int32 i = 0; i < SceneCaptureContainter->StoreCaptureTransforms.Num(); i++)
+	int32 NSceneCaptureContainter = SceneCaptureContainter->StoreCaptureTransforms.Num();
+	for(int32 i = 0; i < NSceneCaptureContainter; i++)
 	{
 		FTransform Transform = SceneCaptureContainter->StoreCaptureTransforms[i];
 		if(CurrentTransform.GetLocation() == Transform.GetLocation() &&CurrentTransform.GetRotation() == Transform.GetRotation())
@@ -365,15 +366,16 @@ bool ProcessFoliage::ProcessImg()
 		{
 			continue;
 		}
-
-		for (int32 c = 0; c < PickPixelArrayErode.Num(); c++)
+		int32 NErode = PickPixelArrayErode.Num();
+		for (int32 c = 0; c < NErode; c++)
 		{
-			PickPixelArrayErode.Swap(c, FMath::RandRange(0, PickPixelArrayErode.Num() - 1));
+			PickPixelArrayErode.Swap(c, FMath::RandRange(0, NErode - 1));
 		}
+		
 		//循环5次 没检测出来算了;
-		for (int32 c = 0; c < FMath::Min(PickPixelArrayErode.Num(), 5); c++)
+		for (int32 c = 0; c < FMath::Min(NErode, 5); c++)
 		{
-			FVector2i PickPixel = PickPixelArrayErode[FMath::RandRange(0, PickPixelArrayErode.Num() - 1)];
+			FVector2i PickPixel = PickPixelArrayErode[FMath::RandRange(0, NErode - 1)];
 			//FVector2i PickPixel = PickPixelArrayErode[c];
 			
 			//创建物体的Object
@@ -516,19 +518,19 @@ bool ProcessOpenAsset::ProcessImg()
 		{
 			continue;
 		}
-
-		for (int32 c = 0; c < PickPixelArrayErode.Num(); c++)
+		int32 NErode = PickPixelArrayErode.Num();
+		for (int32 c = 0; c < NErode; c++)
 		{
-			PickPixelArrayErode.Swap(c, FMath::RandRange(0, PickPixelArrayErode.Num() - 1));
+			PickPixelArrayErode.Swap(c, FMath::RandRange(0, NErode - 1));
 		}
 
 
 		UE_LOG(LogTemp, Warning, TEXT("ThreadDone"));
 		//循环5次 没检测出来算了;
-		for (int32 c = 0; c < FMath::Min(PickPixelArrayErode.Num(), 5); c++)
+		for (int32 c = 0; c < FMath::Min(NErode, 5); c++)
 		{
 
-			FVector2i PickPixel = PickPixelArrayErode[FMath::RandRange(0, PickPixelArrayErode.Num() - 1)];
+			FVector2i PickPixel = PickPixelArrayErode[FMath::RandRange(0, NErode - 1)];
 			//FVector2i PickPixel = PickPixelArrayErode[c];
 
 			//做一个物体的Transform, 模式1代表会以像素方向为Forward
@@ -678,8 +680,9 @@ void ScreenProcess::LineDetection()
 		canny_aperture_size,
 		do_merge);
 	TArray<Vec4f> lines_fld;
+	int32 Nlines_fld = lines_fld.Num();
 	fld->detect(LineDetectImg, lines_fld);
-	for (size_t i = 0; i < lines_fld.Num(); i++)
+	for (size_t i = 0; i < Nlines_fld; i++)
 	{
 		//得到直线两点之间的距离
 		FVector2D ScreenPosStart = FVector2D(FMath::Clamp(lines_fld[i][1], float(0.), float(Width)), FMath::Clamp(lines_fld[i][0], float(0.), float(Height)));
@@ -865,6 +868,7 @@ bool FConsiderMeshZ::ProcessMesh()
 	float MinHeight = Bounds.Origin.Z - Bounds.BoxExtent.Z;
 	float Threshold = 50.;
 	TArray<FVector> PickVertices;
+
 	for (int32 VerticeId : OriginalMesh->VertexIndicesItr())
 	{
 		FVector3d MeshVerticePos = OriginalMesh->GetVertex(VerticeId);
@@ -1030,24 +1034,36 @@ void ASceneCaptureContainter::GenerateTransforms()
 		TArray<FName> PlaneTags;
 		PlaneTags.Add(FName(TEXT("SAuto")));
 		PlaneStaticActor->Tags = PlaneTags;
+
+
+
+		FVector l = FVector(Size.X / FMath::FloorToInt(Size.X / DivdeSize), Size.Y / FMath::FloorToInt(Size.Y / DivdeSize),Size.Z / FMath::FloorToInt(Size.Z / DivdeSize));
+		int32 DSizeX = FMath::FloorToInt(Size.X / DivdeSize);
+		int32 DSizeY = FMath::FloorToInt(Size.Y / DivdeSize);
+		int32 DSizeZ = FMath::FloorToInt(Size.Z / DivdeSize);
 		
-		for (int32 i = 0; i < Size.X / DivdeSize + 2; i++)
+		for (int32 i = 0; i < DSizeX ; i++)
 		{
-			for (int32 n = 0; n < Size.Y / DivdeSize + 2; n++)
+			for (int32 n = 0; n < DSizeY; n++)
 			{
-				for (int32 c = 0; c < Size.Z / DivdeSize + 2; c++)
+				for (int32 c = 0; c < DSizeZ; c++)
 				{
-					if(OrigPos.Z + c * DivdeSize < Center.Z - BoxExtent.Z * 1.1)
-					{
-						continue;
-					}
+					//意义不明的计算
+					// if(OrigPos.Z + c * DivdeSize < Center.Z - BoxExtent.Z * 1.1)
+					// {
+					// 	//continue;
+					// }
+					BoxTransform.SetScale3D(FVector::OneVector);
+					FVector Pos = BoxTransform.TransformVector(FVector(i * l.X, n * l.Y, c * l.Z) + l/2 - BoxExtent);
+					
 					for (FVector Dir : Dirs)
 					{
 						FVector PlaneScale = FVector(DivdeSize, DivdeSize, DivdeSize) * .01 * 0.1; //这里把片缩小十倍是不希望碰撞检测过大的区域. 不然没得生成了. 
 						float RandomDist = FMath::FRandRange(0, DivdeSize * 0.2);
 						FVector RandomVector = FMath::VRandCone(FVector(0, 0, 1), 360, 360);
 						FVector RandomDir = FMath::VRandCone(FVector(0, 0, 1), 360, 360);
-						FVector Pos = FVector(i, n, c) * DivdeSize + OrigPos + RandomVector * RandomDist;
+						
+						FVector RandomPos = Pos + RandomVector * RandomDist;
 						FRotator Rot = FRotationMatrix::MakeFromX((Dir + RandomDir * .3).GetSafeNormal()).Rotator();
 						FTransform PlaneTransform = FTransform(Rot, Pos, PlaneScale);
 						
@@ -1086,6 +1102,7 @@ void ASceneCaptureContainter::GenerateTransforms()
 						//检测一下相机前方远处有没有物体, 如果有的话就把该transform加入进检测序列中
 						FVector Start = Pos;
 						FVector End = Start + Dir * ScreenDepthMax;
+						
 						if (UKismetSystemLibrary::LineTraceSingle(GetWorld(), Start, End, ETraceTypeQuery::TraceTypeQuery1, true, ActorsToIgnore, EDrawDebugTrace::None, OutHit, true))
 						{
 							if (PickActors.Find(OutHit.GetActor()) >= 0 && OutHit.Distance > 200 && OutHit.Distance > 1300)
@@ -1116,6 +1133,69 @@ void ASceneCaptureContainter::GenerateTransforms()
 	}
 }
 
+void ABoxSelecter::GenerateTransform(float ExtentMult ,float DirDivide)
+{
+	//我发现直接用pickactors的bound作为摄像机的可生成区域, 生成的也太多了.
+	//感觉还不如用box作为生成区域算了. 因为某些区域, 比如我只想检测城镇内部的生成,
+	//但是如果使用pickactors的bound的话会检测到城镇的外围.
+	FVector Center, BoxExtent;
+	
+	GetActorBounds(false,Center, BoxExtent);
+ 	//UGameplayStatics::GetActorArrayBounds(Actors, true, Center, BoxExtent);
+	FVector Size = BoxExtent * ExtentMult * 2;
+	//这里是生成多个角度
+	TArray<FVector> Dirs;
+	TSet<FVector> DirSet;
+	FVector DirTest = FVector::ZeroVector;//DirTest用来测试生成出来的方向加一起是不是0, 如果不是0 那么某个方向产生的物体就会特别多
+	//DirDivide = 2;
+	
+	for (int32 i = 0; i < DirDivide * 2 + 1; i++)
+	{
+		for (int32 n = 0; n < DirDivide * 2 + 1; n++)
+		{
+			for (int32 c = 0; c < DirDivide * 2 + 1; c++)
+			{
+				//暂时不检测物体的底部
+				if (c / DirDivide - 1 > .2)
+				{
+					continue;
+				}
+				float RandomAngleRangeMult = FMath::FRandRange(0.1, 0.2);
+				FVector RandomVector = FMath::VRandCone(FVector(0, 0, 1), 360, 360);
+				//为了测试.暂时先不搞
+				FVector Dir = (FVector(i / DirDivide - 1, n / DirDivide - 1, 0) + RandomVector * RandomAngleRangeMult).GetSafeNormal();
+				DirSet.Add(Dir);
+				DirTest += Dir;
+			}
+		}
+	}
+	Dirs = DirSet.Array();
+	DirTest = DirTest.GetSafeNormal();
+	//收集相机的transform
+	PerCaptureTransforms.Empty();
+	FVector l = FVector(Size.X / FMath::FloorToInt(Size.X / DivdeSize), Size.Y / FMath::FloorToInt(Size.Y / DivdeSize),Size.Z / FMath::FloorToInt(Size.Z / DivdeSize));
+	int32 DSizeX = FMath::FloorToInt(Size.X / DivdeSize);
+	int32 DSizeY = FMath::FloorToInt(Size.Y / DivdeSize);
+	int32 DSizeZ = FMath::FloorToInt(Size.Z / DivdeSize);
+	for (int32 i = 0; i < DSizeX +1; i++)
+	{
+		for (int32 n = 0; n < DSizeY +1; n++)
+		{
+			for (int32 c = 0; c < DSizeZ +1; c++)
+			{
+
+				for (FVector Dir : Dirs)
+				{
+					FTransform ActorTransform = GetActorTransform();
+					ActorTransform.SetScale3D(FVector::OneVector);
+					FVector Pos = ActorTransform.TransformPosition(FVector(i * l.X, n * l.Y, c * l.Z) - BoxExtent);
+					PerCaptureTransforms.Add(FTransform(FRotator::ZeroRotator, Pos, FVector::OneVector));
+				}
+			}
+		}
+	}
+}
+
 void ASceneCaptureContainter::GenerateBlockBox()
 {
 	FVector Center, BoxExtent;
@@ -1136,11 +1216,12 @@ void ASceneCaptureContainter::GenerateBlockBox()
 			}
 		}
 	}
-	for (int32 i = 0; i < PosRandoms.Num(); i++)
+	int32 NposR = PosRandoms.Num();
+	for (int32 i = 0; i < NposR; i++)
 	{
-		PosRandoms.Swap(i, FMath::RandRange(0, PosRandoms.Num() - 1));
+		PosRandoms.Swap(i, FMath::RandRange(0, NposR - 1));
 	}
-	for (int32 i = 0; i < PosRandoms.Num() * Block; i++)
+	for (int32 i = 0; i < NposR * Block; i++)
 	{
 		FTransform AddTransform = FTransform(FRotator::ZeroRotator, PosRandoms[i], FVector::OneVector * DivdeSize / 100);
 		InstanceBlockMesh->AddInstanceWorldSpace(AddTransform);
@@ -1375,7 +1456,8 @@ FTransform ScreenProcess::CreateObjectTransform(FVector2i PickPixel, int32 Type)
 	Dirs.Add(FVector2i(-1, 0));
 	//?ó????2d????б????????????????????
 	FVector2i TarDir = FVector2i(0,0);
-	for (int32 d = 1; d < FMath::Max(SceneData.Num(), SceneData[0].Num()); d++)
+	int32 NScenceData = FMath::Max(SceneData.Num(), SceneData[0].Num());
+	for (int32 d = 1; d < NScenceData; d++)
 	{
 		for (FVector2i Dir : Dirs)
 		{
@@ -1497,10 +1579,12 @@ bool ScreenProcess::OverlapCheck(Mat Img, FVector2i PickPixel)
 	}
 
 	uchar* ptmp = NULL;
-	for (int32 i = 0; i < ErodeBoundPixels.X * 2; i++)
+	int32 NErodePX = ErodeBoundPixels.X * 2;
+	int32 NErodePY = ErodeBoundPixels.Y * 2;
+	for (int32 i = 0; i < NErodePX; i++)
 	{
 		ptmp = Img.ptr<uchar>(int32(MinPos.X) + i);
-		for (int32 n = 0; n < ErodeBoundPixels.Y * 2; n++)
+		for (int32 n = 0; n < NErodePY; n++)
 		{
 			//FVector2i CheckPixel = MinPos + FVector2i(i, n);
 			

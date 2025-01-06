@@ -5,10 +5,7 @@
 #include "Engine/StaticMesh.h"
 #include "Kismet/GameplayStatics.h"
 #include "Kismet/KismetRenderingLibrary.h"
-//#include "Engine/TextureRenderTarget2D.h"
-//#include "KismetProceduralMeshLibrary.h"
 #include "Camera/CameraTypes.h"
-//#include "KismetMathLibrary.h"
 #include "Engine/SceneCapture2D.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
@@ -18,27 +15,155 @@
 #include "FoliageType.h"
 #include "InstancedFoliageActor.h"
 #include "Engine/StaticMeshActor.h"
+#include "EngineUtils.h"
+#include "Runtime/Experimental/Voronoi/Private/voro++/src/container.hh"
+#include "Subsystems/EditorActorSubsystem.h"
 
-//#include "MeshRegionBoundaryLoops.h"
-//#if WITH_OPENCV
-//OPENCV_INCLUDES_START
-//#undef check // the check macro causes problems with opencv headers
-//#include "opencv2/calib3d.hpp"
-//#include "opencv2/imgproc.hpp"
+#if WITH_EDITOR
 
-////using namespace cv;
-//OPENCV_INCLUDES_END
-//#endif
+void UFoliageConverter::ConvertFoliageToInstanceComponent(UFoliageType* InFoliageType)
+{
+	UEditorActorSubsystem* EditorActorSubsystem = GEditor->GetEditorSubsystem<UEditorActorSubsystem>();
+	TArray<AActor*> SelectedActors = EditorActorSubsystem->GetSelectedLevelActors();
+	AConvertFoliageInstanceContainer* Container = nullptr;
+	for (AActor* Actor : SelectedActors)
+	{
+		if (Cast<AConvertFoliageInstanceContainer>(Actor))
+		{
+			Container = Cast<AConvertFoliageInstanceContainer>(Actor);
+			break;
+		}
+	}
+	if (!Container)
+		return;
+	
+	Container->AddInstanceFromFoliageType(InFoliageType);
+}
 
+void UFoliageConverter::ConvertInstanceComponentToFoliage(UFoliageType* InFoliageType, UClass* ContainerClass)
+{
+	UEditorActorSubsystem* EditorActorSubsystem = GEditor->GetEditorSubsystem<UEditorActorSubsystem>();
+	TArray<AActor*> SelectedActors = EditorActorSubsystem->GetSelectedLevelActors();
+	AConvertFoliageInstanceContainer* Container = nullptr;
+	for (AActor* Actor : SelectedActors)
+	{
+		if (Cast<AConvertFoliageInstanceContainer>(Actor))
+		{
+			Container = Cast<AConvertFoliageInstanceContainer>(Actor);
+			break;
+		}
+	}
+	if (!Container)
+		return;
+	Container->ConvertInstanceToFoliage(InFoliageType);
+}
 
+#endif
 
+UStaticMesh* UFoliageConverter::GetStaticMesh(UFoliageType* InFoliageType)
+{
+	for (TActorIterator<AInstancedFoliageActor> It(GWorld); It; ++It)
+	{
+		AInstancedFoliageActor* IFA = (*It);
+		FFoliageInfo* FoliageInfo = It->FindInfo(InFoliageType);
+		if (!FoliageInfo)
+		{
+			continue;
+		}
+		UStaticMesh* SMesh = FoliageInfo->GetComponent()->GetStaticMesh();
+		if (!SMesh)
+		{
+			continue;
+		}
+		return SMesh;
+	}
+	return nullptr;
+}
+
+const UFoliageType* UFoliageConverter::GetFoliageType(UStaticMesh* StaticMesh)
+{
+	AInstancedFoliageActor* IFA = nullptr;
+	for (TActorIterator<AInstancedFoliageActor> It(GWorld); It; ++It)
+	{
+		IFA = (*It);
+		break;
+	}
+	if (!IFA)
+		return nullptr;
+
+	TArray<const UFoliageType*> FoliageTypes;
+	IFA->GetAllFoliageTypesForSource(StaticMesh, FoliageTypes);
+	if (FoliageTypes.Num() > 0)
+	{
+		return FoliageTypes[0];
+	}
+	
+	return nullptr;
+}
+
+void UFoliageConverter::GetAllInstancesTransfrom(UFoliageType* InFoliageType, TArray<FTransform>& OutTransforms)
+{
+	
+	for (TActorIterator<AInstancedFoliageActor> It(GWorld); It; ++It)
+	{
+		AInstancedFoliageActor* IFA = (*It);
+		FFoliageInfo* FoliageInfo = It->FindInfo(InFoliageType);
+		if (!FoliageInfo)
+			continue;
+		
+		if (!FoliageInfo->GetComponent() || FoliageInfo->Instances.Num() == 0)
+			continue;
+		int32 InstanceCount = FoliageInfo->GetComponent()->GetInstanceCount();
+		TArray<FTransform> TempTransforms;
+		TempTransforms.SetNum(InstanceCount);
+
+		for (int32 i = 0; i < InstanceCount; i++)
+		{
+			FoliageInfo->GetComponent()->GetInstanceTransform(i, TempTransforms[i], true);
+		}
+		OutTransforms.Append(TempTransforms);
+	}
+	
+}
+
+void UFoliageConverter::RefreshFoliage(UFoliageType* InFoliageType)
+{
+	for (TActorIterator<AInstancedFoliageActor> It(GWorld); It; ++It)
+	{
+		AInstancedFoliageActor* IFA = (*It);
+		FFoliageInfo* FoliageInfo = It->FindInfo(InFoliageType);
+		if (!FoliageInfo)
+		{
+			continue;
+		}
+
+		FoliageInfo->Refresh(true, true);
+	}
+}
+
+const UFoliageType* UFoliageConverter::AddFoliageType(const UFoliageType* InType)
+{
+	AInstancedFoliageActor* IFA = nullptr;
+	for (TActorIterator<AInstancedFoliageActor> It(GWorld); It; ++It)
+	{
+		IFA = (*It);
+		break;
+	}
+	if (!IFA)
+		return nullptr;
+	
+	FFoliageInfo* Info = nullptr;
+	UFoliageType* FoliageType = IFA->AddFoliageType(InType, &Info);
+	
+	return nullptr;
+}
 
 bool UFoliageConverter::RemoveFoliageInstance(UStaticMesh* StaticMesh, const int32 InstanceIndex)
 {
 	ULevel* DesiredLevel = GWorld->GetCurrentLevel();
 
 	AInstancedFoliageActor* InstancedFoliageActor = AInstancedFoliageActor::GetInstancedFoliageActorForLevel(DesiredLevel, true);
-	if (!InstancedFoliageActor || InstancedFoliageActor->IsPendingKill())
+	if (!InstancedFoliageActor)
 		return false;
 
 	TArray<const UFoliageType*> FoliageTypes;
@@ -49,7 +174,7 @@ bool UFoliageConverter::RemoveFoliageInstance(UStaticMesh* StaticMesh, const int
 	}
 	const UFoliageType* FoliageType = FoliageTypes[0];
 	
-	if (!FoliageType || FoliageType->IsPendingKill())
+	if (!FoliageType)
 		return false;
 
 	FFoliageInfo* FoliageInfo = InstancedFoliageActor->FindInfo(FoliageType);
@@ -72,7 +197,7 @@ bool UFoliageConverter::SetFoliageInstanceTransform(UStaticMesh* StaticMesh, con
 	ULevel* DesiredLevel = GWorld->GetCurrentLevel();
 
 	AInstancedFoliageActor* InstancedFoliageActor = AInstancedFoliageActor::GetInstancedFoliageActorForLevel(DesiredLevel, true);
-	if (!InstancedFoliageActor || InstancedFoliageActor->IsPendingKill())
+	if (!InstancedFoliageActor)
 		return false;
 
 	TArray<const UFoliageType*> FoliageTypes;
@@ -82,7 +207,7 @@ bool UFoliageConverter::SetFoliageInstanceTransform(UStaticMesh* StaticMesh, con
 		return false;
 	}
 	const UFoliageType* FoliageType = FoliageTypes[0];
-	if (!FoliageType || FoliageType->IsPendingKill())
+	if (!FoliageType)
 		return false;
 
 	else
@@ -116,7 +241,7 @@ bool UFoliageConverter::SetFoliageInstanceID(UStaticMesh* StaticMesh, int32 Inst
 	ULevel* DesiredLevel = GWorld->GetCurrentLevel();
 
 	AInstancedFoliageActor* InstancedFoliageActor = AInstancedFoliageActor::GetInstancedFoliageActorForLevel(DesiredLevel, true);
-	if (!InstancedFoliageActor || InstancedFoliageActor->IsPendingKill())
+	if (!InstancedFoliageActor)
 		return false;
 
 	TArray<const UFoliageType*> FoliageTypes;
@@ -126,7 +251,7 @@ bool UFoliageConverter::SetFoliageInstanceID(UStaticMesh* StaticMesh, int32 Inst
 		return false;
 	}
 	const UFoliageType* FoliageType = FoliageTypes[0];
-	if (!FoliageType || FoliageType->IsPendingKill())
+	if (!FoliageType)
 		return false;
 
 	else
@@ -150,7 +275,7 @@ bool UFoliageConverter::GetFoliageInstanceID(UStaticMesh* StaticMesh, int32 Inst
 	ULevel* DesiredLevel = GWorld->GetCurrentLevel();
 
 	AInstancedFoliageActor* InstancedFoliageActor = AInstancedFoliageActor::GetInstancedFoliageActorForLevel(DesiredLevel, true);
-	if (!InstancedFoliageActor || InstancedFoliageActor->IsPendingKill())
+	if (!InstancedFoliageActor)
 		return false;
 
 	TArray<const UFoliageType*> FoliageTypes;
@@ -160,7 +285,7 @@ bool UFoliageConverter::GetFoliageInstanceID(UStaticMesh* StaticMesh, int32 Inst
 		return false;
 	}
 	const UFoliageType* FoliageType = FoliageTypes[0];
-	if (!FoliageType || FoliageType->IsPendingKill())
+	if (!FoliageType)
 		return false;
 
 	else
@@ -222,7 +347,7 @@ bool UFoliageConverter::SetCustomDataValue(UInstancedStaticMeshComponent* Instan
 
 	// Force recreation of the render data when proxy is created
 	//这里不知道为什么更新材质不能用自带的函数, 必须直接写++ 错误提示貌似是没有include
-	InstanceStaticMesh->InstanceUpdateCmdBuffer.NumEdits++;
+	// InstanceStaticMesh->InstanceUpdateCmdBuffer.NumEdits++;
 	InstanceStaticMesh->MarkRenderStateDirty();
 
 	return true;
@@ -234,7 +359,7 @@ bool UFoliageConverter::AddFoliageInstance(UStaticMesh* StaticMesh, UPrimitiveCo
 	ULevel* DesiredLevel = GWorld->GetCurrentLevel();
 
 	AInstancedFoliageActor* InstancedFoliageActor = AInstancedFoliageActor::GetInstancedFoliageActorForLevel(DesiredLevel, true);
-	if (!InstancedFoliageActor || InstancedFoliageActor->IsPendingKill())
+	if (!InstancedFoliageActor)
 		return false;
 
 	TArray<const UFoliageType*> FoliageTypes;
@@ -279,7 +404,7 @@ UHierarchicalInstancedStaticMeshComponent* UFoliageConverter::FindFoliageInstanc
 	ULevel* DesiredLevel = GWorld->GetCurrentLevel();
 
 	AInstancedFoliageActor* InstancedFoliageActor = AInstancedFoliageActor::GetInstancedFoliageActorForLevel(DesiredLevel, true);
-	if (!InstancedFoliageActor || InstancedFoliageActor->IsPendingKill())
+	if (!InstancedFoliageActor)
 		return nullptr;
 
 	TArray<const UFoliageType*> FoliageTypes;
@@ -289,7 +414,7 @@ UHierarchicalInstancedStaticMeshComponent* UFoliageConverter::FindFoliageInstanc
 		return nullptr;
 	}
 	const UFoliageType* FoliageType = FoliageTypes[0];
-	if (!FoliageType || FoliageType->IsPendingKill())
+	if (!FoliageType )
 	{
 		return nullptr;
 	}
@@ -326,3 +451,81 @@ void UFoliageConverter::AddFoliage()
 
 
 }
+
+
+
+#define LOCTEXT_NAMESPACE "AConvertFoliageInstanceContainer"
+
+AConvertFoliageInstanceContainer::AConvertFoliageInstanceContainer(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+	FoliageInstanceContainer = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("FoliageInstanceContainer"));
+	UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	FoliageInstanceContainer->SetStaticMesh(Mesh);
+	FoliageInstanceContainer->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Overlap);
+	FoliageInstanceContainer->SetCollisionObjectType(ECollisionChannel::ECC_WorldDynamic);
+	FoliageInstanceContainer->SetHiddenInGame(true);
+	FoliageInstanceContainer->SetupAttachment(GetRootComponent(), TEXT("FoliageInstanceContainer"));
+}
+
+void AConvertFoliageInstanceContainer::AddInstanceFromFoliageType(UFoliageType* InFoliageType)
+{
+	TArray<FTransform> Transforms;
+	UFoliageConverter::GetAllInstancesTransfrom(InFoliageType, Transforms);
+	UMaterial* Material = LoadObject<UMaterial>(
+	nullptr, TEXT("/Engine/EngineMaterials/EditorBrushMaterial.EditorBrushMaterial"));
+	FoliageInstanceContainer->SetStaticMesh(UFoliageConverter::GetStaticMesh(InFoliageType));
+	FoliageInstanceContainer->AddInstances(Transforms, false, true, false);
+	FoliageInstanceContainer->SetMaterial(0, Material);
+
+	for (TActorIterator<AInstancedFoliageActor> It(GWorld); It; ++It)
+	{
+		AInstancedFoliageActor* IFA = (*It);
+		IFA->RemoveFoliageType(&InFoliageType, 1);
+	}
+}
+
+void AConvertFoliageInstanceContainer::ConvertInstanceToFoliage(UFoliageType* InFoliageType)
+{
+	int32 InstanceCount = FoliageInstanceContainer->GetInstanceCount();
+	if (InstanceCount == 0)
+		return;
+	
+	TArray<FTransform> Transforms;
+	Transforms.Reserve(InstanceCount);
+	for (int32 i = 0; i < InstanceCount; i++)
+	{
+		FTransform Transform;
+		FoliageInstanceContainer->GetInstanceTransform(i, Transform, true);
+		Transforms.Add(Transform);
+	}
+
+	TMap<AInstancedFoliageActor*, TArray<const FFoliageInstance*>> InstancesToAdd;
+	TArray<FFoliageInstance> FoliageInstances;
+	FoliageInstances.Reserve(Transforms.Num()); // Reserve 
+
+	for (const FTransform& InstanceTransfo : Transforms)
+	{
+		AInstancedFoliageActor* IFA = AInstancedFoliageActor::Get(GWorld, true, GWorld->PersistentLevel, InstanceTransfo.GetLocation());
+		FFoliageInstance FoliageInstance;
+		FoliageInstance.Location = InstanceTransfo.GetLocation();
+		FoliageInstance.Rotation = InstanceTransfo.GetRotation().Rotator();
+		FoliageInstance.DrawScale3D = (FVector3f)InstanceTransfo.GetScale3D();
+
+		FoliageInstances.Add(FoliageInstance);
+		InstancesToAdd.FindOrAdd(IFA).Add(&FoliageInstances[FoliageInstances.Num() - 1]);
+	}
+
+	for (const auto& Pair : InstancesToAdd)
+	{
+		FFoliageInfo* TypeInfo = nullptr;
+		if (UFoliageType* FoliageType = Pair.Key->AddFoliageType(InFoliageType, &TypeInfo))
+		{
+			TypeInfo->AddInstances(FoliageType, Pair.Value);
+		}
+	}
+	
+	FoliageInstanceContainer->ClearInstances();
+	UFoliageConverter::RefreshFoliage(InFoliageType);
+}
+

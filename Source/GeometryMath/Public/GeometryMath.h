@@ -3,7 +3,7 @@
 #include "CoreMinimal.h"
 #include "Modules/ModuleManager.h"
 
-class FWFCModule : public IModuleInterface
+class FGeometryMathModule : public IModuleInterface
 {
 public:
     virtual void StartupModule() override;

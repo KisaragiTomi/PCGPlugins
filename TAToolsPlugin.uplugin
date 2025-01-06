@@ -17,21 +17,18 @@
   "EnabledByDefault": true,
   "Modules": [
     {
-      "Name": "TAToolsPlugin",
-      "Type": "Runtime",
-      "LoadingPhase": "PostConfigInit",
-      "WhitelistPlatforms": [
-        "Win64"
-      ]
-    },
-    {
       "Name": "FoliageCluster",
       "Type": "Editor",
       "LoadingPhase": "Default"
     },
     {
-      "Name": "WFC",
-      "Type": "Runtime",
+      "Name": "GeometryMath",
+      "Type": "Editor",
+      "LoadingPhase": "Default"
+    },
+    {
+      "Name": "GeometryScriptExtra",
+      "Type": "Editor",
       "LoadingPhase": "Default"
     }
   ],
@@ -44,11 +41,11 @@
       ]
     },
     {
-      "Name": "WaveFunctionCollapse",
+      "Name": "ModelingToolsEditorMode",
       "Enabled": true
     },
     {
-      "Name": "ModelingToolsEditorMode",
+      "Name": "GeometryScripting",
       "Enabled": true
     }
   ]

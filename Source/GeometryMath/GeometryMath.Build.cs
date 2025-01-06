@@ -1,8 +1,8 @@
 ﻿using UnrealBuildTool;
 
-public class WFC : ModuleRules
+public class GeometryMath : ModuleRules
 {
-    public WFC(ReadOnlyTargetRules Target) : base(Target)
+    public GeometryMath(ReadOnlyTargetRules Target) : base(Target)
     {
         PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 
@@ -10,8 +10,6 @@ public class WFC : ModuleRules
             new string[]
             {
                 "Core", 
-                "UnrealEd",
-                "WaveFunctionCollapse",
             }
         );
 

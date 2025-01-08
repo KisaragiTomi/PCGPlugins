@@ -38,9 +38,9 @@
 #include "AssetUtils/CreateStaticMeshUtil.h"
 #include "AssetUtils/CreateSkeletalMeshUtil.h"
 #include "AssetUtils/CreateTexture2DUtil.h"
-//#include "Operations/ExtrudeMesh.h"
 #include "PackageTools.h"
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "CleaningOps/HoleFillOp.h"
 #include "DynamicMesh/MeshNormals.h"
 #include "Subsystems/EditorActorSubsystem.h"
 #include "GeometryScript/MeshAssetFunctions.h"
@@ -351,7 +351,7 @@ TArray<FGeometryScriptPolyPath> UGeometryGenerate::SpaceColonization(TArray<FTra
 
 UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FBox Bounds, bool Result, int32 ExtentPlus, float VoxelSize)
 {
-	float LandscapeMeshExtrude = 200;
+	float LandscapeMeshExtrude = 100;
 	FVector Center = Bounds.GetCenter();
 	FVector Extent = Bounds.GetExtent();
 	
@@ -404,7 +404,6 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 				{
 					InstanceDynamicMesh->EditMesh([&](FDynamicMesh3& EditMesh)
 					{
-						//MeshTransforms::ApplyTransform(EditMesh, (FTransformSRT3d)Transform, bFixOrientationForNegativeScale);
 						FTransformSRT3d XForm(TransformCenter);
 						FMeshIndexMappings TmpMappings;
 						FDynamicMeshEditor Editor(&AppendToMesh);
@@ -449,18 +448,17 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 	}
 	
 	//CreateBoundaryMesh
-	OutMesh = FixUnClosedBoundary(OutMesh, true, true, LandscapeMeshExtrude);
+	UGeometryGenerate::ExtrudeUnclosedBoundary(OutMesh, LandscapeMeshExtrude);
 
 	//TODO Adapting to situations where objects are very far from the Landscape
 	//CreateLandscapeMesh
 	UDynamicMesh* LandscapePlaneMesh = NewObject<UDynamicMesh>(); 
-	LandscapePlaneMesh = ULandscapeExtra::CreateProjectPlane(LandscapePlaneMesh, Center, Extent * 1.1, ExtentPlus);
-	
-	UDynamicMesh* BoundaryMesh = FixUnClosedBoundary(LandscapePlaneMesh, false, false, LandscapeMeshExtrude);
+	ULandscapeExtra::CreateProjectPlane(LandscapePlaneMesh, Center, Extent * 1.1, ExtentPlus);
+	UDynamicMesh* BoundaryMesh = FixUnclosedBoundary(LandscapePlaneMesh, LandscapeMeshExtrude, false, false);
 	FGeometryScriptAppendMeshOptions AppendOptions;
-	OutMesh =  UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutMesh, LandscapePlaneMesh, FTransform(FVector(0, 0, -LandscapeMeshExtrude)), false, AppendOptions, nullptr);
-	OutMesh =  UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutMesh, LandscapePlaneMesh, FTransform::Identity, false, AppendOptions, nullptr);
-	OutMesh =  UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutMesh, BoundaryMesh, FTransform::Identity, false, AppendOptions, nullptr);
+	UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutMesh, LandscapePlaneMesh, FTransform(FVector(0, 0, -LandscapeMeshExtrude)));
+	UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutMesh, LandscapePlaneMesh, FTransform::Identity);
+	UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutMesh, BoundaryMesh, FTransform::Identity);
 	
 	if (!Result)
 	{
@@ -493,7 +491,175 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 	return OutMesh;
 }
 
-UDynamicMesh* UGeometryGenerate::FixUnClosedBoundary(UDynamicMesh* FixMesh, bool ProjectToLandscape, bool AppendMesh, float ProjectOffset)
+UDynamicMesh* UGeometryGenerate::ExtrudeUnclosedBoundary(UDynamicMesh* FixMesh, float Offset, bool AppendMesh)
+{
+	FGeometryScriptMeshSelection Selection;
+	UGeometryScriptLibrary_MeshSelectionFunctions::CreateSelectAllMeshSelection(FixMesh, Selection, EGeometryScriptMeshSelectionType::Triangles);
+
+	TArray<FGeometryScriptIndexList> IndexLoops;
+	TArray<FGeometryScriptPolyPath> PathLoops;
+	int32 NumLoops = 0;
+	bool bFoundErrors = false;
+	UGeometryScriptLibrary_MeshSelectionQueryFunctions::GetMeshSelectionBoundaryLoops(FixMesh, Selection,IndexLoops, PathLoops, NumLoops, bFoundErrors, nullptr);
+
+	int32 LoopNum = IndexLoops.Num();
+	FGeometryScriptPrimitiveOptions PrimitiveOptions;
+	FDynamicMesh3 BoundaryMeshCombine;
+	UDynamicMesh* FillFanMeshCombine = NewObject<UDynamicMesh>();
+	for (int32 i = 0; i < LoopNum; i++)
+	{
+		FGeometryScriptPolyPath Pathloop = PathLoops[i];
+		FGeometryScriptIndexList IndexLoop = IndexLoops[i];
+		TArray<FVector> Vertices = *Pathloop.Path;
+		TArray<FVector> Tangents;
+		TArray<int32> LoopVertexNumber = *IndexLoop.List;
+
+		Tangents.Reserve(Vertices.Num());
+		for (int32 j = 0; j < Vertices.Num(); j++)
+		{
+			FVector Tangent = UE::Geometry::CurveUtil::Tangent<double, FVector>(Vertices, j);
+			Tangents.Add(Tangent);
+		}
+
+		UDynamicMesh* BoundaryMesh = NewObject<UDynamicMesh>();
+
+		TArray<FTransform> PathTransforms;
+		PathTransforms.Reserve(Vertices.Num());
+		TArray<float> PathTexParamV;
+		PathTexParamV.Reserve(Vertices.Num());
+		for (FVector Vertece : Vertices)
+		{
+			FTransform Transform(Vertece);
+			PathTransforms.Add(Transform);
+			PathTexParamV.Add(0);
+		}
+		PathTexParamV.Add(0);
+		TArray<FVector2D> PolylineVertices;
+		PolylineVertices.Add(FVector2D(0, 0));
+		PolylineVertices.Add(FVector2D(0, 0));
+		TArray<float> PolylineTexParamU;
+		PolylineTexParamU.Add(0);
+		PolylineTexParamU.Add(1);
+
+		UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendSweepPolyline(
+			BoundaryMesh, PrimitiveOptions, FTransform::Identity, PolylineVertices, PathTransforms, PolylineTexParamU,
+			PathTexParamV, true, 1, 1, 0, nullptr);
+
+		UDynamicMesh* FillFanMesh = NewObject<UDynamicMesh>();
+		
+		FixMesh->EditMesh([&](FDynamicMesh3& FixEditMesh)
+		{
+			BoundaryMesh->EditMesh([&](FDynamicMesh3& EditMesh)
+			{
+				int32 VertexCount = EditMesh.VertexCount() / 2;
+				FMeshNormals Normals(&FixEditMesh);
+				Normals.ComputeVertexNormals();
+				TArray<FVector> NormalArray = Normals.GetNormals();
+				
+				for (int i = 0; i < VertexCount; i++)
+				{
+					int32 TarId = i * 2 + 1;
+					if (EditMesh.IsVertex(TarId))
+					{
+						FVector Normal = NormalArray[LoopVertexNumber[i]];
+						FVector Tangent = Tangents[i];
+						FVector Dir = FVector::CrossProduct(Tangent, Normal);
+						FVector BoundaryLocation = EditMesh.GetVertex(TarId);
+						BoundaryLocation -= Normal * Offset;
+						
+						FVector& VertexLocation = Vertices[i];
+						VertexLocation -= Normal * Offset;
+						EditMesh.SetVertex(TarId, BoundaryLocation);
+					}
+				}
+
+				FMeshIndexMappings TmpMappings;
+				FDynamicMeshEditor Editor = nullptr;
+				if (AppendMesh)
+				{
+					Editor = FDynamicMeshEditor(&FixEditMesh);
+				}
+				else
+				{
+					Editor = FDynamicMeshEditor(&BoundaryMeshCombine);
+				}
+
+				FTransform XForm = FTransform::Identity;
+
+				Editor.AppendMesh(&EditMesh, TmpMappings,
+				                  [&](int, const FVector3d& Position) { return XForm.TransformPosition(Position); });
+			}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+		}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+		
+		UGeometryGenerate::FillLine(FillFanMesh, Vertices);
+		UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(FixMesh, FillFanMesh, FTransform::Identity);
+		UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(FillFanMeshCombine, FillFanMesh, FTransform::Identity);
+	}
+	if (!AppendMesh)
+	{
+		UDynamicMesh* MeshCombineOut = NewObject<UDynamicMesh>();
+		MeshCombineOut->SetMesh(MoveTemp(BoundaryMeshCombine));
+		UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(MeshCombineOut, FillFanMeshCombine, FTransform::Identity);
+		return MeshCombineOut;
+	}
+	
+	return FixMesh;
+}
+
+UDynamicMesh* UGeometryGenerate::FillLine(UDynamicMesh* TargetMesh, TArray<FVector> VertexLoop)
+{
+	bool Success = true;
+	UDynamicMesh* BoundaryMeshCombineOut = NewObject<UDynamicMesh>();
+	BoundaryMeshCombineOut->Reset();
+	FDynamicMesh3 CopyMesh;
+	BoundaryMeshCombineOut->EditMesh([&](FDynamicMesh3& EditMesh)
+	{
+		int32 VertexCount = VertexLoop.Num();
+		for (int32 i = 0; i < VertexCount; i++)
+		{
+			EditMesh.AppendVertex(VertexLoop[i]);
+		}
+		FVector3d c = FVector3d::Zero();
+		for (int i = 0; i < VertexLoop.Num(); ++i)
+		{
+			c += VertexLoop[i];
+		}
+		c *= 1.0 / VertexLoop.Num();
+		// add centroid vtx
+		int32 NewVertex = EditMesh.AppendVertex(c);
+		
+		//FDynamicMeshEditor Editor(EditMesh);
+		FDynamicMeshEditResult AddFanResult;
+		int N = VertexLoop.Num();
+		AddFanResult.NewTriangles.Reserve(N);
+
+		int i = 0;
+		for (i = 0; i < N; ++i)
+		{
+			int A = i;
+			int B = (i + 1) % N;
+
+			FIndex3i NewT(NewVertex, B, A);
+			int NewTID = EditMesh.AppendTriangle(NewT, 0);
+			if (NewTID < 0)
+			{
+				Success = false;
+			}
+
+			AddFanResult.NewTriangles.Add(NewTID);
+		}
+		CopyMesh = EditMesh;
+	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+
+	if (Success)
+	{
+		TargetMesh->SetMesh(MoveTemp(CopyMesh));
+		return TargetMesh;
+	}
+	return nullptr;
+}
+
+UDynamicMesh* UGeometryGenerate::FixUnclosedBoundary(UDynamicMesh* FixMesh, float ProjectOffset, bool ProjectToLandscape, bool AppendMesh)
 {
 	FGeometryScriptMeshSelection Selection;
 	UGeometryScriptLibrary_MeshSelectionFunctions::CreateSelectAllMeshSelection(FixMesh, Selection, EGeometryScriptMeshSelectionType::Triangles);
@@ -662,7 +828,7 @@ UDynamicMesh* UGeometryGenerate::VoxelMergeMeshs(UDynamicMesh* TargetMesh, float
 		FDynamicMesh3 ConvertlMesh;
 		FMeshDescriptionToDynamicMesh Converter;
 		Converter.Convert(&MergedMeshesDescription, ConvertlMesh);
-
+		
 		EditMesh.Copy(ConvertlMesh);
 		
 	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
@@ -682,11 +848,6 @@ UDynamicMesh* UGeometryGenerate::BlurVertexNormals(UDynamicMesh* TargetMesh, int
 	FVector3f normaltestaffter;
 	TargetMesh->EditMesh([&](FDynamicMesh3& EditMesh) 
 	{
-		normaltestpre = EditMesh.GetVertexNormal(1);
-		FMeshNormals MeshNormals(&EditMesh);
-		MeshNormals.RecomputeOverlayNormals(EditMesh.Attributes()->PrimaryNormals(), CalculateOptions.bAreaWeighted, CalculateOptions.bAngleWeighted);
-		MeshNormals.CopyToVertexNormals(&EditMesh, false);
-		
 		FDynamicMeshNormalOverlay* Normals = EditMesh.Attributes()->PrimaryNormals();
 	
 		if (Normals->ElementCount() > 0)
@@ -714,9 +875,70 @@ UDynamicMesh* UGeometryGenerate::BlurVertexNormals(UDynamicMesh* TargetMesh, int
 			
 			BlurOp.SmoothOverlay(Normals, NormalsToSmooth);
 		}
-		normaltestaffter = EditMesh.GetVertexNormal(1);
+		
 	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+	
+	UGeometryGenerate::CreateVertexNormals(TargetMesh);
+	
+	return TargetMesh;
+}
 
+UDynamicMesh* UGeometryGenerate::GetVertexNormalOverlay(UDynamicMesh* TargetMesh)
+{
+	return TargetMesh;
+}
+
+UDynamicMesh* UGeometryGenerate::CreateVertexNormals(UDynamicMesh* TargetMesh)
+{
+	TArray<int32> Test;
+	TArray<FVector> NormalsTemp;
+	FVector3f Test0;
+	FVector3f Test1;
+	FVector3f Test2;
+	FVector3f Test3;
+	TArray<FVector3f> NormalsTemp2;
+	TargetMesh->EditMesh([&](FDynamicMesh3& EditMesh) 
+	{
+		if (EditMesh.VertexCount() > 0)
+		{
+			if (EditMesh.HasVertexNormals() == false)
+			{
+				EditMesh.EnableVertexNormals(FVector3f::UpVector);
+			}
+			FMeshNormals Normals(&EditMesh);
+			Normals.ComputeVertexNormals();
+			Normals.CopyToVertexNormals(&EditMesh, false);
+			NormalsTemp = Normals.GetNormals();
+			for (int32 i = 0; i < NormalsTemp.Num(); i++)
+			{
+				FVector3f Normal = FVector3f(NormalsTemp[i].X, NormalsTemp[i].Y, NormalsTemp[i].Z);
+				EditMesh.SetVertexNormal(i, Normal);
+				NormalsTemp2.Add(EditMesh.GetVertexNormal(i));
+			}
+			Test0 = EditMesh.GetVertexNormal(0);
+			Test1 = EditMesh.GetVertexNormal(1);
+			// for (int32 i = 0; i < EditMesh.VertexCount(); i++)
+			// {
+			// 	Test.Add(i);
+			// }
+			// FDynamicMeshNormalOverlay* Normals = EditMesh.Attributes()->PrimaryNormals();
+			// int32 TriCount = EditMesh.TriangleCount();
+			// for (int32 TriIndex = 0; TriIndex < TriCount; ++TriIndex)
+			// {
+			// 	FIndex3i TVid =  Normals->GetTriangle(TriIndex);
+			// 	for (int32 i = 0; i < 3; ++i)
+			// 	{
+			// 		
+			// 		FVector3f Normal = Normals->GetElement(TVid[i]);
+			// 		EditMesh.SetVertexNormal(TVid[i], Normal);
+			// 	}
+			
+			Test2 = EditMesh.GetVertexNormal(2);
+			Test3 = EditMesh.GetVertexNormal(3);
+		}
+
+	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+	
 	return TargetMesh;
 }
 
@@ -751,7 +973,7 @@ UStaticMesh* UGeometryGenerate::CreateStaticMeshAsset(UDynamicMesh* TargetMesh, 
 	return NewStaticMesh;
 }
 
-FVector UGeometryGenerate::Test()
+FVector UGeometryGenerate::TestViewPosition()
 {
 	FLevelEditorViewportClient* SelectedViewport = NULL;
 

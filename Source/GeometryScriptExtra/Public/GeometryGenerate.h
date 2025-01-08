@@ -63,7 +63,7 @@ public:
 	static UDynamicMesh* VDBMeshFromActors(TArray<AActor*> In_Actors, FBox Bounds, bool Result, int32 ExtentPlus = 3, float VoxelSize = 10);
 
 	UFUNCTION(BlueprintCallable, Category = Generate)
-	static UDynamicMesh* FixUnClosedBoundary(UDynamicMesh* FixMesh, bool ProjectToLandscape = true, bool AppendMesh = true, float ProjectOffset = 50);
+	static UDynamicMesh* FixUnclosedBoundary(UDynamicMesh* FixMesh, float ProjectOffset = 100, bool ProjectToLandscape = true, bool AppendMesh = true);
 
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static UDynamicMesh* VoxelMergeMeshs(UDynamicMesh* TargetMesh, float VoxelSize = 10);
@@ -72,13 +72,22 @@ public:
 	static UDynamicMesh* BlurVertexNormals(UDynamicMesh* TargetMesh, int32 Iteration = 5, bool RecomputeNormals = true);
 
 	UFUNCTION(BlueprintCallable, Category = Generate)
-	static UStaticMesh* CreateStaticMeshAsset(UDynamicMesh* TargetMesh, FString AssetPathAndName, TArray<UMaterialInterface*> Materials);
-	
-
-
+	static UDynamicMesh* CreateVertexNormals(UDynamicMesh* TargetMesh);
 	
 	UFUNCTION(BlueprintCallable, Category = Generate)
-	static FVector Test();
+	static UDynamicMesh* GetVertexNormalOverlay(UDynamicMesh* TargetMesh);
+	
+	UFUNCTION(BlueprintCallable, Category = Generate)
+	static UStaticMesh* CreateStaticMeshAsset(UDynamicMesh* TargetMesh, FString AssetPathAndName, TArray<UMaterialInterface*> Materials);
+
+	UFUNCTION(BlueprintCallable, Category = Generate)
+	static UDynamicMesh* ExtrudeUnclosedBoundary(UDynamicMesh* FixMesh, float Offset = 100, bool AppendMesh = true);
+	
+	UFUNCTION(BlueprintCallable, Category = Generate)
+	static UDynamicMesh* FillLine(UDynamicMesh* TargetMesh, TArray<FVector> VertexLoop);
+	
+	UFUNCTION(BlueprintCallable, Category = Generate)
+	static FVector TestViewPosition();
 	// UFUNCTION(BlueprintCallable, Category = Generate)
 	// static UDynamicMesh* SpaceColonizationMesh(UDynamicMesh* TargetMesh, TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, int32 Iterations =
 	// 									   50, int32 Activetime = 20, float Ranggrow = 0.5, float Seed = 0.2);
@@ -87,6 +96,8 @@ public:
 	static TArray<FGeometryScriptPolyPath> SpaceColonization(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, int32 Iterations =
 		                                       50, int32 Activetime = 20,  int32 BackGrowCount = 8, float Ranggrow = 0.5, float Seed = 0.2, float BackGrowRange = 0.8);
 };
+
+
 
 USTRUCT()
 struct FSpaceColonizationAttribute

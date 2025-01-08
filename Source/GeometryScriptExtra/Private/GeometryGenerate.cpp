@@ -371,7 +371,6 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 	FTransform TransformCenter = FTransform::Identity;
 	for (UStaticMeshComponent* AppendMeshComponent : AppendMeshComponents)
 	{
-		//FTransform ComponentTransform = AppendMeshComponent->GetComponentToWorld();
 		if (Cast<UInstancedStaticMeshComponent>(AppendMeshComponent))
 		{
 			UInstancedStaticMeshComponent* Instances = Cast<UInstancedStaticMeshComponent>(AppendMeshComponent);
@@ -430,9 +429,7 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 		FTransform LocalToWorld;
 		bool bSuccess = UE::Conversion::SceneComponentToDynamicMesh(AppendMeshComponent, ToMeshOptions, true, CopyMesh, LocalToWorld, ErrorMessage);
 		if (!bSuccess)
-		{
 			continue;
-		}
 		
 		OutMesh->EditMesh([&](FDynamicMesh3& AppendToMesh)
 		{
@@ -455,15 +452,12 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 	UDynamicMesh* LandscapePlaneMesh = NewObject<UDynamicMesh>(); 
 	ULandscapeExtra::CreateProjectPlane(LandscapePlaneMesh, Center, Extent * 1.1, ExtentPlus);
 	UDynamicMesh* BoundaryMesh = FixUnclosedBoundary(LandscapePlaneMesh, LandscapeMeshExtrude, false, false);
-	FGeometryScriptAppendMeshOptions AppendOptions;
 	UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutMesh, LandscapePlaneMesh, FTransform(FVector(0, 0, -LandscapeMeshExtrude)));
 	UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutMesh, LandscapePlaneMesh, FTransform::Identity);
 	UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutMesh, BoundaryMesh, FTransform::Identity);
 	
 	if (!Result)
-	{
 		return OutMesh;
-	}
 	
 	OutMesh = VoxelMergeMeshs(OutMesh , VoxelSize);
 	
@@ -546,22 +540,18 @@ UDynamicMesh* UGeometryGenerate::ExtrudeUnclosedBoundary(UDynamicMesh* FixMesh, 
 			PathTexParamV, true, 1, 1, 0, nullptr);
 
 		UDynamicMesh* FillFanMesh = NewObject<UDynamicMesh>();
-		
+		UGeometryGenerate::CreateVertexNormalFromOverlay(FixMesh);
 		FixMesh->EditMesh([&](FDynamicMesh3& FixEditMesh)
 		{
 			BoundaryMesh->EditMesh([&](FDynamicMesh3& EditMesh)
 			{
 				int32 VertexCount = EditMesh.VertexCount() / 2;
-				FMeshNormals Normals(&FixEditMesh);
-				Normals.ComputeVertexNormals();
-				TArray<FVector> NormalArray = Normals.GetNormals();
-				
 				for (int i = 0; i < VertexCount; i++)
 				{
 					int32 TarId = i * 2 + 1;
 					if (EditMesh.IsVertex(TarId))
 					{
-						FVector Normal = NormalArray[LoopVertexNumber[i]];
+						FVector Normal = (FVector)FixEditMesh.GetVertexNormal(LoopVertexNumber[i]);
 						FVector Tangent = Tangents[i];
 						FVector Dir = FVector::CrossProduct(Tangent, Normal);
 						FVector BoundaryLocation = EditMesh.GetVertex(TarId);
@@ -628,7 +618,6 @@ UDynamicMesh* UGeometryGenerate::FillLine(UDynamicMesh* TargetMesh, TArray<FVect
 		// add centroid vtx
 		int32 NewVertex = EditMesh.AppendVertex(c);
 		
-		//FDynamicMeshEditor Editor(EditMesh);
 		FDynamicMeshEditResult AddFanResult;
 		int N = VertexLoop.Num();
 		AddFanResult.NewTriangles.Reserve(N);
@@ -883,8 +872,35 @@ UDynamicMesh* UGeometryGenerate::BlurVertexNormals(UDynamicMesh* TargetMesh, int
 	return TargetMesh;
 }
 
-UDynamicMesh* UGeometryGenerate::GetVertexNormalOverlay(UDynamicMesh* TargetMesh)
+UDynamicMesh* UGeometryGenerate::CreateVertexNormalFromOverlay(UDynamicMesh* TargetMesh)
 {
+	TargetMesh->EditMesh([&](FDynamicMesh3& EditMesh) 
+	{
+		if (EditMesh.VertexCount() > 0)
+		{
+			if (EditMesh.HasVertexNormals() == false)
+			{
+				EditMesh.EnableVertexNormals(FVector3f::UpVector);
+			}
+			FDynamicMeshNormalOverlay* Normals = EditMesh.Attributes()->PrimaryNormals();
+			int32 TriCount = EditMesh.TriangleCount();
+			for (int32 TriIndex = 0; TriIndex < TriCount; ++TriIndex)
+			{
+				FIndex3i TVidNormal =  Normals->GetTriangle(TriIndex);
+				FIndex3i TVid = EditMesh.GetTriangle(TriIndex);
+				for (int32 i = 0; i < 3; ++i)
+				{
+					if (TVidNormal[i] < 0 || !EditMesh.IsVertex(TVid[i]))
+						continue;
+					FVector3f PreNormal = EditMesh.GetVertexNormal(TVid[i]);
+					FVector3f Normal = Normals->GetElement(TVidNormal[i]);
+					EditMesh.SetVertexNormal(TVid[i], Normal);
+				}
+			}
+		}
+
+	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+	
 	return TargetMesh;
 }
 

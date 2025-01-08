@@ -75,7 +75,7 @@ public:
 	static UDynamicMesh* CreateVertexNormals(UDynamicMesh* TargetMesh);
 	
 	UFUNCTION(BlueprintCallable, Category = Generate)
-	static UDynamicMesh* GetVertexNormalOverlay(UDynamicMesh* TargetMesh);
+	static UDynamicMesh* CreateVertexNormalFromOverlay(UDynamicMesh* TargetMesh);
 	
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static UStaticMesh* CreateStaticMeshAsset(UDynamicMesh* TargetMesh, FString AssetPathAndName, TArray<UMaterialInterface*> Materials);

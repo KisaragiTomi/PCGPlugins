@@ -5,7 +5,6 @@
 #include "PointFunction.h"
 #include "GeometryScript/MeshBasicEditFunctions.h"
 #include "GeometryScript/MeshNormalsFunctions.h"
-#include "Metadata/PCGMetadataAttributeTraits.h"
 #include "Spatial/MeshAABBTree3.h"
 
 

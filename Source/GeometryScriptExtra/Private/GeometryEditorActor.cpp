@@ -297,18 +297,18 @@ void AVineContainer::VisVine( bool MainVine)
 		int32 VertexCount = (*Line.Path).Num();
 
 		//OffsetVine
-		float VineOffset = 3;
+		float VineOffset = VV.VinesOffset;
 		for (int32 i = 0; i < VertexCount; i++)
 		{
 			FVector NormalSum = FVector::ZeroVector;
 			for (int32 n = 0; n < 6; n++)
 			{
-				float OffsetMax = 50;
+				float OffsetSerchDist = 50;
 				FVector VertexLocation = (*Line.Path)[i];
 				FRandomStream Random(123 * VertexLocation.X * i);
 				const FVector RandomOffset = Random.VRand();
 				FRandomStream RandomDist(.012385 * VertexLocation.X * i);
-				const float RandomOffsetDist = RandomDist.FRand() * OffsetMax;
+				const float RandomOffsetDist = RandomDist.FRand() * OffsetSerchDist;
 				VertexLocation += RandomOffset * RandomOffsetDist;
 				FGeometryScriptTrianglePoint NearestPoint;
 				EGeometryScriptSearchOutcomePins Outcome;
@@ -319,7 +319,7 @@ void AVineContainer::VisVine( bool MainVine)
 					//Sometimes it will Calculates a downward normal it is wrong
 					//FVector Normal = EditMesh.GetTriBaryNormal(NearestPoint.TriangleID, NearestPoint.BaryCoords[0], NearestPoint.BaryCoords[1], NearestPoint.BaryCoords[2]);
 					FVector Normal = EditMesh.GetTriNormal(NearestPoint.TriangleID);
-					NormalSum += Normal * (RandomOffsetDist / OffsetMax);
+					NormalSum += Normal * (RandomOffsetDist / OffsetSerchDist);
 				});
 			}
 			NormalSum.Normalize();
@@ -330,9 +330,7 @@ void AVineContainer::VisVine( bool MainVine)
 		Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
 		Line = UPolyLine::SmoothLine(Line, 1);
 		
-		//GenerateReuslt
-		//TArray<FTransform> Transforms = UPolyLine::ConvertPolyPathToTransforms(Line, true);
-		
+		//CaluclateVineTransforms
 		TArray<FVector> LineVectors = *Line.Path;
 		int32 LineVertexNum = LineVectors.Num();
 		TArray<FTransform> Transforms;
@@ -361,10 +359,8 @@ void AVineContainer::VisVine( bool MainVine)
 				VertexNormal = EditMesh.GetVertexNormal(id[0]);
 				VertexNormal1 = EditMesh.GetVertexNormal(id[1]);
 				VertexNormal2 = EditMesh.GetVertexNormal(id[2]);
-				//const UE::Geometry::TDynamicVector<FVector3f>& normalsR = EditMesh.normal.GetValue();
 				n = FVector3d(NearestPoint.BaryCoords[0] * EditMesh.GetVertexNormal(id[0]) + NearestPoint.BaryCoords[1] * EditMesh.GetVertexNormal(id[1]) + NearestPoint.BaryCoords[2] * EditMesh.GetVertexNormal(id[2]));
 				n.Normalize();
-				//EditMesh.GetTriBaryNormal();
 			});
 			FVector Tangent = UE::Geometry::CurveUtil::Tangent<double, FVector>(LineVectors, i);
 			Transforms.Add(FTransform(FRotationMatrix::MakeFromXZ(Tangent, Normal).Rotator(), LineVectors[i], FVector::OneVector));
@@ -378,6 +374,8 @@ void AVineContainer::VisVine( bool MainVine)
 			float SweepScale = VV.CurveControl->GetUnadjustedLinearColorValue(i / (TransformCount - 1.0)).G;
 			Transform.SetScale3D(FVector::OneVector * SweepScale);
 		}
+
+		//AddMeshToReuslt
 		if (MainVine)
 		{
 			FGeometryScriptPrimitiveOptions PrimitiveOptions;
@@ -397,6 +395,8 @@ void AVineContainer::VisVine( bool MainVine)
 			// 	PlaneMesh, PrimitiveOptions, FTransform::Identity, Line2DTemp, Transforms, false);
 		}
 	}
+	
+	//GenerateReuslt
 	FGeometryScriptAppendMeshOptions AppendOptions;
 	if (MainVine)
 	{
@@ -451,25 +451,20 @@ void AVineContainer::VisVine( bool MainVine)
 		UE::Geometry::FDynamicMeshMaterialAttribute* MaterialIDs = Mesh.Attributes()->GetMaterialID();
 		Mesh.TrianglesItr();
 		int32 TriCount = Mesh.MaxTriangleID();
-		//int32 Test = 1;
 		MaterialIDsTemp.Reserve(TriCount);
 		for (int32 i = 0; i < TriCount; i++)
 		{
 			int32 Test = MaterialIDs->GetValue(i);
-			//MaterialIDs->SetValue(i, 0);
 			MaterialIDsTemp.Add(Test);
 		}
 	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
 
-	int32 Temp = 1;
-
-	FDynamicMesh3 MeshCopy;
-	ContainerMesh->ProcessMesh([&](const FDynamicMesh3& EditMesh)
-	{
-		MeshCopy = EditMesh;
-	});
-
-	//OutMesh->SetMesh(MoveTemp(MeshCopy));
+	// FDynamicMesh3 MeshCopy;
+	// ContainerMesh->ProcessMesh([&](const FDynamicMesh3& EditMesh)
+	// {
+	// 	MeshCopy = EditMesh;
+	// });
+	
 }
 
 inline void AVineContainer::Clean()

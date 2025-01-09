@@ -41,6 +41,8 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
 	float MergeDistMult = 3;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	float VinesOffset = 5;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
 	UCurveLinearColor* CurveControl;
 };
 

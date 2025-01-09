@@ -403,6 +403,24 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 				{
 					InstanceDynamicMesh->EditMesh([&](FDynamicMesh3& EditMesh)
 					{
+						int32 TriCount = EditMesh.TriangleCount();
+						for (int32 i = 0; i < TriCount; i++)
+						{
+							FIndex3i VertexIndexs = EditMesh.GetTriangle(i);
+							bool IsOutSideTriangle = true;
+							TArray<FVector> VertexPositions;
+							VertexPositions.Reserve(3);
+							for (int32 j = 0; j < 3; j++)
+							{
+								FVector Vertex = EditMesh.GetVertex(VertexIndexs[j]);
+								VertexPositions.Add(Vertex);
+							}
+							FBox TriBox(VertexPositions);
+							if (!Bounds.Intersect(TriBox))
+							{
+								EditMesh.RemoveTriangle(i);
+							}
+						}
 						FTransformSRT3d XForm(TransformCenter);
 						FMeshIndexMappings TmpMappings;
 						FDynamicMeshEditor Editor(&AppendToMesh);
@@ -433,6 +451,24 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 		
 		OutMesh->EditMesh([&](FDynamicMesh3& AppendToMesh)
 		{
+			int32 TriCount = CopyMesh.TriangleCount();
+			for (int32 i = 0; i < TriCount; i++)
+			{
+				FIndex3i VertexIndexs = CopyMesh.GetTriangle(i);
+				bool IsOutSideTriangle = true;
+				TArray<FVector> VertexPositions;
+				VertexPositions.Reserve(3);
+				for (int32 j = 0; j < 3; j++)
+				{
+					FVector Vertex = CopyMesh.GetVertex(VertexIndexs[j]);
+					VertexPositions.Add(Vertex);
+				}
+				FBox TriBox(VertexPositions);
+				if (!Bounds.Intersect(TriBox))
+				{
+					CopyMesh.RemoveTriangle(i);
+				}
+			}
 			FTransformSRT3d XForm(TransformCenter);
 			FMeshIndexMappings TmpMappings;
 			FDynamicMeshEditor Editor(&AppendToMesh);

@@ -906,13 +906,6 @@ UDynamicMesh* UGeometryGenerate::CreateVertexNormalFromOverlay(UDynamicMesh* Tar
 
 UDynamicMesh* UGeometryGenerate::CreateVertexNormals(UDynamicMesh* TargetMesh)
 {
-	TArray<int32> Test;
-	TArray<FVector> NormalsTemp;
-	FVector3f Test0;
-	FVector3f Test1;
-	FVector3f Test2;
-	FVector3f Test3;
-	TArray<FVector3f> NormalsTemp2;
 	TargetMesh->EditMesh([&](FDynamicMesh3& EditMesh) 
 	{
 		if (EditMesh.VertexCount() > 0)
@@ -924,33 +917,6 @@ UDynamicMesh* UGeometryGenerate::CreateVertexNormals(UDynamicMesh* TargetMesh)
 			FMeshNormals Normals(&EditMesh);
 			Normals.ComputeVertexNormals();
 			Normals.CopyToVertexNormals(&EditMesh, false);
-			NormalsTemp = Normals.GetNormals();
-			for (int32 i = 0; i < NormalsTemp.Num(); i++)
-			{
-				FVector3f Normal = FVector3f(NormalsTemp[i].X, NormalsTemp[i].Y, NormalsTemp[i].Z);
-				EditMesh.SetVertexNormal(i, Normal);
-				NormalsTemp2.Add(EditMesh.GetVertexNormal(i));
-			}
-			Test0 = EditMesh.GetVertexNormal(0);
-			Test1 = EditMesh.GetVertexNormal(1);
-			// for (int32 i = 0; i < EditMesh.VertexCount(); i++)
-			// {
-			// 	Test.Add(i);
-			// }
-			// FDynamicMeshNormalOverlay* Normals = EditMesh.Attributes()->PrimaryNormals();
-			// int32 TriCount = EditMesh.TriangleCount();
-			// for (int32 TriIndex = 0; TriIndex < TriCount; ++TriIndex)
-			// {
-			// 	FIndex3i TVid =  Normals->GetTriangle(TriIndex);
-			// 	for (int32 i = 0; i < 3; ++i)
-			// 	{
-			// 		
-			// 		FVector3f Normal = Normals->GetElement(TVid[i]);
-			// 		EditMesh.SetVertexNormal(TVid[i], Normal);
-			// 	}
-			
-			Test2 = EditMesh.GetVertexNormal(2);
-			Test3 = EditMesh.GetVertexNormal(3);
 		}
 
 	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);

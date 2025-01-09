@@ -128,6 +128,7 @@ void UGeometryGenerate::GenerateVines(FSpaceColonizationOptions SC, bool Result,
 	}
 	
 	FBox Bounds(BBoxVectors);
+	Bounds = Bounds.ExpandBy(50);
 	FVector Center = Bounds.GetCenter();
 	FVector Extent = Bounds.GetExtent();
 	TArray<TEnumAsByte<EObjectTypeQuery>> ObjectTypes = {

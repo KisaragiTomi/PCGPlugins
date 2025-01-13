@@ -18,6 +18,52 @@
 /**
  * 
  */
+DECLARE_STATS_GROUP(TEXT("TestTime"), STATGROUP_TestTime, STATCAT_Advanced);
+DECLARE_CYCLE_STAT(TEXT("SCTime"), STAT_SpaceColonization, STATGROUP_TestTime);
+DECLARE_CYCLE_STAT(TEXT("SCTimeMultThread"), STAT_SpaceColonizationMultThread, STATGROUP_TestTime);
+
+DECLARE_CYCLE_STAT(TEXT("SCConverteMesh"), STAT_SCConvertMesh, STATGROUP_TestTime);
+DECLARE_CYCLE_STAT(TEXT("SCConverteMeshMultThread"), STAT_SCConvertMeshMultThread, STATGROUP_TestTime);
+namespace ProcessAsync
+{
+	template<typename T>
+	TArray<T> ProcessAsync(int32 NumPt, int32 ThreadPointNum, TFunction<T(int32)> Func)
+	{
+		int32 NumThreads = FMath::Min(NumPt / ThreadPointNum + 1, FPlatformMisc::NumberOfCoresIncludingHyperthreads() - 1LL);
+		TArray<TFuture<TArray<T>>> Threads;
+		Threads.Reserve(NumThreads);
+		const int32 Batch = NumPt / NumThreads + 1;
+		for (int32 t = 0; t < NumThreads; ++t)
+		{
+			const int64 StartIdx = Batch * t;
+			const int64 EndIdx = t == NumThreads - 1 ? NumPt : StartIdx + Batch;
+			Threads.Emplace(Async(EAsyncExecution::TaskGraph, [StartIdx, EndIdx, Func]
+			{
+				TArray<T> ResultsPerTask;
+				ResultsPerTask.Reserve(EndIdx - StartIdx);
+				for (int64 p = StartIdx; p < EndIdx; ++p)
+				{
+					T Results = Func(p);
+					ResultsPerTask.Add(Results);
+				}
+				//FPlatformProcess::Sleep(10);
+				return ResultsPerTask;
+			}));
+			
+			float Time = FPlatformTime::Seconds();
+			UE_LOG(LogTemp, Log, TEXT("The float value is: %f"), Time);
+		}
+		TArray<T> Results;
+		Results.Reserve(NumThreads);
+		for (const TFuture<TArray<T>>& ThreadResult : Threads)
+		{
+			ThreadResult.Wait();
+			TArray<T> ResultsPerTask =  ThreadResult.Get();
+			Results.Append(ResultsPerTask);
+		}
+		return Results;
+	}
+}
 
 UENUM(BlueprintType)
 enum EOutMeshType : int
@@ -57,10 +103,10 @@ class GEOMETRYSCRIPTEXTRA_API UGeometryGenerate : public UBlueprintFunctionLibra
 	GENERATED_BODY()
 public:
 	UFUNCTION(BlueprintCallable, Category = Generate)
-	static void GenerateVines(FSpaceColonizationOptions SC, bool Result, bool OutDebugMesh);
+	static void GenerateVines(FSpaceColonizationOptions SC, bool Result = true, bool OutDebugMesh = false, bool MultThread = false);
 	
 	UFUNCTION(BlueprintCallable, Category = Generate)
-	static UDynamicMesh* VDBMeshFromActors(TArray<AActor*> In_Actors, FBox Bounds, bool Result, int32 ExtentPlus = 3, float VoxelSize = 10);
+	static UDynamicMesh* VDBMeshFromActors(TArray<AActor*> In_Actors, FBox Bounds, bool Result, int32 ExtentPlus = 3, float VoxelSize = 10, bool MultThread = true);
 
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static UDynamicMesh* FixUnclosedBoundary(UDynamicMesh* FixMesh, float ProjectOffset = 100, bool ProjectToLandscape = true, bool AppendMesh = true);
@@ -88,13 +134,10 @@ public:
 	
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static FVector TestViewPosition();
-	// UFUNCTION(BlueprintCallable, Category = Generate)
-	// static UDynamicMesh* SpaceColonizationMesh(UDynamicMesh* TargetMesh, TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, int32 Iterations =
-	// 									   50, int32 Activetime = 20, float Ranggrow = 0.5, float Seed = 0.2);
 
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static TArray<FGeometryScriptPolyPath> SpaceColonization(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, int32 Iterations =
-		                                       50, int32 Activetime = 20,  int32 BackGrowCount = 8, float Ranggrow = 0.5, float Seed = 0.2, float BackGrowRange = 0.8);
+		                                       50, int32 Activetime = 20,  int32 BackGrowCount = 8, float Ranggrow = 0.5, float Seed = 0.2, float BackGrowRange = 0.8, bool MultThread = true);
 };
 
 
@@ -130,6 +173,7 @@ public:
 	FVector N = FVector::ZeroVector;
 	UPROPERTY()
 	TArray<int32> Associates;
+
 	
 
 	// FORCEINLINE bool operator==(const FMeshData& Other) const

@@ -368,6 +368,9 @@ void AVineContainer::VisVine( bool MainVine)
 		}
 		
 		int32 TransformCount = Transforms.Num();
+		if (TransformCount < 3)
+			continue;
+		
 		for (int32 i = 0; i < TransformCount; i++)
 		{
 			FTransform& Transform = Transforms[i];
@@ -414,10 +417,10 @@ void AVineContainer::VisVine( bool MainVine)
 		UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(ContainerMesh, TubeMesh, FTransform::Identity, false,
 												  AppendOptions);
 		
-		OutTubeMesh = NewObject<UDynamicMesh>();
-		OutTubeMesh->Reset();
-		UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutTubeMesh, TubeMesh, FTransform::Identity, false,
-																  AppendOptions);
+		// OutTubeMesh = NewObject<UDynamicMesh>();
+		// OutTubeMesh->Reset();
+		// UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutTubeMesh, TubeMesh, FTransform::Identity, false,
+		// 														  AppendOptions);
 	}
 	else
 	{
@@ -429,10 +432,10 @@ void AVineContainer::VisVine( bool MainVine)
 		UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(ContainerMesh, PlaneMesh, FTransform::Identity, false,
 														  AppendOptions);
 
-		OutPlaneMesh = NewObject<UDynamicMesh>();
-		OutPlaneMesh->Reset();
-		UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutPlaneMesh, PlaneMesh, FTransform::Identity, false,
-													  AppendOptions);
+		// OutPlaneMesh = NewObject<UDynamicMesh>();
+		// OutPlaneMesh->Reset();
+		// UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutPlaneMesh, PlaneMesh, FTransform::Identity, false,
+		// 											  AppendOptions);
 		
 		ContainerMesh->EditMesh([&](FDynamicMesh3& Mesh)
 		{

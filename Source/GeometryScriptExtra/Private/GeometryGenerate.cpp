@@ -49,7 +49,7 @@
 using namespace UE::Geometry;
 
 
-void UGeometryGenerate::GenerateVines(FSpaceColonizationOptions SC, bool Result, bool OutDebugMesh)
+void UGeometryGenerate::GenerateVines(FSpaceColonizationOptions SC, bool Result, bool OutDebugMesh, bool MultThread)
 {
 	// FLevelEditorViewportClient* SelectedViewport = NULL;
 	//
@@ -151,7 +151,7 @@ void UGeometryGenerate::GenerateVines(FSpaceColonizationOptions SC, bool Result,
 	if (Container->BVH.Spatial.IsValid() == false || Container->PrefixMesh == nullptr || !Container->
 		CheckActors(MeshActors) || Container->InstanceBound != Bounds)
 	{
-		MeshCombine = VDBMeshFromActors(MeshActors, Bounds, (OutDebugMesh?false:true), SC.ExtentPlus, SC.VoxelSize);
+		MeshCombine = VDBMeshFromActors(MeshActors, Bounds, (OutDebugMesh?false:true), SC.ExtentPlus, SC.VoxelSize, MultThread);
 		MeshCombine = UGeometryScriptLibrary_MeshSpatial::BuildBVHForMesh(MeshCombine, BVH, nullptr);
 		Container->BVH = BVH;
 		Container->PrefixMesh = MeshCombine;
@@ -185,7 +185,7 @@ void UGeometryGenerate::GenerateVines(FSpaceColonizationOptions SC, bool Result,
 	{
 		TArray<FTransform> SCSourceTransform;
 		SCSourceTransform.Add(TubeSourceTransforms[i]);
-		Lines.Append(SpaceColonization(SCSourceTransform, TargetTransforms, SC.Iteration, SC.Activetime, 5, SC.RandGrow, SC.Seed, SC.BackGrowRange));
+		Lines.Append(SpaceColonization(SCSourceTransform, TargetTransforms, SC.Iteration, SC.Activetime, 5, SC.RandGrow, SC.Seed, SC.BackGrowRange, MultThread));
 	}
 	UDynamicMesh* OutMesh = Container->GetDynamicMeshComponent()->GetDynamicMesh();
 	OutMesh->Reset();
@@ -195,18 +195,19 @@ void UGeometryGenerate::GenerateVines(FSpaceColonizationOptions SC, bool Result,
 	Container->VisVine(true);
 
 	//PlaneLines
+	Lines.Reset();
 	for (int32 i = 0; i < PlaneSourceCount; i++)
 	{
 		TArray<FTransform> SCSourceTransform;
 		SCSourceTransform.Add(PlaneSourceTransforms[i]);
-		Lines.Append(SpaceColonization(SCSourceTransform, TargetTransforms, SC.Iteration, SC.Activetime, 12, SC.RandGrow, SC.Seed, SC.BackGrowRange));
+		Lines.Append(SpaceColonization(SCSourceTransform, TargetTransforms, SC.Iteration, SC.Activetime, 12, SC.RandGrow, SC.Seed, SC.BackGrowRange, MultThread));
 	}
 	Container->PlaneLines.Reset();
 	Container->PlaneLines = Lines;
 	Container->VisVine(false);
 }
 
-TArray<FGeometryScriptPolyPath> UGeometryGenerate::SpaceColonization(TArray<FTransform> TubeSourceTransforms, TArray<FTransform> TargetTransforms, int32 Iteration, int32 Activetime, int32 BackGrowCount, float RandGrow, float Seed, float BackGrowRange)
+TArray<FGeometryScriptPolyPath> UGeometryGenerate::SpaceColonization(TArray<FTransform> TubeSourceTransforms, TArray<FTransform> TargetTransforms, int32 Iteration, int32 Activetime, int32 BackGrowCount, float RandGrow, float Seed, float BackGrowRange, bool MultThread)
 {
 	TArray<FGeometryScriptPolyPath> Lines;
 	if (TubeSourceTransforms.Num() == 0 || TargetTransforms.Num() == 0)
@@ -233,84 +234,186 @@ TArray<FGeometryScriptPolyPath> UGeometryGenerate::SpaceColonization(TArray<FTra
 		SCAttributes[Nearpt].Startpt = true;
 		SCAttributes[Nearpt].Startid = Nearpt;
 	}
-
+	
 	//TArray<TArray<FVector>> Lines;
+	
+	//bool MultThread = false;
 	float Infrad = 200;
-	int32 PtNum = TargetLocations.Num();
+	int32 ThreadPointNum = 1;
+	int32 NumPt = TargetLocations.Num();
+	int32 NumThreads = FMath::Min(NumPt / ThreadPointNum + 1, FPlatformMisc::NumberOfCoresIncludingHyperthreads() - 1LL);
+	TArray<TFuture<void>> Threads;
+	Threads.Reserve(NumThreads);
+	const int64 Batch = NumPt / NumThreads + 1;
 	for (int32 i = 0; i < Iteration; i++ )
 	{
-		for (int32 p = 0; p < PtNum; p++ )
+		
+		for (int32 p = 0; p < NumPt; p++ )
 		{
 			SCAttributes[p].Associates.Reset();
 		}
-		for (int32 p = 0; p < PtNum; p++ )
+		if (MultThread)
 		{
-			bool Attractor = SCAttributes[p].Attractor;
-			if (!Attractor)
-				continue;
-			FVector FindLocation = TargetLocations[p];
-			int32 NearPt = UPointFunction::FindNearPointIteration(TargetLocations, FindLocation, [SCAttributes](int32 CurrentIteration)
+			SCOPE_CYCLE_COUNTER(STAT_SpaceColonizationMultThread)
+			TArray<TTuple<int32, int32>> AssociatesCollection =  ProcessAsync::ProcessAsync<TTuple<int32, int32>>(NumPt, ThreadPointNum, [&](const int32 p)
 			{
-				return SCAttributes[CurrentIteration].Attractor == false;
+				TTuple<int32, int32> FindPt;
+				FindPt.Key = -1;
+				bool Attractor = SCAttributes[p].Attractor;
+				if (!Attractor)
+					return FindPt;
+				FVector FindLocation = TargetLocations[p];
+				int32 NearPt = UPointFunction::FindNearPointIteration(TargetLocations, FindLocation, [SCAttributes](int32 CurrentIteration)
+				{
+					return SCAttributes[CurrentIteration].Attractor == false;
+				});
+				if (NearPt == -1)
+					return FindPt;
+							
+				float NearestDist = FVector::Dist(FindLocation, TargetLocations[NearPt]);
+				if (NearestDist * 1.1 < Infrad )
+				{
+					FindPt.Key = NearPt;
+					FindPt.Value = p;
+				}
+				return FindPt;
 			});
-			if (NearPt == -1)
-				continue;
-			
-			float NearestDist = FVector::Dist(FindLocation, TargetLocations[NearPt]);
-			if (NearestDist * 1.1 < Infrad )
+			for (int32 j = 0; j < AssociatesCollection.Num(); j++)
 			{
-				//Infrad = NearestDist * 1.1;
-				SCAttributes[NearPt].Associates.Add(p);
+				if (AssociatesCollection[j].Key == -1)
+					continue;
+				SCAttributes[AssociatesCollection[j].Key].Associates.Add(AssociatesCollection[j].Value);
+			}
+
+			TArray<TTuple<FIndex3i, FVector>> ProcessResult = ProcessAsync::ProcessAsync<TTuple<FIndex3i, FVector>>(NumPt, ThreadPointNum, [&](const int32 p)
+			{
+				TTuple<FIndex3i, FVector> ThreadCalculate;
+				ThreadCalculate.Key = FIndex3i(-1, -1, 0);
+				float Grow = FMath::RandRange(0, 1);
+				if (SCAttributes[p].Attractor == true
+					|| SCAttributes[p].SpawnCount < i - Activetime
+					|| (Grow < RandGrow && i > 10)
+					|| SCAttributes[p].Associates.Num() == 0
+					|| SCAttributes[p].BranchCount > 2)
+					return ThreadCalculate;
+
+				
+				FVector FindLocation = TargetLocations[p];
+				int32 NearPt = UPointFunction::FindNearPointIteration(TargetLocations, FindLocation, [SCAttributes](int32 CurrentIteration)
+				{
+					return SCAttributes[CurrentIteration].Attractor == true;
+				});
+				if (NearPt == -1)
+					return ThreadCalculate;
+							
+				float NearestDist = FVector::Dist(FindLocation, TargetLocations[NearPt]);
+
+				FVector DirSum;
+				for (int32 Index : SCAttributes[p].Associates)
+				{
+					FVector Dir = (TargetLocations[Index] - TargetLocations[p]);
+					//Dir.Normalize();
+					DirSum += Dir;
+				}
+				DirSum.Normalize();
+			
+				ThreadCalculate.Key = FIndex3i(p, NearPt, 1);
+				ThreadCalculate.Value = TargetLocations[p]+ DirSum * NearestDist;
+				
+				return ThreadCalculate;
+			});
+			for (int32 j = 0; j < ProcessResult.Num(); j++)
+			{
+				if (ProcessResult[j].Key.C == 0)
+					continue;
+				int32 p = ProcessResult[j].Key.A;
+				int32 NearPt = ProcessResult[j].Key.B;
+				SCAttributes[p].SpawnCount += 1;
+				TargetLocations[NearPt] = ProcessResult[j].Value;
+				SCAttributes[NearPt].Startid = SCAttributes[p].Startid;
+				SCAttributes[NearPt].SpawnCount = SCAttributes[p].SpawnCount;
+				SCAttributes[NearPt].Attractor = false;
+				SCAttributes[NearPt].End = true;
+				SCAttributes[NearPt].BranchCount = 1;
+				SCAttributes[p].End = false;
+				
+				SCAttributes[NearPt].PrePt = p;
+				SCAttributes[p].NextPt = NearPt;
+				SCAttributes[p].BranchCount += 1;
 			}
 		}
-		
-		for (int32 p = 0; p < PtNum; p++ )
+		else
 		{
-			float Grow = FMath::RandRange(0, 1);
-			if (SCAttributes[p].Attractor == true
-				|| SCAttributes[p].SpawnCount < i - Activetime
-				|| (Grow < RandGrow && i > 10)
-				|| SCAttributes[p].Associates.Num() == 0
-				|| SCAttributes[p].BranchCount > 2)
-				continue;
-			
-			FVector FindLocation = TargetLocations[p];
-			int32 NearPt = UPointFunction::FindNearPointIteration(TargetLocations, FindLocation, [SCAttributes](int32 CurrentIteration)
+			SCOPE_CYCLE_COUNTER(STAT_SpaceColonization)
+			for (int32 p = 0; p < NumPt; p++ )
 			{
-				return SCAttributes[CurrentIteration].Attractor == true;
-			});
-			if (NearPt == -1)
-				continue;
-			
-			float NearestDist = FVector::Dist(FindLocation, TargetLocations[NearPt]);
-
-			FVector DirSum;
-			for (int32 Index : SCAttributes[p].Associates)
-			{
-				FVector Dir = (TargetLocations[Index] - TargetLocations[p]);
-				//Dir.Normalize();
-				DirSum += Dir;
+				bool Attractor = SCAttributes[p].Attractor;
+				if (!Attractor)
+					continue;
+				FVector FindLocation = TargetLocations[p];
+				int32 NearPt = UPointFunction::FindNearPointIteration(TargetLocations, FindLocation, [SCAttributes](int32 CurrentIteration)
+				{
+					return SCAttributes[CurrentIteration].Attractor == false;
+				});
+				if (NearPt == -1)
+					continue;
+				
+				float NearestDist = FVector::Dist(FindLocation, TargetLocations[NearPt]);
+				if (NearestDist * 1.1 < Infrad )
+				{
+					//Infrad = NearestDist * 1.1;
+					SCAttributes[NearPt].Associates.Add(p);
+				}
 			}
-			DirSum.Normalize();
 			
-			SCAttributes[p].SpawnCount += 1;
-			TargetLocations[NearPt] = TargetLocations[p]+ DirSum * NearestDist;
-			SCAttributes[NearPt].Startid = SCAttributes[p].Startid;
-			SCAttributes[NearPt].SpawnCount = SCAttributes[p].SpawnCount;
-			SCAttributes[NearPt].Attractor = false;
-			SCAttributes[NearPt].End = true;
-			SCAttributes[NearPt].BranchCount = 1;
-			SCAttributes[p].End = false;
-			
-			SCAttributes[NearPt].PrePt = p;
-			SCAttributes[p].NextPt = NearPt;
-			SCAttributes[p].BranchCount += 1;
+			for (int32 p = 0; p < NumPt; p++ )
+			{
+				float Grow = FMath::RandRange(0, 1);
+				if (SCAttributes[p].Attractor == true
+					|| SCAttributes[p].SpawnCount < i - Activetime
+					|| (Grow < RandGrow && i > 10)
+					|| SCAttributes[p].Associates.Num() == 0
+					|| SCAttributes[p].BranchCount > 2)
+					continue;
+				
+				FVector FindLocation = TargetLocations[p];
+				int32 NearPt = UPointFunction::FindNearPointIteration(TargetLocations, FindLocation, [SCAttributes](int32 CurrentIteration)
+				{
+					return SCAttributes[CurrentIteration].Attractor == true;
+				});
+				if (NearPt == -1)
+					continue;
+				
+				float NearestDist = FVector::Dist(FindLocation, TargetLocations[NearPt]);
 
+				FVector DirSum;
+				for (int32 Index : SCAttributes[p].Associates)
+				{
+					FVector Dir = (TargetLocations[Index] - TargetLocations[p]);
+					//Dir.Normalize();
+					DirSum += Dir;
+				}
+				DirSum.Normalize();
+				
+				SCAttributes[p].SpawnCount += 1;
+				TargetLocations[NearPt] = TargetLocations[p]+ DirSum * NearestDist;
+				SCAttributes[NearPt].Startid = SCAttributes[p].Startid;
+				SCAttributes[NearPt].SpawnCount = SCAttributes[p].SpawnCount;
+				SCAttributes[NearPt].Attractor = false;
+				SCAttributes[NearPt].End = true;
+				SCAttributes[NearPt].BranchCount = 1;
+				SCAttributes[p].End = false;
+				
+				SCAttributes[NearPt].PrePt = p;
+				SCAttributes[p].NextPt = NearPt;
+				SCAttributes[p].BranchCount += 1;
+
+			}
 		}
+
 	}
-
 	//CreateLineArray
-	for (int32 p = 0; p < TargetTransforms.Num(); p++)
+	for (int32 p = 0; p < NumPt; p++)
 	{
 		if (SCAttributes[p].End != true)
 			continue;
@@ -350,7 +453,7 @@ TArray<FGeometryScriptPolyPath> UGeometryGenerate::SpaceColonization(TArray<FTra
 	return Lines;
 }
 
-UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FBox Bounds, bool Result, int32 ExtentPlus, float VoxelSize)
+UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FBox Bounds, bool Result, int32 ExtentPlus, float VoxelSize, bool MultThread)
 {
 	float LandscapeMeshExtrude = 100;
 	FVector Center = Bounds.GetCenter();
@@ -368,8 +471,11 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 	{
 		//return nullptr;
 	}
+	
 	//CollectSceneMeshComponennt
 	FTransform TransformCenter = FTransform::Identity;
+	TArray<UStaticMesh*> BoundStaticMeshs;
+	TArray<FTransform> BoundTransforms;
 	for (UStaticMeshComponent* AppendMeshComponent : AppendMeshComponents)
 	{
 		if (Cast<UInstancedStaticMeshComponent>(AppendMeshComponent))
@@ -377,9 +483,10 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 			UInstancedStaticMeshComponent* Instances = Cast<UInstancedStaticMeshComponent>(AppendMeshComponent);
 			int32 InstanceCount = Instances->GetInstanceCount();
 			UStaticMesh* InstanceMesh = Instances->GetStaticMesh();
+			
 			for (int32 i = 0; i < InstanceCount; i++)
 			{
-				UDynamicMesh* InstanceDynamicMesh = NewObject<UDynamicMesh>();
+				
 				FTransform InstanceTransform = FTransform::Identity;
 				Instances->GetInstanceTransform(i, InstanceTransform);
 				FBox StaticMeshBound = InstanceMesh->GetBoundingBox();
@@ -388,99 +495,127 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 				if (!StaticMeshBound.Intersect(Bounds))
 					continue;
 				
-				FGeometryScriptCopyMeshFromAssetOptions AssetOptions;
-				FGeometryScriptMeshReadLOD RequestedLOD;
-				RequestedLOD.LODIndex = FMath::Min(InstanceMesh->GetNumLODs() - 1, 3);
-				RequestedLOD.LODType = EGeometryScriptLODType::RenderData;
-				EGeometryScriptOutcomePins Outcome;
-				UGeometryScriptLibrary_StaticMeshFunctions::CopyMeshFromStaticMesh(InstanceMesh, InstanceDynamicMesh, AssetOptions, RequestedLOD, Outcome);
-				
-				InstanceDynamicMesh->EditMesh([&](FDynamicMesh3& EditMesh) 
-				{
-					MeshTransforms::ApplyTransform(EditMesh, (FTransformSRT3d)InstanceTransform, true);
-				
-				}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
-				OutMesh->EditMesh([&](FDynamicMesh3& AppendToMesh)
-				{
-					InstanceDynamicMesh->EditMesh([&](FDynamicMesh3& EditMesh)
-					{
-						int32 TriCount = EditMesh.TriangleCount();
-						for (int32 i = 0; i < TriCount; i++)
-						{
-							FIndex3i VertexIndexs = EditMesh.GetTriangle(i);
-							bool IsOutSideTriangle = true;
-							TArray<FVector> VertexPositions;
-							VertexPositions.Reserve(3);
-							for (int32 j = 0; j < 3; j++)
-							{
-								FVector Vertex = EditMesh.GetVertex(VertexIndexs[j]);
-								VertexPositions.Add(Vertex);
-							}
-							FBox TriBox(VertexPositions);
-							if (!Bounds.Intersect(TriBox))
-							{
-								EditMesh.RemoveTriangle(i);
-							}
-						}
-						FTransformSRT3d XForm(TransformCenter);
-						FMeshIndexMappings TmpMappings;
-						FDynamicMeshEditor Editor(&AppendToMesh);
-						const FDynamicMesh3* UseOtherMesh = &EditMesh;
-						Editor.AppendMesh(UseOtherMesh, TmpMappings,
-							[&](int, const FVector3d& Position) { return XForm.TransformPosition(Position); },
-							[&](int, const FVector3d& Normal) { return XForm.TransformNormal(Normal); });
-					});
-				}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+				BoundStaticMeshs.Add(InstanceMesh);
+				BoundTransforms.Add(InstanceTransform);
 			}
 			continue;
 		}
-		//Bounds.Intersect()
-		
-		UE::Conversion::FToMeshOptions ToMeshOptions;
-		ToMeshOptions.bUseClosestLOD = false;
-		ToMeshOptions.LODIndex = 0;
-		
-		ToMeshOptions.LODType = UE::Conversion::EMeshLODType::MaxAvailable;
-		ToMeshOptions.bWantNormals = true;
-		ToMeshOptions.bWantTangents = true;
-		FDynamicMesh3 CopyMesh;
-		FText ErrorMessage;
-		FTransform LocalToWorld;
-		bool bSuccess = UE::Conversion::SceneComponentToDynamicMesh(AppendMeshComponent, ToMeshOptions, true, CopyMesh, LocalToWorld, ErrorMessage);
-		if (!bSuccess)
-			continue;
-		
-		OutMesh->EditMesh([&](FDynamicMesh3& AppendToMesh)
-		{
-			int32 TriCount = CopyMesh.TriangleCount();
-			for (int32 i = 0; i < TriCount; i++)
-			{
-				FIndex3i VertexIndexs = CopyMesh.GetTriangle(i);
-				bool IsOutSideTriangle = true;
-				TArray<FVector> VertexPositions;
-				VertexPositions.Reserve(3);
-				for (int32 j = 0; j < 3; j++)
-				{
-					FVector Vertex = CopyMesh.GetVertex(VertexIndexs[j]);
-					VertexPositions.Add(Vertex);
-				}
-				FBox TriBox(VertexPositions);
-				if (!Bounds.Intersect(TriBox))
-				{
-					CopyMesh.RemoveTriangle(i);
-				}
-			}
-			FTransformSRT3d XForm(TransformCenter);
-			FMeshIndexMappings TmpMappings;
-			FDynamicMeshEditor Editor(&AppendToMesh);
-			const FDynamicMesh3* UseOtherMesh = &CopyMesh;
-			Editor.AppendMesh(UseOtherMesh, TmpMappings,
-				[&](int, const FVector3d& Position) { return XForm.TransformPosition(Position); },
-				[&](int, const FVector3d& Normal) { return XForm.TransformNormal(Normal); });
-
-		}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+		BoundStaticMeshs.Add(AppendMeshComponent->GetStaticMesh());
+		BoundTransforms.Add(AppendMeshComponent->GetComponentToWorld());
 	}
+
+	//ConvertMeshs
 	
+	//bool MultThread = true;
+	UDynamicMesh* DynamicMeshCollection = NewObject<UDynamicMesh>();
+	DynamicMeshCollection->Reset();
+	if (MultThread)
+	{
+		SCOPE_CYCLE_COUNTER(STAT_SCConvertMeshMultThread)
+		TArray<UDynamicMesh*> Meshs = ProcessAsync::ProcessAsync<UDynamicMesh*>(
+			BoundTransforms.Num(), 1, [&](const int32 i)
+			{
+				UDynamicMesh* DynamicMesh = NewObject<UDynamicMesh>();
+				DynamicMesh->Reset();
+				UStaticMesh* StaticMesh = BoundStaticMeshs[i];
+				FTransform Transform = BoundTransforms[i];
+				FGeometryScriptCopyMeshFromAssetOptions AssetOptions;
+				FGeometryScriptMeshReadLOD RequestedLOD;
+				RequestedLOD.LODIndex = FMath::Min(StaticMesh->GetNumLODs() - 1, 3);
+				RequestedLOD.LODType = EGeometryScriptLODType::RenderData;
+				EGeometryScriptOutcomePins Outcome;
+				UGeometryScriptLibrary_StaticMeshFunctions::CopyMeshFromStaticMesh(
+					StaticMesh, DynamicMesh, AssetOptions, RequestedLOD, Outcome);
+
+				DynamicMesh->EditMesh([&](FDynamicMesh3& EditMesh)
+				{
+					MeshTransforms::ApplyTransform(EditMesh, (FTransformSRT3d)Transform, true);
+				}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+
+				DynamicMesh->EditMesh([&](FDynamicMesh3& EditMesh)
+				{
+					int32 TriCount = EditMesh.TriangleCount();
+					for (int32 i = 0; i < TriCount; i++)
+					{
+						FIndex3i VertexIndexs = EditMesh.GetTriangle(i);
+						bool IsOutSideTriangle = true;
+						TArray<FVector> VertexPositions;
+						VertexPositions.Reserve(3);
+						for (int32 j = 0; j < 3; j++)
+						{
+							FVector Vertex = EditMesh.GetVertex(VertexIndexs[j]);
+							VertexPositions.Add(Vertex);
+						}
+						FBox TriBox(VertexPositions);
+						if (!Bounds.Intersect(TriBox))
+						{
+							EditMesh.RemoveTriangle(i);
+						}
+					}
+				}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+				return DynamicMesh;
+			});
+		for (UDynamicMesh* Mesh : Meshs)
+		{
+			UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(DynamicMeshCollection, Mesh, FTransform::Identity);
+		}
+	}
+	else
+	{
+		SCOPE_CYCLE_COUNTER(STAT_SCConvertMesh)
+		for (int32 i = 0; i < BoundTransforms.Num(); i++)
+		{
+			
+			UDynamicMesh* DynamicMesh = NewObject<UDynamicMesh>();
+			UStaticMesh* StaticMesh = BoundStaticMeshs[i];
+			FTransform Transform = BoundTransforms[i];
+			FGeometryScriptCopyMeshFromAssetOptions AssetOptions;
+			FGeometryScriptMeshReadLOD RequestedLOD;
+			RequestedLOD.LODIndex = FMath::Min(StaticMesh->GetNumLODs() - 1, 3);
+			RequestedLOD.LODType = EGeometryScriptLODType::RenderData;
+			EGeometryScriptOutcomePins Outcome;
+			UGeometryScriptLibrary_StaticMeshFunctions::CopyMeshFromStaticMesh(
+				StaticMesh, DynamicMesh, AssetOptions, RequestedLOD, Outcome);
+
+			DynamicMesh->EditMesh([&](FDynamicMesh3& EditMesh)
+			{
+				MeshTransforms::ApplyTransform(EditMesh, (FTransformSRT3d)Transform, true);
+			}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+			DynamicMeshCollection->EditMesh([&](FDynamicMesh3& AppendToMesh)
+			{
+				DynamicMesh->EditMesh([&](FDynamicMesh3& EditMesh)
+				{
+					int32 TriCount = EditMesh.TriangleCount();
+					for (int32 i = 0; i < TriCount; i++)
+					{
+						FIndex3i VertexIndexs = EditMesh.GetTriangle(i);
+						bool IsOutSideTriangle = true;
+						TArray<FVector> VertexPositions;
+						VertexPositions.Reserve(3);
+						for (int32 j = 0; j < 3; j++)
+						{
+							FVector Vertex = EditMesh.GetVertex(VertexIndexs[j]);
+							VertexPositions.Add(Vertex);
+						}
+						FBox TriBox(VertexPositions);
+						if (!Bounds.Intersect(TriBox))
+						{
+							EditMesh.RemoveTriangle(i);
+						}
+					}
+					FTransformSRT3d XForm(TransformCenter);
+					FMeshIndexMappings TmpMappings;
+					FDynamicMeshEditor Editor(&AppendToMesh);
+					const FDynamicMesh3* UseOtherMesh = &EditMesh;
+					Editor.AppendMesh(UseOtherMesh, TmpMappings,
+					                  [&](int, const FVector3d& Position) { return XForm.TransformPosition(Position); },
+					                  [&](int, const FVector3d& Normal) { return XForm.TransformNormal(Normal); });
+				});
+			}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+		}
+	}
+	UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutMesh, DynamicMeshCollection, FTransform::Identity);
+
 	//CreateBoundaryMesh
 	UGeometryGenerate::ExtrudeUnclosedBoundary(OutMesh, LandscapeMeshExtrude);
 

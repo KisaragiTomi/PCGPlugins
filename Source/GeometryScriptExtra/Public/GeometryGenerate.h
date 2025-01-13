@@ -29,10 +29,10 @@ namespace ProcessAsync
 	template<typename T>
 	TArray<T> ProcessAsync(int32 NumPt, int32 ThreadPointNum, TFunction<T(int32)> Func)
 	{
-		int32 NumThreads = FMath::Min(NumPt / ThreadPointNum + 1, FPlatformMisc::NumberOfCoresIncludingHyperthreads() - 1LL);
+		int32 NumThreads = FMath::Min(NumPt / ThreadPointNum, FPlatformMisc::NumberOfCoresIncludingHyperthreads() - 1LL);
 		TArray<TFuture<TArray<T>>> Threads;
 		Threads.Reserve(NumThreads);
-		const int32 Batch = NumPt / NumThreads + 1;
+		const int32 Batch = NumPt / NumThreads;
 		for (int32 t = 0; t < NumThreads; ++t)
 		{
 			const int64 StartIdx = Batch * t;

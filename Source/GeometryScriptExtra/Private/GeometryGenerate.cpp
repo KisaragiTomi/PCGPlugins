@@ -616,6 +616,9 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 	}
 	UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutMesh, DynamicMeshCollection, FTransform::Identity);
 
+	//BlurNormals 
+	BlurVertexNormals(OutMesh);
+	
 	//CreateBoundaryMesh
 	UGeometryGenerate::ExtrudeUnclosedBoundary(OutMesh, LandscapeMeshExtrude);
 
@@ -632,9 +635,6 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 		return OutMesh;
 	
 	OutMesh = VoxelMergeMeshs(OutMesh , VoxelSize);
-	
-	//BlurNormals
-	//OutMesh = BlurVertexNormals(OutMesh);
 	
 	//MeshAttributeTest
 	// OutMesh->EditMesh([&](FDynamicMesh3& Mesh)
@@ -1039,7 +1039,7 @@ UDynamicMesh* UGeometryGenerate::BlurVertexNormals(UDynamicMesh* TargetMesh, int
 		
 	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
 	
-	UGeometryGenerate::CreateVertexNormals(TargetMesh);
+	UGeometryGenerate::CreateVertexNormalFromOverlay(TargetMesh);
 	
 	return TargetMesh;
 }

@@ -46,7 +46,6 @@ namespace ProcessAsync
 					T Results = Func(p);
 					ResultsPerTask.Add(Results);
 				}
-				//FPlatformProcess::Sleep(10);
 				return ResultsPerTask;
 			}));
 			

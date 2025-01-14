@@ -1,5 +1,6 @@
 ﻿#include "GeometryGenerate.h"
 
+#include "DetailLayoutBuilder.h"
 #include "UDynamicMesh.h"
 #include "LandscapeExtra.h"
 #include "DynamicMesh/DynamicMesh3.h"
@@ -41,9 +42,13 @@
 #include "PackageTools.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "CleaningOps/HoleFillOp.h"
+#include "DataWrappers/ChaosVDParticleDataWrapper.h"
 #include "DynamicMesh/MeshNormals.h"
 #include "Subsystems/EditorActorSubsystem.h"
 #include "GeometryScript/MeshAssetFunctions.h"
+#include "GeometryScript/MeshRemeshFunctions.h"
+#include "Interfaces/IHttpResponse.h"
+#include "Properties/UVLayoutProperties.h"
 
 
 using namespace UE::Geometry;
@@ -151,7 +156,7 @@ void UGeometryGenerate::GenerateVines(FSpaceColonizationOptions SC, bool Result,
 	if (Container->BVH.Spatial.IsValid() == false || Container->PrefixMesh == nullptr || !Container->
 		CheckActors(MeshActors) || Container->InstanceBound != Bounds)
 	{
-		MeshCombine = VDBMeshFromActors(MeshActors, Bounds, (OutDebugMesh?false:true), SC.ExtentPlus, SC.VoxelSize, MultThread);
+		MeshCombine = VDBMeshFromActors(MeshActors, BBoxVectors, (OutDebugMesh?false:true), SC.ExtentPlus, SC.VoxelSize, MultThread);
 		MeshCombine = UGeometryScriptLibrary_MeshSpatial::BuildBVHForMesh(MeshCombine, BVH, nullptr);
 		Container->BVH = BVH;
 		Container->PrefixMesh = MeshCombine;
@@ -316,7 +321,7 @@ TArray<FGeometryScriptPolyPath> UGeometryGenerate::SpaceColonization(TArray<FTra
 					DirSum += Dir;
 				}
 				DirSum.Normalize();
-			
+				
 				ThreadCalculate.Key = FIndex3i(p, NearPt, 1);
 				ThreadCalculate.Value = TargetLocations[p]+ DirSum * NearestDist;
 				
@@ -453,9 +458,10 @@ TArray<FGeometryScriptPolyPath> UGeometryGenerate::SpaceColonization(TArray<FTra
 	return Lines;
 }
 
-UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FBox Bounds, bool Result, int32 ExtentPlus, float VoxelSize, bool MultThread)
+UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, TArray<FVector> BBoxVertors, bool Result, int32 ExtentPlus, float VoxelSize, bool MultThread)
 {
 	float LandscapeMeshExtrude = 100;
+	FBox Bounds(BBoxVertors);
 	FVector Center = Bounds.GetCenter();
 	FVector Extent = Bounds.GetExtent();
 	
@@ -467,15 +473,11 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 		Actor->GetComponents(UStaticMeshComponent::StaticClass(), StaticMeshComponents);
 		AppendMeshComponents.Append(StaticMeshComponents);
 	}
-	if (AppendMeshComponents.Num() == 0)
-	{
-		//return nullptr;
-	}
-	
 	//CollectSceneMeshComponennt
 	FTransform TransformCenter = FTransform::Identity;
 	TArray<UStaticMesh*> BoundStaticMeshs;
 	TArray<FTransform> BoundTransforms;
+	TMap<UStaticMesh*, TArray<FTransform>> BoundTransformMap;
 	for (UStaticMeshComponent* AppendMeshComponent : AppendMeshComponents)
 	{
 		if (Cast<UInstancedStaticMeshComponent>(AppendMeshComponent))
@@ -486,7 +488,6 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 			
 			for (int32 i = 0; i < InstanceCount; i++)
 			{
-				
 				FTransform InstanceTransform = FTransform::Identity;
 				Instances->GetInstanceTransform(i, InstanceTransform);
 				FBox StaticMeshBound = InstanceMesh->GetBoundingBox();
@@ -494,31 +495,185 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 				
 				if (!StaticMeshBound.Intersect(Bounds))
 					continue;
-				
-				BoundStaticMeshs.Add(InstanceMesh);
-				BoundTransforms.Add(InstanceTransform);
+
+				bool VectorInBox = false;
+				for (FVector BBoxVector : BBoxVertors)
+				{
+					if (StaticMeshBound.IsInside(BBoxVector))
+						VectorInBox = true;
+				}
+				if (!VectorInBox)
+					continue;
+
+				if (BoundTransformMap.Contains(InstanceMesh))
+				{
+					TArray<FTransform>* Transforms = BoundTransformMap.Find(InstanceMesh);
+					Transforms->Add(InstanceTransform);
+
+				}
+				else
+				{
+					BoundTransformMap.Add(InstanceMesh, {InstanceTransform});
+					//BoundTransforms.Add(InstanceTransform);
+				}
 			}
 			continue;
 		}
-		BoundStaticMeshs.Add(AppendMeshComponent->GetStaticMesh());
-		BoundTransforms.Add(AppendMeshComponent->GetComponentToWorld());
-	}
+		UStaticMesh* StaticMesh = AppendMeshComponent->GetStaticMesh();
+		FTransform Transform = AppendMeshComponent->GetComponentToWorld();
+		FBox StaticMeshBound = StaticMesh->GetBoundingBox();
+		StaticMeshBound = StaticMeshBound.TransformBy(Transform);
+		bool VectorInBox = false;
+		for (FVector BBoxVector : BBoxVertors)
+		{
+			if (StaticMeshBound.IsInside(BBoxVector))
+				VectorInBox = true;
+		}
+		if (!VectorInBox)
+			continue;
 
+		if (BoundTransformMap.Contains(StaticMesh))
+		{
+			TArray<FTransform>* Transforms = BoundTransformMap.Find(StaticMesh);
+			Transforms->Add(Transform);
+
+		}
+		else
+		{
+			BoundTransformMap.Add(StaticMesh, {Transform});
+		}
+	}
 	//ConvertMeshs
-	
-	//bool MultThread = true;
-	UDynamicMesh* DynamicMeshCollection = NewObject<UDynamicMesh>();
-	DynamicMeshCollection->Reset();
-	if (MultThread)
+	TArray<UStaticMesh*> BoundTransformMapKeyArray;
+	TArray<TArray<FTransform>> BoundTransformMapValueArray;
+	BoundTransformMap.GenerateKeyArray(BoundTransformMapKeyArray);
+	BoundTransformMap.GenerateValueArray(BoundTransformMapValueArray);
+
+	if (BoundTransformMapKeyArray.Num() > 0)
 	{
-		SCOPE_CYCLE_COUNTER(STAT_SCConvertMeshMultThread)
-		TArray<UDynamicMesh*> Meshs = ProcessAsync::ProcessAsync<UDynamicMesh*>(
-			BoundTransforms.Num(), 1, [&](const int32 i)
+		UDynamicMesh* DynamicMeshCollection = NewObject<UDynamicMesh>();
+		DynamicMeshCollection->Reset();
+		if (MultThread)
+		{
+			SCOPE_CYCLE_COUNTER(STAT_SCConvertMeshMultThread)
+			TArray<UDynamicMesh*> DynamicMeshes;
+			DynamicMeshes.SetNum(BoundTransformMapKeyArray.Num());
+			TArray<TTuple<int32, FTransform>> DynamicMeshTransforms;
+			for (int32 i = 0; i < BoundTransformMapValueArray.Num(); i++)
+			{
+				TArray<FTransform> Transforms = BoundTransformMapValueArray[i];
+				for (int32 j = 0; j < Transforms.Num(); j++)
+				{
+					TTuple<int32, FTransform> TransformTuple;
+					TransformTuple.Key = i;
+					TransformTuple.Value = Transforms[j];
+					DynamicMeshTransforms.Add(TransformTuple);
+				}
+			}
+			TArray<TTuple<int32, UDynamicMesh*>> MeshConvertTuples = ProcessAsync::ProcessAsync<TTuple<int32, UDynamicMesh*>>(
+			BoundTransformMapKeyArray.Num(), 1, [&](const int32 i)
 			{
 				UDynamicMesh* DynamicMesh = NewObject<UDynamicMesh>();
 				DynamicMesh->Reset();
-				UStaticMesh* StaticMesh = BoundStaticMeshs[i];
-				FTransform Transform = BoundTransforms[i];
+
+				UStaticMesh* StaticMesh = BoundTransformMapKeyArray[i];
+				FGeometryScriptCopyMeshFromAssetOptions AssetOptions;
+				FGeometryScriptMeshReadLOD RequestedLOD;
+				RequestedLOD.LODIndex = FMath::Min(StaticMesh->GetNumLODs() - 1, 3);
+				RequestedLOD.LODType = EGeometryScriptLODType::RenderData;
+				EGeometryScriptOutcomePins Outcome;
+				UGeometryScriptLibrary_StaticMeshFunctions::CopyMeshFromStaticMesh(
+					StaticMesh, DynamicMesh, AssetOptions, RequestedLOD, Outcome);
+				TTuple<int32, UDynamicMesh*> DynamicMeshTuple;
+				DynamicMeshTuple.Key = i;
+				DynamicMeshTuple.Value = DynamicMesh;
+				return DynamicMeshTuple;
+			});
+			for (TTuple<int32, UDynamicMesh*> DynamicMeshTuple : MeshConvertTuples)
+			{
+				DynamicMeshes[DynamicMeshTuple.Key] = DynamicMeshTuple.Value;
+			}
+			// for (int32 i = 0; i < BoundTransformMapKeyArray.Num(); i++)
+			// {
+			// 	UDynamicMesh* DynamicMesh = NewObject<UDynamicMesh>();
+			// 	DynamicMesh->Reset();
+			//
+			// 	UStaticMesh* StaticMesh = BoundTransformMapKeyArray[i];
+			// 	FGeometryScriptCopyMeshFromAssetOptions AssetOptions;
+			// 	FGeometryScriptMeshReadLOD RequestedLOD;
+			// 	RequestedLOD.LODIndex = FMath::Min(StaticMesh->GetNumLODs() - 1, 3);
+			// 	RequestedLOD.LODType = EGeometryScriptLODType::RenderData;
+			// 	EGeometryScriptOutcomePins Outcome;
+			// 	UGeometryScriptLibrary_StaticMeshFunctions::CopyMeshFromStaticMesh(
+			// 		StaticMesh, DynamicMesh, AssetOptions, RequestedLOD, Outcome);
+			// 	
+			// 	 DynamicMeshes.Add(DynamicMesh);
+			// }
+			
+			TArray<UDynamicMesh*> Meshs = ProcessAsync::ProcessAsync<UDynamicMesh*>(
+				DynamicMeshTransforms.Num(), 1, [&](const int32 i)
+				{
+					FTransform Transform = DynamicMeshTransforms[i].Value;
+					UDynamicMesh* DynamicMesh = DynamicMeshes[DynamicMeshTransforms[i].Key];
+					UDynamicMesh* PerMesh = NewObject<UDynamicMesh>();
+					PerMesh->Reset();
+					FDynamicMesh3 MeshCopy;
+					DynamicMesh->ProcessMesh([&](const FDynamicMesh3& EditMesh)
+					{
+						MeshCopy = EditMesh;
+					});
+					PerMesh->SetMesh(MoveTemp(MeshCopy));
+					PerMesh->EditMesh([&](FDynamicMesh3& EditMesh)
+					{
+						MeshTransforms::ApplyTransform(EditMesh, (FTransformSRT3d)Transform, true);
+					}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+
+					PerMesh->EditMesh([&](FDynamicMesh3& EditMesh)
+					{
+						int32 TriCount = EditMesh.TriangleCount();
+						for (int32 i = 0; i < TriCount; i++)
+						{
+							FIndex3i VertexIndexs = EditMesh.GetTriangle(i);
+							bool IsOutSideTriangle = true;
+							TArray<FVector> VertexPositions;
+							VertexPositions.Reserve(3);
+							for (int32 j = 0; j < 3; j++)
+							{
+								FVector Vertex = EditMesh.GetVertex(VertexIndexs[j]);
+								VertexPositions.Add(Vertex);
+							}
+							FBox TriBox(VertexPositions);
+							if (!Bounds.Intersect(TriBox))
+							{
+								EditMesh.RemoveTriangle(i);
+							}
+						}
+					}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+					
+					//BlurNormals 
+					BlurVertexNormals(PerMesh);
+					
+					//CreateBoundaryMesh
+					UGeometryGenerate::ExtrudeUnclosedBoundary(PerMesh, LandscapeMeshExtrude);
+					return PerMesh;
+				});
+			for (UDynamicMesh* Mesh : Meshs)
+			{
+				if (!Mesh || Mesh->GetTriangleCount() == 0)
+					continue;
+
+				UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(DynamicMeshCollection, Mesh, FTransform::Identity);
+			}
+		}
+		else
+		{
+			SCOPE_CYCLE_COUNTER(STAT_SCConvertMesh)
+			for (int32 i = 0; i < BoundTransformMapKeyArray.Num(); i++)
+			{
+				
+				UDynamicMesh* DynamicMesh = NewObject<UDynamicMesh>();
+				UStaticMesh* StaticMesh = BoundTransformMapKeyArray[i];
+				TArray<FTransform> Transforms = BoundTransformMapValueArray[i];
 				FGeometryScriptCopyMeshFromAssetOptions AssetOptions;
 				FGeometryScriptMeshReadLOD RequestedLOD;
 				RequestedLOD.LODIndex = FMath::Min(StaticMesh->GetNumLODs() - 1, 3);
@@ -527,102 +682,54 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, FB
 				UGeometryScriptLibrary_StaticMeshFunctions::CopyMeshFromStaticMesh(
 					StaticMesh, DynamicMesh, AssetOptions, RequestedLOD, Outcome);
 
-				DynamicMesh->EditMesh([&](FDynamicMesh3& EditMesh)
+				for (int32 j = 0; j < Transforms.Num(); j++)
 				{
-					MeshTransforms::ApplyTransform(EditMesh, (FTransformSRT3d)Transform, true);
-				}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
-
-				DynamicMesh->EditMesh([&](FDynamicMesh3& EditMesh)
-				{
-					int32 TriCount = EditMesh.TriangleCount();
-					for (int32 i = 0; i < TriCount; i++)
+					UDynamicMesh* PerMesh = NewObject<UDynamicMesh>();
+					PerMesh->Reset();
+					FDynamicMesh3 MeshCopy;
+					DynamicMesh->ProcessMesh([&](const FDynamicMesh3& EditMesh)
 					{
-						FIndex3i VertexIndexs = EditMesh.GetTriangle(i);
-						bool IsOutSideTriangle = true;
-						TArray<FVector> VertexPositions;
-						VertexPositions.Reserve(3);
-						for (int32 j = 0; j < 3; j++)
-						{
-							FVector Vertex = EditMesh.GetVertex(VertexIndexs[j]);
-							VertexPositions.Add(Vertex);
-						}
-						FBox TriBox(VertexPositions);
-						if (!Bounds.Intersect(TriBox))
-						{
-							EditMesh.RemoveTriangle(i);
-						}
-					}
-				}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
-				return DynamicMesh;
-			});
-		for (UDynamicMesh* Mesh : Meshs)
-		{
-			UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(DynamicMeshCollection, Mesh, FTransform::Identity);
-		}
-	}
-	else
-	{
-		SCOPE_CYCLE_COUNTER(STAT_SCConvertMesh)
-		for (int32 i = 0; i < BoundTransforms.Num(); i++)
-		{
-			
-			UDynamicMesh* DynamicMesh = NewObject<UDynamicMesh>();
-			UStaticMesh* StaticMesh = BoundStaticMeshs[i];
-			FTransform Transform = BoundTransforms[i];
-			FGeometryScriptCopyMeshFromAssetOptions AssetOptions;
-			FGeometryScriptMeshReadLOD RequestedLOD;
-			RequestedLOD.LODIndex = FMath::Min(StaticMesh->GetNumLODs() - 1, 3);
-			RequestedLOD.LODType = EGeometryScriptLODType::RenderData;
-			EGeometryScriptOutcomePins Outcome;
-			UGeometryScriptLibrary_StaticMeshFunctions::CopyMeshFromStaticMesh(
-				StaticMesh, DynamicMesh, AssetOptions, RequestedLOD, Outcome);
-
-			DynamicMesh->EditMesh([&](FDynamicMesh3& EditMesh)
-			{
-				MeshTransforms::ApplyTransform(EditMesh, (FTransformSRT3d)Transform, true);
-			}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
-			DynamicMeshCollection->EditMesh([&](FDynamicMesh3& AppendToMesh)
-			{
-				DynamicMesh->EditMesh([&](FDynamicMesh3& EditMesh)
-				{
-					int32 TriCount = EditMesh.TriangleCount();
-					for (int32 i = 0; i < TriCount; i++)
+						MeshCopy = EditMesh;
+					});
+					PerMesh->SetMesh(MoveTemp(MeshCopy));
+					PerMesh->EditMesh([&](FDynamicMesh3& EditMesh)
 					{
-						FIndex3i VertexIndexs = EditMesh.GetTriangle(i);
-						bool IsOutSideTriangle = true;
-						TArray<FVector> VertexPositions;
-						VertexPositions.Reserve(3);
-						for (int32 j = 0; j < 3; j++)
-						{
-							FVector Vertex = EditMesh.GetVertex(VertexIndexs[j]);
-							VertexPositions.Add(Vertex);
-						}
-						FBox TriBox(VertexPositions);
-						if (!Bounds.Intersect(TriBox))
-						{
-							EditMesh.RemoveTriangle(i);
-						}
-					}
-					FTransformSRT3d XForm(TransformCenter);
-					FMeshIndexMappings TmpMappings;
-					FDynamicMeshEditor Editor(&AppendToMesh);
-					const FDynamicMesh3* UseOtherMesh = &EditMesh;
-					Editor.AppendMesh(UseOtherMesh, TmpMappings,
-					                  [&](int, const FVector3d& Position) { return XForm.TransformPosition(Position); },
-					                  [&](int, const FVector3d& Normal) { return XForm.TransformNormal(Normal); });
-				});
-			}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
-		}
-	}
-	UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutMesh, DynamicMeshCollection, FTransform::Identity);
+						MeshTransforms::ApplyTransform(EditMesh, (FTransformSRT3d)Transforms[j], true);
+					}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
 
-	//BlurNormals 
-	BlurVertexNormals(OutMesh);
+					PerMesh->EditMesh([&](FDynamicMesh3& EditMesh)
+					{
+						int32 TriCount = EditMesh.TriangleCount();
+						for (int32 i = 0; i < TriCount; i++)
+						{
+							FIndex3i VertexIndexs = EditMesh.GetTriangle(i);
+							bool IsOutSideTriangle = true;
+							TArray<FVector> VertexPositions;
+							VertexPositions.Reserve(3);
+							for (int32 j = 0; j < 3; j++)
+							{
+								FVector Vertex = EditMesh.GetVertex(VertexIndexs[j]);
+								VertexPositions.Add(Vertex);
+							}
+							FBox TriBox(VertexPositions);
+							if (!Bounds.Intersect(TriBox))
+							{
+								EditMesh.RemoveTriangle(i);
+							}
+						}
+					}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+					//BlurNormals 
+					BlurVertexNormals(PerMesh);
+					//CreateBoundaryMesh
+					UGeometryGenerate::ExtrudeUnclosedBoundary(PerMesh, LandscapeMeshExtrude);
+					UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(DynamicMeshCollection, PerMesh, FTransform::Identity);
+				}
+			}
+		}
+		UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutMesh, DynamicMeshCollection, FTransform::Identity);
+	}
+
 	
-	//CreateBoundaryMesh
-	UGeometryGenerate::ExtrudeUnclosedBoundary(OutMesh, LandscapeMeshExtrude);
-
-	//TODO Adapting to situations where objects are very far from the Landscape
 	//CreateLandscapeMesh
 	UDynamicMesh* LandscapePlaneMesh = NewObject<UDynamicMesh>(); 
 	ULandscapeExtra::CreateProjectPlane(LandscapePlaneMesh, Center, Extent * 1.1, ExtentPlus);
@@ -672,6 +779,7 @@ UDynamicMesh* UGeometryGenerate::ExtrudeUnclosedBoundary(UDynamicMesh* FixMesh, 
 	FGeometryScriptPrimitiveOptions PrimitiveOptions;
 	FDynamicMesh3 BoundaryMeshCombine;
 	UDynamicMesh* FillFanMeshCombine = NewObject<UDynamicMesh>();
+	UGeometryGenerate::CreateVertexNormalFromOverlay(FixMesh);
 	for (int32 i = 0; i < LoopNum; i++)
 	{
 		FGeometryScriptPolyPath Pathloop = PathLoops[i];
@@ -712,7 +820,7 @@ UDynamicMesh* UGeometryGenerate::ExtrudeUnclosedBoundary(UDynamicMesh* FixMesh, 
 			PathTexParamV, true, 1, 1, 0, nullptr);
 
 		UDynamicMesh* FillFanMesh = NewObject<UDynamicMesh>();
-		UGeometryGenerate::CreateVertexNormalFromOverlay(FixMesh);
+		
 		FixMesh->EditMesh([&](FDynamicMesh3& FixEditMesh)
 		{
 			BoundaryMesh->EditMesh([&](FDynamicMesh3& EditMesh)
@@ -984,7 +1092,7 @@ UDynamicMesh* UGeometryGenerate::VoxelMergeMeshs(UDynamicMesh* TargetMesh, float
 
 		
 		bool bSuccess = VoxelCSGTool->ComputeUnion(Interrupter, PlacedMeshs, MergedMeshesDescription, MergedOrigin, 0.001, 0);
-		MergedMeshesDescription.Vertices().Num();
+		//MergedMeshesDescription.Vertices().Num();
 
 		FDynamicMesh3 ConvertlMesh;
 		FMeshDescriptionToDynamicMesh Converter;

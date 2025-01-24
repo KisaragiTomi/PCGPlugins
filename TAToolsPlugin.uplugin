@@ -27,6 +27,11 @@
       "LoadingPhase": "Default"
     },
     {
+      "Name": "VDBExtra",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    },
+    {
       "Name": "GeometryScriptExtra",
       "Type": "Editor",
       "LoadingPhase": "Default"

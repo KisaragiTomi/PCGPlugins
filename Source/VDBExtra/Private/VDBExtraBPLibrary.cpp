@@ -26,10 +26,11 @@ UDynamicMesh* UVDBExtraBPLibrary::ParticlesToVDBMesh(UDynamicMesh* TargetMesh,  
 	float Rmin = 1.5;
 	for (int32 i = 0; i < Particles.Num(); i++)
 	{
-		float Rad = Particles[i].Rad;
+		float& Rad = Particles[i].Rad;
 		if (Rad > Rmax || Rad < Rmin)
 		{
 			UE_LOG(LogTemp, Warning, TEXT("Particles are too large or too small!"));
+			Rad = FMath::Clamp(Rad, Rmin, Rmax);
 		}
 	}
 	VDBParticleList pa(1, 1);
@@ -41,29 +42,10 @@ UDynamicMesh* UVDBExtraBPLibrary::ParticlesToVDBMesh(UDynamicMesh* TargetMesh,  
 	raster.rasterizeTrails(pa, 0.75);
 	raster.finalize(true);
 	ls->setTransform(openvdb::math::Transform::createLinearTransform(1));
-	openvdb::CoordBBox treeIndexBbox = pa.getBBox(*ls);
-	ls->setGridClass(openvdb::GRID_LEVEL_SET);
-	ls->setName("LevelSetSphere");
-	// Create a VDB file object.
-	openvdb::io::File file("mygrids.vdb");
-	// Add the grid pointer to a container.
-	openvdb::GridPtrVec grids;
-
-	// Write out the contents of the container.
-	grids.push_back(ls);
-	file.write(grids);
-	file.close();
-
-
-	//ProxyLOD::ExtractIsosurfaceWithNormals(ls, 0, 0.001, AOSMeshedVolume); // QUestion should IsoSurface be worldspace?
-	// 	
-	//ProxyLOD::AddNormals(AOSMeshedVolume);																					
-	// Evidently this conversion code makes certain assumptions about the FMeshDescription. that were introduced when it was converted from FRawMesh...
+	//ls->setGridClass(openvdb::GRID_LEVEL_SET);
+	
 	FMeshDescription MergedMeshesDescription;
 	ConvertMeshVDBExtra(ls, MergedMeshesDescription);
-	//ProxyLOD::ConvertMesh(AOSMeshedVolume, MergedMeshesDescription);
-	//ProxyLOD::AOSMeshToRawMesh(AOSMeshedVolume, MergedMeshesDescription);
-	//AOSMeshToRawMesh(AOSMeshedVolume, MergedMeshesDescription);
 	FDynamicMesh3 ConvertlMesh;
 	FMeshDescriptionToDynamicMesh Converter;
 	Converter.Convert(&MergedMeshesDescription, ConvertlMesh);

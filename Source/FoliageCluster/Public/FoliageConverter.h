@@ -14,10 +14,6 @@
 
 #include "FoliageConverter.generated.h"
 
-
-
-
-
 /**
  * 
  */

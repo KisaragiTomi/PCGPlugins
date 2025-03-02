@@ -5,7 +5,7 @@ public class GeometryScriptExtra : ModuleRules
     public GeometryScriptExtra(ReadOnlyTargetRules Target) : base(Target)
     {
         PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
-        
+        bUseRTTI = true;
         PublicDependencyModuleNames.AddRange(
             new string[]
             {
@@ -46,11 +46,16 @@ public class GeometryScriptExtra : ModuleRules
                 "GeometryScriptingCore",
                 "Projects",
                 "Slate",
-                "UnrealEd",
                 "ProxyLODMeshReduction",
                 "SlateCore", 
                 "ModelingComponentsEditorOnly"
             }
+        );
+        AddEngineThirdPartyPrivateStaticDependencies(Target,
+            "IntelTBB",
+            "UVAtlas",
+            "DirectXMesh",
+            "OpenVDB"
         );
     }
 }

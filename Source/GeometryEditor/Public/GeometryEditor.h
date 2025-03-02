@@ -4,7 +4,7 @@
 
 #include "Modules/ModuleManager.h"
 
-class FVDBExtraModule : public IModuleInterface
+class FGeometryEditorModule : public IModuleInterface
 {
 public:
 

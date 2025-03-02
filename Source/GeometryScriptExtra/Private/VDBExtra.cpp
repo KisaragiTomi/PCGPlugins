@@ -1,26 +1,33 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
-#include "VDBExtraBPLibrary.h"
+#include "VDBExtra.h"
 #include "UDynamicMesh.h"
 #include "ProxyLOD/Private/ProxyLODMeshAttrTransfer.h"
 #include "ProxyLOD/Private/ProxyLODMeshConvertUtils.h"
 #include "ProxyLOD/Private/ProxyLODMeshTypes.h"
 #include "ProxyLOD/Private/ProxyLODMeshUtilities.h"
+#include "GeometryGeneral.h"
+#include "GeometryScript/MeshSpatialFunctions.h"
+
 #include <openvdb/tools/ParticlesToLevelSet.h>
-#include "VDBExtra.h"
+
+#include "GeometryScript/MeshDecompositionFunctions.h"
 
 using namespace ProxyLOD;
+using namespace UE::Geometry;
 
-UVDBExtraBPLibrary::UVDBExtraBPLibrary(const FObjectInitializer& ObjectInitializer)
+
+UVDBExtra::UVDBExtra(const FObjectInitializer& ObjectInitializer)
 : Super(ObjectInitializer)
 {
 
 }
 
-UDynamicMesh* UVDBExtraBPLibrary::ParticlesToVDBMesh(UDynamicMesh* TargetMesh,  TArray<FParticleRasterize> Particles)
+UDynamicMesh* UVDBExtra::ParticlesToVDBMesh(UDynamicMesh* TargetMesh,  TArray<FParticleRasterize> Particles, float VoxelSize)
 {
-
-	const float VoxelSize = 1.0f, HalfWidth = 2.0f;
+	if (TargetMesh == nullptr)
+		return nullptr;
+	const float HalfWidth = 2.0f;
 	openvdb::FloatGrid::Ptr ls = openvdb::createLevelSet<openvdb::FloatGrid>(VoxelSize, HalfWidth);
 	float Rmax = 100;
 	float Rmin = 1.5;
@@ -42,7 +49,6 @@ UDynamicMesh* UVDBExtraBPLibrary::ParticlesToVDBMesh(UDynamicMesh* TargetMesh,  
 	raster.rasterizeTrails(pa, 0.75);
 	raster.finalize(true);
 	ls->setTransform(openvdb::math::Transform::createLinearTransform(1));
-	//ls->setGridClass(openvdb::GRID_LEVEL_SET);
 	
 	FMeshDescription MergedMeshesDescription;
 	ConvertMeshVDBExtra(ls, MergedMeshesDescription);
@@ -55,13 +61,76 @@ UDynamicMesh* UVDBExtraBPLibrary::ParticlesToVDBMesh(UDynamicMesh* TargetMesh,  
 	
 }
 
-void UVDBExtraBPLibrary::ConvertMeshVDBExtra(const openvdb::FloatGrid::ConstPtr SDFVolume, FMeshDescription& OutRawMesh)
+UDynamicMesh* UVDBExtra::ParticlesToVDBMeshUniform(UDynamicMesh* TargetMesh, TArray<FVector> Locations, float RadiusMult, float VoxelSize, bool PostProcess)
+{
+	if (TargetMesh == nullptr)
+		return nullptr;
+	const float HalfWidth = 2.0f;
+	openvdb::FloatGrid::Ptr ls = openvdb::createLevelSet<openvdb::FloatGrid>(VoxelSize, 2);
+	float Rmax = 100;
+	float Rmin = 1.5;
+
+	float Radius = FMath::Max((Rmin + .1) * VoxelSize * RadiusMult, (Rmin + 0.1) * VoxelSize);
+
+	TArray<FParticleRasterize> Particles;
+	for (int32 i = 0; i < Locations.Num(); i++)
+	{
+		FParticleRasterize Particle;
+		Particle.Position = Locations[i];
+		Particle.Rad = Radius;
+		Particles.Add(Particle);
+	}
+	VDBParticleList pa(1, 1);
+	pa.Append(Particles);
+	
+	openvdb::tools::ParticlesToLevelSet<openvdb::FloatGrid> raster(*ls);
+	raster.setRmax(Rmax);
+	raster.setRmin(Rmin);
+	raster.rasterizeTrails(pa, 0.75);
+	raster.finalize(true);
+	ls->setTransform(openvdb::math::Transform::createLinearTransform(VoxelSize));
+	// ls->setName("density");
+	//
+	// // Create a VDB file object.
+	// openvdb::io::File file("mygrids.vdb");
+	// // Add the grid pointer to a container.
+	// openvdb::GridPtrVec grids;
+	// grids.push_back(ls);
+	// // Write out the contents of the container.
+	// file.write(grids);
+	// file.close();
+	
+	FMeshDescription MergedMeshesDescription;
+	ConvertMeshVDBExtra(ls, MergedMeshesDescription);
+	FDynamicMesh3 ConvertlMesh;
+	FMeshDescriptionToDynamicMesh Converter;
+	Converter.Convert(&MergedMeshesDescription, ConvertlMesh);
+
+	if (PostProcess)
+	{
+		
+		UDynamicMesh* OrigMesh = NewObject<UDynamicMesh>();
+		UGeometryScriptLibrary_MeshDecompositionFunctions::CopyMeshToMesh(TargetMesh, OrigMesh, OrigMesh);
+		TargetMesh->SetMesh(MoveTemp(ConvertlMesh));
+		FixConvertMesh(TargetMesh, OrigMesh);
+		
+		return TargetMesh;
+
+	}
+	else
+	{
+		TargetMesh->SetMesh(MoveTemp(ConvertlMesh));
+		return TargetMesh;
+	}
+}
+
+void UVDBExtra::ConvertMeshVDBExtra(const openvdb::FloatGrid::ConstPtr SDFVolume, FMeshDescription& OutRawMesh)
 {
 	FAOSMesh AOSMesh;
-	ProxyLOD::SDFVolumeToMesh(SDFVolume, 0, 0.001, AOSMesh);
+	ProxyLOD::SDFVolumeToMesh(SDFVolume, 0.001, 0.25, AOSMesh);
 	OutRawMesh.Empty();
 	//FStaticMeshAttributes Attributes(OutRawMesh);
-
+	//ProxyLOD::AddNormals(AOSMesh);
 
 	FStaticMeshAttributes Attributes(OutRawMesh);
 	Attributes.Register();
@@ -148,5 +217,39 @@ void UVDBExtraBPLibrary::ConvertMeshVDBExtra(const openvdb::FloatGrid::ConstPtr 
 			CreateTriangle(VertexIndexes, Normals);
 		}
 	}
+}
+
+void UVDBExtra::FixConvertMesh(UDynamicMesh* TargetMesh, UDynamicMesh* SourceMesh)
+{
+	FGeometryScriptDynamicMeshBVH BVH;
+	UGeometryScriptLibrary_MeshSpatial::BuildBVHForMesh(SourceMesh, BVH, nullptr);
+	UGeometryGeneral::CreateVertexNormalFromOverlay(SourceMesh);
+	UGeometryGeneral::CreateVertexNormalFromOverlay(TargetMesh);
+	
+	TargetMesh->EditMesh([&](FDynamicMesh3& EditMesh)
+	{
+		int32 VertexCount = EditMesh.VertexCount();
+		for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex)
+		{
+			if (!EditMesh.IsVertex(VertexIndex))
+				continue;
+			
+			FVector Normal = (FVector)EditMesh.GetVertexNormal(VertexIndex);
+			FVector Location = EditMesh.GetVertex(VertexIndex);
+			FGeometryScriptSpatialQueryOptions Options;
+			FGeometryScriptTrianglePoint NearestPoint;
+			EGeometryScriptSearchOutcomePins Outcome;
+			UGeometryScriptLibrary_MeshSpatial::FindNearestPointOnMesh(
+			SourceMesh, BVH, Location, Options, NearestPoint, Outcome, nullptr);
+			FVector NearestLocation = NearestPoint.Position;
+			FVector N = GetNearestLocationNormal(EditMesh, NearestPoint);
+			FVector Dir = Location - NearestLocation;
+			Dir.Normalize();
+			if (FVector::DotProduct(N, Dir) < 0.0f)
+				continue;
+
+			EditMesh.SetVertex(VertexIndex, NearestLocation);
+		}
+	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
 }
 

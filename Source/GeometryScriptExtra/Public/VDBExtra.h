@@ -7,7 +7,7 @@
 #include "MeshDescription.h"
 #include "MeshDescriptionToDynamicMesh.h"
 #include "UDynamicMesh.h"
-#include "VDBExtraBPLibrary.generated.h"
+#include "VDBExtra.generated.h"
 
 
 /* 
@@ -29,7 +29,7 @@
 */
 
 USTRUCT(BlueprintType, meta = (DisplayName = "ParticlesRasterize"))
-struct VDBEXTRA_API FParticleRasterize
+struct GEOMETRYSCRIPTEXTRA_API FParticleRasterize
 {
     GENERATED_BODY()
 public:
@@ -42,15 +42,18 @@ public:
 
 
 UCLASS()
-class UVDBExtraBPLibrary : public UBlueprintFunctionLibrary
+class GEOMETRYSCRIPTEXTRA_API UVDBExtra : public UBlueprintFunctionLibrary
 {
 	GENERATED_UCLASS_BODY()
-
 	UFUNCTION(BlueprintCallable, Category = "VDBExtra")
-	static UDynamicMesh* ParticlesToVDBMesh(UDynamicMesh* TargetMesh, TArray<FParticleRasterize> Particles);
+	static UDynamicMesh* ParticlesToVDBMesh(UDynamicMesh* TargetMesh, TArray<FParticleRasterize> Particles, float VoxelSize = 5);
     
-	
+    UFUNCTION(BlueprintCallable, Category = "VDBExtra")
+    static UDynamicMesh* ParticlesToVDBMeshUniform(UDynamicMesh* TargetMesh, TArray<FVector> Locations, float RadiusMult = 2, float VoxelSize = 5, bool PostProcess = false);
+    
     static void ConvertMeshVDBExtra(openvdb::FloatGrid::ConstPtr SDFVolume, FMeshDescription& OutRawMesh);
+
+    static void FixConvertMesh(UDynamicMesh* TargetMesh, UDynamicMesh* SourceMesh);
     
 };
 

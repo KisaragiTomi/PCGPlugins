@@ -301,31 +301,49 @@ void AVineContainer::VisVine( bool MainVine)
 		for (int32 i = 0; i < VertexCount; i++)
 		{
 			FVector NormalSum = FVector::ZeroVector;
-			for (int32 n = 0; n < 6; n++)
+			// for (int32 n = 0; n < 6; n++)
+			// {
+			// 	float OffsetSerchDist = 50;
+			// 	FVector VertexLocation = (*Line.Path)[i];
+			// 	FRandomStream Random(123 * VertexLocation.X * i);
+			// 	const FVector RandomOffset = Random.VRand();
+			// 	FRandomStream RandomDist(.012385 * VertexLocation.X * i);
+			// 	const float RandomOffsetDist = RandomDist.FRand() * OffsetSerchDist;
+			// 	VertexLocation += RandomOffset * RandomOffsetDist;
+			// 	FGeometryScriptTrianglePoint NearestPoint;
+			// 	EGeometryScriptSearchOutcomePins Outcome;
+			// 	UGeometryScriptLibrary_MeshSpatial::FindNearestPointOnMesh(
+			// 	PrefixMesh, BVH, VertexLocation, Options, NearestPoint, Outcome, nullptr);
+			// 	PrefixMesh->ProcessMesh([&](const FDynamicMesh3& EditMesh)
+			// 	{
+			// 		//Sometimes it will Calculates a downward normal it is wrong
+			// 		//FVector Normal = EditMesh.GetTriBaryNormal(NearestPoint.TriangleID, NearestPoint.BaryCoords[0], NearestPoint.BaryCoords[1], NearestPoint.BaryCoords[2]);
+			// 		FVector Normal = EditMesh.GetTriNormal(NearestPoint.TriangleID);
+			// 		NormalSum += Normal * (RandomOffsetDist / OffsetSerchDist);
+			// 	});
+			// }
+			// float OffsetSerchDist = 50;
+			FVector VertexLocation = (*Line.Path)[i];
+			FRandomStream Random(123 * VertexLocation.X * i);
+			const FVector RandomOffset = Random.VRand();
+			FRandomStream RandomDist(.012385 * VertexLocation.X * i);
+			// const float RandomOffsetDist = RandomDist.FRand() * OffsetSerchDist;
+			// VertexLocation += RandomOffset * RandomOffsetDist;
+			FGeometryScriptTrianglePoint NearestPoint;
+			EGeometryScriptSearchOutcomePins Outcome;
+			UGeometryScriptLibrary_MeshSpatial::FindNearestPointOnMesh(
+			PrefixMesh, BVH, VertexLocation, Options, NearestPoint, Outcome, nullptr);
+			FVector Normal;
+			PrefixMesh->ProcessMesh([&](const FDynamicMesh3& EditMesh)
 			{
-				float OffsetSerchDist = 50;
-				FVector VertexLocation = (*Line.Path)[i];
-				FRandomStream Random(123 * VertexLocation.X * i);
-				const FVector RandomOffset = Random.VRand();
-				FRandomStream RandomDist(.012385 * VertexLocation.X * i);
-				const float RandomOffsetDist = RandomDist.FRand() * OffsetSerchDist;
-				VertexLocation += RandomOffset * RandomOffsetDist;
-				FGeometryScriptTrianglePoint NearestPoint;
-				EGeometryScriptSearchOutcomePins Outcome;
-				UGeometryScriptLibrary_MeshSpatial::FindNearestPointOnMesh(
-				PrefixMesh, BVH, VertexLocation, Options, NearestPoint, Outcome, nullptr);
-				PrefixMesh->ProcessMesh([&](const FDynamicMesh3& EditMesh)
-				{
-					//Sometimes it will Calculates a downward normal it is wrong
-					//FVector Normal = EditMesh.GetTriBaryNormal(NearestPoint.TriangleID, NearestPoint.BaryCoords[0], NearestPoint.BaryCoords[1], NearestPoint.BaryCoords[2]);
-					FVector Normal = EditMesh.GetTriNormal(NearestPoint.TriangleID);
-					NormalSum += Normal * (RandomOffsetDist / OffsetSerchDist);
-				});
-			}
-			NormalSum.Normalize();
-			FVector& VertexLocation = (*Line.Path)[i];
-			VertexLocation += NormalSum * VineOffset;
-			VertexLocation.Z += FMath::FRandRange(0, 0.1);
+				//Sometimes it will Calculates a downward normal it is wrong
+				//FVector Normal = EditMesh.GetTriBaryNormal(NearestPoint.TriangleID, NearestPoint.BaryCoords[0], NearestPoint.BaryCoords[1], NearestPoint.BaryCoords[2]);
+				Normal = EditMesh.GetTriNormal(NearestPoint.TriangleID);
+				//NormalSum += Normal * (RandomOffsetDist / OffsetSerchDist);
+			});
+			FVector& VertexLocationFix = (*Line.Path)[i];
+			VertexLocationFix += Normal * VineOffset;
+			VertexLocationFix.Z += FMath::FRandRange(0, 0.1);
 		}
 		Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
 		Line = UPolyLine::SmoothLine(Line, 1);

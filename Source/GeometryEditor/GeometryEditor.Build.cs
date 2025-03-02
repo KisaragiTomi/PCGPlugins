@@ -2,11 +2,10 @@
 
 using UnrealBuildTool;
 
-public class VDBExtra : ModuleRules
+public class GeometryEditor : ModuleRules
 {
-	public VDBExtra(ReadOnlyTargetRules Target) : base(Target)
+	public GeometryEditor(ReadOnlyTargetRules Target) : base(Target)
 	{
-		bUseRTTI = true;
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 
 		PublicIncludePaths.AddRange(
@@ -51,7 +50,6 @@ public class VDBExtra : ModuleRules
 				"MeshConversion",
 				"MeshDescription",
 				"GeometryScriptingCore",
-				"ProxyLODMeshReduction",
 				// ... add other public dependencies that you statically link with here ...
 			}
 			);
@@ -60,21 +58,22 @@ public class VDBExtra : ModuleRules
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
-				"CoreUObject",
 				"Engine",
 				"Slate",
-				"ProxyLODMeshReduction",
+				"UnrealEd",
 				"SlateCore",
+				"LevelEditor",
+				"ModelingOperators",
+				"CoreUObject",
+				"DeveloperSettings",
+				"GeometryAlgorithms",
+				"GeometryCore",
+				"GeometryFramework",
+				"Projects",
+				"ModelingComponentsEditorOnly"
 				// ... add private dependencies that you statically link with here ...	
 			}
 			);
 		
-		
-		AddEngineThirdPartyPrivateStaticDependencies(Target,
-			"IntelTBB",
-			"UVAtlas",
-			"DirectXMesh",
-			"OpenVDB"
-		);
 	}
 }

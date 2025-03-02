@@ -23,17 +23,17 @@
     },
     {
       "Name": "GeometryMath",
-      "Type": "Editor",
-      "LoadingPhase": "Default"
-    },
-    {
-      "Name": "VDBExtra",
       "Type": "Runtime",
       "LoadingPhase": "Default"
     },
     {
-      "Name": "GeometryScriptExtra",
+      "Name": "GeometryEditor",
       "Type": "Editor",
+      "LoadingPhase": "Default"
+    },
+    {
+      "Name": "GeometryScriptExtra",
+      "Type": "Runtime",
       "LoadingPhase": "Default"
     }
   ],

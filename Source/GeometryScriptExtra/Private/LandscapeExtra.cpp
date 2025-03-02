@@ -8,10 +8,11 @@
 #include "DynamicMeshEditor.h"
 #include "DynamicMesh/MeshTransforms.h"
 #include "EngineUtils.h"
+#include "LandscapeEdit.h"
 
 using namespace UE::Geometry;
 
-#if WITH_EDITOR
+// #if WITH_EDITOR
 
 struct FSafeIndices
 {
@@ -146,8 +147,8 @@ UDynamicMesh* ULandscapeExtra::CreateProjectPlane(UDynamicMesh* Mesh, FVector Ce
 	int32 XNum = KeyMax.X - KeyMin.X;
 	int32 YNum = KeyMax.Y - KeyMin.Y;
 	int32 NumVertices = XNum * YNum;
-
-
+	
+	
 	FRectangleMeshGenerator RectGenerator;
 	RectGenerator.Origin = FVector3d(0, 0, 0);
 	RectGenerator.Normal = FVector3f::UnitZ();
@@ -157,10 +158,22 @@ UDynamicMesh* ULandscapeExtra::CreateProjectPlane(UDynamicMesh* Mesh, FVector Ce
 	RectGenerator.HeightVertexCount = FMath::Max(0, YNum);
 	RectGenerator.bSinglePolyGroup = true;
 	RectGenerator.Generate();
-
+	
 	FGeometryScriptPrimitiveOptions PrimitiveOptions;
 	AppendPrimitive(PlaneMesh, &RectGenerator, FTransform::Identity, PrimitiveOptions);
-
+	
+	// TArray<uint16> Values;
+	// Values.AddZeroed(NumVertices);
+	//
+	// FScopedSetLandscapeEditingLayer Scope(Landscape, Landscape->GetLayer(0)->Guid, [&] { /*Landscape->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_All); */});
+	//
+	// FLandscapeEditDataInterface LandscapeEdit(Landscape->GetLandscapeInfo());
+	// LandscapeEdit.SetShouldDirtyPackage(false);
+	// LandscapeEdit.GetHeightDataFast(KeyMin.X, KeyMin.Y, KeyMax.X, KeyMax.Y, Values.GetData(), 0);
+	//
+	int32 FindIndex = 0;
+	TArray<FVector> Test;
+	Test.Reserve(NumVertices);
 	TArray<FVector> Vertices;
 	Vertices.Reserve(NumVertices);
 	for (int32 j = KeyMin.Y; j < KeyMax.Y; j++)
@@ -183,13 +196,19 @@ UDynamicMesh* ULandscapeExtra::CreateProjectPlane(UDynamicMesh* Mesh, FVector Ce
 			FIntPoint ComponentLocation (i - ComponentMapKey.X * ComponentSizeQuads, j - ComponentMapKey.Y * ComponentSizeQuads);
 			FColor* Data = CDI.GetHeightData(ComponentLocation.X, ComponentLocation.Y);
 			float Height = LandscapeDataAccess::UnpackHeight(*Data);
-
-				
+			
+			
 			FVector LandscapePosition = FVector(i , j , Height);
 			Vertices.Add(LandscapePosition);
+
+			FindIndex = (j - KeyMin.Y) * YNum + (i - KeyMin.X);
+			// Test.Add(FVector(i , j , LandscapeDataAccess::GetLocalHeight(Values[FindIndex])));
+
+			// FVector LandscapePosition = FVector(i , j , LandscapeDataAccess::GetLocalHeight(Values[(j- KeyMin.Y) * YNum + (i - KeyMin.X)]));
+			// Vertices.Add(LandscapePosition);
 		}
 	}
-	
+
 	PlaneMesh->EditMesh([&](FDynamicMesh3& EditMesh)
 	{
 		for (int32 i = 0; i < NumVertices; i++)
@@ -202,7 +221,9 @@ UDynamicMesh* ULandscapeExtra::CreateProjectPlane(UDynamicMesh* Mesh, FVector Ce
 		}
 		MeshTransforms::ApplyTransform(EditMesh, (FTransformSRT3d)(Landscape->GetTransform()), true);
 	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
-
+	Test.Empty();
+	// Values.Empty();
+	Vertices.Empty();
 	FDynamicMesh3 MeshCopy;
 	PlaneMesh->ProcessMesh([&](const FDynamicMesh3& EditMesh)
 	{
@@ -289,4 +310,4 @@ bool ULandscapeExtra::ProjectPoint(FVector SourceLocation, FVector& OutLocation,
 	return true;
 }
 
-#endif
+// #endif

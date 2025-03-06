@@ -186,7 +186,7 @@ UDynamicMesh* UGeometryGeneral::PrimNormal(UDynamicMesh* TargetMesh, FVector Tes
 	return TargetMesh;
 }
 
-FVector UE::Geometry::GetNearestLocationNormal(FDynamicMesh3& EditMesh, FGeometryScriptTrianglePoint NearestPoint)
+FVector UGeometryGeneral::GetNearestLocationNormal(FDynamicMesh3& EditMesh, FGeometryScriptTrianglePoint NearestPoint)
 {
 	if (EditMesh.HasVertexNormals())
 	{

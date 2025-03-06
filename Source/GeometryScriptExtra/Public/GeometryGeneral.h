@@ -15,10 +15,6 @@
  * 
  */
 
-namespace UE::Geometry
-{
-	static FVector GetNearestLocationNormal(FDynamicMesh3& EditMesh, FGeometryScriptTrianglePoint NearestPoint);
-}
 
 UCLASS()
 class GEOMETRYSCRIPTEXTRA_API UGeometryGeneral : public UBlueprintFunctionLibrary
@@ -41,4 +37,5 @@ public:
 	static UDynamicMesh* PrimNormal(UDynamicMesh* TargetMesh, FVector TestPos, FVector& OutVector);
 
 
+	static FVector GetNearestLocationNormal(FDynamicMesh3& EditMesh, FGeometryScriptTrianglePoint NearestPoint);
 };

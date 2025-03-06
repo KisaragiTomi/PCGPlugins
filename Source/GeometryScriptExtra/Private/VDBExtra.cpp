@@ -242,7 +242,7 @@ void UVDBExtra::FixConvertMesh(UDynamicMesh* TargetMesh, UDynamicMesh* SourceMes
 			UGeometryScriptLibrary_MeshSpatial::FindNearestPointOnMesh(
 			SourceMesh, BVH, Location, Options, NearestPoint, Outcome, nullptr);
 			FVector NearestLocation = NearestPoint.Position;
-			FVector N = GetNearestLocationNormal(EditMesh, NearestPoint);
+			FVector N = UGeometryGeneral::GetNearestLocationNormal(EditMesh, NearestPoint);
 			FVector Dir = Location - NearestLocation;
 			Dir.Normalize();
 			if (FVector::DotProduct(N, Dir) < 0.0f)

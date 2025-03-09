@@ -235,6 +235,7 @@ UDynamicMesh* ULandscapeExtra::CreateProjectPlane(UDynamicMesh* Mesh, FVector Ce
 
 bool ULandscapeExtra::ProjectPoint(FVector SourceLocation, FVector& OutLocation, FVector& OutNormal)
 {
+	
 	OutLocation = FVector::ZeroVector;
 	OutNormal = FVector::ZeroVector;
 	ALandscape* Landscape = nullptr;

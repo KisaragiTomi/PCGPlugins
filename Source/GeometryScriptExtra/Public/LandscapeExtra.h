@@ -20,10 +20,10 @@ class GEOMETRYSCRIPTEXTRA_API ULandscapeExtra : public UBlueprintFunctionLibrary
 {
 	GENERATED_BODY()
 public:
-	UFUNCTION(BlueprintCallable, Category = PolyLine)
+	UFUNCTION(BlueprintCallable, Category = Landscape)
 	static UDynamicMesh* CreateProjectPlane(UDynamicMesh* Mesh, FVector Center, FVector Extent, int32 ExtentPlus = 1);
 
-	UFUNCTION(BlueprintCallable, Category = PolyLine)
+	UFUNCTION(BlueprintCallable, Category = Landscape)
 	static bool ProjectPoint(FVector SourceLocation, FVector& OutLocation, FVector& OutNormal);
 
 };

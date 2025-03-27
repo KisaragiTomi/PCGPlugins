@@ -365,7 +365,7 @@ TArray<FLinearColor> ULandscapeExtra::GetLandscapeData( FVector Center, FVector 
 	
 }
 
-TArray<FLinearColor> ULandscapeExtra::CreateLandscapeTextureData(FVector& MapMin, FVector& MapMax, FVector Center, FVector Extent, int32 TextureSize, int32 ExtentPlus)
+TArray<FLinearColor> ULandscapeExtra::CreateLandscapeTextureData(FIntVector4& OutSize, FVector& MapMin, FVector& MapMax, FVector Center, FVector Extent, int32 TextureSize, int32 ExtentPlus)
 {
 	
 	TArray<FLinearColor> OutHeightNormals;
@@ -416,23 +416,32 @@ TArray<FLinearColor> ULandscapeExtra::CreateLandscapeTextureData(FVector& MapMin
 	LandscapeEdit.GetHeightDataFast(X1, Y1, X2, Y2, (uint16*)Values.GetData(), 0);
 
 
-	int32 NumPixel = 0;
+	int32 NumPixelX = 0;
 	for (int i = 4; i < 12; i ++)
 	{
-		if (FMath::Pow(2.0, i) >= XNum)
+		if (1 << i >= XNum)
 		{
-			NumPixel = FMath::Pow(2.0, i);
+			NumPixelX = 1 << i;
 			break;
 		}
 	}
-	if (NumPixel == 0) return OutHeightNormals;
-	
-	int32 NumPixelX = NumPixel;
-	NumPixel = FMath::Pow(NumPixel, 2.0);
+	if (NumPixelX == 0) return OutHeightNormals;
+
+	int32 NumPixelY = 0;
+	for (int i = 4; i < 12; i ++)
+	{
+		if (1 << i >= XNum)
+		{
+			NumPixelY = 1 << i;
+			break;
+		}
+	}
+	if (NumPixelY == 0) return OutHeightNormals;
+
 	
 	TMap<FIntPoint, FLinearColor> MapHeightNormals;
 	TArray<FLinearColor> HeightNormals;
-	HeightNormals.AddZeroed(NumPixel);
+	HeightNormals.AddZeroed(NumPixelX * NumPixelY);
 	for (int32 j = YMin; j < YMax; j++)
 	{
 		for (int32 i = XMin; i < XMax; i++)
@@ -457,51 +466,9 @@ TArray<FLinearColor> ULandscapeExtra::CreateLandscapeTextureData(FVector& MapMin
 		}
 	}
 	
-	//
-	// OutHeightNormals.Reserve(TextureSize * TextureSize);
-	// for (int32 Y = 0; Y < TextureSize; Y++)
-	// {
-	// 	for (int32 X = 0; X < TextureSize; X++)
-	// 	{
-	// 		FVector CurrentPostion = Min + FVector(X / (TextureSize - 1.0), Y / (TextureSize - 1.0), 0) * (Max - Min);
-	// 		
-	// 		FVector LocalPoint = Landscape->GetTransform().InverseTransformPosition(CurrentPostion);
-	// 		int32 CellMaxX = FMath::CeilToInt(LocalPoint.X);
-	// 		int32 CellMaxY = FMath::CeilToInt(LocalPoint.Y);
-	// 		int32 CellMinX = FMath::Floor(LocalPoint.X);
-	// 		int32 CellMinY = FMath::Floor(LocalPoint.Y);
-	// 		
-	// 		float XFraction = FMath::Fractional(CurrentPostion.X);
-	// 		float YFraction = FMath::Fractional(CurrentPostion.Y);
-	//
-	// 		FLinearColor Color00 = *MapHeightNormals.Find(FIntPoint(CellMinX, CellMinY));
-	// 		FLinearColor Color10 = *MapHeightNormals.Find(FIntPoint(CellMaxX, CellMinY));
-	// 		FLinearColor Color01 = *MapHeightNormals.Find(FIntPoint(CellMinX, CellMaxY));
-	// 		FLinearColor Color11 = *MapHeightNormals.Find(FIntPoint(CellMaxX, CellMaxY));
-	// 		
-	// 		FVector WorldPos00 = Landscape->GetTransform().TransformPosition(FVector(CellMinX, CellMinY, Color00.A));
-	// 		FVector WorldPos10 = Landscape->GetTransform().TransformPosition(FVector(CellMaxX, CellMinY, Color10.A));
-	// 		FVector WorldPos01 = Landscape->GetTransform().TransformPosition(FVector(CellMinX, CellMaxY, Color01.A));
-	// 		FVector WorldPos11 = Landscape->GetTransform().TransformPosition(FVector(CellMaxX, CellMaxY, Color11.A));
-	//
-	// 		FVector Normal00 = FVector(Color00.R, Color00.G, Color00.B);
-	// 		FVector Normal10 = FVector(Color10.R, Color10.G, Color10.B);
-	// 		FVector Normal01 = FVector(Color01.R, Color01.G, Color01.B);
-	// 		FVector Normal11 = FVector(Color11.R, Color11.G, Color11.B);
-	// 		
-	// 		const FVector LerpPositionY0 = FMath::Lerp(WorldPos00, WorldPos10, XFraction);
-	// 		const FVector LerpPositionY1 = FMath::Lerp(WorldPos01, WorldPos11, XFraction);
-	// 		const FVector Position = FMath::Lerp(LerpPositionY0, LerpPositionY1, YFraction);
-	// 		const FVector LerpNormalY0 = FMath::Lerp(Normal00, Normal10, XFraction).GetSafeNormal();
-	// 		const FVector LerpNormalY1 = FMath::Lerp(Normal01, Normal11, XFraction).GetSafeNormal();
-	// 		const FVector Normal = Normal11;
-	// 		
-	// 		OutHeightNormals.Add(FLinearColor(Normal.X, Normal.Y, Normal.Z, Position.Z));
-	// 	}
-	// }
-	
 	MapMin = Landscape->GetTransform().TransformPosition(FVector(XMin - .5, YMin - .5, 0));
-	MapMax = Landscape->GetTransform().TransformPosition(FVector(NumPixelX + XMin -.5, NumPixelX + YMin - .5, 0));
+	MapMax = Landscape->GetTransform().TransformPosition(FVector(NumPixelX + XMin -.5, NumPixelY + YMin - .5, 0));
+	OutSize = FIntVector4(XNum, YNum, NumPixelX, NumPixelY);
 	return  HeightNormals;
 }
 

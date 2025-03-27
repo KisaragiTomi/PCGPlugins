@@ -30,7 +30,8 @@ public:
 	static TArray<FLinearColor> GetLandscapeData(FVector Center, FVector Extent, int32 ExtentPlus = 1);
 	
 	UFUNCTION(BlueprintCallable, Category = Landscape)
-	static TArray<FLinearColor> CreateLandscapeTextureData(FVector& MapMin, FVector& MapMax, FVector Center, FVector Extent, int32 TextureSize = 256, int32 ExtentPlus = 1);
+	static TArray<FLinearColor> CreateLandscapeTextureData(FIntVector4& OutSize, FVector& MapMin, FVector& MapMax, FVector Center, FVector Extent, int32 TextureSize = 256, int32
+	                                                       ExtentPlus = 1);
 
 	UFUNCTION(BlueprintCallable, Category = Landscape)
 	static TArray<FLinearColor> CreateLandscapeMeshTextureData(FVector& MapMin, FVector& MapMax, FVector Center, FVector Extent, int32 TextureSize = 256, int32 ExtentPlus = 1);

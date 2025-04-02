@@ -262,7 +262,7 @@ UDynamicMesh* UGeometryGenerate::ExtrudeUnclosedBoundary(UDynamicMesh* FixMesh, 
 
 		UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendSweepPolyline(
 			BoundaryMesh, PrimitiveOptions, FTransform::Identity, PolylineVertices, PathTransforms, PolylineTexParamU,
-			PathTexParamV, true, 1, 1, 0, nullptr);
+			PathTexParamV, true, 1, 1, 0);
 
 		UDynamicMesh* FillFanMesh = NewObject<UDynamicMesh>();
 		
@@ -634,7 +634,7 @@ UDynamicMesh* UGeometryGenerate::FixUnclosedBoundary(UDynamicMesh* FixMesh, floa
 		
 		UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendSweepPolyline(
 			BoundaryMesh, PrimitiveOptions, FTransform::Identity, PolylineVertices, PathTransforms, PolylineTexParamU,
-			PathTexParamV, true, 1, 1, 0, nullptr);
+			PathTexParamV, true, 1, 1, 0);
 		FixMesh->EditMesh([&](FDynamicMesh3& FixEditMesh)
 		{
 			BoundaryMesh->EditMesh([&](FDynamicMesh3& EditMesh)

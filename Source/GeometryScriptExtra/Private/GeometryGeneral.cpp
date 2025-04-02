@@ -22,8 +22,6 @@ UDynamicMesh* UGeometryGeneral::BlurVertexNormals(UDynamicMesh* TargetMesh, int3
 		UGeometryScriptLibrary_MeshNormalsFunctions::RecomputeNormals(TargetMesh, CalculateOptions);
 	}
 	
-	FVector3f normaltestpre;
-	FVector3f normaltestaffter;
 	TargetMesh->EditMesh([&](FDynamicMesh3& EditMesh) 
 	{
 		FDynamicMeshNormalOverlay* Normals = EditMesh.Attributes()->PrimaryNormals();

@@ -340,7 +340,6 @@ void ULandscapeExtra::CreateLandscapeTextureData(FReadLandscapeData& LandscapeDa
 	TArray<uint16> Values;
 	Values.AddZeroed(NumVertices );
 	
-	FScopedSetLandscapeEditingLayer Scope(Landscape, Landscape->GetLayer(0)->Guid, [&] { /*Landscape->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_All); */});
 
 	int32 X1 = KeyMin.X;
 	int32 Y1 = KeyMin.Y;

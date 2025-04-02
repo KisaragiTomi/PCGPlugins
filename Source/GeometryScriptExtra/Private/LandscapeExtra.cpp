@@ -4,6 +4,7 @@
 #include "Generators/RectangleMeshGenerator.h"
 #include "GeometryScript/GeometryScriptTypes.h"
 #include "GeometryScript/MeshPrimitiveFunctions.h"
+#include "GeometryGeneral.h"
 #include "UDynamicMesh.h"
 #include "DynamicMeshEditor.h"
 #include "DynamicMesh/MeshTransforms.h"
@@ -49,73 +50,7 @@ static FSafeIndices CalcSafeIndices(FVector2D LocalPoint, int32 Stride)
 	return Result;
 }
 
-static void ApplyPrimitiveOptionsToMesh(
-	FDynamicMesh3& Mesh, const FTransform& Transform, 
-	FGeometryScriptPrimitiveOptions PrimitiveOptions, 
-	FVector3d PreTranslate = FVector3d::Zero(),
-	TOptional<FQuaterniond> PreRotate = TOptional<FQuaterniond>())
-{
-	bool bHasTranslate = PreTranslate.SquaredLength() > 0;
-	if (PreRotate.IsSet())
-	{
-		FFrame3d Frame(PreTranslate, *PreRotate);
-		MeshTransforms::FrameCoordsToWorld(Mesh, Frame);
-	}
-	else if (bHasTranslate)
-	{
-		MeshTransforms::Translate(Mesh, PreTranslate);
-	}
-
-	MeshTransforms::ApplyTransform(Mesh, (FTransformSRT3d)Transform, true);
-	if (PrimitiveOptions.PolygroupMode == EGeometryScriptPrimitivePolygroupMode::SingleGroup)
-	{
-		for (int32 tid : Mesh.TriangleIndicesItr())
-		{
-			Mesh.SetTriangleGroup(tid, 0);
-		}
-	}
-	if (PrimitiveOptions.bFlipOrientation)
-	{
-		Mesh.ReverseOrientation(true);
-		if (Mesh.HasAttributes())
-		{
-			FDynamicMeshNormalOverlay* Normals = Mesh.Attributes()->PrimaryNormals();
-			for (int elemid : Normals->ElementIndicesItr())
-			{
-				Normals->SetElement(elemid, -Normals->GetElement(elemid));
-			}
-		}
-	}
-}
-
-static void AppendPrimitive(
-	UDynamicMesh* TargetMesh,
-	FMeshShapeGenerator* Generator, 
-	FTransform Transform, 
-	FGeometryScriptPrimitiveOptions PrimitiveOptions,
-	FVector3d PreTranslate = FVector3d::Zero(),
-	TOptional<FQuaterniond> PreRotate = TOptional<FQuaterniond>())
-{
-	if (TargetMesh->IsEmpty())
-	{
-		TargetMesh->EditMesh([&](FDynamicMesh3& EditMesh)
-		{
-			EditMesh.Copy(Generator);
-			ApplyPrimitiveOptionsToMesh(EditMesh, Transform, PrimitiveOptions, PreTranslate, PreRotate);
-		}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
-	}
-	else
-	{
-		FDynamicMesh3 TempMesh(Generator);
-		ApplyPrimitiveOptionsToMesh(TempMesh, Transform, PrimitiveOptions, PreTranslate, PreRotate);
-		TargetMesh->EditMesh([&](FDynamicMesh3& EditMesh)
-		{
-			FMeshIndexMappings TmpMappings;
-			FDynamicMeshEditor Editor(&EditMesh);
-			Editor.AppendMesh(&TempMesh, TmpMappings);
-		}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
-	}
-}
+ 
 
 UDynamicMesh* ULandscapeExtra::CreateProjectPlane(UDynamicMesh* Mesh, FVector Center, FVector Extent, int32 ExtentPlus)
 {
@@ -161,7 +96,7 @@ UDynamicMesh* ULandscapeExtra::CreateProjectPlane(UDynamicMesh* Mesh, FVector Ce
 	RectGenerator.Generate();
 	
 	FGeometryScriptPrimitiveOptions PrimitiveOptions;
-	AppendPrimitive(PlaneMesh, &RectGenerator, FTransform::Identity, PrimitiveOptions);
+	UGeometryGeneral::AppendPrimitive(PlaneMesh, &RectGenerator, FTransform::Identity, PrimitiveOptions);
 	
 	TArray<uint16> Values;
 	Values.AddZeroed(NumVertices );
@@ -324,8 +259,8 @@ TArray<FLinearColor> ULandscapeExtra::GetLandscapeData( FVector Center, FVector 
 	int32 YNum = KeyMax.Y - KeyMin.Y;
 	int32 NumVertices = XNum * YNum;
 	
-	TArray<uint16> Values;
-	Values.AddZeroed(NumVertices );
+	TArray<uint16> HeightValues;
+	HeightValues.AddZeroed(NumVertices );
 	
 	FScopedSetLandscapeEditingLayer Scope(Landscape, Landscape->GetLayer(0)->Guid, [&] { /*Landscape->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_All); */});
 	
@@ -335,7 +270,7 @@ TArray<FLinearColor> ULandscapeExtra::GetLandscapeData( FVector Center, FVector 
 	int32 Y2 = KeyMax.Y - 1;
 	FLandscapeEditDataInterface LandscapeEdit(Landscape->GetLandscapeInfo());
 	LandscapeEdit.SetShouldDirtyPackage(false);
-	LandscapeEdit.GetHeightDataFast(X1, Y1, X2, Y2, (uint16*)Values.GetData(), 0);
+	LandscapeEdit.GetHeightDataFast(X1, Y1, X2, Y2, (uint16*)HeightValues.GetData(), 0);
 	
 	TArray<FLinearColor> HeightNormals;
 	HeightNormals.Reserve(NumVertices);
@@ -343,17 +278,17 @@ TArray<FLinearColor> ULandscapeExtra::GetLandscapeData( FVector Center, FVector 
 	{
 		for (int32 i = KeyMin.X; i < KeyMax.X; i++)
 		{
-			FVector LandscapePosition = FVector(i , j , LandscapeDataAccess::GetLocalHeight(Values[(j- KeyMin.Y) * XNum + (i - KeyMin.X)]));
+			FVector LandscapePosition = FVector(i , j , LandscapeDataAccess::GetLocalHeight(HeightValues[(j- KeyMin.Y) * XNum + (i - KeyMin.X)]));
 			
 			int xPrev = (i == X1) ? KeyMin.X : i - 1;
 			int xNext = (i == X2) ? i : i + 1;
 			int yPrev = (j == Y1) ? KeyMin.Y : j - 1;
 			int yNext = (j == Y2) ? j : j + 1;
 			
-			FVector LandscapePositionXN = FVector(xNext , j , LandscapeDataAccess::GetLocalHeight(Values[(j- KeyMin.Y) * XNum + (xNext - KeyMin.X)]));
-			FVector LandscapePositionXP = FVector(xPrev , j , LandscapeDataAccess::GetLocalHeight(Values[(j- KeyMin.Y) * XNum + (xPrev - KeyMin.X)]));
-			FVector LandscapePositionYN = FVector(i , yNext , LandscapeDataAccess::GetLocalHeight(Values[(yNext- KeyMin.Y) * XNum + (i - KeyMin.X)]));
-			FVector LandscapePositionYP = FVector(i , yPrev , LandscapeDataAccess::GetLocalHeight(Values[(yPrev- KeyMin.Y) * XNum + (i - KeyMin.X)]));
+			FVector LandscapePositionXN = FVector(xNext , j , LandscapeDataAccess::GetLocalHeight(HeightValues[(j- KeyMin.Y) * XNum + (xNext - KeyMin.X)]));
+			FVector LandscapePositionXP = FVector(xPrev , j , LandscapeDataAccess::GetLocalHeight(HeightValues[(j- KeyMin.Y) * XNum + (xPrev - KeyMin.X)]));
+			FVector LandscapePositionYN = FVector(i , yNext , LandscapeDataAccess::GetLocalHeight(HeightValues[(yNext- KeyMin.Y) * XNum + (i - KeyMin.X)]));
+			FVector LandscapePositionYP = FVector(i , yPrev , LandscapeDataAccess::GetLocalHeight(HeightValues[(yPrev- KeyMin.Y) * XNum + (i - KeyMin.X)]));
 			FVector DX = (LandscapePositionXN - LandscapePositionXP).GetSafeNormal();
 			FVector DY = (LandscapePositionYN - LandscapePositionYP).GetSafeNormal();
 			FVector Normal = FVector::CrossProduct(DX, DY).GetSafeNormal();
@@ -365,7 +300,7 @@ TArray<FLinearColor> ULandscapeExtra::GetLandscapeData( FVector Center, FVector 
 	
 }
 
-TArray<FLinearColor> ULandscapeExtra::CreateLandscapeTextureData(FIntVector4& OutSize, FVector& MapMin, FVector& MapMax, FVector Center, FVector Extent, int32 TextureSize, int32 ExtentPlus)
+void ULandscapeExtra::CreateLandscapeTextureData(FReadLandscapeData& LandscapeData, FVector Center, FVector Extent, int32 ExtentPlus)
 {
 	
 	TArray<FLinearColor> OutHeightNormals;
@@ -373,7 +308,7 @@ TArray<FLinearColor> ULandscapeExtra::CreateLandscapeTextureData(FIntVector4& Ou
 	const FVector Max = Center + Extent;
 	if (Extent.Length() < .001)
 	{
-		return OutHeightNormals;
+		return;
 	}
 	ALandscape* Landscape = nullptr;
 	if (UWorld* World = GEngine->GetWorldFromContextObject(GWorld, EGetWorldErrorMode::LogAndReturnNull))
@@ -386,7 +321,7 @@ TArray<FLinearColor> ULandscapeExtra::CreateLandscapeTextureData(FIntVector4& Ou
 	}
 	if (!Landscape)
 	{
-		return OutHeightNormals;
+		return;
 	}
 	const ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo();
 	const FVector MaxLocalPoint = Landscape->GetTransform().InverseTransformPosition(Max);
@@ -417,7 +352,7 @@ TArray<FLinearColor> ULandscapeExtra::CreateLandscapeTextureData(FIntVector4& Ou
 
 
 	int32 NumPixelX = 0;
-	for (int i = 4; i < 12; i ++)
+	for (int i = 5; i < 12; i ++)
 	{
 		if (1 << i >= XNum)
 		{
@@ -425,23 +360,25 @@ TArray<FLinearColor> ULandscapeExtra::CreateLandscapeTextureData(FIntVector4& Ou
 			break;
 		}
 	}
-	if (NumPixelX == 0) return OutHeightNormals;
+	if (NumPixelX == 0) return;
 
 	int32 NumPixelY = 0;
-	for (int i = 4; i < 12; i ++)
+	for (int i = 5; i < 12; i ++)
 	{
-		if (1 << i >= XNum)
+		if (1 << i >= YNum)
 		{
 			NumPixelY = 1 << i;
 			break;
 		}
 	}
-	if (NumPixelY == 0) return OutHeightNormals;
+	if (NumPixelY == 0) return;
 
 	
 	TMap<FIntPoint, FLinearColor> MapHeightNormals;
 	TArray<FLinearColor> HeightNormals;
+	TArray<FLinearColor> ValidHeightNormals;
 	HeightNormals.AddZeroed(NumPixelX * NumPixelY);
+	ValidHeightNormals.Reserve(XNum * YNum);
 	for (int32 j = YMin; j < YMax; j++)
 	{
 		for (int32 i = XMin; i < XMax; i++)
@@ -460,16 +397,32 @@ TArray<FLinearColor> ULandscapeExtra::CreateLandscapeTextureData(FIntVector4& Ou
 			FVector DX = (LandscapePositionXN - LandscapePositionXP).GetSafeNormal();
 			FVector DY = (LandscapePositionYN - LandscapePositionYP).GetSafeNormal();
 			FVector Normal = FVector::CrossProduct(DX, DY).GetSafeNormal();
-			HeightNormals[i - XMin + (j - YMin) * NumPixelX] = (FLinearColor(Normal.X, Normal.Y, Normal.Z, LandscapePosition.Z));
+			HeightNormals[i - XMin + (j - YMin) * NumPixelX] = FLinearColor(Normal.X, Normal.Y, Normal.Z, LandscapePosition.Z);
 			MapHeightNormals.Add(FIntPoint(i, j), FLinearColor(Normal.X, Normal.Y, Normal.Z, LandscapePosition.Z));
-			
+			ValidHeightNormals.Add(FLinearColor(Normal.X, Normal.Y, Normal.Z, LandscapePosition.Z));
 		}
 	}
-	
-	MapMin = Landscape->GetTransform().TransformPosition(FVector(XMin - .5, YMin - .5, 0));
-	MapMax = Landscape->GetTransform().TransformPosition(FVector(NumPixelX + XMin -.5, NumPixelY + YMin - .5, 0));
-	OutSize = FIntVector4(XNum, YNum, NumPixelX, NumPixelY);
-	return  HeightNormals;
+	TArray<FFloat16Color> HeightNormals16;
+	HeightNormals16.Reserve(HeightNormals.Num());
+	for (int32 i = 0; i < HeightNormals.Num(); i++)
+	{
+		FFloat16Color Color = HeightNormals[i];
+		HeightNormals16.Add(Color);
+	}
+	LandscapeData.Colors16 = HeightNormals16;
+	LandscapeData.ValidColors = ValidHeightNormals;
+	LandscapeData.Colors = HeightNormals;
+	LandscapeData.MapMin = Landscape->GetTransform().TransformPosition(FVector(XMin - .5, YMin - .5, 0)) + Max * FVector(0, 0, 1);
+	LandscapeData.MapMax = Landscape->GetTransform().TransformPosition(FVector(NumPixelX + XMin -.5, NumPixelY + YMin - .5, 0)) + Min * FVector(0, 0, 1);
+	LandscapeData.ValidMapMin = Landscape->GetTransform().TransformPosition(FVector(XMin - .5, YMin - .5, 0));
+	LandscapeData.ValidMapMax = Landscape->GetTransform().TransformPosition(FVector(XNum + XMin- .5, YNum + YMin - .5, 0));
+	LandscapeData.TextureSize = FIntVector2(NumPixelX, NumPixelY);
+	LandscapeData.TextureVaildSize = FIntVector2(XNum, YNum);
+	LandscapeData.ValidUVRange = FVector2f(XNum / float(NumPixelX), YNum / float(NumPixelY));
+	LandscapeData.ReadRange = FIntVector4(X1, Y1, X2, Y2);
+	LandscapeData.Transform = Landscape->GetTransform();
+	LandscapeData.TextureBounds = FBoxSphereBounds(FBox(LandscapeData.MapMin + .5, LandscapeData.MapMax + .5));
+	LandscapeData.ValidTextureBounds = FBoxSphereBounds(FBox(LandscapeData.ValidMapMin + .5, LandscapeData.ValidMapMax + .5));
 }
 
 TArray<FLinearColor> ULandscapeExtra::CreateLandscapeMeshTextureData(FVector& MapMin, FVector& MapMax, FVector Center,
@@ -518,7 +471,7 @@ TArray<FLinearColor> ULandscapeExtra::CreateLandscapeMeshTextureData(FVector& Ma
 	RectGenerator.Generate();
 	
 	FGeometryScriptPrimitiveOptions PrimitiveOptions;
-	AppendPrimitive(PlaneMesh, &RectGenerator, FTransform::Identity, PrimitiveOptions);
+	UGeometryGeneral::AppendPrimitive(PlaneMesh, &RectGenerator, FTransform::Identity, PrimitiveOptions);
 	
 	TArray<uint16> Values;
 	Values.AddZeroed(NumVertices );

@@ -6,7 +6,9 @@
 #include "DynamicMeshEditor.h"
 #include "UDynamicMesh.h"
 #include "DynamicMesh/MeshNormals.h"
+#include "DynamicMesh/MeshTransforms.h"
 #include "GeometryScript/MeshNormalsFunctions.h"
+#include "GeometryScript/MeshPrimitiveFunctions.h"
 #include "GeometryScript/MeshSpatialFunctions.h"
 #include "Operations/SmoothDynamicMeshAttributes.h"
 
@@ -215,5 +217,75 @@ FVector UGeometryGeneral::GetNearestLocationNormal(FDynamicMesh3& EditMesh, FGeo
 		N.Normalize();
 	
 		return N;
+	}
+}
+
+
+static void ApplyPrimitiveOptionsToMesh(
+	FDynamicMesh3& Mesh, const FTransform& Transform, 
+	FGeometryScriptPrimitiveOptions PrimitiveOptions, 
+	FVector3d PreTranslate = FVector3d::Zero(),
+	TOptional<FQuaterniond> PreRotate = TOptional<FQuaterniond>())
+{
+	bool bHasTranslate = PreTranslate.SquaredLength() > 0;
+	if (PreRotate.IsSet())
+	{
+		FFrame3d Frame(PreTranslate, *PreRotate);
+		MeshTransforms::FrameCoordsToWorld(Mesh, Frame);
+	}
+	else if (bHasTranslate)
+	{
+		MeshTransforms::Translate(Mesh, PreTranslate);
+	}
+
+	MeshTransforms::ApplyTransform(Mesh, (FTransformSRT3d)Transform, true);
+	if (PrimitiveOptions.PolygroupMode == EGeometryScriptPrimitivePolygroupMode::SingleGroup)
+	{
+		for (int32 tid : Mesh.TriangleIndicesItr())
+		{
+			Mesh.SetTriangleGroup(tid, 0);
+		}
+	}
+	if (PrimitiveOptions.bFlipOrientation)
+	{
+		Mesh.ReverseOrientation(true);
+		if (Mesh.HasAttributes())
+		{
+			FDynamicMeshNormalOverlay* Normals = Mesh.Attributes()->PrimaryNormals();
+			for (int elemid : Normals->ElementIndicesItr())
+			{
+				Normals->SetElement(elemid, -Normals->GetElement(elemid));
+			}
+		}
+	}
+}
+
+
+void UGeometryGeneral::AppendPrimitive(
+	UDynamicMesh* TargetMesh,
+	FMeshShapeGenerator* Generator, 
+	FTransform Transform, 
+	FGeometryScriptPrimitiveOptions PrimitiveOptions,
+	FVector3d PreTranslate,
+	TOptional<FQuaterniond> PreRotate)
+{
+	if (TargetMesh->IsEmpty())
+	{
+		TargetMesh->EditMesh([&](FDynamicMesh3& EditMesh)
+		{
+			EditMesh.Copy(Generator);
+			ApplyPrimitiveOptionsToMesh(EditMesh, Transform, PrimitiveOptions, PreTranslate, PreRotate);
+		}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+	}
+	else
+	{
+		FDynamicMesh3 TempMesh(Generator);
+		ApplyPrimitiveOptionsToMesh(TempMesh, Transform, PrimitiveOptions, PreTranslate, PreRotate);
+		TargetMesh->EditMesh([&](FDynamicMesh3& EditMesh)
+		{
+			FMeshIndexMappings TmpMappings;
+			FDynamicMeshEditor Editor(&EditMesh);
+			Editor.AppendMesh(&TempMesh, TmpMappings);
+		}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
 	}
 }

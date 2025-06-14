@@ -19,22 +19,26 @@
     {
       "Name": "FoliageCluster",
       "Type": "Editor",
-      "LoadingPhase": "Default"
+      "LoadingPhase": "Default",
+      "BlacklistTargets": ["Shipping"]
     },
     {
       "Name": "GeometryMath",
       "Type": "Runtime",
-      "LoadingPhase": "Default"
+      "LoadingPhase": "Default",
+      "BlacklistTargets": ["Shipping"]
     },
     {
       "Name": "GeometryEditor",
       "Type": "Editor",
-      "LoadingPhase": "Default"
+      "LoadingPhase": "Default",
+      "BlacklistTargets": ["Shipping"]
     },
     {
-      "Name": "GeometryScriptExtra",
-      "Type": "Runtime",
-      "LoadingPhase": "Default"
+      "Name": "GeometryScriptExtraEditor",
+      "Type": "Editor",
+      "LoadingPhase": "Default",
+      "BlacklistTargets": ["Shipping"]
     }
   ],
   "Plugins": [

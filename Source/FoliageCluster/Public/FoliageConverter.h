@@ -17,16 +17,47 @@
 /**
  * 
  */
+
+
+UCLASS()
+class FOLIAGECLUSTER_API AConvertFoliageInstanceContainer : public ADynamicMeshActor
+{
+	GENERATED_BODY()
+
+public:
+	AConvertFoliageInstanceContainer(const FObjectInitializer& ObjectInitializer);
+	// {
+	// 	FoliageInstanceContainer = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("FoliageInstanceContainer"));
+	// 	UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	// 	FoliageInstanceContainer->SetStaticMesh(Mesh);
+	// 	FoliageInstanceContainer->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Overlap);
+	// 	FoliageInstanceContainer->SetCollisionObjectType(ECollisionChannel::ECC_WorldDynamic);
+	// 	FoliageInstanceContainer->SetVisibility(false, false);
+	// 	FoliageInstanceContainer->SetHiddenInGame(true);
+	// 	SetRootComponent(FoliageInstanceContainer);
+	// }
+	UPROPERTY(BlueprintReadWrite, Category = "CubeAttrib")
+	UInstancedStaticMeshComponent* FoliageInstanceContainer;
+
+	UFUNCTION(BlueprintCallable, Category = Convert)
+	virtual void AddInstanceFromFoliageType(UFoliageType* InFoliageType);
+
+	UFUNCTION(BlueprintCallable, Category = Convert)
+	virtual void ConvertInstanceToFoliage(UFoliageType* InFoliageType);
+};
+
+
+
 UCLASS()
 class FOLIAGECLUSTER_API UFoliageConverter : public UBlueprintFunctionLibrary
 {
 	GENERATED_BODY()
 public:
 	UFUNCTION(BlueprintCallable, Category = FoliageExtra)
-	static void ConvertFoliageToInstanceComponent(UFoliageType* InFoliageType);
+	static void ConvertFoliageToInstanceComponent(UFoliageType* InFoliageType, AConvertFoliageInstanceContainer* Container);
 
 	UFUNCTION(BlueprintCallable, Category = FoliageExtra)
-	static void ConvertInstanceComponentToFoliage(UFoliageType* InFoliageType, UClass* ContainerClass);
+	static void ConvertInstanceComponentToFoliage(UFoliageType* InFoliageType, UClass* ContainerClass, AConvertFoliageInstanceContainer* Container);
 
 	UFUNCTION(BlueprintPure, Category = FoliageExtra)
 	static UStaticMesh* GetStaticMesh(UFoliageType* InFoliageType);
@@ -75,31 +106,3 @@ public:
 
 
 };
-
-UCLASS()
-class FOLIAGECLUSTER_API AConvertFoliageInstanceContainer : public ADynamicMeshActor
-{
-	GENERATED_BODY()
-
-public:
-	AConvertFoliageInstanceContainer(const FObjectInitializer& ObjectInitializer);
-	// {
-	// 	FoliageInstanceContainer = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("FoliageInstanceContainer"));
-	// 	UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
-	// 	FoliageInstanceContainer->SetStaticMesh(Mesh);
-	// 	FoliageInstanceContainer->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Overlap);
-	// 	FoliageInstanceContainer->SetCollisionObjectType(ECollisionChannel::ECC_WorldDynamic);
-	// 	FoliageInstanceContainer->SetVisibility(false, false);
-	// 	FoliageInstanceContainer->SetHiddenInGame(true);
-	// 	SetRootComponent(FoliageInstanceContainer);
-	// }
-	UPROPERTY(BlueprintReadWrite, Category = "CubeAttrib")
-	UInstancedStaticMeshComponent* FoliageInstanceContainer;
-
-	UFUNCTION(BlueprintCallable, Category = Convert)
-	virtual void AddInstanceFromFoliageType(UFoliageType* InFoliageType);
-
-	UFUNCTION(BlueprintCallable, Category = Convert)
-	virtual void ConvertInstanceToFoliage(UFoliageType* InFoliageType);
-};
-

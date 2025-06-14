@@ -27,29 +27,7 @@ public class GeometryEditor : ModuleRules
 		PublicDependencyModuleNames.AddRange(
 			new string[]
 			{
-				"TraceLog",
-				"Core",
-				"CoreUObject",
-				"Engine",
-				"InputCore",
-				"UnrealEd",
-				"RawMesh",
-				"StaticMeshDescription",
-				"MeshUtilities",
-				"MaterialUtilities",
-				"PropertyEditor",
-				"SlateCore",
-				"Slate",
-				"RenderCore",
-				"RHI",
-				"QuadricMeshReduction",
-				"DynamicMesh",
-				"GeometryAlgorithms",
-				"GeometryCore",
-				"GeometryFramework",
-				"MeshConversion",
-				"MeshDescription",
-				"GeometryScriptingCore",
+
 				// ... add other public dependencies that you statically link with here ...
 			}
 			);
@@ -70,7 +48,22 @@ public class GeometryEditor : ModuleRules
 				"GeometryCore",
 				"GeometryFramework",
 				"Projects",
-				"ModelingComponentsEditorOnly"
+				"ModelingComponentsEditorOnly",
+				"TraceLog",
+				"Core",
+				"InputCore",
+				"RawMesh",
+				"StaticMeshDescription",
+				"MeshUtilities",
+				"MaterialUtilities",
+				"PropertyEditor",
+				"RenderCore",
+				"RHI",
+				"QuadricMeshReduction",
+				"DynamicMesh",
+				"MeshConversion",
+				"MeshDescription",
+				"GeometryScriptingCore",
 				// ... add private dependencies that you statically link with here ...	
 			}
 			);

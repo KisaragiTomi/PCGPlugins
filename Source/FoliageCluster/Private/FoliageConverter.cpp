@@ -6,7 +6,6 @@
 #include "Kismet/GameplayStatics.h"
 #include "Kismet/KismetRenderingLibrary.h"
 #include "Camera/CameraTypes.h"
-#include "Engine/SceneCapture2D.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -16,49 +15,22 @@
 #include "InstancedFoliageActor.h"
 #include "Engine/StaticMeshActor.h"
 #include "EngineUtils.h"
-#include "Runtime/Experimental/Voronoi/Private/voro++/src/container.hh"
-#include "Subsystems/EditorActorSubsystem.h"
 
-#if WITH_EDITOR
 
-void UFoliageConverter::ConvertFoliageToInstanceComponent(UFoliageType* InFoliageType)
+void UFoliageConverter::ConvertFoliageToInstanceComponent(UFoliageType* InFoliageType, AConvertFoliageInstanceContainer* Container) 
 {
-	UEditorActorSubsystem* EditorActorSubsystem = GEditor->GetEditorSubsystem<UEditorActorSubsystem>();
-	TArray<AActor*> SelectedActors = EditorActorSubsystem->GetSelectedLevelActors();
-	AConvertFoliageInstanceContainer* Container = nullptr;
-	for (AActor* Actor : SelectedActors)
-	{
-		if (Cast<AConvertFoliageInstanceContainer>(Actor))
-		{
-			Container = Cast<AConvertFoliageInstanceContainer>(Actor);
-			break;
-		}
-	}
 	if (!Container)
 		return;
-	
 	Container->AddInstanceFromFoliageType(InFoliageType);
 }
 
-void UFoliageConverter::ConvertInstanceComponentToFoliage(UFoliageType* InFoliageType, UClass* ContainerClass)
+void UFoliageConverter::ConvertInstanceComponentToFoliage(UFoliageType* InFoliageType, UClass* ContainerClass, AConvertFoliageInstanceContainer* Container)
 {
-	UEditorActorSubsystem* EditorActorSubsystem = GEditor->GetEditorSubsystem<UEditorActorSubsystem>();
-	TArray<AActor*> SelectedActors = EditorActorSubsystem->GetSelectedLevelActors();
-	AConvertFoliageInstanceContainer* Container = nullptr;
-	for (AActor* Actor : SelectedActors)
-	{
-		if (Cast<AConvertFoliageInstanceContainer>(Actor))
-		{
-			Container = Cast<AConvertFoliageInstanceContainer>(Actor);
-			break;
-		}
-	}
 	if (!Container)
 		return;
 	Container->ConvertInstanceToFoliage(InFoliageType);
 }
 
-#endif
 
 UStaticMesh* UFoliageConverter::GetStaticMesh(UFoliageType* InFoliageType)
 {
@@ -452,9 +424,6 @@ void UFoliageConverter::AddFoliage()
 
 }
 
-
-
-#define LOCTEXT_NAMESPACE "AConvertFoliageInstanceContainer"
 
 AConvertFoliageInstanceContainer::AConvertFoliageInstanceContainer(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)

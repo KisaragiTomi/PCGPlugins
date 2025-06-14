@@ -20,7 +20,6 @@ public class FoliageCluster : ModuleRules
                 "CoreUObject",
                 "Engine",
                 "Slate",
-                "UnrealEd",
                 "GeometryFramework",
                 "SlateCore"
             }

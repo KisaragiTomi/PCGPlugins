@@ -133,6 +133,7 @@ UDynamicMesh* ULandscapeExtra::CreateProjectPlane(UDynamicMesh* Mesh, FVector Ce
 			if (EditMesh.IsVertex(i))
 			{
 				EditMesh.SetVertex(i, (FVector3d)NewPosition);
+
 			}
 		}
 		MeshTransforms::ApplyTransform(EditMesh, (FTransformSRT3d)(Landscape->GetTransform()), true);

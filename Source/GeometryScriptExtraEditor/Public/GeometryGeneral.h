@@ -43,17 +43,18 @@ public:
 	int ClassNum = -1;
 	int ParentClass = -1;
 
-	virtual void  CollectedData(FDynamicMesh3& EditMesh, int TID, float Dist) = 0;
+	virtual bool  CollectedData(FDynamicMesh3& EditMesh, int TID, float Dist) = 0;
 };
 
 struct FWindTreeReduceData :public FDynamicMeshComponentReduceData
 {
 public:
 
-	virtual void  CollectedData(FDynamicMesh3& EditMesh, int TID, float InDist)
+	virtual bool  CollectedData(FDynamicMesh3& EditMesh, int TID, float InDist)
 	{
 		MaxDist = fmaxf(MaxDist, InDist);
 		Count += 1;
+		return true;
 	}
 };
 
@@ -61,10 +62,15 @@ struct FWindTreeCombineLeafData :public FDynamicMeshComponentReduceData
 {
 public:
 
-	virtual void  CollectedData(FDynamicMesh3& EditMesh, int TID, float InDist)
+	virtual bool  CollectedData(FDynamicMesh3& EditMesh, int TID, float InDist)
 	{
-		MinDist = fmin(MinDist, InDist);
-		Count += 1;
+		if (InDist < MinDist)
+		{
+			MinDist = fmin(MinDist, InDist);
+			Count += 1;
+			return true;
+		}
+		return false;
 	}
 };
 

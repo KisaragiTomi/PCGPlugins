@@ -219,7 +219,9 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 
 	FMeshBoundaryLoops BLoops(MeshCopy.Get(), true);
 	// float CombineDistThreashould = 30;
-	
+	TArray<int> UVIndexTest;
+	TArray<FVector2D> UVTestIndex;
+	TArray<FVector2D> UVFloat;
 	TargetMesh->EditMesh([&](FDynamicMesh3& EditMesh)
 	{
 		EditMesh.EnableAttributes();
@@ -229,10 +231,11 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 		}
 		
 		
-		VI_ATTR(Class, EditMesh, 0);
+		VI_ATTR(Class, EditMesh, -1);
 		VI_ATTR(PreClass, EditMesh, 0);
 		VI_ATTR(DiscardPoint, EditMesh, 0);
-		TI_ATTR(Class, EditMesh, 0);
+		VI_ATTR(HolePoint, EditMesh, 0);
+		TI_ATTR(Class, EditMesh, -1);
 
 
 		
@@ -260,6 +263,9 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 			bool Checked = false;
 			bool CheckedTemp = false;
 			bool IsLeaf = false;
+
+			TArray<TArray<int>> Holes;
+			int VaildHole = 0;
 		};
 
 
@@ -273,9 +279,15 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 		TMap<int, FWindTreeComponentData> ComponentDatas;
 		for ( int c = 0; c < Components.Num(); c++)
 		{
+
+			
 			FWindTreeComponentData ComponentData;
 			ComponentData.TIDs = Components[c].Indices;
 			ComponentData.Class = c;
+			FDynamicMeshMaterialAttribute* ATI_MaterialID = EditMesh.Attributes()->GetMaterialID();
+			int MaterialID = ATI_MaterialID->GetValue(ComponentData.TIDs[0]);
+			bool IsLeaf = false;
+			if (MaterialID == LeafMaterialIndex) IsLeaf = true;
 
 			FVector3d CenterPos = FVector3d::Zero();
 			for (int TID : ComponentData.TIDs)
@@ -291,16 +303,8 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 			}
 			CenterPos /= ComponentData.TIDs.Num() * 3.0;
 			ComponentData.Center = (FVector)CenterPos;
-
-			FDynamicMeshMaterialAttribute* ATI_MaterialID = EditMesh.Attributes()->GetMaterialID();
-			int MaterialID = ATI_MaterialID->GetValue(ComponentData.TIDs[0]);
-			if (LeafMaterialIndex < 0)
-			{
-				ComponentDatas.Add(c, ComponentData);
-				continue;
-			}
-
-			if (MaterialID == LeafMaterialIndex)
+			
+			if (IsLeaf)
 			{
 				ComponentData.IsLeaf = true;
 				LeafComponentDatas.Add(c, ComponentData);
@@ -536,7 +540,78 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 		//End Find Root
 		//=================================================================================
 
+
+		//CollectHoles
+		//=================================================================================
+		for (int i = 0; i < BLoops.GetLoopCount(); i++)
+		{
+			TArray<int> LoopVertices = BLoops.Loops[i].Vertices;
+			int DiscardPoint = 0;
+			int LoopClassNum = -1;
+			int PreClassNum = -1;
+
+			AVI_PreClass->GetValue(BLoops.Loops[i].Vertices[0], &PreClassNum);
+			AVI_Class->GetValue(BLoops.Loops[i].Vertices[0], &LoopClassNum);
+			AVI_DiscardPoint->GetValue(BLoops.Loops[i].Vertices[0], &DiscardPoint);
+			
+			if (ComponentDatas.Find(LoopClassNum) == nullptr) continue;
+			if (DiscardPoint) continue;
+
+			for (int VID : LoopVertices)
+			{
+				if (!EditMesh.IsVertex(VID)) continue;
+				int HolePoint = 1;
+				AVI_HolePoint->SetValue(VID, &HolePoint);
+			}
+			ComponentDatas[LoopClassNum].Holes.Add(LoopVertices);
+		}
+
+		//EndCollectHoles
+		//=================================================================================
 		
+		for (TPair<int, FWindTreeComponentData>& ComponentData: ComponentDatas)
+		{
+			
+			FWindTreeComponentData Data = ComponentData.Value;
+			if (Data.Holes.Num() <= 1) continue;
+			TArray<float> Sizes;
+			float MaxSize = -9999999999;
+			int VaildHole;
+			
+			for (int i = 0; i < Data.Holes.Num(); i++)
+			{
+				TArray<int> Hole = Data.Holes[i];
+				TArray<FVector> VertexPoss;
+				VertexPoss.Reserve(Hole.Num());
+				for (int VID : Hole)
+				{
+					FVector VertexPos = EditMesh.GetVertex(VID);
+					VertexPoss.Add(VertexPos);
+				}
+
+				FBox Box = FBox(VertexPoss);
+				
+				float Size = Box.GetSize().Length();
+				MaxSize	= fmax(Size, MaxSize);			
+				Sizes.Add(Size);
+				if (Size > MaxSize) VaildHole = i;
+			}
+			// for (int i = 0; i < Data.Holes.Num(); i++)
+			// {
+			// 	if (Sizes[i] == MaxSize) continue;
+			//
+			// 	for (int VID : Data.Holes[i])
+			// 	{
+			// 		int discardPoint = 1;
+			// 		AVI_DiscardPoint->SetValue(VID, &discardPoint);
+			// 	}
+			// }
+			
+		}
+		for (TPair<int, FWindTreeComponentData>& ComponentData: ComponentDatas)
+		{
+			
+		}
 		TArray<FVector> AllLoopVertices;
 		for (int i = 0; i < BLoops.GetLoopCount(); i++)
 		{
@@ -556,9 +631,11 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 			AVI_PreClass->GetValue(BLoops.Loops[i].Vertices[0], &PreClassNum);
 			AVI_Class->GetValue(BLoops.Loops[i].Vertices[0], &LoopClassNum);
 			AVI_DiscardPoint->GetValue(BLoops.Loops[i].Vertices[0], &DiscardPoint);
-			
-			bool LoopChecked = ComponentDatas[LoopClassNum].Checked;
+
+			if (ComponentDatas.Find(LoopClassNum) == nullptr) continue;
 			if (DiscardPoint) continue;
+
+			bool LoopChecked = ComponentDatas[LoopClassNum].Checked;
 
 			
 			for (int j = 0; j < NumLoopVertices; j++)
@@ -847,6 +924,7 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 		// }
 		//
 		//
+
 		
 		//Build hierarchy
 		for (int i = 0 ; i < 10; i++)
@@ -913,6 +991,7 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 					return true;
 				});
 				bool Find = false;
+				float MinDist = 9999999999999;
 				for (int TID : Data.TIDs)
 				{
 					FIndex3i TVIDs = EditMesh.GetTriangle(TID);
@@ -923,7 +1002,9 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 					HitTID = BVH.Spatial->FindNearestTriangle(VertexPos, Dist, QueryOptionsXYZ);
 					
 					if (HitTID < 0) continue;
-					
+					if (Dist > MinDist) continue;
+
+					MinDist = Dist;
 					int ParentClassNum = -1;
 					AttribClass->GetValue(HitTID, &ParentClassNum);
 					float ParentClassDist = 0;
@@ -931,7 +1012,8 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 					
 					if (TempComponentMap.Find(ParentClassNum) != nullptr) ComponentReduceData = *TempComponentMap.Find(ParentClassNum);
 
-					ComponentReduceData.CollectedData(EditMesh, TID, Dist);
+					bool LeafCheck = ComponentReduceData.CollectedData(EditMesh, TID, Dist);
+					
 					TempComponentMap.Add(ParentClassNum, ComponentReduceData);
 					Find = true;
 				}
@@ -1141,24 +1223,30 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 		
 		float TextureMax = fmax(tXx, tXy);
 
+		UVIndexTest.Reserve(HierarchyCompMap.Num());
+		UVTestIndex.Reserve(HierarchyCompMap.Num());
+		UVFloat.Reserve(HierarchyCompMap.Num());
 		for (TPair<FString, FWindTreeComponentData>& Component : HierarchyCompMap)
 		{
+
 			FString HierarchyN = Component.Key;
 			FWindTreeComponentData Data = Component.Value;
+			UVIndexTest.Add(Data.UVIndex);
 			int UVIndex = Data.UVIndex;
+			float PosX = rint(fmodf(UVIndex, TextureMax));
+			float PosY = floor(UVIndex / TextureMax);
+			FVector2f UV2 = FVector2f(PosX / tXx + .5 / tXx, PosY / tXy + 0.5 / tXy);
 			for (int TID : Data.TIDs)
 			{
-				float PosX = fmodf(UVIndex, TextureMax);
-				float PosY = floor(UVIndex / TextureMax);
-				FVector2f UV2 = FVector2f(PosX / tXx + .5 / tXx, PosY / tXy + 0.5 / tXy);
 				FIndex3i TVIDs = UVOverlay2->GetTriangle(TID);
 				for (int v = 0; v < 3; v++)
 				{
-					if (!EditMesh.IsVertex(TVIDs[v]))continue;
+					// if (!EditMesh.IsVertex(TVIDs[v]))continue;
 					UVOverlay2->SetElement(TVIDs[v], UV2);
 				}
 			}
-			
+			UVTestIndex.Add(FVector2D(UV2.X * 103, UV2.Y * 9));
+			UVFloat.Add(FVector2D(UV2.X, UV2.Y));
 
 			int ParentIndex = HierarchyCompMap[Data.ParentHierarchy].UVIndex;
 			
@@ -1194,6 +1282,21 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 				}
 			}
 			//End Debug Color
+		}
+		TArray<TArray<FVector2f>> UVSet;
+		for (TPair<int, FWindTreeComponentData>& Component : LeafComponentDatas)
+		{
+			TArray<FVector2f> UVPerLeaf;
+			for (int TID : Component.Value.TIDs)
+			{
+				FIndex3i TVIDs = UVOverlay2->GetTriangle(TID);
+				FVector2f UVf = FVector2f(0, 0);
+
+				UVOverlay2->GetElement(TVIDs[0], UVf);
+				
+				UVPerLeaf.Add(UVf);
+			}
+			UVSet.Add(UVPerLeaf);
 		}
 	});
 	

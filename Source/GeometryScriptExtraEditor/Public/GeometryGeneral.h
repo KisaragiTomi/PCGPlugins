@@ -99,14 +99,23 @@ public:
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static void WindDataForTree(UDynamicMesh* TargetMesh, TArray<FLinearColor>& PivotIndexData, TArray<FLinearColor>& DirExtentData, int32& tXx, int32
 	                            & tXy, TArray<FVector>& OutHolePositions, TMap<int, FVector>& DebugClassNum, int LeafMaterialIndex = -1, float
-	                            CombineDistThreashould = 50, float FindParentThreashold = 5);
+	                            CombineDistThreashould = 50, float FindParentThreashold = 5, bool OutDebugColor = false);
 	
 
 	static void TreeWindMergeComponents(FDynamicMesh3& EditMesh, FGeometryScriptDynamicMeshBVH BVH, TMap<int, FDynamicMeshComponentData> ComponentDatas);
 
+	UFUNCTION(BlueprintCallable, Category = Generate)
+	static UDynamicMesh* WeldDynamicMesh(UDynamicMesh* TargetMesh, float Tolerance = 0.001);
+	
+	static void WeldVertices(FDynamicMesh3& EditMesh, float Tolerance);
 
 
-
+	UFUNCTION(BlueprintCallable, Category = Generate)
+	static UDynamicMesh* ColorAttribTransf(UDynamicMesh* SourceMesh, UDynamicMesh* TargetMesh, bool& Success, FLinearColor ChannelMask = FLinearColor(1, 1, 1, 1));
+	
+	UFUNCTION(BlueprintCallable, Category = Generate)
+	static UDynamicMesh* UVAttribTransf(UDynamicMesh* SourceMesh, UDynamicMesh* TargetMesh, bool& Success, int UVNum = 1, FLinearColor ChannelMask = FLinearColor(1, 1, 1, 1));
+	
 	
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static UDynamicMesh* FillUVData(UDynamicMesh* TargetMesh, int32 UVLayerNum);

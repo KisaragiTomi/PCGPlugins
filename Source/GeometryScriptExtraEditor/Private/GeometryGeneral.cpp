@@ -18,13 +18,16 @@
 #include "Selections/MeshConnectedComponents.h"
 #include "tbb/parallel_reduce.h"
 #include "GeometryAttribute.h"
+#include "GroupTopology.h"
 #include "MinVolumeBox3.h"
 #include "OrientedBoxTypes.h"
-#include "boost/test/data/monomorphic/collection.hpp"
+#include "DynamicMesh/Operations/MergeCoincidentMeshEdges.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "openvdb/math/BBox.h"
 #include "Spatial/FastWinding.h"
 #include "Spatial/MeshAABBTree3.h"
+#include "Spatial/PointHashGrid3.h"
+#include "Util/IndexPriorityQueue.h"
 
 
 using namespace UE::Geometry;
@@ -203,27 +206,25 @@ UDynamicMesh* UGeometryGeneral::PrimNormal(UDynamicMesh* TargetMesh, FVector Tes
 
 void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
                                        TArray<FLinearColor>& PivotIndexData,
-                                       
+
                                        TArray<FLinearColor>& DirExtentData,
                                        int32& tXx,
                                        int32& tXy,
                                        TArray<FVector>& OutHolePositions,
                                        TMap<int, FVector>& DebugClassNum,
-										int LeafMaterialIndex,
+                                       int LeafMaterialIndex,
                                        float CombineDistThreashould,
-                                       float FindParentThreashold
+                                       float FindParentThreashold, bool OutDebugColor
 )
 {
-	TSharedPtr<FDynamicMesh3> MeshCopy = MakeShared<FDynamicMesh3>();
-	TargetMesh->ProcessMesh([&](const FDynamicMesh3& EditMesh) { MeshCopy->Copy(EditMesh); });
 
-	FMeshBoundaryLoops BLoops(MeshCopy.Get(), true);
 	// float CombineDistThreashould = 30;
 	TArray<int> UVIndexTest;
 	TArray<FVector2D> UVTestIndex;
 	TArray<FVector2D> UVFloat;
 	TargetMesh->EditMesh([&](FDynamicMesh3& EditMesh)
 	{
+		FMeshBoundaryLoops BLoops(&EditMesh, true);
 		EditMesh.EnableAttributes();
 		if (EditMesh.Attributes()->NumUVLayers() < 2)
 		{
@@ -238,7 +239,6 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 		TI_ATTR(Class, EditMesh, -1);
 
 
-		
 
 		FMeshConnectedComponents Components(&EditMesh);
 		Components.FindConnectedTriangles();
@@ -550,7 +550,7 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 			int LoopClassNum = -1;
 			int PreClassNum = -1;
 
-			AVI_PreClass->GetValue(BLoops.Loops[i].Vertices[0], &PreClassNum);
+			// AVI_PreClass->GetValue(BLoops.Loops[i].Vertices[0], &PreClassNum);
 			AVI_Class->GetValue(BLoops.Loops[i].Vertices[0], &LoopClassNum);
 			AVI_DiscardPoint->GetValue(BLoops.Loops[i].Vertices[0], &DiscardPoint);
 			
@@ -568,81 +568,64 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 
 		//EndCollectHoles
 		//=================================================================================
-		
+		TArray<FVector> AllLoopVertices;
 		for (TPair<int, FWindTreeComponentData>& ComponentData: ComponentDatas)
 		{
 			
-			FWindTreeComponentData Data = ComponentData.Value;
-			if (Data.Holes.Num() <= 1) continue;
-			TArray<float> Sizes;
-			float MaxSize = -9999999999;
-			int VaildHole;
+			FWindTreeComponentData& Data = ComponentData.Value;
+			int Class = ComponentData.Key;
+			if (Data.Holes.Num() < 1) continue;
+			
+			float MaxSize = -9999999999.0;
+			TArray<int> VaildHole = Data.Holes[0];
+			TArray<FVector> VaildLoops;
 			
 			for (int i = 0; i < Data.Holes.Num(); i++)
 			{
 				TArray<int> Hole = Data.Holes[i];
 				TArray<FVector> VertexPoss;
 				VertexPoss.Reserve(Hole.Num());
-				for (int VID : Hole)
+				for (int VID : Data.Holes[i])
 				{
 					FVector VertexPos = EditMesh.GetVertex(VID);
 					VertexPoss.Add(VertexPos);
 				}
 
 				FBox Box = FBox(VertexPoss);
-				
 				float Size = Box.GetSize().Length();
-				MaxSize	= fmax(Size, MaxSize);			
-				Sizes.Add(Size);
-				if (Size > MaxSize) VaildHole = i;
+				
+				if (Size > MaxSize)
+				{
+					VaildLoops = VertexPoss;
+					VaildHole = Data.Holes[i];
+					MaxSize = fmax(Size, MaxSize);
+				}
 			}
-			// for (int i = 0; i < Data.Holes.Num(); i++)
-			// {
-			// 	if (Sizes[i] == MaxSize) continue;
-			//
-			// 	for (int VID : Data.Holes[i])
-			// 	{
-			// 		int discardPoint = 1;
-			// 		AVI_DiscardPoint->SetValue(VID, &discardPoint);
-			// 	}
-			// }
-			
-		}
-		for (TPair<int, FWindTreeComponentData>& ComponentData: ComponentDatas)
-		{
-			
-		}
-		TArray<FVector> AllLoopVertices;
-		for (int i = 0; i < BLoops.GetLoopCount(); i++)
-		{
-			
+			if (VaildHole.Num() == 0)
+			{
+				FIndex3i TVIDs = EditMesh.GetTriangle(Data.TIDs[0]);
+				VaildHole.Add(TVIDs[0]);
+				VaildLoops.Add(FVector(0, 0, 0));
+			}
 			FVector Normal = FVector::ZeroVector;
 			FVector Center = FVector::ZeroVector;
 			
-			TArray<int> LoopVertices = BLoops.Loops[i].Vertices;
+			// TArray<int> LoopVertices = BLoops.Loops[i].Vertices;
 			TArray<FVector> LoopVertexPos;
-			LoopVertexPos.Reserve(LoopVertices.Num());
-			float NumLoopVertices = LoopVertices.Num();
-			if (NumLoopVertices == 0) continue;
-			int DiscardPoint = 0;
-			int LoopClassNum = -1;
-			int PreClassNum = -1;
-
-			AVI_PreClass->GetValue(BLoops.Loops[i].Vertices[0], &PreClassNum);
-			AVI_Class->GetValue(BLoops.Loops[i].Vertices[0], &LoopClassNum);
-			AVI_DiscardPoint->GetValue(BLoops.Loops[i].Vertices[0], &DiscardPoint);
-
-			if (ComponentDatas.Find(LoopClassNum) == nullptr) continue;
-			if (DiscardPoint) continue;
-
-			bool LoopChecked = ComponentDatas[LoopClassNum].Checked;
-
+			int DiscardPoint = -1;
 			
-			for (int j = 0; j < NumLoopVertices; j++)
+			// AVI_PreClass->GetValue(LoopVertices.Vertices[0], &PreClassNum);
+			// AVI_Class->GetValue(BLoops.Loops[i].Vertices[0], &LoopClassNum);
+			AVI_DiscardPoint->GetValue(VaildHole[0], &DiscardPoint);
+			
+			if (DiscardPoint) continue;
+			bool LoopChecked = Data.Checked;
+			
+			for (int j = 0; j < VaildHole.Num(); j++)
 			{
-				FVector PrePos = BLoops.Loops[i].GetPrevVertex(j);
-				FVector Pos = BLoops.Loops[i].GetVertex(j);
-				FVector NextPos = BLoops.Loops[i].GetNextVertex(j);
+				FVector PrePos = VaildLoops[(j == 0) ? (VaildHole.Num()-1) : (j-1) ];
+				FVector Pos = VaildLoops[j];
+				FVector NextPos =  VaildLoops[(j + 1) % VaildHole.Num() ];
 				
 				Center += Pos;
 				
@@ -650,22 +633,17 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 				FVector Dir2 = (NextPos - Pos).GetSafeNormal();
 
 				Normal += FVector::CrossProduct(Dir1, Dir2);
-				
 			}
 			FVector3d ResultN = Normal.GetSafeNormal();
-			Center /= NumLoopVertices;
-
-
-
+			Center /= float(VaildHole.Num());
 
 			// Find ParentClass
 			//=================================================================================
 			int ParentClass = TNumericLimits<int>::Max();
 			bool TarChecked = false;
-			for (int j = 0; j < NumLoopVertices; j++)
+			for (int j = 0; j < VaildHole.Num(); j++)
 			{
-				FVector3d VertexPos = EditMesh.GetVertex(LoopVertices[j]);
-				LoopVertexPos.Add(VertexPos);
+				FVector3d VertexPos = VaildLoops[j];
 				
 				int HitTID = TNumericLimits<int>::Max();
 				IMeshSpatial::FQueryOptions QueryOptionsXYZ([&](int32 TID)
@@ -674,7 +652,7 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 					int FindClass = -1;
 					ATI_Class->GetValue(TID, &FindClass);
 					if (!ComponentDatas.Find(FindClass)) return false;
-					return FindClass != LoopClassNum;
+					return FindClass != Class;
 				});
 				double Dist;
 				HitTID = BVH.Spatial->FindNearestTriangle(VertexPos, Dist, QueryOptionsXYZ);
@@ -690,27 +668,129 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 				TarChecked = TarChecked || Check;
 				
 			}
-			AllLoopVertices.Append(LoopVertexPos);
+			AllLoopVertices.Append(VaildLoops);
 			
 			// End Parent Class
 			//=================================================================================
 			
 			if (LoopChecked == 1 ) continue;
 			
-			ComponentDatas[LoopClassNum].RootCenter = Center;
-			ComponentDatas[LoopClassNum].RootNormal = ResultN;
-			ComponentDatas[LoopClassNum].ParentClass = ParentClass;
+			Data.RootCenter = Center;
+			Data.RootNormal = ResultN;
+			Data.ParentClass = ParentClass;
 
 			if  (ParentClass != TNumericLimits<int>::Max()) continue;
 			
-			ComponentDatas[LoopClassNum].RootCenter = FVector::ZeroVector;
-			ComponentDatas[LoopClassNum].RootNormal = FVector::UpVector;
-			ComponentDatas[LoopClassNum].ParentClass = -1;
-			ComponentDatas[LoopClassNum].Hierarchy = "Root";
-			ComponentDatas[LoopClassNum].Checked = 1;
+			Data.RootCenter = FVector::ZeroVector;
+			Data.RootNormal = FVector::UpVector;
+			Data.ParentClass = -1;
+			Data.Hierarchy = "Root";
+			Data.Checked = 1;
 			
 		}
-		OutHolePositions = AllLoopVertices;
+		// for (TPair<int, FWindTreeComponentData>& ComponentData: ComponentDatas)
+		// {
+		// 	
+		// }
+		//
+		// for (int i = 0; i < BLoops.GetLoopCount(); i++)
+		// {
+		// 	
+		// 	FVector Normal = FVector::ZeroVector;
+		// 	FVector Center = FVector::ZeroVector;
+		// 	
+		// 	TArray<int> LoopVertices = BLoops.Loops[i].Vertices;
+		// 	TArray<FVector> LoopVertexPos;
+		// 	LoopVertexPos.Reserve(LoopVertices.Num());
+		// 	float NumLoopVertices = LoopVertices.Num();
+		// 	if (NumLoopVertices == 0) continue;
+		// 	int DiscardPoint = 0;
+		// 	int LoopClassNum = -1;
+		// 	int PreClassNum = -1;
+		//
+		// 	AVI_PreClass->GetValue(BLoops.Loops[i].Vertices[0], &PreClassNum);
+		// 	AVI_Class->GetValue(BLoops.Loops[i].Vertices[0], &LoopClassNum);
+		// 	AVI_DiscardPoint->GetValue(BLoops.Loops[i].Vertices[0], &DiscardPoint);
+		//
+		// 	if (ComponentDatas.Find(LoopClassNum) == nullptr) continue;
+		// 	if (DiscardPoint) continue;
+		//
+		// 	bool LoopChecked = ComponentDatas[LoopClassNum].Checked;
+		//
+		// 	
+		// 	for (int j = 0; j < NumLoopVertices; j++)
+		// 	{
+		// 		FVector PrePos = BLoops.Loops[i].GetPrevVertex(j);
+		// 		FVector Pos = BLoops.Loops[i].GetVertex(j);
+		// 		FVector NextPos = BLoops.Loops[i].GetNextVertex(j);
+		// 		
+		// 		Center += Pos;
+		// 		
+		// 		FVector Dir1 = (PrePos - Pos).GetSafeNormal();
+		// 		FVector Dir2 = (NextPos - Pos).GetSafeNormal();
+		//
+		// 		Normal += FVector::CrossProduct(Dir1, Dir2);
+		// 		
+		// 	}
+		// 	FVector3d ResultN = Normal.GetSafeNormal();
+		// 	Center /= NumLoopVertices;
+		//
+		//
+		//
+		//
+		// 	// Find ParentClass
+		// 	//=================================================================================
+		// 	int ParentClass = TNumericLimits<int>::Max();
+		// 	bool TarChecked = false;
+		// 	for (int j = 0; j < NumLoopVertices; j++)
+		// 	{
+		// 		FVector3d VertexPos = EditMesh.GetVertex(LoopVertices[j]);
+		// 		LoopVertexPos.Add(VertexPos);
+		// 		
+		// 		int HitTID = TNumericLimits<int>::Max();
+		// 		IMeshSpatial::FQueryOptions QueryOptionsXYZ([&](int32 TID)
+		// 		{
+		// 			if (TID == TNumericLimits<int>::Max()) return false;
+		// 			int FindClass = -1;
+		// 			ATI_Class->GetValue(TID, &FindClass);
+		// 			if (!ComponentDatas.Find(FindClass)) return false;
+		// 			return FindClass != LoopClassNum;
+		// 		});
+		// 		double Dist;
+		// 		HitTID = BVH.Spatial->FindNearestTriangle(VertexPos, Dist, QueryOptionsXYZ);
+		// 		if (HitTID < 0) continue;
+		// 		
+		// 		if (Dist > FindParentThreashold ) continue;
+		// 		
+		// 		int ParentClassNum = -1;
+		// 		ATI_Class->GetValue(HitTID, &ParentClassNum);
+		// 		
+		// 		bool Check = ComponentDatas[ParentClassNum].Checked;
+		// 		ParentClass = fmin(ParentClass, ParentClassNum);
+		// 		TarChecked = TarChecked || Check;
+		// 		
+		// 	}
+		// 	AllLoopVertices.Append(LoopVertexPos);
+		// 	
+		// 	// End Parent Class
+		// 	//=================================================================================
+		// 	
+		// 	if (LoopChecked == 1 ) continue;
+		// 	
+		// 	ComponentDatas[LoopClassNum].RootCenter = Center;
+		// 	ComponentDatas[LoopClassNum].RootNormal = ResultN;
+		// 	ComponentDatas[LoopClassNum].ParentClass = ParentClass;
+		//
+		// 	if  (ParentClass != TNumericLimits<int>::Max()) continue;
+		// 	
+		// 	ComponentDatas[LoopClassNum].RootCenter = FVector::ZeroVector;
+		// 	ComponentDatas[LoopClassNum].RootNormal = FVector::UpVector;
+		// 	ComponentDatas[LoopClassNum].ParentClass = -1;
+		// 	ComponentDatas[LoopClassNum].Hierarchy = "Root";
+		// 	ComponentDatas[LoopClassNum].Checked = 1;
+		// 	
+		// }
+		// OutHolePositions = AllLoopVertices;
 
 		// //ReduceComponent  V2
 		// //=================================================================================
@@ -991,7 +1071,7 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 					return true;
 				});
 				bool Find = false;
-				float MinDist = 9999999999999;
+				float MinDist = 1e10;
 				for (int TID : Data.TIDs)
 				{
 					FIndex3i TVIDs = EditMesh.GetTriangle(TID);
@@ -1241,7 +1321,8 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 				FIndex3i TVIDs = UVOverlay2->GetTriangle(TID);
 				for (int v = 0; v < 3; v++)
 				{
-					// if (!EditMesh.IsVertex(TVIDs[v]))continue;
+					if (!UVOverlay2->IsElement(TVIDs[v])) continue;
+
 					UVOverlay2->SetElement(TVIDs[v], UV2);
 				}
 			}
@@ -1262,6 +1343,9 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 			DirExtentData[UVIndex] = (FLinearColor(Normal.X, Normal.Y, Normal.Z, fmax(Data.OriginExtent, 0.01)));
 			
 			//Debug Color
+
+			if (! OutDebugColor) continue;
+			
 			FLinearColor TestColor = FLinearColor::MakeRandomColor();
 			FDynamicMeshColorOverlay* ColorOverlay = EditMesh.Attributes()->PrimaryColors();
 						
@@ -1283,21 +1367,21 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 			}
 			//End Debug Color
 		}
-		TArray<TArray<FVector2f>> UVSet;
-		for (TPair<int, FWindTreeComponentData>& Component : LeafComponentDatas)
-		{
-			TArray<FVector2f> UVPerLeaf;
-			for (int TID : Component.Value.TIDs)
-			{
-				FIndex3i TVIDs = UVOverlay2->GetTriangle(TID);
-				FVector2f UVf = FVector2f(0, 0);
-
-				UVOverlay2->GetElement(TVIDs[0], UVf);
-				
-				UVPerLeaf.Add(UVf);
-			}
-			UVSet.Add(UVPerLeaf);
-		}
+		// TArray<TArray<FVector2f>> UVSet;
+		// for (TPair<int, FWindTreeComponentData>& Component : LeafComponentDatas)
+		// {
+		// 	TArray<FVector2f> UVPerLeaf;
+		// 	for (int TID : Component.Value.TIDs)
+		// 	{
+		// 		FIndex3i TVIDs = UVOverlay2->GetTriangle(TID);
+		// 		FVector2f UVf = FVector2f(0, 0);
+		//
+		// 		UVOverlay2->GetElement(TVIDs[0], UVf);
+		// 		
+		// 		UVPerLeaf.Add(UVf);
+		// 	}
+		// 	UVSet.Add(UVPerLeaf);
+		// }
 	});
 	
 
@@ -1323,6 +1407,516 @@ void UGeometryGeneral::TreeWindMergeComponents(FDynamicMesh3& EditMesh, FGeometr
 	TMap<int, FDynamicMeshComponentData> ComponentDatas)
 {
 
+}
+
+UDynamicMesh* UGeometryGeneral::WeldDynamicMesh(UDynamicMesh* TargetMesh, float Tolerance)
+{
+	TargetMesh->EditMesh([&](FDynamicMesh3& EditMesh)
+	{
+		WeldVertices(EditMesh, Tolerance);
+	});
+	return TargetMesh;
+}
+
+void UGeometryGeneral::WeldVertices(FDynamicMesh3& EditMesh, float Tolerance)
+{
+	// FMergeCoincidentMeshEdges Welder(&EditMesh);
+	// Welder.MergeVertexTolerance = Tolerance * 0.001;
+	// Welder.MergeSearchTolerance = 2 * Welder.MergeVertexTolerance;
+	// Welder.OnlyUniquePairs = false;
+	// Welder.Apply();
+
+
+	FSplitAttributeWelder  SplitAttributeWelder;
+
+	constexpr float DegToRad = static_cast<float>(UE_PI / 180.f);
+
+	SplitAttributeWelder.UVDistSqrdThreshold = 0.01f * 0.01f;;
+	SplitAttributeWelder.NormalVecDotThreshold = FMath::Abs(1.f - FMath::Cos( DegToRad * 0.1f));
+	SplitAttributeWelder.TangentVecDotThreshold = FMath::Abs(1.f - FMath::Cos( DegToRad * 0.1f));
+	SplitAttributeWelder.ColorDistSqrdThreshold = 0.01f * 0.01f;
+
+	FMeshBoundaryLoops BLoops(&EditMesh, true);
+	TSet<int32> EdgesToMerge; 
+	for (int i = 0; i < BLoops.GetLoopCount(); i++)
+	{
+		TArray<int> LoopEdges = BLoops.Loops[i].Edges;
+		EdgesToMerge.Append(LoopEdges);
+	}
+
+	float MergeSearchTolerance =  2 * Tolerance;
+	double ToleranceSqr = Tolerance * Tolerance;
+	double UseMergeSearchTol = (MergeSearchTolerance > 0) ? MergeSearchTolerance : 2 * Tolerance;
+	
+	//
+	// construct hash table for edge midpoints
+	//
+
+
+
+	
+	TArray<FVector3d> BoundaryMidPoints;
+	TArray<int32> ToMidPt;
+	ToMidPt.Init(-1, EditMesh.MaxEdgeID());
+	for (int32 EID : EditMesh.BoundaryEdgeIndicesItr())
+	{
+		ToMidPt[EID] = BoundaryMidPoints.Add(EditMesh.GetEdgePoint(EID, 0.5));
+	}
+	int32 InitialNumBoundaryEdges = BoundaryMidPoints.Num();
+	int hashN = 64;
+	if (InitialNumBoundaryEdges > 1000)   hashN = 128;
+	if (InitialNumBoundaryEdges > 10000)  hashN = 256;
+	if (InitialNumBoundaryEdges > 100000)  hashN = 512;
+	FAxisAlignedBox3d Bounds = EditMesh.GetBounds(true);
+	double CellSize = FMath::Max(FMathd::ZeroTolerance, Bounds.MaxDim() / (double)hashN);
+	
+	double DensityBasedCellSize = FMath::Max(FMathd::ZeroTolerance, Bounds.MaxDim() / (double)hashN);
+	double FinalCellSize = FMath::Max(DensityBasedCellSize, UseMergeSearchTol * 2.0);
+	
+	TPointHashGrid3<int32, double> MidpointsHash(FinalCellSize, -1);
+
+	UseMergeSearchTol = fmin(UseMergeSearchTol, Bounds.MaxDim());
+	// temp values and buffers
+	FVector3d A, B, C, D;
+	TArray<int> equivBuffer;
+	TArray<int> SearchMatches;
+	SearchMatches.Reserve(1024);  // allocate buffer
+	
+	//
+	// construct edge equivalence sets. First we find all other edges with same
+	// midpoint, and then we form equivalence set for edge from subset that also
+	// has same endpoints
+	//
+	
+	typedef TArray<int> EdgesList;
+	TArray<EdgesList*> EquivalenceSets;
+	EquivalenceSets.Init(nullptr, EditMesh.MaxEdgeID());
+	TSet<int> RemainingEdges;
+	
+	for (int eid : EditMesh.BoundaryEdgeIndicesItr()) 
+	{
+		const int32 MidPtIdx = ToMidPt[eid];
+ 		FVector3d midpt = BoundaryMidPoints[MidPtIdx];
+	
+		// find all other edges with same midpoint in query sphere
+		SearchMatches.Reset();
+		MidpointsHash.FindPointsInBall(midpt, UseMergeSearchTol, [&](const int32& PtIdx)
+			{
+				return FVector3d::DistSquared(midpt, BoundaryMidPoints[ToMidPt[PtIdx]]);
+			}, SearchMatches);
+		// add each point after querying for neighbors, so we only find edges with earlier IDs
+		MidpointsHash.InsertPointUnsafe(eid, midpt);
+	
+		int N = SearchMatches.Num();
+		if (N == 0)
+		{
+			continue;		// edge has no matches
+		}
+	
+		EditMesh.GetEdgeV(eid, A, B);
+	
+		// if same endpoints, add to equivalence set for this edge (and matching reverse equivalence)
+		equivBuffer.Reset();
+		for (int i = 0; i < N; ++i) 
+		{
+			int32 MatchEID = SearchMatches[i];
+			EditMesh.GetEdgeV(SearchMatches[i], C, D);
+			if ( (DistanceSquared(A,C) < ToleranceSqr && DistanceSquared(B,D) < ToleranceSqr) ||
+			(DistanceSquared(A,D) < ToleranceSqr && DistanceSquared(B,C) < ToleranceSqr)) 
+			{
+				equivBuffer.Add(SearchMatches[i]);
+				if (!EquivalenceSets[MatchEID])
+				{
+					EquivalenceSets[MatchEID] = new EdgesList();
+					RemainingEdges.Add(MatchEID);
+				}
+				EquivalenceSets[MatchEID]->Add(eid);
+			}
+		}
+		if (equivBuffer.Num() > 0)
+		{
+			EquivalenceSets[eid] = new EdgesList(equivBuffer);
+			RemainingEdges.Add(eid);
+		}
+	}
+	
+	
+	//
+	// add potential duplicate edges to priority queue, sorted by number of possible matches. 
+	//
+	
+	// [TODO] could replace remaining hashset w/ PQ, and use conservative count?
+	// [TODO] Does this need to be a PQ? Not updating PQ below anyway...
+	FIndexPriorityQueue DuplicatesQueue;
+	DuplicatesQueue.Initialize(EditMesh.MaxEdgeID());
+	for (int eid : RemainingEdges) 
+	{
+		// if (OnlyUniquePairs) 
+		// {
+		// 	if (EquivalenceSets[eid]->Num() != 1)
+		// 	{
+		// 		continue;
+		// 	}
+		//
+		// 	// check that reverse match is the same and unique
+		// 	int other_eid = (*EquivalenceSets[eid])[0];
+		// 	if (EquivalenceSets[other_eid]->Num() != 1 || (*EquivalenceSets[other_eid])[0] != eid)
+		// 	{
+		// 		continue;
+		// 	}
+		// }
+		const float Priority = (float)EquivalenceSets[eid]->Num();
+		DuplicatesQueue.Insert(eid, Priority);
+	}
+	
+	//
+	// process all potential matches, merging edges as we go in a greedy fashion.
+	
+	while (DuplicatesQueue.GetCount() > 0) 
+	{
+		int eid = DuplicatesQueue.Dequeue();
+		
+		if (EditMesh.IsEdge(eid) == false || EquivalenceSets[eid] == nullptr || RemainingEdges.Contains(eid) == false)
+		{
+			continue;               // dealt with this edge already
+		}
+		if (EditMesh.IsBoundaryEdge(eid) == false)
+		{
+			continue;				// this edge got merged already
+		}
+	
+		EdgesList& Matches = *EquivalenceSets[eid];
+		//
+		 // select best viable match (currently just "first"...)
+		 // @todo could we make better decisions here? prefer planarity?
+		 bool bMerged = false;
+		 int FailedCount = 0;
+		 for (int i = 0; i < Matches.Num() && bMerged == false; ++i) 
+		 {
+		 	int other_eid = Matches[i];
+		 	if (EditMesh.IsEdge(other_eid) == false || EditMesh.IsBoundaryEdge(other_eid) == false)
+		 	{
+		 		continue;
+		 	}
+		
+		 	// When there is no geometry selection, EdgesToMerge is never initialized
+		 	bool bWeldingAcrossEntireMesh = (EdgesToMerge.Num() > 0);
+		
+		 	// Edges only considered for merging if we're welding the entire mesh or, when using a geometry selection,
+		 	// if EITHER edge in the Match are a part of the selection
+		 	if (EdgesToMerge.Contains(eid) || EdgesToMerge.Contains(other_eid))
+		 	{
+		 		FDynamicMesh3::FMergeEdgesInfo MergeInfo;
+		 		EMeshResult Result = EditMesh.MergeEdges(eid, other_eid, MergeInfo);
+		 		if (Result != EMeshResult::Ok) 
+		 		{
+		 			// if the operation failed we remove this edge from the equivalence set
+		 			Matches.RemoveAt(i);
+		 			i--;
+		
+		 			EquivalenceSets[other_eid]->Remove(eid);
+		 			//DuplicatesQueue.UpdatePriority(...);  // should we do this?
+		
+		 			FailedCount++;
+		 		}
+		 		else 
+		 		{
+		 			// ok we merged, other edge is no longer free
+		 			bMerged = true;
+		 			delete EquivalenceSets[other_eid];
+		 			EquivalenceSets[other_eid] = nullptr;
+		 			RemainingEdges.Remove(other_eid);
+		
+		 			// weld attributes 
+
+		 			SplitAttributeWelder.WeldSplitElements(EditMesh, MergeInfo.KeptVerts[0]);
+		 			SplitAttributeWelder.WeldSplitElements(EditMesh, MergeInfo.KeptVerts[1]);
+
+		 			FIndex2i EVID = EditMesh.GetEdgeV(eid);
+		 			FIndex2i EVIDother = EditMesh.GetEdgeV(other_eid);
+		 			FVector Pos00 = EditMesh.GetVertex(EVID[0]);
+		 			FVector Pos01 = EditMesh.GetVertex(EVID[1]);
+		 			FVector Pos10 = EditMesh.GetVertex(EVIDother[0]);
+		 			FVector Pos11 = EditMesh.GetVertex(EVIDother[1]);
+		 			
+		 			
+		 		}
+		 	}
+		 }
+	
+		 // Removing branch with two identical cases to fix static analysis warning.
+		 // However, these two branches are *not* the same...we're just not sure 
+		 // what the right thing to do is in the else case
+		if (bMerged) 
+		{
+			 delete EquivalenceSets[eid];
+			 EquivalenceSets[eid] = nullptr;
+			 RemainingEdges.Remove(eid);
+		}
+		else 
+		{
+			// should we do something else here? doesn't make sense to put
+			// back into Q, as it should be at the top, right?
+			delete EquivalenceSets[eid];
+			EquivalenceSets[eid] = nullptr;
+			RemainingEdges.Remove(eid);
+		}
+	
+	}
+	
+	// FinalNumBoundaryEdges = 0;
+	// for (int eid : Mesh->BoundaryEdgeIndicesItr())
+	// {
+	// 	FinalNumBoundaryEdges++;
+	// }
+
+	return ;
+
+
+
+
+
+	
+	// TSet<int32> GroupEdgeIDs;
+	// TArray<int32> CornerIDs;
+	// CornerIDs.Reserve(EditMesh.VertexCount());
+	// for (int i : EditMesh.VertexIndicesItr())
+	// {
+	// 	CornerIDs.Add(i);
+	// }
+	// FGroupTopology GroupTopology(&EditMesh, true);
+	//
+	// for (int32 CornerID : CornerIDs)
+	// {
+	// 	GroupTopology.ForCornerNbrEdges(CornerID, [CornerID, &CornerIDs, &GroupEdgeIDs, GroupTopology](int32 EdgeID)
+	// 	{
+	// 		if (CornerIDs.Contains(GroupTopology.Edges[EdgeID].EndpointCorners.A)
+	// 			&& CornerIDs.Contains(GroupTopology.Edges[EdgeID].EndpointCorners.B))
+	// 		{
+	// 			GroupEdgeIDs.Add(EdgeID);					
+	// 		}
+	// 		return true;
+	// 	});
+	// }
+	//
+	//
+	// FDynamicMesh3::FCollapseEdgeOptions CollapseOptions;
+	// CollapseOptions.bAllowHoleCollapse = true;
+	// CollapseOptions.bAllowCollapsingInternalEdgeWithBoundaryVertices = true;
+	// CollapseOptions.bAllowTetrahedronCollapse = true;
+	//
+	// TSet<int32> EidsToCollapse;
+	// for (int32 GroupEdgeID : GroupEdgeIDs)
+	// {
+	// 	EidsToCollapse.Append(GroupTopology.GetGroupEdgeEdges(GroupEdgeID));
+	// }
+	//
+	// // Partition our edges into connected components so that we can collapse into their
+	// //  individual centroids.
+	// TArray<TSet<int32>> EidComponents;
+	// TSet<int32> PartitionedEids;
+	// TArray<int32> TempQueue;
+	// for (int32 Eid : EidsToCollapse)
+	// {
+	// 	if (PartitionedEids.Contains(Eid))
+	// 	{
+	// 		continue;
+	// 	}
+	//
+	// 	TSet<int32>& ComponentEids = EidComponents.Emplace_GetRef();
+	// 	ComponentEids.Add(Eid);
+	// 	FMeshConnectedComponents::GrowToConnectedEdges(EditMesh, { Eid }, ComponentEids, &TempQueue,
+	// 		[&EidsToCollapse](int32 CurrentEid, int32 NeighborEid)
+	// 		{
+	// 			return EidsToCollapse.Contains(NeighborEid);
+	// 		});
+	// 	PartitionedEids.Append(ComponentEids);
+	// }
+	//
+	// // Now process our components.
+	// bool bAllCollapsesSuccessful = true;
+	// TSet<int32> NewSelectionVids;
+	// for (TSet<int32>& Component : EidComponents)
+	// {
+	// 	FVector3d Centroid = FVector3d::Zero();
+	// 	for (int32 Eid : Component)
+	// 	{
+	// 		Centroid += EditMesh.GetEdgePoint(Eid, 0.5);
+	// 	}
+	// 	Centroid /= Component.Num();
+	//
+	// 	// Unfiltered because vids will disappear in subsequent collapses
+	// 	TSet<int32> UnfilteredVidsToMove;
+	//
+	// 	for (int32 Eid : Component)
+	// 	{
+	// 		// Some edges might be collapsed away by other collapses
+	// 		if (!EditMesh.IsEdge(Eid))
+	// 		{
+	// 			continue;
+	// 		}
+	//
+	// 		FIndex2i EdgeVids = EditMesh.GetEdgeV(Eid);
+	// 		FDynamicMesh3::FEdgeCollapseInfo CollapseInfo;
+	// 		EMeshResult Result = EditMesh.CollapseEdge(EdgeVids.A, EdgeVids.B, CollapseOptions, CollapseInfo);
+	//
+	// 		// Certain collapses of isolated triangles/quads are not currently allowed by CollapseEdge,
+	// 		//  but we allow them if the user asks for them.
+	// 		if (Result == EMeshResult::Failed_CollapseTriangle
+	// 			|| Result == EMeshResult::Failed_CollapseQuad
+	// 			|| Result == EMeshResult::Failed_FoundDuplicateTriangle)
+	// 		{
+	// 			bAllCollapsesSuccessful = RemoveEdgeTrisIfNotLast(*CurrentMesh, Eid) && bAllCollapsesSuccessful;
+	// 		}
+	// 		// We could also check for EMeshResult::InvalidTopology and do the "move with seam"
+	// 		//  approach we do for welding, but it seems like it would be harder to notice this
+	// 		//  for collapses because the degenerate triangles are harder to find than open boundaries.
+	// 		//  So for now we won't fake a collapse in that case.
+	// 		else if (Result == EMeshResult::Ok)
+	// 		{
+	// 			UnfilteredVidsToMove.Add(CollapseInfo.KeptVertex);
+	// 		}
+	// 		else
+	// 		{
+	// 			bAllCollapsesSuccessful = false;
+	// 		}
+	// 	}
+	//
+	// 	for (int32 Vid : UnfilteredVidsToMove)
+	// 	{
+	// 		if (EditMesh.IsVertex(Vid))
+	// 		{
+	// 			EditMesh.SetVertex(Vid, Centroid);
+	// 			NewSelectionVids.Add(Vid);
+	// 		}
+	// 	}
+	// }
+	//
+	// EmitCurrentMeshChangeAndUpdate(CollapseEdgeTransactionLabel, ChangeTracker.EndChange(), FGroupTopologySelection());
+	//
+	// // Now that the topology is updated, we can get the new corner id's to
+	// //  set the new selection.
+	// FGroupTopologySelection NewSelection;
+	// for (int32 Vid : NewSelectionVids)
+	// {
+	// 	// Even though we filtered each component, it's possible for one component's collapses to indirectly
+	// 	//  destroy verts in another, hence the check here.
+	// 	if (!EditMesh.IsVertex(Vid))
+	// 	{
+	// 		continue;
+	// 	}
+	// 	int32 CornerID = Topology->GetCornerIDFromVertexID(Vid);
+	// 	if (CornerID != IndexConstants::InvalidID)
+	// 	{
+	// 		NewSelection.SelectedCornerIDs.Add(CornerID);
+	// 	}
+	// }
+	// // Seems possible to end up with an empty selection if we collapsed a triangle hole in a group,
+	// //  so the new vertex is not part of a group boundary.
+	// if (!NewSelection.IsEmpty())
+	// {
+	// 	SelectionMechanic->SetSelection(NewSelection);
+	// }
+	//
+
+
+}
+
+UDynamicMesh* UGeometryGeneral::ColorAttribTransf(UDynamicMesh* SourceMesh, UDynamicMesh* TargetMesh, bool& Success, FLinearColor ChannelMask)
+{
+	Success = true;
+	ChannelMask.R = rintf(ChannelMask.R);
+	ChannelMask.G = rintf(ChannelMask.G);
+	ChannelMask.B = rintf(ChannelMask.B);
+	ChannelMask.A = rintf(ChannelMask.A);
+	
+	TSharedPtr<FDynamicMesh3> SourceMeshCopy = MakeShared<FDynamicMesh3>();
+	SourceMesh->ProcessMesh([&](const FDynamicMesh3& EditMesh) { SourceMeshCopy->Copy(EditMesh); });
+	TargetMesh->EditMesh([&](FDynamicMesh3& EditMesh)
+	{
+		FDynamicMeshColorOverlay* TargetColorOverlay = EditMesh.Attributes()->PrimaryColors();
+		FDynamicMeshColorOverlay* SourceColorOverlay = SourceMeshCopy->Attributes()->PrimaryColors();
+		if (TargetColorOverlay->ElementCount() != SourceColorOverlay->ElementCount())
+		{
+			Success = false;
+			return ;
+		}
+
+		for(int EID : TargetColorOverlay->ElementIndicesItr())
+		{
+			FVector4f SourceColor4f = FVector4f::Zero();
+			SourceColorOverlay->GetElement(EID, SourceColor4f);
+			FVector4f TargetColor4f = FVector4f::Zero();
+			TargetColorOverlay->GetElement(EID, TargetColor4f);
+			
+			TargetColor4f.X = FMath::Lerp(TargetColor4f.X, SourceColor4f.X, (float)ChannelMask.R) ;
+			TargetColor4f.Y = FMath::Lerp(TargetColor4f.Y, SourceColor4f.Y, (float)ChannelMask.G) ;
+			TargetColor4f.Z = FMath::Lerp(TargetColor4f.Z, SourceColor4f.Z, (float)ChannelMask.B) ;
+			TargetColor4f.W = FMath::Lerp(TargetColor4f.W, SourceColor4f.W, (float)ChannelMask.A) ;
+			TargetColorOverlay->SetElement(EID, TargetColor4f);
+		}
+	});
+	return TargetMesh;
+}
+
+UDynamicMesh* UGeometryGeneral::UVAttribTransf(UDynamicMesh* SourceMesh, UDynamicMesh* TargetMesh, bool& Success,
+                                               int UVNum, FLinearColor ChannelMask)
+{
+	Success = true;
+	ChannelMask.R = rintf(ChannelMask.R);
+	ChannelMask.G = rintf(ChannelMask.G);
+	
+	TSharedPtr<FDynamicMesh3> SourceMeshCopy = MakeShared<FDynamicMesh3>();
+	SourceMesh->ProcessMesh([&](const FDynamicMesh3& EditMesh) { SourceMeshCopy->Copy(EditMesh); });
+	TargetMesh->EditMesh([&](FDynamicMesh3& EditMesh)
+	{
+		if ( SourceMeshCopy->Attributes()->NumUVLayers() < UVNum )
+		{
+			Success = false;
+			return ;
+		}
+		FDynamicMeshUVOverlay* SourceUVOverlay = SourceMeshCopy->Attributes()->GetUVLayer(UVNum);
+		FDynamicMeshUVOverlay* TargetUVOverlay = nullptr;
+		if (EditMesh.Attributes()->NumUVLayers() < UVNum)
+		{
+			EditMesh.Attributes()->SetNumUVLayers(UVNum + 1);
+			TargetUVOverlay = EditMesh.Attributes()->GetUVLayer(UVNum);
+			TargetUVOverlay->InitializeTriangles(EditMesh.MaxTriangleID());
+			for (int i = 0; i < SourceUVOverlay->ElementCount(); i++)
+			{
+				FVector2f SourceUV2f = FVector2f::Zero();
+				SourceUVOverlay->GetElement(i, SourceUV2f);
+				TargetUVOverlay->AppendElement(SourceUV2f);
+			}
+			
+		}
+		else
+		{
+			TargetUVOverlay = EditMesh.Attributes()->GetUVLayer(UVNum);
+			for(int EID : SourceUVOverlay->ElementIndicesItr())
+			{
+				FVector2f SourceUV2f = FVector2f::Zero();
+				SourceUVOverlay->GetElement(EID, SourceUV2f);
+				FVector2f TargetUV2f = FVector2f::Zero();
+				TargetUVOverlay->GetElement(EID, TargetUV2f);
+				//
+				// TargetUV2f.X = FMath::Lerp(TargetUV2f.X, SourceUV2f.X, (float)ChannelMask.R) ;
+				// TargetUV2f.Y = FMath::Lerp(TargetUV2f.Y, SourceUV2f.Y, (float)ChannelMask.G) ;
+				TargetUVOverlay->SetElement(EID, SourceUV2f);
+			}
+		}
+
+		
+
+		// if (TargetUVOverlay->ElementCount() != SourceUVOverlay->ElementCount())
+		// {
+		// 	Success = false;
+		// 	return ;
+		// }
+	
+
+	});
+	return TargetMesh;
 }
 
 template<typename ReduceDatatype, typename  ComponentType>

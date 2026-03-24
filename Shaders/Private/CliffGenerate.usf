@@ -1,0 +1,56 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/General.usf"
+
+float RandomRotator;
+float Size;
+
+Texture2D T_SceneDepth;
+Texture2D T_TMeshDepth;
+Texture2D T_SceneNormal;
+Texture2D T_CurrentSceneDepth;
+Texture2D T_Height;
+Texture2D T_Result;
+RWTexture2D<float4> RW_CurrentSceneDepth;
+RWTexture2D<float4> RW_PreTargetHeight;
+RWTexture2D<float4> RW_TargetHeight;
+RWTexture2D<float4> RW_AttributeUpPixel;
+RWTexture2D<float4> RW_DebugView;
+RWTexture2D<float4> RW_Result;
+
+
+SamplerState Sampler;
+
+
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void CalculateTargetHeight(
+                       uint3 DispatchThreadId : SV_DispatchThreadID,
+	                   uint GroupIndex : SV_GroupIndex) 
+{
+	float MaxCell = 0;
+	RW_PreTargetHeight.GetDimensions(MaxCell, MaxCell);
+	MaxCell -= 1;
+	
+	static const uint2 directionOffsets[4] = {
+		uint2(0, 1),   
+		uint2(0, -1), 
+		uint2(-1, 0), 
+		uint2(1, 0)   
+	};
+	
+	for (int i = 0; i < 4; i++)
+	{
+		uint2 NeighborCoord = clamp(
+			DispatchThreadId + directionOffsets[i],
+			uint2(0, 0),
+			uint2(MaxCell, MaxCell)
+		);
+		
+		float4 NeighborHeight = RW_PreTargetHeight[NeighborCoord];
+		if (NeighborHeight.z > 0 && NeighborHeight.x > RW_PreTargetHeight[DispatchThreadId].x)
+		{
+			RW_TargetHeight[DispatchThreadId.xy] = NeighborHeight;
+		}
+	}
+}
+

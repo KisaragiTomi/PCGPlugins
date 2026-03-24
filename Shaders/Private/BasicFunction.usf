@@ -1,0 +1,465 @@
+//#pragma
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/ComputeShaderUtils.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/General.usf"
+// #include "/Engine/Generated/GeneratedUniformBuffers.ush"
+
+// #include "/Engine/Private/DeferredShadingCommon.ush"
+
+
+// #include "/Engine/Private/DistanceField/GlobalDistanceFieldUtils.ush"
+// #include "/Engine/Private/DistanceField/GlobalDistanceFieldObjectGrid.ush"
+// #include "/Engine/Private/DistanceFieldLightingShared.ush"
+// #include "/Engine/Private/SceneData.ush"
+// #include "/Engine/Private/Random.ush"
+
+#ifndef THREADGROUPSIZE_X
+#define THREADGROUPSIZE_X 32
+#endif
+
+#ifndef THREADGROUPSIZE_Y
+#define THREADGROUPSIZE_Y 32
+#endif
+
+#ifndef EXTENTGENERATEMASK
+#define EXTENTGENERATEMASK 1
+#endif
+
+SamplerState Sampler;
+
+Texture2D T_Height;
+RWTexture2D<float4> RW_Gradient;
+
+
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void CalculateGradient(
+					   uint3 DispatchThreadId : SV_DispatchThreadID,
+					   uint GroupIndex : SV_GroupIndex)
+{
+	float MaxCell = 0;
+	T_Height.GetDimensions(MaxCell, MaxCell);
+	float2 uv = DispatchThreadId.xy / (MaxCell - 1);
+	float4 Gradient = float4(0, 0, 0, 0);
+	Gradient = ComputeGradientT(Sampler, T_Height, uv);
+	RW_Gradient[DispatchThreadId.xy] = Gradient;
+}
+
+Texture2D T_BlurTexture;
+RWTexture2D<float4> RW_BlurTexture;
+float BlurScale;
+
+#ifndef BT_SHAREFIND
+#define BT_SHAREFIND 1
+#endif
+
+groupshared half3 shareBlur[THREADGROUPSIZE_X + BT_SHAREFIND * 2][THREADGROUPSIZE_Y + BT_SHAREFIND * 2];
+
+float4 BlurPixel(SamplerState Sampler, Texture2D BlurTexture, uint3 DispatchThreadId, uint3 GroupThreadId, uint GroupIndex)
+{
+  
+    float MaxCell;
+    BlurTexture.GetDimensions(MaxCell, MaxCell);
+    MaxCell -= 1;
+    
+    uint PixelBoundSize = BT_SHAREFIND;
+    int2 globalPos = DispatchThreadId.xy;
+
+    // 加载主区域到共享内存
+    shareBlur[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize] = BlurTexture[DispatchThreadId.xy].xyz;
+ 
+    // 左边缘
+    if (GroupThreadId.x < PixelBoundSize)
+    {
+        int2 pos = globalPos - int2(PixelBoundSize, 0);
+        shareBlur[GroupThreadId.x][GroupThreadId.y + PixelBoundSize] = BlurTexture[clamp(pos, int2(0,0), MaxCell)].xyz;
+    }
+    // 右边缘
+    if (GroupThreadId.x >= THREADGROUPSIZE_X - PixelBoundSize)
+    {
+        int2 pos = globalPos + int2(PixelBoundSize, 0);
+        shareBlur[GroupThreadId.x + PixelBoundSize * 2][GroupThreadId.y + PixelBoundSize] = BlurTexture[clamp(pos, int2(0,0), MaxCell)].xyz;
+    }
+    // 上边缘
+    if (GroupThreadId.y < PixelBoundSize)
+    {
+        int2 pos = globalPos - int2(0, PixelBoundSize);
+        shareBlur[GroupThreadId.x + PixelBoundSize][GroupThreadId.y] = BlurTexture[clamp(pos, int2(0,0), MaxCell)].xyz;
+    }
+    // 下边缘
+    if (GroupThreadId.y >= THREADGROUPSIZE_X - PixelBoundSize)
+    {
+        int2 pos = globalPos + int2(0, PixelBoundSize);
+        shareBlur[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize * 2] = BlurTexture[clamp(pos, int2(0,0), MaxCell)].xyz;
+    }
+	
+	if (GroupThreadId.x < PixelBoundSize && GroupThreadId.y < PixelBoundSize)
+	{
+		int2 pos = globalPos + int2(-PixelBoundSize, -PixelBoundSize);
+		shareBlur[GroupThreadId.x][GroupThreadId.y] = BlurTexture[clamp(pos, int2(0,0), MaxCell)].xyz;
+	}
+	if (GroupThreadId.x < PixelBoundSize && GroupThreadId.y >= THREADGROUPSIZE_X - PixelBoundSize)
+	{
+		int2 pos = globalPos + int2(-PixelBoundSize, PixelBoundSize);
+		shareBlur[GroupThreadId.x][GroupThreadId.y + PixelBoundSize * 2] = BlurTexture[clamp(pos, int2(0,0), MaxCell)].xyz;
+	}
+	if (GroupThreadId.x >= THREADGROUPSIZE_X - PixelBoundSize && GroupThreadId.y >= THREADGROUPSIZE_X - PixelBoundSize)
+	{
+		int2 pos = globalPos + int2(PixelBoundSize, PixelBoundSize);
+		shareBlur[GroupThreadId.x + PixelBoundSize * 2][GroupThreadId.y + PixelBoundSize * 2] = BlurTexture[clamp(pos, int2(0,0), MaxCell)].xyz;
+	}
+	if (GroupThreadId.x >= THREADGROUPSIZE_X - PixelBoundSize && GroupThreadId.y < PixelBoundSize)
+	{
+		int2 pos = globalPos + int2(PixelBoundSize, -PixelBoundSize);
+		shareBlur[GroupThreadId.x + PixelBoundSize * 2][GroupThreadId.y] = BlurTexture[clamp(pos, int2(0,0), MaxCell)].xyz;
+	}
+    
+	
+    // 同步线程
+    GroupMemoryBarrierWithGroupSync();
+
+    // 计算模糊（从共享内存读取）
+	float4 sum = 0;
+	for (int dy = -BT_SHAREFIND; dy <= BT_SHAREFIND; ++dy) 
+	{
+		for (int dx = -BT_SHAREFIND; dx <= BT_SHAREFIND; ++dx)
+		{
+			sum += float4(shareBlur[GroupThreadId.x + PixelBoundSize + dx][GroupThreadId.y + PixelBoundSize + dy], 0);
+		}
+	}
+	float4 result = sum / (float)((2*PixelBoundSize+1)*(2*PixelBoundSize+1));
+    return result; 
+}
+
+
+float4 BlurPixelOrig(SamplerState Sampler, Texture2D BlurTexture, float2 uv)
+{
+	float Gx = 0;
+	float Gy = 0;
+	float4 SumSampleValue = float4(0, 0, 0, 0);
+	float MaxCell = 0;
+	BlurTexture.GetDimensions(MaxCell, MaxCell);
+    
+	for (int i = -1; i <= 1; i++)
+	{
+		for (int j = -1; j <= 1; j++)
+		{
+			float2 offset = float2(i, j) / MaxCell; 
+			float4 SampleValue = BlurTexture.SampleLevel(Sampler, uv + offset, 0);
+			SumSampleValue += SampleValue;
+		}
+	}
+	SumSampleValue /= 9.0; 
+	return SumSampleValue; 
+}
+
+float4 BlurNormalPixel(SamplerState Sampler, Texture2D BlurTexture, float2 uv)
+{
+    float Gx = 0;
+    float Gy = 0;
+    float4 SumSampleValue = float4(0, 0, 0, 0);
+    float MaxCell = 0;
+    BlurTexture.GetDimensions(MaxCell, MaxCell);
+    
+    for (int i = -1; i <= 1; i++)
+    {
+        for (int j = -1; j <= 1; j++)
+        {
+            float2 offset = float2(i, j) / MaxCell; 
+            float4 SampleValue = BlurTexture.SampleLevel(Sampler, uv + offset, 0);
+            SumSampleValue += SampleValue;
+        }
+    }
+    SumSampleValue /= 9.0; 
+    if (length(SumSampleValue) > 0.001)
+    {
+        SumSampleValue.xyz = normalize(SumSampleValue.xyz);
+    }
+    else
+    {
+        SumSampleValue.xyz = 0;
+    }
+    return SumSampleValue; 
+}
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void BlurTexture(
+					   uint3 DispatchThreadId : SV_DispatchThreadID,
+					   uint3 GroupThreadId : SV_GroupThreadID,
+					   uint GroupIndex : SV_GroupIndex)
+{
+	float MaxCell = 0;
+	T_BlurTexture.GetDimensions(MaxCell, MaxCell);
+	float2 uv = DispatchThreadId.xy / (MaxCell - 1);
+	float4 BlurColor = float4(0, 0, 0, 0);
+	// for (int i = 0; i < 15000; i++)
+	// {
+#if BLURTEXTURE_BT_BLUR3X3
+	BlurColor = BlurPixel(Sampler, T_BlurTexture, DispatchThreadId, GroupThreadId, GroupIndex);
+#elif BLURTEXTURE_BT_BLUR7X7
+	BlurColor = BlurPixel(Sampler, T_BlurTexture, DispatchThreadId, GroupThreadId, GroupIndex);
+#elif BLURTEXTURE_BT_BLUR9X9
+	BlurColor = BlurPixel(Sampler, T_BlurTexture, DispatchThreadId, GroupThreadId, GroupIndex);
+#elif BLURTEXTURE_BT_BLUR15X15
+	BlurColor = BlurPixel(Sampler, T_BlurTexture, DispatchThreadId, GroupThreadId, GroupIndex);
+#elif BLURTEXTURE_BT_BLURNORMAL3X3
+	
+	BlurColor = BlurNormalPixel(Sampler, T_BlurTexture, uv);
+#elif BLURTEXTURE_BT_BLURNORMAL7X7
+	
+#elif BLURTEXTURE_BT_BLURNORMAL9X9
+	
+#elif BLURTEXTURE_BT_BLURNORMAL15X15
+	
+#endif
+	// }
+	//BlurColor = T_BlurTexture[DispatchThreadId.xy];
+	// BlurColor = lerp(T_BlurTexture[DispatchThreadId.xy], BlurColor, BlurScale);
+	RW_BlurTexture[DispatchThreadId.xy] = BlurColor;
+}
+
+Texture2D T_UpPixel;
+RWTexture2D<float4> RW_UpPixel;
+float UpPixelThreshold;
+int Channel;
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void UpPixel(
+					   uint3 DispatchThreadId : SV_DispatchThreadID,
+					   uint GroupIndex : SV_GroupIndex)
+{
+	float3 NormalColor = T_UpPixel[DispatchThreadId.xy].xyz;
+	float dotvalue = dot(NormalColor, float3(0, 0, 1));
+	
+	RW_UpPixel[DispatchThreadId.xy][Channel] = float(dotvalue > UpPixelThreshold);
+  
+}
+
+
+#ifndef GROUPNUM
+#define GROUPNUM 8
+#endif
+
+#ifndef MaxPOINTSPERCELL
+#define MaxPOINTSPERCELL 128
+#endif
+
+
+
+Texture2D T_ProcssTexture0;
+Texture2DArray<float4> TA_ProcssTexture0;
+RWTexture2D<float4> RW_ProcssTexture0;
+RWTexture2D<float4> RW_DebugView;
+RWTexture2DArray<float4> RW_TextureArray0;
+RWBuffer<int> RW_IndexBuffer0;
+RWBuffer<float4> RWB_Float4_0;
+uint InputIntData0;
+uint InputIntData1;
+float InputData0;
+float3 InputVectorData0;
+float3 InputVectorData1;
+
+void ProcessHeightTexture(uint3 DispatchThreadId)
+{
+	RW_ProcssTexture0[DispatchThreadId.xy].x = min(InputData0 - T_ProcssTexture0[DispatchThreadId.xy].x, InputData0);
+	// RW_ProcssTexture0[DispatchThreadId.xy] = 1;
+}
+
+void BuildTextureArray(uint3 DispatchThreadId)
+{
+	RW_TextureArray0[int3(DispatchThreadId.xy, InputIntData0)] = T_ProcssTexture0[DispatchThreadId.xy];
+}
+
+
+void SampleHeihgtData(uint3 DispatchThreadId)
+{
+	float MaxCell = 0;
+	RW_ProcssTexture0.GetDimensions(MaxCell, MaxCell);
+	float2 SampleUV = (DispatchThreadId.xy + .5) / (MaxCell - 0);
+	// vector Range = HeightDataSizeMax - HeightDataSizeMin;
+	// vector MinUV = (TextureSizeMin - HeightDataSizeMin) / Range;
+	// vector MaxUV = (TextureSizeMax - HeightDataSizeMax) / Range;
+	// vector UVRange = MaxUV - MinUV;
+	SampleUV *= InputVectorData0.xy;
+	SampleUV += InputVectorData1.xy;
+	
+	RW_ProcssTexture0[DispatchThreadId.xy] = T_ProcssTexture0.SampleLevel(Sampler, SampleUV, 0);
+	// RW_ProcssTexture0[DispatchThreadId.xy] = 1;
+}
+
+groupshared half ShareExtentFasthalf[64][64];
+void ExtentMaskFast(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupID)
+{
+    float MaxCell;
+    T_ProcssTexture0.GetDimensions(MaxCell, MaxCell);
+    MaxCell -= 1;
+ 
+	int Channel = InputIntData0;
+	int NumExtend = min(16, InputIntData1);
+    int PixelBoundSize = 16;
+	
+    int2 globalPos = DispatchThreadId.xy;
+    float4 CurrentColor = T_ProcssTexture0[DispatchThreadId.xy];
+    ShareExtentFasthalf[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize] = CurrentColor[Channel];
+	RW_ProcssTexture0[DispatchThreadId.xy] = CurrentColor;
+	
+    if (GroupThreadId.x < PixelBoundSize)
+    {
+        int2 FillPos = globalPos - int2(PixelBoundSize, 0);
+        ShareExtentFasthalf[GroupThreadId.x][GroupThreadId.y + PixelBoundSize] = T_ProcssTexture0[clamp(FillPos, int2(0,0), MaxCell)][Channel];
+    }
+    if (GroupThreadId.x >= THREADGROUPSIZE_X - PixelBoundSize)
+    {
+        int2 FillPos = globalPos + int2(PixelBoundSize, 0);
+        ShareExtentFasthalf[GroupThreadId.x + PixelBoundSize * 2][GroupThreadId.y + PixelBoundSize] = T_ProcssTexture0[clamp(FillPos, int2(0,0), MaxCell)][Channel];
+    }
+    if (GroupThreadId.y < PixelBoundSize)
+    {
+        int2 FillPos = globalPos - int2(0, PixelBoundSize);
+        ShareExtentFasthalf[GroupThreadId.x + PixelBoundSize][GroupThreadId.y] = T_ProcssTexture0[clamp(FillPos, int2(0,0), MaxCell)][Channel];
+    }
+    if (GroupThreadId.y >= THREADGROUPSIZE_X - PixelBoundSize)
+    {
+        int2 FillPos = globalPos + int2(0, PixelBoundSize);
+        ShareExtentFasthalf[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize * 2] = T_ProcssTexture0[clamp(FillPos, int2(0,0), MaxCell)][Channel];
+    }
+
+	if (GroupThreadId.x < PixelBoundSize && GroupThreadId.y < PixelBoundSize)
+	{
+		int2 pos = globalPos + int2(-PixelBoundSize, -PixelBoundSize);
+		ShareExtentFasthalf[GroupThreadId.x][GroupThreadId.y] = T_ProcssTexture0[clamp(pos, int2(0,0), MaxCell)][Channel];
+	}
+	if (GroupThreadId.x < PixelBoundSize && GroupThreadId.y >= THREADGROUPSIZE_X - PixelBoundSize)
+	{
+		int2 pos = globalPos + int2(-PixelBoundSize, PixelBoundSize);
+		ShareExtentFasthalf[GroupThreadId.x][GroupThreadId.y + PixelBoundSize * 2] = T_ProcssTexture0[clamp(pos, int2(0,0), MaxCell)][Channel];
+	}
+	if (GroupThreadId.x >= THREADGROUPSIZE_X - PixelBoundSize && GroupThreadId.y >= THREADGROUPSIZE_X - PixelBoundSize)
+	{
+		int2 pos = globalPos + int2(PixelBoundSize, PixelBoundSize);
+		ShareExtentFasthalf[GroupThreadId.x + PixelBoundSize * 2][GroupThreadId.y + PixelBoundSize * 2] = T_ProcssTexture0[clamp(pos, int2(0,0), MaxCell)][Channel];
+	}
+	if (GroupThreadId.x >= THREADGROUPSIZE_X - PixelBoundSize && GroupThreadId.y < PixelBoundSize)
+	{
+		int2 pos = globalPos + int2(PixelBoundSize, -PixelBoundSize);
+		ShareExtentFasthalf[GroupThreadId.x + PixelBoundSize * 2][GroupThreadId.y] = T_ProcssTexture0[clamp(pos, int2(0,0), MaxCell)][Channel];
+	}
+	
+    GroupMemoryBarrierWithGroupSync();
+ 
+	float CurrentDist = 99999999;
+	uint2 CurrentOffset = uint2(GroupThreadId.x + PixelBoundSize, GroupThreadId.y + PixelBoundSize);
+	half CurrentShareColor = ShareExtentFasthalf[CurrentOffset.x][CurrentOffset.y];
+	bool IsChange = false;
+    for (int Y = -NumExtend; Y <= NumExtend; Y++ )
+    {
+    	for (int X = -NumExtend; X <= NumExtend; X++ )
+    	{
+    		uint2 Offset = CurrentOffset.xy + int2(X, Y);
+    		half ShareColor = ShareExtentFasthalf[Offset.x][Offset.y];
+			float Dist = distance(CurrentOffset, Offset);
+    		IsChange = ShareColor > 0 && Dist < CurrentDist;
+			CurrentDist = IsChange ? Dist : CurrentDist;
+    		CurrentShareColor = IsChange ? ShareColor : CurrentShareColor;
+    		
+    	}
+    }
+    RW_ProcssTexture0[DispatchThreadId.xy][Channel] = CurrentShareColor;
+}
+
+void DrawTexture16(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupID)
+{
+	int2 MaxCell;
+	RW_ProcssTexture0.GetDimensions(MaxCell.x, MaxCell.y);
+	int MaxIndex;
+	int Index = DispatchThreadId.x + DispatchThreadId.y * MaxCell.x;
+	float4 Color = Index >= InputIntData0 ? float4(0, 0, 0, 0) : RWB_Float4_0[Index];
+	RW_ProcssTexture0[DispatchThreadId.xy] = Color;
+}
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void GeneralFunctionSet(
+						uint3 GroupId : SV_GroupID,
+						uint3 DispatchThreadId : SV_DispatchThreadID,
+						uint3 GroupThreadId : SV_GroupThreadID,
+						uint GroupIndex : SV_GroupIndex) 
+{
+#if GTS_PROCESSMESHHEIGHTTEXTURE
+	ProcessHeightTexture(DispatchThreadId);
+#elif GTS_BUILDTEXTUREARRAY
+	BuildTextureArray(DispatchThreadId);
+#elif GTS_CONVERTHEIGHTDATATEXTURE
+	SampleHeihgtData(DispatchThreadId);
+#elif GTS_MASKEXTENDFAST
+	ExtentMaskFast(DispatchThreadId, GroupThreadId, GroupId);
+#elif GTS_DRAWTEXTURE16
+	DrawTexture16(DispatchThreadId, GroupThreadId, GroupId);
+#endif
+
+}
+
+void DistanceToNearestSurface(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupId, uint GroupIndex)
+{
+#if USE_DISTANCEFIELD
+	RW_DebugView[DispatchThreadId.xy].x = GetDistanceToNearestSurfaceGlobal(float3(DispatchThreadId.xy, 0) * 10);
+#endif
+}	
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void DistanceFieldFunction(
+						uint3 GroupId : SV_GroupID,
+						uint3 DispatchThreadId : SV_DispatchThreadID,
+						uint3 GroupThreadId : SV_GroupThreadID,
+						uint GroupIndex : SV_GroupIndex)
+{
+#if GDF_DISTANCETONEARESTSURFACE
+	DistanceToNearestSurface(DispatchThreadId, GroupThreadId, GroupId, GroupIndex);
+#endif
+	
+	
+}
+
+RWTexture2D<float4> RW_CopySource;
+Texture2D<float4> T_CopySource;
+// float4 TextureSizeAndPixelSize;
+SamplerState SourceSampler;
+
+void FDrawCopyTexture(
+	in float4 SvPosition : SV_POSITION,
+	out float4 OutColor : SV_Target0)
+{
+	OutColor = HALF4_TYPE(1.0f, 1.0f, 1.0f, 0.0f);
+
+	// float2 UVPos = SvPosition.xy * TextureSizeAndPixelSize.zw;
+	//
+	// float UnClampedNoL = UVPos.x * 2.0f - 1.0f;
+	// float Curvature = UVPos.y;
+#if DC_COPYRWTEXTURE
+	OutColor = RW_CopySource[uint2(round(SvPosition.x), round(SvPosition.y))];
+#elif DC_COPYTEXTURE
+	OutColor = T_CopySource.Sample(SourceSampler, SvPosition);
+#endif
+}
+
+
+RWTexture2D<float4> RW_PivotIndex;
+RWTexture2D<float4> RW_DirExtent;
+RWBuffer<float4> RWB_PivotIndex;
+RWBuffer<float4> RWB_DirExtent;
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void TreeWind(
+						uint3 GroupId : SV_GroupID,
+						uint3 DispatchThreadId : SV_DispatchThreadID,
+						uint3 GroupThreadId : SV_GroupThreadID,
+						uint GroupIndex : SV_GroupIndex)
+{
+	int2 CellSize;
+	RW_PivotIndex.GetDimensions(CellSize.x, CellSize.y);
+	
+	int Index = CellSize.x * (CellSize.y - DispatchThreadId.y - 1) + DispatchThreadId.x;
+
+	RW_PivotIndex[DispatchThreadId.xy] = RWB_PivotIndex[Index];
+	RW_DirExtent[DispatchThreadId.xy] = RWB_DirExtent[Index];
+}

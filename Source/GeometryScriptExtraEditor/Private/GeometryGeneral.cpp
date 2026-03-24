@@ -213,12 +213,12 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
                                        TArray<FVector>& OutHolePositions,
                                        TMap<int, FVector>& DebugClassNum,
                                        int LeafMaterialIndex,
-                                       float CombineDistThreashould,
-                                       float FindParentThreashold, bool OutDebugColor
+                                       float CombineDistThreshold,
+                                       float FindParentThreshold, bool OutDebugColor
 )
 {
 
-	// float CombineDistThreashould = 30;
+	// float CombineDistThreshold = 30;
 	TArray<int> UVIndexTest;
 	TArray<FVector2D> UVTestIndex;
 	TArray<FVector2D> UVFloat;
@@ -265,7 +265,7 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 			bool IsLeaf = false;
 
 			TArray<TArray<int>> Holes;
-			int VaildHole = 0;
+			int ValidHole = 0;
 		};
 
 
@@ -415,8 +415,8 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 			if (Data.Holes.Num() < 1) continue;
 			
 			float MaxSize = -9999999999.0;
-			TArray<int> VaildHole = Data.Holes[0];
-			TArray<FVector> VaildLoops;
+			TArray<int> ValidHole = Data.Holes[0];
+			TArray<FVector> ValidLoops;
 			
 			for (int i = 0; i < Data.Holes.Num(); i++)
 			{
@@ -434,16 +434,16 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 				
 				if (Size > MaxSize)
 				{
-					VaildLoops = VertexPoss;
-					VaildHole = Data.Holes[i];
+					ValidLoops = VertexPoss;
+					ValidHole = Data.Holes[i];
 					MaxSize = fmax(Size, MaxSize);
 				}
 			}
-			if (VaildHole.Num() == 0)
+			if (ValidHole.Num() == 0)
 			{
 				FIndex3i TVIDs = EditMesh.GetTriangle(Data.TIDs[0]);
-				VaildHole.Add(TVIDs[0]);
-				VaildLoops.Add(FVector(0, 0, 0));
+				ValidHole.Add(TVIDs[0]);
+				ValidLoops.Add(FVector(0, 0, 0));
 			}
 			FVector Normal = FVector::ZeroVector;
 			FVector Center = FVector::ZeroVector;
@@ -454,16 +454,16 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 			
 			// AVI_PreClass->GetValue(LoopVertices.Vertices[0], &PreClassNum);
 			// AVI_Class->GetValue(BLoops.Loops[i].Vertices[0], &LoopClassNum);
-			AVI_DiscardPoint->GetValue(VaildHole[0], &DiscardPoint);
+			AVI_DiscardPoint->GetValue(ValidHole[0], &DiscardPoint);
 			
 			if (DiscardPoint) continue;
 			bool LoopChecked = Data.Checked;
 			
-			for (int j = 0; j < VaildHole.Num(); j++)
+			for (int j = 0; j < ValidHole.Num(); j++)
 			{
-				FVector PrePos = VaildLoops[(j == 0) ? (VaildHole.Num()-1) : (j-1) ];
-				FVector Pos = VaildLoops[j];
-				FVector NextPos =  VaildLoops[(j + 1) % VaildHole.Num() ];
+				FVector PrePos = ValidLoops[(j == 0) ? (ValidHole.Num()-1) : (j-1) ];
+				FVector Pos = ValidLoops[j];
+				FVector NextPos =  ValidLoops[(j + 1) % ValidHole.Num() ];
 				
 				Center += Pos;
 				
@@ -473,15 +473,15 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 				Normal += FVector::CrossProduct(Dir1, Dir2);
 			}
 			FVector3d ResultN = Normal.GetSafeNormal();
-			Center /= float(VaildHole.Num());
+			Center /= float(ValidHole.Num());
 
 			// Find ParentClass
 			//=================================================================================
 			int ParentClass = TNumericLimits<int>::Max();
 			bool TarChecked = false;
-			for (int j = 0; j < VaildHole.Num(); j++)
+			for (int j = 0; j < ValidHole.Num(); j++)
 			{
-				FVector3d VertexPos = VaildLoops[j];
+				FVector3d VertexPos = ValidLoops[j];
 				
 				int HitTID = TNumericLimits<int>::Max();
 				IMeshSpatial::FQueryOptions QueryOptionsXYZ([&](int32 TID)
@@ -496,7 +496,7 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 				HitTID = BVH.Spatial->FindNearestTriangle(VertexPos, Dist, QueryOptionsXYZ);
 				if (HitTID < 0) continue;
 				
-				if (Dist > FindParentThreashold ) continue;
+				if (Dist > FindParentThreshold ) continue;
 				
 				int ParentClassNum = -1;
 				ATI_Class->GetValue(HitTID, &ParentClassNum);
@@ -506,7 +506,7 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 				TarChecked = TarChecked || Check;
 				
 			}
-			AllLoopVertices.Append(VaildLoops);
+			AllLoopVertices.Append(ValidLoops);
 			
 			// End Parent Class
 			//=================================================================================
@@ -692,17 +692,17 @@ void UGeometryGeneral::WindDataForTree(UDynamicMesh* TargetMesh,
 			FVector ObjectBasisVectorY = Data.RootNormal.GetSafeNormal();
 			FVector ObjectBasisVectorZ = FVector::CrossProduct(ObjectBasisVectorX, -ObjectBasisVectorY).GetSafeNormal();
 			FQuat yDhiedral = FQuat::FindBetweenNormals(ObjectBasisVectorY, FVector(0, 1, 0));
-			yDhiedral.RotateVector(ObjectBasisVectorZ);
 			FQuat zDhiedral = FQuat::FindBetweenNormals(ObjectBasisVectorZ, FVector(0, 0, 1));
 
 
 			for (int v = 0; v < Data.VPoss.Num(); v++)
 			{
-				FVector& VertexPos = Data.VPoss[v];
+				FVector VertexPos = Data.VPoss[v];
 	
 				VertexPos -= Data.RootCenter;
-				yDhiedral.RotateVector(VertexPos);
-				zDhiedral.RotateVector(VertexPos);
+				VertexPos = yDhiedral.RotateVector(VertexPos);
+				VertexPos = zDhiedral.RotateVector(VertexPos);
+				Data.VPoss[v] = VertexPos;
 			}
 			FBox BBox = FBox(Data.VPoss);
 			FVector BBoxSize = BBox.GetSize();
@@ -1437,13 +1437,13 @@ TMap<int, ReduceDatatype> UGeometryGeneral::FindNearestComponents(FDynamicMesh3&
 	// 	FDynamicMeshComponentData& Data = ComponentDatas[Class];
 	// 	int ParentClass = Data.ParentClass;
 	// 	float MaxDist = ReduceDatatype.MaxDist;
-	// 	if (MaxDist > CombineDistThreashould ||  MaxDist == TNumericLimits<int>::Max() ) continue;
+	// 	if (MaxDist > CombineDistThreshold ||  MaxDist == TNumericLimits<int>::Max() ) continue;
 	//
 	// 	if (ReduceComponentMap.Find(ParentClass))
 	// 	{
 	// 		FWindTreeReduceData& ParentReduceData = ReduceComponentMap[ParentClass];
 	// 		MaxDist = ParentReduceData.MaxDist;
-	// 		if (MaxDist > CombineDistThreashould ||  MaxDist == TNumericLimits<int>::Max() ) continue;
+	// 		if (MaxDist > CombineDistThreshold ||  MaxDist == TNumericLimits<int>::Max() ) continue;
 	// 	}
 	// 	ComponentDatas[ParentClass].TIDs.Append(Data.TIDs);
 	// 	ComponentDatas[Class].TIDs.Empty();
@@ -1514,7 +1514,7 @@ TMap<int, ReduceDatatype> UGeometryGeneral::FindNearestComponents(FDynamicMesh3&
  //        		if ( MinDistComponentReduceData.Value.Count <  ComponentReduceData.Value.Count) MinDistComponentReduceData = ComponentReduceData;
  //        	}
  //        	float MaxDist = MinDistComponentReduceData.Value.Dist;
- //        	if (MaxDist > CombineDistThreashould || MaxDist == TNumericLimits<int>::Max() ) continue;
+ //        	if (MaxDist > CombineDistThreshold || MaxDist == TNumericLimits<int>::Max() ) continue;
 	// 		
  //        	ComponentData.Value.AddToClass = MinDistComponentReduceData.Key;
 	// 		
@@ -1544,7 +1544,7 @@ TMap<int, ReduceDatatype> UGeometryGeneral::FindNearestComponents(FDynamicMesh3&
  //        double MaxDist = MinDistComponentReduceData.Value.Dist;
  //        int TargetClass = MinDistComponentReduceData.Key;
  //    	
- //        if (TargetClass < 0 || MaxDist > CombineDistThreashould || MaxDist == TNumericLimits<double>::Max())
+ //        if (TargetClass < 0 || MaxDist > CombineDistThreshold || MaxDist == TNumericLimits<double>::Max())
  //        {
  //            Data.AddToClass = -1;
  //            Data.MaxDistToParent = TNumericLimits<double>::Max();

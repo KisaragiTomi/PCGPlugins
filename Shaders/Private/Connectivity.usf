@@ -1,0 +1,301 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/General.usf"
+
+#ifndef THREADGROUPSIZE_X
+#define THREADGROUPSIZE_X 32
+#endif
+#ifndef THREADGROUPSIZE_Y
+#define THREADGROUPSIZE_Y 32
+#endif
+
+SamplerState Sampler;
+
+
+Texture2D<float4> InputTexture;
+RWTexture2D<float4> RW_ConnectivityPixel;
+RWTexture2D<float4> RW_DebugView;
+
+RWTexture2D<float4> RW_LabelBufferA;
+RWTexture2D<float4> RW_LabelBufferB;
+RWTexture2D<float4> RW_SaveBufferA;
+RWTexture2D<float4> RW_SaveBufferB;
+
+RWTexture2D<uint> RW_LabelCounters;
+
+// RWBuffer<uint> RW_LabelCounters;
+RWBuffer<uint> RW_NormalizeCounter;
+RWBuffer<float4> RW_ResultBuffer;
+// RWBuffer<float> RW_;
+int Channel;
+uint PieceNum;
+//ConsumeStructuredBuffer<uint> FreeLabels;
+
+
+groupshared float sharedMin[256]; 
+
+[numthreads(256, 1, 1)]
+void CS_Promote(
+				uint3 GroupThreadId : SV_GroupThreadID,
+				uint GroupIndex : SV_GroupIndex)
+{
+	uint index = GroupIndex.x * 256 + GroupThreadId.x;
+	float val = 65536;
+	
+	// if (index < g_dataSize)
+	// {
+	val = InputTexture[index];
+	// }
+	sharedMin[GroupThreadId.x] = val;
+    
+	GroupMemoryBarrierWithGroupSync(); 
+
+	// 归约：逐步折半比较最小值
+	for (uint stride = 128; stride > 0; stride >>= 1)
+	{
+		if (GroupThreadId.x < stride) {
+			sharedMin[GroupThreadId.x] = min(sharedMin[GroupThreadId.x], sharedMin[GroupThreadId.x + stride]);
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+	
+	if (GroupThreadId.x == 0) 
+	{
+		RW_ConnectivityPixel[GroupIndex] = sharedMin[0];
+	}
+}
+
+void CPF_Init(uint3 DispatchThreadId)
+{
+	float MaxCell = 0;
+	InputTexture.GetDimensions(MaxCell, MaxCell);
+	
+	float label = DispatchThreadId.y * MaxCell + DispatchThreadId.x + 1; // +1避免0冲突
+	if (InputTexture[DispatchThreadId.xy][Channel] > 0)
+	{
+		RW_LabelBufferA[DispatchThreadId.xy].xy = DispatchThreadId.xy;
+		RW_LabelBufferB[DispatchThreadId.xy].xy = DispatchThreadId.xy;
+		RW_LabelBufferA[DispatchThreadId.xy].zw = DispatchThreadId.xy;
+		RW_LabelBufferB[DispatchThreadId.xy].zw = DispatchThreadId.xy;
+		// RW_SaveBufferA[DispatchThreadId.xy].xy = DispatchThreadId.xy;
+		// RW_SaveBufferB[DispatchThreadId.xy].xy = DispatchThreadId.xy;
+		// RW_SaveBufferA[DispatchThreadId.xy].zw = DispatchThreadId.xy;
+		// RW_SaveBufferB[DispatchThreadId.xy].zw = DispatchThreadId.xy;
+		RW_DebugView[DispatchThreadId.xy] = float4(label/100000.0, 0, 0, 0);
+		
+	} else
+	{
+		RW_LabelBufferA[DispatchThreadId.xy] = -1;
+		RW_LabelBufferB[DispatchThreadId.xy] = -1;
+		RW_DebugView[DispatchThreadId.xy] = -1;
+	}
+}
+void CPF_Findislands(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupID)
+{
+	float2 currentLabel = RW_LabelBufferA[DispatchThreadId.xy].xy;
+	float MaxCell = 0;
+	InputTexture.GetDimensions(MaxCell, MaxCell);
+	int PixelNum = RW_LabelBufferA[DispatchThreadId.xy].x - 1;
+	float LineX = PixelNum - 100 * 256;
+	int2 DispathThreadIdFromLabel = int2(LineX, PixelNum / MaxCell);
+	RW_DebugView[DispathThreadIdFromLabel].y = LineX / 100.0;
+}
+
+groupshared half4 ShareIslandNum [THREADGROUPSIZE_X + 2][THREADGROUPSIZE_X + 2]; //DispatchThreadId.xy
+groupshared half2 ShareFindIndex [THREADGROUPSIZE_Y][THREADGROUPSIZE_Y]; // GroupIndex
+
+void CPF_FindislandsFast(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupID, uint GroupIndex)
+{
+	
+	float MaxCell = 0;
+	InputTexture.GetDimensions(MaxCell, MaxCell);
+	MaxCell -= 1;
+	
+    int PixelBoundSize = 1;
+    int2 globalPos = DispatchThreadId.xy;
+	int2 FindID= RW_LabelBufferA[DispatchThreadId.xy].xy;
+	float2 CurrentID = RW_LabelBufferA[FindID].zw;
+	ShareIslandNum[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize] = float4(CurrentID, CurrentID);
+	ShareFindIndex[GroupThreadId.x][GroupThreadId.y] = GroupThreadId.xy;
+	RW_DebugView[DispatchThreadId.xy].y = 0;
+	
+    if (GroupThreadId.x < PixelBoundSize)
+    {
+        int2 pos = globalPos - int2(PixelBoundSize, 0);
+    	int2 FindID = RW_LabelBufferA[clamp(pos, 0, MaxCell)].xy;
+    	float2 ID = RW_LabelBufferA[FindID].wz;
+        ShareIslandNum[GroupThreadId.x][GroupThreadId.y + PixelBoundSize] = float4(ID, ID);
+    }
+    if (GroupThreadId.x >= THREADGROUPSIZE_X - PixelBoundSize)
+    {
+        int2 pos = globalPos + int2(PixelBoundSize, 0);
+    	int2 FindID = RW_LabelBufferA[clamp(pos, 0, MaxCell)].xy;
+    	float2 ID = RW_LabelBufferA[FindID].wz;
+        ShareIslandNum[GroupThreadId.x + PixelBoundSize * 2][GroupThreadId.y + PixelBoundSize] = float4(ID, ID);
+    }
+    if (GroupThreadId.y < PixelBoundSize)
+    {
+        int2 pos = globalPos - int2(0, PixelBoundSize);
+    	int2 FindID = RW_LabelBufferA[clamp(pos, 0, MaxCell)].xy;
+    	float2 ID = RW_LabelBufferA[FindID].wz;
+        ShareIslandNum[GroupThreadId.x + PixelBoundSize][GroupThreadId.y] = float4(ID, ID);
+    }
+    if (GroupThreadId.y >= THREADGROUPSIZE_X - PixelBoundSize)
+    {
+        int2 pos = globalPos + int2(0, PixelBoundSize);
+    	int2 FindID = RW_LabelBufferA[clamp(pos, 0, MaxCell)].xy;
+    	float2 ID = RW_LabelBufferA[FindID].wz;
+        ShareIslandNum[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize * 2] = float4(ID, ID);
+    }
+	
+    GroupMemoryBarrierWithGroupSync();
+	
+	MaxCell += 1;
+	float2 CurrentShareIslandNum = ShareIslandNum[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize];
+	if (CurrentShareIslandNum.x == -1) return;
+
+	CurrentShareIslandNum = ShareIslandNum[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize];
+	float CurrentIndex = CurrentShareIslandNum.x + CurrentShareIslandNum.y * MaxCell;
+    	
+	// for (int n = 0; n < 4; n++)
+	// {
+	// 	uint2 Offset = GroupThreadId.xy + PixelBoundSize + NeighbourOffset[n];
+	// 	float2 ShareResult = ShareIslandNum[Offset.x][Offset.y].xy;
+	// 	float Index = ShareResult.x + ShareResult.y * MaxCell;
+	// 	if ( Index > 0 && CurrentIndex > Index)
+	// 	{
+	// 		CurrentIndex = Index;
+	// 		ShareIslandNum[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize] = float4(ShareResult, ShareResult);
+	// 	}
+	// 	// CurrentIndex = ShareResult.x >= 0 ? CurrentShareIslandNum : min(ShareResult, CurrentShareIslandNum);
+	// 	// ShareIslandNum[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize] = CurrentShareIslandNum;
+	// }
+	// GroupMemoryBarrierWithGroupSync();
+	
+    for (int i = 0; i < THREADGROUPSIZE_X * 2; i ++)
+    {
+    	// float2 FindIndex = ShareFindIndex[GroupThreadId.x][GroupThreadId.y];
+     //    CurrentShareIslandNum = ShareIslandNum[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize];
+    	// float CurrentIndex = CurrentShareIslandNum.x + CurrentShareIslandNum.y * MaxCell;
+    	//
+     //    for (int n = 0; n < 4; n++)
+     //    {
+     //        uint2 Offset = GroupThreadId.xy + PixelBoundSize + NeighbourOffset[n];
+     //        float2 ShareResult = ShareIslandNum[Offset.x][Offset.y].xy;
+     //    	float2 ShareIndexResult = ShareFindIndex[clamp(Offset.x, 0, MaxCell -1)][clamp(Offset.y, 0, MaxCell -1)];
+     //    	float Index = ShareResult.x + ShareResult.y * MaxCell;
+     //    	if ( Index > 0 && CurrentIndex > Index)
+     //    	{
+     //    		CurrentIndex = Index;
+     //    		ShareIslandNum[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize].xy = ShareResult;
+     //    		ShareIslandNum[ShareIndexResult.x + PixelBoundSize][ShareIndexResult.y + PixelBoundSize].xy = ShareResult;
+     //    		ShareFindIndex[GroupThreadId.x][GroupThreadId.y].xy = ShareIndexResult;
+     //    	}
+     //    	// CurrentIndex = ShareResult.x >= 0 ? CurrentShareIslandNum : min(ShareResult, CurrentShareIslandNum);
+     //    	// ShareIslandNum[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize] = CurrentShareIslandNum;
+     //    }
+     //    GroupMemoryBarrierWithGroupSync();
+    	// FindIndex = ShareFindIndex[GroupThreadId.x][GroupThreadId.y];
+    	// float2 ContainerIslandNum = ShareIslandNum[FindIndex.x + PixelBoundSize][FindIndex.y + PixelBoundSize].xy;
+    	// CurrentShareIslandNum = ShareIslandNum[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize];
+    	// CurrentIndex = CurrentShareIslandNum.x + CurrentShareIslandNum.y * MaxCell;
+    	// float2 ContainerIndex = ContainerIslandNum.x + ContainerIslandNum.y * MaxCell;
+    	// if (CurrentIndex > ContainerIndex)
+    	// ShareIslandNum[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize].xy = ContainerIslandNum;
+    	//
+    	// GroupMemoryBarrierWithGroupSync();
+		
+    	CurrentShareIslandNum = ShareIslandNum[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize];
+    	float CurrentIndex = CurrentShareIslandNum.x + CurrentShareIslandNum.y * MaxCell;
+    	
+    	for (int n = 0; n < 4; n++)
+    	{
+    		uint2 Offset = GroupThreadId.xy + PixelBoundSize + NeighbourOffset[n];
+    		float2 ShareResult = ShareIslandNum[Offset.x][Offset.y].xy;
+    		float Index = ShareResult.x + ShareResult.y * MaxCell;
+    		if ( Index > 0 && CurrentIndex > Index)
+    		{
+    			CurrentIndex = Index;
+    			ShareIslandNum[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize] = float4(ShareResult, ShareResult);
+    		}
+    		// CurrentIndex = ShareResult.x >= 0 ? CurrentShareIslandNum : min(ShareResult, CurrentShareIslandNum);
+    		// ShareIslandNum[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize] = CurrentShareIslandNum;
+    	}
+    	GroupMemoryBarrierWithGroupSync();
+    }
+	
+	CurrentShareIslandNum = ShareIslandNum[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize];
+	RW_LabelBufferB[DispatchThreadId.xy] = float4(CurrentShareIslandNum, CurrentShareIslandNum);
+	RW_LabelBufferB[FindID].zw = CurrentShareIslandNum;
+	RW_DebugView[CurrentShareIslandNum].y = 11111;
+	
+}
+
+void CPF_Count(uint3 DispatchThreadId)
+{
+	
+	float2 IndexXY = RW_LabelBufferA[DispatchThreadId.xy].xy;
+	RW_LabelBufferB[DispatchThreadId.xy].xy = 0;
+	
+	if (IndexXY.x != -1)
+	{
+		InterlockedAdd(RW_LabelCounters[DispatchThreadId.xy], 1);
+	}
+}
+
+void CPF_NormalizeResult(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupID)
+{
+	
+	float2 IndexXY = RW_LabelBufferA[DispatchThreadId.xy].xy;
+	if (DispatchThreadId.x != IndexXY.x || DispatchThreadId.y != IndexXY.y || IndexXY.x == -1) return;
+
+	uint PreValue = 0;
+	InterlockedAdd(RW_NormalizeCounter[0], 1, PreValue);
+
+	float Count = RW_LabelCounters[IndexXY];
+	RW_ResultBuffer[PreValue].xyz = float3(IndexXY, Count);
+	RW_LabelBufferB[DispatchThreadId.xy].x = PreValue;
+}
+
+void CPF_DrawTexture(uint3 DispatchThreadId)
+{
+	float MaxCell = 0;
+	InputTexture.GetDimensions(MaxCell, MaxCell);
+	MaxCell -= 1;
+	
+	float MaxCount = RW_NormalizeCounter[0];
+	RW_ConnectivityPixel[uint2(MaxCell, MaxCell)].w = MaxCount;
+	float2 IndexXY = RW_LabelBufferA[DispatchThreadId.xy].xy;
+	
+	if (IndexXY.x == -1) return;
+
+	int NormalizedIndex = RW_LabelBufferB[IndexXY].x;
+	float Count = RW_ResultBuffer[NormalizedIndex].z;
+	RW_ConnectivityPixel[DispatchThreadId.xy].xyz = float3(RW_LabelBufferB[IndexXY].x + 1, (RW_LabelBufferB[IndexXY].x + 1) / MaxCount, Count);
+	RW_ConnectivityPixel[uint2(NormalizedIndex, 0)].w = Count;
+}
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void ConnectivityPixel(
+						uint3 GroupId : SV_GroupID,
+						uint3 DispatchThreadId : SV_DispatchThreadID,
+						uint3 GroupThreadId : SV_GroupThreadID,
+						uint GroupIndex : SV_GroupIndex) 
+{
+
+#if CONNECTIVITYSTEP_CP_Init
+	
+	CPF_Init(DispatchThreadId);
+#elif CONNECTIVITYSTEP_CP_FindIslands 
+	CPF_FindislandsFast(DispatchThreadId, GroupThreadId, GroupId, GroupIndex);
+
+#elif CONNECTIVITYSTEP_CP_Count
+	CPF_Count(DispatchThreadId);
+#elif CONNECTIVITYSTEP_CP_NormalizeResult
+	CPF_NormalizeResult(DispatchThreadId, GroupThreadId, GroupId);
+	
+#elif CONNECTIVITYSTEP_CP_DrawTexture
+	
+	CPF_DrawTexture(DispatchThreadId);
+	
+#endif
+}

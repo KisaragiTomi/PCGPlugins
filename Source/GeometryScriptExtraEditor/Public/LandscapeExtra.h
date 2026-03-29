@@ -21,7 +21,7 @@ GENERATED_BODY()
 	TArray<FLinearColor> ValidColors;
 	FIntVector4 ReadRange = FIntVector4(0, 0, 0, 0);
 	FIntVector2 TextureSize = FIntVector2(0, 0);
-	FIntVector2 TextureVaildSize = FIntVector2(0, 0);
+	FIntVector2 TextureValidSize = FIntVector2(0, 0);
 	FVector2f ValidUVRange = FVector2f::Zero();
 	FVector MapMin = FVector::ZeroVector;
 	FVector MapMax = FVector::ZeroVector;

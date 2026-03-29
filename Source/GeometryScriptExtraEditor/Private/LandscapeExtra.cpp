@@ -1,4 +1,4 @@
-﻿#include "LandscapeExtra.h"
+#include "LandscapeExtra.h"
 #include "Landscape.h"
 #include "Kismet/GameplayStatics.h"
 #include "Generators/RectangleMeshGenerator.h"
@@ -10,6 +10,7 @@
 #include "DynamicMesh/MeshTransforms.h"
 #include "EngineUtils.h"
 #include "LandscapeEdit.h"
+#include "LandscapeEditLayer.h"
 #include "Util/ColorConstants.h"
 
 using namespace UE::Geometry;
@@ -101,7 +102,8 @@ UDynamicMesh* ULandscapeExtra::CreateProjectPlane(UDynamicMesh* Mesh, FVector Ce
 	TArray<uint16> Values;
 	Values.AddZeroed(NumVertices );
 	
-	FScopedSetLandscapeEditingLayer Scope(Landscape, Landscape->GetLayerConst(0)->Guid, [&] { /*Landscape->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_All); */});
+	FScopedSetLandscapeEditingLayer Scope(Landscape, Landscape->GetLayerConst(0)->EditLayer->GetGuid(), [&] {});
+	
 	int32 X1 = KeyMin.X;
 	int32 Y1 = KeyMin.Y;
 	int32 X2 = KeyMax.X - 1;
@@ -262,7 +264,7 @@ TArray<FLinearColor> ULandscapeExtra::GetLandscapeData( FVector Center, FVector 
 	TArray<uint16> HeightValues;
 	HeightValues.AddZeroed(NumVertices );
 	
-	FScopedSetLandscapeEditingLayer Scope(Landscape, Landscape->GetLayerConst(0)->Guid, [&] { /*Landscape->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_All); */});
+	FScopedSetLandscapeEditingLayer Scope(Landscape, Landscape->GetLayerConst(0)->EditLayer->GetGuid(), [&] {});
 	
 	int32 X1 = KeyMin.X;
 	int32 Y1 = KeyMin.Y;
@@ -416,7 +418,7 @@ void ULandscapeExtra::CreateLandscapeTextureData(FReadLandscapeData& LandscapeDa
 	LandscapeData.ValidMapMin = Landscape->GetTransform().TransformPosition(FVector(XMin - .5, YMin - .5, 0));
 	LandscapeData.ValidMapMax = Landscape->GetTransform().TransformPosition(FVector(XNum + XMin- .5, YNum + YMin - .5, 0));
 	LandscapeData.TextureSize = FIntVector2(NumPixelX, NumPixelY);
-	LandscapeData.TextureVaildSize = FIntVector2(XNum, YNum);
+	LandscapeData.TextureValidSize = FIntVector2(XNum, YNum);
 	LandscapeData.ValidUVRange = FVector2f(XNum / float(NumPixelX), YNum / float(NumPixelY));
 	LandscapeData.ReadRange = FIntVector4(X1, Y1, X2, Y2);
 	LandscapeData.Transform = Landscape->GetTransform();
@@ -475,8 +477,8 @@ TArray<FLinearColor> ULandscapeExtra::CreateLandscapeMeshTextureData(FVector& Ma
 	TArray<uint16> Values;
 	Values.AddZeroed(NumVertices );
 	
-	FScopedSetLandscapeEditingLayer Scope(Landscape, Landscape->GetLayerConst(0)->Guid, [&] { /*Landscape->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_All); */});
-
+	FScopedSetLandscapeEditingLayer Scope(Landscape, Landscape->GetLayerConst(0)->EditLayer->GetGuid(), [&] {});
+	
 	int32 X1 = KeyMin.X;
 	int32 Y1 = KeyMin.Y;
 	int32 X2 = KeyMax.X - 1;

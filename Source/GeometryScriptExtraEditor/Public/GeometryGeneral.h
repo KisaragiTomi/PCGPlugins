@@ -99,7 +99,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static void WindDataForTree(UDynamicMesh* TargetMesh, TArray<FLinearColor>& PivotIndexData, TArray<FLinearColor>& DirExtentData, int32& tXx, int32
 	                            & tXy, TArray<FVector>& OutHolePositions, TMap<int, FVector>& DebugClassNum, int LeafMaterialIndex = -1, float
-	                            CombineDistThreashould = 50, float FindParentThreashold = 5, bool OutDebugColor = false);
+	                            CombineDistThreshold = 50, float FindParentThreshold = 5, bool OutDebugColor = false);
 	
 
 	static void TreeWindMergeComponents(FDynamicMesh3& EditMesh, FGeometryScriptDynamicMeshBVH BVH, TMap<int, FDynamicMeshComponentData> ComponentDatas);
@@ -131,7 +131,7 @@ public:
 	template<typename ReduceDatatype, typename ComponentType>
 	static TMap<int, ReduceDatatype> FindNearestComponents(FDynamicMesh3& EditMesh, FGeometryScriptDynamicMeshBVH BVH, TMap<int, ComponentType> ComponentDatas);
 
-
+	
 	
 	
 	static void AppendPrimitive(

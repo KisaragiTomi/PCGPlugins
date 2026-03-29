@@ -1,0 +1,412 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/General.usf"
+
+#ifndef MAX_HEIGHT
+#define MAX_HEIGHT 10000
+#endif
+
+Texture2D T_OrigLandscapeData;
+Texture2D T_MaterialBlendTexture;
+Texture2D T_AlphaTexture;
+float4 ValidUVRange;
+RWTexture2D<float4> RW_LayerAlpha;
+RWTexture2D<float4> RW_LayerGeneratedHeight;
+RWTexture2D<float4> RW_LayerBlendResult;
+RWTexture2D<float4> RW_DebugView;
+float GlobalAlpha;
+float HeightModStrength;
+float NormalStrength;
+float FalloffWidth;
+float NoiseFrequency;
+float NoiseAmplitude;
+float ErosionStrength;
+float3 BoxOrigin;
+float3 BoxExtent;
+SamplerState Sampler;
+
+float Hash(float2 P)
+{
+	return frac(sin(dot(P, float2(127.1, 311.7))) * 43758.5453123);
+}
+
+float Hash3(float3 P)
+{
+	return frac(sin(dot(P, float3(127.1, 311.7, 74.7))) * 43758.5453123);
+}
+
+float Noise2D(float2 P)
+{
+	float2 I = floor(P);
+	float2 F = frac(P);
+	F = F * F * (3.0 - 2.0 * F);
+	float A = Hash(I);
+	float B = Hash(I + float2(1.0, 0.0));
+	float C = Hash(I + float2(0.0, 1.0));
+	float D = Hash(I + float2(1.0, 1.0));
+	return lerp(lerp(A, B, F.x), lerp(C, D, F.x), F.y);
+}
+
+float FBM2D(float2 P, int Octaves)
+{
+	float Value = 0.0;
+	float Amplitude = 0.5;
+	float Frequency = 1.0;
+	for (int i = 0; i < Octaves; i++)
+	{
+		Value += Amplitude * Noise2D(P * Frequency);
+		Frequency *= 2.0;
+		Amplitude *= 0.5;
+	}
+	return Value;
+}
+
+float3 ComputeNormalFromHeight(float2 UV, float HeightOffset)
+{
+	float2 E = float2(0.001, 0.0);
+	float H0 = Noise2D(UV * NoiseFrequency + E.xy) * NoiseAmplitude;
+	float H1 = Noise2D(UV * NoiseFrequency - E.xy) * NoiseAmplitude;
+	float H2 = Noise2D(UV * NoiseFrequency + E.yx) * NoiseAmplitude;
+	float H3 = Noise2D(UV * NoiseFrequency - E.yx) * NoiseAmplitude;
+	float3 N = normalize(float3(H1 - H0, H3 - H2, 2.0 * E.x));
+	return N * NormalStrength;
+}
+
+float ComputeFalloffMask(float2 UV, float2 CenterUV, float2 UVRange, float FalloffWorldWidth)
+{
+	float2 Dist = abs(UV - CenterUV);
+	float2 HalfRange = UVRange * 0.5;
+	float MaxDist = max(Dist.x / HalfRange.x, Dist.y / HalfRange.y);
+	float EdgeDist = (1.0 - MaxDist);
+	float NormalizedFalloff = FalloffWorldWidth / max(max(HalfRange.x, HalfRange.y), 1.0);
+	float Mask = smoothstep(0.0, NormalizedFalloff, EdgeDist);
+	return Mask;
+}
+
+float2 WorldToBoxUV(float3 WorldPos, float3 BoxMin, float3 BoxMax)
+{
+	float3 BoxRange = BoxMax - BoxMin;
+	float3 BoxCenter = (BoxMin + BoxMax) * 0.5;
+	float3 LocalPos = WorldPos - BoxCenter;
+	float3 Normalized = LocalPos / (BoxRange * 0.5);
+	return Normalized.xy * 0.5 + 0.5;
+}
+
+float ComputeBoxFalloff(float3 WorldPos)
+{
+	float3 BoxMin = BoxOrigin - BoxExtent;
+	float3 BoxMax = BoxOrigin + BoxExtent;
+	float3 D = abs(WorldPos - BoxOrigin) - BoxExtent;
+	float OutsideDist = length(max(D, 0.0));
+	float InsideDist = min(max(D.x, max(D.y, D.z)), 0.0);
+	float SignedDist = OutsideDist + InsideDist;
+	float Falloff = 1.0 - smoothstep(0.0, FalloffWidth, abs(SignedDist));
+	return clamp(Falloff, 0.0, 1.0);
+}
+
+void GenerateLayerAlpha_Common(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupId, uint GroupIndex,
+	out float2 OutUV, out float OutBoxFalloff, out float2 OutCell)
+{
+	float2 MaxCell;
+	RW_LayerAlpha.GetDimensions(MaxCell.x, MaxCell.y);
+	OutCell = MaxCell;
+	OutUV = (DispatchThreadId.xy + 0.5) / MaxCell;
+	float2 CenterUV = ValidUVRange.xy + (ValidUVRange.zw - ValidUVRange.xy) * 0.5;
+	float2 UVRange = ValidUVRange.zw - ValidUVRange.xy;
+	OutBoxFalloff = ComputeFalloffMask(OutUV, CenterUV, UVRange, FalloffWidth);
+}
+
+void GenerateLayerHeight_Common(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupId, uint GroupIndex,
+	out float2 OutUV, out float OutBoxFalloff, out float2 OutCell)
+{
+	float2 MaxCell;
+	RW_LayerGeneratedHeight.GetDimensions(MaxCell.x, MaxCell.y);
+	OutCell = MaxCell;
+	OutUV = (DispatchThreadId.xy + 0.5) / MaxCell;
+	float2 CenterUV = ValidUVRange.xy + (ValidUVRange.zw - ValidUVRange.xy) * 0.5;
+	float2 UVRange = ValidUVRange.zw - ValidUVRange.xy;
+	OutBoxFalloff = ComputeFalloffMask(OutUV, CenterUV, UVRange, FalloffWidth);
+}
+
+float ComputeNoiseHeight(float2 UV)
+{
+	float2 ValidUVtoFull = clamp((UV - ValidUVRange.xy) / max(ValidUVRange.zw - ValidUVRange.xy, 0.001), 0.0, 1.0);
+	float BaseHeight = NoiseAmplitude * FBM2D(ValidUVtoFull * NoiseFrequency * 100.0, 6);
+	return BaseHeight;
+}
+
+float ComputeNoiseAlpha(float2 UV, float2 ValidUVtoFull)
+{
+	float Octave1 = FBM2D(ValidUVtoFull * NoiseFrequency * 50.0, 4);
+	float Octave2 = Noise2D(ValidUVtoFull * NoiseFrequency * 200.0 + 100.0);
+	float Combined = Octave1 * 0.7 + Octave2 * 0.3;
+	return Combined * GlobalAlpha;
+}
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void CSLandscapeLayerFunction(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint GroupIndex : SV_GroupIndex)
+{
+#if L_LAYERGENERATEALPHA
+	{
+		float2 UV;
+		float BoxFalloff;
+		float2 MaxCell;
+		GenerateLayerAlpha_Common(DispatchThreadId, GroupThreadId, GroupId, GroupIndex, UV, BoxFalloff, MaxCell);
+		float2 ValidUVtoFull = clamp((UV - ValidUVRange.xy) / max(ValidUVRange.zw - ValidUVRange.xy, 0.001), 0.0, 1.0);
+		float NoiseAlpha = ComputeNoiseAlpha(UV, ValidUVtoFull);
+		float FinalAlpha = NoiseAlpha * BoxFalloff;
+		RW_LayerAlpha[DispatchThreadId.xy] = float4(FinalAlpha, BoxFalloff, NoiseAlpha, 1.0);
+	}
+#endif
+
+#if L_LAYERGENERATEHEIGHT
+	{
+		float2 UV;
+		float BoxFalloff;
+		float2 MaxCell;
+		GenerateLayerHeight_Common(DispatchThreadId, GroupThreadId, GroupId, GroupIndex, UV, BoxFalloff, MaxCell);
+		float2 ValidUVtoFull = clamp((UV - ValidUVRange.xy) / max(ValidUVRange.zw - ValidUVRange.xy, 0.001), 0.0, 1.0);
+		float4 OrigData = T_OrigLandscapeData.Sample(Sampler, UV);
+		float OrigHeight = length(OrigData) > 0.5 ? OrigData.a : 0.0;
+		float NoiseH = ComputeNoiseHeight(UV);
+		float HeightMod = HeightModStrength * NoiseH * BoxFalloff;
+		float TotalGeneratedHeight = NoiseH + HeightMod;
+		float3 Normal = ComputeNormalFromHeight(UV, NoiseH);
+		RW_LayerGeneratedHeight[DispatchThreadId.xy] = float4(Normal * 0.5 + 0.5, TotalGeneratedHeight);
+		if (RW_DebugView != (RWTexture2D<float4>)0)
+		{
+			float DebugAlpha = ComputeNoiseAlpha(UV, ValidUVtoFull) * BoxFalloff;
+			RW_DebugView[DispatchThreadId.xy] = float4(DebugAlpha, TotalGeneratedHeight / max(NoiseAmplitude, 1.0), 0.0, 1.0);
+		}
+	}
+#endif
+
+#if L_LAYERBLENDALPHA
+	{
+		float2 MaxCell;
+		RW_LayerBlendResult.GetDimensions(MaxCell.x, MaxCell.y);
+		float2 UV = (DispatchThreadId.xy + 0.5) / MaxCell;
+		if (length(ValidUVRange) < 0.001)
+		{
+			RW_LayerBlendResult[DispatchThreadId.xy] = float4(0, 0, 0, 0);
+			return;
+		}
+		float4 OrigData = T_OrigLandscapeData.SampleLevel(Sampler, UV, 0);
+		if (length(OrigData) < 0.5)
+		{
+			RW_LayerBlendResult[DispatchThreadId.xy] = float4(0, 0, 0, 0);
+			return;
+		}
+		float4 LayerData = T_AlphaTexture.SampleLevel(Sampler, UV, 0);
+		float GeneratedHeight = LayerData.a;
+		float Alpha = LayerData.r * GlobalAlpha;
+		float2 ValidUVtoFull = clamp((UV - ValidUVRange.xy) / max(ValidUVRange.zw - ValidUVRange.xy, 0.001), 0.0, 1.0);
+		float2 CenterUV = ValidUVRange.xy + (ValidUVRange.zw - ValidUVRange.xy) * 0.5;
+		float2 UVRange = ValidUVRange.zw - ValidUVRange.xy;
+		float BoxFalloff = ComputeFalloffMask(UV, CenterUV, UVRange, FalloffWidth);
+		float FinalAlpha = Alpha * BoxFalloff;
+		float OrigHeight = OrigData.a;
+		float BlendedHeight = OrigHeight * (1.0 - FinalAlpha) + GeneratedHeight * FinalAlpha;
+		float3 OrigNormal = (OrigData.rgb * 2.0 - 1.0);
+		float3 GenNormal = (LayerData.rgb * 2.0 - 1.0);
+		float3 BlendedNormal = normalize(OrigNormal * (1.0 - FinalAlpha) + GenNormal * FinalAlpha);
+		RW_LayerBlendResult[DispatchThreadId.xy] = float4(BlendedNormal * 0.5 + 0.5, BlendedHeight);
+		if (RW_DebugView != (RWTexture2D<float4>)0)
+		{
+			RW_DebugView[DispatchThreadId.xy] = float4(FinalAlpha, BlendedHeight / max(MAX_HEIGHT, 1.0), GeneratedHeight / max(MAX_HEIGHT, 1.0), 1.0);
+		}
+	}
+#endif
+
+#if L_LAYERBLENDMATERIALDRIVE
+	{
+		float2 MaxCell;
+		RW_LayerBlendResult.GetDimensions(MaxCell.x, MaxCell.y);
+		float2 UV = (DispatchThreadId.xy + 0.5) / MaxCell;
+		if (length(ValidUVRange) < 0.001)
+		{
+			RW_LayerBlendResult[DispatchThreadId.xy] = float4(0, 0, 0, 0);
+			return;
+		}
+		float4 OrigData = T_OrigLandscapeData.SampleLevel(Sampler, UV, 0);
+		if (length(OrigData) < 0.5)
+		{
+			RW_LayerBlendResult[DispatchThreadId.xy] = float4(0, 0, 0, 0);
+			return;
+		}
+		float4 LayerData = T_AlphaTexture.SampleLevel(Sampler, UV, 0);
+		float4 MaterialBlend = T_MaterialBlendTexture.SampleLevel(Sampler, UV, 0);
+		float MaterialAlpha = MaterialBlend.r * GlobalAlpha;
+		float MatHeightMod = MaterialBlend.g * HeightModStrength;
+		float MatNormalStr = MaterialBlend.b * NormalStrength;
+		float GeneratedHeight = LayerData.a + MatHeightMod;
+		float2 ValidUVtoFull = clamp((UV - ValidUVRange.xy) / max(ValidUVRange.zw - ValidUVRange.xy, 0.001), 0.0, 1.0);
+		float2 CenterUV = ValidUVRange.xy + (ValidUVRange.zw - ValidUVRange.xy) * 0.5;
+		float2 UVRange = ValidUVRange.zw - ValidUVRange.xy;
+		float BoxFalloff = ComputeFalloffMask(UV, CenterUV, UVRange, FalloffWidth);
+		float FinalAlpha = MaterialAlpha * BoxFalloff;
+		float OrigHeight = OrigData.a;
+		float BlendedHeight = OrigHeight * (1.0 - FinalAlpha) + GeneratedHeight * FinalAlpha;
+		float3 OrigNormal = (OrigData.rgb * 2.0 - 1.0);
+		float3 GenNormal = (LayerData.rgb * 2.0 - 1.0);
+		float3 BlendedNormal = normalize(OrigNormal * (1.0 - FinalAlpha * MatNormalStr) + GenNormal * FinalAlpha * MatNormalStr);
+		RW_LayerBlendResult[DispatchThreadId.xy] = float4(BlendedNormal * 0.5 + 0.5, BlendedHeight);
+		if (RW_DebugView != (RWTexture2D<float4>)0)
+		{
+			RW_DebugView[DispatchThreadId.xy] = float4(FinalAlpha, MaterialAlpha, MatNormalStr, 1.0);
+		}
+	}
+#endif
+}
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void CSRuntimeLandscapeLayerFunction(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint GroupIndex : SV_GroupIndex)
+{
+#if RL_GENERATENOISEALPHA
+	{
+		float2 MaxCell;
+		RW_LayerAlpha.GetDimensions(MaxCell.x, MaxCell.y);
+		float2 UV = (DispatchThreadId.xy + 0.5) / MaxCell;
+		float2 CenterUV = ValidUVRange.xy + (ValidUVRange.zw - ValidUVRange.xy) * 0.5;
+		float2 UVRange = ValidUVRange.zw - ValidUVRange.xy;
+		float BoxFalloff = ComputeFalloffMask(UV, CenterUV, UVRange, FalloffWidth);
+		float2 ValidUVtoFull = clamp((UV - ValidUVRange.xy) / max(ValidUVRange.zw - ValidUVRange.xy, 0.001), 0.0, 1.0);
+		float Octave1 = FBM2D(ValidUVtoFull * NoiseFrequency * 50.0, 4);
+		float Octave2 = Noise2D(ValidUVtoFull * NoiseFrequency * 200.0 + 100.0);
+		float Combined = Octave1 * 0.7 + Octave2 * 0.3;
+		float FinalAlpha = Combined * GlobalAlpha * BoxFalloff;
+		RW_LayerAlpha[DispatchThreadId.xy] = float4(FinalAlpha, BoxFalloff, Combined, 1.0);
+	}
+#endif
+
+#if RL_GENERATENOISEHEIGHT
+	{
+		float2 MaxCell;
+		RW_LayerAlpha.GetDimensions(MaxCell.x, MaxCell.y);
+		float2 UV = (DispatchThreadId.xy + 0.5) / MaxCell;
+		float4 OrigData = T_OrigLandscapeData.SampleLevel(Sampler, UV, 0);
+		float OrigHeight = length(OrigData) > 0.5 ? OrigData.a : 0.0;
+		float2 ValidUVtoFull = clamp((UV - ValidUVRange.xy) / max(ValidUVRange.zw - ValidUVRange.xy, 0.001), 0.0, 1.0);
+		float NoiseH = NoiseAmplitude * FBM2D(ValidUVtoFull * NoiseFrequency * 100.0, 6);
+		float2 CenterUV = ValidUVRange.xy + (ValidUVRange.zw - ValidUVRange.xy) * 0.5;
+		float2 UVRange = ValidUVRange.zw - ValidUVRange.xy;
+		float BoxFalloff = ComputeFalloffMask(UV, CenterUV, UVRange, FalloffWidth);
+		float TotalH = NoiseH * BoxFalloff;
+		float3 Normal = ComputeNormalFromHeight(UV, NoiseH);
+		RW_LayerAlpha[DispatchThreadId.xy] = float4(Normal * 0.5 + 0.5, TotalH + OrigHeight);
+		if (RW_DebugView != (RWTexture2D<float4>)0)
+		{
+			RW_DebugView[DispatchThreadId.xy] = float4(BoxFalloff, NoiseH / max(NoiseAmplitude, 1.0), 0.0, 1.0);
+		}
+	}
+#endif
+
+#if RL_BLENDALPHA
+	{
+		float2 MaxCell;
+		RW_BlendResult.GetDimensions(MaxCell.x, MaxCell.y);
+		float2 UV = (DispatchThreadId.xy + 0.5) / MaxCell;
+		if (length(ValidUVRange) < 0.001)
+		{
+			RW_BlendResult[DispatchThreadId.xy] = float4(0, 0, 0, 0);
+			return;
+		}
+		float4 OrigData = T_OrigLandscapeData.SampleLevel(Sampler, UV, 0);
+		if (length(OrigData) < 0.5)
+		{
+			RW_BlendResult[DispatchThreadId.xy] = float4(0, 0, 0, 0);
+			return;
+		}
+		float4 LayerData = T_AlphaTexture.SampleLevel(Sampler, UV, 0);
+		float Alpha = LayerData.r * GlobalAlpha;
+		float GeneratedHeight = LayerData.a;
+		float2 CenterUV = ValidUVRange.xy + (ValidUVRange.zw - ValidUVRange.xy) * 0.5;
+		float2 UVRange = ValidUVRange.zw - ValidUVRange.xy;
+		float BoxFalloff = ComputeFalloffMask(UV, CenterUV, UVRange, FalloffWidth);
+		float FinalAlpha = Alpha * BoxFalloff;
+		float OrigHeight = OrigData.a;
+		float BlendedHeight = OrigHeight * (1.0 - FinalAlpha) + GeneratedHeight * FinalAlpha;
+		float3 OrigNormal = (OrigData.rgb * 2.0 - 1.0);
+		float3 GenNormal = (LayerData.rgb * 2.0 - 1.0);
+		float3 BlendedNormal = normalize(OrigNormal * (1.0 - FinalAlpha) + GenNormal * FinalAlpha);
+		RW_BlendResult[DispatchThreadId.xy] = float4(BlendedNormal * 0.5 + 0.5, BlendedHeight);
+		if (RW_DebugView != (RWTexture2D<float4>)0)
+		{
+			RW_DebugView[DispatchThreadId.xy] = float4(FinalAlpha, BlendedHeight / max(MAX_HEIGHT, 1.0), GeneratedHeight / max(MAX_HEIGHT, 1.0), 1.0);
+		}
+	}
+#endif
+
+#if RL_BLENDMATERIALDRIVE
+	{
+		float2 MaxCell;
+		RW_BlendResult.GetDimensions(MaxCell.x, MaxCell.y);
+		float2 UV = (DispatchThreadId.xy + 0.5) / MaxCell;
+		if (length(ValidUVRange) < 0.001)
+		{
+			RW_BlendResult[DispatchThreadId.xy] = float4(0, 0, 0, 0);
+			return;
+		}
+		float4 OrigData = T_OrigLandscapeData.SampleLevel(Sampler, UV, 0);
+		if (length(OrigData) < 0.5)
+		{
+			RW_BlendResult[DispatchThreadId.xy] = float4(0, 0, 0, 0);
+			return;
+		}
+		float4 LayerData = T_AlphaTexture.SampleLevel(Sampler, UV, 0);
+		float4 MaterialBlend = T_MaterialBlendTexture.SampleLevel(Sampler, UV, 0);
+		float MaterialAlpha = MaterialBlend.r * GlobalAlpha;
+		float MatHeightMod = MaterialBlend.g * HeightModStrength;
+		float MatNormalStr = MaterialBlend.b * NormalStrength;
+		float GeneratedHeight = LayerData.a + MatHeightMod;
+		float2 CenterUV = ValidUVRange.xy + (ValidUVRange.zw - ValidUVRange.xy) * 0.5;
+		float2 UVRange = ValidUVRange.zw - ValidUVRange.xy;
+		float BoxFalloff = ComputeFalloffMask(UV, CenterUV, UVRange, FalloffWidth);
+		float FinalAlpha = MaterialAlpha * BoxFalloff;
+		float OrigHeight = OrigData.a;
+		float BlendedHeight = OrigHeight * (1.0 - FinalAlpha) + GeneratedHeight * FinalAlpha;
+		float3 OrigNormal = (OrigData.rgb * 2.0 - 1.0);
+		float3 GenNormal = (LayerData.rgb * 2.0 - 1.0);
+		float3 BlendedNormal = normalize(OrigNormal * (1.0 - FinalAlpha * MatNormalStr) + GenNormal * FinalAlpha * MatNormalStr);
+		RW_BlendResult[DispatchThreadId.xy] = float4(BlendedNormal * 0.5 + 0.5, BlendedHeight);
+		if (RW_DebugView != (RWTexture2D<float4>)0)
+		{
+			RW_DebugView[DispatchThreadId.xy] = float4(FinalAlpha, MaterialAlpha, MatNormalStr, 1.0);
+		}
+	}
+#endif
+
+#if RL_THERMALEROSION
+	{
+		float2 MaxCell;
+		RW_BlendResult.GetDimensions(MaxCell.x, MaxCell.y);
+		float2 UV = (DispatchThreadId.xy + 0.5) / MaxCell;
+		float4 CurrData = T_OrigLandscapeData.SampleLevel(Sampler, UV, 0);
+		if (length(CurrData) < 0.5)
+		{
+			RW_BlendResult[DispatchThreadId.xy] = CurrData;
+			return;
+		}
+		float H = CurrData.a;
+		float2 E = float2(0.002, 0.0);
+		float HL = T_OrigLandscapeData.SampleLevel(Sampler, UV - E.xy, 0).a;
+		float HR = T_OrigLandscapeData.SampleLevel(Sampler, UV + E.xy, 0).a;
+		float HU = T_OrigLandscapeData.SampleLevel(Sampler, UV + E.yx, 0).a;
+		float HD = T_OrigLandscapeData.SampleLevel(Sampler, UV - E.yx, 0).a;
+		float HLaplacian = (HL + HR + HU + HD) / 4.0 - H;
+		float TalusAngle = 0.01;
+		float TalusDiff = TalusAngle * max(ErosionStrength, 0.0);
+		float Flow = max(HLaplacian - TalusDiff, 0.0);
+		H = H - Flow * 0.25 * ErosionStrength;
+		float3 Normal = (CurrData.rgb * 2.0 - 1.0);
+		RW_BlendResult[DispatchThreadId.xy] = float4(Normal * 0.5 + 0.5, H);
+	}
+#endif
+}

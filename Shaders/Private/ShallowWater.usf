@@ -55,10 +55,14 @@ RWTexture2D<float4> RW_SmoothHeightA;
 RWTexture2D<float4> RW_SmoothHeightB;
 RWTexture2D<float4> RW_ResultSmoothHeight;
 RWBuffer<float4> RWB_SourceUVRads;
+RWBuffer<uint> RWB_DispatchRegion;
+RWBuffer<uint> RWB_DispatchIndirectArgs;
+Buffer<uint> B_DispatchRegion;
 
 int CloseBound;
 int BCount_SourceUVRads;
 int HeightSmoothCount;
+int DispatchExpandPixels;
 // float2 MaxCell;
 
 float4 SourceUVRad;
@@ -71,6 +75,60 @@ float AdvectFoam;
 float FoamFadeSpeed;
 float2 CopyValidUV;
 SamplerState Sampler;
+
+static const uint SW_DISPATCH_REGION_MIN_X = 0;
+static const uint SW_DISPATCH_REGION_MIN_Y = 1;
+static const uint SW_DISPATCH_REGION_MAX_X = 2;
+static const uint SW_DISPATCH_REGION_MAX_Y = 3;
+static const uint SW_DISPATCH_REGION_FOUND = 4;
+
+uint2 GetDispatchRegionMin()
+{
+	return uint2(B_DispatchRegion[SW_DISPATCH_REGION_MIN_X], B_DispatchRegion[SW_DISPATCH_REGION_MIN_Y]);
+}
+
+uint2 GetDispatchRegionSize()
+{
+	return max(uint2(B_DispatchRegion[2], B_DispatchRegion[3]), uint2(1, 1));
+}
+
+bool IsDispatchThreadActive(uint2 LocalDispatchThreadId)
+{
+	const uint2 DispatchSize = GetDispatchRegionSize();
+	return LocalDispatchThreadId.x < DispatchSize.x && LocalDispatchThreadId.y < DispatchSize.y;
+}
+
+int2 GetDispatchThreadPixel(uint2 LocalDispatchThreadId, int2 MaxCell)
+{
+	const uint2 DispatchMin = GetDispatchRegionMin();
+	const uint2 DispatchSize = GetDispatchRegionSize();
+	const uint2 SafeLocalThreadId = min(LocalDispatchThreadId, DispatchSize - 1);
+	return clamp(int2(DispatchMin + SafeLocalThreadId), int2(0, 0), MaxCell - 1);
+}
+
+int2 ClampPixelCoord(int2 PixelCoord, int2 MaxCell)
+{
+	return clamp(PixelCoord, int2(0, 0), MaxCell - 1);
+}
+
+bool UpdateDispatchBoundsFromSource(float4 SourceData, int2 MaxCell, inout int MinX, inout int MinY, inout int MaxX, inout int MaxY)
+{
+	if (SourceData.w <= 0)
+	{
+		return false;
+	}
+
+	const int2 ClampedMaxCell = MaxCell - 1;
+	const float2 TextureExtent = max(float2(ClampedMaxCell), float2(1.0, 1.0));
+	const int2 Center = clamp(int2(round(SourceData.xy * TextureExtent)), int2(0, 0), ClampedMaxCell);
+	const int RadiusPixels = max(1, (int)ceil(SourceData.w * max(TextureExtent.x, TextureExtent.y))) + DispatchExpandPixels;
+
+	MinX = min(MinX, Center.x - RadiusPixels);
+	MinY = min(MinY, Center.y - RadiusPixels);
+	MaxX = max(MaxX, Center.x + RadiusPixels);
+	MaxY = max(MaxY, Center.y + RadiusPixels);
+	return true;
+}
 
 
 #ifndef CREATE_SHARE_DATA_FUNC
@@ -104,6 +162,35 @@ half4 CalShalllowWaterResult_ShareData(int2 Pos)
 }
 
 #include "/Plugin/PCGPlugins/Shaders/Private/General.usf"
+
+void FillSharedGroupRemapped(
+	in uint3 GroupId,
+	in uint3 GroupThreadId,
+	int2 MaxCell,
+	in uint GroupIndex)
+{
+	const int2 GroupTopLeftGlobal =
+		int2(GetDispatchRegionMin()) +
+		int2(GroupId.xy) * int2(THREADGROUPSIZE_X, THREADGROUPSIZE_Y) -
+		int2(GENERAL_SHAREGROUP_EXTENT, GENERAL_SHAREGROUP_EXTENT);
+
+	const uint THREAD_COUNT = THREADGROUPSIZE_X * THREADGROUPSIZE_Y;
+	const uint SHARED_DIM_X = THREADGROUPSIZE_X + 2 * GENERAL_SHAREGROUP_EXTENT;
+	const uint SHARED_DIM_Y = THREADGROUPSIZE_Y + 2 * GENERAL_SHAREGROUP_EXTENT;
+	const uint TOTAL_SHARED_ELEMENTS = SHARED_DIM_X * SHARED_DIM_Y;
+
+	for (uint i = GroupIndex; i < TOTAL_SHARED_ELEMENTS; i += THREAD_COUNT)
+	{
+		int localX = i % SHARED_DIM_X;
+		int localY = i / SHARED_DIM_X;
+
+		int2 globalPos = GroupTopLeftGlobal + int2(localX, localY);
+		globalPos = clamp(globalPos, int2(0, 0), MaxCell - 1);
+		GENERAL_SHAREGROUP_NAME[localX][localY] = CREATE_SHARE_DATA_FUNC(globalPos);
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+}
 
 
 float2 ClampMax2(float2 F2, float Max)
@@ -153,8 +240,10 @@ float2 AdvectSimVel(float2 Offset, float2 DispatchThreadId, float2 MaxCell)
     // float2 UV = DispatchThreadId / MaxCell;
     
     // float2 OffsetUV = UV + Offset;
-    float2 StateVel = RW_VelHeightSimA[DispatchThreadId.xy + Offset].xy;
-    float2 SampleUV = (Offset - StateVel * DT + DispatchThreadId.xy + .5) / MaxCell ;
+    const int2 SafeDispatchThreadId = ClampPixelCoord(int2(DispatchThreadId), int2(MaxCell));
+    const int2 OffsetPixel = ClampPixelCoord(SafeDispatchThreadId + int2(Offset), int2(MaxCell));
+    float2 StateVel = RW_VelHeightSimA[OffsetPixel].xy;
+    float2 SampleUV = (float2(OffsetPixel) - StateVel * DT + .5) / MaxCell ;
     // float2 AdvectVel = T_VelocityHeight.Sample(Sampler, SampleUV).xy;
     float2 AdvectVel = SWSampleBilinear(RW_VelHeightSimA, SampleUV).xy;
     AdvectVel *= abs(sign(StateVel));
@@ -168,8 +257,10 @@ float2 AdvectSimVelShare(float2 Offset, float2 DispatchThreadId, float2 MaxCell)
     float2 UV = DispatchThreadId / MaxCell;
     
     float2 OffsetUV = UV + Offset;
-    float2 StateVel = RW_VelHeightSimA[DispatchThreadId.xy + Offset].xy;
-    float2 SampleUV = (Offset - StateVel * DT + DispatchThreadId.xy + .5) / MaxCell ;
+    const int2 SafeDispatchThreadId = ClampPixelCoord(int2(DispatchThreadId), int2(MaxCell));
+    const int2 OffsetPixel = ClampPixelCoord(SafeDispatchThreadId + int2(Offset), int2(MaxCell));
+    float2 StateVel = RW_VelHeightSimA[OffsetPixel].xy;
+    float2 SampleUV = (float2(OffsetPixel) - StateVel * DT + .5) / MaxCell ;
     // float2 AdvectVel = T_VelocityHeight.Sample(Sampler, SampleUV).xy;
     float2 AdvectVel = SWSampleBilinear(RW_VelHeightSimA, SampleUV).xy;
     AdvectVel *= abs(sign(StateVel));
@@ -192,6 +283,130 @@ float UseSplineRange(float2 UV, inout float Height)
 	return HeightMult;
 }
 
+void ResetDispatchRegion(uint3 DispatchThreadId)
+{
+	if (any(DispatchThreadId.xy != 0))
+	{
+		return;
+	}
+
+	uint Width;
+	uint Height;
+	T_SceneDepth.GetDimensions(Width, Height);
+
+	RWB_DispatchRegion[SW_DISPATCH_REGION_MIN_X] = Width;
+	RWB_DispatchRegion[SW_DISPATCH_REGION_MIN_Y] = Height;
+	RWB_DispatchRegion[SW_DISPATCH_REGION_MAX_X] = 0;
+	RWB_DispatchRegion[SW_DISPATCH_REGION_MAX_Y] = 0;
+	RWB_DispatchRegion[SW_DISPATCH_REGION_FOUND] = 0;
+
+	RWB_DispatchIndirectArgs[0] = 1;
+	RWB_DispatchIndirectArgs[1] = 1;
+	RWB_DispatchIndirectArgs[2] = 1;
+}
+
+void ScanDispatchRegion(uint3 DispatchThreadId)
+{
+	uint Width;
+	uint Height;
+	T_SceneDepth.GetDimensions(Width, Height);
+
+	if (DispatchThreadId.x >= Width || DispatchThreadId.y >= Height)
+	{
+		return;
+	}
+
+	const float4 VelocityHeight = T_VelocityHeight[DispatchThreadId.xy];
+	bool bIsPotentiallyActive = VelocityHeight.z > 0.001;
+
+#if USESPLINERANGE
+	const float SplineRange = 800;
+	const float DistToSpline = T_SplineScaleDist[DispatchThreadId.xy].z;
+	bIsPotentiallyActive = bIsPotentiallyActive || DistToSpline < (SplineRange * 3.0 + DispatchExpandPixels * 20.0);
+#else
+	const float4 DepthWet = T_ResultDepthWet[DispatchThreadId.xy];
+	bIsPotentiallyActive = bIsPotentiallyActive || DepthWet.x > 0.001 || DepthWet.y > -9000;
+#endif
+
+	if (!bIsPotentiallyActive)
+	{
+		return;
+	}
+
+	InterlockedMin(RWB_DispatchRegion[SW_DISPATCH_REGION_MIN_X], DispatchThreadId.x);
+	InterlockedMin(RWB_DispatchRegion[SW_DISPATCH_REGION_MIN_Y], DispatchThreadId.y);
+	InterlockedMax(RWB_DispatchRegion[SW_DISPATCH_REGION_MAX_X], DispatchThreadId.x);
+	InterlockedMax(RWB_DispatchRegion[SW_DISPATCH_REGION_MAX_Y], DispatchThreadId.y);
+	InterlockedMax(RWB_DispatchRegion[SW_DISPATCH_REGION_FOUND], 1);
+}
+
+void FinalizeDispatchRegion(uint3 DispatchThreadId)
+{
+	if (any(DispatchThreadId.xy != 0))
+	{
+		return;
+	}
+
+	uint Width;
+	uint Height;
+	T_SceneDepth.GetDimensions(Width, Height);
+
+	const int2 MaxCell = int2(Width, Height);
+	const int2 ClampedMaxCell = MaxCell - 1;
+
+	int MinX = (int)RWB_DispatchRegion[SW_DISPATCH_REGION_MIN_X];
+	int MinY = (int)RWB_DispatchRegion[SW_DISPATCH_REGION_MIN_Y];
+	int MaxX = (int)RWB_DispatchRegion[SW_DISPATCH_REGION_MAX_X];
+	int MaxY = (int)RWB_DispatchRegion[SW_DISPATCH_REGION_MAX_Y];
+	bool bHasRegion = RWB_DispatchRegion[SW_DISPATCH_REGION_FOUND] > 0;
+
+	for (int SourceIndex = 0; SourceIndex < BCount_SourceUVRads; ++SourceIndex)
+	{
+		bHasRegion |= UpdateDispatchBoundsFromSource(RWB_SourceUVRads[SourceIndex], MaxCell, MinX, MinY, MaxX, MaxY);
+	}
+
+	bHasRegion |= UpdateDispatchBoundsFromSource(SourceUVRad, MaxCell, MinX, MinY, MaxX, MaxY);
+
+	if (!bHasRegion)
+	{
+		MinX = 0;
+		MinY = 0;
+		MaxX = ClampedMaxCell.x;
+		MaxY = ClampedMaxCell.y;
+	}
+	else
+	{
+		MinX -= DispatchExpandPixels;
+		MinY -= DispatchExpandPixels;
+		MaxX += DispatchExpandPixels;
+		MaxY += DispatchExpandPixels;
+	}
+
+#if USESPLINERANGE
+	const int2 ValidRangeMax = clamp(int2(ceil(CopyValidUV * float2(MaxCell))) - 1, int2(0, 0), ClampedMaxCell);
+	MaxX = min(MaxX, ValidRangeMax.x);
+	MaxY = min(MaxY, ValidRangeMax.y);
+#endif
+
+	MinX = clamp(MinX, 0, ClampedMaxCell.x);
+	MinY = clamp(MinY, 0, ClampedMaxCell.y);
+	MaxX = clamp(MaxX, MinX, ClampedMaxCell.x);
+	MaxY = clamp(MaxY, MinY, ClampedMaxCell.y);
+
+	const uint SizeX = max((uint)(MaxX - MinX + 1), 1u);
+	const uint SizeY = max((uint)(MaxY - MinY + 1), 1u);
+
+	RWB_DispatchRegion[0] = (uint)MinX;
+	RWB_DispatchRegion[1] = (uint)MinY;
+	RWB_DispatchRegion[2] = SizeX;
+	RWB_DispatchRegion[3] = SizeY;
+	RWB_DispatchRegion[4] = (uint)MaxX;
+
+	RWB_DispatchIndirectArgs[0] = max((SizeX + THREADGROUPSIZE_X - 1) / THREADGROUPSIZE_X, 1u);
+	RWB_DispatchIndirectArgs[1] = max((SizeY + THREADGROUPSIZE_Y - 1) / THREADGROUPSIZE_Y, 1u);
+	RWB_DispatchIndirectArgs[2] = 1u;
+}
+
 float HeightDiffCheck(float4 CurrentState, float4 NeighbourState, float SHC, float NHC)
 {
 	float HeightDiffThresholdMax = 50;
@@ -210,10 +425,20 @@ float HeightDiffCheck(float4 CurrentState, float4 NeighbourState, float SHC, flo
 	return VelLerp;
 }
 
-void CalVelocityHeight_Flux(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupID, uint GroupIndex)
+void CalVelocityHeight_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId, uint3 GroupID, uint GroupIndex)
 {
     float2 MaxCell;
     RW_VelHeightSimA.GetDimensions(MaxCell.x, MaxCell.y);
+    const int2 MaxCellInt = int2(MaxCell);
+    const bool bDispatchThreadValid = IsDispatchThreadActive(LocalDispatchThreadId.xy);
+    const int2 DispatchPixel = GetDispatchThreadPixel(LocalDispatchThreadId.xy, MaxCellInt);
+    const uint3 DispatchThreadId = uint3(DispatchPixel, LocalDispatchThreadId.z);
+
+	FillSharedGroupRemapped(GroupID, GroupThreadId, MaxCellInt, GroupIndex);
+	if (!bDispatchThreadValid)
+	{
+		return;
+	}
 
     const float HeightMAX = MAX_HEIGHT;
     float AccelerationLimit = 18;
@@ -227,24 +452,28 @@ void CalVelocityHeight_Flux(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 G
 
 
 	
-	float SHC = HeightMAX - T_SceneDepth[DispatchThreadId.xy].x;
-	float SHR = HeightMAX - T_SceneDepth[DispatchThreadId.xy + uint2(1, 0)].x;
-	float SHT = HeightMAX - T_SceneDepth[DispatchThreadId.xy + uint2(0, -1)].x;
-	float SHL = HeightMAX - T_SceneDepth[DispatchThreadId.xy + uint2(-1, 0)].x;
-	float SHB = HeightMAX - T_SceneDepth[DispatchThreadId.xy + uint2(0, 1)].x;
+	const int2 PixelRight = ClampPixelCoord(DispatchPixel + int2(1, 0), MaxCellInt);
+	const int2 PixelTop = ClampPixelCoord(DispatchPixel + int2(0, -1), MaxCellInt);
+	const int2 PixelLeft = ClampPixelCoord(DispatchPixel + int2(-1, 0), MaxCellInt);
+	const int2 PixelBottom = ClampPixelCoord(DispatchPixel + int2(0, 1), MaxCellInt);
+	float SHC = HeightMAX - T_SceneDepth[DispatchPixel].x;
+	float SHR = HeightMAX - T_SceneDepth[PixelRight].x;
+	float SHT = HeightMAX - T_SceneDepth[PixelTop].x;
+	float SHL = HeightMAX - T_SceneDepth[PixelLeft].x;
+	float SHB = HeightMAX - T_SceneDepth[PixelBottom].x;
 	float SHCRest = SHC;
 	
-	float SSHC = RW_SmoothHeightA[DispatchThreadId.xy].y;
-	float SSHR = RW_SmoothHeightA[DispatchThreadId.xy + uint2(1, 0)].y;
-	float SSHT = RW_SmoothHeightA[DispatchThreadId.xy + uint2(0, -1)].y;
-	float SSHL = RW_SmoothHeightA[DispatchThreadId.xy + uint2(-1, 0)].y;
-	float SSHB = RW_SmoothHeightA[DispatchThreadId.xy + uint2(0, 1)].y;
+	float SSHC = RW_SmoothHeightA[DispatchPixel].y;
+	float SSHR = RW_SmoothHeightA[PixelRight].y;
+	float SSHT = RW_SmoothHeightA[PixelTop].y;
+	float SSHL = RW_SmoothHeightA[PixelLeft].y;
+	float SSHB = RW_SmoothHeightA[PixelBottom].y;
 
-	float4 CurrentState = RW_VelHeightSimA[DispatchThreadId.xy];
-	float4 RightState = RW_VelHeightSimA[uint2(DispatchThreadId.x + 1, DispatchThreadId.y)];
-	float4 BottonState = RW_VelHeightSimA[uint2(DispatchThreadId.x, DispatchThreadId.y + 1)];
-	float4 LeftState = RW_VelHeightSimA[uint2(DispatchThreadId.x - 1, DispatchThreadId.y)];
-	float4 TopState = RW_VelHeightSimA[uint2(DispatchThreadId.x, DispatchThreadId.y - 1)];
+	float4 CurrentState = RW_VelHeightSimA[DispatchPixel];
+	float4 RightState = RW_VelHeightSimA[PixelRight];
+	float4 BottonState = RW_VelHeightSimA[PixelBottom];
+	float4 LeftState = RW_VelHeightSimA[PixelLeft];
+	float4 TopState = RW_VelHeightSimA[PixelTop];
 
 	float2 VelC = CurrentState.xy;
 	float VC = max(CurrentState.z, 0);
@@ -261,8 +490,6 @@ void CalVelocityHeight_Flux(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 G
     SHL = lerp(SHL, SSHL, SmoothStress);
     SHB = lerp(SHB, SSHB, SmoothStress);
 	
-	FillSharedGroup(DispatchThreadId, GroupThreadId, MaxCell, GroupIndex);
-	
 	float4 CurrentHeightData = GENERAL_SHAREGROUP_NAME[GroupThreadId.x + GENERAL_SHAREGROUP_EXTENT ][GroupThreadId.y + GENERAL_SHAREGROUP_EXTENT];
 	float2 CurrentVel = CurrentHeightData.xy;
 	int ValidCount = 0;
@@ -274,7 +501,7 @@ void CalVelocityHeight_Flux(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 G
 	{
 		for (int X = -GENERAL_SHAREGROUP_EXTENT ; X <= GENERAL_SHAREGROUP_EXTENT; X++)
 		{
-			bool OutBound = DispatchThreadId.x + X  > MaxCell.x - 1 || DispatchThreadId.y + Y > MaxCell.y - 1  || DispatchThreadId.x + X < 0 || DispatchThreadId.y + Y < 0;
+			bool OutBound = DispatchPixel.x + X > MaxCellInt.x - 1 || DispatchPixel.y + Y > MaxCellInt.y - 1 || DispatchPixel.x + X < 0 || DispatchPixel.y + Y < 0;
 			int2 Offset = GroupThreadId.xy + int2(X, Y) + int2(GENERAL_SHAREGROUP_EXTENT, GENERAL_SHAREGROUP_EXTENT);
 			float Dist = 1 - length(float2(X, Y)) / GENERAL_SHAREGROUP_EXTENT / pow(2, .5);
 			Dist = smoothstep(0, 1, Dist);
@@ -315,7 +542,7 @@ void CalVelocityHeight_Flux(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 G
 	RW_DebugView[DispatchThreadId.xy].y = NeighbourHeightMax;
 	float4 TestData = GENERAL_SHAREGROUP_NAME[GroupThreadId.x + GENERAL_SHAREGROUP_EXTENT * 2][GroupThreadId.y + GENERAL_SHAREGROUP_EXTENT * 2];
 	TestData = GENERAL_SHAREGROUP_NAME[GroupThreadId.x][GroupThreadId.y];
-	uint2 SharePosX = clamp(int2(DispatchThreadId.xy) - int2(3, 0), int2(0, 0), int2(MaxCell.x - 1, MaxCell.y - 1));
+	uint2 SharePosX = clamp(DispatchPixel - int2(3, 0), int2(0, 0), MaxCellInt - 1);
 	TestData = SharePosX.x;
 	// TestData.yz = DispatchThreadId.xy - int2(3, 3);
 	// if (GroupID.x == 0 && GroupID.y == 0)
@@ -500,21 +727,33 @@ void CalVelocityHeight_Flux(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 G
 }
 
 
-void CalShalllowIntegrate_Flux(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupID, uint GroupIndex)
+void CalShalllowIntegrate_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId, uint3 GroupID, uint GroupIndex)
 {
     float2 MaxCell;
     RW_VelHeightSimA.GetDimensions(MaxCell.x, MaxCell.y);
+    const int2 MaxCellInt = int2(MaxCell);
+    const bool bDispatchThreadValid = IsDispatchThreadActive(LocalDispatchThreadId.xy);
+    const int2 DispatchPixel = GetDispatchThreadPixel(LocalDispatchThreadId.xy, MaxCellInt);
+    const uint3 DispatchThreadId = uint3(DispatchPixel, LocalDispatchThreadId.z);
+    if (!bDispatchThreadValid)
+    {
+    	return;
+    }
     float FluidTransportMax = 100;
     float FluxEnergy = 1;
     float FoamShallowGenerate = 0.1;
     float FoamShallowDepth = 400;
     float FoamWaveGenerate = 0;
     
-    float4 CurrentState = RW_VelHeightSimA[DispatchThreadId.xy];
-    float4 RightState = RW_VelHeightSimA[uint2(DispatchThreadId.x + 1, DispatchThreadId.y)];
-    float4 BottonState = RW_VelHeightSimA[uint2(DispatchThreadId.x, DispatchThreadId.y + 1)];
-    float4 LeftState = RW_VelHeightSimA[uint2(DispatchThreadId.x - 1, DispatchThreadId.y)];
-    float4 TopState = RW_VelHeightSimA[uint2(DispatchThreadId.x, DispatchThreadId.y - 1)];
+    const int2 PixelRight = ClampPixelCoord(DispatchPixel + int2(1, 0), MaxCellInt);
+    const int2 PixelTop = ClampPixelCoord(DispatchPixel + int2(0, -1), MaxCellInt);
+    const int2 PixelLeft = ClampPixelCoord(DispatchPixel + int2(-1, 0), MaxCellInt);
+    const int2 PixelBottom = ClampPixelCoord(DispatchPixel + int2(0, 1), MaxCellInt);
+    float4 CurrentState = RW_VelHeightSimA[DispatchPixel];
+    float4 RightState = RW_VelHeightSimA[PixelRight];
+    float4 BottonState = RW_VelHeightSimA[PixelBottom];
+    float4 LeftState = RW_VelHeightSimA[PixelLeft];
+    float4 TopState = RW_VelHeightSimA[PixelTop];
     
     float VC = max(CurrentState.z, 0);
     float VR = max(RightState.z, 0);
@@ -607,11 +846,19 @@ void CalShalllowIntegrate_Flux(uint3 DispatchThreadId, uint3 GroupThreadId, uint
 
 
 // groupshared half4 GENERAL_SHAREGROUP_NAME[THREADGROUPSIZE_X + POSTHEIGHTDIST * 2][THREADGROUPSIZE_Y + POSTHEIGHTDIST * 2];
-void CalShalllowWaterResult_Flux(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupID, uint GroupIndex)
+void CalShalllowWaterResult_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId, uint3 GroupID, uint GroupIndex)
 {
 	float2 MaxCell;
 	RW_VelHeightSimA.GetDimensions(MaxCell.x, MaxCell.y);
-	
+	const bool bDispatchThreadValid = IsDispatchThreadActive(LocalDispatchThreadId.xy);
+	const uint3 DispatchThreadId = uint3(GetDispatchThreadPixel(LocalDispatchThreadId.xy, int2(MaxCell)), LocalDispatchThreadId.z);
+
+	FillSharedGroupRemapped(GroupID, GroupThreadId, int2(MaxCell), GroupIndex);
+	if (!bDispatchThreadValid)
+	{
+		return;
+	}
+
 	//Fill sharegroup
 	const int PixelBoundSize = GENERAL_SHAREGROUP_EXTENT;
 	float4 VelHeightFoam = RW_VelHeightSimA[DispatchThreadId.xy];
@@ -622,8 +869,6 @@ void CalShalllowWaterResult_Flux(uint3 DispatchThreadId, uint3 GroupThreadId, ui
 	float4 DepthWet = T_ResultDepthWet[DispatchThreadId.xy];
 	float DryingSpeed = 5;
 	float CurrentWet = DepthWet.y;
-
-	FillSharedGroup(DispatchThreadId, GroupThreadId, MaxCell, GroupIndex);
 	
 	float4 VelHeightFoamTest = GENERAL_SHAREGROUP_NAME[GroupThreadId.x + GENERAL_SHAREGROUP_EXTENT][GroupThreadId.y + GENERAL_SHAREGROUP_EXTENT];
 	CurrentSceneHeight = GENERAL_SHAREGROUP_NAME[GroupThreadId.x + GENERAL_SHAREGROUP_EXTENT][GroupThreadId.y + GENERAL_SHAREGROUP_EXTENT].y;
@@ -816,7 +1061,13 @@ void ShallowWater(
                         uint GroupIndex : SV_GroupIndex) 
 {
     
-#if SW_VELOCITYHEIGHTSIM
+#if SW_RESETDISPATCHREGION
+	ResetDispatchRegion(DispatchThreadId);
+#elif SW_SCANDISPATCHREGION
+	ScanDispatchRegion(DispatchThreadId);
+#elif SW_FINALIZEDISPATCHREGION
+	FinalizeDispatchRegion(DispatchThreadId);
+#elif SW_VELOCITYHEIGHTSIM
     CalVelocityHeight_Flux(DispatchThreadId, GroupThreadId, GroupId, GroupIndex);
 #elif SW_SHALLOWINTEGRATE
     CalShalllowIntegrate_Flux(DispatchThreadId, GroupThreadId, GroupId, GroupIndex);

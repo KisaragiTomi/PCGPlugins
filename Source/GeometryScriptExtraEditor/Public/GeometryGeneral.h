@@ -131,7 +131,7 @@ public:
 	template<typename ReduceDatatype, typename ComponentType>
 	static TMap<int, ReduceDatatype> FindNearestComponents(FDynamicMesh3& EditMesh, FGeometryScriptDynamicMeshBVH BVH, TMap<int, ComponentType> ComponentDatas);
 
-
+	
 	
 	
 	static void AppendPrimitive(

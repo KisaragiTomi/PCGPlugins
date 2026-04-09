@@ -48,12 +48,16 @@ public:
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, T_OrigLandscapeData)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, T_AlphaTexture)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, T_MaterialBlendTexture)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_LayerAlpha)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_LayerHeight)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_LayerGeneratedHeight)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_LayerBlendResult)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_BlendResult)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_DebugView)
 		SHADER_PARAMETER(FVector4f, ValidUVRange)
 		SHADER_PARAMETER(float, GlobalAlpha)
+		SHADER_PARAMETER(float, HeightModStrength)
+		SHADER_PARAMETER(float, NormalStrength)
 		SHADER_PARAMETER(float, NoiseFrequency)
 		SHADER_PARAMETER(float, NoiseAmplitude)
 		SHADER_PARAMETER(float, FalloffWidth)
@@ -329,7 +333,12 @@ void ACSRuntimeLandscapeLayer::GenerateLayerData()
 
 			PassParameters->RW_LayerAlpha = RDGUAV_Alpha;
 			PassParameters->RW_DebugView = RDGUAV_Debug;
-			PassParameters->ValidUVRange = FVector4f(LandscapeTexMinUV, LandscapeTexMinUV + LandscapeTexUVRange);
+			{
+				auto UVEnd_tmp = LandscapeTexMinUV + LandscapeTexUVRange;
+				PassParameters->ValidUVRange = FVector4f(
+					static_cast<float>(LandscapeTexMinUV.X), static_cast<float>(LandscapeTexMinUV.Y),
+					static_cast<float>(UVEnd_tmp.X), static_cast<float>(UVEnd_tmp.Y));
+			}
 			PassParameters->GlobalAlpha = LayerSettings.GlobalAlpha;
 			PassParameters->NoiseFrequency = LayerSettings.NoiseFrequency;
 			PassParameters->NoiseAmplitude = LayerSettings.NoiseAmplitude;
@@ -342,7 +351,7 @@ void ACSRuntimeLandscapeLayer::GenerateLayerData()
 				TShaderMapRef<FCSRuntimeLandscapeLayer> ComputeShader_GenAlpha(
 					FCSRuntimeLandscapeLayer::CreatePermutation(FCSRuntimeLandscapeLayer::ERuntimeLayerFunction::RL_GenerateNoiseAlpha));
 				PassParameters->RW_LayerAlpha = RDGUAV_Alpha;
-				PassParameters->RW_LayerHeight = nullptr;
+				PassParameters->RW_LayerGeneratedHeight = nullptr;
 				GraphBuilder.AddPass(
 					RDG_EVENT_NAME("RuntimeGenerateNoiseAlpha"),
 					PassParameters,
@@ -358,7 +367,7 @@ void ACSRuntimeLandscapeLayer::GenerateLayerData()
 				TShaderMapRef<FCSRuntimeLandscapeLayer> ComputeShader_GenHeight(
 					FCSRuntimeLandscapeLayer::CreatePermutation(FCSRuntimeLandscapeLayer::ERuntimeLayerFunction::RL_GenerateNoiseHeight));
 				PassParameters->RW_LayerAlpha = nullptr;
-				PassParameters->RW_LayerHeight = RDGUAV_Alpha;
+				PassParameters->RW_LayerGeneratedHeight = RDGUAV_Alpha;
 				PassParameters->RW_DebugView = RDGUAV_Debug;
 				GraphBuilder.AddPass(
 					RDG_EVENT_NAME("RuntimeGenerateNoiseHeight"),
@@ -409,7 +418,12 @@ void ACSRuntimeLandscapeLayer::BlendLayer()
 			PassParameters->T_AlphaTexture = RDG_Alpha;
 			PassParameters->RW_BlendResult = RDGUAV_Result;
 			PassParameters->RW_DebugView = RDGUAV_Debug;
-			PassParameters->ValidUVRange = FVector4f(LandscapeTexMinUV, LandscapeTexMinUV + LandscapeTexUVRange);
+			{
+				auto UVEnd_tmp = LandscapeTexMinUV + LandscapeTexUVRange;
+				PassParameters->ValidUVRange = FVector4f(
+					static_cast<float>(LandscapeTexMinUV.X), static_cast<float>(LandscapeTexMinUV.Y),
+					static_cast<float>(UVEnd_tmp.X), static_cast<float>(UVEnd_tmp.Y));
+			}
 			PassParameters->GlobalAlpha = LayerSettings.GlobalAlpha;
 			PassParameters->Sampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
 
@@ -417,8 +431,8 @@ void ACSRuntimeLandscapeLayer::BlendLayer()
 
 			if (ActiveBlend == ERuntimeLayerBlendMode::MaterialDrive && LayerSettings.MaterialBlendTexture)
 			{
-				PassParameters->T_AlphaTexture = RegisterExternalTexture(GraphBuilder,
-					LayerSettings.MaterialBlendTexture->GetResource()->GetTexture2DResource()->GetTextureRHI(), TEXT("R_MaterialBlend"));
+			PassParameters->T_AlphaTexture = RegisterExternalTexture(GraphBuilder,
+				LayerSettings.MaterialBlendTexture->GetResource()->GetTextureRHI(), TEXT("R_MaterialBlend"), ERDGTextureFlags::None);
 			}
 
 			TShaderMapRef<FCSRuntimeLandscapeLayer> ComputeShader_Blend = FCSRuntimeLandscapeLayer::CreatePermutation(
@@ -473,8 +487,8 @@ void ACSRuntimeLandscapeLayer::ApplyToLandscape()
 	FLandscapeEditDataInterface LandscapeEdit(TargetLandscape->GetLandscapeInfo());
 	LandscapeEdit.SetShouldDirtyPackage(false);
 
-	FLandscapeLayer* EditLayer = TargetLandscape->GetLayer(0);
-	FGuid LayerGuid = EditLayer ? EditLayer->GetGuid() : FGuid();
+	const FLandscapeLayer* EditLayer = TargetLandscape->GetLayerConst(0);
+	FGuid LayerGuid = (EditLayer && EditLayer->EditLayer) ? EditLayer->EditLayer->GetGuid() : FGuid();
 
 	LandscapeEdit.SetHeightData(
 		LandscapeData.ReadRange.X, LandscapeData.ReadRange.Y,

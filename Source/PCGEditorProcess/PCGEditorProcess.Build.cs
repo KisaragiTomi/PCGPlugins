@@ -2,9 +2,9 @@
 
 using UnrealBuildTool;
 
-public class CSEditorProcess : ModuleRules
+public class PCGEditorProcess : ModuleRules
 {
-	public CSEditorProcess(ReadOnlyTargetRules Target) : base(Target)
+	public PCGEditorProcess(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 		
@@ -50,6 +50,8 @@ public class CSEditorProcess : ModuleRules
 				"MaterialUtilities",
 				"Blutility",
 				"LandscapeEditorUtilities",
+				"MeshDescription",
+				"StaticMeshDescription",
 				// ... add private dependencies that you statically link with here ...	
 			}
 			);
@@ -64,11 +66,11 @@ public class CSEditorProcess : ModuleRules
 		
 		// if (Target.Type == TargetType.Editor)
 		// {
-		// 	PublicDependencyModuleNames.Add("CSEditorProcess");
+		// 	PublicDependencyModuleNames.Add("PCGEditorProcess");
 		// }
 		// else
 		// {
-		// 	PublicDependencyModuleNames.Remove("CSEditorProcess");
+		// 	PublicDependencyModuleNames.Remove("PCGEditorProcess");
 		// }
 	}
 }

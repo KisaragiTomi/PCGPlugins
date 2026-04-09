@@ -12,9 +12,14 @@
 
 //
 #include "ComputeShaderShallowWater.generated.h"
-//
-//
-// //This struct act as a container for all the parameters that the client needs to pass to the Compute Shader Manager.
+
+UENUM(BlueprintType)
+enum class EWaterfallExpansion : uint8
+{
+	Expansion_5  = 0 UMETA(DisplayName = "5"),
+	Expansion_7  = 1 UMETA(DisplayName = "7"),
+	Expansion_10 = 2 UMETA(DisplayName = "10"),
+};
 
 
 
@@ -68,6 +73,8 @@ public:
 	int32 Iteration = 1;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	int32 HeightSmoothIteration = 1;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
+	EWaterfallExpansion WaterfallExpansionIterations = EWaterfallExpansion::Expansion_5;
 	UPROPERTY(BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	float DT = .1;
 	UPROPERTY(BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
@@ -151,6 +158,14 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	void ConstructionComponent();
 	
+	UFUNCTION(BlueprintPure, Category = "SWParameter")
+	int32 GetWaterfallExpansionCount() const
+	{
+		constexpr int32 LUT[] = { 5, 7, 10 };
+		const int32 Idx = FMath::Clamp(static_cast<int32>(WaterfallExpansionIterations), 0, 2);
+		return LUT[Idx];
+	}
+
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	void ShallowWaterSolverSoucePoint(int32 InIteration);
 
@@ -180,7 +195,20 @@ public:
 	void SetMaterialParameter();
 	virtual void SetMaterialParameter_Implementation();
 
-	
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capturer", Meta=(Priority=1000))
+	bool bAutoCapture = false;
+
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
+	void CaptureSceneDepthNow();
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug|RenderDoc", Meta=(Priority=999))
+	bool bCaptureNextSolverFrame = false;
+
+	UFUNCTION(BlueprintCallable, Category = "Debug|RenderDoc")
+	void RequestRenderDocCapture();
+
+	UFUNCTION(BlueprintCallable, Category = "Debug|RenderDoc")
+	void ShallowWaterSolverSoucePointWithCapture(int32 InIteration);
 };
 
 

@@ -12,7 +12,7 @@
 //  * 
 //  */
 // UCLASS()
-// class CSEDITORPROCESS_API UComputeShaderShallowWaterEditorUtility : public UEditorUtilityWidget
+// class PCGEDITORPROCESS_API UComputeShaderShallowWaterEditorUtility : public UEditorUtilityWidget
 // {
 // 	GENERATED_BODY()
 // 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")

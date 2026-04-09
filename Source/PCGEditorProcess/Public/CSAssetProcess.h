@@ -11,7 +11,7 @@
  * 
  */
 UCLASS()
-class CSEDITORPROCESS_API UCSAssetProcess : public UBlueprintFunctionLibrary
+class PCGEDITORPROCESS_API UCSAssetProcess : public UBlueprintFunctionLibrary
 {
 	GENERATED_BODY()
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
@@ -47,6 +47,20 @@ class CSEDITORPROCESS_API UCSAssetProcess : public UBlueprintFunctionLibrary
 	
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	static void MaterialTest(ACSShallowWaterCapture* InCSSWActor);
+
+	/**
+	 * 读取 16bit RT 的 B 通道对 Plane 顶点做 Z 位移，
+	 * 同时将 RT 的 RG 归一化写入顶点色 RG，A 通道直接写入顶点色 A。
+	 * @param InRenderTarget		16bit RT（RTF_RGBA16f）
+	 * @param InStaticMesh			目标 Plane StaticMesh
+	 * @param DisplaceScale			B 通道位移缩放系数
+	 */
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
+	static void DisplaceMeshByRTBlueChannel(UTextureRenderTarget2D* InRenderTarget, UStaticMesh* InStaticMesh, float DisplaceScale = 100.0f);
+
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader|Debug")
+	static void DebugDumpSWPassResults(ACSShallowWaterCapture* InCSSWActor);
+	
 };
 
 

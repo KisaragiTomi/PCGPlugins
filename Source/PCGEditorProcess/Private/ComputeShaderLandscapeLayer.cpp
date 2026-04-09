@@ -44,9 +44,11 @@ public:
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, T_OrigLandscapeData)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, T_MaterialBlendTexture)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, T_AlphaTexture)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_LayerAlpha)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_LayerGeneratedHeight)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_LayerBlendResult)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_BlendResult)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_DebugView)
 		SHADER_PARAMETER(FVector4f, ValidUVRange)
 		SHADER_PARAMETER(float, GlobalAlpha)
@@ -55,6 +57,7 @@ public:
 		SHADER_PARAMETER(float, FalloffWidth)
 		SHADER_PARAMETER(float, NoiseFrequency)
 		SHADER_PARAMETER(float, NoiseAmplitude)
+		SHADER_PARAMETER(float, ErosionStrength)
 		SHADER_PARAMETER(FVector3f, BoxOrigin)
 		SHADER_PARAMETER(FVector3f, BoxExtent)
 		SHADER_PARAMETER_SAMPLER(SamplerState, Sampler)
@@ -185,7 +188,12 @@ void ACSLandscapeLayer::GenerateLayerAlphaAndHeight()
 			PassParameters->RW_LayerAlpha = RDGUAV_Alpha;
 			PassParameters->RW_LayerGeneratedHeight = RDGUAV_Height;
 			PassParameters->RW_DebugView = RDGUAV_Debug;
-			PassParameters->ValidUVRange = FVector4f(LandscapeTexMinUV, LandscapeTexMinUV + LandscapeTexUVRange);
+			{
+				auto UVEnd = LandscapeTexMinUV + LandscapeTexUVRange;
+				PassParameters->ValidUVRange = FVector4f(
+					static_cast<float>(LandscapeTexMinUV.X), static_cast<float>(LandscapeTexMinUV.Y),
+					static_cast<float>(UVEnd.X), static_cast<float>(UVEnd.Y));
+			}
 			PassParameters->GlobalAlpha = GlobalAlpha;
 			PassParameters->HeightModStrength = HeightModStrength;
 			PassParameters->NormalStrength = NormalStrength;
@@ -274,7 +282,12 @@ void ACSLandscapeLayer::BlendLayerWithAlpha()
 			PassParameters->T_MaterialBlendTexture = RDG_Alpha;
 			PassParameters->RW_LayerBlendResult = RDGUAV_Result;
 			PassParameters->RW_DebugView = RDGUAV_Debug;
-			PassParameters->ValidUVRange = FVector4f(LandscapeTexMinUV, LandscapeTexMinUV + LandscapeTexUVRange);
+			{
+				auto UVEnd = LandscapeTexMinUV + LandscapeTexUVRange;
+				PassParameters->ValidUVRange = FVector4f(
+					static_cast<float>(LandscapeTexMinUV.X), static_cast<float>(LandscapeTexMinUV.Y),
+					static_cast<float>(UVEnd.X), static_cast<float>(UVEnd.Y));
+			}
 			PassParameters->GlobalAlpha = GlobalAlpha;
 			PassParameters->HeightModStrength = HeightModStrength;
 			PassParameters->NormalStrength = NormalStrength;
@@ -327,23 +340,23 @@ void ACSLandscapeLayer::CreateLandscapeLayer()
 		return;
 	}
 
-	int32 NewLayerIndex = Landscape->GetLayerCount();
-	Landscape->CreateLayer(NewLayerIndex);
-
-	if (ULandscapeLayerInfo* LayerInfo = Landscape->GetLayerInfo(NewLayerIndex))
+	FName UsedLayerName = LayerName;
+	if (UsedLayerName.IsNone())
 	{
-		LayerGuid = LayerInfo->GetGuid();
+		int32 ExistingCount = Landscape->GetLayersConst().Num();
+		UsedLayerName = FName(*FString::Printf(TEXT("PCG_TempLayer_%d"), ExistingCount));
+	}
+
+	int32 NewLayerIndex = Landscape->CreateLayer(UsedLayerName);
+	if (NewLayerIndex != INDEX_NONE)
+	{
+		const FLandscapeLayer* NewLayer = Landscape->GetLayerConst(NewLayerIndex);
+		if (NewLayer && NewLayer->EditLayer)
+		{
+			LayerGuid = NewLayer->EditLayer->GetGuid();
+		}
 		LayerIndex = NewLayerIndex;
 		bLayerCreated = true;
-
-		FName UsedLayerName = LayerName;
-		if (UsedLayerName.IsNone())
-		{
-			UsedLayerName = FName(*FString::Printf(TEXT("PCG_TempLayer_%d"), NewLayerIndex));
-		}
-
-		LayerInfo->LayerNameObj = UsedLayerName;
-		LayerInfo->bVisible = true;
 
 		UE_LOG(LogTemp, Log, TEXT("ACSLandscapeLayer: Created layer '%s' at index %d, Guid: %s"),
 			*UsedLayerName.ToString(), LayerIndex, *LayerGuid.ToString());
@@ -362,7 +375,7 @@ void ACSLandscapeLayer::RemoveLandscapeLayer()
 	}
 	if (!Landscape) return;
 
-	Landscape->DeleteLayer(LayerIndex, nullptr);
+	Landscape->DeleteLayer(LayerIndex);
 	bLayerCreated = false;
 	LayerGuid = FGuid();
 	LayerIndex = -1;

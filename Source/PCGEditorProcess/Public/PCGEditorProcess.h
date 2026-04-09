@@ -5,7 +5,7 @@
 #include "CoreMinimal.h"
 #include "Modules/ModuleManager.h"
 
-class FCSEditorProcessModule : public IModuleInterface
+class FPCGEditorProcessModule : public IModuleInterface
 {
 public:
 

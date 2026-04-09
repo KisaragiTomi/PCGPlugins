@@ -16,7 +16,7 @@
 class USplineComponent;
 
 UCLASS()
-class CSEDITORPROCESS_API ACSLandscape : public ALandscapeBlueprintBrush
+class PCGEDITORPROCESS_API ACSLandscape : public ALandscapeBlueprintBrush
 {
 GENERATED_BODY()
 public:
@@ -88,7 +88,7 @@ public:
 
 
 UCLASS()
-class CSEDITORPROCESS_API ACSLandscapeRiver : public ACSLandscape
+class PCGEDITORPROCESS_API ACSLandscapeRiver : public ACSLandscape
 {
 GENERATED_BODY()
 public:

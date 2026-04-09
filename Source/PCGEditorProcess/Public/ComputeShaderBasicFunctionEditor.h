@@ -14,7 +14,7 @@
 
 
 UCLASS()
-class CSEDITORPROCESS_API UComputeShaderBasicFunctionEditor : public UBlueprintFunctionLibrary
+class PCGEDITORPROCESS_API UComputeShaderBasicFunctionEditor : public UBlueprintFunctionLibrary
 {
 	GENERATED_BODY()
 public:

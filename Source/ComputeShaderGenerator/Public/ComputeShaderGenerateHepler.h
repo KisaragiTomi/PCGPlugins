@@ -133,7 +133,7 @@ namespace CSHepler
 		return -1;
 	}
 
-	void CreateRWBuffer(FRDGBuilder& GraphBuilder, FRDGBufferRef& RDGBuffer, FRDGBufferUAVRef& RDGUAVBuffer, uint32 NumElements, uint32 BytesPerElement, EPixelFormat Format = PF_A16B16G16R16, const TCHAR* Name = TEXT("UAV_Buffer"))
+	inline void CreateRWBuffer(FRDGBuilder& GraphBuilder, FRDGBufferRef& RDGBuffer, FRDGBufferUAVRef& RDGUAVBuffer, uint32 NumElements, uint32 BytesPerElement, EPixelFormat Format = PF_A16B16G16R16, const TCHAR* Name = TEXT("UAV_Buffer"))
 	{
 		if (NumElements == 0 || BytesPerElement == 0) return;
 		RDGBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(BytesPerElement, NumElements), Name);

@@ -23,7 +23,7 @@
 /// </summary>
 ///
 
-class FCalculateGradient : public FGlobalShader
+class COMPUTESHADERGENERATOR_API FCalculateGradient : public FGlobalShader
 {
 public:
 	//Declare this class as a global shader
@@ -65,9 +65,9 @@ public:
 	
 };
 
-IMPLEMENT_GLOBAL_SHADER(FCalculateGradient, "/Plugin/PCGPlugins/Shaders/Private/BasicFunction.usf", "CalculateGradient", SF_Compute);
+// IMPLEMENT_GLOBAL_SHADER moved to ComputeShaderBasicFunction.cpp
 
-class FConnectivityPixel : public FGlobalShader
+class COMPUTESHADERGENERATOR_API FConnectivityPixel : public FGlobalShader
 {
 public:
 	enum class EConnectivityStep : uint8
@@ -144,10 +144,10 @@ public:
 	}
 };
 
-IMPLEMENT_GLOBAL_SHADER(FConnectivityPixel, "/Plugin/PCGPlugins/Shaders/Private/Connectivity.usf", "ConnectivityPixel", SF_Compute);
+// IMPLEMENT_GLOBAL_SHADER moved to ComputeShaderBasicFunction.cpp
 
 
-class FBlurTexture : public FGlobalShader
+class COMPUTESHADERGENERATOR_API FBlurTexture : public FGlobalShader
 {
 public:
 
@@ -231,9 +231,9 @@ public:
 	}
 };
 
-IMPLEMENT_GLOBAL_SHADER(FBlurTexture, "/Plugin/PCGPlugins/Shaders/Private/BasicFunction.usf", "BlurTexture", SF_Compute);
+// IMPLEMENT_GLOBAL_SHADER moved to ComputeShaderBasicFunction.cpp
 
-class FUpPixelsMask : public FGlobalShader
+class COMPUTESHADERGENERATOR_API FUpPixelsMask : public FGlobalShader
 {
 public:
 
@@ -271,9 +271,9 @@ public:
 	}
 };
 
-IMPLEMENT_GLOBAL_SHADER(FUpPixelsMask, "/Plugin/PCGPlugins/Shaders/Private/BasicFunction.usf", "UpPixel", SF_Compute);
+// IMPLEMENT_GLOBAL_SHADER moved to ComputeShaderBasicFunction.cpp
 
-class FGeneralFunctionShader : public FGlobalShader
+class COMPUTESHADERGENERATOR_API FGeneralFunctionShader : public FGlobalShader
 {
 public:
 	enum class EGeneralShader : uint8
@@ -361,10 +361,10 @@ public:
 	}
 };
 
-IMPLEMENT_GLOBAL_SHADER(FGeneralFunctionShader, "/Plugin/PCGPlugins/Shaders/Private/BasicFunction.usf", "GeneralFunctionSet", SF_Compute);
+// IMPLEMENT_GLOBAL_SHADER moved to ComputeShaderBasicFunction.cpp
 
 
-class FTreeWindShader : public FGlobalShader
+class COMPUTESHADERGENERATOR_API FTreeWindShader : public FGlobalShader
 {
 public:
 	
@@ -412,7 +412,7 @@ public:
 	}
 };
 
-IMPLEMENT_GLOBAL_SHADER(FTreeWindShader, "/Plugin/PCGPlugins/Shaders/Private/BasicFunction.usf", "TreeWind", SF_Compute);
+// IMPLEMENT_GLOBAL_SHADER moved to ComputeShaderBasicFunction.cpp
 
 
 class FDrawPrimHeightVertexBuffer : public FVertexBuffer
@@ -423,7 +423,7 @@ public:
 };
 
 
-class FSampleSpline : public FGlobalShader
+class COMPUTESHADERGENERATOR_API FSampleSpline : public FGlobalShader
 {
 public:
 	enum class ESampleStep : uint8
@@ -499,10 +499,10 @@ public:
 	}
 };
 
-IMPLEMENT_GLOBAL_SHADER(FSampleSpline, "/Plugin/PCGPlugins/Shaders/Private/SampleSpline.usf", "SampleSpline", SF_Compute);
+// IMPLEMENT_GLOBAL_SHADER moved to ComputeShaderBasicFunction.cpp
 
 
-class FGlobalDistanceFieldForCS : public FGlobalShader
+class COMPUTESHADERGENERATOR_API FGlobalDistanceFieldForCS : public FGlobalShader
 {
 public:
 	enum class ESDFShader : uint8
@@ -576,4 +576,4 @@ public:
 	}
 };
 
-IMPLEMENT_GLOBAL_SHADER(FGlobalDistanceFieldForCS, "/Plugin/PCGPlugins/Shaders/Private/BasicFunction.usf", "GeneralFunctionSet", SF_Compute);
+// IMPLEMENT_GLOBAL_SHADER moved to ComputeShaderBasicFunction.cpp

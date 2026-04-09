@@ -19,7 +19,7 @@ enum class ELandscapeLayerBlendMode : uint8
 };
 
 UCLASS()
-class CSEDITORPROCESS_API ACSLandscapeLayer : public ALandscapeBlueprintBrush
+class PCGEDITORPROCESS_API ACSLandscapeLayer : public ALandscapeBlueprintBrush
 {
 	GENERATED_BODY()
 public:

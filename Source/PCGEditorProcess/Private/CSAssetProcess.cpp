@@ -41,6 +41,8 @@
 #include "Kismet/KismetMathLibrary.h"
 #include "Runtime/Experimental/Voronoi/Private/voro++/src/container.hh"
 #include "Subsystems/EditorAssetSubsystem.h"
+#include "MeshDescription.h"
+#include "StaticMeshAttributes.h"
 
 
 class UEditorAssetSubsystem;
@@ -276,12 +278,8 @@ void UCSAssetProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 	UStaticMesh* VisMesh = InCSSWActor->VisualizeMesh->GetStaticMesh(); 
 	if (VisMesh == nullptr) return;
 
-	// InCSSWActor->VisualizeMesh->SetVisibility(false);
-	// InCSSWActor->CausticsDecal->SetVisibility(false);
-
 	FName CSSWTag = InCSSWActor->SWTag;
 
-	
 	ULevel* CurrentLevel = InCSSWActor->GetLevel();
 	FString LevelPathName = GetPathNameSafe(CurrentLevel);
 	FString FileName;
@@ -289,8 +287,6 @@ void UCSAssetProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 	FString Extension;
 	FPaths::Split(LevelPathName, LevelPath, FileName, Extension);
 	FString AssetFloderPath = LevelPath.Append("/CSSWData");
-
-	
 
 	if (InCSSWActor->SWUniqueID < 0)
 	{
@@ -305,7 +301,6 @@ void UCSAssetProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 	FString RestultWaterMaterialPathFull = AssetFloderPath + "/" + ResultWaterMaterialName + "." + ResultWaterMaterialName;
 	FString RestultDecalMaterialPathFull = AssetFloderPath + "/" + ResultDecalMaterialName + "." + ResultDecalMaterialName;
 
-
 	UTexture2D* VelHeightTexture = UCSAssetProcess::ConveretAndSaveRTAsset(ResultVelHeightName, AssetFloderPath, InCSSWActor->RT_ResultVelHeight);
 	UTexture2D* DepthWetTexture = UCSAssetProcess::ConveretAndSaveRTAsset(ResultDepthWetName, AssetFloderPath, InCSSWActor->RT_ResultDepthWet);
 	UMaterialInstance* WaterMaterial = UCSAssetProcess::FindOrDuplicateMaterialInstanceAsset( GetPathNameSafe(InCSSWActor->WaterMaterial), RestultWaterMaterialPathFull);
@@ -314,22 +309,117 @@ void UCSAssetProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 	UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(Cast<UMaterialInstanceConstant>(WaterMaterial), TEXT("CSSW_DepthWet"), DepthWetTexture);
 	UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(Cast<UMaterialInstanceConstant>(DecalMaterial), TEXT("CSSW_VelHeight"), VelHeightTexture);
 	UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(Cast<UMaterialInstanceConstant>(DecalMaterial), TEXT("CSSW_DepthWet"), DepthWetTexture);
-	
-	// UEditorAssetLibrary::SaveLoadedAsset(WaterMaterial, false);
-	// UEditorAssetLibrary::SaveLoadedAsset(DecalMaterial, false);
-	
-	// WaterMaterial->GetPackage()->MarkPackageDirty();
-	// DecalMaterial->GetPackage()->MarkPackageDirty();
-	
-	// WaterMaterial->GetPackage()->SetDirtyFlag(true);
-	// WaterMaterial->GetPackage()->MarkPackageDirty();
 
-	// bool test = WaterMaterial->GetPackage()->IsDirty();
-	// GEditor.broadcasta
-	// GEditor->GetEditorSubsystem<UEditorAssetSubsystem>()->SetDirtyFlag(WaterMaterial, true);
-	
-	// UPackage aa;
-	// aa.SetDirtyFlag();
+	// --- Duplicate mesh, remove dry faces, displace vertices, write vertex colors ---
+	UTextureRenderTarget2D* RT = InCSSWActor->RT_ResultVelHeight;
+	if (!RT || !VisMesh->IsSourceModelValid(0)) return;
+
+	FTextureRenderTargetResource* RTResource = RT->GameThread_GetRenderTargetResource();
+	if (!RTResource) return;
+
+	const int32 RTWidth  = RT->SizeX;
+	const int32 RTHeight = RT->SizeY;
+
+	TArray<FFloat16Color> Pixels;
+	Pixels.SetNumUninitialized(RTWidth * RTHeight);
+	if (!RTResource->ReadFloat16Pixels(Pixels)) return;
+
+	FString MeshAssetName = FString::Printf(TEXT("SM_CSSW_Water_%d"), ActorId);
+	FString OriginalMeshPath = GetPathNameSafe(VisMesh);
+	FString DuplicateMeshPath = AssetFloderPath / MeshAssetName;
+
+	if (UEditorAssetLibrary::DoesAssetExist(DuplicateMeshPath))
+	{
+		UEditorAssetLibrary::DeleteAsset(DuplicateMeshPath);
+	}
+	UObject* DupObj = UEditorAssetLibrary::DuplicateAsset(OriginalMeshPath, DuplicateMeshPath);
+	UStaticMesh* NewMesh = Cast<UStaticMesh>(DupObj);
+	if (!NewMesh) return;
+
+	FMeshDescription* MeshDesc = NewMesh->GetMeshDescription(0);
+	if (!MeshDesc) return;
+
+	FStaticMeshAttributes Attributes(*MeshDesc);
+	Attributes.Register();
+
+	TVertexInstanceAttributesRef<FVector2f> VertexUVs = Attributes.GetVertexInstanceUVs();
+
+	constexpr float DryThreshold = -9000.0f;
+
+	auto SampleHeight = [&](FVertexInstanceID VID) -> float
+	{
+		FVector2f UV = VertexUVs.Get(VID, 0);
+		int32 PX = FMath::Clamp(FMath::FloorToInt32(UV.X * RTWidth),  0, RTWidth  - 1);
+		int32 PY = FMath::Clamp(FMath::FloorToInt32(UV.Y * RTHeight), 0, RTHeight - 1);
+		return Pixels[PY * RTWidth + PX].B.GetFloat();
+	};
+
+	TArray<FPolygonID> PolygonsToDelete;
+	for (const FPolygonID PolygonID : MeshDesc->Polygons().GetElementIDs())
+	{
+		TArrayView<const FVertexInstanceID> PolyVerts = MeshDesc->GetPolygonVertexInstances(PolygonID);
+		bool bAllDry = true;
+		for (const FVertexInstanceID& VID : PolyVerts)
+		{
+			if (SampleHeight(VID) > DryThreshold)
+			{
+				bAllDry = false;
+				break;
+			}
+		}
+		if (bAllDry)
+		{
+			PolygonsToDelete.Add(PolygonID);
+		}
+	}
+
+	for (const FPolygonID& PID : PolygonsToDelete)
+	{
+		TArray<FTriangleID> TriangleIDs;
+		for (const FTriangleID TID : MeshDesc->GetPolygonTriangles(PID))
+		{
+			TriangleIDs.Add(TID);
+		}
+		for (const FTriangleID& TID : TriangleIDs)
+		{
+			MeshDesc->DeleteTriangle(TID);
+		}
+		MeshDesc->DeletePolygon(PID);
+	}
+
+	TVertexAttributesRef<FVector3f> VertexPositions = Attributes.GetVertexPositions();
+	TVertexInstanceAttributesRef<FVector4f> VertexColors = Attributes.GetVertexInstanceColors();
+	constexpr float VelocityMax = 6.0f;
+	TSet<FVertexID> DisplacedVertices;
+
+	for (const FVertexInstanceID InstanceID : MeshDesc->VertexInstances().GetElementIDs())
+	{
+		FVertexID VertexID = MeshDesc->GetVertexInstanceVertex(InstanceID);
+
+		FVector2f UV = VertexUVs.Get(InstanceID, 0);
+		int32 PixelX = FMath::Clamp(FMath::FloorToInt32(UV.X * RTWidth),  0, RTWidth  - 1);
+		int32 PixelY = FMath::Clamp(FMath::FloorToInt32(UV.Y * RTHeight), 0, RTHeight - 1);
+		const FFloat16Color& Px = Pixels[PixelY * RTWidth + PixelX];
+
+		if (!DisplacedVertices.Contains(VertexID))
+		{
+			FVector3f Pos = VertexPositions[VertexID];
+			Pos.Z += Px.B.GetFloat();
+			VertexPositions[VertexID] = Pos;
+			DisplacedVertices.Add(VertexID);
+		}
+
+		float NormVelX = FMath::Clamp(Px.R.GetFloat() / VelocityMax * 0.5f + 0.5f, 0.0f, 1.0f);
+		float NormVelY = FMath::Clamp(Px.G.GetFloat() / VelocityMax * 0.5f + 0.5f, 0.0f, 1.0f);
+		float Foam = FMath::Clamp(Px.A.GetFloat(), 0.0f, 1.0f);
+
+		VertexColors.Set(InstanceID, FVector4f(NormVelX, NormVelY, 0.0f, Foam));
+	}
+
+	NewMesh->CommitMeshDescription(0);
+	NewMesh->Build(false);
+	NewMesh->PostEditChange();
+	UEditorAssetLibrary::SaveLoadedAsset(NewMesh, false);
 }
 
 UTexture2D* UCSAssetProcess::SaveTextureData(UTextureRenderTarget2D* RenderTarget, FString AssetName)
@@ -610,4 +700,170 @@ void UCSAssetProcess::MaterialTest(ACSShallowWaterCapture* InCSSWActor)
 	FStringView PackageMountPoint = FPathViews::GetMountPointNameFromPath(InName);
 	// uint32 DefaultPackageFlags = GCreatePackageDefaultFlagsMap.Find(PackageMountPoint);
 	
+}
+
+void UCSAssetProcess::DebugDumpSWPassResults(ACSShallowWaterCapture* InCSSWActor)
+{
+	if (InCSSWActor == nullptr)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DebugDumpSWPassResults: InCSSWActor is null."));
+		return;
+	}
+
+	ULevel* CurrentLevel = InCSSWActor->GetLevel();
+	FString LevelPathName = GetPathNameSafe(CurrentLevel);
+	FString FileName;
+	FString LevelPath;
+	FString Extension;
+	FPaths::Split(LevelPathName, LevelPath, FileName, Extension);
+	FString DebugFolderPath = LevelPath / TEXT("debug");
+
+	struct FRTEntry
+	{
+		UTextureRenderTarget2D* RT;
+		FString Name;
+	};
+
+	TArray<FRTEntry> RTsToSave = {
+		{ InCSSWActor->RT_SceneDepth,       TEXT("Debug_SceneDepth") },
+		{ InCSSWActor->RT_VelocityHeight,   TEXT("Debug_VelocityHeight") },
+		{ InCSSWActor->RT_ResultVelHeight,   TEXT("Debug_ResultVelHeight") },
+		{ InCSSWActor->RT_ResultDepthWet,    TEXT("Debug_ResultDepthWet") },
+		{ InCSSWActor->RT_SmoothHeight,      TEXT("Debug_SmoothHeight") },
+		{ InCSSWActor->RT_DebugView,         TEXT("Debug_DebugView") },
+	};
+
+	int32 SavedCount = 0;
+	for (const FRTEntry& Entry : RTsToSave)
+	{
+		if (Entry.RT == nullptr)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("DebugDumpSWPassResults: %s is null, skipping."), *Entry.Name);
+			continue;
+		}
+		UTexture2D* SavedTexture = UCSAssetProcess::ConveretAndSaveRTAsset(Entry.Name, DebugFolderPath, Entry.RT);
+		if (SavedTexture)
+		{
+			UEditorAssetLibrary::SaveLoadedAsset(SavedTexture, false);
+			SavedCount++;
+			UE_LOG(LogTemp, Log, TEXT("DebugDumpSWPassResults: Saved %s -> %s/%s"), *Entry.Name, *DebugFolderPath, *Entry.Name);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("DebugDumpSWPassResults: Failed to save %s"), *Entry.Name);
+		}
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("DebugDumpSWPassResults: Done. Saved %d/%d textures to %s"), SavedCount, RTsToSave.Num(), *DebugFolderPath);
+}
+
+void UCSAssetProcess::DisplaceMeshByRTBlueChannel(
+	UTextureRenderTarget2D* InRenderTarget,
+	UStaticMesh* InStaticMesh,
+	float DisplaceScale)
+{
+	if (!InRenderTarget || !InStaticMesh) return;
+
+	// --- 1. 读取 16bit RT 像素 ---
+	FTextureRenderTargetResource* RTResource = InRenderTarget->GameThread_GetRenderTargetResource();
+	if (!RTResource) return;
+
+	const int32 RTWidth  = InRenderTarget->SizeX;
+	const int32 RTHeight = InRenderTarget->SizeY;
+
+	TArray<FFloat16Color> Float16Pixels;
+	Float16Pixels.SetNumUninitialized(RTWidth * RTHeight);
+
+	if (!RTResource->ReadFloat16Pixels(Float16Pixels))
+	{
+		UE_LOG(LogTemp, Error, TEXT("DisplaceMeshByRTBlueChannel: ReadFloat16Pixels failed."));
+		return;
+	}
+
+	// --- 2. 计算 RG 通道的 min/max 用于归一化 ---
+	float MinR =  MAX_FLT, MaxR = -MAX_FLT;
+	float MinG =  MAX_FLT, MaxG = -MAX_FLT;
+
+	for (const FFloat16Color& Px : Float16Pixels)
+	{
+		float R = Px.R.GetFloat();
+		float G = Px.G.GetFloat();
+		MinR = FMath::Min(MinR, R);  MaxR = FMath::Max(MaxR, R);
+		MinG = FMath::Min(MinG, G);  MaxG = FMath::Max(MaxG, G);
+	}
+
+	const float RangeR = (MaxR - MinR) > KINDA_SMALL_NUMBER ? (MaxR - MinR) : 1.0f;
+	const float RangeG = (MaxG - MinG) > KINDA_SMALL_NUMBER ? (MaxG - MinG) : 1.0f;
+
+	// --- 3. 获取 MeshDescription ---
+	if (!InStaticMesh->IsSourceModelValid(0))
+	{
+		UE_LOG(LogTemp, Error, TEXT("DisplaceMeshByRTBlueChannel: LOD0 source model is not valid."));
+		return;
+	}
+
+	FMeshDescription* MeshDesc = InStaticMesh->GetMeshDescription(0);
+	if (!MeshDesc)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DisplaceMeshByRTBlueChannel: Failed to get MeshDescription for LOD0."));
+		return;
+	}
+
+	// 确保顶点色属性已注册（引擎默认 Plane 可能没有）
+	FStaticMeshAttributes Attributes(*MeshDesc);
+	Attributes.Register();
+
+	TVertexAttributesRef<FVector3f> VertexPositions = Attributes.GetVertexPositions();
+	TVertexInstanceAttributesRef<FVector2f> VertexUVs = Attributes.GetVertexInstanceUVs();
+	TVertexInstanceAttributesRef<FVector4f> VertexColors = Attributes.GetVertexInstanceColors();
+
+	const int32 NumVertexInstances = MeshDesc->VertexInstances().Num();
+
+	// 记录已处理的 VertexID，防止同一顶点被多个 Instance 重复位移
+	TSet<FVertexID> DisplacedVertices;
+
+	// --- 4. 遍历顶点: Z 位移 + 写入顶点色 ---
+	for (int32 i = 0; i < NumVertexInstances; ++i)
+	{
+		FVertexInstanceID InstanceID(i);
+		FVertexID VertexID = MeshDesc->GetVertexInstanceVertex(InstanceID);
+
+		// UV0 -> 像素坐标
+		FVector2f UV = VertexUVs.Get(InstanceID, 0);
+		int32 PixelX = FMath::Clamp(FMath::FloorToInt32(UV.X * RTWidth),  0, RTWidth  - 1);
+		int32 PixelY = FMath::Clamp(FMath::FloorToInt32(UV.Y * RTHeight), 0, RTHeight - 1);
+
+		const FFloat16Color& Pixel = Float16Pixels[PixelY * RTWidth + PixelX];
+
+		// B 通道 -> Z 位移（每个顶点只位移一次）
+		if (!DisplacedVertices.Contains(VertexID))
+		{
+			float BlueValue = Pixel.B.GetFloat();
+			FVector3f Pos = VertexPositions[VertexID];
+			Pos.Z += BlueValue * DisplaceScale;
+			VertexPositions[VertexID] = Pos;
+			DisplacedVertices.Add(VertexID);
+		}
+
+		// RG 归一化 -> 顶点色 RG，A 直接写入
+		float NormR = (Pixel.R.GetFloat() - MinR) / RangeR;
+		float NormG = (Pixel.G.GetFloat() - MinG) / RangeG;
+		float AlphaValue = Pixel.A.GetFloat();
+
+		FVector4f Color(
+			FMath::Clamp(NormR, 0.0f, 1.0f),
+			FMath::Clamp(NormG, 0.0f, 1.0f),
+			0.0f,
+			FMath::Clamp(AlphaValue, 0.0f, 1.0f)
+		);
+		VertexColors.Set(InstanceID, Color);
+	}
+
+	// --- 5. 提交并重建 ---
+	InStaticMesh->CommitMeshDescription(0);
+	InStaticMesh->Build(false);
+	InStaticMesh->PostEditChange();
+
+	UE_LOG(LogTemp, Log, TEXT("DisplaceMeshByRTBlueChannel: Displaced %d verts, wrote vertex colors on '%s'."),
+		NumVertexInstances, *InStaticMesh->GetName());
 }

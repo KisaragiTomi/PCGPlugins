@@ -1,0 +1,171 @@
+#pragma once
+
+/*
+ * SparseTileDispatch.ush
+ *
+ * Generic tile-level sparse dispatch utilities.
+ * Requires THREADGROUPSIZE_X / THREADGROUPSIZE_Y to be defined before inclusion.
+ *
+ * Usage:
+ *   1. Declare compact buffers in your shader (RWB_CompactTileCoords, etc.)
+ *   2. Include this file
+ *   3. Call STD_AppendActiveTile() from your domain-specific CompactActiveTiles pass
+ *   4. Call STD_WriteFinalizeCompactArgs() from your FinalizeCompact pass
+ *   5. Use STD_GetTilePixel() / STD_IsTileThreadActive() in sim passes
+ *   6. Use STD_FillSharedGroup() to cooperatively fill shared memory
+ */
+
+#ifndef SPARSE_TILE_DISPATCH_USH
+#define SPARSE_TILE_DISPATCH_USH
+
+// ─────────────── Tile coordinate packing ───────────────
+
+int2 STD_UnpackTileCoord(uint Packed)
+{
+	return int2(Packed & 0xFFFF, Packed >> 16);
+}
+
+uint STD_PackTileCoord(int2 Tile)
+{
+	return (uint(Tile.y) << 16) | uint(Tile.x);
+}
+
+// ─────────────── Thread-to-pixel remapping ───────────────
+
+int2 STD_GetTilePixel(uint GroupIdX, uint3 GroupThreadId, int2 MaxCell, Buffer<uint> TileCoords)
+{
+	const int2 TileCoord = STD_UnpackTileCoord(TileCoords[GroupIdX]);
+	const int2 Pixel = TileCoord * int2(THREADGROUPSIZE_X, THREADGROUPSIZE_Y) + int2(GroupThreadId.xy);
+	return clamp(Pixel, int2(0, 0), MaxCell - 1);
+}
+
+bool STD_IsTileThreadActive(uint GroupIdX, uint3 GroupThreadId, int2 MaxCell, Buffer<uint> TileCoords)
+{
+	const int2 TileCoord = STD_UnpackTileCoord(TileCoords[GroupIdX]);
+	const int2 Pixel = TileCoord * int2(THREADGROUPSIZE_X, THREADGROUPSIZE_Y) + int2(GroupThreadId.xy);
+	return Pixel.x < MaxCell.x && Pixel.y < MaxCell.y;
+}
+
+// ─────────────── Shared memory cooperative fill ───────────────
+// Requires GENERAL_SHAREGROUP_NAME, CREATE_SHARE_DATA_FUNC, GENERAL_SHAREGROUP_EXTENT
+// to be defined before calling.
+
+#ifdef GENERAL_SHAREGROUP_NAME
+void STD_FillSharedGroup(
+	uint GroupIdX,
+	uint3 GroupThreadId,
+	int2 MaxCell,
+	uint GroupIndex,
+	Buffer<uint> TileCoords)
+{
+	const int2 TileCoord = STD_UnpackTileCoord(TileCoords[GroupIdX]);
+	const int2 GroupTopLeftGlobal =
+		TileCoord * int2(THREADGROUPSIZE_X, THREADGROUPSIZE_Y) -
+		int2(GENERAL_SHAREGROUP_EXTENT, GENERAL_SHAREGROUP_EXTENT);
+
+	const uint THREAD_COUNT = THREADGROUPSIZE_X * THREADGROUPSIZE_Y;
+	const uint SHARED_DIM_X = THREADGROUPSIZE_X + 2 * GENERAL_SHAREGROUP_EXTENT;
+	const uint SHARED_DIM_Y = THREADGROUPSIZE_Y + 2 * GENERAL_SHAREGROUP_EXTENT;
+	const uint TOTAL_SHARED_ELEMENTS = SHARED_DIM_X * SHARED_DIM_Y;
+
+	for (uint i = GroupIndex; i < TOTAL_SHARED_ELEMENTS; i += THREAD_COUNT)
+	{
+		int localX = i % SHARED_DIM_X;
+		int localY = i / SHARED_DIM_X;
+
+		int2 globalPos = GroupTopLeftGlobal + int2(localX, localY);
+		globalPos = clamp(globalPos, int2(0, 0), MaxCell - 1);
+		GENERAL_SHAREGROUP_NAME[localX][localY] = CREATE_SHARE_DATA_FUNC(globalPos);
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+}
+#endif // GENERAL_SHAREGROUP_NAME
+
+// ─────────────── Tile append (for CompactActiveTiles) ───────────────
+
+void STD_AppendActiveTile(int2 TileCoord, RWBuffer<uint> CompactTileCoords, RWBuffer<uint> CompactCounter)
+{
+	uint idx;
+	InterlockedAdd(CompactCounter[0], 1, idx);
+	CompactTileCoords[idx] = STD_PackTileCoord(TileCoord);
+}
+
+// ─────────────── Group-cooperative tile scanning ───────────────
+// All threads in the group cooperatively scan the tile's expanded region.
+// Uses a groupshared flag to reduce results.
+//
+// Caller must define:
+//   bool STD_IsPixelActive(int2 PixelCoord)
+// before calling this function.
+//
+// Parameters:
+//   TileCoord       - which tile this group represents
+//   TileSize        - int2(THREADGROUPSIZE_X, THREADGROUPSIZE_Y)
+//   ExpandPixels    - how far beyond tile borders to scan
+//   MaxCell         - texture dimensions
+//   GroupIndex      - SV_GroupIndex
+//   ThreadCount     - total threads per group (e.g. 256)
+//   CompactTileCoords / CompactCounter - output buffers
+
+groupshared uint gs_STD_TileActive;
+
+void STD_CooperativeTileScan(
+	int2 TileCoord,
+	int2 TileSize,
+	int ExpandPixels,
+	int2 MaxCell,
+	uint GroupIndex,
+	uint ThreadCount,
+	RWBuffer<uint> CompactTileCoords,
+	RWBuffer<uint> CompactCounter)
+{
+	if (GroupIndex == 0)
+		gs_STD_TileActive = 0;
+
+	GroupMemoryBarrierWithGroupSync();
+
+	const int2 TileOrigin = TileCoord * TileSize;
+
+	if (TileOrigin.x < MaxCell.x && TileOrigin.y < MaxCell.y)
+	{
+		const int2 ScanMin = max(TileOrigin - ExpandPixels, int2(0, 0));
+		const int2 ScanMax = min(TileOrigin + TileSize + ExpandPixels - 1, MaxCell - 1);
+		const int2 ScanSize = ScanMax - ScanMin + 1;
+		const uint TotalScanPixels = (uint)ScanSize.x * (uint)ScanSize.y;
+
+		for (uint i = GroupIndex; i < TotalScanPixels; i += ThreadCount)
+		{
+			if (gs_STD_TileActive != 0)
+				break;
+
+			int2 p = ScanMin + int2(i % ScanSize.x, i / ScanSize.x);
+
+			#ifdef STD_IS_PIXEL_ACTIVE
+			if (STD_IS_PIXEL_ACTIVE(p))
+			{
+				InterlockedOr(gs_STD_TileActive, 1);
+			}
+			#endif
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (GroupIndex == 0 && gs_STD_TileActive != 0)
+	{
+		STD_AppendActiveTile(TileCoord, CompactTileCoords, CompactCounter);
+	}
+}
+
+// ─────────────── FinalizeCompact ───────────────
+
+void STD_WriteFinalizeCompactArgs(RWBuffer<uint> CompactCounter, RWBuffer<uint> CompactIndirectArgs)
+{
+	uint tileCount = CompactCounter[0];
+	CompactIndirectArgs[0] = max(tileCount, 1u);
+	CompactIndirectArgs[1] = 1u;
+	CompactIndirectArgs[2] = 1u;
+}
+
+#endif // SPARSE_TILE_DISPATCH_USH

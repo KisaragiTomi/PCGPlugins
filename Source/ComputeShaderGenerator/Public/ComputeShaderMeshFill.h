@@ -34,7 +34,7 @@ public:
 
 };
 
-class FMeshFillMult : public FGlobalShader
+class COMPUTESHADERGENERATOR_API FMeshFillMult : public FGlobalShader
 {
 public:
 		
@@ -199,7 +199,7 @@ public:
 	}
 };
 
-IMPLEMENT_GLOBAL_SHADER(FMeshFillMult, "/Plugin/PCGPlugins/Shaders/Private/MeshFill.usf", "MeshFillMult", SF_Compute);
+// IMPLEMENT_GLOBAL_SHADER moved to ComputeShaderBasicFunction.cpp
 
 USTRUCT(BlueprintType)
 struct COMPUTESHADERGENERATOR_API FCSGenerateParameter

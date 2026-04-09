@@ -13,6 +13,7 @@ RWTexture2D<float4> RW_LayerAlpha;
 RWTexture2D<float4> RW_LayerGeneratedHeight;
 RWTexture2D<float4> RW_LayerBlendResult;
 RWTexture2D<float4> RW_DebugView;
+RWTexture2D<float4> RW_BlendResult;
 float GlobalAlpha;
 float HeightModStrength;
 float NormalStrength;
@@ -23,6 +24,10 @@ float ErosionStrength;
 float3 BoxOrigin;
 float3 BoxExtent;
 SamplerState Sampler;
+
+#ifndef USE_DEBUG_VIEW
+#define USE_DEBUG_VIEW 1
+#endif
 
 float Hash(float2 P)
 {
@@ -176,11 +181,12 @@ void CSLandscapeLayerFunction(
 		float TotalGeneratedHeight = NoiseH + HeightMod;
 		float3 Normal = ComputeNormalFromHeight(UV, NoiseH);
 		RW_LayerGeneratedHeight[DispatchThreadId.xy] = float4(Normal * 0.5 + 0.5, TotalGeneratedHeight);
-		if (RW_DebugView != (RWTexture2D<float4>)0)
+#if USE_DEBUG_VIEW
 		{
 			float DebugAlpha = ComputeNoiseAlpha(UV, ValidUVtoFull) * BoxFalloff;
 			RW_DebugView[DispatchThreadId.xy] = float4(DebugAlpha, TotalGeneratedHeight / max(NoiseAmplitude, 1.0), 0.0, 1.0);
 		}
+#endif
 	}
 #endif
 
@@ -214,10 +220,9 @@ void CSLandscapeLayerFunction(
 		float3 GenNormal = (LayerData.rgb * 2.0 - 1.0);
 		float3 BlendedNormal = normalize(OrigNormal * (1.0 - FinalAlpha) + GenNormal * FinalAlpha);
 		RW_LayerBlendResult[DispatchThreadId.xy] = float4(BlendedNormal * 0.5 + 0.5, BlendedHeight);
-		if (RW_DebugView != (RWTexture2D<float4>)0)
-		{
-			RW_DebugView[DispatchThreadId.xy] = float4(FinalAlpha, BlendedHeight / max(MAX_HEIGHT, 1.0), GeneratedHeight / max(MAX_HEIGHT, 1.0), 1.0);
-		}
+#if USE_DEBUG_VIEW
+		RW_DebugView[DispatchThreadId.xy] = float4(FinalAlpha, BlendedHeight / max(MAX_HEIGHT, 1.0), GeneratedHeight / max(MAX_HEIGHT, 1.0), 1.0);
+#endif
 	}
 #endif
 
@@ -254,10 +259,9 @@ void CSLandscapeLayerFunction(
 		float3 GenNormal = (LayerData.rgb * 2.0 - 1.0);
 		float3 BlendedNormal = normalize(OrigNormal * (1.0 - FinalAlpha * MatNormalStr) + GenNormal * FinalAlpha * MatNormalStr);
 		RW_LayerBlendResult[DispatchThreadId.xy] = float4(BlendedNormal * 0.5 + 0.5, BlendedHeight);
-		if (RW_DebugView != (RWTexture2D<float4>)0)
-		{
-			RW_DebugView[DispatchThreadId.xy] = float4(FinalAlpha, MaterialAlpha, MatNormalStr, 1.0);
-		}
+#if USE_DEBUG_VIEW
+		RW_DebugView[DispatchThreadId.xy] = float4(FinalAlpha, MaterialAlpha, MatNormalStr, 1.0);
+#endif
 	}
 #endif
 }
@@ -301,10 +305,9 @@ void CSRuntimeLandscapeLayerFunction(
 		float TotalH = NoiseH * BoxFalloff;
 		float3 Normal = ComputeNormalFromHeight(UV, NoiseH);
 		RW_LayerAlpha[DispatchThreadId.xy] = float4(Normal * 0.5 + 0.5, TotalH + OrigHeight);
-		if (RW_DebugView != (RWTexture2D<float4>)0)
-		{
-			RW_DebugView[DispatchThreadId.xy] = float4(BoxFalloff, NoiseH / max(NoiseAmplitude, 1.0), 0.0, 1.0);
-		}
+#if USE_DEBUG_VIEW
+		RW_DebugView[DispatchThreadId.xy] = float4(BoxFalloff, NoiseH / max(NoiseAmplitude, 1.0), 0.0, 1.0);
+#endif
 	}
 #endif
 
@@ -337,10 +340,9 @@ void CSRuntimeLandscapeLayerFunction(
 		float3 GenNormal = (LayerData.rgb * 2.0 - 1.0);
 		float3 BlendedNormal = normalize(OrigNormal * (1.0 - FinalAlpha) + GenNormal * FinalAlpha);
 		RW_BlendResult[DispatchThreadId.xy] = float4(BlendedNormal * 0.5 + 0.5, BlendedHeight);
-		if (RW_DebugView != (RWTexture2D<float4>)0)
-		{
-			RW_DebugView[DispatchThreadId.xy] = float4(FinalAlpha, BlendedHeight / max(MAX_HEIGHT, 1.0), GeneratedHeight / max(MAX_HEIGHT, 1.0), 1.0);
-		}
+#if USE_DEBUG_VIEW
+		RW_DebugView[DispatchThreadId.xy] = float4(FinalAlpha, BlendedHeight / max(MAX_HEIGHT, 1.0), GeneratedHeight / max(MAX_HEIGHT, 1.0), 1.0);
+#endif
 	}
 #endif
 
@@ -376,10 +378,9 @@ void CSRuntimeLandscapeLayerFunction(
 		float3 GenNormal = (LayerData.rgb * 2.0 - 1.0);
 		float3 BlendedNormal = normalize(OrigNormal * (1.0 - FinalAlpha * MatNormalStr) + GenNormal * FinalAlpha * MatNormalStr);
 		RW_BlendResult[DispatchThreadId.xy] = float4(BlendedNormal * 0.5 + 0.5, BlendedHeight);
-		if (RW_DebugView != (RWTexture2D<float4>)0)
-		{
-			RW_DebugView[DispatchThreadId.xy] = float4(FinalAlpha, MaterialAlpha, MatNormalStr, 1.0);
-		}
+#if USE_DEBUG_VIEW
+		RW_DebugView[DispatchThreadId.xy] = float4(FinalAlpha, MaterialAlpha, MatNormalStr, 1.0);
+#endif
 	}
 #endif
 

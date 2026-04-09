@@ -7,7 +7,7 @@ public class ComputeShaderGenerator : ModuleRules
 	public ComputeShaderGenerator(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
-		bUseRTTI = true; 
+		bUseRTTI = true;
 		PublicIncludePaths.AddRange(
 			new string[] {
 				// ... add public include paths required here ...

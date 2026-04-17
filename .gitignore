@@ -1,0 +1,20 @@
+# Ignore everything
+*
+
+# Include Plugin and Content
+!.gitignore
+!Plugins/
+!Plugins/PCGPlugins/
+!Plugins/PCGPlugins/**
+!Content/
+!Content/**
+
+# Re-exclude build artifacts inside PCGPlugins
+Plugins/PCGPlugins/Binaries/
+Plugins/PCGPlugins/Intermediate/
+Plugins/PCGPlugins/Config/
+Plugins/PCGPlugins/ThirdParty/
+Plugins/PCGPlugins/.git_bak/
+
+# Exclude Content build artifacts
+Content/**/*.uasset.bak

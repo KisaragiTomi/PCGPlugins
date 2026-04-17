@@ -1,0 +1,217 @@
+//#pragma
+
+#include "/Engine/Public/Platform.ush"
+
+#include "/Plugin/PCGPlugins/Shaders/Private/General.usf"
+
+#ifndef THREADGROUPSIZE_X
+#define THREADGROUPSIZE_X 32
+#endif
+
+#ifndef THREADGROUPSIZE_Y
+#define THREADGROUPSIZE_Y 32
+#endif
+
+
+SamplerState Sampler;
+
+
+#ifndef MAXPOINTSPERSPLINE
+#define MAXPOINTSPERSPLINE 1024
+#endif
+
+
+RWTexture2D<float4> RW_SampleResult_DirMinDistRotate;
+RWTexture2D<float4> RW_SampleResult_GradientHeight;
+RWTexture2D<float4> RW_DebugView;
+RWBuffer<float4> RW_PointsToSampleBuffer;
+RWBuffer<int> RW_SplinePointCount;
+int NumSpline;
+float3 BoundsMin;
+float3 BoundsSize;
+
+groupshared float ShareReduction[THREADGROUPSIZE_X * THREADGROUPSIZE_X];
+groupshared float4 ShareSplineData[MAXPOINTSPERSPLINE];
+groupshared int ShareFindNearestPoint[MAXPOINTSPERSPLINE];
+groupshared int PointCounter;
+void AttributeFromSpline(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupId, uint GroupIndex)
+{
+	float MaxCell;
+	RW_SampleResult_DirMinDistRotate.GetDimensions(MaxCell, MaxCell);
+
+	const int MaxPointsPerSpline = MAXPOINTSPERSPLINE;
+	const int PointsPerPixelMax = (MAXPOINTSPERSPLINE + (THREADGROUPSIZE_X * THREADGROUPSIZE_X) - 1) / (THREADGROUPSIZE_X * THREADGROUPSIZE_X);
+	float2 UV = (DispatchThreadId.xy + .5) / MaxCell;
+	float2 WorldLocation = BoundsMin + BoundsSize.xy * UV;
+	float2 UVMin = (GroupThreadId.xy * THREADGROUPSIZE_X + .5) / MaxCell;
+	float2 UVMax = (min(MaxCell - 1, (GroupThreadId.xy + 1 ) * THREADGROUPSIZE_X) +.5) / MaxCell;
+	float WorldGroupSize = length(BoundsSize.xy * (UVMax - UVMin));
+	
+	float4 SampleResult_DirMinDistRotate = 1e+10;
+	float4 SampleResult_GradientHeight = 1e+10;
+	for (int i = 0; i < NumSpline; i++)
+	{
+		//Find NearestPoint
+		PointCounter = 0;
+		float NumPoints = min(RW_SplinePointCount[i], MAXPOINTSPERSPLINE);
+		float MinDist = 1e+10;
+		int SplineDataNum = MaxPointsPerSpline * i + GroupIndex ;
+		if ( GroupIndex < NumPoints)
+		{
+			float4 SplineData = RW_PointsToSampleBuffer[SplineDataNum];
+			ShareSplineData[GroupIndex] = SplineData;
+			MinDist = distance(WorldLocation, SplineData.xy);
+		}
+		
+		ShareReduction[GroupIndex] = MinDist;
+
+		GroupMemoryBarrierWithGroupSync();
+		
+		for (uint stride = THREADGROUPSIZE_X * THREADGROUPSIZE_X / 2; stride > 0; stride >>= 1) {
+			if (GroupIndex < stride) {
+				ShareReduction[GroupIndex] = min(ShareReduction[GroupIndex], ShareReduction[GroupIndex + stride]);
+			}
+			GroupMemoryBarrierWithGroupSync();
+		}
+		MinDist = ShareReduction[0];
+
+		float ThreadDist = MinDist + WorldGroupSize;
+		float4 SplineData = ShareSplineData[GroupIndex];
+		if (MinDist < ThreadDist && length(SplineData) != 0)
+		{
+			int PreValue;
+			InterlockedAdd(PointCounter, 1, PreValue);
+			ShareFindNearestPoint[PreValue] = SplineDataNum;
+			ShareFindNearestPoint[PreValue] = GroupIndex;
+		}
+		
+		GroupMemoryBarrierWithGroupSync();
+		MinDist = 1e+10;
+		int MinDistNum = -1;
+		float4 MinDistSplineData = -1;
+		for (int j = 0; j < PointCounter; j++)
+		{
+			int FindSplineDataNum = ShareFindNearestPoint[j];
+			float4 SplineData = ShareSplineData[FindSplineDataNum];
+			float Dist = distance(WorldLocation, SplineData.xy);
+			if (Dist < MinDist)
+			{
+				MinDist = min(MinDist, Dist);
+				MinDistSplineData = SplineData;
+				MinDistNum = FindSplineDataNum;
+				
+			}
+		}
+		//Find NearestPoint End
+
+		//Sample Spline
+		float CurrentDist = SampleResult_DirMinDistRotate.z;
+		int SplineDataPreNum =  MinDistNum - 1 < 0? MinDistNum + 1 : MinDistNum - 1;
+		int SplineDataNextNum = MinDistNum + 1 > NumPoints - 1? MinDistNum - 1 : MinDistNum + 1;
+		float4 SplineDataPre = ShareSplineData[SplineDataPreNum];
+		float4 SplineDataNext = ShareSplineData[SplineDataNextNum];
+		float DistPre = distance(WorldLocation, SplineDataPre.xy);
+		float DistNext = distance(WorldLocation, SplineDataNext.xy);
+				
+		float4 A = MinDistSplineData;
+		float4 B = MinDistSplineData;
+		float4 B1 = DistPre < DistNext? SplineDataNext : SplineDataPre;
+		float4 B2 = DistPre < DistNext? SplineDataPre : SplineDataNext;
+				
+		float2 AB1 = B1.xy - A.xy;
+		float2 AB2 = B2.xy - A.xy;
+		float2 AP = WorldLocation - A.xy;
+		float dotAB1 = abs(dot(AB1, AB1));
+		float t1 = abs(dot(AP, AB1)) / dotAB1;
+		float dotAB2 = abs(dot(AB2, AB2));
+		float t2 = abs(dot(AP, AB2)) / dotAB2;
+		t1 = clamp(t1, 0, 1);
+		t2 = clamp(t2, 0, 1);
+
+
+		float2 Gradient = SampleResult_GradientHeight.xy;
+		float Height = SampleResult_GradientHeight.z;
+		float4 LerpSplineData = MinDistSplineData;
+		LerpSplineData.xy - SampleResult_DirMinDistRotate.xy;
+		LerpSplineData.w = SampleResult_DirMinDistRotate.w;
+		float ResultDist = SampleResult_DirMinDistRotate.z;
+		if (dotAB1 < 1e-6 || dotAB2 < 1e-6)
+		{
+			if (CurrentDist > MinDist)
+			{
+				LerpSplineData = MinDistSplineData;
+				ResultDist = MinDist;
+				Gradient = (MinDistSplineData.xy - WorldLocation).xy;
+				Height = MinDistSplineData.z;
+			}
+		}
+		else
+		{
+			float2 MinPos1 = A.xy + t1 * AB1;
+			float MinDist1 = distance(MinPos1, WorldLocation);
+			float2 MinPos2 = A.xy + t2 * AB2;
+			float MinDist2 = distance(MinPos2, WorldLocation);
+			float t = 0;
+			if (MinDist1 < MinDist2)
+			{
+				MinDist = MinDist1;
+				t = t1;
+				B = B1;
+			}
+			else
+			{
+				MinDist = MinDist2;
+				t = t2;
+				B = B2;
+			}
+			if (CurrentDist > MinDist)
+			{
+				LerpSplineData = lerp(A, B, t);
+				ResultDist = MinDist;
+				Gradient = (LerpSplineData.xy - WorldLocation).xy;
+				Height = LerpSplineData.z;
+			}
+		}
+		//Sample Spline End
+
+		SampleResult_DirMinDistRotate.xy = LerpSplineData.xy;
+		SampleResult_DirMinDistRotate.w = LerpSplineData.w;
+		SampleResult_DirMinDistRotate.z = ResultDist;
+		SampleResult_GradientHeight.xyz = float3(Gradient, Height);
+		
+		GroupMemoryBarrierWithGroupSync();
+	}
+	// SampleResult_DirMinDistRotate.z /= 1000;
+	SampleResult_DirMinDistRotate.xy  = normalize(float2(cos(radians(SampleResult_DirMinDistRotate.w)), sin(radians(SampleResult_DirMinDistRotate.w))));
+	RW_SampleResult_DirMinDistRotate[DispatchThreadId.xy] = SampleResult_DirMinDistRotate;
+	RW_SampleResult_GradientHeight[DispatchThreadId.xy] = SampleResult_GradientHeight;
+	RW_DebugView[DispatchThreadId.xy] = SampleResult_DirMinDistRotate.z / 1000;
+	RW_DebugView[DispatchThreadId.xy] = 1;
+}
+
+void RasterizeSpline(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupId, uint GroupIndex)
+{
+	// if (DispatchThreadId.x > RW_SplinePointCount[0]) return;
+	// float MaxCell;
+	// RW_OutTexture.GetDimensions(MaxCell, MaxCell);
+	//
+	// float2 UV = (RW_PointsToSampleBuffer[DispatchThreadId.x].xy - BoundsMin.xy) / BoundsSize.xy;
+	// RW_OutTexture[uint2(UV * MaxCell)] = 11;
+	// // RW_OutTexture[uint2(DispatchThreadId.x, 0)].x = UV.x > 1;
+	
+}
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void SampleSpline(
+						uint3 GroupId : SV_GroupID,
+						uint3 DispatchThreadId : SV_DispatchThreadID,
+						uint3 GroupThreadId : SV_GroupThreadID,
+						uint GroupIndex : SV_GroupIndex) 
+{
+#if SS_SAMPLESPLINE
+	AttributeFromSpline(DispatchThreadId, GroupThreadId, GroupId, GroupIndex);
+#elif SS_RASTERIZESPLINE
+	RasterizeSpline(DispatchThreadId, GroupThreadId, GroupId, GroupIndex);
+#endif
+
+}

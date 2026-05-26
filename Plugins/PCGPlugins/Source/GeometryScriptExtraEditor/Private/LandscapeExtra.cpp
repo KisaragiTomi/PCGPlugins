@@ -8,6 +8,7 @@
 #include "UDynamicMesh.h"
 #include "DynamicMeshEditor.h"
 #include "DynamicMesh/MeshTransforms.h"
+#include "Engine/Engine.h"
 #include "EngineUtils.h"
 #include "LandscapeEdit.h"
 #include "LandscapeEditLayer.h"

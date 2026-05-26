@@ -1,0 +1,368 @@
+#include "/Engine/Public/Platform.ush"
+
+#ifndef THREADGROUPSIZE_X
+#define THREADGROUPSIZE_X 64
+#endif
+
+StructuredBuffer<float4> PathPoints;
+StructuredBuffer<int4> PathPointMeta;
+StructuredBuffer<float4> MeshTriangleVertices;
+StructuredBuffer<int4> SegmentMeta;
+StructuredBuffer<uint> GridCellOffsets;
+StructuredBuffer<uint> GridTriangleIndices;
+RWStructuredBuffer<float4> RW_OutVertices;
+RWStructuredBuffer<uint> RW_OutIndices;
+
+uint PathPointCount;
+uint SegmentCount;
+uint MeshTriangleCount;
+uint OutputVertexCount;
+uint OutputIndexCount;
+uint ProfileCount;
+uint bTube;
+float VinesOffset;
+float CircleScale;
+float LineScale;
+
+float3 GridOrigin;
+float GridCellSize;
+int3 GridDimensions;
+uint GridTotalCells;
+uint bUseGrid;
+
+float3 SafeNormalize3(float3 V, float3 Fallback)
+{
+    float LenSq = dot(V, V);
+    if (LenSq <= 1.0e-8f)
+    {
+        return Fallback;
+    }
+    return V * rsqrt(LenSq);
+}
+
+float3 ClosestPointOnTriangle(float3 P, float3 A, float3 B, float3 C)
+{
+    float3 AB = B - A;
+    float3 AC = C - A;
+    float3 AP = P - A;
+    float D1 = dot(AB, AP);
+    float D2 = dot(AC, AP);
+    if (D1 <= 0.0f && D2 <= 0.0f)
+    {
+        return A;
+    }
+
+    float3 BP = P - B;
+    float D3 = dot(AB, BP);
+    float D4 = dot(AC, BP);
+    if (D3 >= 0.0f && D4 <= D3)
+    {
+        return B;
+    }
+
+    float VC = D1 * D4 - D3 * D2;
+    if (VC <= 0.0f && D1 >= 0.0f && D3 <= 0.0f)
+    {
+        float V = D1 / (D1 - D3);
+        return A + V * AB;
+    }
+
+    float3 CP = P - C;
+    float D5 = dot(AB, CP);
+    float D6 = dot(AC, CP);
+    if (D6 >= 0.0f && D5 <= D6)
+    {
+        return C;
+    }
+
+    float VB = D5 * D2 - D1 * D6;
+    if (VB <= 0.0f && D2 >= 0.0f && D6 <= 0.0f)
+    {
+        float W = D2 / (D2 - D6);
+        return A + W * AC;
+    }
+
+    float VA = D3 * D6 - D5 * D4;
+    if (VA <= 0.0f && (D4 - D3) >= 0.0f && (D5 - D6) >= 0.0f)
+    {
+        float WEdge = (D4 - D3) / ((D4 - D3) + (D5 - D6));
+        return B + WEdge * (C - B);
+    }
+
+    float Denom = 1.0f / (VA + VB + VC);
+    float VFace = VB * Denom;
+    float WFace = VC * Denom;
+    return A + AB * VFace + AC * WFace;
+}
+
+int3 WorldToGridCell(float3 WorldPos)
+{
+    float3 Local = (WorldPos - GridOrigin) / GridCellSize;
+    return int3(
+        clamp((int)floor(Local.x), 0, GridDimensions.x - 1),
+        clamp((int)floor(Local.y), 0, GridDimensions.y - 1),
+        clamp((int)floor(Local.z), 0, GridDimensions.z - 1));
+}
+
+uint GridCellIndex(int3 Cell)
+{
+    return uint(Cell.x) + uint(Cell.y) * uint(GridDimensions.x) + uint(Cell.z) * uint(GridDimensions.x) * uint(GridDimensions.y);
+}
+
+void TestTriangle(uint TriIndex, float3 Query, inout float BestDistSq, inout float3 BestPosition, inout float3 BestNormal)
+{
+    uint Base = TriIndex * 3u;
+    float3 A = MeshTriangleVertices[Base + 0u].xyz;
+    float3 B = MeshTriangleVertices[Base + 1u].xyz;
+    float3 C = MeshTriangleVertices[Base + 2u].xyz;
+    float3 N = cross(B - A, C - A);
+    float NSq = dot(N, N);
+    if (NSq <= 1.0e-8f)
+    {
+        return;
+    }
+
+    float3 Closest = ClosestPointOnTriangle(Query, A, B, C);
+    float3 Delta = Query - Closest;
+    float DistSq = dot(Delta, Delta);
+    if (DistSq < BestDistSq)
+    {
+        BestDistSq = DistSq;
+        BestPosition = Closest;
+        BestNormal = N * rsqrt(NSq);
+    }
+}
+
+void FindClosestMeshPointGrid(float3 Query, out float3 OutPosition, out float3 OutNormal)
+{
+    OutPosition = Query;
+    OutNormal = float3(0.0f, 0.0f, 1.0f);
+
+    if (MeshTriangleCount == 0u)
+    {
+        return;
+    }
+
+    float BestDistSq = 3.402823466e+38f;
+    float3 BestNormal = OutNormal;
+    float3 BestPosition = Query;
+
+    int3 CenterCell = WorldToGridCell(Query);
+
+    // Search expanding rings of cells until we find a triangle or exhaust neighbors
+    // Start with the center cell, then expand to 3x3x3 neighborhood
+    for (int Radius = 0; Radius <= 1; ++Radius)
+    {
+        for (int DZ = -Radius; DZ <= Radius; ++DZ)
+        {
+            for (int DY = -Radius; DY <= Radius; ++DY)
+            {
+                for (int DX = -Radius; DX <= Radius; ++DX)
+                {
+                    // Skip inner cells already visited in previous radius
+                    if (Radius > 0 && abs(DX) < Radius && abs(DY) < Radius && abs(DZ) < Radius)
+                    {
+                        continue;
+                    }
+
+                    int3 Cell = CenterCell + int3(DX, DY, DZ);
+                    if (Cell.x < 0 || Cell.y < 0 || Cell.z < 0 ||
+                        Cell.x >= GridDimensions.x || Cell.y >= GridDimensions.y || Cell.z >= GridDimensions.z)
+                    {
+                        continue;
+                    }
+
+                    uint CellIdx = GridCellIndex(Cell);
+                    uint Start = GridCellOffsets[CellIdx];
+                    uint End = GridCellOffsets[CellIdx + 1u];
+
+                    for (uint Slot = Start; Slot < End; ++Slot)
+                    {
+                        uint TriIndex = GridTriangleIndices[Slot];
+                        TestTriangle(TriIndex, Query, BestDistSq, BestPosition, BestNormal);
+                    }
+                }
+            }
+        }
+
+        // If we found something in the center cell, check if it's close enough
+        // that expanding further won't help (distance < cell diagonal)
+        if (Radius == 0 && BestDistSq < 3.402823466e+38f)
+        {
+            float CellDiagonalSq = 3.0f * GridCellSize * GridCellSize;
+            if (BestDistSq <= CellDiagonalSq)
+            {
+                // Still expand one ring to catch triangles near cell boundaries
+                continue;
+            }
+        }
+    }
+
+    // If grid search found nothing (empty cells), fall back to brute force
+    if (BestDistSq >= 3.402823466e+38f)
+    {
+        for (uint TriIndex = 0u; TriIndex < MeshTriangleCount; ++TriIndex)
+        {
+            TestTriangle(TriIndex, Query, BestDistSq, BestPosition, BestNormal);
+        }
+    }
+
+    OutPosition = BestPosition;
+    OutNormal = BestNormal;
+}
+
+void FindClosestMeshPointBruteForce(float3 Query, out float3 OutPosition, out float3 OutNormal)
+{
+    OutPosition = Query;
+    OutNormal = float3(0.0f, 0.0f, 1.0f);
+
+    if (MeshTriangleCount == 0u)
+    {
+        return;
+    }
+
+    float BestDistSq = 3.402823466e+38f;
+    float3 BestNormal = OutNormal;
+    float3 BestPosition = Query;
+
+    for (uint TriIndex = 0u; TriIndex < MeshTriangleCount; ++TriIndex)
+    {
+        TestTriangle(TriIndex, Query, BestDistSq, BestPosition, BestNormal);
+    }
+
+    OutPosition = BestPosition;
+    OutNormal = BestNormal;
+}
+
+void FindClosestMeshPoint(float3 Query, out float3 OutPosition, out float3 OutNormal)
+{
+    if (bUseGrid != 0u && GridTotalCells > 1u)
+    {
+        FindClosestMeshPointGrid(Query, OutPosition, OutNormal);
+    }
+    else
+    {
+        FindClosestMeshPointBruteForce(Query, OutPosition, OutNormal);
+    }
+}
+
+float2 GetProfilePoint(uint ProfileIndex)
+{
+    if (bTube != 0u)
+    {
+        if (ProfileIndex == 0u)
+        {
+            return float2(10.0f, 0.0f) * CircleScale;
+        }
+        if (ProfileIndex == 1u)
+        {
+            return float2(-5.0f, 8.660254f) * CircleScale;
+        }
+        return float2(-5.0f, -8.660254f) * CircleScale;
+    }
+
+    return float2(ProfileIndex == 0u ? -5.0f : 5.0f, 0.0f) * LineScale;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void BuildVineVisualizationMeshCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint Index = DispatchThreadId.x;
+
+    if (Index < OutputVertexCount && ProfileCount > 0u)
+    {
+        uint PointIndex = Index / ProfileCount;
+        uint ProfileIndex = Index - PointIndex * ProfileCount;
+        if (PointIndex < PathPointCount)
+        {
+            float4 PackedPoint = PathPoints[PointIndex];
+            int4 Meta = PathPointMeta[PointIndex];
+            uint PrevIndex = (uint)max(Meta.x, 0);
+            uint NextIndex = (uint)max(Meta.y, 0);
+            PrevIndex = min(PrevIndex, PathPointCount - 1u);
+            NextIndex = min(NextIndex, PathPointCount - 1u);
+
+            float3 Query = PackedPoint.xyz;
+            float Scale = PackedPoint.w;
+            float3 PrevPos = PathPoints[PrevIndex].xyz;
+            float3 NextPos = PathPoints[NextIndex].xyz;
+            float3 Tangent = SafeNormalize3(NextPos - PrevPos, float3(1.0f, 0.0f, 0.0f));
+
+            float3 Projected;
+            float3 Normal;
+            FindClosestMeshPoint(Query, Projected, Normal);
+            Normal = SafeNormalize3(Normal, float3(0.0f, 0.0f, 1.0f));
+
+            float3 Binormal = cross(Normal, Tangent);
+            if (dot(Binormal, Binormal) <= 1.0e-8f)
+            {
+                Binormal = cross(float3(0.0f, 0.0f, 1.0f), Tangent);
+            }
+            Binormal = SafeNormalize3(Binormal, float3(0.0f, 1.0f, 0.0f));
+            float3 FrameNormal = SafeNormalize3(cross(Tangent, Binormal), Normal);
+
+            float2 Profile = GetProfilePoint(ProfileIndex) * Scale;
+            float3 Center = Projected + Normal * VinesOffset;
+            float3 OutPosition = Center + Binormal * Profile.x + FrameNormal * Profile.y;
+            RW_OutVertices[Index] = float4(OutPosition, 1.0f);
+        }
+    }
+
+    if (Index < SegmentCount && ProfileCount > 0u)
+    {
+        int4 Segment = SegmentMeta[Index];
+        uint APoint = (uint)max(Segment.x, 0);
+        uint BPoint = (uint)max(Segment.y, 0);
+        if (APoint >= PathPointCount || BPoint >= PathPointCount)
+        {
+            return;
+        }
+
+        uint ABase = APoint * ProfileCount;
+        uint BBase = BPoint * ProfileCount;
+
+        if (bTube != 0u)
+        {
+            uint SegmentIndexBase = Index * ProfileCount * 6u;
+            for (uint Edge = 0u; Edge < ProfileCount; ++Edge)
+            {
+                uint NextEdge = (Edge + 1u) % ProfileCount;
+                uint WriteBase = SegmentIndexBase + Edge * 6u;
+                if (WriteBase + 5u >= OutputIndexCount)
+                {
+                    continue;
+                }
+
+                uint A0 = ABase + Edge;
+                uint A1 = ABase + NextEdge;
+                uint B0 = BBase + Edge;
+                uint B1 = BBase + NextEdge;
+
+                RW_OutIndices[WriteBase + 0u] = A0;
+                RW_OutIndices[WriteBase + 1u] = B0;
+                RW_OutIndices[WriteBase + 2u] = B1;
+                RW_OutIndices[WriteBase + 3u] = A0;
+                RW_OutIndices[WriteBase + 4u] = B1;
+                RW_OutIndices[WriteBase + 5u] = A1;
+            }
+        }
+        else
+        {
+            uint WriteBase = Index * 6u;
+            if (WriteBase + 5u < OutputIndexCount && ProfileCount >= 2u)
+            {
+                uint A0 = ABase + 0u;
+                uint A1 = ABase + 1u;
+                uint B0 = BBase + 0u;
+                uint B1 = BBase + 1u;
+
+                RW_OutIndices[WriteBase + 0u] = A0;
+                RW_OutIndices[WriteBase + 1u] = B0;
+                RW_OutIndices[WriteBase + 2u] = B1;
+                RW_OutIndices[WriteBase + 3u] = A0;
+                RW_OutIndices[WriteBase + 4u] = B1;
+                RW_OutIndices[WriteBase + 5u] = A1;
+            }
+        }
+    }
+}

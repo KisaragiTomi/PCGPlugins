@@ -11,8 +11,11 @@
 #include "Components/DecalComponent.h"
 #include "RenderGraphBuilder.h"
 #include "RHIGPUReadback.h"
+#include "TimerManager.h"
 
 #define CSSW_VELOCITY_CLAMP 4
+
+class FObjectPreSaveContext;
 
 #include "ComputeShaderShallowWater.generated.h"
 
@@ -64,6 +67,16 @@ public:
 	UStaticMesh* DebugMesh;
 	UPROPERTY(BlueprintReadWrite, Category = "Debug")
 	UStaticMeshComponent* ReusltMesh;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Bake", Meta=(Priority=1000))
+	bool bUseBakedResultMesh = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Bake", Meta=(EditCondition="bUseBakedResultMesh", Priority=1000))
+	UStaticMesh* BakedResultMesh = nullptr;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Bake", Meta=(Priority=999))
+	UStaticMesh* SimulationPreviewMesh = nullptr;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Bake", Meta=(Priority=999))
+	UMaterialInterface* SimulationWaterMaterial = nullptr;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Bake", Meta=(Priority=999))
+	UMaterialInterface* SimulationDecalMaterial = nullptr;
 	UPROPERTY(BlueprintReadWrite, Category = "Debug")
 	UHierarchicalInstancedStaticMeshComponent* SimVisHISM;
 	UPROPERTY(BlueprintReadWrite, Category = "Debug")
@@ -81,7 +94,7 @@ public:
 	UMaterialInterface* VisDecalMaterial;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	bool CloseBound = false;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000, ClampMin="1", UIMin="1"))
 	int32 Iteration = 1;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	int32 HeightSmoothIteration = 1;
@@ -116,6 +129,9 @@ public:
 	float CaptureSize = 2000;
 
 	virtual void PostLoad() override;
+	virtual void BeginPlay() override;
+	virtual void PreSave(FObjectPreSaveContext ObjectSaveContext) override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 	virtual void OnConstruction(const FTransform& Transform) override;
 	
@@ -195,21 +211,24 @@ public:
 	int32 TileMaskReadbackWriteIdx = 0;
 	int32 TileMaskReadbackWidth = 0;
 	int32 TileMaskReadbackHeight = 0;
+	int32 TileMaskReadbackCopyWidth[ReadbackBufferCount] = {};
+	int32 TileMaskReadbackCopyHeight[ReadbackBufferCount] = {};
+	int32 TileMaskReadbackGeneration[ReadbackBufferCount] = {};
 
 	FRHIGPUTextureReadback* ResultReadback[ReadbackBufferCount] = {};
 	int32 ResultReadbackWriteIdx = 0;
+	int32 ResultReadbackCopyWidth[ReadbackBufferCount] = {};
+	int32 ResultReadbackCopyHeight[ReadbackBufferCount] = {};
+	int32 ResultReadbackGeneration[ReadbackBufferCount] = {};
+	int32 SolverReadbackGeneration = 1;
 	TArray<FFloat16Color> CachedResultPixels;
 	int32 CachedResultWidth = 0;
 	int32 CachedResultHeight = 0;
 
-	UPROPERTY(BlueprintReadOnly, Category = "ComputeShader")
-	bool bSolverActive = false;
-	bool bSolverPausedForConstruction = false;
-
 	FTimerHandle ConstructionDebounceHandle;
 	uint64 LastSolverFrameNumber = 0;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug|RenderDoc", Meta=(Priority=999))
+	UPROPERTY(Transient, EditAnywhere, BlueprintReadWrite, Category = "Debug|RenderDoc", Meta=(Priority=999))
 	bool bCaptureNextSolverFrame = false;
 
 	UFUNCTION(BlueprintCallable, Category = "Debug|RenderDoc")
@@ -237,10 +256,10 @@ public:
 		OutInvSize = SimUVInvSize;
 	}
 
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	void StartSolver();
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "ComputeShader", Meta=(ClampMin="0", UIMin="0"))
+	void StartSolver(float TimerRate = 0.0f);
 
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "ComputeShader")
 	void StopSolver();
 
 	DECLARE_DELEGATE_OneParam(FOnBakeResultMesh, ACSShallowWaterCapture*);
@@ -253,10 +272,16 @@ public:
 	void OnBakeComplete();
 	virtual void OnBakeComplete_Implementation();
 
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	void ToggleSimVisualization();
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader|Bake")
+	void UseBakedResultMesh(UStaticMesh* InBakedMesh, UMaterialInterface* InWaterMaterial, UMaterialInterface* InDecalMaterial);
 
-	UPROPERTY(BlueprintReadOnly, Category = "ComputeShader")
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader|Bake")
+	void UseSimulationResultMesh();
+
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader", Meta=(ClampMin="1", UIMin="1"))
+	void ToggleSimVisualization(int32 SimIterationsPerFrame = 1);
+
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "ComputeShader")
 	bool bSimVisActive = false;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug|DebugViewPlane")
@@ -266,8 +291,20 @@ public:
 	void ShowDebugViewPlane(float Duration = 5.0f);
 
 private:
+	void ClearSolverTimer();
+	bool IsSolverTimerActive() const;
+	void ScheduleSolverTimerTick();
+	void HandleSolverTimerTick(int32 ExpectedSolverReadbackGeneration);
+	void StopSimulationRuntime(bool bResetVisualization);
+	void UpdateSimulationPreviewMesh();
+	bool EnsureSimVisHISMReady();
+	void ResetSimVisTiles();
+	void ResetSolverReadbackState(bool bAdvanceGeneration, bool bClearCachedResult);
+
 	TWeakObjectPtr<AActor> DebugViewPlaneActor;
 	FTimerHandle DebugViewPlaneTimerHandle;
+	FTimerHandle SolverTimerHandle;
+	float SolverTimerRate = 0.0f;
 };
 
 

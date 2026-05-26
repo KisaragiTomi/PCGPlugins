@@ -1,0 +1,285 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1680" height="1240" viewBox="0 0 1680 1240" role="img" aria-labelledby="title desc">
+  <title id="title">PCGPlugins 浅水模拟生命周期</title>
+  <desc id="desc">ACSShallowWaterCapture 和 UCSShallowWaterProcess 从编辑器点击、选择 Actor、启动 Tick、每帧 GPU 求解、读回显示、停止和烘焙的生命周期流程图。</desc>
+
+  <defs>
+    <marker id="arrow-blue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 1 1 L 11 6 L 1 11 Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 1 1 L 11 6 L 1 11 Z" fill="#059669"/>
+    </marker>
+    <marker id="arrow-amber" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 1 1 L 11 6 L 1 11 Z" fill="#b45309"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 1 1 L 11 6 L 1 11 Z" fill="#dc2626"/>
+    </marker>
+    <filter id="shadow" x="-8%" y="-12%" width="116%" height="124%">
+      <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+    <style>
+      .bg { fill: #f7fafc; }
+      .lane { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; filter: url(#shadow); }
+      .lane-title { font: 700 23px "Microsoft YaHei", "Segoe UI", Arial, sans-serif; fill: #0f172a; }
+      .title { font: 800 36px "Microsoft YaHei", "Segoe UI", Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 17px "Microsoft YaHei", "Segoe UI", Arial, sans-serif; fill: #475569; }
+      .card-title { font: 700 18px "Microsoft YaHei", "Segoe UI", Arial, sans-serif; fill: #0f172a; }
+      .card-text { font: 400 14px "Microsoft YaHei", "Segoe UI", Arial, sans-serif; fill: #334155; }
+      .small { font: 400 12.5px "Microsoft YaHei", "Segoe UI", Arial, sans-serif; fill: #475569; }
+      .code { font: 600 13px Consolas, "SFMono-Regular", monospace; fill: #1e293b; }
+      .tag { font: 700 12px "Microsoft YaHei", "Segoe UI", Arial, sans-serif; fill: #0f172a; }
+      .entry { fill: #eff6ff; stroke: #60a5fa; }
+      .state { fill: #f0fdf4; stroke: #34d399; }
+      .gpu { fill: #eef2ff; stroke: #818cf8; }
+      .output { fill: #ecfdf5; stroke: #10b981; }
+      .bake { fill: #fffbeb; stroke: #f59e0b; }
+      .guard { fill: #fff1f2; stroke: #fb7185; }
+      .neutral { fill: #f8fafc; stroke: #94a3b8; }
+      .card { stroke-width: 2; rx: 10; }
+      .line-blue { fill: none; stroke: #2563eb; stroke-width: 3; marker-end: url(#arrow-blue); }
+      .line-green { fill: none; stroke: #059669; stroke-width: 3; marker-end: url(#arrow-green); }
+      .line-amber { fill: none; stroke: #b45309; stroke-width: 3; marker-end: url(#arrow-amber); }
+      .line-red { fill: none; stroke: #dc2626; stroke-width: 3; marker-end: url(#arrow-red); }
+      .line-dash { fill: none; stroke: #64748b; stroke-width: 2.5; stroke-dasharray: 8 8; marker-end: url(#arrow-blue); }
+      .loop { fill: none; stroke: #4f46e5; stroke-width: 2.5; stroke-dasharray: 7 7; marker-end: url(#arrow-blue); }
+      .label-blue { fill: #dbeafe; stroke: #60a5fa; stroke-width: 1.5; rx: 8; }
+      .label-green { fill: #dcfce7; stroke: #34d399; stroke-width: 1.5; rx: 8; }
+      .label-amber { fill: #fef3c7; stroke: #f59e0b; stroke-width: 1.5; rx: 8; }
+      .label-red { fill: #fee2e2; stroke: #fb7185; stroke-width: 1.5; rx: 8; }
+      .note { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1680" height="1240"/>
+
+  <text class="title" x="64" y="64">PCGPlugins 浅水模拟生命周期</text>
+  <text class="subtitle" x="64" y="96">基于 ACSShallowWaterCapture / UCSShallowWaterProcess / ShallowWater.usf 当前代码路径整理</text>
+
+  <rect class="lane" x="48" y="126" width="1584" height="170" rx="18"/>
+  <text class="lane-title" x="78" y="164">1. 编辑器入口：点击后先找到正确的 CSSW Actor</text>
+
+  <rect class="card entry" x="78" y="188" width="270" height="82"/>
+  <text class="card-title" x="102" y="216">点击 Sim / Start</text>
+  <text class="card-text" x="102" y="242">
+    <tspan x="102" dy="0">EUW / BP 调用入口</tspan>
+    <tspan x="102" dy="20">或直接点 Actor CallInEditor</tspan>
+  </text>
+
+  <rect class="card entry" x="398" y="188" width="290" height="82"/>
+  <text class="card-title" x="422" y="216">StartSWSolver</text>
+  <text class="code" x="422" y="242">
+    <tspan x="422" dy="0">CSSW_GetSelectActor()</tspan>
+    <tspan x="422" dy="19">Iteration = 参数</tspan>
+  </text>
+
+  <rect class="card guard" x="738" y="188" width="300" height="82"/>
+  <text class="card-title" x="762" y="216">选择判定</text>
+  <text class="card-text" x="762" y="242">
+    <tspan x="762" dy="0">选中 Capture / 子 Actor</tspan>
+    <tspan x="762" dy="20">或选中 Source 后重叠查找</tspan>
+  </text>
+
+  <rect class="card guard" x="1088" y="168" width="245" height="74"/>
+  <text class="card-title" x="1112" y="196">找不到 Actor</text>
+  <text class="card-text" x="1112" y="222">
+    <tspan x="1112" dy="0">返回 false</tspan>
+    <tspan x="1112" dy="20">日志: No CSSW actor selected</tspan>
+  </text>
+
+  <rect class="card state" x="1088" y="252" width="245" height="30"/>
+  <text class="tag" x="1112" y="272">找到后继续启动</text>
+
+  <rect class="card state" x="1383" y="188" width="220" height="82"/>
+  <text class="card-title" x="1407" y="216">StartSolver()</text>
+  <text class="card-text" x="1407" y="242">
+    <tspan x="1407" dy="0">Actor 方法真正启动</tspan>
+    <tspan x="1407" dy="20">TimerRate 当前不参与</tspan>
+  </text>
+
+  <path class="line-blue" d="M 348 229 L 388 229"/>
+  <path class="line-blue" d="M 688 229 L 728 229"/>
+  <path class="line-red" d="M 1038 214 L 1078 205"/>
+  <path class="line-green" d="M 1038 270 C 1130 304 1296 304 1373 238"/>
+
+  <rect class="lane" x="48" y="326" width="1584" height="190" rx="18"/>
+  <text class="lane-title" x="78" y="364">2. StartSolver：重置状态、抓深度、启用 Tick</text>
+
+  <rect class="card state" x="78" y="390" width="300" height="92"/>
+  <text class="card-title" x="102" y="418">重置读回缓存</text>
+  <text class="code" x="102" y="444">
+    <tspan x="102" dy="0">ResetSolverReadbackState()</tspan>
+    <tspan x="102" dy="19">清 CachedResultPixels</tspan>
+  </text>
+
+  <rect class="card state" x="430" y="390" width="300" height="92"/>
+  <text class="card-title" x="454" y="418">捕获场景深度</text>
+  <text class="code" x="454" y="444">
+    <tspan x="454" dy="0">CaptureSceneDepthNow()</tspan>
+    <tspan x="454" dy="19">ShowOnly CSSW / Landscape</tspan>
+  </text>
+
+  <rect class="card neutral" x="782" y="390" width="300" height="92"/>
+  <text class="card-title" x="806" y="418">切回模拟预览</text>
+  <text class="code" x="806" y="444">
+    <tspan x="806" dy="0">UseSimulationResultMesh()</tspan>
+    <tspan x="806" dy="19">或 UpdateSimulationPreviewMesh()</tspan>
+  </text>
+
+  <rect class="card state" x="1134" y="390" width="300" height="92"/>
+  <text class="card-title" x="1158" y="418">激活运行态</text>
+  <text class="code" x="1158" y="444">
+    <tspan x="1158" dy="0">bSolverActive = true</tspan>
+    <tspan x="1158" dy="19">bSimVisActive = true</tspan>
+  </text>
+
+  <rect class="card state" x="1458" y="390" width="145" height="92"/>
+  <text class="card-title" x="1482" y="418">启用 Tick</text>
+  <text class="code" x="1482" y="444">
+    <tspan x="1482" dy="0">SetActorTick</tspan>
+    <tspan x="1482" dy="19">OnSolverStarted</tspan>
+  </text>
+
+  <path class="line-blue" d="M 378 436 L 420 436"/>
+  <path class="line-blue" d="M 730 436 L 772 436"/>
+  <path class="line-blue" d="M 1082 436 L 1124 436"/>
+  <path class="line-blue" d="M 1434 436 L 1448 436"/>
+
+  <rect class="lane" x="48" y="546" width="1584" height="270" rx="18"/>
+  <text class="lane-title" x="78" y="584">3. 每帧 Tick：没有源点时会早退，看起来像“点击没反应”</text>
+
+  <rect class="card state" x="78" y="616" width="260" height="92"/>
+  <text class="card-title" x="102" y="644">Tick 触发</text>
+  <text class="card-text" x="102" y="670">
+    <tspan x="102" dy="0">Editor viewport 也可 Tick</tspan>
+    <tspan x="102" dy="20">active 时每帧求解</tspan>
+  </text>
+
+  <rect class="card state" x="388" y="616" width="300" height="92"/>
+  <text class="card-title" x="412" y="644">单帧保护</text>
+  <text class="code" x="412" y="670">
+    <tspan x="412" dy="0">GFrameCounter</tspan>
+    <tspan x="412" dy="19">LastSolverFrameNumber</tspan>
+  </text>
+
+  <rect class="card neutral" x="738" y="616" width="320" height="92"/>
+  <text class="card-title" x="762" y="644">资源和材质准备</text>
+  <text class="code" x="762" y="670">
+    <tspan x="762" dy="0">CheckAndCreateTexture()</tspan>
+    <tspan x="762" dy="19">SetMaterialParameter()</tspan>
+  </text>
+
+  <rect class="card guard" x="1108" y="592" width="300" height="82"/>
+  <text class="card-title" x="1132" y="620">GetSources() = 0</text>
+  <text class="card-text" x="1132" y="646">
+    <tspan x="1132" dy="0">没有 ACSSHallowWaterSource</tspan>
+    <tspan x="1132" dy="20">或源点不在 Box 范围内</tspan>
+  </text>
+
+  <rect class="card guard" x="1108" y="704" width="300" height="82"/>
+  <text class="card-title" x="1132" y="732">早退路径</text>
+  <text class="code" x="1132" y="758">
+    <tspan x="1132" dy="0">ResetSimVisTiles()</tspan>
+    <tspan x="1132" dy="19">return; 不调度 GPU pass</tspan>
+  </text>
+
+  <rect class="card output" x="1458" y="616" width="145" height="92"/>
+  <text class="card-title" x="1482" y="644">有源点</text>
+  <text class="card-text" x="1482" y="670">
+    <tspan x="1482" dy="0">转 UV/radius</tspan>
+    <tspan x="1482" dy="20">准备 RDG</tspan>
+  </text>
+
+  <rect class="label-red" x="1352" y="734" width="252" height="36"/>
+  <text class="small" x="1372" y="756">最常见“无反应”断点：源点为空</text>
+
+  <path class="line-blue" d="M 338 662 L 378 662"/>
+  <path class="line-blue" d="M 688 662 L 728 662"/>
+  <path class="line-red" d="M 1058 646 L 1098 634"/>
+  <path class="line-red" d="M 1258 674 L 1258 694"/>
+  <path class="line-green" d="M 1058 690 C 1188 696 1326 694 1448 666"/>
+
+  <rect class="lane" x="48" y="846" width="1584" height="184" rx="18"/>
+  <text class="lane-title" x="78" y="884">4. GPU / RDG 求解管线：每帧真正产生水面结果</text>
+
+  <rect class="card gpu" x="78" y="910" width="250" height="86"/>
+  <text class="card-title" x="102" y="938">CompactActiveTiles</text>
+  <text class="card-text" x="102" y="964">
+    <tspan x="102" dy="0">扫描活动像素</tspan>
+    <tspan x="102" dy="20">写 TileMask / compact buffers</tspan>
+  </text>
+
+  <rect class="card gpu" x="378" y="910" width="250" height="86"/>
+  <text class="card-title" x="402" y="938">FinalizeCompact</text>
+  <text class="card-text" x="402" y="964">
+    <tspan x="402" dy="0">生成间接 Dispatch 参数</tspan>
+    <tspan x="402" dy="20">或使用 full-screen fallback</tspan>
+  </text>
+
+  <rect class="card gpu" x="678" y="910" width="300" height="86"/>
+  <text class="card-title" x="702" y="938">Iteration 循环</text>
+  <text class="code" x="702" y="964">
+    <tspan x="702" dy="0">VelocityHeightSim</tspan>
+    <tspan x="702" dy="19">ShallowIntegrate + ping-pong</tspan>
+  </text>
+
+  <rect class="card gpu" x="1028" y="910" width="250" height="86"/>
+  <text class="card-title" x="1052" y="938">Result Pass</text>
+  <text class="card-text" x="1052" y="964">
+    <tspan x="1052" dy="0">合成结果纹理</tspan>
+    <tspan x="1052" dy="20">DepthWet / VelHeight / Debug</tspan>
+  </text>
+
+  <rect class="card gpu" x="1328" y="910" width="275" height="86"/>
+  <text class="card-title" x="1352" y="938">Copy + Readback</text>
+  <text class="card-text" x="1352" y="964">
+    <tspan x="1352" dy="0">复制回 RenderTarget</tspan>
+    <tspan x="1352" dy="20">TileMask / Result 双缓冲读回</tspan>
+  </text>
+
+  <path class="line-blue" d="M 328 953 L 368 953"/>
+  <path class="line-blue" d="M 628 953 L 668 953"/>
+  <path class="line-blue" d="M 978 953 L 1018 953"/>
+  <path class="line-blue" d="M 1278 953 L 1318 953"/>
+  <path class="loop" d="M 828 904 C 850 868 952 868 952 910"/>
+  <text class="small" x="842" y="880">重复 InIteration 次</text>
+
+  <rect class="lane" x="48" y="1060" width="1584" height="136" rx="18"/>
+  <text class="lane-title" x="78" y="1098">5. 输出、切换、停止和烘焙</text>
+
+  <rect class="card output" x="78" y="1120" width="310" height="52"/>
+  <text class="card-title" x="102" y="1148">材质输出</text>
+  <text class="code" x="220" y="1148">CSSW_VelHeight / CSSW_DepthWet</text>
+
+  <rect class="card output" x="438" y="1120" width="285" height="52"/>
+  <text class="card-title" x="462" y="1148">可视化 Tile</text>
+  <text class="code" x="580" y="1148">ApplySimVisTiles()</text>
+
+  <rect class="card neutral" x="773" y="1120" width="270" height="52"/>
+  <text class="card-title" x="797" y="1148">运行中再点击</text>
+  <text class="card-text" x="917" y="1148">只切换 bSimVisActive</text>
+
+  <rect class="card bake" x="1093" y="1120" width="230" height="52"/>
+  <text class="card-title" x="1117" y="1148">Stop 路径</text>
+  <text class="code" x="1212" y="1148">StopRuntime</text>
+
+  <rect class="card bake" x="1373" y="1120" width="230" height="52"/>
+  <text class="card-title" x="1397" y="1148">Bake 路径</text>
+  <text class="code" x="1492" y="1148">SaveSWData()</text>
+
+  <path class="line-green" d="M 1466 996 L 1466 1036 L 30 1036 L 30 1146 L 68 1146"/>
+  <path class="line-green" d="M 388 1146 L 428 1146"/>
+  <path class="line-amber" d="M 1043 1146 L 1083 1146"/>
+  <path class="line-amber" d="M 1323 1146 L 1363 1146"/>
+
+  <rect class="note" x="64" y="1210" width="455" height="0"/>
+  <rect class="label-blue" x="64" y="1206" width="355" height="28"/>
+  <text class="small" x="82" y="1225">运行态核心：bSolverActive + Actor Tick + 每帧 GPU pass</text>
+
+  <rect class="label-red" x="452" y="1206" width="338" height="28"/>
+  <text class="small" x="470" y="1225">无反应优先查：选中 Actor、源点数量、Source 是否在 Box 内</text>
+
+  <rect class="label-amber" x="823" y="1206" width="365" height="28"/>
+  <text class="small" x="841" y="1225">静态态核心：BakeResultMesh 保存纹理/网格并切到 bUseBakedResultMesh</text>
+</svg>

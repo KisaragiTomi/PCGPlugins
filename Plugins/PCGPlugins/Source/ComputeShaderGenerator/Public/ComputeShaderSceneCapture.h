@@ -4,8 +4,10 @@
 #include "DynamicMeshActor.h"
 #include "GenericPlatform/GenericPlatformMisc.h"
 #include "Kismet/BlueprintAsyncActionBase.h"
+#include "Engine/DataAsset.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Components/BoxComponent.h"
+#include "Components/SceneCaptureComponent2D.h"
 //
 #include "ComputeShaderSceneCapture.generated.h"
 

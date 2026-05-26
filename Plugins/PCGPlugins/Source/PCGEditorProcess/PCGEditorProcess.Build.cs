@@ -1,5 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+using System;
+using System.IO;
 using UnrealBuildTool;
 
 public class PCGEditorProcess : ModuleRules
@@ -7,7 +9,15 @@ public class PCGEditorProcess : ModuleRules
 	public PCGEditorProcess(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
-		
+		PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "..", "PCGPluginsShared"));
+		bool bPCGPluginsDebug = Target.Configuration != UnrealTargetConfiguration.Shipping;
+		string PCGPluginsDebugEnv = Environment.GetEnvironmentVariable("PCGPLUGINS_DEBUG");
+		if (!string.IsNullOrWhiteSpace(PCGPluginsDebugEnv))
+		{
+			bPCGPluginsDebug = PCGPluginsDebugEnv != "0" && !PCGPluginsDebugEnv.Equals("false", StringComparison.OrdinalIgnoreCase);
+		}
+		PublicDefinitions.Add("PCGPLUGINS_DEBUG=" + (bPCGPluginsDebug ? "1" : "0"));
+
 			
 		
 		PublicDependencyModuleNames.AddRange(
@@ -26,6 +36,7 @@ public class PCGEditorProcess : ModuleRules
 			{
 				"EditorFramework",
 				"Engine",
+				"Foliage",
 				"Landscape",
 				"RenderCore",
 				"ComputeShaderGenerator", 
@@ -52,7 +63,6 @@ public class PCGEditorProcess : ModuleRules
 				"LandscapeEditorUtilities",
 				"MeshDescription",
 				"StaticMeshDescription",
-				// ... add private dependencies that you statically link with here ...	
 			}
 			);
 		

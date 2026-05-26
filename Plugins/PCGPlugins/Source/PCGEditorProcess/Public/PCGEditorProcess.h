@@ -5,6 +5,8 @@
 #include "CoreMinimal.h"
 #include "Modules/ModuleManager.h"
 
+class AComputeShaderMeshGenerator;
+
 class FPCGEditorProcessModule : public IModuleInterface
 {
 public:
@@ -12,4 +14,7 @@ public:
 	/** IModuleInterface implementation */
 	virtual void StartupModule() override;
 	virtual void ShutdownModule() override;
+
+private:
+	void StartInstanceBrush(AComputeShaderMeshGenerator* TargetActor);
 };

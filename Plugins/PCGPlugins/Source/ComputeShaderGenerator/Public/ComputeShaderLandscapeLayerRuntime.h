@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "ComputeShaderGenerateHepler.h"
+#include "ComputeShaderBasicFunction.h"
 #include "ComputeShaderLandscapeLayerRuntime.generated.h"
 
 class UMaterialInterface;
@@ -113,6 +114,14 @@ public:
 		meta = (DisplayName = "Target Landscape Actor (auto-find if none)"))
 	ALandscape* TargetLandscape;
 
+	/** When false, ApplyToLandscape() is skipped in the pipeline. Call CommitToLandscape() explicitly to permanently write. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Runtime|Landscape",
+		meta = (DisplayName = "Auto Commit (permanently write on apply)"))
+	bool bAutoCommit = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Runtime|Landscape")
+	bool bHasRuntimeResult = false;
+
 public:
 	virtual void OnConstruction(const FTransform& Transform) override;
 	virtual void Tick(float DeltaTime) override;
@@ -129,8 +138,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RuntimeLandscapeLayer")
 	void BlendLayer();
 
+	/** If bAutoCommit is true, permanently writes to landscape. Otherwise just marks result as ready. */
 	UFUNCTION(BlueprintCallable, Category = "RuntimeLandscapeLayer")
 	void ApplyToLandscape();
+
+	/** Force-commit the current result to the landscape heightmap regardless of bAutoCommit. */
+	UFUNCTION(BlueprintCallable, Category = "RuntimeLandscapeLayer")
+	void CommitToLandscape();
 
 	UFUNCTION(BlueprintCallable, Category = "RuntimeLandscapeLayer")
 	void FullRuntimePipeline();

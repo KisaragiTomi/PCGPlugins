@@ -17,12 +17,6 @@
   "EnabledByDefault": true,
   "Modules": [
     {
-      "Name": "FoliageCluster",
-      "Type": "Editor",
-      "LoadingPhase": "Default",
-      "BlacklistTargets": ["Shipping"]
-    },
-    {
       "Name": "GeometryMath",
       "Type": "Runtime",
       "LoadingPhase": "Default",

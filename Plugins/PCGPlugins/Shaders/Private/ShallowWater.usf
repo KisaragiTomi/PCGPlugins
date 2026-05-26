@@ -44,12 +44,12 @@ RWTexture2D<float4> RW_SmoothHeightB;
 RWTexture2D<float4> RW_ResultSmoothHeight;
 RWTexture2D<float4> RW_TileMask;
 
-RWBuffer<float4> RWB_SourceUVRads;
-RWBuffer<uint>   RWB_CompactTileCoords;
-RWBuffer<uint>   RWB_CompactCounter;
+StructuredBuffer<float4> RWB_SourceUVRads;
+RWStructuredBuffer<uint> RWB_CompactTileCoords;
+RWStructuredBuffer<uint> RWB_CompactCounter;
 RWBuffer<uint>   RWB_CompactIndirectArgs;
-Buffer<uint>     B_CompactTileCoords;
-Buffer<uint>     B_CompactCounter;
+StructuredBuffer<uint> B_CompactTileCoords;
+StructuredBuffer<uint> B_CompactCounter;
 
 // ─── Uniforms ───────────────────────────────────────────────────────
 
@@ -161,7 +161,7 @@ bool SW_IsPixelActive(int2 p)
 		return true;
 
 	float4 DW = T_ResultDepthWet[p];
-	if (DW.w > 0.0)
+	if (DW.x > 0.0001 || DW.w > 0.0)
 		return true;
 
 	if (BCount_SourceUVRads > 0)

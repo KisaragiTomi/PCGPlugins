@@ -5,6 +5,7 @@
 #include "DynamicMesh/DynamicMesh3.h"
 #include "DynamicMeshEditor.h"
 #include "DynamicMesh/DynamicMeshOverlay.h"
+#include "Engine/World.h"
 #include "Operations/SmoothDynamicMeshAttributes.h"
 
 using namespace UE::Geometry;

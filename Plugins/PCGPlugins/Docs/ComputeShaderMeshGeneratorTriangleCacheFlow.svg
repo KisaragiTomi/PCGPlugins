@@ -1,0 +1,180 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1120" viewBox="0 0 1600 1120" role="img" aria-labelledby="title desc">
+  <title id="title">ComputeShaderMeshGenerator voxel activation to triangle read flow</title>
+  <desc id="desc">AComputeShaderMeshGenerator flow: public cache entry activates voxel cells from reference points, marks new cells dirty, then dirty voxel pages trigger static mesh triangle extraction and scatter into render-target cache pages.</desc>
+
+  <defs>
+    <style>
+      .bg { fill: #0b1020; }
+      .panel { fill: #111827; stroke: #334155; stroke-width: 2; }
+      .entry { fill: #1e293b; stroke: #94a3b8; stroke-width: 2; }
+      .gate { fill: #172554; stroke: #60a5fa; stroke-width: 2; }
+      .voxel { fill: #064e3b; stroke: #34d399; stroke-width: 2; }
+      .dirty { fill: #422006; stroke: #f59e0b; stroke-width: 2; }
+      .tri { fill: #312e81; stroke: #a78bfa; stroke-width: 2; }
+      .out { fill: #3b0764; stroke: #c084fc; stroke-width: 2; }
+      .title { fill: #f8fafc; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; font-size: 31px; font-weight: 700; }
+      .subtitle { fill: #cbd5e1; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; font-size: 16px; }
+      .label { fill: #f8fafc; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; font-size: 18px; font-weight: 700; }
+      .text { fill: #e5e7eb; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; font-size: 15px; }
+      .small { fill: #cbd5e1; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; font-size: 13px; }
+      .mono { fill: #e0f2fe; font-family: Consolas, "Microsoft YaHei", monospace; font-size: 13px; }
+      .muted { fill: #94a3b8; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; font-size: 12px; }
+      .chip { fill: #020617; stroke: #475569; stroke-width: 1.4; }
+      .arrowBlue { stroke: #93c5fd; stroke-width: 3; fill: none; marker-end: url(#arrowBlue); }
+      .arrowGreen { stroke: #6ee7b7; stroke-width: 3; fill: none; marker-end: url(#arrowGreen); }
+      .arrowAmber { stroke: #fbbf24; stroke-width: 3; fill: none; marker-end: url(#arrowAmber); }
+      .arrowPurple { stroke: #d8b4fe; stroke-width: 3; fill: none; marker-end: url(#arrowPurple); }
+      .arrowThin { stroke: #64748b; stroke-width: 2; fill: none; marker-end: url(#arrowThin); }
+    </style>
+
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#93c5fd" />
+    </marker>
+    <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#6ee7b7" />
+    </marker>
+    <marker id="arrowAmber" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#fbbf24" />
+    </marker>
+    <marker id="arrowPurple" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#d8b4fe" />
+    </marker>
+    <marker id="arrowThin" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#64748b" />
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="1120" />
+
+  <text class="title" x="42" y="52">ComputeShaderMeshGenerator: voxel 激活 -> triangle 读取</text>
+  <text class="subtitle" x="42" y="82">入口先根据 ReferencePoints 激活 voxel cell；新增激活的 dirty voxel 再触发 StaticMesh RenderData 三角形读取，并写入 per-voxel triangle cache。</text>
+
+  <rect class="chip" x="1200" y="28" width="24" height="14" rx="4" />
+  <text class="muted" x="1232" y="40">state / request</text>
+  <rect class="voxel" x="1200" y="52" width="24" height="14" rx="4" />
+  <text class="muted" x="1232" y="64">voxel activation</text>
+  <rect class="tri" x="1388" y="52" width="24" height="14" rx="4" />
+  <text class="muted" x="1420" y="64">triangle read</text>
+
+  <!-- Top row: public entry and activation decision -->
+  <rect class="panel" x="40" y="110" width="1520" height="205" rx="22" />
+
+  <rect class="entry" x="70" y="145" width="310" height="135" rx="16" />
+  <text class="label" x="94" y="176">1. Public cache entry</text>
+  <text class="mono" x="94" y="204">EnsureTriangleCache(Request)</text>
+  <text class="mono" x="94" y="226">EnsureTriangleCacheByBox(...)</text>
+  <text class="small" x="94" y="252">RequestId / ReferencePoints</text>
+  <text class="small" x="94" y="272">BoxCenter / BoxExtent / LODIndex</text>
+
+  <rect class="gate" x="430" y="145" width="330" height="135" rx="16" />
+  <text class="label" x="454" y="176">2. Cache gate</text>
+  <text class="small" x="454" y="204">Normalize request and build input bounds</text>
+  <text class="small" x="454" y="226">Full rebuild when bounds/schema/RT change</text>
+  <text class="mono" x="454" y="250">Reset + Rebuild + Generation++</text>
+  <text class="small" x="454" y="272">Requires valid UAV render targets</text>
+
+  <rect class="voxel" x="810" y="145" width="360" height="135" rx="16" />
+  <text class="label" x="834" y="176">3. Activate voxel cells</text>
+  <text class="mono" x="834" y="204">BuildActiveCellsFromReferencePoints</text>
+  <text class="small" x="834" y="226">RadiusInCells = ceil(ActivationRadius / VoxelSize)</text>
+  <text class="small" x="834" y="248">Add cells whose bounds touch the sphere</text>
+  <text class="mono" x="834" y="272">BuildUnionActiveCells()</text>
+
+  <rect class="out" x="1220" y="145" width="310" height="135" rx="16" />
+  <text class="label" x="1244" y="176">Returned handle</text>
+  <text class="small" x="1244" y="204">bValid / CacheGeneration</text>
+  <text class="small" x="1244" y="226">CachedWorldBounds / GridSize</text>
+  <text class="small" x="1244" y="248">VoxelMetaRT</text>
+  <text class="small" x="1244" y="270">TriangleVertexRT / TriangleNormalRT</text>
+
+  <path class="arrowBlue" d="M380 212 L430 212" />
+  <path class="arrowGreen" d="M760 212 L810 212" />
+  <path class="arrowThin" d="M1170 212 L1220 212" />
+
+  <!-- Middle row: active set diff into dirty cells -->
+  <rect class="panel" x="40" y="345" width="1520" height="255" rx="22" />
+  <text class="label" x="70" y="382">Voxel activation becomes dirty work</text>
+
+  <rect class="voxel" x="70" y="415" width="325" height="120" rx="16" />
+  <text class="label" x="94" y="446">RequestActiveCells</text>
+  <text class="small" x="94" y="474">Per RequestId active cell set</text>
+  <text class="mono" x="94" y="498">TMap&lt;FName, TSet&lt;Cell&gt;&gt;</text>
+  <text class="small" x="94" y="520">Persistent requests are unioned</text>
+
+  <rect class="voxel" x="435" y="415" width="290" height="120" rx="16" />
+  <text class="label" x="459" y="446">DiffActiveCells</text>
+  <text class="small" x="459" y="474">Compare union against CacheState.ActiveCells</text>
+  <text class="mono" x="459" y="498">CellsToActivate</text>
+  <text class="mono" x="459" y="520">CellsToDeactivate</text>
+
+  <rect class="dirty" x="765" y="415" width="300" height="120" rx="16" />
+  <text class="label" x="789" y="446">Page allocator</text>
+  <text class="mono" x="789" y="474">ReleasePagesForCells</text>
+  <text class="mono" x="789" y="498">AllocatePagesForCells</text>
+  <text class="small" x="789" y="520">One active voxel owns one page</text>
+
+  <rect class="dirty" x="1105" y="415" width="395" height="120" rx="16" />
+  <text class="label" x="1129" y="446">Dirty voxel trigger</text>
+  <text class="mono" x="1129" y="474">DirtyCells.Append(CellsToActivate)</text>
+  <text class="mono" x="1129" y="498">DispatchDirtyVoxelTriangleCacheUpdate()</text>
+  <text class="small" x="1129" y="520">Only dirty pages read and rewrite triangles</text>
+
+  <path class="arrowGreen" d="M395 475 L435 475" />
+  <path class="arrowAmber" d="M725 475 L765 475" />
+  <path class="arrowAmber" d="M1065 475 L1105 475" />
+  <path class="arrowAmber" d="M1302 535 C1302 575, 208 575, 208 640" />
+
+  <!-- Bottom row: dirty voxel triangle update -->
+  <rect class="panel" x="40" y="630" width="1520" height="430" rx="22" />
+  <text class="label" x="70" y="668">Triangle read path activated by dirty voxels</text>
+
+  <rect class="dirty" x="70" y="700" width="300" height="125" rx="16" />
+  <text class="label" x="94" y="731">4. Dirty world bounds</text>
+  <text class="small" x="94" y="759">Merge bounds of CacheState.DirtyCells</text>
+  <text class="small" x="94" y="781">Expand by VoxelSize * 0.5</text>
+  <text class="mono" x="94" y="805">DirtyVoxelPages = Cell + PageIndex</text>
+
+  <rect class="tri" x="70" y="865" width="300" height="125" rx="16" />
+  <text class="label" x="94" y="896">5. Scene request filter</text>
+  <text class="mono" x="94" y="924">BuildBoxSceneTriangleRequests</text>
+  <text class="small" x="94" y="948">SMC / ISMC intersect DirtyWorldBounds</text>
+  <text class="small" x="94" y="970">Result: FCSStaticMeshTriangleRequest[]</text>
+
+  <rect class="dirty" x="430" y="700" width="300" height="125" rx="16" />
+  <text class="label" x="454" y="731">6. Clear page slots</text>
+  <text class="mono" x="454" y="759">ClearDirtyVoxelCacheCS</text>
+  <text class="small" x="454" y="781">Meta: active / generation / tri start</text>
+  <text class="small" x="454" y="803">Vertex and normal slots are zeroed</text>
+
+  <rect class="tri" x="780" y="700" width="395" height="180" rx="16" />
+  <text class="label" x="804" y="731">7. Read triangles from StaticMesh RenderData</text>
+  <text class="mono" x="804" y="759">AddStaticMeshTrianglesToRDG</text>
+  <text class="small" x="804" y="783">Resolve LODResources from UStaticMesh::GetRenderData()</text>
+  <text class="small" x="804" y="805">Bind PositionVertexBuffer SRV + IndexBuffer SRV</text>
+  <text class="mono" x="804" y="829">ExtractStaticMeshTrianglesCS</text>
+  <text class="small" x="804" y="853">Outputs: TriangleVertices / TriangleNormals / Counter</text>
+
+  <rect class="out" x="1225" y="700" width="295" height="180" rx="16" />
+  <text class="label" x="1249" y="731">8. Scatter to voxel cache</text>
+  <text class="mono" x="1249" y="759">ScatterTrianglesToVoxelCacheCS</text>
+  <text class="small" x="1249" y="783">For each dirty page, test triangle AABB</text>
+  <text class="small" x="1249" y="805">Write only triangles overlapping the voxel</text>
+  <text class="small" x="1249" y="829">Overflow is encoded as negative TriCount</text>
+  <text class="small" x="1249" y="853">GraphBuilder.Execute() submits RDG work</text>
+
+  <path class="arrowAmber" d="M220 825 L220 865" />
+  <path class="arrowPurple" d="M370 928 C515 928, 610 850, 780 790" />
+  <path class="arrowAmber" d="M370 762 L430 762" />
+  <path class="arrowPurple" d="M1175 790 L1225 790" />
+
+  <!-- Output cache resources -->
+  <rect class="out" x="430" y="925" width="1090" height="85" rx="16" />
+  <text class="label" x="454" y="956">Actor-owned cache resources updated</text>
+  <text class="mono" x="454" y="984">VoxelMetaRT: active/generation/triStart/triCount</text>
+  <text class="mono" x="828" y="984">TriangleVertexRT: P0/P1/P2 float4 pixels</text>
+  <text class="mono" x="1224" y="984">TriangleNormalRT: per-triangle normal</text>
+
+  <path class="arrowAmber" d="M1372 880 L1372 925" />
+
+  <text class="muted" x="42" y="1092">Key point: voxel activation is CPU-side cache state diff; triangle reading is render-thread/RDG work triggered only for DirtyCells.</text>
+</svg>

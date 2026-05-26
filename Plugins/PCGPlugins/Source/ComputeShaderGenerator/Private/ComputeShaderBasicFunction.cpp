@@ -24,6 +24,7 @@ IMPLEMENT_GLOBAL_SHADER(FMeshFillMult, "/Plugin/PCGPlugins/Shaders/Private/MeshF
 #include "EngineUtils.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/StaticMeshActor.h"
+#include "Engine/Texture2DArray.h"
 #include "Kismet/KismetRenderingLibrary.h"
 #include "ComputeShaderGeneral.h"
 #include "EngineModule.h"
@@ -32,15 +33,12 @@ IMPLEMENT_GLOBAL_SHADER(FMeshFillMult, "/Plugin/PCGPlugins/Shaders/Private/MeshF
 #include "Landscape.h"
 #include "LandscapeEditResourcesSubsystem.h"
 #include "PixelShaderUtils.h"
-#include "Components/SplineComponent.h"
-#include "Engine/Texture2DArray.h"
 #include "GeometryScript/PolyPathFunctions.h"
 
 using namespace CSHepler;
 using namespace FImageCoreUtils;
 
 DECLARE_CYCLE_STAT(TEXT("CS Execute"), STAT_CSTest_Execute, STATGROUP_CSTest)
-
 
 class FDrawCopyTexturePS : public FGlobalShader
 {

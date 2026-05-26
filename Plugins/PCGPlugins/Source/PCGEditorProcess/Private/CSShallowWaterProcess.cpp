@@ -13,6 +13,7 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "MeshDescription.h"
 #include "StaticMeshAttributes.h"
+#include "StaticMeshOperations.h"
 #include "TimerManager.h"
 
 
@@ -327,6 +328,16 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 		return;
 	}
 
+	FStaticMeshOperations::ComputeTriangleTangentsAndNormals(MergedDesc, 0.0f, *MeshAssetName);
+	FStaticMeshOperations::ComputeTangentsAndNormals(
+		MergedDesc,
+		EComputeNTBsFlags::Normals
+		| EComputeNTBsFlags::Tangents
+		| EComputeNTBsFlags::UseMikkTSpace
+		| EComputeNTBsFlags::BlendOverlappingNormals
+		| EComputeNTBsFlags::WeightedNTBs
+		| EComputeNTBsFlags::IgnoreDegenerateTriangles);
+
 	FMeshDescription* TargetDesc = NewMesh->GetMeshDescription(0);
 	*TargetDesc = MoveTemp(MergedDesc);
 
@@ -345,6 +356,48 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 	NewMesh->PostEditChange();
 	UEditorAssetLibrary::SaveLoadedAsset(NewMesh, false);
 	NewMesh->MarkPackageDirty();
+
+	InCSSWActor->Modify();
+	if (InCSSWActor->ReusltMesh)
+	{
+		InCSSWActor->ReusltMesh->Modify();
+		if (!InCSSWActor->SimulationPreviewMesh)
+		{
+			InCSSWActor->SimulationPreviewMesh = InCSSWActor->ReusltMesh->GetStaticMesh();
+		}
+		InCSSWActor->ReusltMesh->SetStaticMesh(NewMesh);
+		InCSSWActor->ReusltMesh->SetRelativeScale3D(FVector::OneVector);
+		if (WaterMIC)
+		{
+			InCSSWActor->ReusltMesh->SetMaterial(0, WaterMIC);
+		}
+		InCSSWActor->ReusltMesh->SetVisibility(true);
+		InCSSWActor->ReusltMesh->MarkRenderStateDirty();
+	}
+	if (!InCSSWActor->SimulationWaterMaterial)
+	{
+		InCSSWActor->SimulationWaterMaterial = InCSSWActor->WaterMaterial;
+	}
+	if (!InCSSWActor->SimulationDecalMaterial)
+	{
+		InCSSWActor->SimulationDecalMaterial = InCSSWActor->DecalMaterial;
+	}
+	InCSSWActor->BakedResultMesh = NewMesh;
+	InCSSWActor->bUseBakedResultMesh = true;
+	InCSSWActor->WaterMaterial = WaterMIC ? WaterMIC : InCSSWActor->WaterMaterial;
+	InCSSWActor->DecalMaterial = DecalMIC ? DecalMIC : InCSSWActor->DecalMaterial;
+	InCSSWActor->StopSolver();
+	InCSSWActor->bSimVisActive = false;
+	if (InCSSWActor->SimVisHISM)
+	{
+		InCSSWActor->SimVisHISM->ClearInstances();
+		InCSSWActor->SimVisHISM->SetVisibility(false);
+	}
+	InCSSWActor->MarkPackageDirty();
+	if (InCSSWActor->ReusltMesh)
+	{
+		InCSSWActor->ReusltMesh->MarkRenderStateDirty();
+	}
 }
 
 ACSShallowWaterCapture* UCSShallowWaterProcess::CSSW_GetSelectActor()
@@ -371,12 +424,15 @@ ACSShallowWaterCapture* UCSShallowWaterProcess::CSSW_GetSelectActor()
 		UEngineTypes::ConvertToObjectType(ECollisionChannel::ECC_WorldDynamic)
 	};
 	FVector BoxExtent = FVector(5, 5, 100000);
+	UWorld* World = SelectedSource->GetWorld();
+	if (!World) return SelectedCapture;
+
 	TArray<AActor*> OverlapActors;
 	TArray<AActor*> ActorsToIgnore;
-	UKismetSystemLibrary::BoxOverlapActors(GWorld, SelectedSource->GetActorLocation(), BoxExtent,
+	UKismetSystemLibrary::BoxOverlapActors(World, SelectedSource->GetActorLocation(), BoxExtent,
 	                                       ObjectTypes, ACSShallowWaterCapture::StaticClass(), ActorsToIgnore,
 	                                       OverlapActors);
-	DrawDebugBox(GWorld, SelectedSource->GetActorLocation(), BoxExtent, FColor(1, 1, 1, 1), false, 1, 0, 1);
+	DrawDebugBox(World, SelectedSource->GetActorLocation(), BoxExtent, FColor(1, 1, 1, 1), false, 1, 0, 1);
 	if (OverlapActors.Num() == 0) return SelectedCapture;
 	SelectedCapture = Cast<ACSShallowWaterCapture>(OverlapActors[0]);
 
@@ -481,10 +537,7 @@ bool UCSShallowWaterProcess::StartSWSolver(ACSShallowWaterCapture*& OutCSSWActor
 	}
 
 	OutCSSWActor->Iteration = Iteration;
-	OutCSSWActor->CaptureSceneDepthNow();
-	if (!OutCSSWActor->bSimVisActive)
-		OutCSSWActor->ToggleSimVisualization();
-	OutCSSWActor->StartSolver();
+	OutCSSWActor->StartSolver(TimerRate);
 
 	return true;
 }

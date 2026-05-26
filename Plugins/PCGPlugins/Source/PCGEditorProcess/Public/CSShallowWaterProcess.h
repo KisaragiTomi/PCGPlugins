@@ -25,7 +25,7 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader|ShallowWater", meta = (ExpandBoolAsExecs = "ReturnValue"))
 	static bool StartSWSolver(ACSShallowWaterCapture*& OutCSSWActor,
-		int32 Iteration = 1, float TimerRate = 0.01f);
+		int32 Iteration = 1, float TimerRate = 0.0f);
 
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader|ShallowWater")
 	static void StopSWSolver(ACSShallowWaterCapture* InCSSWActor);

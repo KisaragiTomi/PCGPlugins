@@ -1,5 +1,9 @@
 ﻿#include "GeometryGenerate.h"
 
+#include "CollisionQueryParams.h"
+#include "Components/PrimitiveComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "StaticMeshRenderDataPointSampler.h"
 #include "DetailLayoutBuilder.h"
 #include "UDynamicMesh.h"
 #include "LandscapeExtra.h"
@@ -57,9 +61,539 @@
 
 using namespace UE::Geometry;
 
+namespace
+{
+bool PointInsideBox(const FBox& Box, const FVector& Point, double Tolerance = KINDA_SMALL_NUMBER)
+{
+	return Box.IsValid
+		&& Point.X >= Box.Min.X - Tolerance && Point.X <= Box.Max.X + Tolerance
+		&& Point.Y >= Box.Min.Y - Tolerance && Point.Y <= Box.Max.Y + Tolerance
+		&& Point.Z >= Box.Min.Z - Tolerance && Point.Z <= Box.Max.Z + Tolerance;
+}
+
+FBox IntersectBoxes(const FBox& A, const FBox& B)
+{
+	if (!A.IsValid || !B.IsValid || !A.Intersect(B))
+	{
+		return FBox(ForceInit);
+	}
+
+	const FVector Min(
+		FMath::Max(A.Min.X, B.Min.X),
+		FMath::Max(A.Min.Y, B.Min.Y),
+		FMath::Max(A.Min.Z, B.Min.Z));
+	const FVector Max(
+		FMath::Min(A.Max.X, B.Max.X),
+		FMath::Min(A.Max.Y, B.Max.Y),
+		FMath::Min(A.Max.Z, B.Max.Z));
+
+	TArray<FVector> Corners;
+	Corners.Reserve(2);
+	Corners.Add(Min);
+	Corners.Add(Max);
+	return FBox(Corners);
+}
+
+float GetPointSamplingSpacing(const FBox& Box, float DesiredSpacing, int32 MaxPoints)
+{
+	float Spacing = FMath::Max(DesiredSpacing, 1.0f);
+	if (!Box.IsValid || MaxPoints <= 0)
+	{
+		return Spacing;
+	}
+
+	const FVector Size = Box.GetSize();
+	const double EstimatedSurfacePoints = 2.0 * (
+		FMath::Max(1.0, Size.X / Spacing) * FMath::Max(1.0, Size.Y / Spacing)
+		+ FMath::Max(1.0, Size.X / Spacing) * FMath::Max(1.0, Size.Z / Spacing)
+		+ FMath::Max(1.0, Size.Y / Spacing) * FMath::Max(1.0, Size.Z / Spacing));
+
+	if (EstimatedSurfacePoints > MaxPoints)
+	{
+		Spacing *= FMath::Sqrt(EstimatedSurfacePoints / MaxPoints);
+	}
+
+	return Spacing;
+}
+
+int32 GridSteps(double Length, float Spacing)
+{
+	return FMath::Max(1, FMath::CeilToInt(Length / Spacing));
+}
+
+double GridValue(double Min, double Max, int32 Index, int32 Steps)
+{
+	return Steps <= 0 ? (Min + Max) * 0.5 : FMath::Lerp(Min, Max, double(Index) / double(Steps));
+}
+
+bool AddUniqueActorPoint(const FVector& Point, const FBox& Bounds, float VoxelSize, TSet<FIntVector>& UniqueKeys, TArray<FVector>& OutPoints)
+{
+	if (!PointInsideBox(Bounds, Point))
+	{
+		return false;
+	}
+
+	const float CellSize = FMath::Max(VoxelSize * 0.25f, 1.0f);
+	const FIntVector Key(
+		FMath::RoundToInt(Point.X / CellSize),
+		FMath::RoundToInt(Point.Y / CellSize),
+		FMath::RoundToInt(Point.Z / CellSize));
+	if (UniqueKeys.Contains(Key))
+	{
+		return false;
+	}
+
+	UniqueKeys.Add(Key);
+	OutPoints.Add(Point);
+	return true;
+}
+
+bool TraceComponentPoint(UPrimitiveComponent* Component, const FVector& Start, const FVector& End, const FBox& SampleBox,
+                         const FBox& Bounds, float VoxelSize, TSet<FIntVector>& UniqueKeys, TArray<FVector>& OutPoints)
+{
+	if (!Component)
+	{
+		return false;
+	}
+
+	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(VDBMeshFromActorPoints), true);
+	QueryParams.bReturnFaceIndex = false;
+	QueryParams.bReturnPhysicalMaterial = false;
+
+	FHitResult Hit;
+	if (!Component->LineTraceComponent(Hit, Start, End, QueryParams))
+	{
+		return false;
+	}
+	if (!PointInsideBox(SampleBox, Hit.ImpactPoint))
+	{
+		return false;
+	}
+
+	return AddUniqueActorPoint(Hit.ImpactPoint, Bounds, VoxelSize, UniqueKeys, OutPoints);
+}
+
+int32 AddComponentTracePoints(UPrimitiveComponent* Component, const FBox& SampleBox, const FBox& Bounds, float Spacing,
+                              int32 MaxPoints, float VoxelSize, TSet<FIntVector>& UniqueKeys, TArray<FVector>& OutPoints)
+{
+	if (!Component || !SampleBox.IsValid)
+	{
+		return 0;
+	}
+
+	const int32 StartPointCount = OutPoints.Num();
+	const FVector Min = SampleBox.Min;
+	const FVector Max = SampleBox.Max;
+	const float Padding = FMath::Max(Spacing, VoxelSize);
+	const int32 XSteps = GridSteps(Max.X - Min.X, Spacing);
+	const int32 YSteps = GridSteps(Max.Y - Min.Y, Spacing);
+	const int32 ZSteps = GridSteps(Max.Z - Min.Z, Spacing);
+
+	auto CanAddMore = [&]()
+	{
+		return MaxPoints <= 0 || (OutPoints.Num() - StartPointCount) < MaxPoints;
+	};
+
+	auto TraceBothWays = [&](const FVector& Start, const FVector& End)
+	{
+		if (!CanAddMore())
+		{
+			return;
+		}
+		TraceComponentPoint(Component, Start, End, SampleBox, Bounds, VoxelSize, UniqueKeys, OutPoints);
+		if (CanAddMore())
+		{
+			TraceComponentPoint(Component, End, Start, SampleBox, Bounds, VoxelSize, UniqueKeys, OutPoints);
+		}
+	};
+
+	for (int32 YIndex = 0; YIndex <= YSteps && CanAddMore(); ++YIndex)
+	{
+		const double Y = GridValue(Min.Y, Max.Y, YIndex, YSteps);
+		for (int32 ZIndex = 0; ZIndex <= ZSteps && CanAddMore(); ++ZIndex)
+		{
+			const double Z = GridValue(Min.Z, Max.Z, ZIndex, ZSteps);
+			TraceBothWays(FVector(Min.X - Padding, Y, Z), FVector(Max.X + Padding, Y, Z));
+		}
+	}
+
+	for (int32 XIndex = 0; XIndex <= XSteps && CanAddMore(); ++XIndex)
+	{
+		const double X = GridValue(Min.X, Max.X, XIndex, XSteps);
+		for (int32 ZIndex = 0; ZIndex <= ZSteps && CanAddMore(); ++ZIndex)
+		{
+			const double Z = GridValue(Min.Z, Max.Z, ZIndex, ZSteps);
+			TraceBothWays(FVector(X, Min.Y - Padding, Z), FVector(X, Max.Y + Padding, Z));
+		}
+	}
+
+	for (int32 XIndex = 0; XIndex <= XSteps && CanAddMore(); ++XIndex)
+	{
+		const double X = GridValue(Min.X, Max.X, XIndex, XSteps);
+		for (int32 YIndex = 0; YIndex <= YSteps && CanAddMore(); ++YIndex)
+		{
+			const double Y = GridValue(Min.Y, Max.Y, YIndex, YSteps);
+			TraceBothWays(FVector(X, Y, Min.Z - Padding), FVector(X, Y, Max.Z + Padding));
+		}
+	}
+
+	return OutPoints.Num() - StartPointCount;
+}
+
+int32 AddBoxSurfacePoints(const FBox& SampleBox, const FBox& Bounds, float Spacing, int32 MaxPoints,
+                          float VoxelSize, TSet<FIntVector>& UniqueKeys, TArray<FVector>& OutPoints)
+{
+	if (!SampleBox.IsValid)
+	{
+		return 0;
+	}
+
+	const int32 StartPointCount = OutPoints.Num();
+	const FVector Min = SampleBox.Min;
+	const FVector Max = SampleBox.Max;
+	const int32 XSteps = GridSteps(Max.X - Min.X, Spacing);
+	const int32 YSteps = GridSteps(Max.Y - Min.Y, Spacing);
+	const int32 ZSteps = GridSteps(Max.Z - Min.Z, Spacing);
+
+	auto CanAddMore = [&]()
+	{
+		return MaxPoints <= 0 || (OutPoints.Num() - StartPointCount) < MaxPoints;
+	};
+
+	auto AddPoint = [&](const FVector& Point)
+	{
+		if (CanAddMore())
+		{
+			AddUniqueActorPoint(Point, Bounds, VoxelSize, UniqueKeys, OutPoints);
+		}
+	};
+
+	for (int32 XIndex = 0; XIndex <= XSteps && CanAddMore(); ++XIndex)
+	{
+		const double X = GridValue(Min.X, Max.X, XIndex, XSteps);
+		for (int32 YIndex = 0; YIndex <= YSteps && CanAddMore(); ++YIndex)
+		{
+			const double Y = GridValue(Min.Y, Max.Y, YIndex, YSteps);
+			AddPoint(FVector(X, Y, Min.Z));
+			AddPoint(FVector(X, Y, Max.Z));
+		}
+	}
+
+	for (int32 XIndex = 0; XIndex <= XSteps && CanAddMore(); ++XIndex)
+	{
+		const double X = GridValue(Min.X, Max.X, XIndex, XSteps);
+		for (int32 ZIndex = 0; ZIndex <= ZSteps && CanAddMore(); ++ZIndex)
+		{
+			const double Z = GridValue(Min.Z, Max.Z, ZIndex, ZSteps);
+			AddPoint(FVector(X, Min.Y, Z));
+			AddPoint(FVector(X, Max.Y, Z));
+		}
+	}
+
+	for (int32 YIndex = 0; YIndex <= YSteps && CanAddMore(); ++YIndex)
+	{
+		const double Y = GridValue(Min.Y, Max.Y, YIndex, YSteps);
+		for (int32 ZIndex = 0; ZIndex <= ZSteps && CanAddMore(); ++ZIndex)
+		{
+			const double Z = GridValue(Min.Z, Max.Z, ZIndex, ZSteps);
+			AddPoint(FVector(Min.X, Y, Z));
+			AddPoint(FVector(Max.X, Y, Z));
+		}
+	}
+
+	return OutPoints.Num() - StartPointCount;
+}
+
+bool ShouldSampleBounds(const FBox& ActorBounds, const FBox& Bounds, const TArray<FVector>& BBoxVectors)
+{
+	if (!ActorBounds.IsValid || !ActorBounds.Intersect(Bounds))
+	{
+		return false;
+	}
+
+	if (BBoxVectors.Num() == 0)
+	{
+		return true;
+	}
+
+	for (const FVector& BBoxVector : BBoxVectors)
+	{
+		if (PointInsideBox(ActorBounds, BBoxVector))
+		{
+			return true;
+		}
+	}
+
+	return true;
+}
+
+int32 EstimateGpuPointCount(const FBox& SampleBox, float DesiredSpacing, int32 MaxPoints)
+{
+	if (!SampleBox.IsValid || MaxPoints == 0)
+	{
+		return 0;
+	}
+
+	const FVector Size = SampleBox.GetSize();
+	const float Spacing = FMath::Max(DesiredSpacing, 1.0f);
+	const double EstimatedSurfacePoints = 2.0 * (
+		FMath::Max(1.0, Size.X / Spacing) * FMath::Max(1.0, Size.Y / Spacing)
+		+ FMath::Max(1.0, Size.X / Spacing) * FMath::Max(1.0, Size.Z / Spacing)
+		+ FMath::Max(1.0, Size.Y / Spacing) * FMath::Max(1.0, Size.Z / Spacing));
+	const int32 ClampedEstimate = FMath::Max(1, FMath::CeilToInt(EstimatedSurfacePoints));
+	return MaxPoints > 0 ? FMath::Min(ClampedEstimate, MaxPoints) : ClampedEstimate;
+}
+
+void AddActorComponentPoints(UStaticMeshComponent* StaticMeshComponent, const FBox& ComponentBounds, const FBox& Bounds,
+                             float DesiredSpacing, int32 MaxPointsPerComponent, float VoxelSize,
+                             TSet<FIntVector>& UniqueKeys, TArray<FVector>& OutPoints)
+{
+	const FBox SampleBox = IntersectBoxes(ComponentBounds, Bounds);
+	if (!SampleBox.IsValid)
+	{
+		return;
+	}
+
+	const float Spacing = GetPointSamplingSpacing(SampleBox, DesiredSpacing, MaxPointsPerComponent);
+	const int32 AddedByTrace = AddComponentTracePoints(StaticMeshComponent, SampleBox, Bounds, Spacing, MaxPointsPerComponent,
+	                                                   VoxelSize, UniqueKeys, OutPoints);
+	if (AddedByTrace == 0)
+	{
+		AddBoxSurfacePoints(SampleBox, Bounds, Spacing, MaxPointsPerComponent, VoxelSize, UniqueKeys, OutPoints);
+	}
+}
+
+bool IsValidCSTriangleIndex(int32 Index, int32 VertexCount)
+{
+	return Index >= 0 && Index < VertexCount;
+}
+
+bool IsFiniteCSVertex(const FVector& Vertex)
+{
+	return !Vertex.ContainsNaN()
+		&& FMath::IsFinite(Vertex.X)
+		&& FMath::IsFinite(Vertex.Y)
+		&& FMath::IsFinite(Vertex.Z);
+}
+
+bool IsDegenerateCSTriangle(const FVector& A, const FVector& B, const FVector& C)
+{
+	const FVector AB = B - A;
+	const FVector AC = C - A;
+	const double AreaSq4 = FVector::CrossProduct(AB, AC).SizeSquared();
+	return AreaSq4 <= 1.0e-8;
+}
+
+UDynamicMesh* BuildDynamicMeshFromCSTriangleData(const TArray<FVector>& Vertices,
+	const TArray<int32>& Indices,
+	const TArray<FVector>& VertexNormals,
+	int32 VertexCount,
+	int32 IndexCount,
+	bool bReverseOrientation,
+	bool bSkipDegenerateTriangles,
+	bool bRecomputeNormals)
+{
+	UDynamicMesh* OutMesh = NewObject<UDynamicMesh>();
+	if (!OutMesh)
+	{
+		return nullptr;
+	}
+	OutMesh->Reset();
+
+	const int32 EffectiveVertexCount = VertexCount >= 0
+		? FMath::Clamp(VertexCount, 0, Vertices.Num())
+		: Vertices.Num();
+	const int32 EffectiveIndexCount = IndexCount >= 0
+		? FMath::Clamp(IndexCount, 0, Indices.Num())
+		: Indices.Num();
+
+	if (EffectiveVertexCount < 3)
+	{
+		return OutMesh;
+	}
+
+	const bool bUseTriangleSoup = EffectiveIndexCount == 0;
+	const int32 TriangleCount = bUseTriangleSoup ? EffectiveVertexCount / 3 : EffectiveIndexCount / 3;
+	if (TriangleCount <= 0)
+	{
+		return OutMesh;
+	}
+
+	const bool bUseInputVertexNormals = !bRecomputeNormals && VertexNormals.Num() >= EffectiveVertexCount;
+
+	FDynamicMesh3 Mesh;
+	TArray<int32> VertexIDMap;
+	VertexIDMap.Reserve(EffectiveVertexCount);
+	for (int32 VertexIndex = 0; VertexIndex < EffectiveVertexCount; ++VertexIndex)
+	{
+		const FVector& Vertex = Vertices[VertexIndex];
+		if (IsFiniteCSVertex(Vertex))
+		{
+			VertexIDMap.Add(Mesh.AppendVertex(FVector3d(Vertex)));
+		}
+		else
+		{
+			VertexIDMap.Add(INDEX_NONE);
+		}
+	}
+
+	if (bUseInputVertexNormals)
+	{
+		Mesh.EnableVertexNormals(FVector3f::UpVector);
+		for (int32 VertexIndex = 0; VertexIndex < EffectiveVertexCount; ++VertexIndex)
+		{
+			const int32 MeshVertexID = VertexIDMap[VertexIndex];
+			if (MeshVertexID == INDEX_NONE || VertexNormals[VertexIndex].ContainsNaN())
+			{
+				continue;
+			}
+
+			const FVector SafeNormal = VertexNormals[VertexIndex].GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
+			Mesh.SetVertexNormal(MeshVertexID, FVector3f(SafeNormal));
+		}
+	}
+
+	int32 AddedTriangles = 0;
+	for (int32 TriangleIndex = 0; TriangleIndex < TriangleCount; ++TriangleIndex)
+	{
+		int32 A = INDEX_NONE;
+		int32 B = INDEX_NONE;
+		int32 C = INDEX_NONE;
+
+		if (bUseTriangleSoup)
+		{
+			A = TriangleIndex * 3 + 0;
+			B = TriangleIndex * 3 + 1;
+			C = TriangleIndex * 3 + 2;
+		}
+		else
+		{
+			A = Indices[TriangleIndex * 3 + 0];
+			B = Indices[TriangleIndex * 3 + 1];
+			C = Indices[TriangleIndex * 3 + 2];
+		}
+
+		if (!IsValidCSTriangleIndex(A, EffectiveVertexCount)
+			|| !IsValidCSTriangleIndex(B, EffectiveVertexCount)
+			|| !IsValidCSTriangleIndex(C, EffectiveVertexCount)
+			|| VertexIDMap[A] == INDEX_NONE
+			|| VertexIDMap[B] == INDEX_NONE
+			|| VertexIDMap[C] == INDEX_NONE
+			|| A == B || B == C || A == C)
+		{
+			continue;
+		}
+
+		if (bSkipDegenerateTriangles && IsDegenerateCSTriangle(Vertices[A], Vertices[B], Vertices[C]))
+		{
+			continue;
+		}
+
+		if (bReverseOrientation)
+		{
+			Swap(B, C);
+		}
+
+		const int32 NewTriangleID = Mesh.AppendTriangle(FIndex3i(VertexIDMap[A], VertexIDMap[B], VertexIDMap[C]), 0);
+		if (NewTriangleID >= 0)
+		{
+			++AddedTriangles;
+		}
+	}
+
+	if (AddedTriangles == 0)
+	{
+		return OutMesh;
+	}
+
+	OutMesh->SetMesh(MoveTemp(Mesh));
+
+	if (bRecomputeNormals)
+	{
+		FGeometryScriptCalculateNormalsOptions CalculateOptions;
+		UGeometryScriptLibrary_MeshNormalsFunctions::RecomputeNormals(OutMesh, CalculateOptions);
+	}
+
+	return OutMesh;
+}
+}
 
 
 
+
+
+UDynamicMesh* UGeometryGenerate::CSTriangleDataToDynamicMesh(FCSTriangleMeshData CSTriangleData, bool bReverseOrientation, bool bSkipDegenerateTriangles, bool bRecomputeNormals)
+{
+	return CSTriangleBuffersToDynamicMesh(
+		CSTriangleData.Vertices,
+		CSTriangleData.Indices,
+		CSTriangleData.VertexNormals,
+		CSTriangleData.VertexCount,
+		CSTriangleData.IndexCount,
+		bReverseOrientation,
+		bSkipDegenerateTriangles,
+		bRecomputeNormals);
+}
+
+UDynamicMesh* UGeometryGenerate::CSTriangleBuffersToDynamicMesh(TArray<FVector> Vertices, TArray<int32> Indices, TArray<FVector> VertexNormals, int32 VertexCount, int32 IndexCount, bool bReverseOrientation, bool bSkipDegenerateTriangles, bool bRecomputeNormals)
+{
+	return BuildDynamicMeshFromCSTriangleData(
+		Vertices,
+		Indices,
+		VertexNormals,
+		VertexCount,
+		IndexCount,
+		bReverseOrientation,
+		bSkipDegenerateTriangles,
+		bRecomputeNormals);
+}
+
+UDynamicMesh* UGeometryGenerate::CSTriangleReadbackToDynamicMesh(const TArray<FVector4f>& CompactVertices, const TArray<uint32>& CompactIndices, const TArray<FVector4f>& CompactVertexNormals, int32 VertexCount, int32 IndexCount, bool bReverseOrientation, bool bSkipDegenerateTriangles, bool bRecomputeNormals)
+{
+	const int32 EffectiveVertexCount = VertexCount >= 0
+		? FMath::Clamp(VertexCount, 0, CompactVertices.Num())
+		: CompactVertices.Num();
+	const int32 EffectiveIndexCount = IndexCount >= 0
+		? FMath::Clamp(IndexCount, 0, CompactIndices.Num())
+		: CompactIndices.Num();
+
+	TArray<FVector> Vertices;
+	Vertices.Reserve(EffectiveVertexCount);
+	for (int32 VertexIndex = 0; VertexIndex < EffectiveVertexCount; ++VertexIndex)
+	{
+		const FVector4f& Vertex = CompactVertices[VertexIndex];
+		Vertices.Add(FVector(Vertex.X, Vertex.Y, Vertex.Z));
+	}
+
+	TArray<int32> Indices;
+	Indices.Reserve(EffectiveIndexCount);
+	for (int32 IndexBufferIndex = 0; IndexBufferIndex < EffectiveIndexCount; ++IndexBufferIndex)
+	{
+		const uint32 Index = CompactIndices[IndexBufferIndex];
+		Indices.Add(Index <= uint32(TNumericLimits<int32>::Max()) ? int32(Index) : INDEX_NONE);
+	}
+
+	TArray<FVector> VertexNormals;
+	if (CompactVertexNormals.Num() >= EffectiveVertexCount)
+	{
+		VertexNormals.Reserve(EffectiveVertexCount);
+		for (int32 NormalIndex = 0; NormalIndex < EffectiveVertexCount; ++NormalIndex)
+		{
+			const FVector4f& Normal = CompactVertexNormals[NormalIndex];
+			VertexNormals.Add(FVector(Normal.X, Normal.Y, Normal.Z));
+		}
+	}
+
+	return BuildDynamicMeshFromCSTriangleData(
+		Vertices,
+		Indices,
+		VertexNormals,
+		EffectiveVertexCount,
+		EffectiveIndexCount,
+		bReverseOrientation,
+		bSkipDegenerateTriangles,
+		bRecomputeNormals);
+}
 
 UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, TArray<FVector> BBoxVertors, bool Result, int32 ExtentPlus, float VoxelSize, float LandscapeMeshExtrude, bool MultThread)
 {
@@ -157,7 +691,7 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, TA
 		UDynamicMesh* DynamicMeshCollection = NewObject<UDynamicMesh>();
 		DynamicMeshCollection->Reset();
 
-		if (false)
+		if (MultThread)
 		{
 			SCOPE_CYCLE_COUNTER(STAT_SCConvertMeshMultThread)
 			CollectMeshsMultThread(DynamicMeshCollection, BoundTransformMapKeyArray, BoundTransformMapValueArray, Bounds, LandscapeMeshExtrude, VoxelSize);
@@ -206,6 +740,147 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromActors(TArray<AActor*> In_Actors, TA
 	// 		}
 	// 	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
 	
+	return OutMesh;
+}
+
+UDynamicMesh* UGeometryGenerate::VDBMeshFromActorPoints(TArray<AActor*> In_Actors, TArray<FVector> BBoxVertors, bool Result, int32 ExtentPlus,
+                                                        float VoxelSize, float LandscapeMeshExtrude, float PointSpacing,
+                                                        float PointRadiusMult, int32 MaxPointsPerComponent)
+{
+	FBox Bounds(BBoxVertors);
+	if (!Bounds.IsValid)
+	{
+		return NewObject<UDynamicMesh>();
+	}
+
+	const FVector Center = Bounds.GetCenter();
+	const FVector Extent = Bounds.GetExtent();
+	const float DesiredSpacing = PointSpacing > 0 ? PointSpacing : FMath::Max(VoxelSize, 1.0f);
+
+	TArray<FVector> SamplePoints;
+	TSet<FIntVector> UniquePointKeys;
+	struct FPointFallbackRequest
+	{
+		UStaticMeshComponent* Component = nullptr;
+		FBox ComponentBounds = FBox(ForceInit);
+	};
+	TArray<FStaticMeshRenderDataPointSampleRequest> GpuSampleRequests;
+	TArray<FPointFallbackRequest> FallbackRequests;
+
+	for (AActor* Actor : In_Actors)
+	{
+		if (!Actor)
+		{
+			continue;
+		}
+
+		TArray<UStaticMeshComponent*> StaticMeshComponents;
+		Actor->GetComponents(UStaticMeshComponent::StaticClass(), StaticMeshComponents);
+		for (UStaticMeshComponent* StaticMeshComponent : StaticMeshComponents)
+		{
+			if (!StaticMeshComponent || !StaticMeshComponent->GetStaticMesh())
+			{
+				continue;
+			}
+
+			if (UInstancedStaticMeshComponent* InstancedComponent = Cast<UInstancedStaticMeshComponent>(StaticMeshComponent))
+			{
+				const UStaticMesh* InstanceMesh = InstancedComponent->GetStaticMesh();
+				if (!InstanceMesh)
+				{
+					continue;
+				}
+
+				const FBox MeshBounds = InstanceMesh->GetBoundingBox();
+				for (int32 InstanceIndex = 0; InstanceIndex < InstancedComponent->GetInstanceCount(); ++InstanceIndex)
+				{
+					FTransform InstanceTransform = FTransform::Identity;
+					InstancedComponent->GetInstanceTransform(InstanceIndex, InstanceTransform, true);
+					const FBox InstanceBounds = MeshBounds.TransformBy(InstanceTransform);
+					if (!ShouldSampleBounds(InstanceBounds, Bounds, BBoxVertors))
+					{
+						continue;
+					}
+
+					const FBox SampleBox = IntersectBoxes(InstanceBounds, Bounds);
+					FStaticMeshRenderDataPointSampleRequest& GpuRequest = GpuSampleRequests.AddDefaulted_GetRef();
+					GpuRequest.StaticMesh = const_cast<UStaticMesh*>(InstanceMesh);
+					GpuRequest.LODIndex = 0;
+					GpuRequest.LocalToWorld = InstanceTransform;
+					GpuRequest.WorldBounds = SampleBox;
+					GpuRequest.MaxPoints = EstimateGpuPointCount(SampleBox, DesiredSpacing, MaxPointsPerComponent);
+					GpuRequest.VoxelCellSize = FMath::Max(VoxelSize * 0.25f, 1.0f);
+
+					FPointFallbackRequest& FallbackRequest = FallbackRequests.AddDefaulted_GetRef();
+					FallbackRequest.Component = StaticMeshComponent;
+					FallbackRequest.ComponentBounds = InstanceBounds;
+				}
+				continue;
+			}
+
+			const FBox ComponentBounds = StaticMeshComponent->Bounds.GetBox();
+			if (!ShouldSampleBounds(ComponentBounds, Bounds, BBoxVertors))
+			{
+				continue;
+			}
+
+			const FBox SampleBox = IntersectBoxes(ComponentBounds, Bounds);
+			FStaticMeshRenderDataPointSampleRequest& GpuRequest = GpuSampleRequests.AddDefaulted_GetRef();
+			GpuRequest.StaticMesh = StaticMeshComponent->GetStaticMesh();
+			GpuRequest.LODIndex = 0;
+			GpuRequest.LocalToWorld = StaticMeshComponent->GetComponentTransform();
+			GpuRequest.WorldBounds = SampleBox;
+			GpuRequest.MaxPoints = EstimateGpuPointCount(SampleBox, DesiredSpacing, MaxPointsPerComponent);
+			GpuRequest.VoxelCellSize = FMath::Max(VoxelSize * 0.25f, 1.0f);
+
+			FPointFallbackRequest& FallbackRequest = FallbackRequests.AddDefaulted_GetRef();
+			FallbackRequest.Component = StaticMeshComponent;
+			FallbackRequest.ComponentBounds = ComponentBounds;
+		}
+	}
+
+	TArray<int32> GpuPointsPerRequest;
+	TArray<FVector> GpuPoints;
+	FStaticMeshRenderDataPointSampler::SamplePointsSync(GpuSampleRequests, GpuPoints, GpuPointsPerRequest);
+	for (const FVector& Point : GpuPoints)
+	{
+		AddUniqueActorPoint(Point, Bounds, VoxelSize, UniquePointKeys, SamplePoints);
+	}
+
+	for (int32 RequestIndex = 0; RequestIndex < FallbackRequests.Num(); ++RequestIndex)
+	{
+		const bool bGpuProducedPoints = GpuPointsPerRequest.IsValidIndex(RequestIndex) && GpuPointsPerRequest[RequestIndex] > 0;
+		if (bGpuProducedPoints)
+		{
+			continue;
+		}
+
+		const FPointFallbackRequest& FallbackRequest = FallbackRequests[RequestIndex];
+		AddActorComponentPoints(FallbackRequest.Component, FallbackRequest.ComponentBounds, Bounds, DesiredSpacing, MaxPointsPerComponent,
+		                        VoxelSize, UniquePointKeys, SamplePoints);
+	}
+
+	UDynamicMesh* OutMesh = NewObject<UDynamicMesh>();
+	if (SamplePoints.Num() > 0)
+	{
+		UVDBExtra::ParticlesToVDBMeshUniform(OutMesh, SamplePoints, PointRadiusMult, VoxelSize);
+	}
+
+	UDynamicMesh* LandscapePlaneMesh = NewObject<UDynamicMesh>();
+	ULandscapeExtra::CreateProjectPlane(LandscapePlaneMesh, Center, Extent * 1.1, ExtentPlus);
+	UDynamicMesh* BoundaryMesh = FixUnclosedBoundary(LandscapePlaneMesh, LandscapeMeshExtrude, false, false);
+	UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutMesh, LandscapePlaneMesh, FTransform(FVector(0, 0, -LandscapeMeshExtrude)));
+	UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutMesh, LandscapePlaneMesh, FTransform::Identity);
+	UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(OutMesh, BoundaryMesh, FTransform::Identity);
+
+	if (!Result)
+	{
+		return OutMesh;
+	}
+
+	OutMesh = VoxelMergeMeshs(OutMesh, VoxelSize);
+	FGeometryScriptCalculateNormalsOptions CalculateOptions;
+	UGeometryScriptLibrary_MeshNormalsFunctions::RecomputeNormals(OutMesh, CalculateOptions);
 	return OutMesh;
 }
 
@@ -776,6 +1451,227 @@ UDynamicMesh* UGeometryGenerate::VoxelMergeMeshs(UDynamicMesh* TargetMesh, float
 
 
 
+UDynamicMesh* UGeometryGenerate::VDBMeshFromSurfaceVoxels(TArray<AActor*> In_Actors, TArray<FVector> ValidPositions,
+                                                          float VoxelSize, float SurfaceDistance, float PointRadiusMult, bool bProjectToSurface, float InclusionDistance)
+{
+	FBox Bounds(ValidPositions);
+	if (!Bounds.IsValid)
+	{
+		return NewObject<UDynamicMesh>();
+	}
+
+	const float MaxDist = SurfaceDistance > 0 ? SurfaceDistance : VoxelSize;
+	const double MaxDistSq = (double)MaxDist * (double)MaxDist;
+	const float InclusionDistSq = InclusionDistance * InclusionDistance;
+
+	auto IsCloseToValidPositions = [&](const FBox& MeshBounds) -> bool
+	{
+		for (const FVector& Pos : ValidPositions)
+		{
+			if (MeshBounds.ComputeSquaredDistanceToPoint(Pos) <= InclusionDistSq)
+			{
+				return true;
+			}
+		}
+		return false;
+	};
+
+	TMap<UStaticMesh*, TArray<FTransform>> MeshTransformMap;
+	for (AActor* Actor : In_Actors)
+	{
+		if (!Actor)
+		{
+			continue;
+		}
+
+		TArray<UStaticMeshComponent*> Components;
+		Actor->GetComponents(Components);
+		for (UStaticMeshComponent* Comp : Components)
+		{
+			if (!Comp || !Comp->GetStaticMesh())
+			{
+				continue;
+			}
+
+			UStaticMesh* SM = Comp->GetStaticMesh();
+			if (UInstancedStaticMeshComponent* ISM = Cast<UInstancedStaticMeshComponent>(Comp))
+			{
+				for (int32 i = 0; i < ISM->GetInstanceCount(); i++)
+				{
+					FTransform InstanceTransform;
+					ISM->GetInstanceTransform(i, InstanceTransform, true);
+					FBox MeshBounds = SM->GetBoundingBox().TransformBy(InstanceTransform);
+					if (IsCloseToValidPositions(MeshBounds))
+					{
+						MeshTransformMap.FindOrAdd(SM).Add(InstanceTransform);
+					}
+				}
+			}
+			else
+			{
+				FTransform WorldTransform = Comp->GetComponentTransform();
+				FBox MeshBounds = SM->GetBoundingBox().TransformBy(WorldTransform);
+				if (IsCloseToValidPositions(MeshBounds))
+				{
+					MeshTransformMap.FindOrAdd(SM).Add(WorldTransform);
+				}
+			}
+		}
+	}
+
+	FDynamicMesh3 CombinedMesh;
+	for (auto& Pair : MeshTransformMap)
+	{
+		UStaticMesh* SM = Pair.Key;
+		const TArray<FTransform>& Transforms = Pair.Value;
+
+		UDynamicMesh* TempMesh = NewObject<UDynamicMesh>();
+		FGeometryScriptCopyMeshFromAssetOptions AssetOptions;
+		FGeometryScriptMeshReadLOD RequestedLOD;
+		RequestedLOD.LODIndex = 0;
+		RequestedLOD.LODType = EGeometryScriptLODType::RenderData;
+		EGeometryScriptOutcomePins Outcome;
+		UGeometryScriptLibrary_StaticMeshFunctions::CopyMeshFromStaticMesh(SM, TempMesh, AssetOptions, RequestedLOD, Outcome);
+
+		for (const FTransform& Transform : Transforms)
+		{
+			FDynamicMesh3 MeshCopy;
+			TempMesh->ProcessMesh([&](const FDynamicMesh3& ReadMesh)
+			{
+				MeshCopy = ReadMesh;
+			});
+			MeshTransforms::ApplyTransform(MeshCopy, (FTransformSRT3d)Transform, true);
+
+			TArray<int32> TrianglesToRemove;
+			for (int32 TID : MeshCopy.TriangleIndicesItr())
+			{
+				FIndex3i Tri = MeshCopy.GetTriangle(TID);
+				FVector V0 = FVector(MeshCopy.GetVertex(Tri[0]));
+				FVector V1 = FVector(MeshCopy.GetVertex(Tri[1]));
+				FVector V2 = FVector(MeshCopy.GetVertex(Tri[2]));
+
+				FBox TriBox(ForceInit);
+				TriBox += V0;
+				TriBox += V1;
+				TriBox += V2;
+
+				bool bKeep = false;
+				for (const FVector& Pos : ValidPositions)
+				{
+					if (TriBox.ComputeSquaredDistanceToPoint(Pos) <= InclusionDistSq)
+					{
+						bKeep = true;
+						break;
+					}
+				}
+				if (!bKeep)
+				{
+					TrianglesToRemove.Add(TID);
+				}
+			}
+
+			for (int32 TID : TrianglesToRemove)
+			{
+				MeshCopy.RemoveTriangle(TID);
+			}
+
+			if (MeshCopy.TriangleCount() > 0)
+			{
+				FDynamicMeshEditor Editor(&CombinedMesh);
+				FMeshIndexMappings Mappings;
+				Editor.AppendMesh(&MeshCopy, Mappings);
+			}
+		}
+	}
+
+	if (CombinedMesh.TriangleCount() == 0)
+	{
+		return NewObject<UDynamicMesh>();
+	}
+
+	TMeshAABBTree3<FDynamicMesh3> Spatial(&CombinedMesh, true);
+
+	const int32 NX = FMath::Max(1, FMath::CeilToInt((Bounds.Max.X - Bounds.Min.X) / VoxelSize));
+	const int32 NY = FMath::Max(1, FMath::CeilToInt((Bounds.Max.Y - Bounds.Min.Y) / VoxelSize));
+	const int32 NZ = FMath::Max(1, FMath::CeilToInt((Bounds.Max.Z - Bounds.Min.Z) / VoxelSize));
+
+	FCriticalSection Mutex;
+	TArray<FVector> SurfaceVoxels;
+
+	ParallelFor(NX, [&](int32 IX)
+	{
+		TArray<FVector> LocalPoints;
+		for (int32 IY = 0; IY < NY; IY++)
+		{
+			for (int32 IZ = 0; IZ < NZ; IZ++)
+			{
+				FVector3d Center(
+					Bounds.Min.X + (IX + 0.5) * VoxelSize,
+					Bounds.Min.Y + (IY + 0.5) * VoxelSize,
+					Bounds.Min.Z + (IZ + 0.5) * VoxelSize);
+
+				double NearDistSq = TNumericLimits<double>::Max();
+				IMeshSpatial::FQueryOptions QueryOptions;
+				QueryOptions.MaxDistance = MaxDist;
+				int32 NearTri = Spatial.FindNearestTriangle(Center, NearDistSq, QueryOptions);
+				if (NearTri >= 0 && NearDistSq <= MaxDistSq)
+				{
+					LocalPoints.Add(FVector(Center));
+				}
+			}
+		}
+
+		if (LocalPoints.Num() > 0)
+		{
+			FScopeLock Lock(&Mutex);
+			SurfaceVoxels.Append(LocalPoints);
+		}
+	});
+
+	UDynamicMesh* OutMesh = NewObject<UDynamicMesh>();
+	if (SurfaceVoxels.Num() > 0)
+	{
+		UVDBExtra::ParticlesToVDBMeshUniform(OutMesh, SurfaceVoxels, PointRadiusMult, VoxelSize);
+	}
+
+	if (bProjectToSurface && OutMesh->GetTriangleCount() > 0)
+	{
+		OutMesh->EditMesh([&](FDynamicMesh3& EditMesh)
+		{
+			ParallelFor(EditMesh.MaxVertexID(), [&](int32 VID)
+			{
+				if (!EditMesh.IsVertex(VID))
+				{
+					return;
+				}
+
+				FVector3d Vertex = EditMesh.GetVertex(VID);
+				double NearDistSq = TNumericLimits<double>::Max();
+				int32 NearTri = Spatial.FindNearestTriangle(Vertex, NearDistSq);
+				if (NearTri >= 0)
+				{
+					FIndex3i Tri = CombinedMesh.GetTriangle(NearTri);
+					FVector3d V0 = CombinedMesh.GetVertex(Tri[0]);
+					FVector3d V1 = CombinedMesh.GetVertex(Tri[1]);
+					FVector3d V2 = CombinedMesh.GetVertex(Tri[2]);
+					FVector NearestPoint = FMath::ClosestPointOnTriangleToPoint(FVector(Vertex), FVector(V0), FVector(V1), FVector(V2));
+					FVector3d TriNormal = VectorUtil::Normal(V0, V1, V2);
+					FVector3d Dir = Vertex - FVector3d(NearestPoint);
+					if (Dir.SquaredLength() < KINDA_SMALL_NUMBER || Dir.Dot(TriNormal) > 0)
+					{
+						EditMesh.SetVertex(VID, FVector3d(NearestPoint));
+					}
+				}
+			});
+		}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
+
+		FGeometryScriptCalculateNormalsOptions NormalOptions;
+		UGeometryScriptLibrary_MeshNormalsFunctions::RecomputeNormals(OutMesh, NormalOptions);
+	}
+
+	return OutMesh;
+}
+
 FVector UGeometryGenerate::TestViewPosition()
 {
 	// FLevelEditorViewportClient* SelectedViewport = NULL;
@@ -791,4 +1687,58 @@ FVector UGeometryGenerate::TestViewPosition()
 	//
 	//
 	return FVector::ZeroVector;
+}
+
+UDynamicMesh* UGeometryGenerate::SurfaceVoxelsToVDBMesh(AComputeShaderMeshGenerator* Generator,
+	float VoxelSize,
+	float RadiusMult,
+	bool bRecomputeNormals)
+{
+	return Generator ? Generator->SurfaceVoxelsToVDBMesh(VoxelSize, RadiusMult, bRecomputeNormals) : nullptr;
+}
+
+UDynamicMesh* UGeometryGenerate::VDBVoxelsToOpenDynamicMesh(FCSSurfaceVoxelData SurfaceVoxels,
+	float VoxelSize,
+	float RadiusMult,
+	bool bRecomputeNormals)
+{
+	const int32 EffectiveVoxelCount = SurfaceVoxels.VoxelCount >= 0
+		? FMath::Clamp(SurfaceVoxels.VoxelCount, 0, SurfaceVoxels.Positions.Num())
+		: SurfaceVoxels.Positions.Num();
+	if (EffectiveVoxelCount <= 0)
+	{
+		return NewObject<UDynamicMesh>();
+	}
+
+	const float SafeVoxelSize = FMath::Max(VoxelSize > 0.0f ? VoxelSize : SurfaceVoxels.VoxelSize, UE_KINDA_SMALL_NUMBER);
+
+	// 收集有效的世界空间位置
+	TArray<FVector> WorldPositions;
+	WorldPositions.Reserve(EffectiveVoxelCount);
+	for (int32 Index = 0; Index < EffectiveVoxelCount; ++Index)
+	{
+		const FVector& Position = SurfaceVoxels.Positions[Index];
+		if (Position.ContainsNaN() || !FMath::IsFinite(Position.X) || !FMath::IsFinite(Position.Y) || !FMath::IsFinite(Position.Z))
+		{
+			continue;
+		}
+		WorldPositions.Add(Position);
+	}
+
+	if (WorldPositions.IsEmpty())
+	{
+		return NewObject<UDynamicMesh>();
+	}
+
+	// 使用 VDB ParticlesToLevelSet 转 mesh，输入已经是世界空间坐标
+	UDynamicMesh* OutMesh = NewObject<UDynamicMesh>();
+	UVDBExtra::ParticlesToVDBMeshUniform(OutMesh, WorldPositions, RadiusMult, SafeVoxelSize, false);
+
+	if (bRecomputeNormals)
+	{
+		FGeometryScriptCalculateNormalsOptions CalculateOptions;
+		UGeometryScriptLibrary_MeshNormalsFunctions::RecomputeNormals(OutMesh, CalculateOptions);
+	}
+
+	return OutMesh;
 }

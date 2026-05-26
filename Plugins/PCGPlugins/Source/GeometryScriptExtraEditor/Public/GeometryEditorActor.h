@@ -10,7 +10,7 @@
 #include "Curve/CurveUtil.h"
 #include "Curves/CurveLinearColor.h"
 #include "GeometryScript/GeometryScriptTypes.h"
-#include "FoliageCluster/Public/FoliageConverter.h"
+#include "ComputeShaderMeshGenerator.h"
 #include "GeometryScript/MeshPrimitiveFunctions.h"
 #include "GeometryScript/MeshSpatialFunctions.h"
 #include "InstancedFoliage.h"
@@ -18,6 +18,27 @@
 #include "FoliageType.h"
 
 #include "GeometryEditorActor.generated.h"
+
+USTRUCT(BlueprintType, meta = (DisplayName = "SC Options"))
+struct GEOMETRYSCRIPTEXTRAEDITOR_API FSpaceColonizationOptions
+{
+	GENERATED_BODY()
+public:
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	int32 Iteration = 10;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	int32 Activetime = 10;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	int32 ExtentPlus = 3;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	float RandGrow = 0;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	float Seed = .5;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	float BackGrowRange = .8;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	float VoxelSize = 10;
+};
 
 USTRUCT(BlueprintType, meta = (DisplayName = "VV Options"))
 struct GEOMETRYSCRIPTEXTRAEDITOR_API FVineVisualization
@@ -47,7 +68,7 @@ public:
 };
 
 UCLASS()
-class GEOMETRYSCRIPTEXTRAEDITOR_API AVineContainer : public AConvertFoliageInstanceContainer
+class GEOMETRYSCRIPTEXTRAEDITOR_API AVineContainer : public AComputeShaderMeshGenerator
 {
 	GENERATED_BODY()
 	
@@ -55,11 +76,14 @@ class GEOMETRYSCRIPTEXTRAEDITOR_API AVineContainer : public AConvertFoliageInsta
 public:
 	AVineContainer(const FObjectInitializer& ObjectInitializer);
 
-	UPROPERTY(BlueprintReadWrite, Category = "StartInstance")
-	UInstancedStaticMeshComponent* TubeFoliageInstanceContainer;
+	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
+	UInstancedStaticMeshComponent* GrowTarget;
+	
+	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
+	UInstancedStaticMeshComponent* TubeVineSource;
 
-	UPROPERTY(BlueprintReadWrite, Category = "StartInstance")
-	UInstancedStaticMeshComponent* PlaneFoliageInstanceContainer;
+	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
+	UInstancedStaticMeshComponent* PlaneVineSource;
 	
 	TArray<AActor*> PickActors;
 	
@@ -67,11 +91,14 @@ public:
 	
 	FBox InstanceBound;
 	
-	UDynamicMesh* PrefixMesh;
+	UPROPERTY(Transient)
+	TObjectPtr<UDynamicMesh> PrefixMesh;
 
-	UDynamicMesh* OutTubeMesh;
+	UPROPERTY(Transient)
+	TObjectPtr<UDynamicMesh> OutTubeMesh;
 
-	UDynamicMesh* OutPlaneMesh;
+	UPROPERTY(Transient)
+	TObjectPtr<UDynamicMesh> OutPlaneMesh;
 	
 	TArray<FGeometryScriptPolyPath> TubeLines;
 
@@ -89,12 +116,20 @@ public:
 	void VisVine(bool MainVine);
 
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
+	bool VisVineGPU(bool MainVine);
+
+	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
+	UDynamicMesh* GenerateVines(FSpaceColonizationOptions SC, float ExtrudeScale = 50, bool Result = true, bool
+	                            MultThread = false);
+
+	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
 	void Clean();
 	// void AddMesh(TArray<FGeometryScriptPolyPath> Lines);
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
 	void AddInstance(UFoliageType* InFoliageType);
 	
-	virtual void AddInstanceFromFoliageType(UFoliageType* InFoliageType) override;
+	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
+	virtual void AddInstanceFromFoliageType(UFoliageType* InFoliageType);
 
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
 	void ConvertInstance(UFoliageType* InFoliageType);
@@ -105,7 +140,8 @@ public:
 	UFUNCTION(BlueprintPure, Category = ContainerCheck)
 	UDynamicMesh* GetPlaneMesh();
 
-	virtual void ConvertInstanceToFoliage(UFoliageType* InFoliageType) override;
+	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
+	virtual void ConvertInstanceToFoliage(UFoliageType* InFoliageType);
 	
 
 };

@@ -9,6 +9,7 @@
 #include "LandscapeComponent.h"
 #include "UDynamicMesh.h"
 #include "Components/InstancedStaticMeshComponent.h"
+#include "ComputeShaderMeshGenerator.h"
 #include "GeometryEditorActor.h"
 #include "Curves/CurveLinearColor.h"
 
@@ -37,27 +38,6 @@ enum EOutMeshType : int
 	CTF_VDBMeshs UMETA(DisplayName = "VDBMeshs"),
 };
 
-USTRUCT(BlueprintType, meta = (DisplayName = "SC Options"))
-struct GEOMETRYSCRIPTEXTRAEDITOR_API FSpaceColonizationOptions
-{
-	GENERATED_BODY()
-public:
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
-	int32 Iteration = 10;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
-	int32 Activetime = 10;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
-	int32 ExtentPlus = 3;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
-	float RandGrow = 0;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
-	float Seed = .5;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
-	float BackGrowRange = .8;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
-	float VoxelSize = 10;
-};
-
 UCLASS()
 class GEOMETRYSCRIPTEXTRAEDITOR_API UGeometryGenerate : public UBlueprintFunctionLibrary
 {
@@ -67,6 +47,42 @@ public:
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static UDynamicMesh* VDBMeshFromActors(TArray<AActor*> In_Actors, TArray<FVector> BBoxVertors, bool Result, int32 ExtentPlus = 3, float VoxelSize = 10, float LandscapeMeshExtrude = 50,  bool
 	                                       MultThread = true);
+
+	UFUNCTION(BlueprintCallable, Category = Generate)
+	static UDynamicMesh* VDBMeshFromActorPoints(TArray<AActor*> In_Actors, TArray<FVector> BBoxVertors, bool Result, int32 ExtentPlus = 3,
+	                                            float VoxelSize = 10, float LandscapeMeshExtrude = 50, float PointSpacing = 0,
+	                                            float PointRadiusMult = 2, int32 MaxPointsPerComponent = 20000);
+
+	UFUNCTION(BlueprintCallable, Category = Generate)
+	static UDynamicMesh* VDBMeshFromSurfaceVoxels(TArray<AActor*> In_Actors, TArray<FVector> ValidPositions,
+	                                              float VoxelSize = 10, float SurfaceDistance = 0,
+	                                              float PointRadiusMult = 2, bool bProjectToSurface = true,
+	                                              float InclusionDistance = 50.0f);
+
+	UFUNCTION(BlueprintCallable, Category = "Generate|ComputeShader")
+	static UDynamicMesh* CSTriangleDataToDynamicMesh(FCSTriangleMeshData CSTriangleData,
+		bool bReverseOrientation = false,
+		bool bSkipDegenerateTriangles = true,
+		bool bRecomputeNormals = true);
+
+	UFUNCTION(BlueprintCallable, Category = "Generate|ComputeShader")
+	static UDynamicMesh* CSTriangleBuffersToDynamicMesh(TArray<FVector> Vertices,
+		TArray<int32> Indices,
+		TArray<FVector> VertexNormals,
+		int32 VertexCount = -1,
+		int32 IndexCount = -1,
+		bool bReverseOrientation = false,
+		bool bSkipDegenerateTriangles = true,
+		bool bRecomputeNormals = true);
+
+	static UDynamicMesh* CSTriangleReadbackToDynamicMesh(const TArray<FVector4f>& CompactVertices,
+		const TArray<uint32>& CompactIndices,
+		const TArray<FVector4f>& CompactVertexNormals,
+		int32 VertexCount = -1,
+		int32 IndexCount = -1,
+		bool bReverseOrientation = false,
+		bool bSkipDegenerateTriangles = true,
+		bool bRecomputeNormals = true);
 
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static UDynamicMesh* FixUnclosedBoundary(UDynamicMesh* FixMesh, float ProjectOffset = 100, bool ProjectToLandscape = true, bool AppendMesh = true);
@@ -90,6 +106,19 @@ public:
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static FVector TestViewPosition();
 
+	/** 将 ComputeShaderMeshGenerator 的 GPU surface voxels 通过 OpenVDB ParticlesToLevelSet 转为 mesh。
+	 *  输出为世界空间坐标。 */
+	UFUNCTION(BlueprintCallable, Category = "Generate|ComputeShader")
+	static UDynamicMesh* SurfaceVoxelsToVDBMesh(AComputeShaderMeshGenerator* Generator,
+		float VoxelSize = 10.0f,
+		float RadiusMult = 2.0f,
+		bool bRecomputeNormals = true);
+
+	UFUNCTION(BlueprintCallable, Category = "Generate|ComputeShader")
+	static UDynamicMesh* VDBVoxelsToOpenDynamicMesh(FCSSurfaceVoxelData SurfaceVoxels,
+		float VoxelSize = 0.0f,
+		float RadiusMult = 2.0f,
+		bool bRecomputeNormals = true);
 
 };
 

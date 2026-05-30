@@ -81,14 +81,16 @@ void FDrawHOLDTextureCSInterface::DispatchRenderThread(FRHICommandListImmediate&
 
 
 			const int32 BufferSize = 64;
-			FRHIResourceCreateInfo CreateInfo(TEXT("BoundsVertexBuffer"));
-			FBufferRHIRef BoundsVertexBufferRHI = RHICmdList.CreateVertexBuffer(
-				BufferSize,
-				BUF_Static | BUF_UnorderedAccess | BUF_KeepCPUAccessible,
-				CreateInfo);
+			FRHIBufferCreateDesc BoundsCreateDesc = FRHIBufferCreateDesc::Create(
+				TEXT("BoundsVertexBuffer"), BufferSize, 0,
+				EBufferUsageFlags::VertexBuffer | EBufferUsageFlags::Static | EBufferUsageFlags::UnorderedAccess | EBufferUsageFlags::KeepCPUAccessible)
+				.DetermineInitialState();
+			FBufferRHIRef BoundsVertexBufferRHI = RHICmdList.CreateBuffer(BoundsCreateDesc);
 			FUnorderedAccessViewRHIRef BoundsVertexBufferUAV = RHICmdList.CreateUnorderedAccessView(
 				BoundsVertexBufferRHI,
-				PF_A32B32G32R32F );
+				FRHIViewDesc::CreateBufferUAV()
+					.SetType(FRHIViewDesc::EBufferType::Typed)
+					.SetFormat(PF_A32B32G32R32F));
 			PassParameters->OutBounds = BoundsVertexBufferUAV;
 			
 			//FRHIShaderResourceView* VertexBufferSRV;

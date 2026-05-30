@@ -32,14 +32,14 @@ uint STD_PackTileCoord(int2 Tile)
 
 // ─────────────── Thread-to-pixel remapping ───────────────
 
-int2 STD_GetTilePixel(uint GroupIdX, uint3 GroupThreadId, int2 MaxCell, Buffer<uint> TileCoords)
+int2 STD_GetTilePixel(uint GroupIdX, uint3 GroupThreadId, int2 MaxCell, StructuredBuffer<uint> TileCoords)
 {
 	const int2 TileCoord = STD_UnpackTileCoord(TileCoords[GroupIdX]);
 	const int2 Pixel = TileCoord * int2(THREADGROUPSIZE_X, THREADGROUPSIZE_Y) + int2(GroupThreadId.xy);
 	return clamp(Pixel, int2(0, 0), MaxCell - 1);
 }
 
-bool STD_IsTileThreadActive(uint GroupIdX, uint3 GroupThreadId, int2 MaxCell, Buffer<uint> TileCoords)
+bool STD_IsTileThreadActive(uint GroupIdX, uint3 GroupThreadId, int2 MaxCell, StructuredBuffer<uint> TileCoords)
 {
 	const int2 TileCoord = STD_UnpackTileCoord(TileCoords[GroupIdX]);
 	const int2 Pixel = TileCoord * int2(THREADGROUPSIZE_X, THREADGROUPSIZE_Y) + int2(GroupThreadId.xy);
@@ -56,7 +56,7 @@ void STD_FillSharedGroup(
 	uint3 GroupThreadId,
 	int2 MaxCell,
 	uint GroupIndex,
-	Buffer<uint> TileCoords)
+	StructuredBuffer<uint> TileCoords)
 {
 	const int2 TileCoord = STD_UnpackTileCoord(TileCoords[GroupIdX]);
 	const int2 GroupTopLeftGlobal =
@@ -84,7 +84,7 @@ void STD_FillSharedGroup(
 
 // ─────────────── Tile append (for CompactActiveTiles) ───────────────
 
-void STD_AppendActiveTile(int2 TileCoord, RWBuffer<uint> CompactTileCoords, RWBuffer<uint> CompactCounter)
+void STD_AppendActiveTile(int2 TileCoord, RWStructuredBuffer<uint> CompactTileCoords, RWStructuredBuffer<uint> CompactCounter)
 {
 	uint idx;
 	InterlockedAdd(CompactCounter[0], 1, idx);
@@ -117,8 +117,8 @@ void STD_CooperativeTileScan(
 	int2 MaxCell,
 	uint GroupIndex,
 	uint ThreadCount,
-	RWBuffer<uint> CompactTileCoords,
-	RWBuffer<uint> CompactCounter)
+	RWStructuredBuffer<uint> CompactTileCoords,
+	RWStructuredBuffer<uint> CompactCounter)
 {
 	if (GroupIndex == 0)
 		gs_STD_TileActive = 0;
@@ -160,7 +160,7 @@ void STD_CooperativeTileScan(
 
 // ─────────────── FinalizeCompact ───────────────
 
-void STD_WriteFinalizeCompactArgs(RWBuffer<uint> CompactCounter, RWBuffer<uint> CompactIndirectArgs)
+void STD_WriteFinalizeCompactArgs(RWStructuredBuffer<uint> CompactCounter, RWBuffer<uint> CompactIndirectArgs)
 {
 	uint tileCount = CompactCounter[0];
 	CompactIndirectArgs[0] = max(tileCount, 1u);

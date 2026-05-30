@@ -98,9 +98,10 @@ void FSimpleScreenVertexBuffer::InitRHI(FRHICommandListBase& RHICmdList)
 	Vertices[3].Position = FVector4f(1, -1, 0, 1);
 	Vertices[3].UV = FVector2f(1, 1);
 
-	// Create vertex buffer. Fill buffer with initial data upon creation
-	FRHIResourceCreateInfo CreateInfo(TEXT("ShaderDemoSquare"), &Vertices);
-	VertexBufferRHI = RHICmdList.CreateVertexBuffer(Vertices.GetResourceDataSize(), BUF_Static, CreateInfo);
+	FRHIBufferCreateDesc CreateDesc = FRHIBufferCreateDesc::CreateVertex(TEXT("ShaderDemoSquare"), Vertices.GetResourceDataSize())
+		.DetermineInitialState()
+		.SetInitActionResourceArray(&Vertices);
+	VertexBufferRHI = RHICmdList.CreateBuffer(CreateDesc);
 }
 
 
@@ -548,11 +549,10 @@ void UCSDrawPrimtive::DrawInstances(UTextureRenderTarget2D* RT_TextureTarget, UT
 			VertexResourceArray.SetNumUninitialized(RasterVertices.Num());
 			FMemory::Memcpy(VertexResourceArray.GetData(), RasterVertices.GetData(), RasterVertices.Num() * sizeof(FDrawRasterVertexData));
 
-			FRHIResourceCreateInfo VertexCreateInfo(TEXT("DrawInstanceRasterVB"), &VertexResourceArray);
-			FBufferRHIRef VertexBufferRHI = RHICmdList.CreateVertexBuffer(
-				VertexResourceArray.GetResourceDataSize(),
-				BUF_Static | BUF_VertexBuffer,
-				VertexCreateInfo);
+			FRHIBufferCreateDesc VertexCreateDesc = FRHIBufferCreateDesc::CreateVertex(TEXT("DrawInstanceRasterVB"), VertexResourceArray.GetResourceDataSize())
+				.DetermineInitialState()
+				.SetInitActionResourceArray(&VertexResourceArray);
+			FBufferRHIRef VertexBufferRHI = RHICmdList.CreateBuffer(VertexCreateDesc);
 
 			FRDGBuilder GraphBuilder(RHICmdList);
 			{

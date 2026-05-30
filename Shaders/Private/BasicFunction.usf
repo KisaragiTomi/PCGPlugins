@@ -1,18 +1,16 @@
 //#pragma
 
+#if USE_DISTANCEFIELD
+#include "/Engine/Private/Common.ush"
+#else
 #include "/Engine/Public/Platform.ush"
+#endif
 #include "/Engine/Private/ComputeShaderUtils.ush"
 #include "/Plugin/PCGPlugins/Shaders/Private/General.usf"
-// #include "/Engine/Generated/GeneratedUniformBuffers.ush"
 
-// #include "/Engine/Private/DeferredShadingCommon.ush"
-
-
-// #include "/Engine/Private/DistanceField/GlobalDistanceFieldUtils.ush"
-// #include "/Engine/Private/DistanceField/GlobalDistanceFieldObjectGrid.ush"
-// #include "/Engine/Private/DistanceFieldLightingShared.ush"
-// #include "/Engine/Private/SceneData.ush"
-// #include "/Engine/Private/Random.ush"
+#if USE_DISTANCEFIELD
+#include "/Engine/Private/DistanceField/GlobalDistanceFieldShared.ush"
+#endif
 
 #ifndef THREADGROUPSIZE_X
 #define THREADGROUPSIZE_X 32
@@ -399,12 +397,33 @@ void GeneralFunctionSet(
 
 }
 
+#if USE_DISTANCEFIELD
+RWStructuredBuffer<float4> RW_PointsToSampleBuffer0;
+#endif
+
 void DistanceToNearestSurface(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupId, uint GroupIndex)
 {
 #if USE_DISTANCEFIELD
-	RW_DebugView[DispatchThreadId.xy].x = GetDistanceToNearestSurfaceGlobal(float3(DispatchThreadId.xy, 0) * 10);
+	float3 TranslatedWorldPos = float3(DispatchThreadId.xy, 0) * InputData0 + View_PreViewTranslationHigh;
+	RW_DebugView[DispatchThreadId.xy].x = GetDistanceToNearestSurfaceGlobal(TranslatedWorldPos);
 #endif
-}	
+}
+
+void SampleGDFAtPositions(uint3 DispatchThreadId)
+{
+#if USE_DISTANCEFIELD
+	uint Index = DispatchThreadId.x;
+	if ((int)Index >= InputIntData0) return;
+	
+	float3 WorldPosition = RW_PointsToSampleBuffer0[Index].xyz;
+	float3 TranslatedWorldPosition = WorldPosition + View_PreViewTranslationHigh;
+	
+	float Distance = GetDistanceToNearestSurfaceGlobal(TranslatedWorldPosition);
+	float3 Gradient = GetDistanceFieldGradientGlobal(TranslatedWorldPosition);
+	
+	RW_PointsToSampleBuffer0[Index] = float4(Gradient, Distance);
+#endif
+}
 
 [numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
 void DistanceFieldFunction(
@@ -415,9 +434,9 @@ void DistanceFieldFunction(
 {
 #if GDF_DISTANCETONEARESTSURFACE
 	DistanceToNearestSurface(DispatchThreadId, GroupThreadId, GroupId, GroupIndex);
+#elif GDF_SAMPLEATPOSITIONS
+	SampleGDFAtPositions(DispatchThreadId);
 #endif
-	
-	
 }
 
 RWTexture2D<float4> RW_CopySource;

@@ -1,12 +1,12 @@
 #include "ComputeShaderShallowWater.h"
 #include "ComputeShaderGenerateHepler.h"
+#include "Engine/StaticMesh.h"
 #include "GlobalShader.h"
 #include "MaterialShader.h"
 #include "ShaderParameterStruct.h"
 #include "RenderGraphResources.h"
 #include "RenderGraphUtils.h"
 #include "RenderGraphBuilder.h"
-#include "ComputeShaderGenerateHepler.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/StaticMeshActor.h"
 #include "Kismet/KismetRenderingLibrary.h"
@@ -18,7 +18,9 @@
 #include "Engine/DecalActor.h"
 #include "Kismet/GameplayStatics.h"
 #include "ClearQuad.h"
-#include "Misc/LowLevelTestAdapter.h"
+#include "Engine/World.h"
+#include "HAL/IConsoleManager.h"
+#include "UObject/ObjectSaveContext.h"
 
 #if PLATFORM_WINDOWS
 #include "Windows/AllowWindowsPlatformTypes.h"
@@ -34,7 +36,7 @@ static void InitRenderDocAPI()
 	HMODULE RDMod = GetModuleHandleA("renderdoc.dll");
 	if (!RDMod) return;
 
-	auto GetAPIFn = reinterpret_cast<pRENDERDOC_GetAPI>(GetProcAddress(RDMod, "RENDERDOC_GetAPI"));
+	auto GetAPIFn = reinterpret_cast<pRENDERDOC_GetAPI>(reinterpret_cast<void*>(GetProcAddress(RDMod, "RENDERDOC_GetAPI")));
 	if (!GetAPIFn) return;
 
 	if (GetAPIFn(eRENDERDOC_API_Version_1_1_1, reinterpret_cast<void**>(&GRenderDocAPI)) != 1)
@@ -54,7 +56,15 @@ DECLARE_STATS_GROUP(TEXT("CSSW"), STATGROUP_CSSW, STATCAT_Advanced);
 DECLARE_CYCLE_STAT(TEXT("CSSW Execute"), STAT_CSSW_Execute, STATGROUP_CSSW)
 DECLARE_CYCLE_STAT(TEXT("CSSW Capture"), STAT_CSSW_Capture, STATGROUP_CSSW)
 DECLARE_CYCLE_STAT(TEXT("CSSW Total"), STAT_CSSW_Total, STATGROUP_CSSW);
+DECLARE_CYCLE_STAT(TEXT("CSSW TileReadback"), STAT_CSSW_TileReadback, STATGROUP_CSSW);
+DECLARE_CYCLE_STAT(TEXT("CSSW ISMUpdate"), STAT_CSSW_ISMUpdate, STATGROUP_CSSW);
 DECLARE_GPU_STAT_NAMED(Stat_ShallowWater, TEXT("ShallowWater"));
+
+static int32 GCSSWUseSparseIndirect = 0;
+static FAutoConsoleVariableRef CVarCSSWUseSparseIndirect(
+	TEXT("pcg.CSSW.UseSparseIndirect"),
+	GCSSWUseSparseIndirect,
+	TEXT("Use sparse-tile DispatchIndirect for CSSW simulation passes. Disabled by default to avoid D3D12 ExecuteIndirect failures while opening editor maps."));
 
 #ifdef NUM_THREADS_PER_GROUP_DIMENSION_X
 #undef NUM_THREADS_PER_GROUP_DIMENSION_X
@@ -87,19 +97,19 @@ public:
 	};
 	class FShallowWaterSimStep : SHADER_PERMUTATION_ENUM_CLASS("SWS", EShallowWaterSimStep);
 	class FSplineRange : SHADER_PERMUTATION_BOOL("USESPLINERANGE");
-	using FPermutationDomain = TShaderPermutationDomain<FShallowWaterSimStep, FSplineRange>;
+	class FWaterfallExtentPerm : SHADER_PERMUTATION_ENUM_CLASS("WATERFALL_PERM", EWaterfallExpansion);
+	using FPermutationDomain = TShaderPermutationDomain<FShallowWaterSimStep, FSplineRange, FWaterfallExtentPerm>;
 
-	static TShaderMapRef<FShallowWaterSim> CreatePermutation(EShallowWaterSimStep Permutation, bool UseSplineRange = false)
+	static TShaderMapRef<FShallowWaterSim> CreatePermutation(EShallowWaterSimStep Permutation, bool UseSplineRange = false, EWaterfallExpansion WfExtent = EWaterfallExpansion::Expansion_5)
 	{
 		typename FPermutationDomain PermutationVector;
 		PermutationVector.Set<FSplineRange>(UseSplineRange);
 		PermutationVector.Set<FShallowWaterSimStep>(Permutation);
+		PermutationVector.Set<FWaterfallExtentPerm>(WfExtent);
 		TShaderMapRef<FShallowWaterSim> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PermutationVector);
 		return ComputeShader;
 	}
-	//Declare this class as a global shader
 	DECLARE_GLOBAL_SHADER(FShallowWaterSim);
-	//Tells the engine that this shader uses a structure for its parameters
 	SHADER_USE_PARAMETER_STRUCT(FShallowWaterSim, FGlobalShader);
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, T_SceneDepth)
@@ -117,12 +127,13 @@ public:
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_SmoothHeightA)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_SmoothHeightB)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_ResultSmoothHeight)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RWB_SourceUVRads)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RWB_CompactTileCoords)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RWB_CompactCounter)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_TileMask)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, RWB_SourceUVRads)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RWB_CompactTileCoords)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RWB_CompactCounter)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RWB_CompactIndirectArgs)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, B_CompactTileCoords)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, B_CompactCounter)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, B_CompactTileCoords)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, B_CompactCounter)
 		RDG_BUFFER_ACCESS(CompactIndirectArgs, ERHIAccess::IndirectArgs)
 		SHADER_PARAMETER(int, CloseBound)
 		SHADER_PARAMETER(int, BCount_SourceUVRads)
@@ -131,7 +142,6 @@ public:
 		SHADER_PARAMETER(FVector4f, SourceUVRad)
 		SHADER_PARAMETER(FVector4f, ModifierUVRad)
 		SHADER_PARAMETER(FVector2f, CopyValidUV)
-		// SHADER_PARAMETER(FVector2f, MaxCell)
 		SHADER_PARAMETER(float, DT)
 		SHADER_PARAMETER(float, Friction)
 		SHADER_PARAMETER(float, SeaLevel)
@@ -141,25 +151,21 @@ public:
 		SHADER_PARAMETER_SAMPLER(SamplerState, Sampler)
 	END_SHADER_PARAMETER_STRUCT()
 public:
-	//Called by the engine to determine which permutations to compile for this shader
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
+		const FPermutationDomain PermutationVector(Parameters.PermutationId);
+		const auto Step = PermutationVector.Get<FShallowWaterSimStep>();
+		const auto WfPerm = PermutationVector.Get<FWaterfallExtentPerm>();
+		if (Step != EShallowWaterSimStep::SW_VelocityHeightSim && WfPerm != EWaterfallExpansion::Expansion_5)
+			return false;
 		return true;
 	}
-	//Modifies the compilations environment of the shader
 	static inline void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
 	{
 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-
-		//We're using it here to add some preprocessor defines. That way we don't have to change both C++ and HLSL code 
-		// when we change the value for NUM_THREADS_PER_GROUP_DIMENSION
-		
 		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), NUM_THREADS_PER_GROUP_DIMENSION_X);
 		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Y"), NUM_THREADS_PER_GROUP_DIMENSION_Y);
 		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Z"), NUM_THREADS_PER_GROUP_DIMENSION_Z);
-		// OutEnvironment.SetDefine(TEXT("GENERAL_SHAREGROUP_NAME"), "ShareGroupGeneral");
-		// OutEnvironment.SetDefine(TEXT("CREATE_SHARE_DATA_FUNC"), "CreateFunc");
-		
 		static const TCHAR* ShaderSourceModeDefineName[] =
 		{
 			TEXT("SW_COMPACTACTIVETILES"),
@@ -177,12 +183,11 @@ public:
 		OutEnvironment.SetDefine(ShaderSourceModeDefineName[SourceModeIndex], 1u);
 
 		OutEnvironment.SetDefine(TEXT("MAX_HEIGHT"), 10000);
-		//OutEnvironment.SetDefine(TEXT("FINDPIXELTHREADSIZE"), 256);
-
+		OutEnvironment.SetDefine(TEXT("VELOCITY_CLAMP"), CSSW_VELOCITY_CLAMP);
 		if (PermutationVector.Get<FShallowWaterSimStep>() == EShallowWaterSimStep::SW_VelocityHeightSim)
 		{
 			OutEnvironment.SetDefine(TEXT("CREATE_SHARE_DATA_FUNC"), TEXT("CalVelocityHeight_SmoothData"));
-			OutEnvironment.SetDefine(TEXT("GENERAL_SHAREGROUP_EXTENT"), 5);
+			OutEnvironment.SetDefine(TEXT("GENERAL_SHAREGROUP_EXTENT"), 0);
 		}
 		if (PermutationVector.Get<FShallowWaterSimStep>() == EShallowWaterSimStep::SW_Result)
 		{
@@ -194,6 +199,9 @@ public:
 			OutEnvironment.SetDefine(TEXT("USESPLINERANGE"), 1);
 		}
 
+		constexpr int32 WaterfallExtentLUT[] = { 5, 7, 10 };
+		const int32 WfIdx = FMath::Clamp(static_cast<int32>(PermutationVector.Get<FWaterfallExtentPerm>()), 0, 2);
+		OutEnvironment.SetDefine(TEXT("WATERFALL_EXTENT"), WaterfallExtentLUT[WfIdx]);
 	}
 };
 
@@ -212,16 +220,26 @@ int32 ComputeDispatchExpandPixels(int32 Iteration, int32 TextureResolution)
 using namespace CSHepler;
 ACSShallowWaterCapture::ACSShallowWaterCapture()
 {
+	PrimaryActorTick.bCanEverTick = false;
+	PrimaryActorTick.bStartWithTickEnabled = false;
+
 	SceneComponent = CreateDefaultSubobject<USceneComponent>(TEXT("CaptureRoot"));
-	//SceneComponent->SetupAttachment(GetRootComponent(), TEXT("CaptureRoot"));
 	SetRootComponent(SceneComponent);
 	
 	Box = CreateDefaultSubobject<UBoxComponent>(TEXT("Box"));
 	Box->SetupAttachment(SceneComponent, TEXT("Box"));
 	Box->SetBoxExtent(FVector(50,50,50));
-	VisualizeMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("VisualizationMesh"));
-	VisualizeMesh->BoundsScale = 100;
-	VisualizeMesh->SetupAttachment(SceneComponent, TEXT("VisualizationMesh"));
+	ReusltMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("VisualizationMesh"));
+	ReusltMesh->BoundsScale = 100;
+	ReusltMesh->bVisibleInRayTracing = false;
+	ReusltMesh->SetupAttachment(SceneComponent, TEXT("VisualizationMesh"));
+	SimVisHISM = CreateDefaultSubobject<UHierarchicalInstancedStaticMeshComponent>(TEXT("SimVisHISM"));
+	SimVisHISM->SetupAttachment(SceneComponent, TEXT("SimVisHISM"));
+	SimVisHISM->SetVisibility(false);
+	SimVisHISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	SimVisHISM->SetCastShadow(false);
+	SimVisHISM->bVisibleInRayTracing = false;
+	SimVisHISM->NumCustomDataFloats = 0;
 	CausticsDecal = CreateDefaultSubobject<UDecalComponent>(TEXT("CausticsDecal"));
 	CausticsDecal->SetupAttachment(SceneComponent, TEXT("CausticsDecal"));
 
@@ -238,16 +256,270 @@ ACSShallowWaterCapture::ACSShallowWaterCapture()
 	
 }
 
+void ACSShallowWaterCapture::ClearSolverTimer()
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(SolverTimerHandle);
+	}
+	SolverTimerHandle.Invalidate();
+}
+
+bool ACSShallowWaterCapture::IsSolverTimerActive() const
+{
+	if (UWorld* World = GetWorld())
+	{
+		return World->GetTimerManager().TimerExists(SolverTimerHandle);
+	}
+	return SolverTimerHandle.IsValid();
+}
+
+void ACSShallowWaterCapture::ScheduleSolverTimerTick()
+{
+	if (IsActorBeingDestroyed())
+	{
+		ClearSolverTimer();
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		ClearSolverTimer();
+		return;
+	}
+
+	const int32 ExpectedSolverReadbackGeneration = SolverReadbackGeneration;
+	FTimerDelegate SolverTimerDelegate = FTimerDelegate::CreateWeakLambda(this, [this, ExpectedSolverReadbackGeneration]()
+	{
+		HandleSolverTimerTick(ExpectedSolverReadbackGeneration);
+	});
+
+	if (SolverTimerRate > 0.0f)
+	{
+		World->GetTimerManager().SetTimer(SolverTimerHandle, SolverTimerDelegate, SolverTimerRate, false);
+	}
+	else
+	{
+		SolverTimerHandle = World->GetTimerManager().SetTimerForNextTick(SolverTimerDelegate);
+	}
+}
+
+void ACSShallowWaterCapture::HandleSolverTimerTick(int32 ExpectedSolverReadbackGeneration)
+{
+	if (ExpectedSolverReadbackGeneration != SolverReadbackGeneration || IsActorBeingDestroyed())
+	{
+		return;
+	}
+
+	if (ExpectedSolverReadbackGeneration == SolverReadbackGeneration && !IsActorBeingDestroyed())
+	{
+		ScheduleSolverTimerTick();
+	}
+	ShallowWaterSolverSoucePoint(Iteration);
+}
+
+void ACSShallowWaterCapture::StopSimulationRuntime(bool bResetVisualization)
+{
+	ClearSolverTimer();
+	bCaptureNextSolverFrame = false;
+	ResetSolverReadbackState(true, false);
+
+	if (bResetVisualization)
+	{
+		bSimVisActive = false;
+		if (SimVisHISM)
+		{
+			ResetSimVisTiles();
+			SimVisHISM->SetVisibility(false);
+		}
+		if (ReusltMesh)
+		{
+			ReusltMesh->SetVisibility(true);
+		}
+	}
+}
+
+void ACSShallowWaterCapture::UpdateSimulationPreviewMesh()
+{
+	if (!ReusltMesh) return;
+
+	if (SimulationPreviewMesh && ReusltMesh->GetStaticMesh() != SimulationPreviewMesh)
+	{
+		ReusltMesh->SetStaticMesh(SimulationPreviewMesh);
+	}
+
+	ReusltMesh->SetRelativeScale3D(FVector::OneVector * CaptureSize / 100);
+
+	if (SimulationWaterMaterial)
+	{
+		WaterMaterial = SimulationWaterMaterial;
+	}
+	if (WaterMaterial)
+	{
+		ReusltMesh->SetMaterial(0, WaterMaterial);
+	}
+
+	if (SimulationDecalMaterial)
+	{
+		DecalMaterial = SimulationDecalMaterial;
+	}
+	if (CausticsDecal && DecalMaterial)
+	{
+		CausticsDecal->SetDecalMaterial(DecalMaterial);
+	}
+
+	ReusltMesh->MarkRenderStateDirty();
+}
+
+bool ACSShallowWaterCapture::EnsureSimVisHISMReady()
+{
+	if (!SimVisHISM) return false;
+
+	if (!SimVisHISM->GetStaticMesh())
+	{
+		UStaticMesh* PreviewMesh = SimulationPreviewMesh;
+		if (!PreviewMesh && ReusltMesh)
+		{
+			PreviewMesh = ReusltMesh->GetStaticMesh();
+		}
+		if (!PreviewMesh && DebugMesh)
+		{
+			PreviewMesh = DebugMesh;
+		}
+		if (!PreviewMesh) return false;
+
+		SimVisHISM->SetStaticMesh(PreviewMesh);
+		if (WaterMaterial)
+		{
+			SimVisHISM->SetMaterial(0, WaterMaterial);
+		}
+	}
+
+	SimVisHISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	SimVisHISM->SetCastShadow(false);
+	SimVisHISM->SetVisibility(bSimVisActive);
+	return true;
+}
+
+void ACSShallowWaterCapture::ResetSimVisTiles()
+{
+	if (SimVisHISM)
+	{
+		SimVisHISM->ClearInstances();
+		SimVisHISM->BuildTreeIfOutdated(false, true);
+		SimVisHISM->MarkRenderStateDirty();
+	}
+	ISMTileSlots.Reset();
+	CachedTileBits.Reset();
+	CachedActiveTileCount = 0;
+}
+
+void ACSShallowWaterCapture::ResetSolverReadbackState(bool bAdvanceGeneration, bool bClearCachedResult)
+{
+	if (bAdvanceGeneration)
+	{
+		SolverReadbackGeneration++;
+		if (SolverReadbackGeneration <= 0)
+		{
+			SolverReadbackGeneration = 1;
+		}
+	}
+
+	TileMaskReadbackWriteIdx = 0;
+	ResultReadbackWriteIdx = 0;
+	TileMaskReadbackWidth = 0;
+	TileMaskReadbackHeight = 0;
+	LastSolverFrameNumber = 0;
+	for (int32 i = 0; i < ReadbackBufferCount; i++)
+	{
+		TileMaskReadbackCopyWidth[i] = 0;
+		TileMaskReadbackCopyHeight[i] = 0;
+		TileMaskReadbackGeneration[i] = 0;
+		ResultReadbackCopyWidth[i] = 0;
+		ResultReadbackCopyHeight[i] = 0;
+		ResultReadbackGeneration[i] = 0;
+	}
+	if (bClearCachedResult)
+	{
+		CachedResultPixels.Reset();
+		CachedResultWidth = 0;
+		CachedResultHeight = 0;
+	}
+}
+
+bool ACSShallowWaterCapture::ShouldTickIfViewportsOnly() const
+{
+	return false;
+}
+
+void ACSShallowWaterCapture::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+}
+
+void ACSShallowWaterCapture::PostLoad()
+{
+	Super::PostLoad();
+
+	StopSimulationRuntime(true);
+
+	if (!SimVisHISM)
+	{
+		SimVisHISM = FindComponentByClass<UHierarchicalInstancedStaticMeshComponent>();
+		if (!SimVisHISM)
+		{
+			SimVisHISM = NewObject<UHierarchicalInstancedStaticMeshComponent>(this, TEXT("SimVisHISM"));
+			SimVisHISM->SetupAttachment(SceneComponent);
+			if (!HasAnyFlags(RF_ClassDefaultObject))
+			{
+				SimVisHISM->RegisterComponent();
+			}
+		}
+		SimVisHISM->SetVisibility(false);
+		SimVisHISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		SimVisHISM->SetCastShadow(false);
+		SimVisHISM->bVisibleInRayTracing = false;
+		SimVisHISM->NumCustomDataFloats = 0;
+		UE_LOG(LogTemp, Warning, TEXT("ACSShallowWaterCapture::PostLoad - Recreated SimVisHISM for %s"), *GetName());
+	}
+}
+
+void ACSShallowWaterCapture::BeginPlay()
+{
+	Super::BeginPlay();
+
+	StopSimulationRuntime(true);
+	SetActorTickEnabled(false);
+}
 
 void ACSShallowWaterCapture::OnConstruction(const FTransform& Transform)
 {
 	Super::OnConstruction(Transform);
-	ConstructionComponent();
+
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(ConstructionDebounceHandle);
+		World->GetTimerManager().SetTimer(ConstructionDebounceHandle,
+			FTimerDelegate::CreateWeakLambda(this, [this]() { ConstructionComponent(); }),
+			0.01f, false);
+	}
+	else
+	{
+		ConstructionComponent();
+	}
 }
 
 
 void ACSShallowWaterCapture::ConstructionComponent()
 {
+	const bool bRestartSolverAfterConstruction = IsSolverTimerActive();
+	if (bRestartSolverAfterConstruction)
+	{
+		ClearSolverTimer();
+	}
+
+	Clean();
 	FVector RelativeScale = FVector(CaptureSceneDepth->OrthoWidth / 100, CaptureSceneDepth->OrthoWidth / 100, MaxHeight / 100);
 	Box->SetRelativeScale3D(RelativeScale);
 	Box->SetRelativeLocation(FVector(0, 0, Scale3DZ * 50));
@@ -262,24 +534,73 @@ void ACSShallowWaterCapture::ConstructionComponent()
 	CaptureSceneDepth->SetRelativeLocation(FVector(0, 0, MaxHeight));
 	CaptureSceneDepth->OrthoWidth = CaptureSize;
 	CaptureSceneDepth->HiddenActors = {this};
-	TextureSize = CaptureSize / WorldPixelSize;
-	VisualizeMesh->SetRelativeScale3D(FVector::OneVector * CaptureSize / 100);
-	VisualizeMesh->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
+	TextureSize = FMath::RoundUpToPowerOfTwo(FMath::Max(16, FMath::CeilToInt32(CaptureSize / WorldPixelSize)));
+	if (bUseBakedResultMesh && BakedResultMesh)
+	{
+		ReusltMesh->SetStaticMesh(BakedResultMesh);
+		ReusltMesh->SetRelativeScale3D(FVector::OneVector);
+		ReusltMesh->MarkRenderStateDirty();
+	}
+	else
+	{
+		UpdateSimulationPreviewMesh();
+	}
+	ReusltMesh->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
+
+	const FVector Loc = GetActorLocation();
+	SimUVCenter = FVector2D(Loc.X, Loc.Y);
+	SimUVSize = CaptureSize;
+	SimUVInvSize = CaptureSize > 0.f ? 1.f / CaptureSize : 0.f;
 
 	SetActorScale3D(FVector::OneVector);
 
-	// CheckAndCreateTexture_SWSourcePoint();
+	if (bRestartSolverAfterConstruction)
+	{
+		ScheduleSolverTimerTick();
+	}
+	else
+	{
+		ClearSolverTimer();
+	}
+}
 
+void ACSShallowWaterCapture::PreSave(FObjectPreSaveContext ObjectSaveContext)
+{
+	StopSimulationRuntime(true);
+	Super::PreSave(ObjectSaveContext);
+}
+
+void ACSShallowWaterCapture::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	StopSimulationRuntime(true);
+	Super::EndPlay(EndPlayReason);
 }
 
 void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 {
+	if (bUseBakedResultMesh)
+	{
+		UseSimulationResultMesh();
+	}
+
+	if (GFrameCounter == LastSolverFrameNumber) return;
+	LastSolverFrameNumber = GFrameCounter;
+
 	if (!CheckAndCreateTexture_SWSourcePoint()) return;
 
 	SCOPE_CYCLE_COUNTER(STAT_CSSW_Execute);
 
+	const FVector Loc = GetActorLocation();
+	SimUVCenter = FVector2D(Loc.X, Loc.Y);
+	SimUVSize = CaptureSize;
+	SimUVInvSize = CaptureSize > 0.f ? 1.f / CaptureSize : 0.f;
+
 	TArray<FVector4> SourceData = GetSources();
-	if (SourceData.Num() == 0) return;
+	if (SourceData.Num() == 0)
+	{
+		ResetSimVisTiles();
+		return;
+	}
 
 	bool bDoCapture = bCaptureNextSolverFrame;
 	if (bDoCapture)
@@ -295,9 +616,7 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 			UE_LOG(LogTemp, Warning, TEXT("[CSSW] RenderDoc not loaded. Launch editor with -RenderDoc flag. Capture request preserved."));
 		}
 	}
- 
-	// CleanupAttachedActors();
-	
+
 	TArray<FVector4f> SourceUVRads;
 	FBoxSphereBounds Bounds = Box->Bounds;
 	FVector ActorLocation = GetActorLocation();
@@ -310,11 +629,6 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 		FVector SourceUV = RelativeSourceLocation / ( Bounds.BoxExtent * 2 );
 		FVector4f SourceUVRad = FVector4f( SourceUV.X, SourceUV.Y, SourceLocation.Z, PerSourceData.W);
 		SourceUVRads.Add(SourceUVRad);
-	}
-
-	if (bAutoCapture)
-	{
-		CaptureSceneDepthNow();
 	}
 	
 	RT_SceneDepth->ResizeTarget(TextureSize, TextureSize);
@@ -330,10 +644,280 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 	FTextureRenderTargetResource* R_ResultVelHeight = RT_ResultVelHeight->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_ResultDepthWet = RT_ResultDepthWet->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_ResultSmoothHeight = RT_SmoothHeight->GameThread_GetRenderTargetResource();
-	
+
+	const int32 TileMaskWidth = FMath::DivideAndRoundUp((int32)TextureSize, NUM_THREADS_PER_GROUP_DIMENSION_X);
+	const int32 TileMaskHeight = FMath::DivideAndRoundUp((int32)TextureSize, NUM_THREADS_PER_GROUP_DIMENSION_Y);
+	if (!RT_TileMask)
+	{
+		RT_TileMask = NewObject<UTextureRenderTarget2D>(this);
+	}
+
+	const bool bNeedsTileMaskResourceRebuild =
+		RT_TileMask->SizeX != TileMaskWidth ||
+		RT_TileMask->SizeY != TileMaskHeight ||
+		RT_TileMask->RenderTargetFormat != ETextureRenderTargetFormat::RTF_RGBA16f ||
+		!RT_TileMask->bCanCreateUAV;
+
+	RT_TileMask->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA16f;
+	RT_TileMask->bCanCreateUAV = true;
+	RT_TileMask->ClearColor = FLinearColor::Black;
+
+	if (bNeedsTileMaskResourceRebuild)
+	{
+		RT_TileMask->InitAutoFormat(TileMaskWidth, TileMaskHeight);
+		RT_TileMask->UpdateResourceImmediate(true);
+	}
+	FTextureRenderTargetResource* R_TileMask = RT_TileMask->GameThread_GetRenderTargetResource();
+
+	TileMaskReadbackWidth = TileMaskWidth;
+	TileMaskReadbackHeight = TileMaskHeight;
+
+	auto ApplySimVisTiles = [&](const TArray<uint8>& NewTileBits, int32 ISMTileCountX, int32 ISMTileCountY)
+	{
+		if (!IsSolverTimerActive() || !EnsureSimVisHISMReady() || ISMTileCountX <= 0 || ISMTileCountY <= 0)
+		{
+			return;
+		}
+
+		const int32 TotalSlots = ISMTileCountX * ISMTileCountY;
+		const bool bInstanceCountMatchesCache = SimVisHISM->GetInstanceCount() == CachedActiveTileCount;
+		if (NewTileBits.Num() != TotalSlots)
+		{
+			return;
+		}
+
+		TArray<uint8> StableTileBits = NewTileBits;
+		if (CachedTileBits.Num() == TotalSlots)
+		{
+			for (int32 Slot = 0; Slot < TotalSlots; Slot++)
+			{
+				StableTileBits[Slot] = StableTileBits[Slot] || CachedTileBits[Slot] ? 1 : 0;
+			}
+		}
+
+		if (bInstanceCountMatchesCache && StableTileBits == CachedTileBits)
+		{
+			return;
+		}
+
+		SCOPE_CYCLE_COUNTER(STAT_CSSW_ISMUpdate);
+		CachedTileBits = StableTileBits;
+
+		const float TileWorldSize = CaptureSize / (float)ISMTileCountX;
+		const float HalfCapture = CaptureSize * 0.5f;
+		const FVector ActiveScale(TileWorldSize / 100.0f, TileWorldSize / 100.0f, 1.0f);
+
+		SimVisHISM->ClearInstances();
+		ISMTileSlots.Reset();
+
+		TArray<FTransform> TransformsToAdd;
+		for (int32 Slot = 0; Slot < TotalSlots; Slot++)
+		{
+			if (!StableTileBits[Slot]) continue;
+			ISMTileSlots.Add(Slot);
+			const int32 TX = Slot % ISMTileCountX;
+			const int32 TY = Slot / ISMTileCountX;
+			const float CenterX = (TX + 0.5f) * TileWorldSize - HalfCapture;
+			const float CenterY = (TY + 0.5f) * TileWorldSize - HalfCapture;
+			TransformsToAdd.Emplace(FQuat::Identity, FVector(CenterX, CenterY, 0.0f), ActiveScale);
+		}
+
+		if (TransformsToAdd.Num() > 0)
+		{
+			SimVisHISM->AddInstances(TransformsToAdd, false, false);
+		}
+
+		CachedActiveTileCount = ISMTileSlots.Num();
+		SimVisHISM->BuildTreeIfOutdated(false, true);
+		SimVisHISM->MarkRenderStateDirty();
+		SimVisHISM->SetVisibility(true);
+		if (ReusltMesh)
+		{
+			ReusltMesh->SetVisibility(false);
+		}
+	};
+
+	auto BuildSourceFallbackTiles = [&](int32 ISMTileCountX, int32 ISMTileCountY)
+	{
+		TArray<uint8> FallbackTileBits;
+		const int32 TotalSlots = ISMTileCountX * ISMTileCountY;
+		if (TotalSlots <= 0)
+		{
+			return FallbackTileBits;
+		}
+
+		FallbackTileBits.SetNumZeroed(TotalSlots);
+		const float TileWorldSize = CaptureSize / (float)ISMTileCountX;
+		const float HalfCapture = CaptureSize * 0.5f;
+		const FVector ActorLoc = GetActorLocation();
+
+		for (const FVector4& Src : SourceData)
+		{
+			const float LocalX = (float)(Src.X - ActorLoc.X);
+			const float LocalY = (float)(Src.Y - ActorLoc.Y);
+			const float Range = FMath::Max((float)Src.W * 3.0f, TileWorldSize);
+
+			const int32 MinTXi = FMath::Clamp(FMath::FloorToInt32((LocalX - Range + HalfCapture) / TileWorldSize), 0, ISMTileCountX - 1);
+			const int32 MaxTXi = FMath::Clamp(FMath::FloorToInt32((LocalX + Range + HalfCapture) / TileWorldSize), 0, ISMTileCountX - 1);
+			const int32 MinTYi = FMath::Clamp(FMath::FloorToInt32((LocalY - Range + HalfCapture) / TileWorldSize), 0, ISMTileCountY - 1);
+			const int32 MaxTYi = FMath::Clamp(FMath::FloorToInt32((LocalY + Range + HalfCapture) / TileWorldSize), 0, ISMTileCountY - 1);
+
+			for (int32 TY = MinTYi; TY <= MaxTYi; TY++)
+			{
+				for (int32 TX = MinTXi; TX <= MaxTXi; TX++)
+				{
+					FallbackTileBits[TY * ISMTileCountX + TX] = 1;
+				}
+			}
+		}
+
+		return FallbackTileBits;
+	};
+
+	constexpr int32 SimVisSubsampleFactor = 2;
+	const int32 FallbackTileCountX = FMath::DivideAndRoundUp(TileMaskWidth, SimVisSubsampleFactor);
+	const int32 FallbackTileCountY = FMath::DivideAndRoundUp(TileMaskHeight, SimVisSubsampleFactor);
+	const int32 TileMaskReadIdx = 1 - TileMaskReadbackWriteIdx;
+	bool bAppliedSimVisThisFrame = false;
+
+	if (IsSolverTimerActive() && TileMaskReadbackGeneration[TileMaskReadIdx] == SolverReadbackGeneration && EnsureSimVisHISMReady() && TileMaskReadback[TileMaskReadIdx] && TileMaskReadback[TileMaskReadIdx]->IsReady())
+	{
+		SCOPE_CYCLE_COUNTER(STAT_CSSW_TileReadback);
+
+		int32 RowPitchInPixels = 0;
+		int32 ReadbackBufferHeight = 0;
+		const FFloat16Color* ReadbackData = static_cast<const FFloat16Color*>(TileMaskReadback[TileMaskReadIdx]->Lock(RowPitchInPixels, &ReadbackBufferHeight));
+
+		const int32 ReadbackWidth = TileMaskReadbackCopyWidth[TileMaskReadIdx] > 0 ? TileMaskReadbackCopyWidth[TileMaskReadIdx] : TileMaskReadbackWidth;
+		const int32 ReadbackHeight = TileMaskReadbackCopyHeight[TileMaskReadIdx] > 0 ? TileMaskReadbackCopyHeight[TileMaskReadIdx] : TileMaskReadbackHeight;
+		const int32 ISMTileCountX = FMath::DivideAndRoundUp(FMath::Max(ReadbackWidth, 0), SimVisSubsampleFactor);
+		const int32 ISMTileCountY = FMath::DivideAndRoundUp(FMath::Max(ReadbackHeight, 0), SimVisSubsampleFactor);
+		const int32 TotalSlots = ISMTileCountX * ISMTileCountY;
+		bool bUsedReadbackData = false;
+
+		if (ReadbackData && RowPitchInPixels >= ReadbackWidth && ReadbackBufferHeight >= ReadbackHeight && TotalSlots > 0)
+		{
+			TArray<uint8> NewTileBits;
+			NewTileBits.SetNumZeroed(TotalSlots);
+
+			for (int32 TY = 0; TY < ISMTileCountY; TY++)
+			{
+				for (int32 TX = 0; TX < ISMTileCountX; TX++)
+				{
+					bool bActive = false;
+					for (int32 DY = 0; DY < SimVisSubsampleFactor && !bActive; DY++)
+					{
+						for (int32 DX = 0; DX < SimVisSubsampleFactor && !bActive; DX++)
+						{
+							const int32 X = TX * SimVisSubsampleFactor + DX;
+							const int32 Y = TY * SimVisSubsampleFactor + DY;
+							if (X < ReadbackWidth && Y < ReadbackHeight)
+							{
+								if (ReadbackData[Y * RowPitchInPixels + X].R.GetFloat() > 0.5f)
+									bActive = true;
+							}
+						}
+					}
+					NewTileBits[TY * ISMTileCountX + TX] = bActive ? 1 : 0;
+				}
+			}
+
+			const TArray<uint8> SourceFallbackBits = BuildSourceFallbackTiles(ISMTileCountX, ISMTileCountY);
+			if (SourceFallbackBits.Num() == NewTileBits.Num())
+			{
+				for (int32 Slot = 0; Slot < TotalSlots; Slot++)
+				{
+					NewTileBits[Slot] = NewTileBits[Slot] || SourceFallbackBits[Slot] ? 1 : 0;
+				}
+			}
+
+			ApplySimVisTiles(NewTileBits, ISMTileCountX, ISMTileCountY);
+			bAppliedSimVisThisFrame = true;
+			bUsedReadbackData = true;
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[CSSW] TileMask readback invalid. Data=%s Pitch=%d BufferH=%d Expected=%dx%d. Using fallback sim-vis tiles."),
+				ReadbackData ? TEXT("Valid") : TEXT("Null"),
+				RowPitchInPixels,
+				ReadbackBufferHeight,
+				ReadbackWidth,
+				ReadbackHeight);
+		}
+
+		if (!bUsedReadbackData && CachedTileBits.Num() == 0 && TotalSlots > 0)
+		{
+			ApplySimVisTiles(BuildSourceFallbackTiles(ISMTileCountX, ISMTileCountY), ISMTileCountX, ISMTileCountY);
+			bAppliedSimVisThisFrame = true;
+		}
+		if (ReadbackData)
+		{
+			TileMaskReadback[TileMaskReadIdx]->Unlock();
+		}
+	}
+	if (IsSolverTimerActive() && !bAppliedSimVisThisFrame && FallbackTileCountX > 0 && FallbackTileCountY > 0)
+	{
+		ApplySimVisTiles(BuildSourceFallbackTiles(FallbackTileCountX, FallbackTileCountY), FallbackTileCountX, FallbackTileCountY);
+	}
+
+	const int32 ResultReadIdx = 1 - ResultReadbackWriteIdx;
+	if (ResultReadbackGeneration[ResultReadIdx] == SolverReadbackGeneration && ResultReadback[ResultReadIdx] && ResultReadback[ResultReadIdx]->IsReady())
+	{
+		int32 RowPitch = 0;
+		int32 ReadbackBufferHeight = 0;
+		const FFloat16Color* Data = static_cast<const FFloat16Color*>(ResultReadback[ResultReadIdx]->Lock(RowPitch, &ReadbackBufferHeight));
+		if (Data && RowPitch > 0)
+		{
+			const int32 W = ResultReadbackCopyWidth[ResultReadIdx] > 0 ? ResultReadbackCopyWidth[ResultReadIdx] : (int32)TextureSize;
+			const int32 H = ResultReadbackCopyHeight[ResultReadIdx] > 0 ? ResultReadbackCopyHeight[ResultReadIdx] : (int32)TextureSize;
+			if (W > 0 && H > 0 && RowPitch >= W && ReadbackBufferHeight >= H)
+			{
+				CachedResultWidth = W;
+				CachedResultHeight = H;
+				CachedResultPixels.SetNumUninitialized(W * H);
+				for (int32 Y = 0; Y < H; Y++)
+				{
+					FMemory::Memcpy(&CachedResultPixels[Y * W], &Data[Y * RowPitch], W * sizeof(FFloat16Color));
+				}
+			}
+		}
+		if (Data)
+		{
+			ResultReadback[ResultReadIdx]->Unlock();
+		}
+	}
+
 	InIteration = FMath::Max(InIteration, 1);
+	const int32 TileWriteIdx = TileMaskReadbackWriteIdx;
+	const int32 ResultWriteIdx = ResultReadbackWriteIdx;
+	TileMaskReadbackCopyWidth[TileWriteIdx] = TileMaskWidth;
+	TileMaskReadbackCopyHeight[TileWriteIdx] = TileMaskHeight;
+	TileMaskReadbackGeneration[TileWriteIdx] = SolverReadbackGeneration;
+	ResultReadbackCopyWidth[ResultWriteIdx] = (int32)TextureSize;
+	ResultReadbackCopyHeight[ResultWriteIdx] = (int32)TextureSize;
+	ResultReadbackGeneration[ResultWriteIdx] = SolverReadbackGeneration;
+	const bool bUseSparseIndirect = GCSSWUseSparseIndirect != 0;
+	const EWaterfallExpansion CapturedWaterfallExpansionIterations = WaterfallExpansionIterations;
+	const float CapturedDT = DT;
+	const float CapturedFriction = Friction;
+	const float CapturedSeaLevel = SeaLevel;
+	const float CapturedAdvectFoam = AdvectFoam;
+	const float CapturedFoamFadeSpeed = FoamFadeSpeed;
+	const int32 CapturedCloseBound = CloseBound;
+	const int32 CapturedInIteration = InIteration;
+	if (!TileMaskReadback[TileWriteIdx])
+		TileMaskReadback[TileWriteIdx] = new FRHIGPUTextureReadback(TEXT("TileMaskReadback"));
+	if (!ResultReadback[ResultWriteIdx])
+		ResultReadback[ResultWriteIdx] = new FRHIGPUTextureReadback(TEXT("ResultReadback"));
+	FRHIGPUTextureReadback* TileMaskReadbackForRender = TileMaskReadback[TileWriteIdx];
+	FRHIGPUTextureReadback* ResultReadbackForRender = ResultReadback[ResultWriteIdx];
+
 	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	[=, this ](FRHICommandListImmediate& RHICmdList)
+	[R_SceneDepth, R_DebugView, R_VelocityHeight, R_ResultVelHeight, R_ResultDepthWet, R_ResultSmoothHeight, R_TileMask,
+	 SourceUVRads = MoveTemp(SourceUVRads), bDoCapture, bUseSparseIndirect, CapturedWaterfallExpansionIterations,
+	 CapturedDT, CapturedFriction, CapturedSeaLevel, ActorLocation, CapturedAdvectFoam, CapturedFoamFadeSpeed,
+	 CapturedCloseBound, CapturedInIteration, TileMaskWidth, TileMaskHeight, TileMaskReadbackForRender,
+	 ResultReadbackForRender](FRHICommandListImmediate& RHICmdList)
 	{
 #if PLATFORM_WINDOWS
 		if (bDoCapture && GRenderDocAPI) GRenderDocAPI->StartFrameCapture(nullptr, nullptr);
@@ -345,11 +929,12 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 			float SizeX = R_SceneDepth->GetSizeXY().X;
 			float SizeY = R_SceneDepth->GetSizeXY().Y;
 			FIntPoint TextureSize = FIntPoint(SizeX, SizeY);
+			const ERDGPassFlags ComputePassFlags = ERDGPassFlags::Compute;
 
 			TShaderMapRef<FShallowWaterSim> ComputeShader_CompactActiveTiles = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_CompactActiveTiles);
 			TShaderMapRef<FShallowWaterSim> ComputeShader_FinalizeCompact = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_FinalizeCompact);
 			TShaderMapRef<FShallowWaterSim> ComputeShader_CalSmoothHeight = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_SmoothHeight);
-			TShaderMapRef<FShallowWaterSim> ComputeShader_CalVelocityHeight = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_VelocityHeightSim);
+			TShaderMapRef<FShallowWaterSim> ComputeShader_CalVelocityHeight = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_VelocityHeightSim, false, CapturedWaterfallExpansionIterations);
 			TShaderMapRef<FShallowWaterSim> ComputeShader_CalShallowIntegrate = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_ShallowIntegrate);
 			TShaderMapRef<FShallowWaterSim> ComputeShader_CalResult = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_Result);
 			
@@ -371,21 +956,35 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 			CREATE_RDG(SceneDepth)
 			CREATE_RDG(VelocityHeight)
 			
-			CREATE_UAVB_32(SourceUVRads)
+			CREATE_RDG_STRUCTURED_UPLOAD_SRV(SourceUVRads, FVector4f, SourceUVRads, TEXT("SourceUVRads"))
 
-			FCompactTileBuffers CompactBuffers = CreateCompactTileBuffers(
+			FCompactTileBuffers CompactBuffers = bUseSparseIndirect
+				? CreateCompactTileBuffers(
+					GraphBuilder, (uint32)SizeX, (uint32)SizeY,
+					NUM_THREADS_PER_GROUP_DIMENSION_X, NUM_THREADS_PER_GROUP_DIMENSION_Y)
+				: CreateFullScreenCompactTileBuffers(
+					GraphBuilder, (uint32)SizeX, (uint32)SizeY,
+					NUM_THREADS_PER_GROUP_DIMENSION_X, NUM_THREADS_PER_GROUP_DIMENSION_Y);
+			FCompactTileBuffers VisualTileMaskBuffers = CreateCompactTileBuffers(
 				GraphBuilder, (uint32)SizeX, (uint32)SizeY,
 				NUM_THREADS_PER_GROUP_DIMENSION_X, NUM_THREADS_PER_GROUP_DIMENSION_Y);
+			const FIntVector SimTileGroupCount((int32)CompactBuffers.MaxTileCount, 1, 1);
 
-			PassParameters->DT = DT;
-			PassParameters->Friction = Friction;
-			PassParameters->SeaLevel = SeaLevel;
+			FRDGTextureRef TRDG_TileMask = nullptr;
+			FRDGTextureUAVRef RDGUAV_TileMask = nullptr;
+			ConvertToUVATextureFormat(GraphBuilder, TRDG_TileMask, RDGUAV_TileMask, FIntPoint(TileMaskWidth, TileMaskHeight), PF_FloatRGBA, TEXT("UAV_TileMask"), FLinearColor::Black);
+			FRDGTextureRef RDG_TileMask = RegisterExternalTexture(GraphBuilder, R_TileMask->GetRenderTargetTexture(), TEXT("TileMask_RT"));
+
+			PassParameters->DT = CapturedDT;
+			PassParameters->Friction = CapturedFriction;
+			PassParameters->SeaLevel = CapturedSeaLevel;
 			PassParameters->ActorLocationZ = ActorLocation.Z;
-			PassParameters->AdvectFoam = AdvectFoam;
-			PassParameters->FoamFadeSpeed = FoamFadeSpeed;
-			PassParameters->CloseBound = CloseBound;
+			PassParameters->AdvectFoam = CapturedAdvectFoam;
+			PassParameters->FoamFadeSpeed = CapturedFoamFadeSpeed;
+			PassParameters->CloseBound = CapturedCloseBound;
 			PassParameters->BCount_SourceUVRads = SourceUVRads.Num();
-			PassParameters->DispatchExpandPixels = ComputeDispatchExpandPixels(InIteration, TextureSize.X);
+			PassParameters->RWB_SourceUVRads = SourceUVRadsSRV;
+			PassParameters->DispatchExpandPixels = ComputeDispatchExpandPixels(CapturedInIteration, TextureSize.X);
 			BindCompactTileBuffers(PassParameters, CompactBuffers);
 			PassParameters->Sampler	= TStaticSamplerState<SF_Bilinear>::GetRHI();
 
@@ -394,40 +993,40 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 			AddCopyTexturePass(GraphBuilder, RDG_ResultVelHeight, TRDG_ResultVelHeight, FRHICopyTextureInfo());
 			AddCopyTexturePass(GraphBuilder, RDG_ResultDepthWet, TRDG_ResultDepthWet, FRHICopyTextureInfo());
 
-			// --- Compact active tiles ---
-			ResetCompactCounter(GraphBuilder, CompactBuffers);
 			const FIntVector FullTileGroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(SizeX, SizeY, 1), FIntVector(NUM_THREADS_PER_GROUP_DIMENSION_X, NUM_THREADS_PER_GROUP_DIMENSION_Y, 1));
+			if (bUseSparseIndirect)
 			{
+				ResetCompactCounter(GraphBuilder, CompactBuffers);
+
 				FShallowWaterSim::FParameters* CompactPassParameters = GraphBuilder.AllocParameters<FShallowWaterSim::FParameters>();
 				*CompactPassParameters = *PassParameters;
 				CompactPassParameters->B_CompactTileCoords = nullptr;
 				CompactPassParameters->B_CompactCounter = nullptr;
 				CompactPassParameters->CompactIndirectArgs = nullptr;
 				CompactPassParameters->RWB_CompactIndirectArgs = nullptr;
-				GraphBuilder.AddPass(
+				CompactPassParameters->RW_TileMask = RDGUAV_TileMask;
+				FComputeShaderUtils::AddPass(
+					GraphBuilder,
 					RDG_EVENT_NAME("CompactActiveTiles"),
+					ComputePassFlags,
+					ComputeShader_CompactActiveTiles,
 					CompactPassParameters,
-					ERDGPassFlags::AsyncCompute,
-					[CompactPassParameters, ComputeShader_CompactActiveTiles, FullTileGroupCount](FRHIComputeCommandList& RHICmdList)
-					{
-						FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_CompactActiveTiles, *CompactPassParameters, FullTileGroupCount);
-					});
-			}
-			{
+					FullTileGroupCount);
+
 				FShallowWaterSim::FParameters* FinalizeCompactPassParameters = GraphBuilder.AllocParameters<FShallowWaterSim::FParameters>();
 				*FinalizeCompactPassParameters = *PassParameters;
 				NullifyAllCompactTileBindings(FinalizeCompactPassParameters);
 				FinalizeCompactPassParameters->RWB_CompactCounter = CompactBuffers.CounterUAV;
 				FinalizeCompactPassParameters->RWB_CompactIndirectArgs = CompactBuffers.IndirectArgsUAV;
-				GraphBuilder.AddPass(
+				FComputeShaderUtils::AddPass(
+					GraphBuilder,
 					RDG_EVENT_NAME("FinalizeCompact"),
+					ComputePassFlags,
+					ComputeShader_FinalizeCompact,
 					FinalizeCompactPassParameters,
-					ERDGPassFlags::AsyncCompute,
-					[FinalizeCompactPassParameters, ComputeShader_FinalizeCompact, SingleGroupCount](FRHIComputeCommandList& RHICmdList)
-					{
-						FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_FinalizeCompact, *FinalizeCompactPassParameters, SingleGroupCount);
-					});
+					SingleGroupCount);
 			}
+
 
 			FRDGTextureRef CurrentVelHeightTextureA = TRDG_VelHeightSimA;
 			FRDGTextureRef CurrentVelHeightTextureB = TRDG_VelHeightSimB;
@@ -438,11 +1037,7 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 			FRDGTextureUAVRef CurrentSmoothHeightA = RDGUAV_SmoothHeightA;
 			FRDGTextureUAVRef CurrentSmoothHeightB = RDGUAV_SmoothHeightB;
 
-			FRDGTextureUAVRef VelUAVs[2] = { RDGUAV_VelHeightSimA, RDGUAV_VelHeightSimB };
-			FRDGTextureUAVRef SmoothUAVs[2] = { RDGUAV_SmoothHeightA, RDGUAV_SmoothHeightB };
-			int32 ReadIdx = 0;
-			int32 WriteIdx = 1;
-			for (int32 i = 0 ; i < InIteration; i++)
+			for (int32 i = 0 ; i < CapturedInIteration; i++)
 			{
 				FShallowWaterSim::FParameters* VelocityHeightPassParameters = GraphBuilder.AllocParameters<FShallowWaterSim::FParameters>();
 				*VelocityHeightPassParameters = *PassParameters;
@@ -451,19 +1046,27 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 				VelocityHeightPassParameters->RW_SmoothHeightA = CurrentSmoothHeightA;
 				VelocityHeightPassParameters->RW_SmoothHeightB = CurrentSmoothHeightB;
 				NullifyCompactTileUAVs(VelocityHeightPassParameters);
-				GraphBuilder.AddPass(
-					RDG_EVENT_NAME("CalVelocityHeight"),
-					VelocityHeightPassParameters,
-					ERDGPassFlags::AsyncCompute,
-					[VelocityHeightPassParameters, ComputeShader_CalVelocityHeight](FRHIComputeCommandList& RHICmdList)
-					{
-						FComputeShaderUtils::DispatchIndirect(
-							RHICmdList,
-							ComputeShader_CalVelocityHeight,
-							*VelocityHeightPassParameters,
-							VelocityHeightPassParameters->CompactIndirectArgs->GetIndirectRHICallBuffer(),
-							0);
-					});
+				if (bUseSparseIndirect)
+				{
+					FComputeShaderUtils::AddPass(
+						GraphBuilder,
+						RDG_EVENT_NAME("CalVelocityHeight"),
+						ComputePassFlags,
+						ComputeShader_CalVelocityHeight,
+						VelocityHeightPassParameters,
+						CompactBuffers.IndirectArgsBuffer,
+						0);
+				}
+				else
+				{
+					FComputeShaderUtils::AddPass(
+						GraphBuilder,
+						RDG_EVENT_NAME("CalVelocityHeight"),
+						ComputePassFlags,
+						ComputeShader_CalVelocityHeight,
+						VelocityHeightPassParameters,
+						SimTileGroupCount);
+				}
 
 				Swap(CurrentVelHeightTextureA, CurrentVelHeightTextureB);
 				Swap(CurrentSmoothHeightTextureA, CurrentSmoothHeightTextureB);
@@ -477,19 +1080,27 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 				ShallowIntegratePassParameters->RW_SmoothHeightA = CurrentSmoothHeightA;
 				ShallowIntegratePassParameters->RW_SmoothHeightB = CurrentSmoothHeightB;
 				NullifyCompactTileUAVs(ShallowIntegratePassParameters);
-				GraphBuilder.AddPass(
-					RDG_EVENT_NAME("CalShallowIntegrate"),
-					ShallowIntegratePassParameters,
-					ERDGPassFlags::AsyncCompute,
-					[ShallowIntegratePassParameters, ComputeShader_CalShallowIntegrate](FRHIComputeCommandList& RHICmdList)
-					{
-						FComputeShaderUtils::DispatchIndirect(
-							RHICmdList,
-							ComputeShader_CalShallowIntegrate,
-							*ShallowIntegratePassParameters,
-							ShallowIntegratePassParameters->CompactIndirectArgs->GetIndirectRHICallBuffer(),
-							0);
-					});
+				if (bUseSparseIndirect)
+				{
+					FComputeShaderUtils::AddPass(
+						GraphBuilder,
+						RDG_EVENT_NAME("CalShallowIntegrate"),
+						ComputePassFlags,
+						ComputeShader_CalShallowIntegrate,
+						ShallowIntegratePassParameters,
+						CompactBuffers.IndirectArgsBuffer,
+						0);
+				}
+				else
+				{
+					FComputeShaderUtils::AddPass(
+						GraphBuilder,
+						RDG_EVENT_NAME("CalShallowIntegrate"),
+						ComputePassFlags,
+						ComputeShader_CalShallowIntegrate,
+						ShallowIntegratePassParameters,
+						SimTileGroupCount);
+				}
 
 				Swap(CurrentVelHeightTextureA, CurrentVelHeightTextureB);
 				Swap(CurrentVelHeightSimA, CurrentVelHeightSimB);
@@ -502,412 +1113,69 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 			ResultPassParameters->RW_SmoothHeightA = CurrentSmoothHeightA;
 			ResultPassParameters->RW_SmoothHeightB = CurrentSmoothHeightB;
 			NullifyCompactTileUAVs(ResultPassParameters);
-			GraphBuilder.AddPass(
-				RDG_EVENT_NAME("Result"),
-				ResultPassParameters,
-				ERDGPassFlags::AsyncCompute,
-				[ResultPassParameters, ComputeShader_CalResult](FRHIComputeCommandList& RHICmdList)
-				{
-					FComputeShaderUtils::DispatchIndirect(
-						RHICmdList,
-						ComputeShader_CalResult,
-						*ResultPassParameters,
-						ResultPassParameters->CompactIndirectArgs->GetIndirectRHICallBuffer(),
-						0);
-				});
+			if (bUseSparseIndirect)
+			{
+				FComputeShaderUtils::AddPass(
+					GraphBuilder,
+					RDG_EVENT_NAME("Result"),
+					ComputePassFlags,
+					ComputeShader_CalResult,
+					ResultPassParameters,
+					CompactBuffers.IndirectArgsBuffer,
+					0);
+			}
+			else
+			{
+				FComputeShaderUtils::AddPass(
+					GraphBuilder,
+					RDG_EVENT_NAME("Result"),
+					ComputePassFlags,
+					ComputeShader_CalResult,
+					ResultPassParameters,
+					SimTileGroupCount);
+			}
+
+			ResetCompactCounter(GraphBuilder, VisualTileMaskBuffers);
+			FShallowWaterSim::FParameters* VisualTileMaskPassParameters = GraphBuilder.AllocParameters<FShallowWaterSim::FParameters>();
+			*VisualTileMaskPassParameters = *PassParameters;
+			BindCompactTileBuffers(VisualTileMaskPassParameters, VisualTileMaskBuffers);
+			VisualTileMaskPassParameters->B_CompactTileCoords = nullptr;
+			VisualTileMaskPassParameters->B_CompactCounter = nullptr;
+			VisualTileMaskPassParameters->CompactIndirectArgs = nullptr;
+			VisualTileMaskPassParameters->RWB_CompactIndirectArgs = nullptr;
+			VisualTileMaskPassParameters->T_ResultDepthWet = TRDG_ResultDepthWet;
+			VisualTileMaskPassParameters->RW_VelHeightSimA = CurrentVelHeightSimA;
+			VisualTileMaskPassParameters->RW_VelHeightSimB = CurrentVelHeightSimB;
+			VisualTileMaskPassParameters->RW_TileMask = RDGUAV_TileMask;
+			FComputeShaderUtils::AddPass(
+				GraphBuilder,
+				RDG_EVENT_NAME("CompactActiveTiles_SimVis"),
+				ComputePassFlags,
+				ComputeShader_CompactActiveTiles,
+				VisualTileMaskPassParameters,
+				FullTileGroupCount);
 			
 			AddCopyTexturePass(GraphBuilder, TRDG_ResultSmoothHeight, RDG_ResultSmoothHeight, FRHICopyTextureInfo());
 			AddCopyTexturePass(GraphBuilder, TRDG_ResultVelHeight, RDG_ResultVelHeight, FRHICopyTextureInfo());
 			AddCopyTexturePass(GraphBuilder, TRDG_ResultDepthWet, RDG_ResultDepthWet, FRHICopyTextureInfo());
 			AddCopyTexturePass(GraphBuilder, CurrentVelHeightTextureA, RDG_VelocityHeight, FRHICopyTextureInfo());
 			AddCopyTexturePass(GraphBuilder, TRDG_DebugView, RDG_DebugView, FRHICopyTextureInfo());
+			AddCopyTexturePass(GraphBuilder, TRDG_TileMask, RDG_TileMask, FRHICopyTextureInfo());
 		}
 		GraphBuilder.Execute();
+
+		TileMaskReadbackForRender->EnqueueCopy(RHICmdList, R_TileMask->GetRenderTargetTexture());
+		ResultReadbackForRender->EnqueueCopy(RHICmdList, R_ResultVelHeight->GetRenderTargetTexture());
 
 #if PLATFORM_WINDOWS
 		if (bDoCapture && GRenderDocAPI) GRenderDocAPI->EndFrameCapture(nullptr, nullptr);
 #endif
 	});
+
+	TileMaskReadbackWriteIdx = 1 - TileWriteIdx;
+	ResultReadbackWriteIdx = 1 - ResultWriteIdx;
 }
 
-void ACSShallowWaterCapture::ShallowWaterSolverSplineRange(UTextureRenderTarget2D* RT_SplineScaleDist, UTextureRenderTarget2D* RT_CopyLandscape, FVector SourceLocation, FVector2f ValidUV, int32 TarIteration, float SourceSize)
-{
-	// if (!CheckAndCreateTexture_SWSourcePoint()) return;
-	// SCOPE_CYCLE_COUNTER(STAT_CSSW_Execute);
-	// if (RT_SplineScaleDist == nullptr || RT_CopyLandscape == nullptr) return;
-	//
-	// FBoxSphereBounds Bounds = Box->Bounds;
-	// FVector RelativeSourceLocation = SourceLocation - (Bounds.Origin - Bounds.BoxExtent);
-	// FVector SourceUV = RelativeSourceLocation / ( Bounds.BoxExtent * 2 );
-	// SourceUV.Z = SourceLocation.Z;
-	// FVector4f SourceUVRad = FVector4f( SourceUV.X, SourceUV.Y, SourceUV.Z, SourceSize);
-	// const float ActorLocationZ = GetActorLocation().Z;
-	//
-	// RT_SceneDepth->ResizeTarget(TextureSize, TextureSize);
-	// RT_DebugView->ResizeTarget(TextureSize, TextureSize);
-	// RT_VelocityHeight->ResizeTarget(TextureSize, TextureSize);
-	// RT_ResultVelHeight->ResizeTarget(TextureSize, TextureSize);
-	// RT_ResultDepthWet->ResizeTarget(TextureSize, TextureSize);
-	// RT_SmoothHeight->ResizeTarget(TextureSize, TextureSize);
-	// // RT_SplineScaleDist->ResizeTarget(TextureSize, TextureSize);
-	//
-	// FTextureRenderTargetResource* R_SceneDepth = RT_SceneDepth->GameThread_GetRenderTargetResource();
-	// FTextureRenderTargetResource* R_DebugView = RT_DebugView->GameThread_GetRenderTargetResource();
-	// FTextureRenderTargetResource* R_VelocityHeight = RT_VelocityHeight->GameThread_GetRenderTargetResource();
-	// FTextureRenderTargetResource* R_ResultVelHeight = RT_ResultVelHeight->GameThread_GetRenderTargetResource();
-	// FTextureRenderTargetResource* R_ResultDepthWet = RT_ResultDepthWet->GameThread_GetRenderTargetResource();
-	// FTextureRenderTargetResource* R_ResultSmoothHeight = RT_SmoothHeight->GameThread_GetRenderTargetResource();
-	// FTextureRenderTargetResource* R_SplineScaleDist = RT_SplineScaleDist->GameThread_GetRenderTargetResource();
-	// FTextureRenderTargetResource* R_CopyLandscape = RT_CopyLandscape->GameThread_GetRenderTargetResource();
-	//
-	// TarIteration = FMath::Max(TarIteration, 1);
-	// ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	// [=, this ](FRHICommandListImmediate& RHICmdList)
-	// {
-	// 	FRDGBuilder GraphBuilder(RHICmdList);
-	// 	{
-	// 		float SizeX = R_SceneDepth->GetSizeXY().X;
-	// 		float SizeY = R_SceneDepth->GetSizeXY().Y;
-	// 		FIntPoint TextureSize = FIntPoint(SizeX, SizeY);
-	// 		
-	// 		TShaderMapRef<FShallowWaterSim> ComputeShader_CompactActiveTiles = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_CompactActiveTiles, true);
-	// 		TShaderMapRef<FShallowWaterSim> ComputeShader_FinalizeCompact = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_FinalizeCompact, true);
-	// 		TShaderMapRef<FShallowWaterSim> ComputeShader_CalVelocityHeight = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_VelocityHeightSim);
-	// 		TShaderMapRef<FShallowWaterSim> ComputeShader_CalShallowIntegrate = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_ShallowIntegrate, true);
-	// 		TShaderMapRef<FShallowWaterSim> ComputeShader_CalResult = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_Result);
-	// 		
-	// 		FShallowWaterSim::FParameters* PassParameters = GraphBuilder.AllocParameters<FShallowWaterSim::FParameters>();
-	// 		FIntVector GroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(SizeX, SizeY, 1), 16);
-	// 		const FIntVector SingleGroupCount(1, 1, 1);
-	// 		
-	// 		
-	// 		FRDGTextureRef TmpRDG_DebugView = ConvertToUVATextureFormat(GraphBuilder, R_DebugView, PF_FloatRGBA, TEXT("UAV_DebugView")); 
-	// 		FRDGTextureUAVRef RDGUAV_DebugView = GraphBuilder.CreateUAV(TmpRDG_DebugView);
-	// 		FRDGTextureRef TmpRDG_Result = ConvertToUVATextureFormat(GraphBuilder, TextureSize, PF_FloatRGBA, TEXT("UAV_Result"));
-	// 		FRDGTextureUAVRef RDGUAV_Result = GraphBuilder.CreateUAV(TmpRDG_Result);
-	// 		FRDGTextureRef TmpRDG_ResultDepthWet = ConvertToUVATextureFormat(GraphBuilder, TextureSize, PF_FloatRGBA, TEXT("UAV_ResultDepthWet"));
-	// 		FRDGTextureUAVRef RDGUAV_ResultDepthWet = GraphBuilder.CreateUAV(TmpRDG_ResultDepthWet);
-	// 		FRDGTextureRef TmpRDG_ResultSmoothHeight = ConvertToUVATextureFormat(GraphBuilder, TextureSize, PF_A32B32G32R32F, TEXT("UAV_ResultSmoothHeight"));
-	// 		FRDGTextureUAVRef RDGUAV_ResultSmoothHeight = GraphBuilder.CreateUAV(TmpRDG_ResultSmoothHeight);
-	// 		
-	// 		FRDGTextureRef RDG_VelHeightSimA = ConvertToUVATextureFormat(GraphBuilder, TextureSize, PF_FloatRGBA, TEXT("UAV_Sim_A"));
-	// 		FRDGTextureUAVRef RDGUAV_VelHeightSimA = GraphBuilder.CreateUAV(RDG_VelHeightSimA);
-	// 		FRDGTextureRef RDG_VelHeightSimB = ConvertToUVATextureFormat(GraphBuilder, TextureSize, PF_FloatRGBA, TEXT("UAV_Sim_B"));
-	// 		FRDGTextureUAVRef RDGUAV_VelHeightSimB = GraphBuilder.CreateUAV(RDG_VelHeightSimB);
-	// 		FRDGTextureRef RDG_SmoothHeightA = ConvertToUVATextureFormat(GraphBuilder, TextureSize, PF_A32B32G32R32F, TEXT("UAV_SmoothHeightA"));
-	// 		FRDGTextureUAVRef RDGUAV_SmoothHeightA = GraphBuilder.CreateUAV(RDG_SmoothHeightA);
-	// 		FRDGTextureRef RDG_SmoothHeightB = ConvertToUVATextureFormat(GraphBuilder, TextureSize, PF_A32B32G32R32F, TEXT("UAV_SmoothHeightB"));
-	// 		FRDGTextureUAVRef RDGUAV_SmoothHeightB = GraphBuilder.CreateUAV(RDG_SmoothHeightB);
-	// 		
-	// 		FRDGTextureRef RDG_SceneDepth = RegisterExternalTexture(GraphBuilder, R_SceneDepth->GetRenderTargetTexture(), TEXT("SceneDepth_RT"));
-	// 		FRDGTextureRef RDG_CopyLandscape = RegisterExternalTexture(GraphBuilder, R_CopyLandscape->GetRenderTargetTexture(), TEXT("CopyLandscape_RT"));
-	// 		FRDGTextureRef RDG_VelocityHeight = RegisterExternalTexture(GraphBuilder, R_VelocityHeight->GetRenderTargetTexture(), TEXT("VelocityHeight_RT"));
-	// 		FRDGTextureRef RDG_SplineScaleDist = RegisterExternalTexture(GraphBuilder, R_SplineScaleDist->GetRenderTargetTexture(), TEXT("SplineScaleDist_RT"));
-	// 		FRDGTextureRef RDG_DebugView = RegisterExternalTexture(GraphBuilder, R_DebugView->GetRenderTargetTexture(), TEXT("DebugView_RT"));
-	// 		FRDGTextureRef RDG_Result = RegisterExternalTexture(GraphBuilder, R_ResultVelHeight->GetRenderTargetTexture(), TEXT("Result_RT"));
-	// 		FRDGTextureRef RDG_ResultDepthWet = RegisterExternalTexture(GraphBuilder, R_ResultDepthWet->GetRenderTargetTexture(), TEXT("ResultDepthWet_RT"));
-	// 		FRDGTextureRef RDG_ResultSmoothHeight = RegisterExternalTexture(GraphBuilder, R_ResultSmoothHeight->GetRenderTargetTexture(), TEXT("ResultSmoothHeight_RT"));
-	//
-	// 		FCompactTileBuffers CompactBuffers = CreateCompactTileBuffers(
-	// 			GraphBuilder, (uint32)SizeX, (uint32)SizeY,
-	// 			NUM_THREADS_PER_GROUP_DIMENSION_X, NUM_THREADS_PER_GROUP_DIMENSION_Y);
-	//
-	// 		PassParameters->T_SceneDepth = RDG_SceneDepth;
-	// 		PassParameters->T_CopyLandscape = RDG_CopyLandscape;
-	// 		PassParameters->T_VelocityHeight = RDG_VelocityHeight;
-	// 		PassParameters->T_SplineScaleDist = RDG_SplineScaleDist;
-	// 		PassParameters->T_ResultDepthWet = RDG_ResultDepthWet;
-	// 		PassParameters->T_ResultSmoothHeight = RDG_ResultSmoothHeight;
-	// 		PassParameters->DT = DT;
-	// 		PassParameters->Friction = Friction;
-	// 		PassParameters->CopyValidUV = ValidUV;
-	// 		PassParameters->SeaLevel = SeaLevel;
-	// 		PassParameters->ActorLocationZ = ActorLocationZ;
-	// 		PassParameters->AdvectFoam = AdvectFoam;
-	// 		PassParameters->FoamFadeSpeed = FoamFadeSpeed;
-	// 		PassParameters->CloseBound = CloseBound;
-	// 		PassParameters->BCount_SourceUVRads = 0;
-	// 		PassParameters->SourceUVRad = SourceUVRad;
-	// 		PassParameters->RW_ResultVelHeight = RDGUAV_Result;
-	// 		PassParameters->RW_ResultDepthWet = RDGUAV_ResultDepthWet;
-	// 		PassParameters->RW_ResultSmoothHeight = RDGUAV_ResultSmoothHeight;
-	// 		PassParameters->RW_DebugView = RDGUAV_DebugView;
-	// 		PassParameters->RW_VelHeightSimA = RDGUAV_VelHeightSimA;
-	// 		PassParameters->RW_VelHeightSimB = RDGUAV_VelHeightSimB;
-	// 		PassParameters->RW_SmoothHeightA = RDGUAV_SmoothHeightA;
-	// 		PassParameters->RW_SmoothHeightB = RDGUAV_SmoothHeightB;
-	// 		PassParameters->RWB_SourceUVRads = nullptr;
-	// 		PassParameters->DispatchExpandPixels = ComputeDispatchExpandPixels(TarIteration, TextureSize.X);
-	// 		BindCompactTileBuffers(PassParameters, CompactBuffers);
-	// 		PassParameters->Sampler	= TStaticSamplerState<SF_Bilinear>::GetRHI();
-	//
-	// 		AddCopyTexturePass(GraphBuilder, RDG_VelocityHeight, RDG_VelHeightSimA, FRHICopyTextureInfo());
-	// 		AddCopyTexturePass(GraphBuilder, RDG_ResultSmoothHeight, RDG_SmoothHeightA, FRHICopyTextureInfo());
-	//
-	// 		// --- Compact active tiles ---
-	// 		ResetCompactCounter(GraphBuilder, CompactBuffers);
-	// 		const FIntVector FullTileGroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(SizeX, SizeY, 1), FIntVector(NUM_THREADS_PER_GROUP_DIMENSION_X, NUM_THREADS_PER_GROUP_DIMENSION_Y, 1));
-	// 		{
-	// 			FShallowWaterSim::FParameters* CompactPassParameters = GraphBuilder.AllocParameters<FShallowWaterSim::FParameters>();
-	// 			*CompactPassParameters = *PassParameters;
-	// 			CompactPassParameters->B_CompactTileCoords = nullptr;
-	// 			CompactPassParameters->B_CompactCounter = nullptr;
-	// 			CompactPassParameters->CompactIndirectArgs = nullptr;
-	// 			CompactPassParameters->RWB_CompactIndirectArgs = nullptr;
-	// 			GraphBuilder.AddPass(
-	// 				RDG_EVENT_NAME("CompactActiveTiles"),
-	// 				CompactPassParameters,
-	// 				ERDGPassFlags::AsyncCompute,
-	// 				[CompactPassParameters, ComputeShader_CompactActiveTiles, FullTileGroupCount](FRHIComputeCommandList& RHICmdList)
-	// 				{
-	// 					FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_CompactActiveTiles, *CompactPassParameters, FullTileGroupCount);
-	// 				});
-	// 		}
-	// 		{
-	// 			FShallowWaterSim::FParameters* FinalizeCompactPassParameters = GraphBuilder.AllocParameters<FShallowWaterSim::FParameters>();
-	// 			*FinalizeCompactPassParameters = *PassParameters;
-	// 			NullifyAllCompactTileBindings(FinalizeCompactPassParameters);
-	// 			FinalizeCompactPassParameters->RWB_CompactCounter = CompactBuffers.CounterUAV;
-	// 			FinalizeCompactPassParameters->RWB_CompactIndirectArgs = CompactBuffers.IndirectArgsUAV;
-	// 			GraphBuilder.AddPass(
-	// 				RDG_EVENT_NAME("FinalizeCompact"),
-	// 				FinalizeCompactPassParameters,
-	// 				ERDGPassFlags::AsyncCompute,
-	// 				[FinalizeCompactPassParameters, ComputeShader_FinalizeCompact, SingleGroupCount](FRHIComputeCommandList& RHICmdList)
-	// 				{
-	// 					FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_FinalizeCompact, *FinalizeCompactPassParameters, SingleGroupCount);
-	// 				});
-	// 		}
-	//
-	// 		FRDGTextureRef CurrentVelHeightTextureA = RDG_VelHeightSimA;
-	// 		FRDGTextureRef CurrentVelHeightTextureB = RDG_VelHeightSimB;
-	// 		FRDGTextureRef CurrentSmoothHeightTextureA = RDG_SmoothHeightA;
-	// 		FRDGTextureRef CurrentSmoothHeightTextureB = RDG_SmoothHeightB;
-	// 		FRDGTextureUAVRef CurrentVelHeightSimA = RDGUAV_VelHeightSimA;
-	// 		FRDGTextureUAVRef CurrentVelHeightSimB = RDGUAV_VelHeightSimB;
-	// 		FRDGTextureUAVRef CurrentSmoothHeightA = RDGUAV_SmoothHeightA;
-	// 		FRDGTextureUAVRef CurrentSmoothHeightB = RDGUAV_SmoothHeightB;
-	// 		for (int32 i = 0 ; i < TarIteration; i++)
-	// 		{
-	// 			FShallowWaterSim::FParameters* VelocityHeightPassParameters = GraphBuilder.AllocParameters<FShallowWaterSim::FParameters>();
-	// 			*VelocityHeightPassParameters = *PassParameters;
-	// 			VelocityHeightPassParameters->RW_VelHeightSimA = CurrentVelHeightSimA;
-	// 			VelocityHeightPassParameters->RW_VelHeightSimB = CurrentVelHeightSimB;
-	// 			VelocityHeightPassParameters->RW_SmoothHeightA = CurrentSmoothHeightA;
-	// 			VelocityHeightPassParameters->RW_SmoothHeightB = CurrentSmoothHeightB;
-	// 			NullifyCompactTileUAVs(VelocityHeightPassParameters);
-	// 			GraphBuilder.AddPass(
-	// 				RDG_EVENT_NAME("CalVelocityHeight"),
-	// 				VelocityHeightPassParameters,
-	// 				ERDGPassFlags::AsyncCompute,
-	// 				[VelocityHeightPassParameters, ComputeShader_CalVelocityHeight](FRHIComputeCommandList& RHICmdList)
-	// 				{
-	// 					FComputeShaderUtils::DispatchIndirect(
-	// 						RHICmdList,
-	// 						ComputeShader_CalVelocityHeight,
-	// 						*VelocityHeightPassParameters,
-	// 						VelocityHeightPassParameters->CompactIndirectArgs->GetIndirectRHICallBuffer(),
-	// 						0);
-	// 				});
-	//
-	// 			Swap(CurrentVelHeightTextureA, CurrentVelHeightTextureB);
-	// 			Swap(CurrentSmoothHeightTextureA, CurrentSmoothHeightTextureB);
-	// 			Swap(CurrentVelHeightSimA, CurrentVelHeightSimB);
-	// 			Swap(CurrentSmoothHeightA, CurrentSmoothHeightB);
-	//
-	// 			FShallowWaterSim::FParameters* ShallowIntegratePassParameters = GraphBuilder.AllocParameters<FShallowWaterSim::FParameters>();
-	// 			*ShallowIntegratePassParameters = *PassParameters;
-	// 			ShallowIntegratePassParameters->RW_VelHeightSimA = CurrentVelHeightSimA;
-	// 			ShallowIntegratePassParameters->RW_VelHeightSimB = CurrentVelHeightSimB;
-	// 			ShallowIntegratePassParameters->RW_SmoothHeightA = CurrentSmoothHeightA;
-	// 			ShallowIntegratePassParameters->RW_SmoothHeightB = CurrentSmoothHeightB;
-	// 			NullifyCompactTileUAVs(ShallowIntegratePassParameters);
-	// 			GraphBuilder.AddPass(
-	// 				RDG_EVENT_NAME("CalShallowIntegrate"),
-	// 				ShallowIntegratePassParameters,
-	// 				ERDGPassFlags::AsyncCompute,
-	// 				[ShallowIntegratePassParameters, ComputeShader_CalShallowIntegrate](FRHIComputeCommandList& RHICmdList)
-	// 				{
-	// 					FComputeShaderUtils::DispatchIndirect(
-	// 						RHICmdList,
-	// 						ComputeShader_CalShallowIntegrate,
-	// 						*ShallowIntegratePassParameters,
-	// 						ShallowIntegratePassParameters->CompactIndirectArgs->GetIndirectRHICallBuffer(),
-	// 						0);
-	// 				});
-	//
-	// 			Swap(CurrentVelHeightTextureA, CurrentVelHeightTextureB);
-	// 			Swap(CurrentSmoothHeightTextureA, CurrentSmoothHeightTextureB);
-	// 			Swap(CurrentVelHeightSimA, CurrentVelHeightSimB);
-	// 			Swap(CurrentSmoothHeightA, CurrentSmoothHeightB);
-	// 		}
-	//
-	// 		FShallowWaterSim::FParameters* ResultPassParameters = GraphBuilder.AllocParameters<FShallowWaterSim::FParameters>();
-	// 		*ResultPassParameters = *PassParameters;
-	// 		ResultPassParameters->RW_VelHeightSimA = CurrentVelHeightSimA;
-	// 		ResultPassParameters->RW_VelHeightSimB = CurrentVelHeightSimB;
-	// 		ResultPassParameters->RW_SmoothHeightA = CurrentSmoothHeightA;
-	// 		ResultPassParameters->RW_SmoothHeightB = CurrentSmoothHeightB;
-	// 		NullifyCompactTileUAVs(ResultPassParameters);
-	// 		GraphBuilder.AddPass(
-	// 			RDG_EVENT_NAME("Result"),
-	// 			ResultPassParameters,
-	// 			ERDGPassFlags::AsyncCompute,
-	// 			[ResultPassParameters, ComputeShader_CalResult](FRHIComputeCommandList& RHICmdList)
-	// 			{
-	// 				FComputeShaderUtils::DispatchIndirect(
-	// 					RHICmdList,
-	// 					ComputeShader_CalResult,
-	// 					*ResultPassParameters,
-	// 					ResultPassParameters->CompactIndirectArgs->GetIndirectRHICallBuffer(),
-	// 					0);
-	// 			});
-	// 		AddCopyTexturePass(GraphBuilder, TmpRDG_Result, RDG_Result, FRHICopyTextureInfo());
-	// 		AddCopyTexturePass(GraphBuilder, TmpRDG_ResultDepthWet, RDG_ResultDepthWet, FRHICopyTextureInfo());
-	// 		AddCopyTexturePass(GraphBuilder, TmpRDG_ResultSmoothHeight, RDG_ResultSmoothHeight, FRHICopyTextureInfo());
-	// 		AddCopyTexturePass(GraphBuilder, CurrentVelHeightTextureA, RDG_VelocityHeight, FRHICopyTextureInfo());
-	// 		AddCopyTexturePass(GraphBuilder, TmpRDG_DebugView, RDG_DebugView, FRHICopyTextureInfo());
-	// 		
-	// 		
-	// 	}
-	// 	GraphBuilder.Execute();
-	// });
-	// FlushRenderingCommands();
-}
-
-void ACSShallowWaterCapture::ShallowWaterSolverSouceTexture()
-{
-	// if (!IsParameterValidMult_SourceTexture()) return;
-	// RT_SceneDepth->ResizeTarget(TextureSize, TextureSize);
-	// RT_DebugView->ResizeTarget(TextureSize, TextureSize);
-	// RT_VelocityHeight->ResizeTarget(TextureSize, TextureSize);
-	// RT_Result->ResizeTarget(TextureSize, TextureSize);
-	// RT_Source->ResizeTarget(TextureSize, TextureSize);
-	//
-	// FTextureRenderTargetResource* R_SceneDepth = RT_SceneDepth->GameThread_GetRenderTargetResource();
-	// FTextureRenderTargetResource* R_DebugView = RT_DebugView->GameThread_GetRenderTargetResource();
-	// FTextureRenderTargetResource* R_VelocityHeight = RT_VelocityHeight->GameThread_GetRenderTargetResource();
-	// FTextureRenderTargetResource* R_ResultVelHeight = RT_Result->GameThread_GetRenderTargetResource();
-	// FTextureRenderTargetResource* R_Source = RT_Source->GameThread_GetRenderTargetResource();
-	//
-	//
-	// Iteration = FMath::Min(Iteration, 1);
-	// ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	// [=, this ](FRHICommandListImmediate& RHICmdList)
-	// {
-	// 	FRDGBuilder GraphBuilder(RHICmdList);
-	// 	{
-	// 		float SizeX = R_SceneDepth->GetSizeXY().X;
-	// 		float SizeY = R_SceneDepth->GetSizeXY().Y;
-	// 		FIntPoint TextureSize = FIntPoint(SizeX, SizeY);
-	// 		
-	// 		TShaderMapRef<FShallowWaterSim> ComputeShader_CalVelocityHeight = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_VelocityHeightSim);
-	// 		TShaderMapRef<FShallowWaterSim> ComputeShader_CalShallowIntegrate = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_ShallowIntegrate);
-	// 		
-	// 		FShallowWaterSim::FParameters* PassParameters = GraphBuilder.AllocParameters<FShallowWaterSim::FParameters>();
-	// 		FIntVector GroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(SizeX, SizeY, 1), 32);
-	// 		
-	// 		
-	// 		FRDGTextureRef TmpRDG_DebugView = ConvertToUVATextureFormat(GraphBuilder, R_DebugView, PF_A32B32G32R32F, TEXT("DebugView_Texture")); 
-	// 		FRDGTextureUAVRef RDGUAV_DebugView = GraphBuilder.CreateUAV(TmpRDG_DebugView);
-	// 		
-	//
-	// 		FRDGTextureRef RDG_VelHeightSimA = ConvertToUVATextureFormat(GraphBuilder, TextureSize, PF_A32B32G32R32F, TEXT("TmpSim_A"));
-	// 		FRDGTextureUAVRef RDGUAV_VelHeightSimA = GraphBuilder.CreateUAV(RDG_VelHeightSimA);
-	// 		FRDGTextureRef RDG_VelHeightSimB = ConvertToUVATextureFormat(GraphBuilder, TextureSize, PF_A32B32G32R32F, TEXT("TmpSim_B"));
-	// 		FRDGTextureUAVRef RDGUAV_VelHeightSimB = GraphBuilder.CreateUAV(RDG_VelHeightSimB);
-	// 		
-	// 		FRDGTextureRef SceneDepthTexture = RegisterExternalTexture(GraphBuilder, R_SceneDepth->GetRenderTargetTexture(), TEXT("SceneDepth_RT"));
-	// 		FRDGTextureRef RDG_VelocityHeight = RegisterExternalTexture(GraphBuilder, R_VelocityHeight->GetRenderTargetTexture(), TEXT("VelocityHeight_RT"));
-	// 		FRDGTextureRef RDG_DebugView = RegisterExternalTexture(GraphBuilder, R_DebugView->GetRenderTargetTexture(), TEXT("DebugView_RT"));
-	// 		FRDGTextureRef RDG_Source = RegisterExternalTexture(GraphBuilder, R_Source->GetRenderTargetTexture(), TEXT("Source_RT"));
-	// 		FRDGTextureRef RDG_Result = RegisterExternalTexture(GraphBuilder, R_ResultVelHeight->GetRenderTargetTexture(), TEXT("Result_RT"));
-	// 		
-	// 		PassParameters->T_SceneDepth = SceneDepthTexture;
-	// 		PassParameters->T_VelocityHeight = RDG_VelocityHeight;
-	// 		PassParameters->T_Source = RDG_Source;
-	// 		PassParameters->DT = DT;
-	// 		PassParameters->Friction = Friction;
-	// 		
-	// 		PassParameters->RW_DebugView = RDGUAV_DebugView;
-	// 		PassParameters->RW_VelHeightSimA = RDGUAV_VelHeightSimA;
-	// 		PassParameters->RW_VelHeightSimB = RDGUAV_VelHeightSimB;
-	// 		PassParameters->Sampler	= TStaticSamplerState<SF_Bilinear>::GetRHI();
-	//
-	// 		AddCopyTexturePass(GraphBuilder, RDG_VelocityHeight, RDG_VelHeightSimA, FRHICopyTextureInfo());
-	// 		for (int32 i = 0 ; i < Iteration; i++)
-	// 		{
-	// 			GraphBuilder.AddPass(
-	// 				RDG_EVENT_NAME("CalVelocityHeight"),
-	// 				PassParameters,
-	// 				ERDGPassFlags::AsyncCompute,
-	// 				[&PassParameters, ComputeShader_CalVelocityHeight, GroupCount, i, RDGUAV_VelHeightSimA, RDGUAV_VelHeightSimB](FRHIComputeCommandList& RHICmdList)
-	// 				{
-	// 					FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_CalVelocityHeight, *PassParameters, GroupCount);
-	// 					if ( i % 2 == 0)
-	// 					{
-	// 						PassParameters->RW_VelHeightSimA = RDGUAV_VelHeightSimB;
-	// 						PassParameters->RW_VelHeightSimB = RDGUAV_VelHeightSimA;
-	// 						
-	// 					}
-	// 					else
-	// 					{
-	// 						PassParameters->RW_VelHeightSimA = RDGUAV_VelHeightSimA;
-	// 						PassParameters->RW_VelHeightSimB = RDGUAV_VelHeightSimB;
-	// 					}
-	// 				});
-	// 			if ( i % 2 == 0)
-	// 			{
-	// 				AddCopyTexturePass(GraphBuilder, RDG_VelHeightSimB, RDG_VelocityHeight, FRHICopyTextureInfo());
-	// 			}
-	// 			else
-	// 			{
-	// 				AddCopyTexturePass(GraphBuilder, RDG_VelHeightSimA, RDG_VelocityHeight, FRHICopyTextureInfo());
-	// 			}
-	// 			GraphBuilder.AddPass(
-	// 				RDG_EVENT_NAME("CalShallowIntegrate"),
-	// 				PassParameters,
-	// 				ERDGPassFlags::AsyncCompute,
-	// 				[&PassParameters, ComputeShader_CalShallowIntegrate, GroupCount, i, RDGUAV_VelHeightSimA, RDGUAV_VelHeightSimB](FRHIComputeCommandList& RHICmdList)
-	// 				{
-	// 					FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_CalShallowIntegrate, *PassParameters, GroupCount);
-	// 					if ( i % 2 == 0)
-	// 					{
-	// 						PassParameters->RW_VelHeightSimA = RDGUAV_VelHeightSimA;
-	// 						PassParameters->RW_VelHeightSimB = RDGUAV_VelHeightSimB;
-	// 					}
-	// 					else
-	// 					{
-	// 						PassParameters->RW_VelHeightSimA = RDGUAV_VelHeightSimB;
-	// 						PassParameters->RW_VelHeightSimB = RDGUAV_VelHeightSimA;
-	// 					}
-	// 				});
-	// 			if ( i % 2 == 0)
-	// 			{
-	// 				AddCopyTexturePass(GraphBuilder, RDG_VelHeightSimA, RDG_VelocityHeight, FRHICopyTextureInfo());
-	// 			}
-	// 			else
-	// 			{
-	// 				AddCopyTexturePass(GraphBuilder, RDG_VelHeightSimB, RDG_VelocityHeight, FRHICopyTextureInfo());
-	// 			}
-	// 		}
-	// 		
-	// 		// if ( Iteration % 2 == 0)
-	// 		// {
-	// 		// 	AddCopyTexturePass(GraphBuilder, RDG_VelHeightSimB, RDG_VelocityHeight, FRHICopyTextureInfo());
-	// 		// }
-	// 		// else
-	// 		// {
-	// 		// 	AddCopyTexturePass(GraphBuilder, RDG_VelHeightSimA, RDG_VelocityHeight, FRHICopyTextureInfo());
-	// 		// }
-	// 		AddCopyTexturePass(GraphBuilder, TmpRDG_DebugView, RDG_DebugView, FRHICopyTextureInfo());
-	//
-	// 		
-	// 	}
-	// 	GraphBuilder.Execute();
-	// });
-	
-}
 
 void ACSShallowWaterCapture::SetHeight()
 {
@@ -927,15 +1195,21 @@ void ACSShallowWaterCapture::SetHeight()
 	FTextureRenderTargetResource* R_ResultVelHeight = RT_ResultVelHeight->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_ResultDepthWet = RT_ResultDepthWet->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_ResultSmoothHeight = RT_SmoothHeight->GameThread_GetRenderTargetResource();
+	const float CapturedDT = DT;
+	const float CapturedFriction = Friction;
+	const float CapturedSeaLevel = SeaLevel;
+	const float CapturedActorLocationZ = GetActorLocation().Z;
 	
 	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	[=, this ](FRHICommandListImmediate& RHICmdList)
+	[R_SceneDepth, R_DebugView, R_VelocityHeight, R_ResultVelHeight, R_ResultDepthWet, R_ResultSmoothHeight,
+	 CapturedDT, CapturedFriction, CapturedSeaLevel, CapturedActorLocationZ](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
 		{
 			float SizeX = R_SceneDepth->GetSizeXY().X;
 			float SizeY = R_SceneDepth->GetSizeXY().Y;
 			FIntPoint TextureSize = FIntPoint(SizeX, SizeY);
+			const ERDGPassFlags ComputePassFlags = ERDGPassFlags::Compute;
 			TShaderMapRef<FShallowWaterSim> ComputeShader_SetHeight = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_SetHeight);
 			TShaderMapRef<FShallowWaterSim> ComputeShader_CalResult = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_Result);
 			
@@ -970,10 +1244,10 @@ void ACSShallowWaterCapture::SetHeight()
 			PassParameters->T_VelocityHeight = RDG_VelocityHeight;
 			PassParameters->T_ResultDepthWet = RDG_ResultDepthWet;
 			PassParameters->T_ResultSmoothHeight = RDG_ResultSmoothHeight;
-			PassParameters->DT = DT;
-			PassParameters->Friction = Friction;
-			PassParameters->SeaLevel = SeaLevel;
-			PassParameters->ActorLocationZ = GetActorLocation().Z;
+			PassParameters->DT = CapturedDT;
+			PassParameters->Friction = CapturedFriction;
+			PassParameters->SeaLevel = CapturedSeaLevel;
+			PassParameters->ActorLocationZ = CapturedActorLocationZ;
 			PassParameters->BCount_SourceUVRads = 0;
 			PassParameters->DispatchExpandPixels = 0;
 			PassParameters->RW_DebugView = RDGUAV_DebugView;
@@ -991,32 +1265,26 @@ void ACSShallowWaterCapture::SetHeight()
 			FShallowWaterSim::FParameters* SetHeightPassParameters = GraphBuilder.AllocParameters<FShallowWaterSim::FParameters>();
 			*SetHeightPassParameters = *PassParameters;
 			NullifyAllCompactTileBindings(SetHeightPassParameters);
-			GraphBuilder.AddPass(
+			FComputeShaderUtils::AddPass(
+				GraphBuilder,
 				RDG_EVENT_NAME("SetHeight"),
+				ComputePassFlags,
+				ComputeShader_SetHeight,
 				SetHeightPassParameters,
-				ERDGPassFlags::AsyncCompute,
-				[SetHeightPassParameters, ComputeShader_SetHeight, GroupCount](FRHIComputeCommandList& RHICmdList)
-				{
-					FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_SetHeight, *SetHeightPassParameters, GroupCount);
-				});
+				GroupCount);
 			
 			// Result pass — uses CompactIndirectArgs, only needs SRV reads
 			FShallowWaterSim::FParameters* ResultPassParameters = GraphBuilder.AllocParameters<FShallowWaterSim::FParameters>();
 			*ResultPassParameters = *PassParameters;
 			NullifyCompactTileUAVs(ResultPassParameters);
-			GraphBuilder.AddPass(
+			FComputeShaderUtils::AddPass(
+				GraphBuilder,
 				RDG_EVENT_NAME("Result"),
+				ComputePassFlags,
+				ComputeShader_CalResult,
 				ResultPassParameters,
-				ERDGPassFlags::AsyncCompute,
-				[ResultPassParameters, ComputeShader_CalResult](FRHIComputeCommandList& RHICmdList)
-				{
-					FComputeShaderUtils::DispatchIndirect(
-						RHICmdList,
-						ComputeShader_CalResult,
-						*ResultPassParameters,
-						ResultPassParameters->CompactIndirectArgs->GetIndirectRHICallBuffer(),
-						0);
-				});
+				CompactBuffers.IndirectArgsBuffer,
+				0);
 			AddCopyTexturePass(GraphBuilder, TmpRDG_Result, RDG_Result, FRHICopyTextureInfo());
 			AddCopyTexturePass(GraphBuilder, TmpRDG_ResultDepthWet, RDG_ResultDepthWet, FRHICopyTextureInfo());
 			AddCopyTexturePass(GraphBuilder, TmpRDG_ResultSmoothHeight, RDG_ResultSmoothHeight, FRHICopyTextureInfo());
@@ -1044,13 +1312,14 @@ void ACSShallowWaterCapture::HeightSmooth()
 	FTextureRenderTargetResource* R_ResultVelHeight = RT_ResultVelHeight->GameThread_GetRenderTargetResource();
 	
 	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	[=, this ](FRHICommandListImmediate& RHICmdList)
+	[R_SceneDepth, R_DebugView, R_VelocityHeight, R_ResultVelHeight](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
 		{
 			float SizeX = R_SceneDepth->GetSizeXY().X;
 			float SizeY = R_SceneDepth->GetSizeXY().Y;
 			FIntPoint TextureSize = FIntPoint(SizeX, SizeY);
+			const ERDGPassFlags ComputePassFlags = ERDGPassFlags::Compute;
 			TShaderMapRef<FShallowWaterSim> ComputeShader_SmoothHeight = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_SmoothHeight);
 			
 			FShallowWaterSim::FParameters* PassParameters = GraphBuilder.AllocParameters<FShallowWaterSim::FParameters>();
@@ -1083,17 +1352,15 @@ void ACSShallowWaterCapture::HeightSmooth()
 			PassParameters->BCount_SourceUVRads = 0;
 			PassParameters->DispatchExpandPixels = 0;
 			PassParameters->RWB_SourceUVRads = nullptr;
-			// PassParameters->MaxCell = FVector2f(SizeX, SizeY);
 			PassParameters->Sampler	= TStaticSamplerState<SF_Bilinear>::GetRHI();
 			
-			GraphBuilder.AddPass(
+			FComputeShaderUtils::AddPass(
+				GraphBuilder,
 				RDG_EVENT_NAME("SmoothHeight"),
+				ComputePassFlags,
+				ComputeShader_SmoothHeight,
 				PassParameters,
-				ERDGPassFlags::AsyncCompute,
-				[PassParameters, ComputeShader_SmoothHeight, GroupCount](FRHIComputeCommandList& RHICmdList)
-				{
-					FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_SmoothHeight, *PassParameters, GroupCount);
-				});
+				GroupCount);
 			
 			AddCopyTexturePass(GraphBuilder, TmpRDG_DebugView, RDG_DebugView, FRHICopyTextureInfo());
 			
@@ -1107,14 +1374,13 @@ void ACSShallowWaterCapture::Clean()
 	UKismetRenderingLibrary::ClearRenderTarget2D(this, RT_ResultVelHeight, FLinearColor(0, 0, -9999, 1));
 	UKismetRenderingLibrary::ClearRenderTarget2D(this, RT_ResultDepthWet,  FLinearColor(-9999, -9999, -9999, -9999));
 	UKismetRenderingLibrary::ClearRenderTarget2D(this, RT_VelocityHeight,  FLinearColor(0, 0, -9999, 1));
-	CaptureSceneDepth->CaptureScene();
 }
 
 void ACSShallowWaterCapture::CleanDepthWet_Construct()
 {
 	if (RT_ResultDepthWet
 	&& RT_ResultDepthWet->GetResource()
-	&& GWorld)
+	&& GetWorld())
 	{
 		FTextureRenderTargetResource* RenderTargetResource = RT_ResultDepthWet->GameThread_GetRenderTargetResource();
 		FLinearColor ClearColor = FLinearColor(-9999, -9999, -9999, -9999);
@@ -1135,7 +1401,10 @@ void ACSShallowWaterCapture::CleanDepthWet_Construct()
 TArray<FVector4> ACSShallowWaterCapture::GetSources()
 {
 	TArray<FVector4> SourceLocations;
-	for (TActorIterator<ACSSHallowWaterSource> It(GWorld, ACSSHallowWaterSource::StaticClass()); It; ++It)
+	UWorld* World = GetWorld();
+	if (!World) return SourceLocations;
+
+	for (TActorIterator<ACSSHallowWaterSource> It(World, ACSSHallowWaterSource::StaticClass()); It; ++It)
 	{
 		ACSSHallowWaterSource* Actor = *It;
 		FVector Location = Actor->GetActorLocation();
@@ -1163,22 +1432,15 @@ void ACSShallowWaterCapture::CleanupAttachedActors()
 			Component->SetVisibility(false);
 		}
 	}
-	VisualizeMesh->SetVisibility(true);
+	ReusltMesh->SetVisibility(false);
 	CausticsDecal->SetVisibility(true);
 }
 
-// void ACSShallowWaterCapture::Initialize_Implementation()
-// {
-//
-// }
-
 void ACSShallowWaterCapture::SetMaterialParameter_Implementation()
 {
-	
-
 	if (RT_ResultDepthWet
-		&& RT_ResultDepthWet->GetResource()
-		&& GWorld)
+	&& RT_ResultDepthWet->GetResource()
+	&& GetWorld())
 	{
 		FTextureRenderTargetResource* RenderTargetResource = RT_ResultDepthWet->GameThread_GetRenderTargetResource();
 		FLinearColor ClearColor = FLinearColor(-9999, -9999, -9999, -9999);
@@ -1194,7 +1456,50 @@ void ACSShallowWaterCapture::SetMaterialParameter_Implementation()
 			RHICmdList.Transition(FRHITransitionInfo(RenderTargetResource->GetRenderTargetTexture(), ERHIAccess::RTV, ERHIAccess::SRVMask));
 		});
 	}
-	
+
+	if (ReusltMesh && WaterMaterial)
+	{
+		UMaterialInstanceDynamic* MID = Cast<UMaterialInstanceDynamic>(ReusltMesh->GetMaterial(0));
+		if (!MID || MID->Parent != WaterMaterial)
+		{
+			MID = UMaterialInstanceDynamic::Create(WaterMaterial, this);
+			ReusltMesh->SetMaterial(0, MID);
+		}
+		MID->SetVectorParameterValue(FName("CSSW_SimCenter"), FLinearColor(SimUVCenter.X, SimUVCenter.Y, 0, 0));
+		MID->SetScalarParameterValue(FName("CSSW_SimInvSize"), SimUVInvSize);
+		if (RT_ResultVelHeight) MID->SetTextureParameterValue(FName("CSSW_VelHeight"), RT_ResultVelHeight);
+		if (RT_ResultDepthWet) MID->SetTextureParameterValue(FName("CSSW_DepthWet"), RT_ResultDepthWet);
+		VisWaterMaterial = MID;
+	}
+
+	if (SimVisHISM && WaterMaterial)
+	{
+		UMaterialInstanceDynamic* HISM_MID = Cast<UMaterialInstanceDynamic>(SimVisHISM->GetMaterial(0));
+		if (!HISM_MID || HISM_MID->Parent != WaterMaterial)
+		{
+			HISM_MID = UMaterialInstanceDynamic::Create(WaterMaterial, this);
+			SimVisHISM->SetMaterial(0, HISM_MID);
+		}
+		HISM_MID->SetVectorParameterValue(FName("CSSW_SimCenter"), FLinearColor(SimUVCenter.X, SimUVCenter.Y, 0, 0));
+		HISM_MID->SetScalarParameterValue(FName("CSSW_SimInvSize"), SimUVInvSize);
+		if (RT_ResultVelHeight) HISM_MID->SetTextureParameterValue(FName("CSSW_VelHeight"), RT_ResultVelHeight);
+		if (RT_ResultDepthWet) HISM_MID->SetTextureParameterValue(FName("CSSW_DepthWet"), RT_ResultDepthWet);
+	}
+
+	if (CausticsDecal && DecalMaterial)
+	{
+		UMaterialInstanceDynamic* DecalMID = Cast<UMaterialInstanceDynamic>(CausticsDecal->GetDecalMaterial());
+		if (!DecalMID || DecalMID->Parent != DecalMaterial)
+		{
+			DecalMID = UMaterialInstanceDynamic::Create(DecalMaterial, this);
+			CausticsDecal->SetDecalMaterial(DecalMID);
+		}
+		DecalMID->SetVectorParameterValue(FName("CSSW_SimCenter"), FLinearColor(SimUVCenter.X, SimUVCenter.Y, 0, 0));
+		DecalMID->SetScalarParameterValue(FName("CSSW_SimInvSize"), SimUVInvSize);
+		if (RT_ResultVelHeight) DecalMID->SetTextureParameterValue(FName("CSSW_VelHeight"), RT_ResultVelHeight);
+		if (RT_ResultDepthWet) DecalMID->SetTextureParameterValue(FName("CSSW_DepthWet"), RT_ResultDepthWet);
+		VisDecalMaterial = DecalMID;
+	}
 }
 
 ACSSHallowWaterSource::ACSSHallowWaterSource()
@@ -1202,25 +1507,15 @@ ACSSHallowWaterSource::ACSSHallowWaterSource()
 	
 }
 
-ACSSHallowWaterContainer::ACSSHallowWaterContainer()
-{
-	SceneComponent = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
-	SetRootComponent(SceneComponent);
-
-	VisualizeMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("VisualizationMesh"));
-	VisualizeMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	VisualizeMesh->SetupAttachment(SceneComponent, TEXT("VisualizationMesh"));
-	CausticsDecal =CreateDefaultSubobject<UDecalComponent>(TEXT("CausticsDecal"));
-	CausticsDecal->DecalSize = FVector(500, 50, 50);
-	CausticsDecal->SetupAttachment(SceneComponent, TEXT("CausticsDecal"));
-
-}
 
 void ACSShallowWaterCapture::CaptureSceneDepthNow()
 {
 	SCOPE_CYCLE_COUNTER(STAT_CSSW_Capture);
 	TArray<AActor*> TagedActors;
-	for (TActorIterator<AActor> It(GWorld, AActor::StaticClass()); It; ++It)
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	for (TActorIterator<AActor> It(World, AActor::StaticClass()); It; ++It)
 	{
 		AActor* Actor = *It;
 		if (!Actor->Tags.Contains(SWCaptureTag) && !Actor->GetClass()->IsChildOf(ALandscape::StaticClass())) continue;
@@ -1244,5 +1539,204 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePointWithCapture(int32 InIte
 {
 	bCaptureNextSolverFrame = true;
 	ShallowWaterSolverSoucePoint(InIteration);
+}
+
+void ACSShallowWaterCapture::StartSolver(float TimerRate)
+{
+	ClearSolverTimer();
+	SolverTimerRate = FMath::Max(TimerRate, 0.0f);
+	ResetSolverReadbackState(true, true);
+	CaptureSceneDepthNow();
+	if (bUseBakedResultMesh)
+	{
+		UseSimulationResultMesh();
+	}
+	else
+	{
+		UpdateSimulationPreviewMesh();
+	}
+	bSimVisActive = true;
+	EnsureSimVisHISMReady();
+	ScheduleSolverTimerTick();
+	OnSolverStarted();
+	UE_LOG(LogTemp, Log, TEXT("[CSSW] StartSolver: %s Iteration=%d CaptureSize=%.2f TextureSize=%.0f TimerRate=%.4f"),
+		*GetName(), Iteration, CaptureSize, TextureSize, SolverTimerRate);
+}
+
+void ACSShallowWaterCapture::StopSolver()
+{
+	StopSimulationRuntime(false);
+}
+
+void ACSShallowWaterCapture::ToggleSimVisualization(int32 SimIterationsPerFrame)
+{
+	Iteration = FMath::Max(SimIterationsPerFrame, 1);
+
+	if (!IsSolverTimerActive())
+	{
+		StartSolver(SolverTimerRate);
+		return;
+	}
+
+	if (bUseBakedResultMesh)
+	{
+		UseSimulationResultMesh();
+	}
+
+	bSimVisActive = !bSimVisActive;
+	
+	if (bSimVisActive)
+	{
+		UpdateSimulationPreviewMesh();
+		if (!EnsureSimVisHISMReady()) return;
+
+		ResetSimVisTiles();
+
+		if (ReusltMesh) ReusltMesh->SetVisibility(false);
+		SimVisHISM->SetVisibility(true);
+	}
+	else
+	{
+		if (SimVisHISM) SimVisHISM->SetVisibility(false);
+		if (ReusltMesh) ReusltMesh->SetVisibility(true);
+	}
+}
+
+void ACSShallowWaterCapture::OnSolverStarted_Implementation()
+{
+	UE_LOG(LogTemp, Log, TEXT("OnSolverStarted_Implementation: Default C++ implementation called on %s"), *GetName());
+}
+
+ACSShallowWaterCapture::FOnBakeResultMesh ACSShallowWaterCapture::OnBakeResultMeshDelegate;
+
+void ACSShallowWaterCapture::BakeResultMesh()
+{
+	if (OnBakeResultMeshDelegate.IsBound())
+	{
+		OnBakeResultMeshDelegate.Execute(this);
+		OnBakeComplete();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("BakeResultMesh: No handler bound (Editor module not loaded?) on %s"), *GetName());
+	}
+}
+
+void ACSShallowWaterCapture::OnBakeComplete_Implementation()
+{
+	StopSolver();
+	bSimVisActive = false;
+	if (SimVisHISM) SimVisHISM->SetVisibility(false);
+	if (ReusltMesh) ReusltMesh->SetVisibility(true);
+}
+
+void ACSShallowWaterCapture::UseBakedResultMesh(UStaticMesh* InBakedMesh, UMaterialInterface* InWaterMaterial, UMaterialInterface* InDecalMaterial)
+{
+	if (!InBakedMesh || !ReusltMesh) return;
+
+	Modify();
+	ReusltMesh->Modify();
+
+	if (!SimulationPreviewMesh)
+	{
+		SimulationPreviewMesh = ReusltMesh->GetStaticMesh();
+	}
+	if (!SimulationWaterMaterial)
+	{
+		SimulationWaterMaterial = WaterMaterial;
+	}
+	if (!SimulationDecalMaterial)
+	{
+		SimulationDecalMaterial = DecalMaterial;
+	}
+
+	BakedResultMesh = InBakedMesh;
+	bUseBakedResultMesh = true;
+	WaterMaterial = InWaterMaterial ? InWaterMaterial : WaterMaterial;
+	DecalMaterial = InDecalMaterial ? InDecalMaterial : DecalMaterial;
+
+	StopSolver();
+	bSimVisActive = false;
+	if (SimVisHISM)
+	{
+		ResetSimVisTiles();
+		SimVisHISM->SetVisibility(false);
+	}
+
+	ReusltMesh->SetStaticMesh(BakedResultMesh);
+	ReusltMesh->SetRelativeScale3D(FVector::OneVector);
+	if (WaterMaterial)
+	{
+		ReusltMesh->SetMaterial(0, WaterMaterial);
+	}
+	ReusltMesh->SetVisibility(true);
+	ReusltMesh->MarkRenderStateDirty();
+	MarkPackageDirty();
+}
+
+void ACSShallowWaterCapture::UseSimulationResultMesh()
+{
+	if (!ReusltMesh) return;
+
+	Modify();
+	ReusltMesh->Modify();
+
+	bUseBakedResultMesh = false;
+	bSimVisActive = false;
+
+	UpdateSimulationPreviewMesh();
+	SetMaterialParameter();
+	MarkPackageDirty();
+}
+
+void ACSShallowWaterCapture::ShowDebugViewPlane(float Duration)
+{
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	TArray<AActor*> Found;
+	UGameplayStatics::GetAllActorsOfClassWithTag(World, AStaticMeshActor::StaticClass(), FName("CSSWVM"), Found);
+	for (AActor* A : Found)
+	{
+		if (A) A->Destroy();
+	}
+	DebugViewPlaneActor.Reset();
+
+	if (!DebugMesh) return;
+
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	AStaticMeshActor* Spawned = World->SpawnActor<AStaticMeshActor>(
+		AStaticMeshActor::StaticClass(),
+		ReusltMesh->GetComponentTransform(),
+		SpawnParams);
+	if (!Spawned) return;
+
+	UStaticMeshComponent* SMC = Spawned->GetStaticMeshComponent();
+	SMC->SetStaticMesh(DebugMesh);
+
+	UMaterialInstanceDynamic* MID = SMC->CreateDynamicMaterialInstance(0, DebugMesh->GetMaterial(0));
+	if (MID && RT_DebugView)
+	{
+		MID->SetTextureParameterValue(FName("Height"), RT_DebugView);
+	}
+
+	Spawned->Tags.Add(FName("CSSWVM"));
+	DebugViewPlaneActor = Spawned;
+
+	if (Duration > 0.f)
+	{
+		World->GetTimerManager().ClearTimer(DebugViewPlaneTimerHandle);
+		World->GetTimerManager().SetTimer(DebugViewPlaneTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this, [this]()
+			{
+				if (DebugViewPlaneActor.IsValid())
+				{
+					DebugViewPlaneActor->Destroy();
+					DebugViewPlaneActor.Reset();
+				}
+			}),
+			Duration, false);
+	}
 }
 

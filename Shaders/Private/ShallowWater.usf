@@ -20,6 +20,10 @@
 #define Gravity 9.81
 #endif
 
+#ifndef VELOCITY_CLAMP
+#define VELOCITY_CLAMP 2
+#endif
+
 // ─── Resource Bindings ──────────────────────────────────────────────
 
 Texture2D T_SceneDepth;
@@ -38,13 +42,14 @@ RWTexture2D<float4> RW_VelHeightSimB;
 RWTexture2D<float4> RW_SmoothHeightA;
 RWTexture2D<float4> RW_SmoothHeightB;
 RWTexture2D<float4> RW_ResultSmoothHeight;
+RWTexture2D<float4> RW_TileMask;
 
-RWBuffer<float4> RWB_SourceUVRads;
-RWBuffer<uint>   RWB_CompactTileCoords;
-RWBuffer<uint>   RWB_CompactCounter;
+StructuredBuffer<float4> RWB_SourceUVRads;
+RWStructuredBuffer<uint> RWB_CompactTileCoords;
+RWStructuredBuffer<uint> RWB_CompactCounter;
 RWBuffer<uint>   RWB_CompactIndirectArgs;
-Buffer<uint>     B_CompactTileCoords;
-Buffer<uint>     B_CompactCounter;
+StructuredBuffer<uint> B_CompactTileCoords;
+StructuredBuffer<uint> B_CompactCounter;
 
 // ─── Uniforms ───────────────────────────────────────────────────────
 
@@ -156,7 +161,7 @@ bool SW_IsPixelActive(int2 p)
 		return true;
 
 	float4 DW = T_ResultDepthWet[p];
-	if (DW.w > 0.0)
+	if (DW.x > 0.0001 || DW.w > 0.0)
 		return true;
 
 	if (BCount_SourceUVRads > 0)
@@ -191,6 +196,47 @@ bool SW_IsPixelActive(int2 p)
 #include "General.usf"
 #include "SparseTileDispatch.ush"
 
+// ─── Waterfall Independent Shared Memory ────────────────────────────
+
+#ifdef SW_VELOCITYHEIGHTSIM
+
+#ifndef WATERFALL_EXTENT
+#define WATERFALL_EXTENT 5
+#endif
+
+groupshared half4 WaterfallSharedGroup[THREADGROUPSIZE_X + WATERFALL_EXTENT * 2][THREADGROUPSIZE_Y + WATERFALL_EXTENT * 2];
+
+half4 WaterfallSharedData(int2 Pos)
+{
+	float4 WaterData = RW_VelHeightSimA[Pos];
+	float SceneHeight = MAX_HEIGHT - T_SceneDepth[Pos].x;
+	return half4(WaterData.xy, SceneHeight, max(WaterData.z, 0));
+}
+
+void FillWaterfallSharedGroup(
+	in int3 DispatchThreadId,
+	in int3 GroupThreadId,
+	int2 MaxCell,
+	in uint GroupIndex)
+{
+	int2 groupTopLeftGlobal = DispatchThreadId.xy - GroupThreadId.xy - int2(WATERFALL_EXTENT, WATERFALL_EXTENT);
+	const uint THREAD_COUNT = THREADGROUPSIZE_X * THREADGROUPSIZE_Y;
+	const uint SHARED_DIM_X = THREADGROUPSIZE_X + 2 * WATERFALL_EXTENT;
+	const uint SHARED_DIM_Y = THREADGROUPSIZE_Y + 2 * WATERFALL_EXTENT;
+	const uint TOTAL = SHARED_DIM_X * SHARED_DIM_Y;
+
+	for (uint i = GroupIndex; i < TOTAL; i += THREAD_COUNT)
+	{
+		int lx = i % SHARED_DIM_X;
+		int ly = i / SHARED_DIM_X;
+		int2 gp = clamp(groupTopLeftGlobal + int2(lx, ly), int2(0, 0), MaxCell - 1);
+		WaterfallSharedGroup[lx][ly] = WaterfallSharedData(gp);
+	}
+	GroupMemoryBarrierWithGroupSync();
+}
+
+#endif // SW_VELOCITYHEIGHTSIM
+
 // ─── Pass 1: Velocity & Height ──────────────────────────────────────
 
 void CalVelocityHeight_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId, uint3 GroupID, uint GroupIndex)
@@ -201,7 +247,7 @@ void CalVelocityHeight_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId, ui
 	const bool bDispatchThreadValid = STD_IsTileThreadActive(GroupID.x, GroupThreadId, MaxCellInt, B_CompactTileCoords);
 	const int2 DispatchPixel = STD_GetTilePixel(GroupID.x, GroupThreadId, MaxCellInt, B_CompactTileCoords);
 	const uint3 DispatchThreadId = uint3(DispatchPixel, LocalDispatchThreadId.z);
-	STD_FillSharedGroup(GroupID.x, GroupThreadId, MaxCellInt, GroupIndex, B_CompactTileCoords);
+	FillWaterfallSharedGroup(DispatchThreadId, GroupThreadId, MaxCellInt, GroupIndex);
 	if (!bDispatchThreadValid)
 		return;
 
@@ -210,7 +256,7 @@ void CalVelocityHeight_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId, ui
 	float WaterMin   = 0.000001;
 	float ScaleZ     = 500;
 	float Damping    = 0.02;
-	float VelocityClamp = 2;
+	float VelocityClamp = VELOCITY_CLAMP;
 
 	const int2 PixelRight  = ClampPixelCoord(DispatchPixel + int2( 1,  0), MaxCellInt);
 	const int2 PixelTop    = ClampPixelCoord(DispatchPixel + int2( 0, -1), MaxCellInt);
@@ -251,32 +297,36 @@ void CalVelocityHeight_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId, ui
 	SHL = lerp(SHL, SSHL, SmoothStress);
 	SHB = lerp(SHB, SSHB, SmoothStress);
 
-	// Smooth height convergence (shared-group neighbourhood)
-	float4 CurrentHeightData = GENERAL_SHAREGROUP_NAME[GroupThreadId.x + GENERAL_SHAREGROUP_EXTENT][GroupThreadId.y + GENERAL_SHAREGROUP_EXTENT];
-	float2 CurrentVel = CurrentHeightData.xy;
+	// Smooth height convergence (waterfall independent shared memory)
+	half4 CurrentWFData = WaterfallSharedGroup[GroupThreadId.x + WATERFALL_EXTENT][GroupThreadId.y + WATERFALL_EXTENT];
+	float CurrentSceneHeight_WF = CurrentWFData.z;
+	float2 CurrentVel_WF = CurrentWFData.xy;
+	float CurrentWater_WF = CurrentWFData.w;
 	int   ValidCount = 0;
 	float SmoothHeightSum = 0;
 	float NeighbourHeightMax = -99999;
-	for (int Y = -GENERAL_SHAREGROUP_EXTENT; Y <= GENERAL_SHAREGROUP_EXTENT; Y++)
+	for (int Y = -WATERFALL_EXTENT; Y <= WATERFALL_EXTENT; Y++)
 	{
-		for (int X = -GENERAL_SHAREGROUP_EXTENT; X <= GENERAL_SHAREGROUP_EXTENT; X++)
+		for (int X = -WATERFALL_EXTENT; X <= WATERFALL_EXTENT; X++)
 		{
 			bool OutBound = DispatchPixel.x + X > MaxCellInt.x - 1 || DispatchPixel.y + Y > MaxCellInt.y - 1
 			             || DispatchPixel.x + X < 0 || DispatchPixel.y + Y < 0;
-			int2 Offset = GroupThreadId.xy + int2(X, Y) + int2(GENERAL_SHAREGROUP_EXTENT, GENERAL_SHAREGROUP_EXTENT);
-			float Dist = 1 - length(float2(X, Y)) / GENERAL_SHAREGROUP_EXTENT / pow(2, .5);
+			int2 Offset = GroupThreadId.xy + int2(X, Y) + int2(WATERFALL_EXTENT, WATERFALL_EXTENT);
+			float Dist = 1 - length(float2(X, Y)) / WATERFALL_EXTENT / pow(2, .5);
 			Dist = smoothstep(0, 1, Dist);
 			Dist = smoothstep(0, 1, Dist);
 
-			float4 ShareData = GENERAL_SHAREGROUP_NAME[Offset.x][Offset.y];
-			float2 ShareVel  = ShareData.xy;
-			float VelDot     = smoothstep(0, 1, max(0, dot(ShareVel, CurrentVel)));
-			float CurrentWater = CurrentHeightData.w;
-			float ShareWater   = ShareData.w;
-			float HeightDiff   = clamp(ShareData.z + ShareWater - CurrentHeightData.z - CurrentWater - 150, 0, 200) / 200;
-			float ShareHeight  = lerp(CurrentHeightData.z, ShareData.z, Dist);
-			ShareHeight = lerp(CurrentHeightData.z, ShareHeight, VelDot);
-			ShareHeight = lerp(CurrentHeightData.z, ShareHeight, HeightDiff);
+			half4 ShareData = WaterfallSharedGroup[Offset.x][Offset.y];
+			float2 ShareVel = ShareData.xy;
+			float ShareSceneHeight = ShareData.z;
+			float ShareWater = ShareData.w;
+
+			float VelDot = smoothstep(0, 1, max(0, dot(ShareVel, CurrentVel_WF)));
+			float HeightDiff = clamp(ShareSceneHeight + ShareWater - CurrentSceneHeight_WF - CurrentWater_WF - 150, 0, 200) / 200;
+
+			float ShareHeight = lerp(CurrentSceneHeight_WF, ShareSceneHeight, Dist);
+			ShareHeight = lerp(CurrentSceneHeight_WF, ShareHeight, VelDot);
+			ShareHeight = lerp(CurrentSceneHeight_WF, ShareHeight, HeightDiff);
 
 			SmoothHeightSum += OutBound ? 0 : ShareHeight;
 			ShareHeight = ShareHeight > MAX_HEIGHT - 1000 ? -99999 : ShareHeight;
@@ -288,7 +338,7 @@ void CalVelocityHeight_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId, ui
 	float HeightChange = lerp(RW_SmoothHeightA[DispatchThreadId.xy].y, NeighbourHeightMax, .05);
 	HeightChange = HeightChange - RW_SmoothHeightA[DispatchThreadId.xy].y;
 	HeightChange = min(abs(HeightChange), 5.5) * sign(HeightChange);
-	float SmoothHeight = clamp(RW_SmoothHeightA[DispatchThreadId.xy].y + HeightChange, CurrentHeightData.z, NeighbourHeightMax);
+	float SmoothHeight = clamp(RW_SmoothHeightA[DispatchThreadId.xy].y + HeightChange, CurrentSceneHeight_WF, NeighbourHeightMax);
 	RW_SmoothHeightB[DispatchThreadId.xy].y = SmoothHeight;
 
 	float FC = CurrentState.w;
@@ -532,11 +582,21 @@ void CalShallowWaterResult_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId
 	DepthWet.y = CurrentWet;
 	DepthWet.z = WetAvg;
 	DepthWet.x = WaterMax;
-	DepthWet.w = ValidCount / Count - .49;
+	DepthWet.w = (ValidCount / Count - .49) * 2;
 
 	RW_ResultDepthWet[DispatchThreadId.xy]     = DepthWet;
 	RW_ResultVelHeight[DispatchThreadId.xy]    = float4(VelHeightFoam.xy, ResultHeight, ResultForm);
 	RW_ResultSmoothHeight[DispatchThreadId.xy] = RW_SmoothHeightA[DispatchThreadId.xy];
+
+	// Debug visualization
+	float RawSceneHeight = MAX_HEIGHT - T_SceneDepth[DispatchThreadId.xy].x;
+	float4 SmoothData = RW_SmoothHeightA[DispatchThreadId.xy];
+	float SmoothH = SmoothData.y;
+	float WaterfallExpansion = saturate((SmoothH - RawSceneHeight) / 200.0);
+	float HeightDiff = SmoothH - RawSceneHeight;
+	float NormDiff = clamp(HeightDiff / 500.0, -1.0, 1.0) * 0.5 + 0.5;
+
+	RW_DebugView[DispatchThreadId.xy] = float4(WaterfallExpansion, NormDiff, 0, CurrentSceneHeight);
 }
 
 // ─── Pass: Set Height ───────────────────────────────────────────────
@@ -579,6 +639,11 @@ void CompactActiveTiles(uint3 GroupId, uint GroupIndex)
 		TileCoord, TileSize, DispatchExpandPixels, MaxCell,
 		GroupIndex, THREADGROUPSIZE_X * THREADGROUPSIZE_Y,
 		RWB_CompactTileCoords, RWB_CompactCounter);
+
+	if (GroupIndex == 0)
+	{
+		RW_TileMask[TileCoord] = float4(gs_STD_TileActive != 0 ? 1.0 : 0.0, 0, 0, 0);
+	}
 }
 
 void FinalizeCompact(uint3 DispatchThreadId)

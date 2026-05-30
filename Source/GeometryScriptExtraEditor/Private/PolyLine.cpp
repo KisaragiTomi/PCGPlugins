@@ -1,4 +1,4 @@
-﻿#include "PolyLine.h"
+#include "../Public/PolyLine.h"
 #include "Curve/CurveUtil.h"
 #include "GeometryScript/MeshPrimitiveFunctions.h"
 

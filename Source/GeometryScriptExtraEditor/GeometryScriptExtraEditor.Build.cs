@@ -1,15 +1,29 @@
-﻿using UnrealBuildTool;
+using System;
+using System.IO;
+using UnrealBuildTool;
 
 public class GeometryScriptExtraEditor : ModuleRules
 {
     public GeometryScriptExtraEditor(ReadOnlyTargetRules Target) : base(Target)
     {
-        PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
+        // Avoid shared-PCH symbol/link mismatches in this editor-only module.
+        PCHUsage = ModuleRules.PCHUsageMode.NoPCHs;
+        bUseUnity = false;
         bUseRTTI = true;
+        PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "..", "PCGPluginsShared"));
+        bool bPCGPluginsDebug = Target.Configuration != UnrealTargetConfiguration.Shipping;
+        string PCGPluginsDebugEnv = Environment.GetEnvironmentVariable("PCGPLUGINS_DEBUG");
+        if (!string.IsNullOrWhiteSpace(PCGPluginsDebugEnv))
+        {
+            bPCGPluginsDebug = PCGPluginsDebugEnv != "0" && !PCGPluginsDebugEnv.Equals("false", StringComparison.OrdinalIgnoreCase);
+        }
+        PublicDefinitions.Add("PCGPLUGINS_DEBUG=" + (bPCGPluginsDebug ? "1" : "0"));
+
         PublicDependencyModuleNames.AddRange(
             new string[]
             {
-                
+                "ComputeShaderGenerator",
+                "GeometryMath",
             }
         );
 
@@ -18,10 +32,12 @@ public class GeometryScriptExtraEditor : ModuleRules
             new string[]
             {
                 "Core",
+                "AssetRegistry",
                 "ModelingOperators",
                 "CoreUObject",
                 "DeveloperSettings",
                 "Engine",
+                "EditorScriptingUtilities",
                 "GeometryAlgorithms",
                 "GeometryCore",
                 "GeometryFramework",
@@ -32,8 +48,6 @@ public class GeometryScriptExtraEditor : ModuleRules
                 "SlateCore", 
                 "Landscape",
                 "Foliage",
-                "GeometryMath",
-                "FoliageCluster",
                 "DynamicMesh",
                 "GeometryCore",
                 "GeometryFramework",
@@ -44,25 +58,20 @@ public class GeometryScriptExtraEditor : ModuleRules
                 "MeshDescription",
                 "StaticMeshDescription",
                 "MeshConversion",
+                "Renderer",
                 "RenderCore",
                 "RHI",
+                "UnrealEd",
             }
         );
-        
-        if (Target.Type == TargetType.Editor)
-        {
-            PublicDependencyModuleNames.Add("FoliageCluster");
-            
-        }
-        else
-        {
-            PublicDependencyModuleNames.Remove("FoliageCluster");
-        }
+
         AddEngineThirdPartyPrivateStaticDependencies(Target,
             "IntelTBB",
             "UVAtlas",
             "DirectXMesh",
-            "OpenVDB"
+            "OpenVDB",
+            "Blosc",
+            "zlib"
         );
     }
 }

@@ -67,6 +67,17 @@ PassParameters->T_##Name = RDG_##Name;
 FRDGTextureRef RDG_##Name = RegisterExternalTexture(GraphBuilder, R_##Name->GetRenderTargetTexture(), TEXT("R_"#Name));\
 PassParameters->T_##Name = RDG_##Name;
 
+#define CREATE_RDG_STRUCTURED_UPLOAD_SRV(Name, ElementType, ArrayData, DebugName) \
+CSHepler::FRDGStructuredBufferRefs Name##Refs = CSHepler::CreateUploadedStructuredBuffer<ElementType>(GraphBuilder, ArrayData, DebugName, false, true); \
+FRDGBufferRef Name##Buffer = Name##Refs.Buffer; \
+FRDGBufferSRVRef Name##SRV = Name##Refs.SRV;
+
+#define CREATE_RDG_STRUCTURED_UAV_SRV(Name, ElementType, ElementCount, DebugName) \
+CSHepler::FRDGStructuredBufferRefs Name##Refs = CSHepler::CreateStructuredBuffer<ElementType>(GraphBuilder, ElementCount, DebugName, true, true); \
+FRDGBufferRef Name##Buffer = Name##Refs.Buffer; \
+FRDGBufferUAVRef Name##UAV = Name##Refs.UAV; \
+FRDGBufferSRVRef Name##SRV = Name##Refs.SRV;
+
 
 DECLARE_STATS_GROUP(TEXT("CSTest"), STATGROUP_CSTest, STATCAT_Advanced);
 
@@ -74,6 +85,50 @@ using namespace UE::Geometry;
 
 namespace CSHepler
 {
+	struct FRDGStructuredBufferRefs
+	{
+		FRDGBufferRef Buffer = nullptr;
+		FRDGBufferUAVRef UAV = nullptr;
+		FRDGBufferSRVRef SRV = nullptr;
+	};
+
+	inline FRDGStructuredBufferRefs CreateStructuredBuffer(FRDGBuilder& GraphBuilder, uint32 BytesPerElement, uint32 NumElements, const TCHAR* Name = TEXT("StructuredBuffer"), bool bCreateUAV = true, bool bCreateSRV = true)
+	{
+		FRDGStructuredBufferRefs Refs;
+		if (BytesPerElement == 0 || NumElements == 0)
+		{
+			return Refs;
+		}
+
+		Refs.Buffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(BytesPerElement, NumElements), Name);
+		if (bCreateUAV)
+		{
+			Refs.UAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Refs.Buffer));
+		}
+		if (bCreateSRV)
+		{
+			Refs.SRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Refs.Buffer));
+		}
+		return Refs;
+	}
+
+	template<typename ElementType>
+	inline FRDGStructuredBufferRefs CreateStructuredBuffer(FRDGBuilder& GraphBuilder, uint32 NumElements, const TCHAR* Name = TEXT("StructuredBuffer"), bool bCreateUAV = true, bool bCreateSRV = true)
+	{
+		return CreateStructuredBuffer(GraphBuilder, sizeof(ElementType), NumElements, Name, bCreateUAV, bCreateSRV);
+	}
+
+	template<typename ElementType>
+	inline FRDGStructuredBufferRefs CreateUploadedStructuredBuffer(FRDGBuilder& GraphBuilder, const TArray<ElementType>& ArrayData, const TCHAR* Name = TEXT("StructuredBuffer"), bool bCreateUAV = false, bool bCreateSRV = true)
+	{
+		FRDGStructuredBufferRefs Refs = CreateStructuredBuffer<ElementType>(GraphBuilder, uint32(ArrayData.Num()), Name, bCreateUAV, bCreateSRV);
+		if (Refs.Buffer)
+		{
+			GraphBuilder.QueueBufferUpload(Refs.Buffer, ArrayData.GetData(), sizeof(ElementType) * ArrayData.Num());
+		}
+		return Refs;
+	}
+
 	static FRDGTextureRef ConvertToUVATexture(FTextureRenderTargetResource* RenderTarget, FRDGBuilder& GraphBuilder, FLinearColor ClearColor = FLinearColor(0 ,0 ,0, 0), const TCHAR* Name = TEXT("TempTexture") )
 	{
 		FRDGTextureDesc Desc_View(FRDGTextureDesc::Create2D(RenderTarget->GetSizeXY(), PF_FloatRGBA, FClearValueBinding::White, TexCreate_RenderTargetable | TexCreate_ShaderResource | TexCreate_UAV));
@@ -130,7 +185,8 @@ namespace CSHepler
 			if (FMath::Pow(2.0, i) - 2 > Iteration)
 				return FMath::Pow(2.0, i);
 		}
-		return -1;
+		ensureMsgf(false, TEXT("GenerateTextureSize: Iteration %d exceeds max supported range (2046), clamping to 4096"), Iteration);
+		return 4096;
 	}
 
 	inline void CreateRWBuffer(FRDGBuilder& GraphBuilder, FRDGBufferRef& RDGBuffer, FRDGBufferUAVRef& RDGUAVBuffer, uint32 NumElements, uint32 BytesPerElement, EPixelFormat Format = PF_A16B16G16R16, const TCHAR* Name = TEXT("UAV_Buffer"))

@@ -5,6 +5,7 @@
 #include "RenderGraphUtils.h"
 #include "GlobalShader.h"
 #include "ShaderParameterStruct.h"
+#include "ComputeShaderGenerateHepler.h"
 
 #ifndef NUM_THREADS_PER_GROUP_DIMENSION_Z
 #define NUM_THREADS_PER_GROUP_DIMENSION_Z 1
@@ -57,17 +58,15 @@ inline FCompactTileBuffers CreateCompactTileBuffers(
 	const uint32 TilesY = FMath::Max((TextureHeight + TileSizeY - 1) / TileSizeY, 1u);
 	Out.MaxTileCount = TilesX * TilesY;
 
-	Out.TileCoordsBuffer = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), Out.MaxTileCount),
-		TEXT("STD.CompactTileCoords"));
-	Out.TileCoordsUAV = GraphBuilder.CreateUAV(Out.TileCoordsBuffer, PF_R32_UINT);
-	Out.TileCoordsSRV = GraphBuilder.CreateSRV(Out.TileCoordsBuffer, PF_R32_UINT);
+	CREATE_RDG_STRUCTURED_UAV_SRV(TileCoords, uint32, Out.MaxTileCount, TEXT("STD.CompactTileCoords"))
+	Out.TileCoordsBuffer = TileCoordsBuffer;
+	Out.TileCoordsUAV = TileCoordsUAV;
+	Out.TileCoordsSRV = TileCoordsSRV;
 
-	Out.CounterBuffer = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1),
-		TEXT("STD.CompactCounter"));
-	Out.CounterUAV = GraphBuilder.CreateUAV(Out.CounterBuffer, PF_R32_UINT);
-	Out.CounterSRV = GraphBuilder.CreateSRV(Out.CounterBuffer, PF_R32_UINT);
+	CREATE_RDG_STRUCTURED_UAV_SRV(Counter, uint32, 1, TEXT("STD.CompactCounter"))
+	Out.CounterBuffer = CounterBuffer;
+	Out.CounterUAV = CounterUAV;
+	Out.CounterSRV = CounterSRV;
 
 	Out.IndirectArgsBuffer = GraphBuilder.CreateBuffer(
 		FRDGBufferDesc::CreateIndirectDesc<FRHIDispatchIndirectParameters>(1),

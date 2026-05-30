@@ -1,4 +1,5 @@
-#include "ComputeShaderLandscape.h"
+﻿#include "ComputeShaderLandscape.h"
+#include "CSLandscapeEditLayer.h"
 #include "GlobalShader.h"
 #include "MaterialShader.h"
 #include "ShaderParameterStruct.h"
@@ -18,9 +19,19 @@
 #include "Landscape.h"
 #include "LandscapeEdit.h"
 #include "LandscapeEditLayer.h"
+#include "LandscapeEditLayerRenderer.h"
+#include "LandscapeEditLayerRendererState.h"
+#include "LandscapeEditLayerTargetTypeState.h"
+#include "LandscapeEditLayerMergeRenderContext.h"
+#include "LandscapeEditResourcesSubsystem.h"
+#include "LandscapeUtils.h"
 #include "Generators/RectangleMeshGenerator.h"
 #include "GeometryScript/MeshPrimitiveFunctions.h"
 #include "GeometryScript/MeshNormalsFunctions.h"
+#include "EngineUtils.h"
+#include "ImageUtils.h"
+#include "Misc/FileHelper.h"
+#include "UObject/SavePackage.h"
 
 class ACSShallowWaterCapture;
 DECLARE_CYCLE_STAT(TEXT("CSL Execute"), STAT_CSL_Execute, STATGROUP_CSTest)
@@ -35,6 +46,7 @@ public:
 		L_CreateRiverBed,
 		L_LandscapeBrushTexture,
 		L_LandscapePaste,
+		L_BrushApplyResult,
 		
 		MAX
 	};
@@ -64,6 +76,8 @@ public:
 		SHADER_PARAMETER(float, BlurRange)
 		SHADER_PARAMETER(float, RiverWidth)
 		SHADER_PARAMETER(float, RiverDepth)
+		SHADER_PARAMETER(float, LandscapeZScale)
+		SHADER_PARAMETER(float, LandscapeZOffset)
 
 		SHADER_PARAMETER_SAMPLER(SamplerState, Sampler)
 	END_SHADER_PARAMETER_STRUCT()
@@ -91,6 +105,7 @@ public:
 			TEXT("L_CREATERIVERBED"),
 			TEXT("L_LANDSCAPEBRUSHTEXTURE"),
 			TEXT("L_LANDSCAPEPASTE"),
+			TEXT("L_BRUSHAPPLYRESULT"),
 			
 			
 
@@ -113,7 +128,7 @@ public:
 	}
 };
 
-IMPLEMENT_GLOBAL_SHADER(FCSLandscape, "/Plugin/PCGPlugins/Shaders/Private/Landscape.usf", "CSLandscapeFunction", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FCSLandscape, "/Plugin/PCGPlugins/Shaders/Private/CSLandscape.usf", "CSLandscapeFunction", SF_Compute);
 
 using namespace CSHepler;
 
@@ -128,9 +143,6 @@ ACSLandscape::ACSLandscape()
 	
 	VisMesh = CreateDefaultSubobject<UDynamicMeshComponent>(TEXT("VisMesh"));
 	VisMesh->SetupAttachment(SceneComponent, TEXT("VisMesh"));
-	
-	AffectHeightmap = true;
-
 }
 
 
@@ -155,24 +167,39 @@ void ACSLandscape::OnConstruction(const FTransform& Transform)
 
 void ACSLandscape::InitRT()
 {
-	if (RT_LandscapeData == nullptr) RT_LandscapeData = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor::Black, true, false);
-	if (RT_CopyLandscapeData == nullptr) RT_CopyLandscapeData = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor::Black, true, false);
-	if (RT_DebugView == nullptr) RT_DebugView = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor::Black, true, false);
-	if (RT_Result == nullptr) RT_Result = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(0, 0, 0, 0), true, false); 
-	
+	EnsureRTs(256, 256);
+}
+
+void ACSLandscape::EnsureRTs(int32 SizeX, int32 SizeY)
+{
+	auto CreateOrResize = [this](UTextureRenderTarget2D*& RT, int32 W, int32 H, ETextureRenderTargetFormat Fmt, FLinearColor Clear)
+	{
+		if (!RT)
+		{
+			RT = UKismetRenderingLibrary::CreateRenderTarget2D(this, W, H, Fmt, Clear, true, false);
+		}
+		else if (RT->SizeX != W || RT->SizeY != H)
+		{
+			RT->ResizeTarget(W, H);
+		}
+	};
+
+	CreateOrResize(RT_LandscapeData, SizeX, SizeY, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor::Black);
+	CreateOrResize(RT_CopyLandscapeData, SizeX, SizeY, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor::Black);
+	CreateOrResize(RT_DebugView, SizeX, SizeY, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor::Black);
+	CreateOrResize(RT_Result, SizeX, SizeY, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(0, 0, 0, 0));
 }
 
 
 void ACSLandscape::ReadLandscapeDataToTexture()
 {
-	if (!IsParameterValidMult()) return;
-	
 	FVector Center = Box->Bounds.Origin;
 	FVector Extent = Box->Bounds.BoxExtent;
 	FReadLandscapeData LandscapeData;
 	ULandscapeExtra::CreateLandscapeTextureData(LandscapeData, Center, Extent);
 	if (LandscapeData.TextureSize.X + LandscapeData.TextureSize.Y < 32) return;
-	RT_LandscapeData->ResizeTarget(LandscapeData.TextureSize.X, LandscapeData.TextureSize.Y);
+
+	EnsureRTs(LandscapeData.TextureSize.X, LandscapeData.TextureSize.Y);
 	
 	FVector TextureMin = Center - Extent;
 	FVector TextureMax = Center + Extent;
@@ -189,13 +216,8 @@ void ACSLandscape::ReadLandscapeDataToTexture()
 
 void ACSLandscape::CopyLandscapeData()
 {
-	if (RT_LandscapeData == nullptr) RT_LandscapeData = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor::Black, true, false);
-	if (RT_CopyLandscapeData == nullptr) RT_CopyLandscapeData = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor::Black, true, false);
-	if (RT_Result == nullptr) RT_Result = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(0, 0, 0, 0), true, false);
-	if (RT_DebugView == nullptr) RT_DebugView = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(0, 0, 0, 0), true, false);
-
 	ReadLandscapeDataToTexture();
-	RT_CopyLandscapeData->ResizeTarget(RT_LandscapeData->SizeX, RT_LandscapeData->SizeY);
+	if (!RT_LandscapeData) return;
 	UComputeShaderBasicFunction::CopyTexture(RT_LandscapeData, RT_CopyLandscapeData);
 	Copy_LandscapeData = Orig_LandscapeData;
 	RT_Result->ResizeTarget(RT_LandscapeData->SizeX, RT_LandscapeData->SizeY);
@@ -213,8 +235,9 @@ void ACSLandscape::CopyLandscapeData()
 	FVector UVRange = MaxUV - MinUV;
 	LandscapeTexMinUV = MinUV;
 	LandscapeTexUVRange = UVRange;
+	const float CapturedBlurRange = BlurRange;
 	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	[=, this](FRHICommandListImmediate& RHICmdList)
+	[R_LandscapeData, R_Result, ValidUVRange, CapturedBlurRange](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
 		{
@@ -247,14 +270,14 @@ void ACSLandscape::CopyLandscapeData()
 			PassParameters->RW_Result = RDGUAV_Result;
 			PassParameters->RW_DebugView = RDGUAV_DebugView;
 			PassParameters->ValidUVRange = ValidUVRange;
-			PassParameters->BlurRange = BlurRange;
+			PassParameters->BlurRange = CapturedBlurRange;
 			PassParameters->Sampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
 
 			GraphBuilder.AddPass(
             	RDG_EVENT_NAME("PasteLandscape"),
             	PassParameters,
             	ERDGPassFlags::AsyncCompute,
-            	[&PassParameters, ComputeShader_BrushTexture, GroupCount](FRHIComputeCommandList& RHICmdList)
+            	[PassParameters, ComputeShader_BrushTexture, GroupCount](FRHIComputeCommandList& RHICmdList)
             	{
             		FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_BrushTexture, *PassParameters, GroupCount);
             	});
@@ -268,38 +291,25 @@ void ACSLandscape::CopyLandscapeData()
 
 	MapMax = Orig_LandscapeData.MapMax;
 	MapMin = Orig_LandscapeData.MapMin;
+
+	bHasResult = true;
+	SaveResultToPersistent();
 }
 
 void ACSLandscape::PasteLandscapeData()
 {
-	if (RT_LandscapeData == nullptr || RT_CopyLandscapeData == nullptr ) return;
-
-	ALandscape* Landscape = nullptr;
-	for (TActorIterator<ALandscape> It(GWorld, ALandscape::StaticClass()); It; ++It)
-	{
-		Landscape = *It;
-		break;
-	}
-	if (!Landscape) return;
-
-	FLandscapeEditDataInterface LandscapeEdit(Landscape->GetLandscapeInfo());
-	LandscapeEdit.SetShouldDirtyPackage(false);
-
 	ReadLandscapeDataToTexture();
+	if (!RT_LandscapeData) return;
 
-	if (RT_Result == nullptr) RT_Result = UKismetRenderingLibrary::CreateRenderTarget2D(this, RT_LandscapeData->SizeX, RT_LandscapeData->SizeY, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(0, 0, 0, 0), true, false);
-	RT_Result->ResizeTarget(RT_LandscapeData->SizeX, RT_LandscapeData->SizeY);
-	RT_DebugView->ResizeTarget(RT_LandscapeData->SizeX, RT_LandscapeData->SizeY);
-
-	
 	FTextureRenderTargetResource* R_DebugView = RT_DebugView->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_LandscapeData = RT_LandscapeData->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_CopyLandscapeData = RT_CopyLandscapeData->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_Result = RT_Result->GameThread_GetRenderTargetResource();
-	FVector4f ValidUVRange =  FVector4f(Orig_LandscapeData.ValidUVRange, Copy_LandscapeData.ValidUVRange);
+	FVector4f PasteValidUVRange = FVector4f(Orig_LandscapeData.ValidUVRange, Copy_LandscapeData.ValidUVRange);
+	const float CapturedBlurRange = BlurRange;
 	
 	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	[=, this](FRHICommandListImmediate& RHICmdList)
+	[R_DebugView, R_LandscapeData, R_CopyLandscapeData, R_Result, PasteValidUVRange, CapturedBlurRange](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
 		{
@@ -325,21 +335,19 @@ void ACSLandscape::PasteLandscapeData()
 			FRDGTextureRef RDG_DebugView = RegisterExternalTexture(GraphBuilder, R_DebugView->GetRenderTargetTexture(), TEXT("R_DebugView"));
 			FRDGTextureRef RDG_Result = RegisterExternalTexture(GraphBuilder, R_Result->GetRenderTargetTexture(), TEXT("R_Result"));
 
-			
-			
 			PassParameters->T_OrigLandscapeData = RDG_LandscapeData;
 			PassParameters->T_CopyLandscapeData = RDG_CopyLandscapeData;
 			PassParameters->RW_Result = RDGUAV_Result;
 			PassParameters->RW_DebugView = RDGUAV_DebugView;
-			PassParameters->ValidUVRange = ValidUVRange;
-			PassParameters->BlurRange = BlurRange;
+			PassParameters->ValidUVRange = PasteValidUVRange;
+			PassParameters->BlurRange = CapturedBlurRange;
 			PassParameters->Sampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
 
 			GraphBuilder.AddPass(
             	RDG_EVENT_NAME("PasteLandscape"),
             	PassParameters,
             	ERDGPassFlags::AsyncCompute,
-            	[&PassParameters, ComputeShader_Paste, GroupCount](FRHIComputeCommandList& RHICmdList)
+            	[PassParameters, ComputeShader_Paste, GroupCount](FRHIComputeCommandList& RHICmdList)
             	{
             		FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_Paste, *PassParameters, GroupCount);
             	});
@@ -350,10 +358,186 @@ void ACSLandscape::PasteLandscapeData()
 	});
 	FlushRenderingCommands();
 
+	bHasResult = true;
+	SaveResultToPersistent();
+	RequestLandscapeUpdate(true);
+}
+
+ALandscape* ACSLandscape::FindLandscape() const
+{
+	if (!GetWorld()) return nullptr;
+	for (TActorIterator<ALandscape> It(GetWorld()); It; ++It)
+	{
+		return *It;
+	}
+	return nullptr;
+}
+
+void ACSLandscape::RequestLandscapeUpdate(bool bInUserTriggered)
+{
+#if WITH_EDITOR
+	EnsureEditLayer();
+
+	ALandscape* Landscape = FindLandscape();
+	if (Landscape)
+	{
+		Landscape->RequestLayersContentUpdateForceAll(ELandscapeLayerUpdateMode::Update_All, bInUserTriggered);
+	}
+#endif
+}
+
+void ACSLandscape::EnsureEditLayer()
+{
+#if WITH_EDITOR
+	ALandscape* Landscape = FindLandscape();
+	if (!Landscape) return;
+
+	// Already exists?
+	if (OwnedEditLayerGuid.IsValid())
+	{
+		int32 Idx = Landscape->GetLayerIndex(OwnedEditLayerGuid);
+		if (Idx != INDEX_NONE) return; // still alive
+		OwnedEditLayerGuid.Invalidate(); // stale, recreate
+	}
+
+	// Each Actor gets its own layer
+	FName LayerName = FName(*FString::Printf(TEXT("CS_%s"), *GetName()));
+	int32 NewIdx = Landscape->CreateLayer(LayerName, UCSLandscapeEditLayer::StaticClass());
+	if (NewIdx != INDEX_NONE)
+	{
+		const FLandscapeLayer* NewLayer = Landscape->GetLayerConst(NewIdx);
+		if (NewLayer && NewLayer->EditLayer)
+		{
+			OwnedEditLayerGuid = NewLayer->EditLayer->GetGuid();
+		}
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("ACSLandscape::EnsureEditLayer: %s → layer %s"),
+		*GetName(), *OwnedEditLayerGuid.ToString());
+#endif
+}
+
+void ACSLandscape::RemoveEditLayer()
+{
+#if WITH_EDITOR
+	if (!OwnedEditLayerGuid.IsValid()) return;
+
+	ALandscape* Landscape = FindLandscape();
+	if (!Landscape) return;
+
+	int32 Idx = Landscape->GetLayerIndex(OwnedEditLayerGuid);
+	if (Idx != INDEX_NONE)
+	{
+		Landscape->DeleteLayer(Idx);
+		UE_LOG(LogTemp, Log, TEXT("ACSLandscape::RemoveEditLayer: deleted layer %s"), *OwnedEditLayerGuid.ToString());
+	}
+
+	OwnedEditLayerGuid.Invalidate();
+#endif
+}
+
+void ACSLandscape::SaveResultToPersistent()
+{
+#if WITH_EDITOR
+	if (!RT_Result || RT_Result->SizeX == 0) return;
+
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	// Create or reuse PersistentResult in our own package (serialized with the actor)
+	if (!PersistentResult || PersistentResult->GetSizeX() != RT_Result->SizeX || PersistentResult->GetSizeY() != RT_Result->SizeY)
+	{
+		PersistentResult = NewObject<UTexture2D>(this, TEXT("PersistentResult"), RF_NoFlags);
+	}
+
+	UKismetRenderingLibrary::ConvertRenderTargetToTexture2DEditorOnly(World, RT_Result, PersistentResult);
+	PersistentResult->UpdateResource();
+	MarkPackageDirty();
+
+	UE_LOG(LogTemp, Log, TEXT("ACSLandscape::SaveResultToPersistent: %s (%dx%d)"),
+		*GetName(), RT_Result->SizeX, RT_Result->SizeY);
+#endif
+}
+
+void ACSLandscape::RestoreResultFromPersistent()
+{
+#if WITH_EDITOR
+	if (!PersistentResult) return;
+
+	int32 W = PersistentResult->GetSizeX();
+	int32 H = PersistentResult->GetSizeY();
+	if (W == 0 || H == 0) return;
+
+	// Ensure RT_Result exists with matching size
+	EnsureRTs(W, H);
+	if (!RT_Result) return;
+
+	// Copy PersistentResult → RT_Result via GPU
+	ENQUEUE_RENDER_COMMAND(RestorePersistent)(
+	[RT = RT_Result, Tex = PersistentResult](FRHICommandListImmediate& RHICmdList)
+	{
+		FTextureRenderTargetResource* RTResource = RT->GameThread_GetRenderTargetResource();
+		FTextureResource* TexResource = Tex->GetResource();
+		if (RTResource && TexResource)
+		{
+			FRHICopyTextureInfo CopyInfo;
+			RHICmdList.CopyTexture(
+				TexResource->GetTexture2DRHI(),
+				RTResource->GetRenderTargetTexture(),
+				CopyInfo);
+		}
+	});
+	FlushRenderingCommands();
+
+	bHasResult = true;
+	UE_LOG(LogTemp, Log, TEXT("ACSLandscape::RestoreResultFromPersistent: %s (%dx%d)"),
+		*GetName(), W, H);
+#endif
+}
+
+void ACSLandscape::PostLoad()
+{
+	Super::PostLoad();
+	RestoreResultFromPersistent();
+}
+
+void ACSLandscape::BeginPlay()
+{
+	Super::BeginPlay();
+}
+
+void ACSLandscape::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	// Only remove the Edit Layer if the actor is explicitly destroyed (e.g. user deletes it).
+	// Do NOT remove on level unload / editor shutdown / PIE end — the layer should persist with the level.
+	if (EndPlayReason == EEndPlayReason::Destroyed)
+	{
+		RemoveEditLayer();
+	}
+	Super::EndPlay(EndPlayReason);
+}
+
+void ACSLandscape::Destroyed()
+{
+	RemoveEditLayer();
+	Super::Destroyed();
+}
+
+void ACSLandscape::CommitToLandscape()
+{
+#if WITH_EDITOR
+	if (!RT_Result || !bHasResult) return;
+
+	ALandscape* Landscape = FindLandscape();
+	if (!Landscape) return;
+
+	FLandscapeEditDataInterface LandscapeEdit(Landscape->GetLandscapeInfo());
+	LandscapeEdit.SetShouldDirtyPackage(true);
+
 	int32 XNum = RT_Result->SizeX;
 	TArray<FLinearColor> ResultColors;
-
 	UKismetRenderingLibrary::ReadRenderTargetRaw(this, RT_Result, ResultColors, false);
+
 	TArray<uint16> HeightData;
 	TArray<uint16> HeightAlphaBlendData;
 	TArray<uint8> HeightFlagsData;
@@ -364,7 +548,7 @@ void ACSLandscape::PasteLandscapeData()
 	{
 		for (int32 X = 0; X < Orig_LandscapeData.TextureValidSize.X; X++)
 		{
-			float ResultHeight = ResultColors[ X + Y * XNum].A / Landscape->GetActorScale3D().Z;
+			float ResultHeight = ResultColors[X + Y * XNum].A / Landscape->GetActorScale3D().Z;
 			HeightAlphaBlendData.Add(0);
 			HeightFlagsData.Add(0);
 			HeightData.Add(LandscapeDataAccess::GetTexHeight(ResultHeight));
@@ -375,14 +559,241 @@ void ACSLandscape::PasteLandscapeData()
 	FGuid LayerGuid = Layer ? Layer->EditLayer->GetGuid() : FGuid();
 	Landscape->ClearEditLayer(0, nullptr, ELandscapeToolTargetTypeFlags::Heightmap);
 	FScopedSetLandscapeEditingLayer Scope(Landscape, LayerGuid, [=] { Landscape->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_All); });
-	LandscapeEdit.SetHeightData(Orig_LandscapeData.ReadRange.X, Orig_LandscapeData.ReadRange.Y,Orig_LandscapeData.ReadRange.Z , Orig_LandscapeData.ReadRange.W, (uint16*)HeightData.GetData(), 0, true, nullptr, (uint16*)HeightAlphaBlendData.GetData(), (uint8*)HeightFlagsData.GetData());
-	// LandscapeEdit.SetAlphaData(LayerInfo, MinX, MinY, MaxX, MaxY, Data.GetData(), 0, ELandscapeLayerPaintingRestriction::None, !LayerInfo->bNoWeightBlend, false);
+	LandscapeEdit.SetHeightData(Orig_LandscapeData.ReadRange.X, Orig_LandscapeData.ReadRange.Y, Orig_LandscapeData.ReadRange.Z, Orig_LandscapeData.ReadRange.W, (uint16*)HeightData.GetData(), 0, true, nullptr, (uint16*)HeightAlphaBlendData.GetData(), (uint8*)HeightFlagsData.GetData());
 
+	bHasResult = false;
+#endif
+}
+
+#if WITH_EDITOR
+
+FString ACSLandscape::GetEditLayerRendererDebugName() const
+{
+	return FString::Printf(TEXT("ACSLandscape_%s"), *GetName());
+}
+
+void ACSLandscape::GetRendererStateInfo(
+	const UE::Landscape::EditLayers::FMergeContext* InMergeContext,
+	UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutSupportedTargetTypeState,
+	UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutEnabledTargetTypeState,
+	TArray<UE::Landscape::EditLayers::FTargetLayerGroup>& OutTargetLayerGroups) const
+{
+	using namespace UE::Landscape::EditLayers;
+	if (bAffectHeightmap)
+	{
+		OutSupportedTargetTypeState.AddTargetTypeMask(ELandscapeToolTargetTypeFlags::Heightmap);
+		if (bHasResult)
+		{
+			OutEnabledTargetTypeState.AddTargetTypeMask(ELandscapeToolTargetTypeFlags::Heightmap);
+		}
+	}
+}
+
+TArray<UE::Landscape::EditLayers::FEditLayerRenderItem> ACSLandscape::GetRenderItems(
+	const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const
+{
+	using namespace UE::Landscape::EditLayers;
+
+	FEditLayerTargetTypeState EnabledState(InMergeContext, bAffectHeightmap ? ELandscapeToolTargetTypeFlags::Heightmap : ELandscapeToolTargetTypeFlags::None);
+
+	FInputWorldArea InputArea = FInputWorldArea::CreateInfinite();
+	FOutputWorldArea OutputArea = FOutputWorldArea::CreateLocalComponent();
+
+	return { FEditLayerRenderItem(EnabledState, InputArea, OutputArea, false) };
+}
+
+UE::Landscape::EditLayers::ERenderFlags ACSLandscape::GetRenderFlags(
+	const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const
+{
+	return UE::Landscape::EditLayers::ERenderFlags::RenderMode_Immediate;
+}
+
+bool ACSLandscape::RenderLayer(
+	UE::Landscape::EditLayers::FRenderParams& RenderParams,
+	UE::Landscape::FRDGBuilderRecorder& RDGBuilderRecorder)
+{
+	if (!bHasResult || !RT_Result) return false;
+	if (!RenderParams.MergeRenderContext->IsHeightmapMerge()) return false;
+
+	RenderParams.MergeRenderContext->CycleBlendRenderTargets(RDGBuilderRecorder);
+	ULandscapeScratchRenderTarget* WriteRT = RenderParams.MergeRenderContext->GetBlendRenderTargetWrite();
+	ULandscapeScratchRenderTarget* ReadRT = RenderParams.MergeRenderContext->GetBlendRenderTargetRead();
+
+	WriteRT->TransitionTo(ERHIAccess::RTV, RDGBuilderRecorder);
+	ReadRT->TransitionTo(ERHIAccess::SRVMask, RDGBuilderRecorder);
+
+	FIntPoint Size = RenderParams.RenderAreaSectionRect.Size();
+
+	// Blend our CS result with the current combined heightmap.
+	// ApplyResultToCombined works in float16 space internally (PF_FloatRGBA UAV),
+	// so we pass the ReadRT's 2D RT directly. The CS reads from it as SRV, writes to
+	// a float UAV, then copies back. The final CopyFrom handles format conversion
+	// from the ReadRT (B8G8R8A8) to WriteRT.
+	UTextureRenderTarget2D* ReadRT2D = ReadRT->GetRenderTarget2D();
+	ApplyResultToCombined(ReadRT2D, ReadRT2D, Size);
+
+	// Copy blended result to the write scratch RT
+	WriteRT->CopyFrom(
+		ULandscapeScratchRenderTarget::FCopyFromScratchRenderTargetParams(ReadRT),
+		RDGBuilderRecorder);
+
+	return true;
+}
+
+void ACSLandscape::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+{
+	Super::PostEditChangeProperty(PropertyChangedEvent);
+
+	FName PropertyName = PropertyChangedEvent.GetMemberPropertyName();
+
+	// Actor moved/rotated/scaled → re-read landscape at new position and re-compute
+	if (PropertyName == USceneComponent::GetRelativeLocationPropertyName()
+		|| PropertyName == USceneComponent::GetRelativeRotationPropertyName()
+		|| PropertyName == USceneComponent::GetRelativeScale3DPropertyName())
+	{
+		BoxMin = Box->Bounds.Origin - Box->Bounds.BoxExtent;
+		BoxMax = Box->Bounds.Origin + Box->Bounds.BoxExtent;
+
+		if (bHasResult)
+		{
+			CopyLandscapeData();
+			PasteLandscapeData();
+			// PasteLandscapeData already calls SaveResultToPersistent + RequestLandscapeUpdate
+		}
+		return;
+	}
+
+	// Other property changes — just re-merge if we have data
+	if (bHasResult)
+	{
+		RequestLandscapeUpdate(true);
+	}
+}
+#endif
+
+void ACSLandscape::ApplyResultToCombined(UTextureRenderTarget2D* InCombinedResult, UTextureRenderTarget2D* OutResult, const FIntPoint& Size)
+{
+	if (!RT_Result || !InCombinedResult) return;
+
+	// Get Landscape transform for world Z ↔ uint16 conversion
+	float ZScale = 1.0f;
+	float ZOffset = 0.0f;
+	ALandscape* Landscape = FindLandscape();
+	if (Landscape)
+	{
+		FTransform LT = Landscape->GetTransform();
+		ZScale = LT.GetScale3D().Z;
+		ZOffset = LT.GetLocation().Z;
+	}
+
+	FTextureRenderTargetResource* R_Combined = InCombinedResult->GameThread_GetRenderTargetResource();
+	FTextureRenderTargetResource* R_CSResult = RT_Result->GameThread_GetRenderTargetResource();
+
+	ENQUEUE_RENDER_COMMAND(ApplyBrushResult)(
+	[R_Combined, R_CSResult, Size, ZScale, ZOffset](FRHICommandListImmediate& RHICmdList)
+	{
+		FRDGBuilder GraphBuilder(RHICmdList);
+		{
+			FIntPoint TextureSize = Size;
+			FIntVector GroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(TextureSize.X, TextureSize.Y, 1), 32);
+
+			TShaderMapRef<FCSLandscape> CS = FCSLandscape::CreatePermutation(FCSLandscape::ELandscapeFunction::L_BrushApplyResult);
+			FCSLandscape::FParameters* Params = GraphBuilder.AllocParameters<FCSLandscape::FParameters>();
+
+			// Use the same pixel format as the output texture to avoid format mismatch on copy
+			EPixelFormat OutputFormat = R_Combined->GetRenderTargetTexture()->GetFormat();
+
+			FRDGTextureRef TmpRDG_Result = nullptr;
+			FRDGTextureUAVRef RDGUAV_Result = nullptr;
+			ConvertToUVATextureFormat(GraphBuilder, TmpRDG_Result, RDGUAV_Result, TextureSize, OutputFormat, TEXT("UAV_BrushApply"));
+
+			FRDGTextureRef RDG_Combined = RegisterExternalTexture(GraphBuilder, R_Combined->GetRenderTargetTexture(), TEXT("R_Combined"));
+			FRDGTextureRef RDG_CSResult = RegisterExternalTexture(GraphBuilder, R_CSResult->GetRenderTargetTexture(), TEXT("R_CSResult"));
+			FRDGTextureRef RDG_Output = RegisterExternalTexture(GraphBuilder, R_Combined->GetRenderTargetTexture(), TEXT("R_Output"));
+
+			Params->T_OrigLandscapeData = RDG_Combined;
+			Params->T_CopyLandscapeData = RDG_CSResult;
+			Params->RW_Result = RDGUAV_Result;
+			Params->LandscapeZScale = ZScale;
+			Params->LandscapeZOffset = ZOffset;
+			Params->Sampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
+
+			GraphBuilder.AddPass(
+				RDG_EVENT_NAME("BrushApplyCSResult"),
+				Params,
+				ERDGPassFlags::AsyncCompute,
+				[Params, CS, GroupCount](FRHIComputeCommandList& CmdList)
+				{
+					FComputeShaderUtils::Dispatch(CmdList, CS, *Params, GroupCount);
+				});
+			AddCopyTexturePass(GraphBuilder, TmpRDG_Result, RDG_Output, FRHICopyTextureInfo());
+		}
+		GraphBuilder.Execute();
+	});
+	FlushRenderingCommands();
 }
 
 void ACSLandscape::BP_InitRT()
 {
 	InitRT();
+}
+
+void ACSLandscape::DebugExportRT(UTextureRenderTarget2D* InRT, const FString& AssetName)
+{
+#if WITH_EDITOR
+	if (!InRT)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DebugExportRT: InRT is null"));
+		return;
+	}
+
+	// Build package path: <LevelPackagePath>/DebugRT/<AssetName>
+	UWorld* World = GetWorld();
+	FString LevelPkgPath;
+	if (World && World->GetOutermost())
+	{
+		LevelPkgPath = FPackageName::GetLongPackagePath(World->GetOutermost()->GetName());
+	}
+	if (LevelPkgPath.IsEmpty())
+	{
+		LevelPkgPath = TEXT("/Game");
+	}
+	const FString PackagePath = LevelPkgPath / TEXT("DebugRT");
+	const FString FullAssetPath = PackagePath / AssetName;
+
+	// Create or find the package
+	UPackage* Package = CreatePackage(*FullAssetPath);
+	Package->FullyLoad();
+
+	// Check if asset already exists — delete it so we can overwrite
+	UTexture2D* ExistingTexture = FindObject<UTexture2D>(Package, *AssetName);
+	if (ExistingTexture)
+	{
+		ExistingTexture->Rename(nullptr, GetTransientPackage(), REN_DontCreateRedirectors);
+		ExistingTexture->MarkAsGarbage();
+	}
+
+	// Create a new UTexture2D in the package, then fill it from the RT
+	UTexture2D* NewTexture = NewObject<UTexture2D>(Package, *AssetName, RF_Public | RF_Standalone);
+	UKismetRenderingLibrary::ConvertRenderTargetToTexture2DEditorOnly(World, InRT, NewTexture);
+
+	// Mark dirty and save
+	NewTexture->MarkPackageDirty();
+	Package->MarkPackageDirty();
+
+	FString PackageFilename;
+	if (FPackageName::TryConvertLongPackageNameToFilename(FullAssetPath, PackageFilename, FPackageName::GetAssetPackageExtension()))
+	{
+		IFileManager::Get().MakeDirectory(*FPaths::GetPath(PackageFilename), true);
+
+		FSavePackageArgs SaveArgs;
+		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+		UPackage::SavePackage(Package, NewTexture, *PackageFilename, SaveArgs);
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("DebugExportRT: Saved %s (%dx%d) → %s"),
+		*AssetName, InRT->SizeX, InRT->SizeY, *FullAssetPath);
+#endif
 }
 
 ACSLandscapeRiver::ACSLandscapeRiver()
@@ -404,18 +815,13 @@ void ACSLandscapeRiver::OnConstruction(const FTransform& Transform)
 inline void ACSLandscapeRiver::InitRT()
 {
 	Super::InitRT();
-	if (RT_SplineRotateDist == nullptr ) RT_SplineRotateDist = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor::Black, true, false);
-	if (RT_SplineGradientHeight == nullptr ) RT_SplineGradientHeight = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor::Black, true, false);
+	if (!RT_SplineRotateDist) RT_SplineRotateDist = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor::Black, true, false);
+	if (!RT_SplineGradientHeight) RT_SplineGradientHeight = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor::Black, true, false);
 }
 
 void ACSLandscapeRiver::ProjectLineToLandscape()
 {
-	ALandscape* Landscape = nullptr;
-	for (TActorIterator<ALandscape> It(GWorld, ALandscape::StaticClass()); It; ++It)
-	{
-		Landscape = *It;
-		break;
-	}
+	ALandscape* Landscape = FindLandscape();
 	if (!Landscape) return;
 	int32 NumPoints = SplineComponent->GetNumberOfSplinePoints();
 	for (int32 i = 0; i < NumPoints; i++)
@@ -475,17 +881,17 @@ void ACSLandscapeRiver::RecenterSpline()
 
 void ACSLandscapeRiver::GenerateRiverBed()
 {
-	if (RT_LandscapeData == nullptr ) RT_LandscapeData = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor::Black, true, false); 
-	if (RT_SplineRotateDist == nullptr) RT_SplineRotateDist = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor::Black, true, false); 
-	if (RT_SplineGradientHeight == nullptr) RT_SplineGradientHeight = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor::Black, true, false);
-	if (RT_Result == nullptr) RT_Result = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(0, 0, 0, 0), true, false);
-
 	CopyLandscapeData();
+	if (!RT_LandscapeData) return;
+
+	// Ensure spline RTs exist
+	if (!RT_SplineRotateDist) RT_SplineRotateDist = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor::Black, true, false);
+	if (!RT_SplineGradientHeight) RT_SplineGradientHeight = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor::Black, true, false);
+
 	ReadLandscapeDataToTexture();
 	TArray<USplineComponent*> SplineComponents;
 	GetComponents(USplineComponent::StaticClass(), SplineComponents);
 	UComputeShaderBasicFunction::SampleSpline(RT_SplineRotateDist, RT_SplineGradientHeight, RT_DebugView, SplineComponents, Box->Bounds, RT_LandscapeData->SizeX);
-	RT_Result->ResizeTarget(RT_LandscapeData->SizeX, RT_LandscapeData->SizeY);
 	
 	FTextureRenderTargetResource* R_Result = RT_Result->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_SplineRotateDist = RT_SplineRotateDist->GameThread_GetRenderTargetResource();
@@ -505,8 +911,12 @@ void ACSLandscapeRiver::GenerateRiverBed()
 	FVector UVRange = MaxUV - MinUV;
 	LandscapeTexMinUV = MinUV;
 	LandscapeTexUVRange = UVRange;
+	const float CapturedBlurRange = BlurRange;
+	const float CapturedTargetRiverWidth = TargetRiverWidth;
+	const float CapturedRiverDepth = RiverDepth;
 	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	[=, this](FRHICommandListImmediate& RHICmdList)
+	[R_Result, R_SplineRotateDist, R_SplineGradientHeight, R_DebugView, R_LandscapeData,
+	 ValidUVRange, CapturedBlurRange, CapturedTargetRiverWidth, CapturedRiverDepth](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
 		{
@@ -541,16 +951,16 @@ void ACSLandscapeRiver::GenerateRiverBed()
 			PassParameters->RW_Result = RDGUAV_Result;
 			PassParameters->RW_DebugView = RDGUAV_DebugView;
 			PassParameters->ValidUVRange = ValidUVRange;
-			PassParameters->BlurRange = BlurRange;
-			PassParameters->RiverWidth = TargetRiverWidth;
-			PassParameters->RiverDepth = RiverDepth;
+			PassParameters->BlurRange = CapturedBlurRange;
+			PassParameters->RiverWidth = CapturedTargetRiverWidth;
+			PassParameters->RiverDepth = CapturedRiverDepth;
 			PassParameters->Sampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
 
 			GraphBuilder.AddPass(
             	RDG_EVENT_NAME("CreateRiverBed"),
             	PassParameters,
             	ERDGPassFlags::AsyncCompute,
-            	[&PassParameters, ComputeShader_CreateRiverBed, GroupCount](FRHIComputeCommandList& RHICmdList)
+            	[PassParameters, ComputeShader_CreateRiverBed, GroupCount](FRHIComputeCommandList& RHICmdList)
             	{
             		FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_CreateRiverBed, *PassParameters, GroupCount);
             	});
@@ -585,5 +995,5 @@ void ACSLandscapeRiver::SimRiver(TSubclassOf<AActor> ActorClass, int32 SimIterat
 	SimActor->CaptureSize = (Box->Bounds.BoxExtent * 2).X;
 	SimActor->SetActorLocation(Box->Bounds.Origin * FVector(1, 1, 0));
 	SimActor->OnConstruction(SimActor->GetTransform());
-	SimActor->ShallowWaterSolverSplineRange(RT_SplineRotateDist, RT_CopyLandscapeData, SourcePoint, Copy_LandscapeData.ValidUVRange, SimIteration, Size);
+	// SimActor->ShallowWaterSolverSplineRange(RT_SplineRotateDist, RT_CopyLandscapeData, SourcePoint, Copy_LandscapeData.ValidUVRange, SimIteration, Size);
 }

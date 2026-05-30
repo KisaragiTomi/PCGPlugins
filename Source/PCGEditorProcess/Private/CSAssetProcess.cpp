@@ -14,6 +14,7 @@
 #include "ComputeShaderGenerateHepler.h"
 #include "EngineUtils.h"
 #include "Components/SceneCaptureComponent2D.h"
+#include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshActor.h"
 #include "Kismet/KismetRenderingLibrary.h"
 #include "ComputeShaderGeneral.h"
@@ -271,157 +272,6 @@ void UCSAssetProcess::CalculateMeshHeight(AStaticMeshActor* InMeshActor,  UTextu
 	NewRenderTarget2D = nullptr;
 }
 
-void UCSAssetProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
-{
-	if (InCSSWActor == nullptr) return;
-	
-	UStaticMesh* VisMesh = InCSSWActor->VisualizeMesh->GetStaticMesh(); 
-	if (VisMesh == nullptr) return;
-
-	FName CSSWTag = InCSSWActor->SWTag;
-
-	ULevel* CurrentLevel = InCSSWActor->GetLevel();
-	FString LevelPathName = GetPathNameSafe(CurrentLevel);
-	FString FileName;
-	FString LevelPath;
-	FString Extension;
-	FPaths::Split(LevelPathName, LevelPath, FileName, Extension);
-	FString AssetFloderPath = LevelPath.Append("/CSSWData");
-
-	if (InCSSWActor->SWUniqueID < 0)
-	{
-		FDateTime Time = FDateTime::Now();
-		InCSSWActor->SWUniqueID = Time.GetDay() * 1e6 + Time.GetHour() * 1e4 + Time.GetMinute() * 1e2 + Time.GetSecond();
-	}
-	int32 ActorId = InCSSWActor->SWUniqueID;
-	FString ResultVelHeightName = FString::Printf(TEXT("T_CSSW_VelHeight_%d"), ActorId);
-	FString ResultDepthWetName = FString::Printf(TEXT("T_CSSW_DepthWet_%d"), ActorId);
-	FString ResultWaterMaterialName = FString::Printf(TEXT("MI_CSSW_Water_%d"), ActorId);
-	FString ResultDecalMaterialName = FString::Printf(TEXT("MI_CSSW_Decal_%d"), ActorId);
-	FString RestultWaterMaterialPathFull = AssetFloderPath + "/" + ResultWaterMaterialName + "." + ResultWaterMaterialName;
-	FString RestultDecalMaterialPathFull = AssetFloderPath + "/" + ResultDecalMaterialName + "." + ResultDecalMaterialName;
-
-	UTexture2D* VelHeightTexture = UCSAssetProcess::ConveretAndSaveRTAsset(ResultVelHeightName, AssetFloderPath, InCSSWActor->RT_ResultVelHeight);
-	UTexture2D* DepthWetTexture = UCSAssetProcess::ConveretAndSaveRTAsset(ResultDepthWetName, AssetFloderPath, InCSSWActor->RT_ResultDepthWet);
-	UMaterialInstance* WaterMaterial = UCSAssetProcess::FindOrDuplicateMaterialInstanceAsset( GetPathNameSafe(InCSSWActor->WaterMaterial), RestultWaterMaterialPathFull);
-	UMaterialInstance* DecalMaterial = UCSAssetProcess::FindOrDuplicateMaterialInstanceAsset( GetPathNameSafe(InCSSWActor->DecalMaterial), RestultDecalMaterialPathFull);
-	UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(Cast<UMaterialInstanceConstant>(WaterMaterial), TEXT("CSSW_VelHeight"), VelHeightTexture);
-	UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(Cast<UMaterialInstanceConstant>(WaterMaterial), TEXT("CSSW_DepthWet"), DepthWetTexture);
-	UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(Cast<UMaterialInstanceConstant>(DecalMaterial), TEXT("CSSW_VelHeight"), VelHeightTexture);
-	UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(Cast<UMaterialInstanceConstant>(DecalMaterial), TEXT("CSSW_DepthWet"), DepthWetTexture);
-
-	// --- Duplicate mesh, remove dry faces, displace vertices, write vertex colors ---
-	UTextureRenderTarget2D* RT = InCSSWActor->RT_ResultVelHeight;
-	if (!RT || !VisMesh->IsSourceModelValid(0)) return;
-
-	FTextureRenderTargetResource* RTResource = RT->GameThread_GetRenderTargetResource();
-	if (!RTResource) return;
-
-	const int32 RTWidth  = RT->SizeX;
-	const int32 RTHeight = RT->SizeY;
-
-	TArray<FFloat16Color> Pixels;
-	Pixels.SetNumUninitialized(RTWidth * RTHeight);
-	if (!RTResource->ReadFloat16Pixels(Pixels)) return;
-
-	FString MeshAssetName = FString::Printf(TEXT("SM_CSSW_Water_%d"), ActorId);
-	FString OriginalMeshPath = GetPathNameSafe(VisMesh);
-	FString DuplicateMeshPath = AssetFloderPath / MeshAssetName;
-
-	if (UEditorAssetLibrary::DoesAssetExist(DuplicateMeshPath))
-	{
-		UEditorAssetLibrary::DeleteAsset(DuplicateMeshPath);
-	}
-	UObject* DupObj = UEditorAssetLibrary::DuplicateAsset(OriginalMeshPath, DuplicateMeshPath);
-	UStaticMesh* NewMesh = Cast<UStaticMesh>(DupObj);
-	if (!NewMesh) return;
-
-	FMeshDescription* MeshDesc = NewMesh->GetMeshDescription(0);
-	if (!MeshDesc) return;
-
-	FStaticMeshAttributes Attributes(*MeshDesc);
-	Attributes.Register();
-
-	TVertexInstanceAttributesRef<FVector2f> VertexUVs = Attributes.GetVertexInstanceUVs();
-
-	constexpr float DryThreshold = -9000.0f;
-
-	auto SampleHeight = [&](FVertexInstanceID VID) -> float
-	{
-		FVector2f UV = VertexUVs.Get(VID, 0);
-		int32 PX = FMath::Clamp(FMath::FloorToInt32(UV.X * RTWidth),  0, RTWidth  - 1);
-		int32 PY = FMath::Clamp(FMath::FloorToInt32(UV.Y * RTHeight), 0, RTHeight - 1);
-		return Pixels[PY * RTWidth + PX].B.GetFloat();
-	};
-
-	TArray<FPolygonID> PolygonsToDelete;
-	for (const FPolygonID PolygonID : MeshDesc->Polygons().GetElementIDs())
-	{
-		TArrayView<const FVertexInstanceID> PolyVerts = MeshDesc->GetPolygonVertexInstances(PolygonID);
-		bool bAllDry = true;
-		for (const FVertexInstanceID& VID : PolyVerts)
-		{
-			if (SampleHeight(VID) > DryThreshold)
-			{
-				bAllDry = false;
-				break;
-			}
-		}
-		if (bAllDry)
-		{
-			PolygonsToDelete.Add(PolygonID);
-		}
-	}
-
-	for (const FPolygonID& PID : PolygonsToDelete)
-	{
-		TArray<FTriangleID> TriangleIDs;
-		for (const FTriangleID TID : MeshDesc->GetPolygonTriangles(PID))
-		{
-			TriangleIDs.Add(TID);
-		}
-		for (const FTriangleID& TID : TriangleIDs)
-		{
-			MeshDesc->DeleteTriangle(TID);
-		}
-		MeshDesc->DeletePolygon(PID);
-	}
-
-	TVertexAttributesRef<FVector3f> VertexPositions = Attributes.GetVertexPositions();
-	TVertexInstanceAttributesRef<FVector4f> VertexColors = Attributes.GetVertexInstanceColors();
-	constexpr float VelocityMax = 6.0f;
-	TSet<FVertexID> DisplacedVertices;
-
-	for (const FVertexInstanceID InstanceID : MeshDesc->VertexInstances().GetElementIDs())
-	{
-		FVertexID VertexID = MeshDesc->GetVertexInstanceVertex(InstanceID);
-
-		FVector2f UV = VertexUVs.Get(InstanceID, 0);
-		int32 PixelX = FMath::Clamp(FMath::FloorToInt32(UV.X * RTWidth),  0, RTWidth  - 1);
-		int32 PixelY = FMath::Clamp(FMath::FloorToInt32(UV.Y * RTHeight), 0, RTHeight - 1);
-		const FFloat16Color& Px = Pixels[PixelY * RTWidth + PixelX];
-
-		if (!DisplacedVertices.Contains(VertexID))
-		{
-			FVector3f Pos = VertexPositions[VertexID];
-			Pos.Z += Px.B.GetFloat();
-			VertexPositions[VertexID] = Pos;
-			DisplacedVertices.Add(VertexID);
-		}
-
-		float NormVelX = FMath::Clamp(Px.R.GetFloat() / VelocityMax * 0.5f + 0.5f, 0.0f, 1.0f);
-		float NormVelY = FMath::Clamp(Px.G.GetFloat() / VelocityMax * 0.5f + 0.5f, 0.0f, 1.0f);
-		float Foam = FMath::Clamp(Px.A.GetFloat(), 0.0f, 1.0f);
-
-		VertexColors.Set(InstanceID, FVector4f(NormVelX, NormVelY, 0.0f, Foam));
-	}
-
-	NewMesh->CommitMeshDescription(0);
-	NewMesh->Build(false);
-	NewMesh->PostEditChange();
-	UEditorAssetLibrary::SaveLoadedAsset(NewMesh, false);
-}
-
 UTexture2D* UCSAssetProcess::SaveTextureData(UTextureRenderTarget2D* RenderTarget, FString AssetName)
 {
 	if (RenderTarget == nullptr) return nullptr;
@@ -606,157 +456,6 @@ void UCSAssetProcess::CreateDebugTexture(AActor* TargetActor, UTextureRenderTarg
 	UCSAssetProcess::ConveretAndSaveRTAsset(TEXT("Debug"), AssetPath, InDebugView);
 }
 
-ACSShallowWaterCapture* UCSAssetProcess::CSSW_GetSelectActor()
-{
-
-	ACSShallowWaterCapture* SelectedCapture =nullptr;
-	USelection* SelectedActors = GEditor->GetSelectedActors();
-	if ( SelectedActors == nullptr && SelectedActors->Num() == 0 ) return SelectedCapture;	//Return nullptr
-	int32 test = SelectedActors->Num();
-	AActor* SelectedActor = Cast<AActor>( SelectedActors->GetSelectedObject(0) );
-
-	if ( SelectedActor == nullptr ) return SelectedCapture; //Return nullptr
-	
-	SelectedCapture = Cast<ACSShallowWaterCapture>( SelectedActor );
-	if ( SelectedCapture != nullptr ) return SelectedCapture;	//Return vaild data
-
-	AActor* ParentActor = SelectedActor->GetAttachParentActor();
-	SelectedCapture = Cast<ACSShallowWaterCapture>( ParentActor );
-	if ( SelectedCapture != nullptr ) return SelectedCapture;	//Return vaild data
-
-	ACSSHallowWaterSource* SelectedSource = Cast<ACSSHallowWaterSource>(SelectedActor);
-	if (SelectedSource == nullptr) return SelectedCapture;	//Return nullptr
-
-	TArray<TEnumAsByte<EObjectTypeQuery>> ObjectTypes = {
-		UEngineTypes::ConvertToObjectType(ECollisionChannel::ECC_WorldStatic),
-		UEngineTypes::ConvertToObjectType(ECollisionChannel::ECC_WorldDynamic)
-	};
-	FVector BoxExtent = FVector(5, 5, 100000);
-	TArray<AActor*> OverlapActors;
-	TArray<AActor*> ActorsToIgnore;
-	UKismetSystemLibrary::BoxOverlapActors(GWorld, SelectedSource->GetActorLocation(), BoxExtent,
-	                                       ObjectTypes, ACSShallowWaterCapture::StaticClass(), ActorsToIgnore,
-	                                       OverlapActors);
-	DrawDebugBox(GWorld, SelectedSource->GetActorLocation(), BoxExtent, FColor(1, 1, 1, 1), false, 1, 0, 1);
-	if (OverlapActors.Num() == 0) return SelectedCapture; //Return nullptr
-	SelectedCapture = Cast<ACSShallowWaterCapture>( OverlapActors[0] );
-
-	return SelectedCapture; //Return nullptr or vaild data
-	
-	// UKismetSystemLibrary::PrintString(GWorld, TEXT("NoSelected"));
-	
-	
-}
-
-void UCSAssetProcess::MaterialTest(ACSShallowWaterCapture* InCSSWActor)
-{
-	if (InCSSWActor == nullptr) return;
-	
-	UStaticMesh* VisMesh = InCSSWActor->VisualizeMesh->GetStaticMesh(); 
-	if (VisMesh == nullptr) return;
-
-	FName CSSWTag = FName("CSSW_Bake");
-	TArray<AActor*> AttachedActors; 
-	InCSSWActor->GetAttachedActors(AttachedActors);
-	for (AActor* AttachedActor : AttachedActors)
-	{
-		if (AttachedActor->Tags.Contains(CSSWTag)) AttachedActor->Destroy();
-	}
-	
-	ULevel* CurrentLevel = InCSSWActor->GetLevel();
-	FString LevelPathName = GetPathNameSafe(CurrentLevel);
-	FString FileName;
-	FString LevelPath;
-	FString Extension;
-	FPaths::Split(LevelPathName, LevelPath, FileName, Extension);
-	FString AssetFloderPath = LevelPath.Append("/CSSWData");
-
-	FDateTime Time = FDateTime::Now();
-	FString ResultVelHeightName = FString::Printf(TEXT("T_CSSW_VelHeight_%d%d%d"), Time.GetHour(), Time.GetMinute(), Time.GetSecond());
-	FString ResultDepthWetName = FString::Printf(TEXT("T_CSSW_DepthWet_%d%d%d"), Time.GetHour(), Time.GetMinute(), Time.GetSecond());
-	FString ResultWaterMaterialName = FString::Printf(TEXT("MI_CSSW_Water_%d%d%d"), Time.GetHour(), Time.GetMinute(), Time.GetSecond());
-	FString ResultDecalMaterialName = FString::Printf(TEXT("MI_CSSW_Decal_%d%d%d"), Time.GetHour(), Time.GetMinute(), Time.GetSecond());
-	// FString VelHeightAssetPath = AssetPath.Append("/" + ResultVelHeightName);
-	// FString DepthWetAssetPath = AssetPath.Append("/" + ResultDepthWetName);
-	FString  VelHeightAssetPath = AssetFloderPath / ResultWaterMaterialName;
-	FString  VelHeightAssetPathFull = AssetFloderPath + "/" + ResultVelHeightName + "." + ResultVelHeightName;
-	
-	FString WaterMaterialPath = GetPathNameSafe(InCSSWActor->WaterMaterial);
-	// UMaterialInstance* WaterMaterial = UCSAssetProcess::FindOrCreateMaterialInstanceAsset(ResultWaterMaterialName, AssetFloderPath, InCSSWActor->WaterMaterial);
-	UMaterialInstance* WaterMaterial = UCSAssetProcess::FindOrDuplicateMaterialInstanceAsset(WaterMaterialPath, VelHeightAssetPathFull, true);
-	
-	UPackage* InOuter = CreatePackage( *VelHeightAssetPath);
-	UMaterialInstanceConstant* NewMaterialInstance = FMaterialUtilities::CreateInstancedMaterial(InCSSWActor->WaterMaterial, InOuter, ResultVelHeightName, RF_Public | RF_Standalone);
-	//
-	
-	FName PathName = FName(*WaterMaterialPath);
-	// TCHAR* NameChar = PathName
-	// UMaterialInstanceConstant* Test = Cast<UMaterialInstanceConstant>(UEditorAssetLibrary::LoadAsset(VelHeightAssetPathFull));
-	// UMaterialInstanceConstant* Test2 = Cast<UMaterialInstanceConstant>(UEditorAssetLibrary::LoadAsset(VelHeightAssetPath));
-
-	TStringBuilder<512> InName;
-	InName = *VelHeightAssetPath;
-	FPathViews::GetMountPointNameFromPath(InName);
-	FStringView PackageMountPoint = FPathViews::GetMountPointNameFromPath(InName);
-	// uint32 DefaultPackageFlags = GCreatePackageDefaultFlagsMap.Find(PackageMountPoint);
-	
-}
-
-void UCSAssetProcess::DebugDumpSWPassResults(ACSShallowWaterCapture* InCSSWActor)
-{
-	if (InCSSWActor == nullptr)
-	{
-		UE_LOG(LogTemp, Error, TEXT("DebugDumpSWPassResults: InCSSWActor is null."));
-		return;
-	}
-
-	ULevel* CurrentLevel = InCSSWActor->GetLevel();
-	FString LevelPathName = GetPathNameSafe(CurrentLevel);
-	FString FileName;
-	FString LevelPath;
-	FString Extension;
-	FPaths::Split(LevelPathName, LevelPath, FileName, Extension);
-	FString DebugFolderPath = LevelPath / TEXT("debug");
-
-	struct FRTEntry
-	{
-		UTextureRenderTarget2D* RT;
-		FString Name;
-	};
-
-	TArray<FRTEntry> RTsToSave = {
-		{ InCSSWActor->RT_SceneDepth,       TEXT("Debug_SceneDepth") },
-		{ InCSSWActor->RT_VelocityHeight,   TEXT("Debug_VelocityHeight") },
-		{ InCSSWActor->RT_ResultVelHeight,   TEXT("Debug_ResultVelHeight") },
-		{ InCSSWActor->RT_ResultDepthWet,    TEXT("Debug_ResultDepthWet") },
-		{ InCSSWActor->RT_SmoothHeight,      TEXT("Debug_SmoothHeight") },
-		{ InCSSWActor->RT_DebugView,         TEXT("Debug_DebugView") },
-	};
-
-	int32 SavedCount = 0;
-	for (const FRTEntry& Entry : RTsToSave)
-	{
-		if (Entry.RT == nullptr)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("DebugDumpSWPassResults: %s is null, skipping."), *Entry.Name);
-			continue;
-		}
-		UTexture2D* SavedTexture = UCSAssetProcess::ConveretAndSaveRTAsset(Entry.Name, DebugFolderPath, Entry.RT);
-		if (SavedTexture)
-		{
-			UEditorAssetLibrary::SaveLoadedAsset(SavedTexture, false);
-			SavedCount++;
-			UE_LOG(LogTemp, Log, TEXT("DebugDumpSWPassResults: Saved %s -> %s/%s"), *Entry.Name, *DebugFolderPath, *Entry.Name);
-		}
-		else
-		{
-			UE_LOG(LogTemp, Warning, TEXT("DebugDumpSWPassResults: Failed to save %s"), *Entry.Name);
-		}
-	}
-
-	UE_LOG(LogTemp, Log, TEXT("DebugDumpSWPassResults: Done. Saved %d/%d textures to %s"), SavedCount, RTsToSave.Num(), *DebugFolderPath);
-}
-
 void UCSAssetProcess::DisplaceMeshByRTBlueChannel(
 	UTextureRenderTarget2D* InRenderTarget,
 	UStaticMesh* InStaticMesh,
@@ -866,4 +565,31 @@ void UCSAssetProcess::DisplaceMeshByRTBlueChannel(
 
 	UE_LOG(LogTemp, Log, TEXT("DisplaceMeshByRTBlueChannel: Displaced %d verts, wrote vertex colors on '%s'."),
 		NumVertexInstances, *InStaticMesh->GetName());
+}
+
+void UCSAssetProcess::SampleGlobalDistanceField(
+	UObject* WorldContextObject,
+	const TArray<FVector>& WorldPositions,
+	TArray<float>& OutDistances,
+	TArray<FVector>& OutGradients)
+{
+	OutDistances.Reset();
+	OutGradients.Reset();
+	if (!WorldContextObject || WorldPositions.IsEmpty()) return;
+
+#if WITH_EDITOR
+	FEditorViewportClient* EditorViewportClient = StaticCast<FEditorViewportClient*>(
+		GEditor->GetActiveViewport()->GetClient());
+	if (!EditorViewportClient) return;
+
+	FViewport* Viewport = EditorViewportClient->Viewport;
+	FSceneViewFamilyContext ViewFamily(
+		FSceneViewFamily::ConstructionValues(
+			Viewport, EditorViewportClient->GetScene(), EditorViewportClient->EngineShowFlags));
+	FSceneView* SceneView = EditorViewportClient->CalcSceneView(&ViewFamily);
+	if (!SceneView) return;
+
+	UComputeShaderBasicFunction::SampleGlobalDistanceFieldAtPositions(
+		SceneView, WorldPositions, OutDistances, OutGradients);
+#endif
 }

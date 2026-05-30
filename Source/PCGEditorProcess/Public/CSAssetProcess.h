@@ -4,25 +4,26 @@
 
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
-#include "ComputeShaderShallowWater.h"
 #include "CSAssetProcess.generated.h"
 
-/**
- * 
- */
+class AStaticMeshActor;
+class UTextureRenderTarget2D;
+class UTexture2D;
+class UMaterialInstance;
+class UMaterialInterface;
+class UStaticMesh;
+
 UCLASS()
 class PCGEDITORPROCESS_API UCSAssetProcess : public UBlueprintFunctionLibrary
 {
 	GENERATED_BODY()
+public:
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	static void CaptureMeshHeight(AStaticMeshActor* InMeshActor, UTextureRenderTarget2D*& OutRenderTarget2D, TArray<AActor*>& OutActors, int32
 	                              InTextureSize = 256);
 
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	static void CalculateMeshHeight(AStaticMeshActor* InMeshActor, UTextureRenderTarget2D* NewRenderTarget2D);
-
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	static void SaveSWData(ACSShallowWaterCapture* InCSSWActor);
 
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	static UTexture2D* SaveTextureData(UTextureRenderTarget2D* RenderTarget, FString AssetName);
@@ -39,14 +40,15 @@ class PCGEDITORPROCESS_API UCSAssetProcess : public UBlueprintFunctionLibrary
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	static void GetDistanceToNearestSurface(UTextureRenderTarget2D* InDebugView);
 
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	static void CreateDebugTexture(AActor* TargetActor, UTextureRenderTarget2D* InDebugView, FString DebugName);
+	UFUNCTION(BlueprintCallable, Category = "DistanceField", meta = (WorldContext = "WorldContextObject"))
+	static void SampleGlobalDistanceField(
+		UObject* WorldContextObject,
+		const TArray<FVector>& WorldPositions,
+		TArray<float>& OutDistances,
+		TArray<FVector>& OutGradients);
 
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	static ACSShallowWaterCapture* CSSW_GetSelectActor();
-	
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	static void MaterialTest(ACSShallowWaterCapture* InCSSWActor);
+	static void CreateDebugTexture(AActor* TargetActor, UTextureRenderTarget2D* InDebugView, FString DebugName);
 
 	/**
 	 * 读取 16bit RT 的 B 通道对 Plane 顶点做 Z 位移，
@@ -58,9 +60,6 @@ class PCGEDITORPROCESS_API UCSAssetProcess : public UBlueprintFunctionLibrary
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	static void DisplaceMeshByRTBlueChannel(UTextureRenderTarget2D* InRenderTarget, UStaticMesh* InStaticMesh, float DisplaceScale = 100.0f);
 
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader|Debug")
-	static void DebugDumpSWPassResults(ACSShallowWaterCapture* InCSSWActor);
-	
 };
 
 

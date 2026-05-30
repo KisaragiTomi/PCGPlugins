@@ -2,7 +2,11 @@
 
 #include "CoreMinimal.h"
 #include "ComputeShaderLandscape.h"
-#include "LandscapeBlueprintBrush.h"
+#include "LandscapeEditLayerRenderer.h"
+#include "LandscapeEditLayerRendererState.h"
+#include "LandscapeEditLayerTargetTypeState.h"
+#include "LandscapeEditLayerTypes.h"
+#include "LandscapeEditTypes.h"
 #include "ComputeShaderLandscapeLayer.generated.h"
 
 class UMaterialInterface;
@@ -19,7 +23,10 @@ enum class ELandscapeLayerBlendMode : uint8
 };
 
 UCLASS()
-class PCGEDITORPROCESS_API ACSLandscapeLayer : public ALandscapeBlueprintBrush
+class PCGEDITORPROCESS_API ACSLandscapeLayer : public AActor
+#if CPP && WITH_EDITOR
+	, public ILandscapeEditLayerRenderer
+#endif
 {
 	GENERATED_BODY()
 public:
@@ -105,6 +112,11 @@ protected:
 	USceneComponent* SceneComponent;
 	UBoxComponent* Box;
 
+	UPROPERTY()
+	FGuid OwnedEditLayerGuid;
+
+	friend class UCSLandscapeEditLayer;
+
 public:
 	virtual void OnConstruction(const FTransform& Transform) override;
 
@@ -120,8 +132,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "LandscapeLayer")
 	void BlendLayerWithAlpha();
 
+	/** Non-destructive: generates the blend result but does NOT write to landscape. Call CommitToLandscape() to permanently apply. */
 	UFUNCTION(BlueprintCallable, Category = "LandscapeLayer")
 	void ApplyBlendedLayerToLandscape();
+
+	/** Permanently bake the current blended result into the Landscape heightmap. */
+	UFUNCTION(BlueprintCallable, Category = "LandscapeLayer")
+	void CommitToLandscape();
 
 	UFUNCTION(BlueprintCallable, Category = "LandscapeLayer")
 	void CreateLandscapeLayer();
@@ -134,4 +151,34 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "LandscapeLayer")
 	static UTextureRenderTarget2D* CreateBlankAlphaTexture(UObject* WorldContextObject, int32 SizeX, int32 SizeY, FLinearColor ClearColor = FLinearColor::Black);
+
+	UFUNCTION(BlueprintCallable, Category = "LandscapeLayer")
+	void RequestLandscapeUpdate(bool bInUserTriggered = false);
+
+#if WITH_EDITOR
+	// --- ILandscapeEditLayerRenderer interface ---
+	virtual FString GetEditLayerRendererDebugName() const override;
+
+	virtual void GetRendererStateInfo(
+		const UE::Landscape::EditLayers::FMergeContext* InMergeContext,
+		UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutSupportedTargetTypeState,
+		UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutEnabledTargetTypeState,
+		TArray<UE::Landscape::EditLayers::FTargetLayerGroup>& OutTargetLayerGroups) const override;
+
+	virtual TArray<UE::Landscape::EditLayers::FEditLayerRenderItem> GetRenderItems(
+		const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const override;
+
+	virtual UE::Landscape::EditLayers::ERenderFlags GetRenderFlags(
+		const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const override;
+
+	virtual bool RenderLayer(
+		UE::Landscape::EditLayers::FRenderParams& RenderParams,
+		UE::Landscape::FRDGBuilderRecorder& RDGBuilderRecorder) override;
+
+	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
+
+private:
+	bool bHasLayerResult = false;
+	ALandscape* FindLandscape() const;
 };

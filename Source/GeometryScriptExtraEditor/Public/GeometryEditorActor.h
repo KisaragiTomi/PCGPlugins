@@ -10,7 +10,7 @@
 #include "Curve/CurveUtil.h"
 #include "Curves/CurveLinearColor.h"
 #include "GeometryScript/GeometryScriptTypes.h"
-#include "FoliageCluster/Public/FoliageConverter.h"
+#include "ComputeShaderMeshGenerator.h"
 #include "GeometryScript/MeshPrimitiveFunctions.h"
 #include "GeometryScript/MeshSpatialFunctions.h"
 #include "InstancedFoliage.h"
@@ -18,6 +18,29 @@
 #include "FoliageType.h"
 
 #include "GeometryEditorActor.generated.h"
+
+class AStaticMeshActor;
+
+USTRUCT(BlueprintType, meta = (DisplayName = "SC Options"))
+struct GEOMETRYSCRIPTEXTRAEDITOR_API FSpaceColonizationOptions
+{
+	GENERATED_BODY()
+public:
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	int32 Iteration = 55;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	int32 Activetime = 10;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	int32 ExtentPlus = 3;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	float RandGrow = 0;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	float Seed = .5;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	float BackGrowRange = .8f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	float VoxelSize = 2.5f;
+};
 
 USTRUCT(BlueprintType, meta = (DisplayName = "VV Options"))
 struct GEOMETRYSCRIPTEXTRAEDITOR_API FVineVisualization
@@ -46,68 +69,132 @@ public:
 	UCurveLinearColor* CurveControl;
 };
 
+struct FVineLinePointScaleData
+{
+	TArray<float> Values;
+};
+
 UCLASS()
-class GEOMETRYSCRIPTEXTRAEDITOR_API AVineContainer : public AConvertFoliageInstanceContainer
+class GEOMETRYSCRIPTEXTRAEDITOR_API AVineContainer : public AComputeShaderMeshGenerator
 {
 	GENERATED_BODY()
 	
 	// Sets default values for this actor's properties
 public:
 	AVineContainer(const FObjectInitializer& ObjectInitializer);
+	virtual void OnConstruction(const FTransform& Transform) override;
 
-	UPROPERTY(BlueprintReadWrite, Category = "StartInstance")
-	UInstancedStaticMeshComponent* TubeFoliageInstanceContainer;
-
-	UPROPERTY(BlueprintReadWrite, Category = "StartInstance")
-	UInstancedStaticMeshComponent* PlaneFoliageInstanceContainer;
+	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
+	UInstancedStaticMeshComponent* GrowTarget;
 	
-	TArray<AActor*> PickActors;
+	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
+	UInstancedStaticMeshComponent* TubeVineSource;
+
+	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
+	UInstancedStaticMeshComponent* PlaneVineSource;
+
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "GrowReference|Data")
+	TArray<FTransform> GrowTargetTransforms;
+
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "GrowReference|Data")
+	TArray<FTransform> TubeVineSourceTransforms;
+
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category = "GrowReference|Data")
+	TArray<FTransform> PlaneVineSourceTransforms;
 	
 	FGeometryScriptDynamicMeshBVH BVH;
 	
 	FBox InstanceBound;
 	
-	UDynamicMesh* PrefixMesh;
+	UPROPERTY(Transient)
+	TObjectPtr<UDynamicMesh> PrefixMesh;
 
-	UDynamicMesh* OutTubeMesh;
+	UPROPERTY(Transient)
+	TObjectPtr<UDynamicMesh> OutTubeMesh;
 
-	UDynamicMesh* OutPlaneMesh;
-	
+	UPROPERTY(Transient)
+	TObjectPtr<UDynamicMesh> OutPlaneMesh;
+
+	UPROPERTY(Transient)
+	TObjectPtr<AStaticMeshActor> GeneratedStaticMeshActor;
+
 	TArray<FGeometryScriptPolyPath> TubeLines;
 
 	TArray<FGeometryScriptPolyPath> PlaneLines;
 
+	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
+	UFoliageType* TargetType;
+
+	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
+	UFoliageType* TubeType;
+
+	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
+	UFoliageType* PlaneType;
+
+	// Per-line source instance scale kept for compatibility with old generated data.
+	TArray<float> TubeLineSourceScales;
+	TArray<float> PlaneLineSourceScales;
+
+	// Per-line source instance location used by VisVine for deterministic temporary SC-point jitter.
+	TArray<FVector> TubeLineSourceLocations;
+	TArray<FVector> PlaneLineSourceLocations;
+
+	// Per-line/per-point scale from SpaceColonization: TargetPointScale * SourcePointScale.
+	// VisVineGPU interpolates these through preprocessing and multiplies vine thickness by them.
+	TArray<FVineLinePointScaleData> TubeLinePointScales;
+	TArray<FVineLinePointScaleData> PlaneLinePointScales;
+
 	//bool MainVine = true;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Adjust")
+	UPROPERTY(BlueprintReadWrite)
 	FVineVisualization VV;
 	
-	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
-	bool CheckActors(TArray<AActor*> CheckActors);
+	UPROPERTY(BlueprintReadWrite)
+	FSpaceColonizationOptions SC;
 	
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
 	void VisVine(bool MainVine);
 
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
+	bool VisVineGPU(bool MainVine);
+
+	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
+	UDynamicMesh* GenerateVines(float ExtrudeScale = 50, bool Result = true, bool MultThread = false);
+
+	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
 	void Clean();
 	// void AddMesh(TArray<FGeometryScriptPolyPath> Lines);
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
-	void AddInstance(UFoliageType* InFoliageType);
-	
-	virtual void AddInstanceFromFoliageType(UFoliageType* InFoliageType) override;
+	void RebuildDisplayInstancesFromTransformArrays();
 
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
-	void ConvertInstance(UFoliageType* InFoliageType);
-
+	virtual void ImportFoliageToTransformArray(UFoliageType* InFoliageType);
 	UFUNCTION(BlueprintPure, Category = ContainerCheck)
 	UDynamicMesh* GetTubeMesh();
 
 	UFUNCTION(BlueprintPure, Category = ContainerCheck)
 	UDynamicMesh* GetPlaneMesh();
 
-	virtual void ConvertInstanceToFoliage(UFoliageType* InFoliageType) override;
-	
+	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
+	virtual void ExportTransformArrayToFoliage(UFoliageType* InFoliageType);
 
+	UFUNCTION(BlueprintCallable, BlueprintCallable, Category = "VineActions")
+	void FetchFoliage();
+
+
+	UFUNCTION(BlueprintCallable, BlueprintCallable, Category = "VineActions")
+	void RevertFoliage();
+
+
+
+	UFUNCTION(BlueprintCallable, BlueprintCallable, Category = "VineActions")
+	void GenerateVineAction();
+
+	UFUNCTION(BlueprintCallable, Category = "VineActions")
+	void SaveStaticmesh();
+
+	UFUNCTION(BlueprintCallable, Category = "VineActions")
+	void ClearAttachedStaticMeshActors();
 };
 
 

@@ -103,7 +103,7 @@ void ACSGenerateCaptureScene::OnConstruction(const FTransform& Transform)
 
 
 
-inline void ACSGenerateCaptureScene::CaptureAll()
+void ACSGenerateCaptureScene::CaptureAll()
 {
 	if (CaptureSceneDepth->TextureTarget != nullptr)	CaptureSceneDepth->CaptureScene();
 	// if (CaptureSceneNormal->TextureTarget != nullptr)	CaptureSceneNormal->CaptureScene();

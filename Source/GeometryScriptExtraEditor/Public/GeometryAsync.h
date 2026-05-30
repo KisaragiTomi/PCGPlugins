@@ -1,5 +1,13 @@
 #pragma once
 
+#include "Async/Async.h"
+#include "CoreMinimal.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
+
+THIRD_PARTY_INCLUDES_START
+#include <tbb/parallel_for.h>
+THIRD_PARTY_INCLUDES_END
+
 namespace ProcessAsync
 {
 	template<typename T>

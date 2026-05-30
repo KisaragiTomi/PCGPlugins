@@ -1,0 +1,223 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1320" viewBox="0 0 1800 1320" role="img" aria-labelledby="title desc">
+  <title id="title">CS Space Colonization flow</title>
+  <desc id="desc">Flow of the current Compute Shader Space Colonization path in GenerateVines.cpp and SpaceColonizationQueue.usf.</desc>
+
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .title { fill: #111827; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; font-size: 34px; font-weight: 800; }
+      .subtitle { fill: #475569; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; font-size: 15px; }
+      .lane { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; }
+      .laneInput { fill: #f0f9ff; stroke: #7dd3fc; }
+      .laneRdg { fill: #ecfdf5; stroke: #6ee7b7; }
+      .laneGpu { fill: #faf5ff; stroke: #d8b4fe; }
+      .laneOut { fill: #f8fafc; stroke: #94a3b8; }
+      .laneTitle { fill: #0f172a; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; font-size: 20px; font-weight: 800; }
+      .node { stroke-width: 2; rx: 14; ry: 14; }
+      .input { fill: #dbeafe; stroke: #2563eb; }
+      .rdg { fill: #ccfbf1; stroke: #0f766e; }
+      .gpu { fill: #ede9fe; stroke: #7c3aed; }
+      .loop { fill: #ffedd5; stroke: #ea580c; }
+      .out { fill: #dcfce7; stroke: #16a34a; }
+      .warn { fill: #fef3c7; stroke: #d97706; }
+      .state { fill: #f1f5f9; stroke: #64748b; }
+      .nodeTitle { fill: #111827; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; font-size: 17px; font-weight: 800; }
+      .text { fill: #1f2937; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; font-size: 13.5px; }
+      .small { fill: #475569; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; font-size: 12.5px; }
+      .code { fill: #172554; font-family: Consolas, "Cascadia Code", monospace; font-size: 12.5px; }
+      .codeGreen { fill: #064e3b; font-family: Consolas, "Cascadia Code", monospace; font-size: 12.5px; }
+      .codePurple { fill: #4c1d95; font-family: Consolas, "Cascadia Code", monospace; font-size: 12.5px; }
+      .noteTitle { fill: #0f172a; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; font-size: 16px; font-weight: 800; }
+      .arrow { stroke: #334155; stroke-width: 2.4; fill: none; marker-end: url(#arrow); }
+      .greenArrow { stroke: #0f766e; stroke-width: 2.6; fill: none; marker-end: url(#greenArrow); }
+      .purpleArrow { stroke: #7c3aed; stroke-width: 2.6; fill: none; marker-end: url(#purpleArrow); }
+      .orangeArrow { stroke: #ea580c; stroke-width: 2.6; fill: none; marker-end: url(#orangeArrow); }
+      .softArrow { stroke: #64748b; stroke-width: 2; stroke-dasharray: 7 7; fill: none; marker-end: url(#softArrow); }
+      .shadow { filter: url(#shadow); }
+    </style>
+
+    <filter id="shadow" x="-8%" y="-8%" width="116%" height="128%">
+      <feDropShadow dx="0" dy="7" stdDeviation="7" flood-color="#0f172a" flood-opacity="0.11"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="greenArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"/>
+    </marker>
+    <marker id="purpleArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/>
+    </marker>
+    <marker id="orangeArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#ea580c"/>
+    </marker>
+    <marker id="softArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="1320"/>
+
+  <text class="title" x="48" y="58">CS版 Space Colonization 流程</text>
+  <text class="subtitle" x="48" y="88">Source: GenerateVines.cpp / SpaceColonizationQueue.usf</text>
+  <text class="subtitle" x="1030" y="58">核心：GPU 保留 InitialTargetPositions 作为逻辑空间，TargetPositions 只承载可变输出位置。</text>
+  <text class="subtitle" x="1030" y="86">当前本地代码：MaxNeighborsPerTarget = 128，Readback 仍然同步 FlushRenderingCommands。</text>
+
+  <rect class="lane laneInput" x="38" y="124" width="390" height="880" rx="24"/>
+  <rect class="lane laneRdg" x="462" y="124" width="430" height="880" rx="24"/>
+  <rect class="lane laneGpu" x="928" y="124" width="520" height="880" rx="24"/>
+  <rect class="lane laneOut" x="1482" y="124" width="280" height="880" rx="24"/>
+
+  <text class="laneTitle" x="66" y="160">C++ Entry / 输入</text>
+  <text class="laneTitle" x="492" y="160">RDG Queue / Buffer</text>
+  <text class="laneTitle" x="958" y="160">SpaceColonizationQueue.usf</text>
+  <text class="laneTitle" x="1510" y="160">Readback / 输出</text>
+
+  <g class="shadow">
+    <rect class="node input" x="68" y="194" width="330" height="132"/>
+    <text class="nodeTitle" x="92" y="226">1. SpaceColonizationCS()</text>
+    <text class="text" x="92" y="254">Blueprint/C++ 调用 CS 路径</text>
+    <text class="code" x="92" y="280">SourceTransforms</text>
+    <text class="code" x="92" y="304">TargetTransforms</text>
+  </g>
+
+  <g class="shadow">
+    <rect class="node input" x="68" y="374" width="330" height="146"/>
+    <text class="nodeTitle" x="92" y="406">2. BuildQueueCSImpl()</text>
+    <text class="text" x="92" y="434">检查 Source / Target / Iteration</text>
+    <text class="text" x="92" y="458">Transform 位置转 FVector4f</text>
+    <text class="code" x="92" y="484">SourcePositions</text>
+    <text class="code" x="92" y="508">InitialTargetPositions</text>
+  </g>
+
+  <g class="shadow">
+    <rect class="node warn" x="68" y="568" width="330" height="128"/>
+    <text class="nodeTitle" x="92" y="600">同步边界</text>
+    <text class="text" x="92" y="628">ENQUEUE_RENDER_COMMAND</text>
+    <text class="text" x="92" y="652">GraphBuilder.Execute()</text>
+    <text class="text" x="92" y="676">FlushRenderingCommands()</text>
+  </g>
+
+  <g class="shadow">
+    <rect class="node rdg" x="492" y="194" width="370" height="188"/>
+    <text class="nodeTitle" x="516" y="226">3. 上传 / 创建 RDG Buffer</text>
+    <text class="codeGreen" x="516" y="254">Uploaded SRV: SourcePositions</text>
+    <text class="codeGreen" x="516" y="278">Uploaded SRV: InitialTargetPositions</text>
+    <text class="codeGreen" x="516" y="302">UAV/SRV: TargetPositions</text>
+    <text class="codeGreen" x="516" y="326">UAV/SRV: State0 / State1</text>
+    <text class="codeGreen" x="516" y="350">UAV/SRV: NeighborCounts / Indices</text>
+  </g>
+
+  <g class="shadow">
+    <rect class="node rdg" x="492" y="430" width="370" height="154"/>
+    <text class="nodeTitle" x="516" y="462">4. Proposal Buffers</text>
+    <text class="codeGreen" x="516" y="490">ProposalOwners</text>
+    <text class="codeGreen" x="516" y="514">ProposalPositions</text>
+    <text class="text" x="516" y="540">每轮 Reset 后由 Propose 写入</text>
+    <text class="text" x="516" y="564">Commit 按 owner 占用目标 attractor</text>
+  </g>
+
+  <g class="shadow">
+    <rect class="node state" x="492" y="632" width="370" height="176"/>
+    <text class="nodeTitle" x="516" y="664">State Packing</text>
+    <text class="code" x="516" y="692">State0 = int4</text>
+    <text class="small" x="540" y="716">x Attractor, y End, z Startpt, w SpawnCount</text>
+    <text class="code" x="516" y="746">State1 = int4</text>
+    <text class="small" x="540" y="770">x Startid, y PrePt, z NextPt, w BranchCount</text>
+    <text class="small" x="516" y="794">C++ layout: FSpaceColonizationGPUState4, 16 bytes</text>
+  </g>
+
+  <g class="shadow">
+    <rect class="node gpu" x="958" y="194" width="450" height="116"/>
+    <text class="nodeTitle" x="982" y="226">5. InitializeSpaceColonizationQueueCS</text>
+    <text class="text" x="982" y="254">TargetPositions = InitialTargetPositions</text>
+    <text class="text" x="982" y="278">所有 target 初始为 Attractor=true</text>
+  </g>
+
+  <g class="shadow">
+    <rect class="node gpu" x="958" y="350" width="450" height="132"/>
+    <text class="nodeTitle" x="982" y="382">6. MarkSpaceColonizationSourcesCS</text>
+    <text class="text" x="982" y="410">每个 Source 扫描全部 InitialTargetPositions</text>
+    <text class="text" x="982" y="434">找到最近 target，标记 Startpt</text>
+    <text class="text" x="982" y="458">该 target 转为非 Attractor</text>
+  </g>
+
+  <g class="shadow">
+    <rect class="node gpu" x="958" y="522" width="450" height="142"/>
+    <text class="nodeTitle" x="982" y="554">7. BuildSpaceColonizationNeighborsCS</text>
+    <text class="text" x="982" y="582">每个 target 扫描全部原始 target</text>
+    <text class="text" x="982" y="606">InfluenceRadius 内写入 NeighborIndices</text>
+    <text class="text" x="982" y="630">邻居表只构建一次，不随 TargetPositions 移动</text>
+  </g>
+
+  <g class="shadow">
+    <rect class="node loop" x="958" y="704" width="450" height="232"/>
+    <text class="nodeTitle" x="982" y="736">8. Per Iteration Loop</text>
+    <text class="text" x="982" y="766">ResetProposalsCS: owner=0xffffffff, position=0</text>
+    <text class="text" x="982" y="794">ProposeGrowthCS: 非 Attractor 节点尝试生长</text>
+    <text class="small" x="1004" y="820">读取固定邻居表，筛选仍为 Attractor 的邻居</text>
+    <text class="small" x="1004" y="844">DirSum 使用 InitialTargetPositions 计算方向</text>
+    <text class="small" x="1004" y="868">NewPosition = RuntimeCurrent + NormalizedDir * NearestDist</text>
+    <text class="text" x="982" y="898">CommitGrowthCS: 目标 Attractor 被 owner 占用</text>
+    <text class="small" x="1004" y="922">InterlockedMin 让最小 source index 赢得竞争</text>
+  </g>
+
+  <g class="shadow">
+    <rect class="node out" x="1512" y="194" width="220" height="154"/>
+    <text class="nodeTitle" x="1532" y="226">9. GPU Copy</text>
+    <text class="text" x="1532" y="254">TargetReadback</text>
+    <text class="text" x="1532" y="278">State0Readback</text>
+    <text class="text" x="1532" y="302">State1Readback</text>
+    <text class="small" x="1532" y="326">FRHIGPUBufferReadback</text>
+  </g>
+
+  <g class="shadow">
+    <rect class="node out" x="1512" y="408" width="220" height="176"/>
+    <text class="nodeTitle" x="1532" y="440">10. Decode</text>
+    <text class="text" x="1532" y="468">Lock readback</text>
+    <text class="text" x="1532" y="492">Memcpy to CPU arrays</text>
+    <text class="text" x="1532" y="516">TargetPositions -> FVector</text>
+    <text class="text" x="1532" y="540">State0/1 -> Attribute</text>
+    <text class="small" x="1532" y="564">失败则返回 false</text>
+  </g>
+
+  <g class="shadow">
+    <rect class="node out" x="1512" y="644" width="220" height="150"/>
+    <text class="nodeTitle" x="1532" y="676">11. Build Lines</text>
+    <text class="text" x="1532" y="704">SpaceColonizationCS()</text>
+    <text class="text" x="1532" y="728">调用 BuildLinesImpl</text>
+    <text class="text" x="1532" y="752">从 End 沿 PrePt 回溯</text>
+    <text class="small" x="1532" y="776">输出 PolyPath array</text>
+  </g>
+
+  <g class="shadow">
+    <rect class="node warn" x="1512" y="854" width="220" height="104"/>
+    <text class="nodeTitle" x="1532" y="886">性能观察点</text>
+    <text class="small" x="1532" y="914">DispatchAndFlush</text>
+    <text class="small" x="1532" y="938">ReadbackAndFlush</text>
+  </g>
+
+  <path class="arrow" d="M 233 326 L 233 374"/>
+  <path class="arrow" d="M 398 447 C 438 447 448 288 492 288"/>
+  <path class="greenArrow" d="M 862 288 C 908 288 912 252 958 252"/>
+  <path class="purpleArrow" d="M 1183 310 L 1183 350"/>
+  <path class="purpleArrow" d="M 1183 482 L 1183 522"/>
+  <path class="orangeArrow" d="M 1183 664 L 1183 704"/>
+  <path class="orangeArrow" d="M 1408 820 C 1448 820 1448 704 1408 704"/>
+  <path class="greenArrow" d="M 1408 252 C 1462 252 1462 271 1512 271"/>
+  <path class="greenArrow" d="M 1512 271 C 1448 271 1448 820 1408 820"/>
+  <path class="greenArrow" d="M 1622 348 L 1622 408"/>
+  <path class="greenArrow" d="M 1622 584 L 1622 644"/>
+  <path class="softArrow" d="M 398 632 C 438 632 448 508 492 508"/>
+  <path class="softArrow" d="M 862 508 C 910 508 912 820 958 820"/>
+
+  <rect class="lane" x="38" y="1040" width="1724" height="188" rx="22"/>
+  <text class="noteTitle" x="68" y="1080">关键数据语义</text>
+  <text class="code" x="68" y="1112">InitialTargetPositions</text>
+  <text class="text" x="286" y="1112">不可变逻辑空间：Source 最近点、邻居缓存、DirSum 和 nearest distance 都基于它。</text>
+  <text class="codeGreen" x="68" y="1146">TargetPositions</text>
+  <text class="text" x="286" y="1146">可变输出空间：Commit 后写入新位置，Readback 后成为 OutTargetLocations。</text>
+  <text class="codePurple" x="68" y="1180">NeighborIndices</text>
+  <text class="text" x="286" y="1180">固定容量缓存：TargetCount * MaxNeighborsPerTarget，当前 C++ 常量为 128，并被 clamp 到 TargetCount。</text>
+  <text class="small" x="68" y="1208">对应 C++: BuildSpaceColonizationQueueCSImpl(), SpaceColonizationCS(); 对应 shader: /Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf</text>
+</svg>

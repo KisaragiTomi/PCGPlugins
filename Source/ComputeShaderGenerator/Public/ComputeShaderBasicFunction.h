@@ -107,8 +107,13 @@ public:
 	                             FLinearColor> SplinePoints, FIntPoint TextureSizeXY, FIntVector GroupCount
 	);
 
-	// UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	static void CalDistanceToNearestSurface(FSceneView* SceneView, UTextureRenderTarget2D* InDebugView);
+
+	static void SampleGlobalDistanceFieldAtPositions(
+		FSceneView* SceneView,
+		const TArray<FVector>& WorldPositions,
+		TArray<float>& OutDistances,
+		TArray<FVector>& OutGradients);
 
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	static void CopyTexture(UTextureRenderTarget2D* InOrig, UTextureRenderTarget2D* InCopy);
@@ -120,8 +125,8 @@ public:
 	static void BuildTextureArray(FRDGBuilder& GraphBuilder, int32& Index, FRDGTextureRef& RDG_CopySource, FRDGTextureUAVRef
 	                              & RDG_CopyTarget, FIntVector& GroupCount);
 
-	static void GenerateWorldCaptureTransform(FRDGBuilder& GraphBuilder, int32& Index, FRDGTextureRef& RDG_CopySource, FRDGTextureUAVRef
-							  & RDG_CopyTarget, FIntVector& GroupCount);
+	// static void GenerateWorldCaptureTransform(FRDGBuilder& GraphBuilder, int32& Index, FRDGTextureRef& RDG_CopySource, FRDGTextureUAVRef
+	// 						  & RDG_CopyTarget, FIntVector& GroupCount);
 
 
 #if WITH_EDITOR

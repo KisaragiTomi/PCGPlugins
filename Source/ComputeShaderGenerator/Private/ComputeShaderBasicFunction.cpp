@@ -10,7 +10,7 @@ IMPLEMENT_GLOBAL_SHADER(FUpPixelsMask, "/Plugin/PCGPlugins/Shaders/Private/Basic
 IMPLEMENT_GLOBAL_SHADER(FGeneralFunctionShader, "/Plugin/PCGPlugins/Shaders/Private/BasicFunction.usf", "GeneralFunctionSet", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FTreeWindShader, "/Plugin/PCGPlugins/Shaders/Private/BasicFunction.usf", "TreeWind", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSampleSpline, "/Plugin/PCGPlugins/Shaders/Private/SampleSpline.usf", "SampleSpline", SF_Compute);
-IMPLEMENT_GLOBAL_SHADER(FGlobalDistanceFieldForCS, "/Plugin/PCGPlugins/Shaders/Private/BasicFunction.usf", "GeneralFunctionSet", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FGlobalDistanceFieldForCS, "/Plugin/PCGPlugins/Shaders/Private/BasicFunction.usf", "DistanceFieldFunction", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FMeshFillMult, "/Plugin/PCGPlugins/Shaders/Private/MeshFill.usf", "MeshFillMult", SF_Compute);
 #include "ComputeShaderGenerateHepler.h"
 #include "GlobalShader.h"
@@ -24,22 +24,21 @@ IMPLEMENT_GLOBAL_SHADER(FMeshFillMult, "/Plugin/PCGPlugins/Shaders/Private/MeshF
 #include "EngineUtils.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/StaticMeshActor.h"
+#include "Engine/Texture2DArray.h"
 #include "Kismet/KismetRenderingLibrary.h"
 #include "ComputeShaderGeneral.h"
 #include "EngineModule.h"
+#include "RHIGPUReadback.h"
 #include "ImageCoreUtils.h"
 #include "Landscape.h"
 #include "LandscapeEditResourcesSubsystem.h"
 #include "PixelShaderUtils.h"
-#include "Components/SplineComponent.h"
-#include "Engine/Texture2DArray.h"
 #include "GeometryScript/PolyPathFunctions.h"
 
 using namespace CSHepler;
 using namespace FImageCoreUtils;
 
 DECLARE_CYCLE_STAT(TEXT("CS Execute"), STAT_CSTest_Execute, STATGROUP_CSTest)
-
 
 class FDrawCopyTexturePS : public FGlobalShader
 {
@@ -57,6 +56,7 @@ public:
 	static TShaderMapRef<FDrawCopyTexturePS> CreatePermutation(EDrawCopy Permutation)
 	{
 		typename FPermutationDomain PermutationVector;
+		PermutationVector.Set<FDrawCopy>(Permutation);
 		TShaderMapRef<FDrawCopyTexturePS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PermutationVector);
 		return ComputeShader;
 	}
@@ -104,10 +104,9 @@ void UComputeShaderBasicFunction::DrawLinearColorsToRenderTarget32(UTextureRende
 {
 	int32 TexturePixelCount = InTextureTarget->SizeX * InTextureTarget->SizeY;
 	if (TexturePixelCount > Colors.Num()) return;
-	// EPixelFormat TexFormat = InTextureTarget->GetFormat();
 	FTextureRenderTargetResource* TextureTarget = InTextureTarget->GameThread_GetRenderTargetResource();
 	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	[=](FRHICommandListImmediate& RHICmdList)
+	[TextureTarget, Colors = MoveTemp(Colors)](FRHICommandListImmediate& RHICmdList)
 	{
 		FTextureRHIRef TextureRHI = TextureTarget->GetRenderTargetTexture();
 		uint32 DestStride;
@@ -139,7 +138,7 @@ void UComputeShaderBasicFunction::DrawLinearColorsToRenderTarget16(UTextureRende
 	}
 	FTextureRenderTargetResource* TextureTarget = InTextureTarget->GameThread_GetRenderTargetResource();
 	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	[=](FRHICommandListImmediate& RHICmdList)
+	[TextureTarget, Colors16 = MoveTemp(Colors16), TexturePixelCount](FRHICommandListImmediate& RHICmdList)
 	{
 		FTextureRHIRef TextureRHI = TextureTarget->GetRenderTargetTexture();
 		uint32 DestStride;
@@ -158,13 +157,13 @@ void UComputeShaderBasicFunction::DrawFFloat16ColorsToRenderTarget(UTextureRende
 	
 	FTextureRenderTargetResource* TextureTarget = InTextureTarget->GameThread_GetRenderTargetResource();
 	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	[=](FRHICommandListImmediate& RHICmdList)
+	[TextureTarget, Colors16 = MoveTemp(Colors16)](FRHICommandListImmediate& RHICmdList)
 	{
 		FTextureRHIRef TextureRHI = TextureTarget->GetRenderTargetTexture();
 		uint32 DestStride;
 		void* DestData = RHILockTexture2D(TextureRHI, 0, RLM_WriteOnly, DestStride, false);
 		 if (!DestStride)	return;
-		FMemory::Memcpy(DestData, Colors16.GetData(), TextureTarget->GetSizeXY().X * TextureTarget->GetSizeXY().Y * sizeof(FFloat16));
+		FMemory::Memcpy(DestData, Colors16.GetData(), TextureTarget->GetSizeXY().X * TextureTarget->GetSizeXY().Y * sizeof(FFloat16Color));
 		RHIUnlockTexture2D(TextureRHI, 0 ,false);
 	});
 	FlushRenderingCommands();
@@ -1024,6 +1023,90 @@ void UComputeShaderBasicFunction::CalDistanceToNearestSurface(FSceneView* SceneV
 	
 }
 
+void UComputeShaderBasicFunction::SampleGlobalDistanceFieldAtPositions(
+	FSceneView* SceneView,
+	const TArray<FVector>& WorldPositions,
+	TArray<float>& OutDistances,
+	TArray<FVector>& OutGradients)
+{
+	if (!SceneView || WorldPositions.IsEmpty()) return;
+
+	const int32 NumPositions = WorldPositions.Num();
+	OutDistances.SetNumZeroed(NumPositions);
+	OutGradients.SetNumZeroed(NumPositions);
+
+	TArray<FVector4f> UploadData;
+	UploadData.SetNum(NumPositions);
+	for (int32 i = 0; i < NumPositions; i++)
+	{
+		UploadData[i] = FVector4f((FVector3f)WorldPositions[i], 0.0f);
+	}
+
+	TUniformBufferRef<FViewUniformShaderParameters> ViewUniformBuffer = SceneView->ViewUniformBuffer;
+	const FGlobalDistanceFieldParameterData* GDFData = GetRendererModule().GetGlobalDistanceFieldParameterData(*SceneView);
+
+	FRHIGPUBufferReadback* Readback = new FRHIGPUBufferReadback(TEXT("GDF_SampleReadback"));
+	const uint32 ReadbackBytes = sizeof(FVector4f) * NumPositions;
+
+	ENQUEUE_RENDER_COMMAND(SampleGDF)([=](FRHICommandListImmediate& RHICmdList)
+	{
+		FRDGBuilder GraphBuilder(RHICmdList);
+		{
+			TShaderMapRef<FGlobalDistanceFieldForCS> ComputeShader =
+				FGlobalDistanceFieldForCS::CreateTempShaderPermutation(
+					FGlobalDistanceFieldForCS::ESDFShader::GDF_SampleAtPositions);
+
+			FGlobalDistanceFieldForCS::FParameters* PassParameters =
+				GraphBuilder.AllocParameters<FGlobalDistanceFieldForCS::FParameters>();
+
+			FRDGBufferDesc BufferDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), NumPositions);
+			FRDGBufferRef PositionsBuffer = GraphBuilder.CreateBuffer(BufferDesc, TEXT("GDF_PositionsBuffer"));
+			GraphBuilder.QueueBufferUpload(PositionsBuffer, UploadData.GetData(), ReadbackBytes, ERDGInitialDataFlags::None);
+			PassParameters->RW_PointsToSampleBuffer0 = GraphBuilder.CreateUAV(PositionsBuffer);
+
+			PassParameters->InputIntData0 = NumPositions;
+			PassParameters->Sampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
+
+			FIntVector GroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(NumPositions, 1, 1), 32);
+
+			GraphBuilder.AddPass(
+				RDG_EVENT_NAME("SampleGlobalDistanceField"),
+				PassParameters,
+				ERDGPassFlags::AsyncCompute,
+				[PassParameters, ComputeShader, GroupCount, ViewUniformBuffer, GDFData](FRHIComputeCommandList& InRHICmdList)
+				{
+					PassParameters->View = ViewUniformBuffer;
+					PassParameters->GlobalDistanceFieldParameters = SetupGlobalDistanceFieldParameters_Minimal(*GDFData);
+					PassParameters->GlobalDistanceFieldParameters.GlobalDistanceFieldCoverageAtlasTextureSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
+					PassParameters->GlobalDistanceFieldParameters.GlobalDistanceFieldPageAtlasTextureSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
+					PassParameters->GlobalDistanceFieldParameters.GlobalDistanceFieldMipTextureSampler = TStaticSamplerState<SF_Trilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+					FComputeShaderUtils::Dispatch(InRHICmdList, ComputeShader, *PassParameters, GroupCount);
+				});
+
+			AddEnqueueCopyPass(GraphBuilder, Readback, PositionsBuffer, ReadbackBytes);
+		}
+		GraphBuilder.Execute();
+	});
+
+	FlushRenderingCommands();
+
+	if (Readback->IsReady())
+	{
+		const FVector4f* ResultPtr = (const FVector4f*)Readback->Lock(ReadbackBytes);
+		if (ResultPtr)
+		{
+			for (int32 i = 0; i < NumPositions; i++)
+			{
+				OutGradients[i] = FVector(ResultPtr[i].X, ResultPtr[i].Y, ResultPtr[i].Z);
+				OutDistances[i] = ResultPtr[i].W;
+			}
+		}
+		Readback->Unlock();
+	}
+
+	delete Readback;
+}
+
 void UComputeShaderBasicFunction::CopyTexture(UTextureRenderTarget2D* InOrig, UTextureRenderTarget2D* InCopy)
 {
 	if (InCopy == nullptr || InOrig == nullptr) return;
@@ -1309,8 +1392,9 @@ void UComputeShaderBasicFunction::UpdateTextureArray(UTexture2DArray* Texture2DA
 	}
 }
 
+#endif
+
 void UComputeShaderBasicFunction::SyncRenderThread()
 {
 	FlushRenderingCommands();
 }
-#endif

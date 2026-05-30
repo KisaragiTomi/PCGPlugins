@@ -12,7 +12,11 @@
 #include "LandscapeEdit.h"
 #include "LandscapeEditLayer.h"
 #include "LandscapeComponent.h"
+#include "LandscapeEditLayerMergeRenderContext.h"
+#include "LandscapeEditResourcesSubsystem.h"
+#include "LandscapeUtils.h"
 #include "TextureResource.h"
+#include "EngineUtils.h"
 
 DECLARE_CYCLE_STAT(TEXT("CSLandscapeLayer Execute"), STAT_CSLayer_Execute, STATGROUP_CSTest)
 
@@ -102,8 +106,6 @@ ACSLandscapeLayer::ACSLandscapeLayer()
 	Box = CreateDefaultSubobject<UBoxComponent>(TEXT("Box"));
 	Box->SetupAttachment(SceneComponent, TEXT("Box"));
 	Box->SetBoxExtent(FVector(50, 50, 50));
-
-	AffectHeightmap = true;
 }
 
 void ACSLandscapeLayer::OnConstruction(const FTransform& Transform)
@@ -162,9 +164,19 @@ void ACSLandscapeLayer::GenerateLayerAlphaAndHeight()
 
 	FVector Center = Box->Bounds.Origin;
 	FVector Extent = Box->Bounds.BoxExtent;
+	const FVector CapturedLandscapeTexMinUV = LandscapeTexMinUV;
+	const FVector CapturedLandscapeTexUVRange = LandscapeTexUVRange;
+	const float CapturedGlobalAlpha = GlobalAlpha;
+	const float CapturedHeightModStrength = HeightModStrength;
+	const float CapturedNormalStrength = NormalStrength;
+	const float CapturedFalloffWidth = FalloffWidth;
+	const float CapturedNoiseFrequency = NoiseFrequency;
+	const float CapturedNoiseAmplitude = NoiseAmplitude;
 
 	ENQUEUE_RENDER_COMMAND(GenerateLayerAlphaHeight)(
-	[=, this](FRHICommandListImmediate& RHICmdList)
+	[R_Alpha, R_Height, R_Debug, Center, Extent, CapturedLandscapeTexMinUV, CapturedLandscapeTexUVRange,
+	 CapturedGlobalAlpha, CapturedHeightModStrength, CapturedNormalStrength, CapturedFalloffWidth,
+	 CapturedNoiseFrequency, CapturedNoiseAmplitude](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
 		{
@@ -189,17 +201,17 @@ void ACSLandscapeLayer::GenerateLayerAlphaAndHeight()
 			PassParameters->RW_LayerGeneratedHeight = RDGUAV_Height;
 			PassParameters->RW_DebugView = RDGUAV_Debug;
 			{
-				auto UVEnd = LandscapeTexMinUV + LandscapeTexUVRange;
+				auto UVEnd = CapturedLandscapeTexMinUV + CapturedLandscapeTexUVRange;
 				PassParameters->ValidUVRange = FVector4f(
-					static_cast<float>(LandscapeTexMinUV.X), static_cast<float>(LandscapeTexMinUV.Y),
+					static_cast<float>(CapturedLandscapeTexMinUV.X), static_cast<float>(CapturedLandscapeTexMinUV.Y),
 					static_cast<float>(UVEnd.X), static_cast<float>(UVEnd.Y));
 			}
-			PassParameters->GlobalAlpha = GlobalAlpha;
-			PassParameters->HeightModStrength = HeightModStrength;
-			PassParameters->NormalStrength = NormalStrength;
-			PassParameters->FalloffWidth = FalloffWidth;
-			PassParameters->NoiseFrequency = NoiseFrequency;
-			PassParameters->NoiseAmplitude = NoiseAmplitude;
+			PassParameters->GlobalAlpha = CapturedGlobalAlpha;
+			PassParameters->HeightModStrength = CapturedHeightModStrength;
+			PassParameters->NormalStrength = CapturedNormalStrength;
+			PassParameters->FalloffWidth = CapturedFalloffWidth;
+			PassParameters->NoiseFrequency = CapturedNoiseFrequency;
+			PassParameters->NoiseAmplitude = CapturedNoiseAmplitude;
 			PassParameters->BoxOrigin = FVector3f(Center);
 			PassParameters->BoxExtent = FVector3f(Extent);
 			PassParameters->Sampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
@@ -213,7 +225,7 @@ void ACSLandscapeLayer::GenerateLayerAlphaAndHeight()
 					RDG_EVENT_NAME("GenerateLayerAlpha"),
 					PassParameters,
 					ERDGPassFlags::AsyncCompute,
-					[&PassParameters, ComputeShader_GenAlpha, GroupCount](FRHIComputeCommandList& RHICmdList)
+					[PassParameters, ComputeShader_GenAlpha, GroupCount](FRHIComputeCommandList& RHICmdList)
 					{
 						FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_GenAlpha, *PassParameters, GroupCount);
 					});
@@ -229,7 +241,7 @@ void ACSLandscapeLayer::GenerateLayerAlphaAndHeight()
 					RDG_EVENT_NAME("GenerateLayerHeight"),
 					PassParameters,
 					ERDGPassFlags::AsyncCompute,
-					[&PassParameters, ComputeShader_GenHeight, GroupCount](FRHIComputeCommandList& RHICmdList)
+					[PassParameters, ComputeShader_GenHeight, GroupCount](FRHIComputeCommandList& RHICmdList)
 					{
 						FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_GenHeight, *PassParameters, GroupCount);
 					});
@@ -255,9 +267,16 @@ void ACSLandscapeLayer::BlendLayerWithAlpha()
 	ULandscapeExtra::CreateLandscapeTextureData(LandscapeData, Center, Extent);
 	if (LandscapeData.TextureSize.X + LandscapeData.TextureSize.Y < 32) return;
 	Orig_LandscapeData = LandscapeData;
+	const FVector CapturedLandscapeTexMinUV = LandscapeTexMinUV;
+	const FVector CapturedLandscapeTexUVRange = LandscapeTexUVRange;
+	const float CapturedGlobalAlpha = GlobalAlpha;
+	const float CapturedHeightModStrength = HeightModStrength;
+	const float CapturedNormalStrength = NormalStrength;
+	const ELandscapeLayerBlendMode CapturedBlendMode = BlendMode;
 
 	ENQUEUE_RENDER_COMMAND(BlendLayerAlpha)(
-	[=, this](FRHICommandListImmediate& RHICmdList)
+	[R_Orig, R_Alpha, R_Height, R_Debug, CapturedLandscapeTexMinUV, CapturedLandscapeTexUVRange,
+	 CapturedGlobalAlpha, CapturedHeightModStrength, CapturedNormalStrength, CapturedBlendMode](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
 		{
@@ -283,18 +302,18 @@ void ACSLandscapeLayer::BlendLayerWithAlpha()
 			PassParameters->RW_LayerBlendResult = RDGUAV_Result;
 			PassParameters->RW_DebugView = RDGUAV_Debug;
 			{
-				auto UVEnd = LandscapeTexMinUV + LandscapeTexUVRange;
+				auto UVEnd = CapturedLandscapeTexMinUV + CapturedLandscapeTexUVRange;
 				PassParameters->ValidUVRange = FVector4f(
-					static_cast<float>(LandscapeTexMinUV.X), static_cast<float>(LandscapeTexMinUV.Y),
+					static_cast<float>(CapturedLandscapeTexMinUV.X), static_cast<float>(CapturedLandscapeTexMinUV.Y),
 					static_cast<float>(UVEnd.X), static_cast<float>(UVEnd.Y));
 			}
-			PassParameters->GlobalAlpha = GlobalAlpha;
-			PassParameters->HeightModStrength = HeightModStrength;
-			PassParameters->NormalStrength = NormalStrength;
+			PassParameters->GlobalAlpha = CapturedGlobalAlpha;
+			PassParameters->HeightModStrength = CapturedHeightModStrength;
+			PassParameters->NormalStrength = CapturedNormalStrength;
 			PassParameters->Sampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
 
 			TShaderMapRef<FCSLandscapeLayer> ComputeShader_Blend = FCSLandscapeLayer::CreatePermutation(
-				BlendMode == ELandscapeLayerBlendMode::MaterialDrive
+				CapturedBlendMode == ELandscapeLayerBlendMode::MaterialDrive
 					? FCSLandscapeLayer::ELandscapeLayerFunction::L_BlendMaterialDrive
 					: FCSLandscapeLayer::ELandscapeLayerFunction::L_BlendAlpha);
 
@@ -302,7 +321,7 @@ void ACSLandscapeLayer::BlendLayerWithAlpha()
 				RDG_EVENT_NAME("BlendLayerWithAlpha"),
 				PassParameters,
 				ERDGPassFlags::AsyncCompute,
-				[&PassParameters, ComputeShader_Blend, GroupCount](FRHIComputeCommandList& RHICmdList)
+				[PassParameters, ComputeShader_Blend, GroupCount](FRHIComputeCommandList& RHICmdList)
 				{
 					FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_Blend, *PassParameters, GroupCount);
 				});
@@ -316,12 +335,7 @@ void ACSLandscapeLayer::BlendLayerWithAlpha()
 
 void ACSLandscapeLayer::CreateLandscapeLayer()
 {
-	ALandscape* Landscape = nullptr;
-	for (TActorIterator<ALandscape> It(GWorld, ALandscape::StaticClass()); It; ++It)
-	{
-		Landscape = *It;
-		break;
-	}
+	ALandscape* Landscape = FindLandscape();
 	if (!Landscape)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("ACSLandscapeLayer: No Landscape found in world."));
@@ -367,12 +381,7 @@ void ACSLandscapeLayer::RemoveLandscapeLayer()
 {
 	if (!bLayerCreated) return;
 
-	ALandscape* Landscape = nullptr;
-	for (TActorIterator<ALandscape> It(GWorld, ALandscape::StaticClass()); It; ++It)
-	{
-		Landscape = *It;
-		break;
-	}
+	ALandscape* Landscape = FindLandscape();
 	if (!Landscape) return;
 
 	Landscape->DeleteLayer(LayerIndex);
@@ -386,13 +395,16 @@ void ACSLandscapeLayer::RemoveLandscapeLayer()
 void ACSLandscapeLayer::ApplyBlendedLayerToLandscape()
 {
 	if (RT_LayerBlendResult == nullptr) return;
+	bHasLayerResult = true;
+	RequestLandscapeUpdate(true);
+}
 
-	ALandscape* Landscape = nullptr;
-	for (TActorIterator<ALandscape> It(GWorld, ALandscape::StaticClass()); It; ++It)
-	{
-		Landscape = *It;
-		break;
-	}
+void ACSLandscapeLayer::CommitToLandscape()
+{
+#if WITH_EDITOR
+	if (RT_LayerBlendResult == nullptr || !bHasLayerResult) return;
+
+	ALandscape* Landscape = FindLandscape();
 	if (!Landscape) return;
 
 	if (!bLayerCreated)
@@ -401,7 +413,7 @@ void ACSLandscapeLayer::ApplyBlendedLayerToLandscape()
 	}
 
 	FLandscapeEditDataInterface LandscapeEdit(Landscape->GetLandscapeInfo());
-	LandscapeEdit.SetShouldDirtyPackage(false);
+	LandscapeEdit.SetShouldDirtyPackage(true);
 
 	FReadLandscapeData LandscapeData;
 	FVector Center = Box->Bounds.Origin;
@@ -421,7 +433,6 @@ void ACSLandscapeLayer::ApplyBlendedLayerToLandscape()
 	HeightFlagsData.Reserve(LandscapeData.TextureValidSize.X * LandscapeData.TextureValidSize.Y);
 
 	float LandscapeScaleZ = Landscape->GetActorScale3D().Z;
-
 	for (int32 Y = 0; Y < LandscapeData.TextureValidSize.Y; Y++)
 	{
 		for (int32 X = 0; X < LandscapeData.TextureValidSize.X; X++)
@@ -445,7 +456,95 @@ void ACSLandscapeLayer::ApplyBlendedLayerToLandscape()
 		LandscapeData.ReadRange.Z, LandscapeData.ReadRange.W,
 		(uint16*)HeightData.GetData(), 0, true, nullptr,
 		(uint16*)HeightAlphaBlendData.GetData(), (uint8*)HeightFlagsData.GetData());
+
+	bHasLayerResult = false;
+#endif
 }
+
+ALandscape* ACSLandscapeLayer::FindLandscape() const
+{
+	if (!GetWorld()) return nullptr;
+	for (TActorIterator<ALandscape> It(GetWorld()); It; ++It)
+	{
+		return *It;
+	}
+	return nullptr;
+}
+
+void ACSLandscapeLayer::RequestLandscapeUpdate(bool bInUserTriggered)
+{
+#if WITH_EDITOR
+	ALandscape* Landscape = FindLandscape();
+	if (Landscape)
+	{
+		Landscape->RequestLayersContentUpdateForceAll(ELandscapeLayerUpdateMode::Update_All, bInUserTriggered);
+	}
+#endif
+}
+
+#if WITH_EDITOR
+
+FString ACSLandscapeLayer::GetEditLayerRendererDebugName() const
+{
+	return FString::Printf(TEXT("ACSLandscapeLayer_%s"), *GetName());
+}
+
+void ACSLandscapeLayer::GetRendererStateInfo(
+	const UE::Landscape::EditLayers::FMergeContext* InMergeContext,
+	UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutSupportedTargetTypeState,
+	UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutEnabledTargetTypeState,
+	TArray<UE::Landscape::EditLayers::FTargetLayerGroup>& OutTargetLayerGroups) const
+{
+	OutSupportedTargetTypeState.AddTargetTypeMask(ELandscapeToolTargetTypeFlags::Heightmap);
+	if (bHasLayerResult)
+	{
+		OutEnabledTargetTypeState.AddTargetTypeMask(ELandscapeToolTargetTypeFlags::Heightmap);
+	}
+}
+
+TArray<UE::Landscape::EditLayers::FEditLayerRenderItem> ACSLandscapeLayer::GetRenderItems(
+	const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const
+{
+	using namespace UE::Landscape::EditLayers;
+	FEditLayerTargetTypeState EnabledState(InMergeContext, ELandscapeToolTargetTypeFlags::Heightmap);
+	return { FEditLayerRenderItem(EnabledState, FInputWorldArea::CreateInfinite(), FOutputWorldArea::CreateLocalComponent(), false) };
+}
+
+UE::Landscape::EditLayers::ERenderFlags ACSLandscapeLayer::GetRenderFlags(
+	const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const
+{
+	return UE::Landscape::EditLayers::ERenderFlags::RenderMode_Immediate;
+}
+
+bool ACSLandscapeLayer::RenderLayer(
+	UE::Landscape::EditLayers::FRenderParams& RenderParams,
+	UE::Landscape::FRDGBuilderRecorder& RDGBuilderRecorder)
+{
+	if (!bHasLayerResult || !RT_LayerBlendResult) return false;
+	if (!RenderParams.MergeRenderContext->IsHeightmapMerge()) return false;
+
+	RenderParams.MergeRenderContext->CycleBlendRenderTargets(RDGBuilderRecorder);
+	ULandscapeScratchRenderTarget* WriteRT = RenderParams.MergeRenderContext->GetBlendRenderTargetWrite();
+
+	WriteRT->TransitionTo(ERHIAccess::RTV, RDGBuilderRecorder);
+
+	FIntPoint Size = RenderParams.RenderAreaSectionRect.Size();
+	ULandscapeScratchRenderTarget::FCopyFromTextureParams CopyParams(RT_LayerBlendResult);
+	CopyParams.CopySize = Size;
+	WriteRT->CopyFrom(CopyParams, RDGBuilderRecorder);
+
+	return true;
+}
+
+void ACSLandscapeLayer::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+{
+	Super::PostEditChangeProperty(PropertyChangedEvent);
+	if (bHasLayerResult)
+	{
+		RequestLandscapeUpdate(true);
+	}
+}
+#endif
 
 void ACSLandscapeLayer::FullPipeline()
 {

@@ -353,11 +353,6 @@ public:
 		const uint32 SourceModeIndex = static_cast<uint32>(PermutationVector.Get<FGeneralFunctionSet>());
 		OutEnvironment.SetDefine(ShaderSourceModeDefineName[SourceModeIndex], 1u);
 
-		EGeneralShader FunctionSelect = PermutationVector.Get<FGeneralFunctionSet>();
-		if (FunctionSelect == EGeneralShader::GTS_BuildTextureArray)
-		{
-			OutEnvironment.SetDefine(TEXT("USE_DISTANCEFIELD"), 1);
-		}
 	}
 };
 
@@ -508,6 +503,7 @@ public:
 	enum class ESDFShader : uint8
 	{
 		GDF_DistanceToNearestSurface,
+		GDF_SampleAtPositions,
 		MAX
 	};
 	class FSDFSet : SHADER_PERMUTATION_ENUM_CLASS("GlobalDistanceFieldForCS", ESDFShader);
@@ -521,9 +517,7 @@ public:
 		return ComputeShader;
 	}
 	
-	//Declare this class as a global shader
 	DECLARE_GLOBAL_SHADER(FGlobalDistanceFieldForCS);
-	//Tells the engine that this shader uses a structure for its parameters
 	SHADER_USE_PARAMETER_STRUCT(FGlobalDistanceFieldForCS, FGlobalShader);
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, T_ProcssTexture0)
@@ -539,28 +533,24 @@ public:
 		SHADER_PARAMETER_SAMPLER(SamplerState, Sampler)
 	END_SHADER_PARAMETER_STRUCT()
 public:
-	//Called by the engine to determine which permutations to compile for this shader
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
-		
-		return true;
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
 	}
-	//Modifies the compilations environment of the shader
+
 	static inline void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
 	{
 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
 
-		//We're using it here to add some preprocessor defines. That way we don't have to change both C++ and HLSL code 
-		// when we change the value for NUM_THREADS_PER_GROUP_DIMENSION
-	
 		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), NUM_THREADS_PER_GROUP_DIMENSION_X);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Y"), NUM_THREADS_PER_GROUP_DIMENSION_Y);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Z"), NUM_THREADS_PER_GROUP_DIMENSION_Z);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Y"), 1);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Z"), 1);
 		OutEnvironment.SetDefine(TEXT("USE_DISTANCEFIELD"), 1);
 		
 		static const TCHAR* ShaderSourceModeDefineName[] =
 		{
 			TEXT("GDF_DISTANCETONEARESTSURFACE"),
+			TEXT("GDF_SAMPLEATPOSITIONS"),
 		};
 		static_assert(UE_ARRAY_COUNT(ShaderSourceModeDefineName) == (uint32)ESDFShader::MAX, "Enum doesn't match define table.");
 		
@@ -571,7 +561,8 @@ public:
 		ESDFShader FunctionSelect = PermutationVector.Get<FSDFSet>();
 		if (FunctionSelect == ESDFShader::GDF_DistanceToNearestSurface)
 		{
-			OutEnvironment.SetDefine(TEXT("USE_DISTANCEFIELD"), 1);
+			OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), NUM_THREADS_PER_GROUP_DIMENSION_X);
+			OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Y"), NUM_THREADS_PER_GROUP_DIMENSION_Y);
 		}
 	}
 };

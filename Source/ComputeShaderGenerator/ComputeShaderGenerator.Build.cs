@@ -1,5 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+using System;
+using System.IO;
 using UnrealBuildTool;
 
 public class ComputeShaderGenerator : ModuleRules
@@ -8,6 +10,15 @@ public class ComputeShaderGenerator : ModuleRules
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 		bUseRTTI = true;
+		PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "..", "PCGPluginsShared"));
+		bool bPCGPluginsDebug = Target.Configuration != UnrealTargetConfiguration.Shipping;
+		string PCGPluginsDebugEnv = Environment.GetEnvironmentVariable("PCGPLUGINS_DEBUG");
+		if (!string.IsNullOrWhiteSpace(PCGPluginsDebugEnv))
+		{
+			bPCGPluginsDebug = PCGPluginsDebugEnv != "0" && !PCGPluginsDebugEnv.Equals("false", StringComparison.OrdinalIgnoreCase);
+		}
+		PublicDefinitions.Add("PCGPLUGINS_DEBUG=" + (bPCGPluginsDebug ? "1" : "0"));
+
 		PublicIncludePaths.AddRange(
 			new string[] {
 				// ... add public include paths required here ...
@@ -25,7 +36,13 @@ public class ComputeShaderGenerator : ModuleRules
 		PublicDependencyModuleNames.AddRange(
 			new string[]
 			{
-				"Core", "Engine", 
+				"Core",
+				"CoreUObject",
+				"Engine",
+				"GeometryFramework",
+				"Renderer",
+				"RenderCore",
+				"RHI",
 				// ... add other public dependencies that you statically link with here ...
 			}
 			);
@@ -36,20 +53,38 @@ public class ComputeShaderGenerator : ModuleRules
 			{
 				"CoreUObject",
 				"Engine",
-                "Renderer",
-				"RenderCore",
-				"RHI",
 				"Projects", 
-				"GeometryFramework", 
 				"GeometryScriptingCore",
 				"DynamicMesh",
-				"GeometryCore", 
+				"GeometryCore",
+				"MeshConversion", 
 				"Landscape",
 				"ImageCore",
 				"Foliage",
+				"MeshDescription",
+				"StaticMeshDescription",
+				"ProxyLODMeshReduction",
 				// ... add private dependencies that you statically link with here ...	
 			}
 			);
+
+		AddEngineThirdPartyPrivateStaticDependencies(Target,
+			"IntelTBB",
+			"OpenVDB",
+			"Blosc",
+			"zlib"
+		);
+
+		if (Target.bBuildEditor)
+		{
+			PrivateDependencyModuleNames.AddRange(
+				new string[]
+				{
+					"AnimationCore",
+					"SkeletalMeshDescription",
+				}
+				);
+		}
 		
 		
 		DynamicallyLoadedModuleNames.AddRange(

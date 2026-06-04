@@ -79,12 +79,6 @@ static FAutoConsoleVariableRef CVarCSSWMaxIterationsPerFrame(
 	GCSSWMaxIterationsPerFrame,
 	TEXT("Maximum CSSW simulation iterations dispatched by one solver frame."));
 
-static int32 GCSSWReleaseTransientResourcesDuringConstruction = 1;
-static FAutoConsoleVariableRef CVarCSSWReleaseTransientResourcesDuringConstruction(
-	TEXT("pcg.CSSW.ReleaseTransientResourcesDuringConstruction"),
-	GCSSWReleaseTransientResourcesDuringConstruction,
-	TEXT("Release CSSW-owned old transient RTs, MIDs, readbacks, and HISM data before ConstructionScript. Enabled by default to prevent editor VRAM residue."));
-
 #ifdef NUM_THREADS_PER_GROUP_DIMENSION_X
 #undef NUM_THREADS_PER_GROUP_DIMENSION_X
 #endif
@@ -755,10 +749,7 @@ void ACSShallowWaterCapture::OnConstruction(const FTransform& Transform)
 		TGuardValue<bool> ConstructionGuard(bSWConstructionGuardActive, true);
 		StopSimulationRuntime(true);
 		WaitForPendingShallowWaterRendering(TEXT("OnConstruction before releasing old CSSW resources"));
-		if (GCSSWReleaseTransientResourcesDuringConstruction != 0)
-		{
-			ReleaseShallowWaterTransientResources(TEXT("OnConstruction old resources"));
-		}
+		ReleaseShallowWaterTransientResources(TEXT("OnConstruction old resources"));
 		Super::OnConstruction(Transform);
 	}
 

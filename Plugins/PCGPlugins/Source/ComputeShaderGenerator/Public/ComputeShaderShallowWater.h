@@ -39,19 +39,19 @@ public:
 	virtual void Tick(float DeltaTime) override;
 	virtual bool ShouldTickIfViewportsOnly() const override;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, EditAnywhere, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_DebugView;
-	UPROPERTY(BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_VelocityHeight;
-	UPROPERTY(BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_ResultVelHeight;
-	UPROPERTY(BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_ResultDepthWet;
-	UPROPERTY(BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_Source;
-	UPROPERTY(BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_SceneDepth;
-	UPROPERTY(BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_SmoothHeight;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug", Meta=(Priority=1000))
 	int32 SWUniqueID = -99999;
@@ -88,13 +88,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	UMaterialInterface* DecalMaterial;
 
-	UPROPERTY(BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
+	UPROPERTY(Transient, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	UMaterialInterface* VisWaterMaterial;
-	UPROPERTY(BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
+	UPROPERTY(Transient, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	UMaterialInterface* VisDecalMaterial;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	bool CloseBound = false;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000, ClampMin="1", UIMin="1"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000, ClampMin="1", ClampMax="32", UIMin="1", UIMax="8"))
 	int32 Iteration = 1;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	int32 HeightSmoothIteration = 1;
@@ -132,23 +132,36 @@ public:
 	virtual void BeginPlay() override;
 	virtual void PreSave(FObjectPreSaveContext ObjectSaveContext) override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void BeginDestroy() override;
 
 	virtual void OnConstruction(const FTransform& Transform) override;
 	
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
+	void ConstructionComponent();
+
+	void ConstructActor();
+
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	bool CheckAndCreateTexture_SWSourcePoint()
 	{
-		if (RT_SceneDepth == nullptr) RT_SceneDepth = UKismetRenderingLibrary::CreateRenderTarget2D(this, TextureSize, TextureSize, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor::Black, true, false);
+		if (!CanRunShallowWaterGPUWork(TEXT("CheckAndCreateTexture_SWSourcePoint"))) return false;
+
+		const int32 SafeTextureSize = ResolveTextureSize();
+		TextureSize = SafeTextureSize;
+
+		if (RT_SceneDepth == nullptr) RT_SceneDepth = UKismetRenderingLibrary::CreateRenderTarget2D(this, SafeTextureSize, SafeTextureSize, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor::Black, true, false);
+		if (RT_DebugView == nullptr) RT_DebugView = UKismetRenderingLibrary::CreateRenderTarget2D(this, SafeTextureSize, SafeTextureSize, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor::Black, true, false);
+		if (RT_VelocityHeight == nullptr) RT_VelocityHeight = UKismetRenderingLibrary::CreateRenderTarget2D(this, SafeTextureSize, SafeTextureSize, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor(0, 0, -9999, 1), true, false);
+		if (RT_ResultVelHeight == nullptr) RT_ResultVelHeight = UKismetRenderingLibrary::CreateRenderTarget2D(this, SafeTextureSize, SafeTextureSize, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(0, 0, -9999, 1), true, false);
+		if (RT_Source == nullptr) RT_Source = UKismetRenderingLibrary::CreateRenderTarget2D(this, SafeTextureSize, SafeTextureSize, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(MaxHeight, 0, 0, 0), true, false);
+		if (RT_SmoothHeight == nullptr) RT_SmoothHeight = UKismetRenderingLibrary::CreateRenderTarget2D(this, SafeTextureSize, SafeTextureSize, ETextureRenderTargetFormat::RTF_RGBA32f,FLinearColor(-9999, -9999, -9999, -9999), true, false);
+		if (!RT_SceneDepth || !RT_DebugView || !RT_VelocityHeight || !RT_ResultVelHeight || !RT_Source || !RT_SmoothHeight) return false;
 		CaptureSceneDepth->TextureTarget = RT_SceneDepth;
-		if (RT_DebugView == nullptr) RT_DebugView = UKismetRenderingLibrary::CreateRenderTarget2D(this, TextureSize, TextureSize, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor::Black, true, false);
-		if (RT_VelocityHeight == nullptr) RT_VelocityHeight = UKismetRenderingLibrary::CreateRenderTarget2D(this, TextureSize, TextureSize, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor(0, 0, -9999, 1), true, false);
-		if (RT_ResultVelHeight == nullptr) RT_ResultVelHeight = UKismetRenderingLibrary::CreateRenderTarget2D(this, TextureSize, TextureSize, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(0, 0, -9999, 1), true, false);
-		if (RT_Source == nullptr) RT_Source = UKismetRenderingLibrary::CreateRenderTarget2D(this, TextureSize, TextureSize, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(MaxHeight, 0, 0, 0), true, false);
-		if (RT_SmoothHeight == nullptr) RT_SmoothHeight = UKismetRenderingLibrary::CreateRenderTarget2D(this, TextureSize, TextureSize, ETextureRenderTargetFormat::RTF_RGBA32f,FLinearColor(-9999, -9999, -9999, -9999), true, false);
 
 		if (RT_ResultDepthWet == nullptr)
 		{
-			RT_ResultDepthWet = UKismetRenderingLibrary::CreateRenderTarget2D(this, TextureSize, TextureSize, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(-9999, -9999, -9999, -9999), true, false);
+			RT_ResultDepthWet = UKismetRenderingLibrary::CreateRenderTarget2D(this, SafeTextureSize, SafeTextureSize, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(-9999, -9999, -9999, -9999), true, false);
+			if (!RT_ResultDepthWet) return false;
 			UKismetRenderingLibrary::ClearRenderTarget2D(this, RT_ResultDepthWet,  FLinearColor(-9999, -9999, -9999, -9999));
 			CleanDepthWet = true;
 		}
@@ -163,8 +176,6 @@ public:
 		SetMaterialParameter();
 		return true;
 	}
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	void ConstructionComponent();
 	
 	UFUNCTION(BlueprintPure, Category = "SWParameter")
 	int32 GetWaterfallExpansionCount() const
@@ -201,7 +212,10 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	void CaptureSceneDepthNow();
 
-	UPROPERTY()
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "ComputeShader")
+	void ReleaseTransientRenderResources();
+
+	UPROPERTY(Transient)
 	UTextureRenderTarget2D* RT_TileMask = nullptr;
 	int32 CachedActiveTileCount = 0;
 	TArray<uint8> CachedTileBits;
@@ -265,7 +279,7 @@ public:
 	DECLARE_DELEGATE_OneParam(FOnBakeResultMesh, ACSShallowWaterCapture*);
 	static FOnBakeResultMesh OnBakeResultMeshDelegate;
 
-	UFUNCTION(CallInEditor, Category = "SWParameter", Meta=(DevelopmentOnly))
+	UFUNCTION(BlueprintCallable, Category = "SWParameter", Meta=(DevelopmentOnly))
 	void BakeResultMesh();
 
 	UFUNCTION(BlueprintNativeEvent, Category = "ComputeShader|Bake")
@@ -278,7 +292,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader|Bake")
 	void UseSimulationResultMesh();
 
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader", Meta=(ClampMin="1", UIMin="1"))
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader", Meta=(ClampMin="1", ClampMax="32", UIMin="1", UIMax="8"))
 	void ToggleSimVisualization(int32 SimIterationsPerFrame = 1);
 
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "ComputeShader")
@@ -300,11 +314,18 @@ private:
 	bool EnsureSimVisHISMReady();
 	void ResetSimVisTiles();
 	void ResetSolverReadbackState(bool bAdvanceGeneration, bool bClearCachedResult);
+	void WaitForPendingShallowWaterRendering(const TCHAR* Context) const;
+	bool IsShallowWaterConstructionBlocked() const;
+	bool CanRunShallowWaterGPUWork(const TCHAR* Context) const;
+	int32 ResolveTextureSize() const;
+	void ReleaseShallowWaterTransientResources(const TCHAR* Context);
 
 	TWeakObjectPtr<AActor> DebugViewPlaneActor;
 	FTimerHandle DebugViewPlaneTimerHandle;
 	FTimerHandle SolverTimerHandle;
 	float SolverTimerRate = 0.0f;
+	bool bSWConstructionGuardActive = false;
+	bool bSWConstructionWorkPending = false;
 };
 
 

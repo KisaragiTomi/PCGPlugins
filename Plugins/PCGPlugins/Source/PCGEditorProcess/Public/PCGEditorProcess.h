@@ -3,9 +3,12 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Delegates/Delegate.h"
 #include "Modules/ModuleManager.h"
 
 class AComputeShaderMeshGenerator;
+class AGPUSkeletalTree;
+class FVineContainerViewportOverlay;
 
 class FPCGEditorProcessModule : public IModuleInterface
 {
@@ -16,5 +19,11 @@ public:
 	virtual void ShutdownModule() override;
 
 private:
+	void InitializeEditorUI();
 	void StartInstanceBrush(AComputeShaderMeshGenerator* TargetActor);
+	void GenerateGPUSkeletalTree(AGPUSkeletalTree* TargetActor);
+
+	FDelegateHandle PostEngineInitHandle;
+	TUniquePtr<FVineContainerViewportOverlay> VineContainerViewportOverlay;
+	bool bEditorModeRegistered = false;
 };

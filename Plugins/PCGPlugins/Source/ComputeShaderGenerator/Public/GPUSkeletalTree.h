@@ -7,6 +7,9 @@
 class USkeletalMesh;
 class USkeleton;
 class UPoseableMeshComponent;
+class AGPUSkeletalTree;
+
+DECLARE_DELEGATE_OneParam(FGPUSkeletalTreeGenerateMeshRequest, AGPUSkeletalTree*);
 
 USTRUCT(BlueprintType)
 struct COMPUTESHADERGENERATOR_API FTreeBranchParams
@@ -73,6 +76,8 @@ class COMPUTESHADERGENERATOR_API AGPUSkeletalTree : public AActor
 public:
 	AGPUSkeletalTree();
 
+	static FGPUSkeletalTreeGenerateMeshRequest OnGenerateTreeEditorRequest;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tree")
 	FTreeBranchParams TreeParams;
 
@@ -96,6 +101,8 @@ public:
 
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Tree")
 	void ApplySkeletalMeshOverride();
+
+	void SetGeneratedSkeletalMesh(USkeletalMesh* Mesh, USkeleton* Skeleton);
 
 	virtual void Tick(float DeltaTime) override;
 	virtual bool ShouldTickIfViewportsOnly() const override { return true; }

@@ -63,7 +63,6 @@ public class ComputeShaderGenerator : ModuleRules
 				"Foliage",
 				"MeshDescription",
 				"StaticMeshDescription",
-				"ProxyLODMeshReduction",
 				// ... add private dependencies that you statically link with here ...	
 			}
 			);
@@ -75,18 +74,6 @@ public class ComputeShaderGenerator : ModuleRules
 			"zlib"
 		);
 
-		if (Target.bBuildEditor)
-		{
-			PrivateDependencyModuleNames.AddRange(
-				new string[]
-				{
-					"AnimationCore",
-					"SkeletalMeshDescription",
-				}
-				);
-		}
-		
-		
 		DynamicallyLoadedModuleNames.AddRange(
 			new string[]
 			{

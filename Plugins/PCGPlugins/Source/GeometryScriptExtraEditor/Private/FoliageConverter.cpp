@@ -10,19 +10,19 @@
 #include "EngineUtils.h"
 #include "InstancedFoliageActor.h"
 
-void UFoliageConverter::ConvertFoliageToInstanceComponent(UFoliageType* InFoliageType, AVineContainer* Container)
+void UFoliageConverter::ConvertFoliageToTransformArray(UFoliageType* InFoliageType, AVineContainer* Container)
 {
 	if (Container)
 	{
-		Container->AddInstanceFromFoliageType(InFoliageType);
+		Container->ImportFoliageToTransformArray(InFoliageType);
 	}
 }
 
-void UFoliageConverter::ConvertInstanceComponentToFoliage(UFoliageType* InFoliageType, UClass* ContainerClass, AVineContainer* Container)
+void UFoliageConverter::ConvertTransformArrayToFoliage(UFoliageType* InFoliageType, AVineContainer* Container)
 {
 	if (Container)
 	{
-		Container->ConvertInstanceToFoliage(InFoliageType);
+		Container->ExportTransformArrayToFoliage(InFoliageType);
 	}
 }
 

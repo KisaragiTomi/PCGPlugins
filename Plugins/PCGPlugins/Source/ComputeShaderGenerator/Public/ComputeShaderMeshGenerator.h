@@ -91,6 +91,14 @@ public:
 	// 生成 voxel 时使用的 cell size，后续转 mesh 时可作为默认面片大小。
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	float VoxelSize = 0.0f;
+
+	// 体素整数网格坐标，与 Positions 一一对应（-1 索引为无效）。
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
+	TArray<FIntVector> Cells;
+
+	// 面积加权质心（target position），与 Positions 一一对应。用于更精确的表面匹配。
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
+	TArray<FVector> TargetPositions;
 };
 
 struct COMPUTESHADERGENERATOR_API FCSStaticMeshTriangleRDGOutput
@@ -148,6 +156,30 @@ struct COMPUTESHADERGENERATOR_API FCSSurfaceVoxelRDGOutput
 	FRDGBufferRef VoxelNormalCounts = nullptr;
 	FRDGBufferUAVRef VoxelNormalCountsUAV = nullptr;
 	FRDGBufferSRVRef VoxelNormalCountsSRV = nullptr;
+
+	// Ported from ResinRattan: target-position accumulation (clipped centroid)
+	FRDGBufferRef VoxelTargetPositions = nullptr;
+	FRDGBufferUAVRef VoxelTargetPositionsUAV = nullptr;
+	FRDGBufferSRVRef VoxelTargetPositionsSRV = nullptr;
+
+	FRDGBufferRef VoxelTargetOffsetSums = nullptr;
+	FRDGBufferUAVRef VoxelTargetOffsetSumsUAV = nullptr;
+
+	FRDGBufferRef VoxelTargetWeightSums = nullptr;
+	FRDGBufferUAVRef VoxelTargetWeightSumsUAV = nullptr;
+
+	// Integer grid cell per voxel, required for spatial blur neighbour lookup.
+	FRDGBufferRef VoxelCells = nullptr;
+	FRDGBufferUAVRef VoxelCellsUAV = nullptr;
+
+	// Blur output buffers (read when blur is enabled).
+	FRDGBufferRef BlurredVoxelNormals = nullptr;
+	FRDGBufferUAVRef BlurredVoxelNormalsUAV = nullptr;
+	FRDGBufferSRVRef BlurredVoxelNormalsSRV = nullptr;
+
+	FRDGBufferRef BlurredVoxelTargetPositions = nullptr;
+	FRDGBufferUAVRef BlurredVoxelTargetPositionsUAV = nullptr;
+	FRDGBufferSRVRef BlurredVoxelTargetPositionsSRV = nullptr;
 
 	uint32 MaxVoxels = 0;
 	uint32 HashSlotCount = 0;
@@ -278,25 +310,25 @@ struct COMPUTESHADERGENERATOR_API FCSMeshGeneratorVoxelGridSettings
 {
 	GENERATED_BODY()
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Voxel")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Voxel")
 	float VoxelSize = 100.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Voxel")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Voxel")
 	float ActivationRadius = 200.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Voxel")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Voxel")
 	int32 MaxActiveVoxels = 4096;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Triangle Cache")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	int32 MaxTrianglesPerVoxel = 256;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Triangle Cache")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	int32 LODIndex = 0;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Triangle Cache")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	float BoundsTolerance = 1.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Triangle Cache")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	int32 MaxCacheTextureDimension = 4096;
 };
 
@@ -387,7 +419,7 @@ struct COMPUTESHADERGENERATOR_API FCSInstancePaintComponentSlot
 {
 	GENERATED_BODY()
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Instance Brush")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Instance Brush")
 	TObjectPtr<UStaticMesh> Mesh = nullptr;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Instance Brush")
@@ -413,35 +445,49 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator")
 	TObjectPtr<UBoxComponent> GeneratorBounds;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator")
+
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator")
 	FCSMeshGeneratorVoxelGridSettings VoxelGridSettings;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Reference Filter")
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Reference Filter")
 	TArray<FVector> ReferencePoints;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Scene Filter")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Scene Filter")
 	FName ExcludedActorTag = TEXT("UA");
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
 	int32 MaxTriangles = 20000000;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
 	int32 MaxVoxels = 2000000;
 
 	// Per-triangle surface voxelization budget. This is intended to limit how many
 	// voxel cells one large triangle may scan when VoxelSize is small; MaxVoxels is
 	// the separate total output capacity.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
 	int32 MaxVoxelCellsPerTriangle = 4096;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "0.001"))
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "0.001"))
 	float QuadScale = 1.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Mesh")
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh")
 	float NormalOffsetScale = 0.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1.0"))
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1.0"))
 	float DynamicMeshCullBoundsScale = 10.0f;
+
+	// -------------------------------------------------------------------------
+	// Surface Voxel Blur — ResinRattan port
+	// -------------------------------------------------------------------------
+
+	/** Number of 3D mean-filter iterations applied after voxelization. 0 = disabled. */
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "0"))
+	int32 SurfaceVoxelBlurIterations = 0;
+
+	/** Neighbourhood radius for the 3D mean filter. 1 = 3x3x3 Moore neighbourhood. */
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
+	int32 SurfaceVoxelBlurRadius = 1;
 
 	// -------------------------------------------------------------------------
 	// Dirty Cache System
@@ -473,49 +519,52 @@ public:
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data|Debug")
 	FCSSurfaceVoxelData LastSurfaceVoxelData;
 
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Mesh|Debug")
+	int64 GeneratorTimeCode = -1;
+
 	// -------------------------------------------------------------------------
 	// Brush System
 	// -------------------------------------------------------------------------
 
 	static FCSInstanceBrushEditorRequest OnInstanceBrushEditorRequest;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Instance Brush")
+	UPROPERTY( BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush")
 	TObjectPtr<UStaticMesh> InstanceBrushMesh = nullptr;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "1.0", UIMin = "1.0"))
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "1.0", UIMin = "1.0"))
 	float InstanceBrushRadius = 500.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "1"))
+	UPROPERTY( BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "1"))
 	int32 InstanceBrushSamplesPerMouseMove = 16;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.0", UIMin = "0.0"))
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float InstanceBrushMinSpacing = 100.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.0", UIMin = "0.0"))
+	UPROPERTY( BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float InstanceBrushTraceRadius = 0.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.1", UIMin = "0.1"))
+	UPROPERTY( BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.1", UIMin = "0.1"))
 	float InstanceBrushPreviewPointSize = 8.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.01", UIMin = "0.01"))
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.01", UIMin = "0.01"))
 	float InstanceBrushPreviewLifetime = 0.1f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Instance Brush")
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush")
 	bool bInstanceBrushAlignToNormal = true;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Instance Brush")
+	UPROPERTY( BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush")
 	bool bInstanceBrushUseGeneratorBounds = true;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Instance Brush")
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush")
 	bool bInstanceBrushExitAfterCommit = false;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.001", UIMin = "0.001"))
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.001", UIMin = "0.001"))
 	FVector2D InstanceBrushUniformScaleRange = FVector2D(1.0f, 1.0f);
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.0", UIMin = "0.0"))
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float InstanceBrushRandomYawDegrees = 360.0f;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush")
+	UPROPERTY( BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush")
 	TArray<FCSInstancePaintComponentSlot> PaintedInstanceComponents;
 
 	/** Opens the editor-side instance brush tool for this generator. */
@@ -561,13 +610,16 @@ public:
 		const TCHAR* DebugName = TEXT("CS.StaticMeshTriangles"),
 		bool bNaniteOnlyFallbackMesh = true);
 
-	/** Adds RDG compute passes that voxelize extracted triangle surfaces into GPU voxel buffers. */
+	/** Adds RDG compute passes that voxelize extracted triangle surfaces into GPU voxel buffers.
+	 *  Includes centroid-based target positions and optional spatial blur pass. */
 	FCSSurfaceVoxelRDGOutput AddTriangleSurfaceVoxelsToRDG(
 		FRDGBuilder& GraphBuilder,
 		const FCSStaticMeshTriangleRDGOutput& TriangleOutput,
 		FVector VoxelOrigin,
 		float VoxelSize = 10.0f,
 		int32 HashSlotCount = 0,
+		int32 BlurIterations = 0,
+		int32 BlurRadius = 1,
 		const TCHAR* DebugName = TEXT("CS.SurfaceVoxels"));
 
 

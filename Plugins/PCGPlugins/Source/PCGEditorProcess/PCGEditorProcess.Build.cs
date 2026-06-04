@@ -43,6 +43,7 @@ public class PCGEditorProcess : ModuleRules
 				"EditorScriptingUtilities",
 				"Renderer",
 				"Projects", 
+				"PropertyEditor",
 				"GeometryScriptExtraEditor",
 				"GeometryScriptingCore",
 				"DynamicMesh",
@@ -50,6 +51,7 @@ public class PCGEditorProcess : ModuleRules
 				"RHI",
 				"Core", 
 				"InputCore",
+				"Slate",
 				"SlateCore",
 				"AssetRegistry",
 				"Core",
@@ -61,7 +63,9 @@ public class PCGEditorProcess : ModuleRules
 				"MaterialUtilities",
 				"Blutility",
 				"LandscapeEditorUtilities",
+				"AnimationCore",
 				"MeshDescription",
+				"SkeletalMeshDescription",
 				"StaticMeshDescription",
 			}
 			);

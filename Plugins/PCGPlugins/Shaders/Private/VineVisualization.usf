@@ -6,11 +6,13 @@
 
 StructuredBuffer<float4> PathPoints;
 StructuredBuffer<int4> PathPointMeta;
+StructuredBuffer<float> PathPointCurveU;
 StructuredBuffer<float4> MeshTriangleVertices;
 StructuredBuffer<int4> SegmentMeta;
 StructuredBuffer<uint> GridCellOffsets;
 StructuredBuffer<uint> GridTriangleIndices;
 RWStructuredBuffer<float4> RW_OutVertices;
+RWStructuredBuffer<float2> RW_OutUVs;
 RWStructuredBuffer<uint> RW_OutIndices;
 
 uint PathPointCount;
@@ -20,7 +22,6 @@ uint OutputVertexCount;
 uint OutputIndexCount;
 uint ProfileCount;
 uint bTube;
-float VinesOffset;
 float CircleScale;
 float LineScale;
 
@@ -282,6 +283,20 @@ void BuildVineVisualizationMeshCS(uint3 DispatchThreadId : SV_DispatchThreadID)
             PrevIndex = min(PrevIndex, PathPointCount - 1u);
             NextIndex = min(NextIndex, PathPointCount - 1u);
 
+            // UV: V along path in world-length units, so longer vines get larger UV ranges.
+            float V = PathPointCurveU[PointIndex];
+
+            // UV: U along profile cross-section
+            float U;
+            if (bTube != 0u)
+            {
+                U = (float)ProfileIndex / (float)ProfileCount;
+            }
+            else
+            {
+                U = (float)ProfileIndex / (float)(ProfileCount - 1u);
+            }
+
             float3 Query = PackedPoint.xyz;
             float Scale = PackedPoint.w;
             float3 PrevPos = PathPoints[PrevIndex].xyz;
@@ -302,9 +317,11 @@ void BuildVineVisualizationMeshCS(uint3 DispatchThreadId : SV_DispatchThreadID)
             float3 FrameNormal = SafeNormalize3(cross(Tangent, Binormal), Normal);
 
             float2 Profile = GetProfilePoint(ProfileIndex) * Scale;
-            float3 Center = Projected + Normal * VinesOffset;
+            float3 Center = Query;
             float3 OutPosition = Center + Binormal * Profile.x + FrameNormal * Profile.y;
+
             RW_OutVertices[Index] = float4(OutPosition, 1.0f);
+            RW_OutUVs[Index] = float2(U, V);
         }
     }
 

@@ -23,9 +23,6 @@
 #include "LandscapeComponent.h"
 #include "MeshDescription.h"
 #include "MeshDescriptionToDynamicMesh.h"
-#include "ProxyLOD/Private/ProxyLODMeshConvertUtils.h"
-#include "ProxyLOD/Private/ProxyLODMeshSDFConversions.h"
-#include "ProxyLOD/Private/ProxyLODMeshTypes.h"
 #if WITH_EDITOR
 #include "LandscapeDataAccess.h"
 #endif
@@ -39,6 +36,7 @@
 #include "UObject/UObjectIterator.h"
 
 #include <openvdb/tools/ParticlesToLevelSet.h>
+#include <openvdb/tools/VolumeToMesh.h>
 
 namespace
 {
@@ -196,14 +194,20 @@ private:
 
 void ConvertVDBVolumeToMeshDescription(openvdb::FloatGrid::ConstPtr SDFVolume, FMeshDescription& OutRawMesh)
 {
-	FAOSMesh AOSMesh;
-	ProxyLOD::SDFVolumeToMesh(SDFVolume, 0.001, 0.25, AOSMesh);
 	OutRawMesh.Empty();
+	if (!SDFVolume)
+	{
+		return;
+	}
+
+	std::vector<openvdb::Vec3s> Points;
+	std::vector<openvdb::Vec3I> Triangles;
+	std::vector<openvdb::Vec4I> Quads;
+	openvdb::tools::volumeToMesh(*SDFVolume, Points, Triangles, Quads, 0.001, 0.25);
 
 	FStaticMeshAttributes Attributes(OutRawMesh);
 	Attributes.Register();
 	TVertexAttributesRef<FVector3f> VertexPositions = Attributes.GetVertexPositions();
-	TEdgeAttributesRef<bool> EdgeHardnesses = Attributes.GetEdgeHardnesses();
 	TPolygonGroupAttributesRef<FName> PolygonGroupImportedMaterialSlotNames = Attributes.GetPolygonGroupMaterialSlotNames();
 	TVertexInstanceAttributesRef<FVector3f> VertexInstanceNormals = Attributes.GetVertexInstanceNormals();
 	TVertexInstanceAttributesRef<FVector3f> VertexInstanceTangents = Attributes.GetVertexInstanceTangents();
@@ -211,48 +215,75 @@ void ConvertVDBVolumeToMeshDescription(openvdb::FloatGrid::ConstPtr SDFVolume, F
 	TVertexInstanceAttributesRef<FVector4f> VertexInstanceColors = Attributes.GetVertexInstanceColors();
 	TVertexInstanceAttributesRef<FVector2f> VertexInstanceUVs = Attributes.GetVertexInstanceUVs();
 
-	const uint32 VertexCount = AOSMesh.GetNumVertexes();
-	const uint32 IndexCount = AOSMesh.GetNumIndexes();
 	if (VertexInstanceUVs.GetNumChannels() < 1)
 	{
 		VertexInstanceUVs.SetNumChannels(1);
 	}
 
 	const FPolygonGroupID PolygonGroupID = OutRawMesh.CreatePolygonGroup();
-	PolygonGroupImportedMaterialSlotNames[PolygonGroupID] = FName(TEXT("ProxyLOD_Material_0"));
+	PolygonGroupImportedMaterialSlotNames[PolygonGroupID] = FName(TEXT("OpenVDB_Material_0"));
 
-	TMap<int32, FVertexID> VertexIDMap;
-	VertexIDMap.Reserve(VertexCount);
-	for (uint32 Index = 0; Index < VertexCount; ++Index)
+	TArray<FVertexID> VertexIDs;
+	VertexIDs.Reserve(static_cast<int32>(Points.size()));
+	for (const openvdb::Vec3s& Point : Points)
 	{
 		const FVertexID NewVertexID = OutRawMesh.CreateVertex();
-		VertexPositions[NewVertexID] = AOSMesh.Vertexes[Index].GetPos();
-		VertexIDMap.Add(Index, NewVertexID);
+		VertexPositions[NewVertexID] = FVector3f(Point[0], Point[1], Point[2]);
+		VertexIDs.Add(NewVertexID);
 	}
 
-	const uint32* AOSIndexes = AOSMesh.Indexes;
-	for (uint32 TriangleIndex = 0, TriangleCount = IndexCount / 3; TriangleIndex < TriangleCount; ++TriangleIndex)
+	auto AppendTriangle = [&OutRawMesh, PolygonGroupID, &VertexIDs, &VertexPositions, &VertexInstanceNormals,
+		&VertexInstanceTangents, &VertexInstanceBinormalSigns, &VertexInstanceColors, &VertexInstanceUVs](int32 Index0, int32 Index1, int32 Index2)
 	{
+		if (!VertexIDs.IsValidIndex(Index0) || !VertexIDs.IsValidIndex(Index1) || !VertexIDs.IsValidIndex(Index2))
+		{
+			return;
+		}
+
+		const FVector3f P0 = VertexPositions[VertexIDs[Index0]];
+		const FVector3f P1 = VertexPositions[VertexIDs[Index1]];
+		const FVector3f P2 = VertexPositions[VertexIDs[Index2]];
+		const FVector Normal = FVector::CrossProduct(FVector(P1 - P0), FVector(P2 - P0)).GetSafeNormal();
+		FVector Tangent = FVector(P1 - P0).GetSafeNormal();
+		if (Tangent.IsNearlyZero())
+		{
+			Tangent = FVector::CrossProduct(FVector::UpVector, Normal).GetSafeNormal();
+		}
+		if (Tangent.IsNearlyZero())
+		{
+			Tangent = FVector::ForwardVector;
+		}
+
 		TArray<FVertexInstanceID> VertexInstanceIDs;
 		VertexInstanceIDs.SetNum(3);
-		for (int32 Corner = 0; Corner < 3; ++Corner)
+		const int32 SourceIndices[3] = {Index0, Index1, Index2};
+		for (int32 Corner = 0; Corner < UE_ARRAY_COUNT(SourceIndices); ++Corner)
 		{
-			const uint32 SourceIndex = AOSIndexes[(TriangleIndex * 3) + Corner];
-			const FVertexID VertexID = VertexIDMap[SourceIndex];
+			const FVertexID VertexID = VertexIDs[SourceIndices[Corner]];
 			const FVertexInstanceID VertexInstanceID = OutRawMesh.CreateVertexInstance(VertexID);
-			const FVector3f Normal = AOSMesh.Vertexes[SourceIndex].Normal;
 
-			VertexInstanceTangents[VertexInstanceID] = FVector3f(1.0f, 0.0f, 0.0f);
-			VertexInstanceNormals[VertexInstanceID] = Normal;
+			VertexInstanceTangents[VertexInstanceID] = FVector3f(Tangent);
+			VertexInstanceNormals[VertexInstanceID] = FVector3f(Normal);
 			VertexInstanceBinormalSigns[VertexInstanceID] = GetBasisDeterminantSign(
 				FVector(VertexInstanceTangents[VertexInstanceID]).GetSafeNormal(),
-				FVector(Normal ^ VertexInstanceTangents[VertexInstanceID]).GetSafeNormal(),
-				FVector(Normal).GetSafeNormal());
+				FVector(FVector3f(Normal) ^ VertexInstanceTangents[VertexInstanceID]).GetSafeNormal(),
+				Normal);
 			VertexInstanceColors[VertexInstanceID] = FVector4f(1.0f);
 			VertexInstanceUVs.Set(VertexInstanceID, 0, FVector2f(0.0f, 0.0f));
 			VertexInstanceIDs[Corner] = VertexInstanceID;
 		}
 		OutRawMesh.CreatePolygon(PolygonGroupID, VertexInstanceIDs);
+	};
+
+	for (const openvdb::Vec4I& Quad : Quads)
+	{
+		AppendTriangle(Quad[0], Quad[1], Quad[2]);
+		AppendTriangle(Quad[2], Quad[3], Quad[0]);
+	}
+
+	for (const openvdb::Vec3I& Triangle : Triangles)
+	{
+		AppendTriangle(Triangle[0], Triangle[1], Triangle[2]);
 	}
 }
 }
@@ -350,6 +381,10 @@ class FTriangleSurfaceVoxelsCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_SurfaceVoxelHashIndices)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<int>, RW_SurfaceVoxelNormalSums)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_SurfaceVoxelNormalCounts)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutVoxelTargetPositions)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<int>, RW_SurfaceVoxelTargetOffsetSums)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_SurfaceVoxelTargetWeightSums)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<int4>, RW_OutVoxelCells)
 		SHADER_PARAMETER(FVector3f, SurfaceVoxelOrigin)
 		SHADER_PARAMETER(float, SurfaceVoxelSize)
 		SHADER_PARAMETER(float, SurfaceThickness)
@@ -381,7 +416,11 @@ class FFinalizeSurfaceVoxelNormalsCS : public FGlobalShader
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<int>, SurfaceVoxelNormalSums)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SurfaceVoxelNormalCounts)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<int>, RW_SurfaceVoxelTargetOffsetSums)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, RW_SurfaceVoxelTargetWeightSums)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, RW_OutVoxelPositions)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutVoxelNormals)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutVoxelTargetPositions)
 		SHADER_PARAMETER(uint32, SurfaceVoxelCapacity)
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -398,6 +437,40 @@ class FFinalizeSurfaceVoxelNormalsCS : public FGlobalShader
 };
 
 IMPLEMENT_GLOBAL_SHADER(FFinalizeSurfaceVoxelNormalsCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "FinalizeSurfaceVoxelNormalsCS", SF_Compute);
+
+// Ported from ResinRattan: 3D spatial blur on surface voxel normals and target positions
+class FBlurSurfaceVoxelsCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FBlurSurfaceVoxelsCS);
+	SHADER_USE_PARAMETER_STRUCT(FBlurSurfaceVoxelsCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, RW_SurfaceVoxelCounter)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, RW_OutVoxelNormals)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, RW_OutVoxelTargetPositions)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<int4>, RW_OutVoxelCells)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, RW_SurfaceVoxelHashSlots)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, RW_SurfaceVoxelHashIndices)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_BlurredVoxelNormals)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_BlurredVoxelTargetPositions)
+		SHADER_PARAMETER(uint32, SurfaceVoxelCapacity)
+		SHADER_PARAMETER(uint32, SurfaceVoxelHashSlotCount)
+		SHADER_PARAMETER(uint32, SurfaceVoxelBlurRadius)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FBlurSurfaceVoxelsCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "BlurSurfaceVoxelsCS", SF_Compute);
 
 // -----------------------------------------------------------------------------
 // Dirty Cache System - Shaders
@@ -1856,6 +1929,8 @@ FCSSurfaceVoxelRDGOutput AddTriangleSurfaceVoxelsToRDGInternal(
 	int32 MaxVoxels,
 	int32 HashSlotCount,
 	int32 MaxVoxelCellsPerTriangle,
+	int32 BlurIterations,
+	int32 InBlurRadius,
 	const TCHAR* DebugName)
 {
 	FCSSurfaceVoxelRDGOutput Output;
@@ -1926,6 +2001,47 @@ FCSSurfaceVoxelRDGOutput AddTriangleSurfaceVoxelsToRDGInternal(
 	Output.VoxelNormalCountsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelNormalCounts, PF_R32_UINT));
 	AddClearUAVPass(GraphBuilder, Output.VoxelNormalCountsUAV, 0u);
 
+	// ResinRattan port: target-position accumulation buffers
+	Output.VoxelTargetPositions = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), VoxelCapacity),
+		TEXT("CS.SurfaceVoxels.TargetPositions"));
+	Output.VoxelTargetPositionsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.VoxelTargetPositions, PF_A32B32G32R32F));
+	Output.VoxelTargetPositionsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelTargetPositions, PF_A32B32G32R32F));
+	AddClearUAVPass(GraphBuilder, Output.VoxelTargetPositionsUAV, 0.0f);
+
+	Output.VoxelTargetOffsetSums = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(int32), VoxelCapacity * 4u),
+		TEXT("CS.SurfaceVoxels.TargetOffsetSums"));
+	Output.VoxelTargetOffsetSumsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.VoxelTargetOffsetSums, PF_R32_SINT));
+	AddClearUAVPass(GraphBuilder, Output.VoxelTargetOffsetSumsUAV, 0u);
+
+	Output.VoxelTargetWeightSums = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), VoxelCapacity),
+		TEXT("CS.SurfaceVoxels.TargetWeightSums"));
+	Output.VoxelTargetWeightSumsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.VoxelTargetWeightSums, PF_R32_UINT));
+	AddClearUAVPass(GraphBuilder, Output.VoxelTargetWeightSumsUAV, 0u);
+
+	Output.VoxelCells = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(int32) * 4, VoxelCapacity),
+		TEXT("CS.SurfaceVoxels.Cells"));
+	Output.VoxelCellsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.VoxelCells, PF_R32G32B32A32_UINT));
+	AddClearUAVPass(GraphBuilder, Output.VoxelCellsUAV, 0u);
+
+	// Blur output buffers (allocated even if blur is disabled to simplify lifetime)
+	Output.BlurredVoxelNormals = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), VoxelCapacity),
+		TEXT("CS.SurfaceVoxels.BlurredNormals"));
+	Output.BlurredVoxelNormalsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.BlurredVoxelNormals, PF_A32B32G32R32F));
+	Output.BlurredVoxelNormalsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.BlurredVoxelNormals, PF_A32B32G32R32F));
+	AddClearUAVPass(GraphBuilder, Output.BlurredVoxelNormalsUAV, 0.0f);
+
+	Output.BlurredVoxelTargetPositions = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), VoxelCapacity),
+		TEXT("CS.SurfaceVoxels.BlurredTargetPositions"));
+	Output.BlurredVoxelTargetPositionsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.BlurredVoxelTargetPositions, PF_A32B32G32R32F));
+	Output.BlurredVoxelTargetPositionsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.BlurredVoxelTargetPositions, PF_A32B32G32R32F));
+	AddClearUAVPass(GraphBuilder, Output.BlurredVoxelTargetPositionsUAV, 0.0f);
+
 	FRDGBufferSRVRef TriangleVerticesSRV = TriangleOutput.TriangleVerticesSRV;
 	if (!TriangleVerticesSRV)
 	{
@@ -1956,6 +2072,10 @@ FCSSurfaceVoxelRDGOutput AddTriangleSurfaceVoxelsToRDGInternal(
 	PassParameters->RW_SurfaceVoxelHashIndices = Output.VoxelHashIndicesUAV;
 	PassParameters->RW_SurfaceVoxelNormalSums = Output.VoxelNormalSumsUAV;
 	PassParameters->RW_SurfaceVoxelNormalCounts = Output.VoxelNormalCountsUAV;
+	PassParameters->RW_OutVoxelTargetPositions = Output.VoxelTargetPositionsUAV;
+	PassParameters->RW_SurfaceVoxelTargetOffsetSums = Output.VoxelTargetOffsetSumsUAV;
+	PassParameters->RW_SurfaceVoxelTargetWeightSums = Output.VoxelTargetWeightSumsUAV;
+	PassParameters->RW_OutVoxelCells = Output.VoxelCellsUAV;
 	PassParameters->SurfaceVoxelOrigin = FVector3f(VoxelOrigin);
 	PassParameters->SurfaceVoxelSize = SafeVoxelSize;
 	PassParameters->SurfaceThickness = SafeSurfaceThickness;
@@ -1981,7 +2101,15 @@ FCSSurfaceVoxelRDGOutput AddTriangleSurfaceVoxelsToRDGInternal(
 	FFinalizeSurfaceVoxelNormalsCS::FParameters* FinalizeParameters = GraphBuilder.AllocParameters<FFinalizeSurfaceVoxelNormalsCS::FParameters>();
 	FinalizeParameters->SurfaceVoxelNormalSums = Output.VoxelNormalSumsSRV;
 	FinalizeParameters->SurfaceVoxelNormalCounts = Output.VoxelNormalCountsSRV;
+	FinalizeParameters->RW_SurfaceVoxelTargetOffsetSums = Output.VoxelTargetOffsetSumsUAV
+		? GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelTargetOffsetSums, PF_R32_SINT))
+		: nullptr;
+	FinalizeParameters->RW_SurfaceVoxelTargetWeightSums = Output.VoxelTargetWeightSumsUAV
+		? GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelTargetWeightSums, PF_R32_UINT))
+		: nullptr;
+	FinalizeParameters->RW_OutVoxelPositions = Output.VoxelPositionsSRV;
 	FinalizeParameters->RW_OutVoxelNormals = Output.VoxelNormalsUAV;
+	FinalizeParameters->RW_OutVoxelTargetPositions = Output.VoxelTargetPositionsUAV;
 	FinalizeParameters->SurfaceVoxelCapacity = VoxelCapacity;
 	GraphBuilder.AddPass(
 		RDG_EVENT_NAME("%s.FinalizeSurfaceVoxelNormals", DebugName),
@@ -1995,6 +2123,74 @@ FCSSurfaceVoxelRDGOutput AddTriangleSurfaceVoxelsToRDGInternal(
 				*FinalizeParameters,
 				FComputeShaderUtils::GetGroupCount(FIntVector(int32(VoxelCapacity), 1, 1), 64));
 		});
+
+	// Blur pass (ported from ResinRattan) — only executes when BlurIterations > 0
+	{
+		const uint32 BlurIters = uint32(FMath::Max(0, BlurIterations));
+		if (BlurIters > 0u)
+		{
+			const uint32 BlurRadius = uint32(FMath::Max(1, InBlurRadius));
+			int32 CurrentNormalsIdx = 0; // 0 = VoxelNormals, 1 = BlurredVoxelNormals
+			int32 CurrentTargetsIdx = 0; // 0 = VoxelTargetPositions, 1 = BlurredVoxelTargetPositions
+
+			TShaderMapRef<FBlurSurfaceVoxelsCS> BlurShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+
+			for (uint32 Iter = 0u; Iter < BlurIters; ++Iter)
+			{
+				const bool bReadFromOriginal = (CurrentNormalsIdx == 0);
+				FRDGBufferSRVRef SrcNormalsSRV = bReadFromOriginal ? Output.VoxelNormalsSRV : Output.BlurredVoxelNormalsSRV;
+				FRDGBufferSRVRef SrcTargetsSRV = bReadFromOriginal ? Output.VoxelTargetPositionsSRV : Output.BlurredVoxelTargetPositionsSRV;
+				FRDGBufferUAVRef DstNormalsUAV = bReadFromOriginal ? Output.BlurredVoxelNormalsUAV : Output.VoxelNormalsUAV;
+				FRDGBufferUAVRef DstTargetsUAV = bReadFromOriginal ? Output.BlurredVoxelTargetPositionsUAV : Output.VoxelTargetPositionsUAV;
+
+				FBlurSurfaceVoxelsCS::FParameters* BlurParameters = GraphBuilder.AllocParameters<FBlurSurfaceVoxelsCS::FParameters>();
+				BlurParameters->RW_SurfaceVoxelCounter = Output.VoxelCounterSRV;
+				BlurParameters->RW_OutVoxelNormals = SrcNormalsSRV;
+				BlurParameters->RW_OutVoxelTargetPositions = SrcTargetsSRV;
+				BlurParameters->RW_OutVoxelCells = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelCells, PF_R32G32B32A32_UINT));
+				BlurParameters->RW_SurfaceVoxelHashSlots = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelHashSlots, PF_R32_UINT));
+				BlurParameters->RW_SurfaceVoxelHashIndices = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelHashIndices, PF_R32_UINT));
+				BlurParameters->RW_BlurredVoxelNormals = DstNormalsUAV;
+				BlurParameters->RW_BlurredVoxelTargetPositions = DstTargetsUAV;
+				BlurParameters->SurfaceVoxelCapacity = VoxelCapacity;
+				BlurParameters->SurfaceVoxelHashSlotCount = SafeHashSlotCount;
+				BlurParameters->SurfaceVoxelBlurRadius = BlurRadius;
+
+				GraphBuilder.AddPass(
+					RDG_EVENT_NAME("%s.BlurSurfaceVoxels_Iter_%u", DebugName, Iter),
+					BlurParameters,
+					ERDGPassFlags::Compute,
+					[BlurParameters, BlurShader, VoxelCapacity](FRHIComputeCommandList& InRHICmdList)
+					{
+						FComputeShaderUtils::Dispatch(
+							InRHICmdList,
+							BlurShader,
+							*BlurParameters,
+							FComputeShaderUtils::GetGroupCount(FIntVector(int32(VoxelCapacity), 1, 1), 64));
+					});
+
+				// Flip ping-pong for next iteration
+				CurrentNormalsIdx = 1 - CurrentNormalsIdx;
+				CurrentTargetsIdx = 1 - CurrentTargetsIdx;
+			}
+
+			// After the last blur, the "current" buffers hold the final result.
+			// Make VoxelNormals/VoxelTargetPositions point to the final output so
+			// downstream readback uses the blurred data.
+			{
+				const bool bFinalIsOriginal = (CurrentNormalsIdx == 0);
+				if (!bFinalIsOriginal)
+				{
+					Output.VoxelNormals = Output.BlurredVoxelNormals;
+					Output.VoxelNormalsSRV = Output.BlurredVoxelNormalsSRV;
+					Output.VoxelNormalsUAV = Output.BlurredVoxelNormalsUAV;
+					Output.VoxelTargetPositions = Output.BlurredVoxelTargetPositions;
+					Output.VoxelTargetPositionsSRV = Output.BlurredVoxelTargetPositionsSRV;
+					Output.VoxelTargetPositionsUAV = Output.BlurredVoxelTargetPositionsUAV;
+				}
+			}
+		}
+	}
 
 	return Output;
 }
@@ -2032,6 +2228,8 @@ FCSSurfaceVoxelRDGOutput AComputeShaderMeshGenerator::AddTriangleSurfaceVoxelsTo
 	FVector VoxelOrigin,
 	float VoxelSize,
 	int32 HashSlotCount,
+	int32 BlurIterations,
+	int32 BlurRadius,
 	const TCHAR* DebugName)
 {
 	return AddTriangleSurfaceVoxelsToRDGInternal(
@@ -2043,6 +2241,8 @@ FCSSurfaceVoxelRDGOutput AComputeShaderMeshGenerator::AddTriangleSurfaceVoxelsTo
 		FMath::Max(1, MaxVoxels),
 		HashSlotCount,
 		FMath::Max(1, MaxVoxelCellsPerTriangle),
+		BlurIterations,
+		BlurRadius,
 		DebugName);
 }
 
@@ -2243,6 +2443,8 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 				SafeMaxVoxels,
 				0,
 				SafeMaxVoxelCellsPerTriangle,
+				0,
+				1,
 				TEXT("CS.BoxSceneSurfaceVoxels"));
 
 			if (VoxelOutput.VoxelPositions && VoxelOutput.VoxelNormals && VoxelOutput.VoxelCounter)
@@ -2486,6 +2688,8 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 				SafeMaxVoxels,
 				0,
 				SafeMaxVoxelCellsPerTriangle,
+				0,
+				1,
 				TEXT("CS.FilteredSurfaceVoxels"));
 
 			if (VoxelOutput.VoxelPositions && VoxelOutput.VoxelNormals && VoxelOutput.VoxelCounter)
@@ -3431,6 +3635,17 @@ AComputeShaderMeshGenerator::AComputeShaderMeshGenerator(const FObjectInitialize
 	: Super(ObjectInitializer)
 {
 	PrimaryActorTick.bCanEverTick = false;
+
+	if (GeneratorTimeCode == -1)
+	{
+		const FDateTime Now = FDateTime::Now();
+		GeneratorTimeCode =
+			int64(Now.GetYear() % 100) * 100000000LL +
+			int64(Now.GetMonth()) * 1000000LL +
+			int64(Now.GetDay()) * 10000LL +
+			int64(Now.GetHour()) * 100LL +
+			int64(Now.GetMinute());
+	}
 
 	USceneComponent* ExistingRoot = GetRootComponent();
 	SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));

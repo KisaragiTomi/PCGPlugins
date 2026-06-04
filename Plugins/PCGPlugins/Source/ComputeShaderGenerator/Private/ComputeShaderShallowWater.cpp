@@ -7,6 +7,7 @@
 #include "RenderGraphResources.h"
 #include "RenderGraphUtils.h"
 #include "RenderGraphBuilder.h"
+#include "RenderingThread.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/StaticMeshActor.h"
 #include "Kismet/KismetRenderingLibrary.h"
@@ -65,6 +66,24 @@ static FAutoConsoleVariableRef CVarCSSWUseSparseIndirect(
 	TEXT("pcg.CSSW.UseSparseIndirect"),
 	GCSSWUseSparseIndirect,
 	TEXT("Use sparse-tile DispatchIndirect for CSSW simulation passes. Disabled by default to avoid D3D12 ExecuteIndirect failures while opening editor maps."));
+
+static int32 GCSSWBlockGPUDuringConstruction = 1;
+static FAutoConsoleVariableRef CVarCSSWBlockGPUDuringConstruction(
+	TEXT("pcg.CSSW.BlockGPUDuringConstruction"),
+	GCSSWBlockGPUDuringConstruction,
+	TEXT("Block CSSW GPU work while an actor is running or finishing ConstructionScript. Enabled by default as an editor crash fallback."));
+
+static int32 GCSSWMaxIterationsPerFrame = 32;
+static FAutoConsoleVariableRef CVarCSSWMaxIterationsPerFrame(
+	TEXT("pcg.CSSW.MaxIterationsPerFrame"),
+	GCSSWMaxIterationsPerFrame,
+	TEXT("Maximum CSSW simulation iterations dispatched by one solver frame."));
+
+static int32 GCSSWReleaseTransientResourcesDuringConstruction = 1;
+static FAutoConsoleVariableRef CVarCSSWReleaseTransientResourcesDuringConstruction(
+	TEXT("pcg.CSSW.ReleaseTransientResourcesDuringConstruction"),
+	GCSSWReleaseTransientResourcesDuringConstruction,
+	TEXT("Release CSSW-owned old transient RTs, MIDs, readbacks, and HISM data before ConstructionScript. Enabled by default to prevent editor VRAM residue."));
 
 #ifdef NUM_THREADS_PER_GROUP_DIMENSION_X
 #undef NUM_THREADS_PER_GROUP_DIMENSION_X
@@ -214,6 +233,46 @@ int32 ComputeDispatchExpandPixels(int32 Iteration, int32 TextureResolution)
 	const int32 IterationMargin = FMath::Max(Iteration, 1) * 2;
 	return FMath::Clamp(IterationMargin + 4, 4, FMath::Max(TextureResolution, 4));
 }
+
+int32 ClampCSSWIterationsPerFrame(int32 RequestedIterations, const UObject* Context)
+{
+	const int32 MaxIterations = FMath::Max(GCSSWMaxIterationsPerFrame, 1);
+	const int32 ClampedIterations = FMath::Clamp(RequestedIterations, 1, MaxIterations);
+	if (ClampedIterations != RequestedIterations)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[CSSW] Clamp iterations for %s: requested=%d clamped=%d max=%d"),
+			*GetNameSafe(Context), RequestedIterations, ClampedIterations, MaxIterations);
+	}
+	return ClampedIterations;
+}
+
+bool IsOwnedByCSSWActor(const UObject* Object, const ACSShallowWaterCapture* Owner)
+{
+	return Object && Owner && (Object->GetOuter() == Owner || Object->GetTypedOuter<ACSShallowWaterCapture>() == Owner);
+}
+
+UMaterialInterface* GetNonTransientFallbackMaterial(UMaterialInterface* Candidate, const ACSShallowWaterCapture* Owner)
+{
+	return IsOwnedByCSSWActor(Candidate, Owner) ? nullptr : Candidate;
+}
+
+void ReleaseOwnedRenderTarget(UTextureRenderTarget2D*& RenderTarget, ACSShallowWaterCapture* Owner)
+{
+	if (!RenderTarget || !IsOwnedByCSSWActor(RenderTarget, Owner))
+	{
+		return;
+	}
+
+	RenderTarget->ReleaseResource();
+	RenderTarget = nullptr;
+}
+
+template <typename ReadbackType>
+void DeleteReadback(ReadbackType*& Readback)
+{
+	delete Readback;
+	Readback = nullptr;
+}
 }
 
 
@@ -312,6 +371,12 @@ void ACSShallowWaterCapture::HandleSolverTimerTick(int32 ExpectedSolverReadbackG
 		return;
 	}
 
+	if (!CanRunShallowWaterGPUWork(TEXT("HandleSolverTimerTick")))
+	{
+		ClearSolverTimer();
+		return;
+	}
+
 	if (ExpectedSolverReadbackGeneration == SolverReadbackGeneration && !IsActorBeingDestroyed())
 	{
 		ScheduleSolverTimerTick();
@@ -330,7 +395,10 @@ void ACSShallowWaterCapture::StopSimulationRuntime(bool bResetVisualization)
 		bSimVisActive = false;
 		if (SimVisHISM)
 		{
-			ResetSimVisTiles();
+			if (!IsShallowWaterConstructionBlocked())
+			{
+				ResetSimVisTiles();
+			}
 			SimVisHISM->SetVisibility(false);
 		}
 		if (ReusltMesh)
@@ -448,6 +516,193 @@ void ACSShallowWaterCapture::ResetSolverReadbackState(bool bAdvanceGeneration, b
 	}
 }
 
+void ACSShallowWaterCapture::ReleaseTransientRenderResources()
+{
+	ReleaseShallowWaterTransientResources(TEXT("ManualRelease"));
+}
+
+void ACSShallowWaterCapture::ReleaseShallowWaterTransientResources(const TCHAR* Context)
+{
+	UE_LOG(LogTemp, Verbose, TEXT("[CSSW] Release transient render resources for %s on %s."),
+		Context ? Context : TEXT("unknown context"), *GetNameSafe(this));
+
+	ClearSolverTimer();
+	bCaptureNextSolverFrame = false;
+	bSimVisActive = false;
+
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(ConstructionDebounceHandle);
+		World->GetTimerManager().ClearTimer(DebugViewPlaneTimerHandle);
+	}
+	ConstructionDebounceHandle.Invalidate();
+	DebugViewPlaneTimerHandle.Invalidate();
+
+	if (DebugViewPlaneActor.IsValid())
+	{
+		DebugViewPlaneActor->Destroy();
+		DebugViewPlaneActor.Reset();
+	}
+
+	if (CaptureSceneDepth)
+	{
+		if (CaptureSceneDepth->TextureTarget && IsOwnedByCSSWActor(CaptureSceneDepth->TextureTarget, this))
+		{
+			CaptureSceneDepth->TextureTarget = nullptr;
+		}
+		CaptureSceneDepth->ShowOnlyActors.Reset();
+		CaptureSceneDepth->HiddenActors.Reset();
+	}
+
+	auto ResolveFallbackMaterial = [this](UMaterialInterface* Preferred, UMaterialInstanceDynamic* DynamicMaterial)
+	{
+		if (UMaterialInterface* Fallback = GetNonTransientFallbackMaterial(Preferred, this))
+		{
+			return Fallback;
+		}
+		return DynamicMaterial ? GetNonTransientFallbackMaterial(DynamicMaterial->Parent, this) : nullptr;
+	};
+
+	if (ReusltMesh)
+	{
+		if (UMaterialInstanceDynamic* MID = Cast<UMaterialInstanceDynamic>(ReusltMesh->GetMaterial(0)))
+		{
+			if (IsOwnedByCSSWActor(MID, this))
+			{
+				ReusltMesh->SetMaterial(0, ResolveFallbackMaterial(WaterMaterial, MID));
+			}
+		}
+		ReusltMesh->MarkRenderStateDirty();
+	}
+
+	if (SimVisHISM)
+	{
+		SimVisHISM->ClearInstances();
+		SimVisHISM->BuildTreeIfOutdated(false, true);
+		if (UMaterialInstanceDynamic* HISM_MID = Cast<UMaterialInstanceDynamic>(SimVisHISM->GetMaterial(0)))
+		{
+			if (IsOwnedByCSSWActor(HISM_MID, this))
+			{
+				SimVisHISM->SetMaterial(0, ResolveFallbackMaterial(WaterMaterial, HISM_MID));
+			}
+		}
+		SimVisHISM->SetVisibility(false);
+		SimVisHISM->MarkRenderStateDirty();
+	}
+
+	if (CausticsDecal)
+	{
+		if (UMaterialInstanceDynamic* DecalMID = Cast<UMaterialInstanceDynamic>(CausticsDecal->GetDecalMaterial()))
+		{
+			if (IsOwnedByCSSWActor(DecalMID, this))
+			{
+				CausticsDecal->SetDecalMaterial(ResolveFallbackMaterial(DecalMaterial, DecalMID));
+			}
+		}
+	}
+
+	if (IsOwnedByCSSWActor(WaterMaterial, this))
+	{
+		WaterMaterial = nullptr;
+	}
+	if (IsOwnedByCSSWActor(DecalMaterial, this))
+	{
+		DecalMaterial = nullptr;
+	}
+	VisWaterMaterial = nullptr;
+	VisDecalMaterial = nullptr;
+
+	if (FApp::CanEverRender() && IsInGameThread())
+	{
+		FlushRenderingCommands();
+	}
+
+	for (int32 i = 0; i < ReadbackBufferCount; i++)
+	{
+		DeleteReadback(TileMaskReadback[i]);
+		DeleteReadback(ResultReadback[i]);
+	}
+
+	ReleaseOwnedRenderTarget(RT_DebugView, this);
+	ReleaseOwnedRenderTarget(RT_VelocityHeight, this);
+	ReleaseOwnedRenderTarget(RT_ResultVelHeight, this);
+	ReleaseOwnedRenderTarget(RT_ResultDepthWet, this);
+	ReleaseOwnedRenderTarget(RT_Source, this);
+	ReleaseOwnedRenderTarget(RT_SceneDepth, this);
+	ReleaseOwnedRenderTarget(RT_SmoothHeight, this);
+	ReleaseOwnedRenderTarget(RT_TileMask, this);
+
+	ResetSolverReadbackState(true, true);
+	ISMTileSlots.Reset();
+	CachedTileBits.Reset();
+	CachedActiveTileCount = 0;
+	SimUVCenter = FVector2D::ZeroVector;
+	SimUVSize = 0.0f;
+	SimUVInvSize = 0.0f;
+	TextureSize = ResolveTextureSize();
+
+	if (FApp::CanEverRender() && IsInGameThread())
+	{
+		FlushRenderingCommands();
+	}
+}
+
+void ACSShallowWaterCapture::WaitForPendingShallowWaterRendering(const TCHAR* Context) const
+{
+	if (GCSSWBlockGPUDuringConstruction == 0 || !FApp::CanEverRender() || !IsInGameThread())
+	{
+		return;
+	}
+
+	UE_LOG(LogTemp, Verbose, TEXT("[CSSW] Flush render thread before %s on %s."),
+		Context ? Context : TEXT("ConstructionScript work"), *GetNameSafe(this));
+	FlushRenderingCommands();
+}
+
+bool ACSShallowWaterCapture::IsShallowWaterConstructionBlocked() const
+{
+	return GCSSWBlockGPUDuringConstruction != 0
+		&& (bSWConstructionGuardActive || bSWConstructionWorkPending || IsRunningUserConstructionScript());
+}
+
+bool ACSShallowWaterCapture::CanRunShallowWaterGPUWork(const TCHAR* Context) const
+{
+	if (HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject) || IsTemplate() || IsActorBeingDestroyed())
+	{
+		return false;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World || World->bIsTearingDown)
+	{
+		return false;
+	}
+
+	if (IsShallowWaterConstructionBlocked())
+	{
+		UE_LOG(LogTemp, Verbose, TEXT("[CSSW] Skip %s while ConstructionScript is active or pending on %s."),
+			Context ? Context : TEXT("GPU work"), *GetNameSafe(this));
+		return false;
+	}
+
+	if (!CaptureSceneDepth || !Box || !ReusltMesh || !CausticsDecal)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[CSSW] Skip %s because required components are missing on %s."),
+			Context ? Context : TEXT("GPU work"), *GetNameSafe(this));
+		return false;
+	}
+
+	return true;
+}
+
+int32 ACSShallowWaterCapture::ResolveTextureSize() const
+{
+	const float SafeCaptureSize = FMath::IsFinite(CaptureSize) && CaptureSize > 0.0f ? CaptureSize : 2000.0f;
+	const float SafeWorldPixelSize = FMath::IsFinite(WorldPixelSize) && WorldPixelSize > 0.0f ? WorldPixelSize : 40.0f;
+	const int32 RequestedSize = FMath::RoundUpToPowerOfTwo(FMath::Max(16, FMath::CeilToInt32(SafeCaptureSize / SafeWorldPixelSize)));
+	return RequestedSize;
+}
+
 bool ACSShallowWaterCapture::ShouldTickIfViewportsOnly() const
 {
 	return false;
@@ -495,89 +750,129 @@ void ACSShallowWaterCapture::BeginPlay()
 
 void ACSShallowWaterCapture::OnConstruction(const FTransform& Transform)
 {
-	Super::OnConstruction(Transform);
+	bSWConstructionWorkPending = true;
+	{
+		TGuardValue<bool> ConstructionGuard(bSWConstructionGuardActive, true);
+		StopSimulationRuntime(true);
+		WaitForPendingShallowWaterRendering(TEXT("OnConstruction before releasing old CSSW resources"));
+		if (GCSSWReleaseTransientResourcesDuringConstruction != 0)
+		{
+			ReleaseShallowWaterTransientResources(TEXT("OnConstruction old resources"));
+		}
+		Super::OnConstruction(Transform);
+	}
 
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().ClearTimer(ConstructionDebounceHandle);
 		World->GetTimerManager().SetTimer(ConstructionDebounceHandle,
-			FTimerDelegate::CreateWeakLambda(this, [this]() { ConstructionComponent(); }),
+			FTimerDelegate::CreateWeakLambda(this, [this]() { ConstructActor(); }),
 			0.01f, false);
 	}
 	else
 	{
-		ConstructionComponent();
+		ConstructActor();
 	}
 }
 
 
 void ACSShallowWaterCapture::ConstructionComponent()
 {
-	const bool bRestartSolverAfterConstruction = IsSolverTimerActive();
-	if (bRestartSolverAfterConstruction)
+	ConstructActor();
+}
+
+void ACSShallowWaterCapture::ConstructActor()
+{
+	bSWConstructionWorkPending = true;
+	TGuardValue<bool> ConstructionGuard(bSWConstructionGuardActive, true);
+	StopSimulationRuntime(true);
+	WaitForPendingShallowWaterRendering(TEXT("ConstructActor"));
+	Clean();
+
+	const float SafeCaptureSize = FMath::IsFinite(CaptureSize) && CaptureSize > 0.0f ? CaptureSize : 2000.0f;
+	TextureSize = ResolveTextureSize();
+
+	if (CaptureSceneDepth)
 	{
-		ClearSolverTimer();
+		CaptureSceneDepth->SetRelativeLocation(FVector(0, 0, MaxHeight));
+		CaptureSceneDepth->OrthoWidth = SafeCaptureSize;
+		CaptureSceneDepth->HiddenActors = {this};
 	}
 
-	Clean();
-	FVector RelativeScale = FVector(CaptureSceneDepth->OrthoWidth / 100, CaptureSceneDepth->OrthoWidth / 100, MaxHeight / 100);
-	Box->SetRelativeScale3D(RelativeScale);
-	Box->SetRelativeLocation(FVector(0, 0, Scale3DZ * 50));
-	Box->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
+	const float EffectiveOrthoWidth = CaptureSceneDepth ? CaptureSceneDepth->OrthoWidth : SafeCaptureSize;
+	if (Box)
+	{
+		FVector RelativeScale = FVector(EffectiveOrthoWidth / 100, EffectiveOrthoWidth / 100, MaxHeight / 100);
+		Box->SetRelativeScale3D(RelativeScale);
+		Box->SetRelativeLocation(FVector(0, 0, Scale3DZ * 50));
+		Box->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
+	}
 
-	FVector DecalRelativeScale = FVector(MaxHeight / 100, CaptureSceneDepth->OrthoWidth / 100, CaptureSceneDepth->OrthoWidth / 100);
-	CausticsDecal->SetRelativeScale3D(DecalRelativeScale);
-	CausticsDecal->SetRelativeRotation(FRotator(-90, 0, 0));
-	CausticsDecal->DecalSize = FVector(500, 50, 50);
-	CausticsDecal->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
-	
-	CaptureSceneDepth->SetRelativeLocation(FVector(0, 0, MaxHeight));
-	CaptureSceneDepth->OrthoWidth = CaptureSize;
-	CaptureSceneDepth->HiddenActors = {this};
-	TextureSize = FMath::RoundUpToPowerOfTwo(FMath::Max(16, FMath::CeilToInt32(CaptureSize / WorldPixelSize)));
+	if (CausticsDecal)
+	{
+		FVector DecalRelativeScale = FVector(MaxHeight / 100, EffectiveOrthoWidth / 100, EffectiveOrthoWidth / 100);
+		CausticsDecal->SetRelativeScale3D(DecalRelativeScale);
+		CausticsDecal->SetRelativeRotation(FRotator(-90, 0, 0));
+		CausticsDecal->DecalSize = FVector(500, 50, 50);
+		CausticsDecal->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
+	}
 	if (bUseBakedResultMesh && BakedResultMesh)
 	{
-		ReusltMesh->SetStaticMesh(BakedResultMesh);
-		ReusltMesh->SetRelativeScale3D(FVector::OneVector);
-		ReusltMesh->MarkRenderStateDirty();
+		if (ReusltMesh)
+		{
+			ReusltMesh->SetStaticMesh(BakedResultMesh);
+			ReusltMesh->SetRelativeScale3D(FVector::OneVector);
+			ReusltMesh->MarkRenderStateDirty();
+		}
 	}
 	else
 	{
 		UpdateSimulationPreviewMesh();
 	}
-	ReusltMesh->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
+	if (ReusltMesh)
+	{
+		ReusltMesh->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
+	}
 
 	const FVector Loc = GetActorLocation();
 	SimUVCenter = FVector2D(Loc.X, Loc.Y);
-	SimUVSize = CaptureSize;
-	SimUVInvSize = CaptureSize > 0.f ? 1.f / CaptureSize : 0.f;
+	SimUVSize = SafeCaptureSize;
+	SimUVInvSize = SafeCaptureSize > 0.f ? 1.f / SafeCaptureSize : 0.f;
 
 	SetActorScale3D(FVector::OneVector);
-
-	if (bRestartSolverAfterConstruction)
-	{
-		ScheduleSolverTimerTick();
-	}
-	else
-	{
-		ClearSolverTimer();
-	}
+	ClearSolverTimer();
+	ResetSolverReadbackState(true, false);
+	bSWConstructionWorkPending = false;
 }
 
 void ACSShallowWaterCapture::PreSave(FObjectPreSaveContext ObjectSaveContext)
 {
 	StopSimulationRuntime(true);
+	ReleaseShallowWaterTransientResources(TEXT("PreSave"));
 	Super::PreSave(ObjectSaveContext);
 }
 
 void ACSShallowWaterCapture::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	StopSimulationRuntime(true);
+	ReleaseShallowWaterTransientResources(TEXT("EndPlay"));
 	Super::EndPlay(EndPlayReason);
+}
+
+void ACSShallowWaterCapture::BeginDestroy()
+{
+	ReleaseShallowWaterTransientResources(TEXT("BeginDestroy"));
+	Super::BeginDestroy();
 }
 
 void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 {
+	if (!CanRunShallowWaterGPUWork(TEXT("ShallowWaterSolverSoucePoint")))
+	{
+		ClearSolverTimer();
+		return;
+	}
+
 	if (bUseBakedResultMesh)
 	{
 		UseSimulationResultMesh();
@@ -587,6 +882,8 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 	LastSolverFrameNumber = GFrameCounter;
 
 	if (!CheckAndCreateTexture_SWSourcePoint()) return;
+	InIteration = ClampCSSWIterationsPerFrame(InIteration, this);
+	Iteration = InIteration;
 
 	SCOPE_CYCLE_COUNTER(STAT_CSSW_Execute);
 
@@ -644,6 +941,11 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 	FTextureRenderTargetResource* R_ResultVelHeight = RT_ResultVelHeight->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_ResultDepthWet = RT_ResultDepthWet->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_ResultSmoothHeight = RT_SmoothHeight->GameThread_GetRenderTargetResource();
+	if (!R_SceneDepth || !R_DebugView || !R_VelocityHeight || !R_ResultVelHeight || !R_ResultDepthWet || !R_ResultSmoothHeight)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[CSSW] Solver skipped because a render target resource is unavailable on %s."), *GetNameSafe(this));
+		return;
+	}
 
 	const int32 TileMaskWidth = FMath::DivideAndRoundUp((int32)TextureSize, NUM_THREADS_PER_GROUP_DIMENSION_X);
 	const int32 TileMaskHeight = FMath::DivideAndRoundUp((int32)TextureSize, NUM_THREADS_PER_GROUP_DIMENSION_Y);
@@ -668,6 +970,11 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 		RT_TileMask->UpdateResourceImmediate(true);
 	}
 	FTextureRenderTargetResource* R_TileMask = RT_TileMask->GameThread_GetRenderTargetResource();
+	if (!R_TileMask)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[CSSW] Solver skipped because tile mask resource is unavailable on %s."), *GetNameSafe(this));
+		return;
+	}
 
 	TileMaskReadbackWidth = TileMaskWidth;
 	TileMaskReadbackHeight = TileMaskHeight;
@@ -1195,6 +1502,11 @@ void ACSShallowWaterCapture::SetHeight()
 	FTextureRenderTargetResource* R_ResultVelHeight = RT_ResultVelHeight->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_ResultDepthWet = RT_ResultDepthWet->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_ResultSmoothHeight = RT_SmoothHeight->GameThread_GetRenderTargetResource();
+	if (!R_SceneDepth || !R_DebugView || !R_VelocityHeight || !R_ResultVelHeight || !R_ResultDepthWet || !R_ResultSmoothHeight)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[CSSW] SetHeight skipped because a render target resource is unavailable on %s."), *GetNameSafe(this));
+		return;
+	}
 	const float CapturedDT = DT;
 	const float CapturedFriction = Friction;
 	const float CapturedSeaLevel = SeaLevel;
@@ -1310,6 +1622,11 @@ void ACSShallowWaterCapture::HeightSmooth()
 	FTextureRenderTargetResource* R_DebugView = RT_DebugView->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_VelocityHeight = RT_VelocityHeight->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_ResultVelHeight = RT_ResultVelHeight->GameThread_GetRenderTargetResource();
+	if (!R_SceneDepth || !R_DebugView || !R_VelocityHeight || !R_ResultVelHeight)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[CSSW] HeightSmooth skipped because a render target resource is unavailable on %s."), *GetNameSafe(this));
+		return;
+	}
 	
 	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
 	[R_SceneDepth, R_DebugView, R_VelocityHeight, R_ResultVelHeight](FRHICommandListImmediate& RHICmdList)
@@ -1371,13 +1688,26 @@ void ACSShallowWaterCapture::HeightSmooth()
 
 void ACSShallowWaterCapture::Clean()
 {
-	UKismetRenderingLibrary::ClearRenderTarget2D(this, RT_ResultVelHeight, FLinearColor(0, 0, -9999, 1));
-	UKismetRenderingLibrary::ClearRenderTarget2D(this, RT_ResultDepthWet,  FLinearColor(-9999, -9999, -9999, -9999));
-	UKismetRenderingLibrary::ClearRenderTarget2D(this, RT_VelocityHeight,  FLinearColor(0, 0, -9999, 1));
+	if (!CanRunShallowWaterGPUWork(TEXT("Clean"))) return;
+
+	if (RT_ResultVelHeight)
+	{
+		UKismetRenderingLibrary::ClearRenderTarget2D(this, RT_ResultVelHeight, FLinearColor(0, 0, -9999, 1));
+	}
+	if (RT_ResultDepthWet)
+	{
+		UKismetRenderingLibrary::ClearRenderTarget2D(this, RT_ResultDepthWet,  FLinearColor(-9999, -9999, -9999, -9999));
+	}
+	if (RT_VelocityHeight)
+	{
+		UKismetRenderingLibrary::ClearRenderTarget2D(this, RT_VelocityHeight,  FLinearColor(0, 0, -9999, 1));
+	}
 }
 
 void ACSShallowWaterCapture::CleanDepthWet_Construct()
 {
+	if (!CanRunShallowWaterGPUWork(TEXT("CleanDepthWet_Construct"))) return;
+
 	if (RT_ResultDepthWet
 	&& RT_ResultDepthWet->GetResource()
 	&& GetWorld())
@@ -1438,6 +1768,8 @@ void ACSShallowWaterCapture::CleanupAttachedActors()
 
 void ACSShallowWaterCapture::SetMaterialParameter_Implementation()
 {
+	if (!CanRunShallowWaterGPUWork(TEXT("SetMaterialParameter"))) return;
+
 	if (RT_ResultDepthWet
 	&& RT_ResultDepthWet->GetResource()
 	&& GetWorld())
@@ -1510,6 +1842,8 @@ ACSSHallowWaterSource::ACSSHallowWaterSource()
 
 void ACSShallowWaterCapture::CaptureSceneDepthNow()
 {
+	if (!CanRunShallowWaterGPUWork(TEXT("CaptureSceneDepthNow"))) return;
+
 	SCOPE_CYCLE_COUNTER(STAT_CSSW_Capture);
 	TArray<AActor*> TagedActors;
 	UWorld* World = GetWorld();
@@ -1545,6 +1879,15 @@ void ACSShallowWaterCapture::StartSolver(float TimerRate)
 {
 	ClearSolverTimer();
 	SolverTimerRate = FMath::Max(TimerRate, 0.0f);
+	Iteration = ClampCSSWIterationsPerFrame(Iteration, this);
+	if (!CanRunShallowWaterGPUWork(TEXT("StartSolver")))
+	{
+		StopSimulationRuntime(true);
+		UE_LOG(LogTemp, Warning, TEXT("[CSSW] StartSolver skipped for %s. ConstructionScript or invalid runtime state is active."),
+			*GetNameSafe(this));
+		return;
+	}
+
 	ResetSolverReadbackState(true, true);
 	CaptureSceneDepthNow();
 	if (bUseBakedResultMesh)
@@ -1570,7 +1913,12 @@ void ACSShallowWaterCapture::StopSolver()
 
 void ACSShallowWaterCapture::ToggleSimVisualization(int32 SimIterationsPerFrame)
 {
-	Iteration = FMath::Max(SimIterationsPerFrame, 1);
+	Iteration = ClampCSSWIterationsPerFrame(SimIterationsPerFrame, this);
+	if (!CanRunShallowWaterGPUWork(TEXT("ToggleSimVisualization")))
+	{
+		StopSimulationRuntime(true);
+		return;
+	}
 
 	if (!IsSolverTimerActive())
 	{
@@ -1659,7 +2007,10 @@ void ACSShallowWaterCapture::UseBakedResultMesh(UStaticMesh* InBakedMesh, UMater
 	bSimVisActive = false;
 	if (SimVisHISM)
 	{
-		ResetSimVisTiles();
+		if (!IsShallowWaterConstructionBlocked())
+		{
+			ResetSimVisTiles();
+		}
 		SimVisHISM->SetVisibility(false);
 	}
 

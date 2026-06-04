@@ -31,7 +31,9 @@ IMPLEMENT_GLOBAL_SHADER(FMeshFillMult, "/Plugin/PCGPlugins/Shaders/Private/MeshF
 #include "RHIGPUReadback.h"
 #include "ImageCoreUtils.h"
 #include "Landscape.h"
+#if WITH_EDITOR
 #include "LandscapeEditResourcesSubsystem.h"
+#endif
 #include "PixelShaderUtils.h"
 #include "GeometryScript/PolyPathFunctions.h"
 

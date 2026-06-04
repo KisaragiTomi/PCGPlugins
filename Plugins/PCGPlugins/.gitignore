@@ -1,4 +1,5 @@
 Binaries/
-Config/
+Config/*
+!Config/DefaultPCGPlugins.ini
 Intermediate/
 ThirdParty/

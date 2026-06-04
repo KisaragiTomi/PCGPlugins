@@ -94,9 +94,12 @@ void MarkSpaceColonizationSourcesCS(uint3 DispatchThreadId : SV_DispatchThreadID
 
     int4 BestState0 = RW_State0[BestIndex];
     int4 BestState1 = RW_State1[BestIndex];
+    float4 BestPosition = InitialTargetPositions[BestIndex];
+    BestPosition.w *= SourcePositions[SourceIndex].w;
     BestState0.x = 0;
     BestState0.z = 1;
     BestState1.x = (int)BestIndex;
+    RW_TargetPositions[BestIndex] = BestPosition;
     RW_State0[BestIndex] = BestState0;
     RW_State1[BestIndex] = BestState1;
 }
@@ -147,7 +150,7 @@ void ResetSpaceColonizationProposalsCS(uint3 DispatchThreadId : SV_DispatchThrea
     }
 
     RW_ProposalOwners[Index] = 0xffffffffu;
-    RW_ProposalPositions[Index] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    RW_ProposalPositions[Index] = float4(0.0f, 0.0f, 0.0f, -1.0f);
 }
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
@@ -183,6 +186,13 @@ void ProposeSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThread
 
     float3 OriginalCurrent = InitialTargetPositions[P].xyz;
     float3 RuntimeCurrent = TargetPositions[P].xyz;
+    float SourceScale = 1.0f;
+    int StartId = SourceState1.x;
+    if (StartId >= 0 && StartId < (int)TargetCount)
+    {
+        float StartTargetScale = max(abs(InitialTargetPositions[StartId].w), 1.0e-6f);
+        SourceScale = TargetPositions[StartId].w / StartTargetScale;
+    }
     float3 DirSum = float3(0.0f, 0.0f, 0.0f);
     uint AssociateCount = 0u;
     uint NearAttractor = 0xffffffffu;
@@ -228,7 +238,7 @@ void ProposeSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThread
 
     float NearestDist = sqrt(NearAttractorDistSq);
     float3 NewPosition = RuntimeCurrent + DirSum * rsqrt(DirLenSq) * NearestDist;
-    RW_ProposalPositions[P] = float4(NewPosition, 1.0f);
+    RW_ProposalPositions[P] = float4(NewPosition, SourceScale);
     InterlockedMin(RW_ProposalOwners[NearAttractor], P);
 }
 
@@ -248,7 +258,7 @@ void CommitSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThreadI
     }
 
     float4 ProposedPosition = ProposalPositions[SourceIndex];
-    if (ProposedPosition.w == 0.0f)
+    if (ProposedPosition.w < 0.0f)
     {
         return;
     }
@@ -271,7 +281,8 @@ void CommitSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThreadI
     RW_State0[SourceIndex] = ParentState0;
     RW_State1[SourceIndex] = ParentState1;
 
-    RW_TargetPositions[TargetIndex] = ProposedPosition;
+    float TargetPointScale = InitialTargetPositions[TargetIndex].w;
+    RW_TargetPositions[TargetIndex] = float4(ProposedPosition.xyz, TargetPointScale * ProposedPosition.w);
     TargetState0.x = 0;
     TargetState0.y = 1;
     TargetState0.z = 0;

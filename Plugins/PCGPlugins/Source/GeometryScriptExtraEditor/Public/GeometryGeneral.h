@@ -11,7 +11,9 @@
 #include "GeometryScript/MeshPrimitiveFunctions.h"
 
 class UStaticMesh;
+class AActor;
 class FSceneView;
+class UMeshComponent;
 
 #include "GeometryGeneral.generated.h"
 
@@ -128,6 +130,17 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static void CalculateOBBUpDir(TArray<FVector> OrientSpaceVertices, FVector& BoxUpDir);
+
+	UFUNCTION(BlueprintCallable, Category = Generate)
+	static UStaticMesh* SaveDynamicMeshToStaticMesh(
+		UDynamicMesh* TargetMesh,
+		const FString& AssetPathAndName,
+		UMeshComponent* MaterialSource = nullptr,
+		bool bReplaceExistingAsset = true,
+		bool bSaveAsset = false,
+		bool bMarkPackageDirty = true);
+
+	static UStaticMesh* SaveDynamicMeshToStaticMesh(UDynamicMesh* TargetMesh, int32 ResultIndex);
 	
 	static FVector GetNearestLocationNormal(FDynamicMesh3& EditMesh, FGeometryScriptTrianglePoint NearestPoint);
 

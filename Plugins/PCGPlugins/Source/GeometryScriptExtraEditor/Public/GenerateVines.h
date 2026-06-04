@@ -47,6 +47,19 @@ public:
 	// }
 };
 
+USTRUCT(BlueprintType)
+struct GEOMETRYSCRIPTEXTRAEDITOR_API FSpaceColonizationLineResult
+{
+	GENERATED_BODY()
+public:
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
+	FGeometryScriptPolyPath Path;
+
+	// Per output point scale. For vine generation this is TargetPointScale * SourcePointScale.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
+	TArray<float> PointScales;
+};
+
 /**
  *
  */
@@ -55,10 +68,6 @@ class GEOMETRYSCRIPTEXTRAEDITOR_API UGenerateVines : public UBlueprintFunctionLi
 {
 	GENERATED_BODY()
 public:
-	UFUNCTION(BlueprintCallable, Category = Generate)
-	static void GenerateVines_L(AVineContainer* Container, FSpaceColonizationOptions SC, float ExtrudeScale = 50, bool Result = true, bool OutDebugMesh = false, bool MultThread
-		                          = false);
-
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static void BuildSpaceColonizationQueue(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms,
 		int32 Iterations, int32 Activetime, float RandGrow, float Seed, bool MultThread,
@@ -74,6 +83,14 @@ public:
 											   50, int32 Activetime = 20,  int32 BackGrowCount = 8, float Ranggrow = 0.5, float Seed = 0.2, float BackGrowRange = 0.8, bool MultThread = true);
 
 	UFUNCTION(BlueprintCallable, Category = Generate)
+	static TArray<FSpaceColonizationLineResult> SpaceColonizationWithScales(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, int32 Iterations =
+											   50, int32 Activetime = 20,  int32 BackGrowCount = 8, float Ranggrow = 0.5, float Seed = 0.2, float BackGrowRange = 0.8, bool MultThread = true);
+
+	UFUNCTION(BlueprintCallable, Category = Generate)
 	static TArray<FGeometryScriptPolyPath> SpaceColonizationCS(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, int32 Iterations =
+											   50, int32 Activetime = 20, int32 BackGrowCount = 8, float Ranggrow = 0.5, float Seed = 0.2, float BackGrowRange = 0.8, float InfluenceRadius = 200.0f);
+
+	UFUNCTION(BlueprintCallable, Category = Generate)
+	static TArray<FSpaceColonizationLineResult> SpaceColonizationCSWithScales(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, int32 Iterations =
 											   50, int32 Activetime = 20, int32 BackGrowCount = 8, float Ranggrow = 0.5, float Seed = 0.2, float BackGrowRange = 0.8, float InfluenceRadius = 200.0f);
 };

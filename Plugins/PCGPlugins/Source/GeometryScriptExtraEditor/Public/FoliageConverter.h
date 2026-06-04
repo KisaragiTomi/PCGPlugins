@@ -19,10 +19,10 @@ class GEOMETRYSCRIPTEXTRAEDITOR_API UFoliageConverter : public UBlueprintFunctio
 
 public:
 	UFUNCTION(BlueprintCallable, Category = FoliageExtra)
-	static void ConvertFoliageToInstanceComponent(UFoliageType* InFoliageType, AVineContainer* Container);
+	static void ConvertFoliageToTransformArray(UFoliageType* InFoliageType, AVineContainer* Container);
 
 	UFUNCTION(BlueprintCallable, Category = FoliageExtra)
-	static void ConvertInstanceComponentToFoliage(UFoliageType* InFoliageType, UClass* ContainerClass, AVineContainer* Container);
+	static void ConvertTransformArrayToFoliage(UFoliageType* InFoliageType, AVineContainer* Container);
 
 	UFUNCTION(BlueprintPure, Category = FoliageExtra)
 	static UStaticMesh* GetStaticMesh(UFoliageType* InFoliageType);

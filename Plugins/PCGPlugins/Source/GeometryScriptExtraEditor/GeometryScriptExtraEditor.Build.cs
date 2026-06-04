@@ -23,6 +23,7 @@ public class GeometryScriptExtraEditor : ModuleRules
             new string[]
             {
                 "ComputeShaderGenerator",
+                "GeometryMath",
             }
         );
 
@@ -31,10 +32,12 @@ public class GeometryScriptExtraEditor : ModuleRules
             new string[]
             {
                 "Core",
+                "AssetRegistry",
                 "ModelingOperators",
                 "CoreUObject",
                 "DeveloperSettings",
                 "Engine",
+                "EditorScriptingUtilities",
                 "GeometryAlgorithms",
                 "GeometryCore",
                 "GeometryFramework",
@@ -45,7 +48,6 @@ public class GeometryScriptExtraEditor : ModuleRules
                 "SlateCore", 
                 "Landscape",
                 "Foliage",
-                "GeometryMath",
                 "DynamicMesh",
                 "GeometryCore",
                 "GeometryFramework",
@@ -59,6 +61,7 @@ public class GeometryScriptExtraEditor : ModuleRules
                 "Renderer",
                 "RenderCore",
                 "RHI",
+                "UnrealEd",
             }
         );
 

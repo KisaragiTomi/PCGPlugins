@@ -1,0 +1,14 @@
+.vs/
+.idea/
+.vscode/
+.windsurf/
+.kiro/
+
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+*.log
+build_output*.txt
+*.sln.DotSettings.user

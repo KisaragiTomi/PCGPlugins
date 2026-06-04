@@ -13,7 +13,15 @@
 #include "GeometryScript/MeshNormalsFunctions.h"
 #include "GeometryScript/MeshPrimitiveFunctions.h"
 #include "GeometryScript/MeshSpatialFunctions.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetUtils/CreateStaticMeshUtil.h"
+#include "Components/MeshComponent.h"
 #include "Operations/SmoothDynamicMeshAttributes.h"
+#include "EditorAssetLibrary.h"
+#include "Engine/Level.h"
+#include "GameFramework/Actor.h"
+#include "ObjectTools.h"
+#include "PackageTools.h"
 #include "Parameterization/DynamicMeshUVEditor.h"
 #include "Selections/MeshConnectedComponents.h"
 #include "tbb/parallel_reduce.h"
@@ -1989,4 +1997,110 @@ FBox UGeometryGeneral::GetMeshDistanceFieldBounds(UStaticMesh* StaticMesh)
 	const FDistanceFieldVolumeData* DFData = StaticMesh->GetRenderData()->LODResources[0].DistanceFieldData;
 	if (!DFData || !DFData->IsValid()) return FBox(EForceInit::ForceInit);
 	return FBox((FVector)DFData->LocalSpaceMeshBounds.Min, (FVector)DFData->LocalSpaceMeshBounds.Max);
+}
+
+UStaticMesh* UGeometryGeneral::SaveDynamicMeshToStaticMesh(
+	UDynamicMesh* TargetMesh,
+	const FString& AssetPathAndName,
+	UMeshComponent* MaterialSource,
+	bool bReplaceExistingAsset,
+	bool bSaveAsset,
+	bool bMarkPackageDirty)
+{
+	if (!TargetMesh || TargetMesh->GetTriangleCount() == 0 || AssetPathAndName.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	const FString SanitizedAssetPathAndName = UPackageTools::SanitizePackageName(AssetPathAndName);
+	const FString AssetFolderPath = FPackageName::GetLongPackagePath(SanitizedAssetPathAndName);
+	if (!AssetFolderPath.IsEmpty())
+	{
+		UEditorAssetLibrary::MakeDirectory(AssetFolderPath);
+	}
+
+	if (bReplaceExistingAsset && UEditorAssetLibrary::DoesAssetExist(SanitizedAssetPathAndName))
+	{
+		UEditorAssetLibrary::DeleteAsset(SanitizedAssetPathAndName);
+	}
+
+	FDynamicMesh3 CopyMesh;
+	int32 NumMaterialSlots = 1;
+	TargetMesh->ProcessMesh([&](const FDynamicMesh3& ReadMesh)
+	{
+		CopyMesh = ReadMesh;
+		if (ReadMesh.HasAttributes() && ReadMesh.Attributes()->HasMaterialID())
+		{
+			const UE::Geometry::FDynamicMeshMaterialAttribute* MaterialIDs = ReadMesh.Attributes()->GetMaterialID();
+			for (const int32 TriangleID : ReadMesh.TriangleIndicesItr())
+			{
+				NumMaterialSlots = FMath::Max(NumMaterialSlots, MaterialIDs->GetValue(TriangleID) + 1);
+			}
+		}
+	});
+
+	TArray<UMaterialInterface*> Materials;
+	Materials.Reserve(NumMaterialSlots);
+	for (int32 MaterialIndex = 0; MaterialIndex < NumMaterialSlots; ++MaterialIndex)
+	{
+		Materials.Add(MaterialSource ? MaterialSource->GetMaterial(MaterialIndex) : nullptr);
+	}
+
+	UE::AssetUtils::FStaticMeshAssetOptions AssetOptions;
+	AssetOptions.NewAssetPath = SanitizedAssetPathAndName;
+	AssetOptions.NumSourceModels = 1;
+	AssetOptions.NumMaterialSlots = NumMaterialSlots;
+	AssetOptions.AssetMaterials = Materials;
+	AssetOptions.bEnableRecomputeNormals = false;
+	AssetOptions.bEnableRecomputeTangents = true;
+	AssetOptions.CollisionType = ECollisionTraceFlag::CTF_UseComplexAsSimple;
+	AssetOptions.SourceMeshes.DynamicMeshes.Add(&CopyMesh);
+
+	UE::AssetUtils::FStaticMeshResults ResultData;
+	const UE::AssetUtils::ECreateStaticMeshResult AssetResult = UE::AssetUtils::CreateStaticMeshAsset(AssetOptions, ResultData);
+	UStaticMesh* NewStaticMesh = AssetResult == UE::AssetUtils::ECreateStaticMeshResult::Ok ? ResultData.StaticMesh : nullptr;
+	if (!NewStaticMesh)
+	{
+		return nullptr;
+	}
+
+	NewStaticMesh->PostEditChange();
+	NewStaticMesh->Modify();
+	if (bMarkPackageDirty)
+	{
+		NewStaticMesh->MarkPackageDirty();
+		if (UPackage* StaticMeshPackage = NewStaticMesh->GetOutermost())
+		{
+			StaticMeshPackage->SetDirtyFlag(true);
+		}
+	}
+	FAssetRegistryModule::AssetCreated(NewStaticMesh);
+	if (bSaveAsset)
+	{
+		UEditorAssetLibrary::SaveLoadedAsset(NewStaticMesh, false);
+	}
+	return NewStaticMesh;
+}
+
+UStaticMesh* UGeometryGeneral::SaveDynamicMeshToStaticMesh(UDynamicMesh* TargetMesh, int32 ResultIndex)
+{
+	if (!TargetMesh || TargetMesh->GetTriangleCount() == 0)
+	{
+		return nullptr;
+	}
+
+	const FString AssetFolderPath = TEXT("/Game/AutoResult");
+	FString AssetName = ObjectTools::SanitizeObjectName(FString::Printf(TEXT("DynamicMesh_%d"), ResultIndex));
+	if (!AssetName.StartsWith(TEXT("SM_")))
+	{
+		AssetName = FString(TEXT("SM_")) + AssetName;
+	}
+
+	return SaveDynamicMeshToStaticMesh(
+		TargetMesh,
+		AssetFolderPath / AssetName,
+		nullptr,
+		true,
+		false,
+		true);
 }

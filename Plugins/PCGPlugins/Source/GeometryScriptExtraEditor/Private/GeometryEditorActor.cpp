@@ -125,6 +125,7 @@ class FVineVisualizationVoxelCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPointNormals)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, SegmentMeta)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, VoxelCells)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VoxelHashSlots)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelNormals)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelTargetPositions)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_OutVertices)
@@ -141,6 +142,7 @@ class FVineVisualizationVoxelCS : public FGlobalShader
 		SHADER_PARAMETER(FVector3f, VoxelOrigin)
 		SHADER_PARAMETER(float, VoxelSize)
 		SHADER_PARAMETER(uint32, VoxelCount)
+		SHADER_PARAMETER(uint32, VoxelHashSlotCount)
 		SHADER_PARAMETER(float, VinesOffset)
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -168,6 +170,7 @@ class FVineVisualizationVoxelBuildAxesCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPointAxes)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, PathPointMeta)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, VoxelCells)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VoxelHashSlots)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelNormals)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelTargetPositions)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_PathPointTangents)
@@ -176,6 +179,7 @@ class FVineVisualizationVoxelBuildAxesCS : public FGlobalShader
 		SHADER_PARAMETER(FVector3f, VoxelOrigin)
 		SHADER_PARAMETER(float, VoxelSize)
 		SHADER_PARAMETER(uint32, VoxelCount)
+		SHADER_PARAMETER(uint32, VoxelHashSlotCount)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -1805,6 +1809,81 @@ static bool DispatchVineVisualizationGPU(
 	return bReadbackSucceeded;
 }
 
+static uint32 HashVineVoxelCell(int32 X, int32 Y, int32 Z)
+{
+	return (static_cast<uint32>(X) * 73856093u)
+		^ (static_cast<uint32>(Y) * 19349663u)
+		^ (static_cast<uint32>(Z) * 83492791u);
+}
+
+static bool SameVineVoxelCell(const FIntVector4& A, const FIntVector4& B)
+{
+	return A.X == B.X && A.Y == B.Y && A.Z == B.Z;
+}
+
+static bool BuildVineVoxelHashSlots(const TArray<FIntVector4>& VoxelCells, TArray<uint32>& OutHashSlots, uint32& OutHashSlotCount)
+{
+	OutHashSlots.Reset();
+	OutHashSlotCount = 0;
+
+	const int32 VoxelCount = VoxelCells.Num();
+	if (VoxelCount <= 0)
+	{
+		return false;
+	}
+
+	uint64 DesiredSlotCount = FMath::Max<uint64>(2ull, uint64(VoxelCount) * 2ull);
+	if (DesiredSlotCount > (1ull << 30))
+	{
+		return false;
+	}
+
+	uint32 SlotCount = 1u;
+	while (uint64(SlotCount) < DesiredSlotCount)
+	{
+		SlotCount <<= 1u;
+	}
+
+	OutHashSlots.Init(0u, int32(SlotCount));
+	const uint32 SlotMask = SlotCount - 1u;
+
+	for (int32 VoxelIndex = 0; VoxelIndex < VoxelCount; ++VoxelIndex)
+	{
+		const FIntVector4& Cell = VoxelCells[VoxelIndex];
+		uint32 Slot = HashVineVoxelCell(Cell.X, Cell.Y, Cell.Z) & SlotMask;
+		bool bInserted = false;
+
+		for (uint32 Probe = 0u; Probe < SlotCount; ++Probe)
+		{
+			uint32& PackedVoxelIndex = OutHashSlots[int32(Slot)];
+			if (PackedVoxelIndex == 0u)
+			{
+				PackedVoxelIndex = uint32(VoxelIndex) + 1u;
+				bInserted = true;
+				break;
+			}
+
+			const int32 ExistingVoxelIndex = int32(PackedVoxelIndex - 1u);
+			if (VoxelCells.IsValidIndex(ExistingVoxelIndex) && SameVineVoxelCell(VoxelCells[ExistingVoxelIndex], Cell))
+			{
+				bInserted = true;
+				break;
+			}
+
+			Slot = (Slot + 1u) & SlotMask;
+		}
+
+		if (!bInserted)
+		{
+			OutHashSlots.Reset();
+			return false;
+		}
+	}
+
+	OutHashSlotCount = SlotCount;
+	return true;
+}
+
 // GPU dispatch for voxel-based vine visualization.
 // Replaces triangle mesh + BVH with FCSSurfaceVoxelData sampling.
 static bool DispatchVineVisualizationGPU_Voxel(
@@ -1866,6 +1945,14 @@ static bool DispatchVineVisualizationGPU_Voxel(
 		GPUVoxelCells.Add(FIntVector4(Cell.X, Cell.Y, Cell.Z, 0));
 	}
 
+	TArray<uint32> GPUVoxelHashSlots;
+	uint32 GPUVoxelHashSlotCount = 0u;
+	if (!BuildVineVoxelHashSlots(GPUVoxelCells, GPUVoxelHashSlots, GPUVoxelHashSlotCount))
+	{
+		GPUVoxelHashSlots.Init(0u, 1);
+		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU_Voxel] Failed to build voxel hash slots; shader will use linear voxel lookup fallback."));
+	}
+
 	const uint64 VertexReadbackBytes64 = uint64(OutputVertexCount) * sizeof(FVector4f);
 	const uint64 UVReadbackBytes64 = uint64(OutputVertexCount) * sizeof(FVector2f);
 	const uint64 IndexReadbackBytes64 = uint64(OutputIndexCount) * sizeof(uint32);
@@ -1885,10 +1972,10 @@ static bool DispatchVineVisualizationGPU_Voxel(
 
 	ENQUEUE_RENDER_COMMAND(VineVisualizationVoxelGPU)(
 		[PathPoints, PathPointAxes, PathPointMeta, PathPointCurveU, SegmentMeta,
-		 GPUVoxelCells, GPUVoxelNormals, GPUVoxelTargetPositions,
+		 GPUVoxelCells, GPUVoxelHashSlots, GPUVoxelNormals, GPUVoxelTargetPositions,
 		 VertexReadback, UVReadback, IndexReadback, VertexReadbackBytes, UVReadbackBytes, IndexReadbackBytes,
 		 PathPointCount, SegmentCount, VoxelCount, ProfileCount, OutputVertexCount, OutputIndexCount,
-		 bTube, CircleScale, LineScale, VinesOffset,
+		 bTube, CircleScale, LineScale, VinesOffset, GPUVoxelHashSlotCount,
 		 VoxelOrigin = FVector3f(VoxelData.VoxelOrigin), VoxelSize = float(VoxelData.VoxelSize),
 		 &bRenderWorkQueued](FRHICommandListImmediate& RHICmdList)
 		{
@@ -1900,6 +1987,7 @@ static bool DispatchVineVisualizationGPU_Voxel(
 			const CSHepler::FRDGStructuredBufferRefs PathPointCurveUBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, PathPointCurveU, TEXT("VineVisualizationVoxel.PathPointCurveU"));
 			const CSHepler::FRDGStructuredBufferRefs SegmentMetaBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, SegmentMeta, TEXT("VineVisualizationVoxel.SegmentMeta"));
 			const CSHepler::FRDGStructuredBufferRefs VoxelCellsBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, GPUVoxelCells, TEXT("VineVisualizationVoxel.VoxelCells"));
+			const CSHepler::FRDGStructuredBufferRefs VoxelHashSlotsBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, GPUVoxelHashSlots, TEXT("VineVisualizationVoxel.VoxelHashSlots"));
 			const CSHepler::FRDGStructuredBufferRefs VoxelNormalsBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, GPUVoxelNormals, TEXT("VineVisualizationVoxel.VoxelNormals"));
 			const CSHepler::FRDGStructuredBufferRefs VoxelTargetPositionsBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, GPUVoxelTargetPositions, TEXT("VineVisualizationVoxel.VoxelTargetPositions"));
 			const CSHepler::FRDGStructuredBufferRefs OutVertexBuffer = CSHepler::CreateStructuredBuffer<FVector4f>(GraphBuilder, OutputVertexCount, TEXT("VineVisualizationVoxel.OutVertices"), true, true);
@@ -1914,6 +2002,7 @@ static bool DispatchVineVisualizationGPU_Voxel(
 			BuildAxesParameters->PathPointAxes = PathPointAxisBuffer.SRV;
 			BuildAxesParameters->PathPointMeta = PathPointMetaBuffer.SRV;
 			BuildAxesParameters->VoxelCells = VoxelCellsBuffer.SRV;
+			BuildAxesParameters->VoxelHashSlots = VoxelHashSlotsBuffer.SRV;
 			BuildAxesParameters->VoxelNormals = VoxelNormalsBuffer.SRV;
 			BuildAxesParameters->VoxelTargetPositions = VoxelTargetPositionsBuffer.SRV;
 			BuildAxesParameters->RW_PathPointTangents = PathPointTangentA.UAV;
@@ -1922,6 +2011,7 @@ static bool DispatchVineVisualizationGPU_Voxel(
 			BuildAxesParameters->VoxelOrigin = VoxelOrigin;
 			BuildAxesParameters->VoxelSize = VoxelSize;
 			BuildAxesParameters->VoxelCount = VoxelCount;
+			BuildAxesParameters->VoxelHashSlotCount = GPUVoxelHashSlotCount;
 
 			GraphBuilder.AddPass(
 				RDG_EVENT_NAME("VineVisualizationVoxel.BuildAxes"),
@@ -1941,6 +2031,7 @@ static bool DispatchVineVisualizationGPU_Voxel(
 			Parameters->PathPointNormals = PathPointNormalA.SRV;
 			Parameters->SegmentMeta = SegmentMetaBuffer.SRV;
 			Parameters->VoxelCells = VoxelCellsBuffer.SRV;
+			Parameters->VoxelHashSlots = VoxelHashSlotsBuffer.SRV;
 			Parameters->VoxelNormals = VoxelNormalsBuffer.SRV;
 			Parameters->VoxelTargetPositions = VoxelTargetPositionsBuffer.SRV;
 			Parameters->RW_OutVertices = OutVertexBuffer.UAV;
@@ -1957,6 +2048,7 @@ static bool DispatchVineVisualizationGPU_Voxel(
 			Parameters->VoxelOrigin = VoxelOrigin;
 			Parameters->VoxelSize = VoxelSize;
 			Parameters->VoxelCount = VoxelCount;
+			Parameters->VoxelHashSlotCount = GPUVoxelHashSlotCount;
 			Parameters->VinesOffset = VinesOffset;
 
 			const uint32 DispatchCount = FMath::Max(OutputVertexCount, SegmentCount);

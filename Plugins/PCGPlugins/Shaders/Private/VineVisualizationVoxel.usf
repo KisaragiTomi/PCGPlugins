@@ -12,6 +12,7 @@ StructuredBuffer<float4> PathPointTangents;
 StructuredBuffer<float4> PathPointNormals;
 StructuredBuffer<int4> SegmentMeta;
 StructuredBuffer<int4> VoxelCells;
+StructuredBuffer<uint> VoxelHashSlots;
 StructuredBuffer<float4> VoxelNormals;
 StructuredBuffer<float4> VoxelTargetPositions;
 RWStructuredBuffer<float4> RW_PathPointTangents;
@@ -32,6 +33,7 @@ float LineScale;
 float3 VoxelOrigin;
 float VoxelSize;
 uint VoxelCount;
+uint VoxelHashSlotCount;
 float VinesOffset;
 
 float3 SafeNormalize3(float3 V, float3 Fallback)
@@ -42,6 +44,50 @@ float3 SafeNormalize3(float3 V, float3 Fallback)
         return Fallback;
     }
     return V * rsqrt(LenSq);
+}
+
+uint HashVoxelCell(int3 Cell)
+{
+    return ((uint)Cell.x * 73856093u)
+        ^ ((uint)Cell.y * 19349663u)
+        ^ ((uint)Cell.z * 83492791u);
+}
+
+int FindVoxelIndexForCell(int3 QueryCell)
+{
+    if (VoxelHashSlotCount > 0u)
+    {
+        uint Mask = VoxelHashSlotCount - 1u;
+        uint Slot = HashVoxelCell(QueryCell) & Mask;
+        for (uint Probe = 0u; Probe < VoxelHashSlotCount; ++Probe)
+        {
+            uint PackedVoxelIndex = VoxelHashSlots[Slot];
+            if (PackedVoxelIndex == 0u)
+            {
+                return -1;
+            }
+
+            uint VoxelIndex = PackedVoxelIndex - 1u;
+            if (VoxelIndex < VoxelCount && all(VoxelCells[VoxelIndex].xyz == QueryCell))
+            {
+                return int(VoxelIndex);
+            }
+
+            Slot = (Slot + 1u) & Mask;
+        }
+
+        return -1;
+    }
+
+    for (uint i = 0u; i < VoxelCount; ++i)
+    {
+        if (all(VoxelCells[i].xyz == QueryCell))
+        {
+            return int(i);
+        }
+    }
+
+    return -1;
 }
 
 // 8-neighbor voxel lookup with two-stage weighting:
@@ -93,17 +139,8 @@ bool SampleVoxelNeighbors(float3 Query, out float3 OutTarget, out float3 OutNorm
 
         int3 CornerCell = BaseCell + Offsets[Corner];
 
-        // Linear scan — uses VoxelCells (int4) for exact cell matching
-        int VoxelIdx = -1;
-        for (uint i = 0u; i < VoxelCount; ++i)
-        {
-            int3 Cell = VoxelCells[i].xyz;
-            if (all(Cell == CornerCell))
-            {
-                VoxelIdx = int(i);
-                break;
-            }
-        }
+        // Hash lookup keeps per-sample voxel matching off the full VoxelCells scan.
+        int VoxelIdx = FindVoxelIndexForCell(CornerCell);
 
         if (VoxelIdx < 0)
         {

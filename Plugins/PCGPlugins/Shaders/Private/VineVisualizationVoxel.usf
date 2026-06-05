@@ -1,0 +1,344 @@
+#include "/Engine/Public/Platform.ush"
+
+#ifndef THREADGROUPSIZE_X
+#define THREADGROUPSIZE_X 64
+#endif
+
+StructuredBuffer<float4> PathPoints;
+StructuredBuffer<float4> PathPointAxes;
+StructuredBuffer<int4> PathPointMeta;
+StructuredBuffer<float> PathPointCurveU;
+StructuredBuffer<float4> PathPointTangents;
+StructuredBuffer<float4> PathPointNormals;
+StructuredBuffer<int4> SegmentMeta;
+StructuredBuffer<int4> VoxelCells;
+StructuredBuffer<float4> VoxelNormals;
+StructuredBuffer<float4> VoxelTargetPositions;
+RWStructuredBuffer<float4> RW_PathPointTangents;
+RWStructuredBuffer<float4> RW_PathPointNormals;
+RWStructuredBuffer<float4> RW_OutVertices;
+RWStructuredBuffer<float2> RW_OutUVs;
+RWStructuredBuffer<uint> RW_OutIndices;
+
+uint PathPointCount;
+uint SegmentCount;
+uint OutputVertexCount;
+uint OutputIndexCount;
+uint ProfileCount;
+uint bTube;
+float CircleScale;
+float LineScale;
+
+float3 VoxelOrigin;
+float VoxelSize;
+uint VoxelCount;
+float VinesOffset;
+
+float3 SafeNormalize3(float3 V, float3 Fallback)
+{
+    float LenSq = dot(V, V);
+    if (LenSq <= 1.0e-8f)
+    {
+        return Fallback;
+    }
+    return V * rsqrt(LenSq);
+}
+
+// 8-neighbor voxel lookup with two-stage weighting:
+// Stage 1: Tri-Linear grid interpolation weight
+// Stage 2: Inverse distance squared to VoxelTargetPosition
+// Returns false if no voxels found near the query.
+bool SampleVoxelNeighbors(float3 Query, out float3 OutTarget, out float3 OutNormal)
+{
+    OutTarget = Query;
+    OutNormal = float3(0.0f, 0.0f, 1.0f);
+
+    if (VoxelCount == 0u)
+    {
+        return false;
+    }
+
+    // Compute base cell and intra-cell local coordinates
+    float3 Local = (Query - VoxelOrigin) / VoxelSize;
+    int3 BaseCell = int3(floor(Local));
+    float3 CellLocal = clamp(Local - float3(BaseCell), 0.0f, 1.0f);
+
+    // Tri-Linear weights for 8 corners
+    float W[8];
+    W[0] = (1.0f - CellLocal.x) * (1.0f - CellLocal.y) * (1.0f - CellLocal.z);
+    W[1] = (          CellLocal.x) * (1.0f - CellLocal.y) * (1.0f - CellLocal.z);
+    W[2] = (1.0f - CellLocal.x) * (          CellLocal.y) * (1.0f - CellLocal.z);
+    W[3] = (          CellLocal.x) * (          CellLocal.y) * (1.0f - CellLocal.z);
+    W[4] = (1.0f - CellLocal.x) * (1.0f - CellLocal.y) * (          CellLocal.z);
+    W[5] = (          CellLocal.x) * (1.0f - CellLocal.y) * (          CellLocal.z);
+    W[6] = (1.0f - CellLocal.x) * (          CellLocal.y) * (          CellLocal.z);
+    W[7] = (          CellLocal.x) * (          CellLocal.y) * (          CellLocal.z);
+
+    int3 Offsets[8] = {
+        int3(0,0,0), int3(1,0,0), int3(0,1,0), int3(1,1,0),
+        int3(0,0,1), int3(1,0,1), int3(0,1,1), int3(1,1,1)
+    };
+
+    float3 SumWeightedTarget = float3(0.0f, 0.0f, 0.0f);
+    float3 SumWeightedNormal = float3(0.0f, 0.0f, 0.0f);
+    float TotalWeight = 0.0f;
+
+    for (int Corner = 0; Corner < 8; ++Corner)
+    {
+        float TriW = W[Corner];
+        if (TriW <= 1.0e-8f)
+        {
+            continue;
+        }
+
+        int3 CornerCell = BaseCell + Offsets[Corner];
+
+        // Linear scan — uses VoxelCells (int4) for exact cell matching
+        int VoxelIdx = -1;
+        for (uint i = 0u; i < VoxelCount; ++i)
+        {
+            int3 Cell = VoxelCells[i].xyz;
+            if (all(Cell == CornerCell))
+            {
+                VoxelIdx = int(i);
+                break;
+            }
+        }
+
+        if (VoxelIdx < 0)
+        {
+            continue;
+        }
+
+        float3 Target = VoxelTargetPositions[VoxelIdx].xyz;
+        float3 Normal = VoxelNormals[VoxelIdx].xyz;
+
+        // Stage 2: Spatial proximity weight (inverse distance squared to TargetPosition)
+        float3 Delta = Query - Target;
+        float DistSq = dot(Delta, Delta);
+        float SpatialW = 1.0f / max(DistSq, 1.0e-8f);
+
+        // Final weight = Tri-Linear grid weight × spatial proximity weight
+        float FinalW = TriW * SpatialW;
+
+        SumWeightedTarget += Target * FinalW;
+        SumWeightedNormal += Normal * FinalW;
+        TotalWeight += FinalW;
+    }
+
+    if (TotalWeight <= 1.0e-8f)
+    {
+        return false;
+    }
+
+    OutTarget = SumWeightedTarget / TotalWeight;
+    OutNormal = SafeNormalize3(SumWeightedNormal / TotalWeight, float3(0.0f, 0.0f, 1.0f));
+    return true;
+}
+
+uint GetLinePointIndex(uint PointIndex, int Offset)
+{
+    int4 Meta = PathPointMeta[PointIndex];
+    int BaseIndex = max(Meta.z, 0);
+    int PointCount = max(Meta.w, 1);
+    int LastIndex = min(BaseIndex + PointCount - 1, int(PathPointCount) - 1);
+    return (uint)min(max(int(PointIndex) + Offset, BaseIndex), LastIndex);
+}
+
+float3 GetFallbackFrameNormal(float3 Tangent)
+{
+    float3 Up = abs(Tangent.z) < 0.9f ? float3(0.0f, 0.0f, 1.0f) : float3(0.0f, 1.0f, 0.0f);
+    return SafeNormalize3(Up - Tangent * dot(Up, Tangent), float3(0.0f, 1.0f, 0.0f));
+}
+
+float3 OrientAxisToReference(float3 Axis, float3 Reference)
+{
+    return dot(Axis, Reference) < 0.0f ? -Axis : Axis;
+}
+
+float3 BuildFrameNormalFromTangent(float3 Tangent, float3 Normal)
+{
+    float3 FallbackNormal = GetFallbackFrameNormal(Tangent);
+    return SafeNormalize3(Normal - Tangent * dot(Normal, Tangent), FallbackNormal);
+}
+
+void BuildOrthonormalFrame(float3 Tangent, float3 Normal, out float3 OutTangent, out float3 OutNormal, out float3 OutBinormal)
+{
+    OutTangent = SafeNormalize3(Tangent, float3(1.0f, 0.0f, 0.0f));
+    OutNormal = BuildFrameNormalFromTangent(OutTangent, Normal);
+    OutBinormal = cross(OutNormal, OutTangent);
+    if (dot(OutBinormal, OutBinormal) <= 1.0e-8f)
+    {
+        OutBinormal = cross(GetFallbackFrameNormal(OutTangent), OutTangent);
+    }
+    OutBinormal = SafeNormalize3(OutBinormal, float3(0.0f, 1.0f, 0.0f));
+    OutNormal = SafeNormalize3(cross(OutTangent, OutBinormal), OutNormal);
+}
+
+void BuildRawVoxelVineFrame(uint PointIndex, out float3 OutTangent, out float3 OutNormal)
+{
+    uint PrevIndex = GetLinePointIndex(PointIndex, -1);
+    uint NextIndex = GetLinePointIndex(PointIndex, 1);
+    float3 PrevPos = PathPoints[PrevIndex].xyz;
+    float3 NextPos = PathPoints[NextIndex].xyz;
+    float3 RawTangent = SafeNormalize3(NextPos - PrevPos, float3(1.0f, 0.0f, 0.0f));
+    float3 SmoothedAxis = PathPointAxes[PointIndex].xyz;
+    OutTangent = dot(SmoothedAxis, SmoothedAxis) > 1.0e-8f
+        ? OrientAxisToReference(SafeNormalize3(SmoothedAxis, RawTangent), RawTangent)
+        : RawTangent;
+
+    float3 Target;
+    float3 SampledNormal;
+    SampleVoxelNeighbors(PathPoints[PointIndex].xyz, Target, SampledNormal);
+    SampledNormal = SafeNormalize3(SampledNormal, GetFallbackFrameNormal(OutTangent));
+    OutNormal = BuildFrameNormalFromTangent(OutTangent, SampledNormal);
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void BuildVineVisualizationVoxelAxesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint PointIndex = DispatchThreadId.x;
+    if (PointIndex >= PathPointCount)
+    {
+        return;
+    }
+
+    float3 Tangent;
+    float3 Normal;
+    BuildRawVoxelVineFrame(PointIndex, Tangent, Normal);
+    RW_PathPointTangents[PointIndex] = float4(Tangent, 0.0f);
+    RW_PathPointNormals[PointIndex] = float4(Normal, 0.0f);
+}
+
+float2 GetProfilePoint(uint ProfileIndex)
+{
+    if (bTube != 0u)
+    {
+        if (ProfileIndex == 0u)
+        {
+            return float2(10.0f, 0.0f) * CircleScale;
+        }
+        if (ProfileIndex == 1u)
+        {
+            return float2(-5.0f, 8.660254f) * CircleScale;
+        }
+        return float2(-5.0f, -8.660254f) * CircleScale;
+    }
+
+    return float2(ProfileIndex == 0u ? -5.0f : 5.0f, 0.0f) * LineScale;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void BuildVineVisualizationVoxelCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint Index = DispatchThreadId.x;
+
+    if (Index < OutputVertexCount && ProfileCount > 0u)
+    {
+        uint PointIndex = Index / ProfileCount;
+        uint ProfileIndex = Index - PointIndex * ProfileCount;
+        if (PointIndex < PathPointCount)
+        {
+            float4 PackedPoint = PathPoints[PointIndex];
+            int4 Meta = PathPointMeta[PointIndex];
+            uint PrevIndex = (uint)max(Meta.x, 0);
+            uint NextIndex = (uint)max(Meta.y, 0);
+            PrevIndex = min(PrevIndex, PathPointCount - 1u);
+            NextIndex = min(NextIndex, PathPointCount - 1u);
+
+            float V = PathPointCurveU[PointIndex];
+
+            float U;
+            if (bTube != 0u)
+            {
+                U = (float)ProfileIndex / (float)ProfileCount;
+            }
+            else
+            {
+                U = (float)ProfileIndex / (float)(ProfileCount - 1u);
+            }
+
+            float3 Query = PackedPoint.xyz;
+            float Scale = PackedPoint.w;
+            float3 PrevPos = PathPoints[PrevIndex].xyz;
+            float3 NextPos = PathPoints[NextIndex].xyz;
+            float3 FallbackTangent = SafeNormalize3(NextPos - PrevPos, float3(1.0f, 0.0f, 0.0f));
+            float3 Tangent = SafeNormalize3(PathPointTangents[PointIndex].xyz, FallbackTangent);
+
+            // Voxel-based surface sampling replaces BVH-based closest point projection
+            float3 Target, SampledNormal;
+            SampleVoxelNeighbors(Query, Target, SampledNormal);
+            float3 Normal = SafeNormalize3(PathPointNormals[PointIndex].xyz, GetFallbackFrameNormal(Tangent));
+            float3 FrameTangent;
+            float3 FrameNormal;
+            float3 Binormal;
+            BuildOrthonormalFrame(Tangent, Normal, FrameTangent, FrameNormal, Binormal);
+
+            float2 Profile = GetProfilePoint(ProfileIndex) * Scale;
+            // GPU owns final surface anchoring and offset for the voxel path.
+            float3 Center = Target + SafeNormalize3(SampledNormal, Normal) * VinesOffset;
+            float3 OutPosition = Center + Binormal * Profile.x + FrameNormal * Profile.y;
+
+            RW_OutVertices[Index] = float4(OutPosition, 1.0f);
+            RW_OutUVs[Index] = float2(U, V);
+        }
+    }
+
+    if (Index < SegmentCount && ProfileCount > 0u)
+    {
+        int4 Segment = SegmentMeta[Index];
+        uint APoint = (uint)max(Segment.x, 0);
+        uint BPoint = (uint)max(Segment.y, 0);
+        if (APoint >= PathPointCount || BPoint >= PathPointCount)
+        {
+            return;
+        }
+
+        uint ABase = APoint * ProfileCount;
+        uint BBase = BPoint * ProfileCount;
+
+        if (bTube != 0u)
+        {
+            uint SegmentIndexBase = Index * ProfileCount * 6u;
+            for (uint Edge = 0u; Edge < ProfileCount; ++Edge)
+            {
+                uint NextEdge = (Edge + 1u) % ProfileCount;
+                uint WriteBase = SegmentIndexBase + Edge * 6u;
+                if (WriteBase + 5u >= OutputIndexCount)
+                {
+                    continue;
+                }
+
+                uint A0 = ABase + Edge;
+                uint A1 = ABase + NextEdge;
+                uint B0 = BBase + Edge;
+                uint B1 = BBase + NextEdge;
+
+                RW_OutIndices[WriteBase + 0u] = A0;
+                RW_OutIndices[WriteBase + 1u] = B0;
+                RW_OutIndices[WriteBase + 2u] = B1;
+                RW_OutIndices[WriteBase + 3u] = A0;
+                RW_OutIndices[WriteBase + 4u] = B1;
+                RW_OutIndices[WriteBase + 5u] = A1;
+            }
+        }
+        else
+        {
+            uint WriteBase = Index * 6u;
+            if (WriteBase + 5u < OutputIndexCount && ProfileCount >= 2u)
+            {
+                uint A0 = ABase + 0u;
+                uint A1 = ABase + 1u;
+                uint B0 = BBase + 0u;
+                uint B1 = BBase + 1u;
+
+                RW_OutIndices[WriteBase + 0u] = A0;
+                RW_OutIndices[WriteBase + 1u] = B0;
+                RW_OutIndices[WriteBase + 2u] = B1;
+                RW_OutIndices[WriteBase + 3u] = A0;
+                RW_OutIndices[WriteBase + 4u] = B1;
+                RW_OutIndices[WriteBase + 5u] = A1;
+            }
+        }
+    }
+}

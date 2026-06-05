@@ -103,7 +103,10 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 			UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(WaterMIC, TEXT("CSSW_VelHeight"), VelHeightTexture);
 		if (DepthWetTexture)
 			UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(WaterMIC, TEXT("CSSW_DepthWet"), DepthWetTexture);
-		UMaterialEditingLibrary::SetMaterialInstanceStaticSwitchParameterValue(WaterMIC, TEXT("SwitchSim"), true);
+		UMaterialEditingLibrary::SetMaterialInstanceVectorParameterValue(WaterMIC, TEXT("CSSW_SimCenter"),
+			FLinearColor(InCSSWActor->SimUVCenter.X, InCSSWActor->SimUVCenter.Y, 0.f, 0.f));
+		UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(WaterMIC, TEXT("CSSW_SimInvSize"), InCSSWActor->SimUVInvSize);
+		UMaterialEditingLibrary::SetMaterialInstanceStaticSwitchParameterValue(WaterMIC, TEXT("SwithSim"), true);
 		UEditorAssetLibrary::SaveLoadedAsset(WaterMIC, false);
 		WaterMIC->MarkPackageDirty();
 	}
@@ -113,6 +116,10 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 			UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(DecalMIC, TEXT("CSSW_VelHeight"), VelHeightTexture);
 		if (DepthWetTexture)
 			UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(DecalMIC, TEXT("CSSW_DepthWet"), DepthWetTexture);
+		UMaterialEditingLibrary::SetMaterialInstanceVectorParameterValue(DecalMIC, TEXT("CSSW_SimCenter"),
+			FLinearColor(InCSSWActor->SimUVCenter.X, InCSSWActor->SimUVCenter.Y, 0.f, 0.f));
+		UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(DecalMIC, TEXT("CSSW_SimInvSize"), InCSSWActor->SimUVInvSize);
+		UMaterialEditingLibrary::SetMaterialInstanceStaticSwitchParameterValue(DecalMIC, TEXT("SwithSim"), true);
 		UEditorAssetLibrary::SaveLoadedAsset(DecalMIC, false);
 		DecalMIC->MarkPackageDirty();
 	}
@@ -388,6 +395,13 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 	InCSSWActor->DecalMaterial = DecalMIC ? DecalMIC : InCSSWActor->DecalMaterial;
 	InCSSWActor->StopSolver();
 	InCSSWActor->bSimVisActive = false;
+	if (InCSSWActor->CausticsDecal && InCSSWActor->DecalMaterial)
+	{
+		InCSSWActor->CausticsDecal->Modify();
+		InCSSWActor->CausticsDecal->SetDecalMaterial(InCSSWActor->DecalMaterial);
+		InCSSWActor->CausticsDecal->SetVisibility(true);
+		InCSSWActor->CausticsDecal->MarkRenderStateDirty();
+	}
 	if (InCSSWActor->SimVisHISM)
 	{
 		InCSSWActor->SimVisHISM->ClearInstances();

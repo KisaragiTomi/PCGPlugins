@@ -2364,6 +2364,9 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 		return OutVoxelData;
 	}
 
+	// Voxel cell 坐标系原点 — 存入 OutVoxelData 用于后续体素采样
+	OutVoxelData.VoxelOrigin = QueryBox.Min;
+
 	const int32 SafeMaxTriangles = FMath::Max(1, MaxTriangles);
 	const int32 SafeMaxVoxels = FMath::Max(1, MaxVoxels);
 	TArray<FCSStaticMeshTriangleRequest> Requests;
@@ -2408,16 +2411,19 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 
 	FRHIGPUBufferReadback* PositionReadback = new FRHIGPUBufferReadback(TEXT("BoxSceneSurfaceVoxels_PositionReadback"));
 	FRHIGPUBufferReadback* NormalReadback = new FRHIGPUBufferReadback(TEXT("BoxSceneSurfaceVoxels_NormalReadback"));
+	FRHIGPUBufferReadback* TargetPositionReadback = new FRHIGPUBufferReadback(TEXT("BoxSceneSurfaceVoxels_TargetPositionReadback"));
+	FRHIGPUBufferReadback* CellReadback = new FRHIGPUBufferReadback(TEXT("BoxSceneSurfaceVoxels_CellReadback"));
 	FRHIGPUBufferReadback* CounterReadback = new FRHIGPUBufferReadback(TEXT("BoxSceneSurfaceVoxels_CounterReadback"));
 	bool bRenderWorkQueued = false;
 	bool bHasGPUOutput = false;
 	int32 VoxelCapacity = 0;
 	uint32 ActualVoxelReadbackBytes = 0;
+	uint32 ActualVoxelCellReadbackBytes = 0;
 
 	ENQUEUE_RENDER_COMMAND(GetBoxSceneSurfaceVoxelsFromGPUGPU)(
-		[ResolvedRequests = MoveTemp(ResolvedRequests), TotalStaticMeshTriangleCount, LandscapeTriangleData = MoveTemp(LandscapeTriangleData), PositionReadback, NormalReadback, CounterReadback, CounterReadbackBytes,
+		[ResolvedRequests = MoveTemp(ResolvedRequests), TotalStaticMeshTriangleCount, LandscapeTriangleData = MoveTemp(LandscapeTriangleData), PositionReadback, NormalReadback, TargetPositionReadback, CellReadback, CounterReadback, CounterReadbackBytes,
 		 SafeMaxTriangles, SafeMaxVoxels, VoxelOrigin = QueryBox.Min, SafeVoxelSize = OutVoxelData.VoxelSize,
-		 SafeMaxVoxelCellsPerTriangle = FMath::Max(1, MaxVoxelCellsPerTriangle), &bRenderWorkQueued, &bHasGPUOutput, &VoxelCapacity, &ActualVoxelReadbackBytes](FRHICommandListImmediate& RHICmdList)
+		 SafeMaxVoxelCellsPerTriangle = FMath::Max(1, MaxVoxelCellsPerTriangle), &bRenderWorkQueued, &bHasGPUOutput, &VoxelCapacity, &ActualVoxelReadbackBytes, &ActualVoxelCellReadbackBytes](FRHICommandListImmediate& RHICmdList)
 		{
 			FRDGBuilder GraphBuilder(RHICmdList);
 			const TArray<FVector> EmptyReferencePoints;
@@ -2447,12 +2453,19 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 				1,
 				TEXT("CS.BoxSceneSurfaceVoxels"));
 
-			if (VoxelOutput.VoxelPositions && VoxelOutput.VoxelNormals && VoxelOutput.VoxelCounter)
+			if (VoxelOutput.VoxelPositions
+				&& VoxelOutput.VoxelNormals
+				&& VoxelOutput.VoxelTargetPositions
+				&& VoxelOutput.VoxelCells
+				&& VoxelOutput.VoxelCounter)
 			{
 				VoxelCapacity = int32(VoxelOutput.MaxVoxels);
 				ActualVoxelReadbackBytes = uint32(uint64(VoxelOutput.MaxVoxels) * sizeof(FVector4f));
+				ActualVoxelCellReadbackBytes = uint32(uint64(VoxelOutput.MaxVoxels) * sizeof(FIntVector4));
 				AddEnqueueCopyPass(GraphBuilder, PositionReadback, VoxelOutput.VoxelPositions, ActualVoxelReadbackBytes);
 				AddEnqueueCopyPass(GraphBuilder, NormalReadback, VoxelOutput.VoxelNormals, ActualVoxelReadbackBytes);
+				AddEnqueueCopyPass(GraphBuilder, TargetPositionReadback, VoxelOutput.VoxelTargetPositions, ActualVoxelReadbackBytes);
+				AddEnqueueCopyPass(GraphBuilder, CellReadback, VoxelOutput.VoxelCells, ActualVoxelCellReadbackBytes);
 				AddEnqueueCopyPass(GraphBuilder, CounterReadback, VoxelOutput.VoxelCounter, CounterReadbackBytes);
 				bHasGPUOutput = true;
 			}
@@ -2467,53 +2480,77 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 	{
 		delete PositionReadback;
 		delete NormalReadback;
+		delete TargetPositionReadback;
+		delete CellReadback;
 		delete CounterReadback;
 		return OutVoxelData;
 	}
 
 	TArray<FVector4f> PositionData;
 	TArray<FVector4f> NormalData;
+	TArray<FVector4f> TargetPositionData;
+	TArray<FIntVector4> CellData;
 	PositionData.SetNumZeroed(VoxelCapacity);
 	NormalData.SetNumZeroed(VoxelCapacity);
+	TargetPositionData.SetNumZeroed(VoxelCapacity);
+	CellData.SetNumZeroed(VoxelCapacity);
 	uint32 VoxelCount = 0;
 	bool bReadbackSucceeded = false;
 
 	ENQUEUE_RENDER_COMMAND(GetBoxSceneSurfaceVoxelsFromGPUReadback)(
-		[PositionReadback, NormalReadback, CounterReadback, ActualVoxelReadbackBytes, CounterReadbackBytes,
-		 &PositionData, &NormalData, &VoxelCount, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList)
+		[PositionReadback, NormalReadback, TargetPositionReadback, CellReadback, CounterReadback, ActualVoxelReadbackBytes, ActualVoxelCellReadbackBytes, CounterReadbackBytes,
+		 &PositionData, &NormalData, &TargetPositionData, &CellData, &VoxelCount, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList)
 		{
-			if (!PositionReadback || !NormalReadback || !CounterReadback)
+			if (!PositionReadback || !NormalReadback || !TargetPositionReadback || !CellReadback || !CounterReadback)
 			{
 				return;
 			}
 
-			if (!PositionReadback->IsReady() || !NormalReadback->IsReady() || !CounterReadback->IsReady())
+			if (!PositionReadback->IsReady()
+				|| !NormalReadback->IsReady()
+				|| !TargetPositionReadback->IsReady()
+				|| !CellReadback->IsReady()
+				|| !CounterReadback->IsReady())
 			{
 				RHICmdList.SubmitAndBlockUntilGPUIdle();
 			}
 
-			if (!PositionReadback->IsReady() || !NormalReadback->IsReady() || !CounterReadback->IsReady())
+			if (!PositionReadback->IsReady()
+				|| !NormalReadback->IsReady()
+				|| !TargetPositionReadback->IsReady()
+				|| !CellReadback->IsReady()
+				|| !CounterReadback->IsReady())
 			{
 				UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneSurfaceVoxelsFromGPU] GPU readback was not ready after flush."));
 				delete PositionReadback;
 				delete NormalReadback;
+				delete TargetPositionReadback;
+				delete CellReadback;
 				delete CounterReadback;
 				return;
 			}
 
 			if (PositionReadback->GetGPUSizeBytes() < ActualVoxelReadbackBytes ||
 				NormalReadback->GetGPUSizeBytes() < ActualVoxelReadbackBytes ||
+				TargetPositionReadback->GetGPUSizeBytes() < ActualVoxelReadbackBytes ||
+				CellReadback->GetGPUSizeBytes() < ActualVoxelCellReadbackBytes ||
 				CounterReadback->GetGPUSizeBytes() < CounterReadbackBytes)
 			{
-				UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneSurfaceVoxelsFromGPU] GPU readback size mismatch. Position=%llu/%u Normal=%llu/%u Counter=%llu/%u"),
+				UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneSurfaceVoxelsFromGPU] GPU readback size mismatch. Position=%llu/%u Normal=%llu/%u Target=%llu/%u Cell=%llu/%u Counter=%llu/%u"),
 					PositionReadback->GetGPUSizeBytes(),
 					ActualVoxelReadbackBytes,
 					NormalReadback->GetGPUSizeBytes(),
 					ActualVoxelReadbackBytes,
+					TargetPositionReadback->GetGPUSizeBytes(),
+					ActualVoxelReadbackBytes,
+					CellReadback->GetGPUSizeBytes(),
+					ActualVoxelCellReadbackBytes,
 					CounterReadback->GetGPUSizeBytes(),
 					CounterReadbackBytes);
 				delete PositionReadback;
 				delete NormalReadback;
+				delete TargetPositionReadback;
+				delete CellReadback;
 				delete CounterReadback;
 				return;
 			}
@@ -2539,6 +2576,26 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 				bLockedAll = false;
 			}
 
+			if (const FVector4f* TargetPositionPtr = static_cast<const FVector4f*>(TargetPositionReadback->Lock(ActualVoxelReadbackBytes)))
+			{
+				FMemory::Memcpy(TargetPositionData.GetData(), TargetPositionPtr, ActualVoxelReadbackBytes);
+				TargetPositionReadback->Unlock();
+			}
+			else
+			{
+				bLockedAll = false;
+			}
+
+			if (const FIntVector4* CellPtr = static_cast<const FIntVector4*>(CellReadback->Lock(ActualVoxelCellReadbackBytes)))
+			{
+				FMemory::Memcpy(CellData.GetData(), CellPtr, ActualVoxelCellReadbackBytes);
+				CellReadback->Unlock();
+			}
+			else
+			{
+				bLockedAll = false;
+			}
+
 			if (const uint32* CounterPtr = static_cast<const uint32*>(CounterReadback->Lock(CounterReadbackBytes)))
 			{
 				VoxelCount = *CounterPtr;
@@ -2551,6 +2608,8 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 
 			delete PositionReadback;
 			delete NormalReadback;
+			delete TargetPositionReadback;
+			delete CellReadback;
 			delete CounterReadback;
 			bReadbackSucceeded = bLockedAll;
 		});
@@ -2571,12 +2630,18 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 
 	OutVoxelData.Positions.Reserve(EffectiveVoxelCount);
 	OutVoxelData.Normals.Reserve(EffectiveVoxelCount);
+	OutVoxelData.TargetPositions.Reserve(EffectiveVoxelCount);
+	OutVoxelData.Cells.Reserve(EffectiveVoxelCount);
 	for (int32 VoxelIndex = 0; VoxelIndex < EffectiveVoxelCount; ++VoxelIndex)
 	{
 		const FVector4f& Position = PositionData[VoxelIndex];
 		const FVector4f& Normal = NormalData[VoxelIndex];
+		const FVector4f& TargetPosition = TargetPositionData[VoxelIndex];
+		const FIntVector4& Cell = CellData[VoxelIndex];
 		OutVoxelData.Positions.Add(FVector(Position.X, Position.Y, Position.Z));
 		OutVoxelData.Normals.Add(FVector(Normal.X, Normal.Y, Normal.Z));
+		OutVoxelData.TargetPositions.Add(FVector(TargetPosition.X, TargetPosition.Y, TargetPosition.Z));
+		OutVoxelData.Cells.Add(FIntVector(Cell.X, Cell.Y, Cell.Z));
 	}
 	OutVoxelData.VoxelCount = EffectiveVoxelCount;
 	LastSurfaceVoxelData = OutVoxelData;
@@ -2822,6 +2887,7 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 	LastSurfaceVoxelData.Normals = OutNormals;
 	LastSurfaceVoxelData.VoxelCount = EffectiveVoxelCount;
 	LastSurfaceVoxelData.VoxelSize = SafeVoxelSize;
+	LastSurfaceVoxelData.VoxelOrigin = QueryBox.Min;
 	StoreSurfaceVoxelTextureData(LastSurfaceVoxelData, QueryBox.Min);
 }
 

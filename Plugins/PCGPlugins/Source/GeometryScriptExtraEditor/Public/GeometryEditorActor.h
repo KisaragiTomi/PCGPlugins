@@ -74,6 +74,11 @@ struct FVineLinePointScaleData
 	TArray<float> Values;
 };
 
+struct FVineLinePointAxisData
+{
+	TArray<FVector> Values;
+};
+
 UCLASS()
 class GEOMETRYSCRIPTEXTRAEDITOR_API AVineContainer : public AComputeShaderMeshGenerator
 {
@@ -99,6 +104,10 @@ public:
 	
 	UPROPERTY(Transient)
 	TObjectPtr<UDynamicMesh> PrefixMesh;
+
+	// Voxel 化表面数据（ResinRattan 移植），用于藤蔓顶点投射和法线获取。
+	// GenerateVines() 中填充，函数返回时自动析构。
+	FCSSurfaceVoxelData CachedSurfaceVoxels;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UDynamicMesh> OutTubeMesh;
@@ -134,6 +143,10 @@ public:
 	// GPU visualization interpolates these through preprocessing and multiplies vine thickness by them.
 	TArray<FVineLinePointScaleData> TubeLinePointScales;
 	TArray<FVineLinePointScaleData> PlaneLinePointScales;
+
+	// Per-line/per-point smoothed line axes from SpaceColonization GPU finalization.
+	TArray<FVineLinePointAxisData> TubeLinePointAxes;
+	TArray<FVineLinePointAxisData> PlaneLinePointAxes;
 
 	//bool MainVine = true;
 
@@ -185,6 +198,23 @@ public:
 
 	UFUNCTION(BlueprintCallable, BlueprintCallable, Category = "VineActions")
 	void GenerateVineAction();
+
+	UFUNCTION(BlueprintCallable, Category = "VineActions|Debug", meta = (DevelopmentOnly, DisplayName = "Draw Debug Vine Surface Voxel Arrows"))
+	int32 DrawDebugVineSurfaceVoxelArrows(
+		float ArrowLength = 0.0f,
+		FLinearColor ArrowColor = FLinearColor::Blue,
+		float Duration = 5.0f,
+		float Thickness = 2.0f,
+		bool bPersistentLines = false,
+		bool bDrawVoxelCenters = true,
+		FLinearColor VoxelCenterColor = FLinearColor::Yellow,
+		float VoxelCenterPointSize = 6.0f,
+		bool bDrawWeightedTargets = true,
+		FLinearColor WeightedTargetColor = FLinearColor::Red,
+		float WeightedTargetPointSize = 8.0f,
+		bool bDrawCenterToTargetLines = true,
+		FLinearColor CenterToTargetColor = FLinearColor(0.0f, 1.0f, 1.0f, 1.0f),
+		int32 MaxArrowsToDraw = 0);
 
 	UFUNCTION(BlueprintCallable, Category = "VineActions")
 	void SaveStaticmesh();

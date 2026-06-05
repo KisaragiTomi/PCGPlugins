@@ -1,0 +1,50 @@
+# clang-tidy configuration for mcp-unreal C++ plugin (local-only).
+#
+# Requires compile_commands.json from UBT:
+#   UnrealBuildTool -mode=GenerateClangDatabase ...
+#
+# Usage:
+#   make cpp-tidy
+#
+# NOT run in CI — UE headers are unavailable on ubuntu-latest.
+
+Checks: >-
+  google-*,
+  bugprone-*,
+  performance-*,
+  readability-identifier-naming,
+  readability-redundant-smartptr-get,
+  readability-container-size-empty,
+  misc-unused-using-decls,
+  misc-redundant-expression,
+  -google-runtime-references,
+  -google-readability-todo,
+  -google-build-using-namespace,
+  -google-default-arguments,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -modernize-use-trailing-return-type,
+  -cppcoreguidelines-owning-memory
+
+WarningsAsErrors: ''
+
+CheckOptions:
+  # UE naming conventions (PascalCase for types, functions, variables).
+  - key: readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+  - key: readability-identifier-naming.FunctionCase
+    value: CamelCase
+  - key: readability-identifier-naming.VariableCase
+    value: CamelCase
+  - key: readability-identifier-naming.ParameterCase
+    value: CamelCase
+
+  # UE assert macros — treat as assertion functions.
+  - key: bugprone-assert-side-effect.AssertMacros
+    value: 'check;verify;ensure;ensureMsgf;checkf;verifyf'
+
+  # UE types safe to pass by value.
+  - key: performance-unnecessary-value-param.AllowedTypes
+    value: 'FString;FName;FText;TSharedPtr;TSharedRef;TWeakPtr;TArray;TMap;TSet'

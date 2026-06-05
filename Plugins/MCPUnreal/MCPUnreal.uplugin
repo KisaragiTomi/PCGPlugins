@@ -1,0 +1,34 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "MCPUnreal",
+	"Description": "MCP server bridge for AI coding agents. Exposes editor functionality via a local HTTP API for the mcp-unreal Go server.",
+	"Category": "Editor",
+	"CreatedBy": "mcp-unreal project",
+	"CreatedByURL": "https://github.com/remiphilippe/mcp-unreal",
+	"DocsURL": "https://github.com/remiphilippe/mcp-unreal/tree/main/plugin",
+	"EnabledByDefault": true,
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Plugins": [
+		{ "Name": "EnhancedInput", "Enabled": true },
+		{ "Name": "ProceduralMeshComponent", "Enabled": true },
+		{ "Name": "PCG", "Enabled": true },
+		{ "Name": "GameplayAbilities", "Enabled": true },
+		{ "Name": "Niagara", "Enabled": true },
+		{ "Name": "Fab", "Enabled": true, "Optional": true }
+	],
+	"Modules": [
+		{
+			"Name": "MCPUnreal",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
+		},
+		{
+			"Name": "MCPUnrealTests",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
+		}
+	]
+}

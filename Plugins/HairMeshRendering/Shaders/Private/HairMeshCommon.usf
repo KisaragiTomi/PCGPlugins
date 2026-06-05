@@ -1,0 +1,185 @@
+// HairMeshCommon.usf — Shared types, texture declarations, and utility functions
+// Virtual path: /Plugin/HairMeshRendering/Private/HairMeshCommon.usf
+
+#pragma once
+
+#include "/Engine/Public/Platform.ush"
+
+// ============================================================================
+// GPU structures (must match C++ FHairStrandVertex / FHairTriStripVertex)
+// ============================================================================
+
+struct FHairStrandVertex
+{
+	float3 Position;
+	float  Width;
+	float3 Tangent;
+	float  V;
+};
+
+struct FHairTriStripVertex
+{
+	float3 Position;
+	float  Pad0;
+	float3 Normal;
+	float  Pad1;
+	float2 UV;
+	float  Pad2;
+	float  Pad3;
+};
+
+// ============================================================================
+// Quadratic Bézier Evaluation
+// ============================================================================
+
+float3 EvalQuadraticBezier(float3 P0, float3 P1, float3 P2, float t)
+{
+	float s = 1.0 - t;
+	return s * s * P0 + 2.0 * s * t * P1 + t * t * P2;
+}
+
+// ============================================================================
+// Styling Coordinate Frame
+// ============================================================================
+
+float3x3 BuildStylingFrame(float3 UDir, float3 VDir)
+{
+	float3 WDir = normalize(cross(UDir, VDir));
+	return float3x3(UDir, VDir, WDir);
+}
+
+// ============================================================================
+// Texture Sampling Helpers
+// ============================================================================
+
+/**
+ * Compute 3D texture coordinate for a given bundle, corner barycentric,
+ * and parametric position along the hair strand.
+ *
+ * @param BlockXY    Top-left texel of the 2x2 bundle block
+ * @param Xi         Barycentric coordinate within the face [0,1]^2
+ * @param T          Parametric position along the strand [0, NumSegments]
+ * @param TexSize3D  (Width, Height, Depth) of the 3D texture
+ */
+float3 ComputeHairTexCoord3D(int2 BlockXY, float2 Xi, float T, int3 TexSize3D)
+{
+	// Map Xi ∈ [0,1]^2 to the center region of the 2x2 texel block
+	// Texel centers: (BlockX + 0.5, BlockY + 0.5) to (BlockX + 1.5, BlockY + 1.5)
+	float2 TexelPos = float2(BlockXY) + 0.5 + Xi;
+	float2 UV = TexelPos / float2(TexSize3D.xy);
+
+	// T maps to z: each segment spans 4 slices in the texture
+	// Slice 0 = root, then per-segment: +1 to +4
+	float Z = (0.5 + T * 4.0) / float(TexSize3D.z);
+
+	return float3(UV, Z);
+}
+
+float2 ComputeHairTexCoord2D(int2 BlockXY, float2 Xi, int2 TexSize2D)
+{
+	float2 TexelPos = float2(BlockXY) + 0.5 + Xi;
+	return TexelPos / float2(TexSize2D);
+}
+
+/**
+ * Sample a hair strand position at parametric t ∈ [0,1] along a segment.
+ * Uses the quadratic Bézier layout: 3 intermediate slices per segment.
+ *
+ * @param HairMeshTex  3D hair mesh texture
+ * @param Sampler      Trilinear sampler
+ * @param BlockXY      Bundle block position
+ * @param Xi           Root position within face
+ * @param Segment      Segment index (0..NumLayers-1)
+ * @param T            Parameter within segment [0,1]
+ * @param TexSize3D    3D texture dimensions
+ */
+float3 SampleHairPosition(
+	Texture3D HairMeshTex, SamplerState Sampler,
+	int2 BlockXY, float2 Xi, int Segment, float T,
+	int3 TexSize3D)
+{
+	// Each segment has 3 intermediate slices + 1 layer slice
+	// Quadratic 1: slices [base+0] P0, [base+1] Q1, [base+2] Q2=Mid
+	// Quadratic 2: slices [base+2] Q2=Mid, [base+3] Q3, [base+4] P1(next layer)
+
+	float BaseZ = float(1 + Segment * 4);
+	float2 TexelUV = (float2(BlockXY) + 0.5 + Xi) / float2(TexSize3D.xy);
+
+	if (Segment == 0 && T < 0.001)
+	{
+		// Root vertex: direct sample from root slice
+		float Z = 0.5 / float(TexSize3D.z);
+		return HairMeshTex.SampleLevel(Sampler, float3(TexelUV, Z), 0).xyz;
+	}
+
+	// Determine which quadratic half and local parameter
+	float LocalT;
+	float3 P0_coord, P1_coord, P2_coord;
+
+	if (T <= 0.5)
+	{
+		// First quadratic: Q(t) between P_start, Q1, Mid
+		LocalT = T * 2.0; // remap [0, 0.5] → [0, 1]
+
+		float Z_P0, Z_Q1, Z_Mid;
+		if (Segment == 0)
+		{
+			Z_P0 = 0.5;  // root slice
+		}
+		else
+		{
+			Z_P0 = BaseZ - 0.5;  // previous layer slice (end of previous segment)
+		}
+		Z_Q1  = BaseZ + 0.5;
+		Z_Mid = BaseZ + 1.5;
+
+		P0_coord = float3(TexelUV, Z_P0  / float(TexSize3D.z));
+		P1_coord = float3(TexelUV, Z_Q1  / float(TexSize3D.z));
+		P2_coord = float3(TexelUV, Z_Mid / float(TexSize3D.z));
+	}
+	else
+	{
+		// Second quadratic: Q(t) between Mid, Q3, P_end
+		LocalT = (T - 0.5) * 2.0; // remap [0.5, 1] → [0, 1]
+
+		float Z_Mid = BaseZ + 1.5;
+		float Z_Q3  = BaseZ + 2.5;
+		float Z_End = BaseZ + 3.5;
+
+		P0_coord = float3(TexelUV, Z_Mid / float(TexSize3D.z));
+		P1_coord = float3(TexelUV, Z_Q3  / float(TexSize3D.z));
+		P2_coord = float3(TexelUV, Z_End / float(TexSize3D.z));
+	}
+
+	// Use hardware trilinear to sample the two control points, then do one
+	// de Casteljau step in software (quadratic Bézier evaluation)
+	float3 A = HairMeshTex.SampleLevel(Sampler, P0_coord, 0).xyz;
+	float3 B = HairMeshTex.SampleLevel(Sampler, P1_coord, 0).xyz;
+	float3 C = HairMeshTex.SampleLevel(Sampler, P2_coord, 0).xyz;
+
+	return EvalQuadraticBezier(A, B, C, LocalT);
+}
+
+// ============================================================================
+// Pseudo-random / Hash
+// ============================================================================
+
+uint WangHash(uint Seed)
+{
+	Seed = (Seed ^ 61u) ^ (Seed >> 16u);
+	Seed *= 9u;
+	Seed ^= (Seed >> 4u);
+	Seed *= 0x27d4eb2du;
+	Seed ^= (Seed >> 15u);
+	return Seed;
+}
+
+float HashToFloat(uint H)
+{
+	return float(H & 0x00FFFFFFu) / float(0x01000000u);
+}
+
+float RandFloat(uint Seed0, uint Seed1)
+{
+	return HashToFloat(WangHash(Seed0 ^ WangHash(Seed1)));
+}

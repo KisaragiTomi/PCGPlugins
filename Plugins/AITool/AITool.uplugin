@@ -1,0 +1,18 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "AITool",
+	"Description": "AI-powered tools: NKSR point cloud surface reconstruction, etc.",
+	"Category": "AI",
+	"CreatedBy": "KLW",
+	"EnabledByDefault": true,
+	"CanContainContent": false,
+	"Modules": [
+		{
+			"Name": "AIToolModule",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}

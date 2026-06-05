@@ -1,0 +1,89 @@
+// EnhancedHairCardsDeformation.usf
+// Compute shader for deforming card vertices based on guide simulation.
+// Mode 0 (PERMUTATION_DEFORM_MODE == 0): Static — copy rest to deformed (no-op).
+// Mode 1 (PERMUTATION_DEFORM_MODE == 1): Guide-based deformation (future).
+
+#include "/Engine/Private/Common.ush"
+
+uint VertexCount;
+
+Buffer<float4> RestPositionBuffer;
+Buffer<float4> RestTangentBuffer;
+
+RWBuffer<float4> DeformedPositionBuffer;
+RWBuffer<float4> DeformedTangentBuffer;
+
+#if PERMUTATION_DEFORM_MODE == 1
+// Guide deformation resources (populated when guide simulation is active)
+uint GuideVertexCount;
+float3 GuideRestPositionOffset;
+float3 GuideDeformedPositionOffset;
+
+ByteAddressBuffer GuideRestPositionBuffer;
+ByteAddressBuffer GuideDeformedPositionBuffer;
+ByteAddressBuffer CardsInterpolationBuffer;
+
+struct FCardGuideData
+{
+	uint  VertexIndex;
+	float VertexLerp;
+};
+
+FCardGuideData ReadCardGuideData(ByteAddressBuffer InBuffer, uint InVertexId)
+{
+	const uint4 Data = InBuffer.Load4(InVertexId * 16);
+	FCardGuideData Out;
+	Out.VertexIndex = Data.x;
+	Out.VertexLerp  = asfloat(Data.y);
+	return Out;
+}
+
+float3 ReadGuidePosition(ByteAddressBuffer InBuffer, uint InIndex, float3 InOffset)
+{
+	const uint Address = InIndex * 8; // packed as 2x uint
+	const uint2 D = InBuffer.Load2(Address);
+	float3 P;
+	P.x = f16tof32(D.x);
+	P.y = f16tof32(D.x >> 16);
+	P.z = f16tof32(D.y);
+	return P + InOffset;
+}
+#endif // PERMUTATION_DEFORM_MODE == 1
+
+[numthreads(64, 1, 1)]
+void MainCS(uint DispatchThreadId : SV_DispatchThreadID)
+{
+	if (DispatchThreadId >= VertexCount)
+		return;
+
+	const uint VertexId = DispatchThreadId;
+
+#if PERMUTATION_DEFORM_MODE == 0
+	// Static mode: just copy rest position and tangents
+	DeformedPositionBuffer[VertexId] = RestPositionBuffer[VertexId];
+	DeformedTangentBuffer[VertexId * 2 + 0] = RestTangentBuffer[VertexId * 2 + 0];
+	DeformedTangentBuffer[VertexId * 2 + 1] = RestTangentBuffer[VertexId * 2 + 1];
+
+#elif PERMUTATION_DEFORM_MODE == 1
+	// Guide-based deformation
+	const FCardGuideData GuideData = ReadCardGuideData(CardsInterpolationBuffer, VertexId);
+	const uint GIdx0 = GuideData.VertexIndex;
+	const uint GIdx1 = min(GIdx0 + 1, GuideVertexCount - 1);
+
+	const float3 RestG0 = ReadGuidePosition(GuideRestPositionBuffer, GIdx0, GuideRestPositionOffset);
+	const float3 RestG1 = ReadGuidePosition(GuideRestPositionBuffer, GIdx1, GuideRestPositionOffset);
+	const float3 DefG0  = ReadGuidePosition(GuideDeformedPositionBuffer, GIdx0, GuideDeformedPositionOffset);
+	const float3 DefG1  = ReadGuidePosition(GuideDeformedPositionBuffer, GIdx1, GuideDeformedPositionOffset);
+
+	const float3 RestGuidePos    = lerp(RestG0, RestG1, GuideData.VertexLerp);
+	const float3 DeformedGuidePos = lerp(DefG0, DefG1, GuideData.VertexLerp);
+
+	const float3 Offset = DeformedGuidePos - RestGuidePos;
+	const float4 RestPos = RestPositionBuffer[VertexId];
+	DeformedPositionBuffer[VertexId] = float4(RestPos.xyz + Offset, RestPos.w);
+
+	// Tangents: simple copy for now (proper basis transform requires more data)
+	DeformedTangentBuffer[VertexId * 2 + 0] = RestTangentBuffer[VertexId * 2 + 0];
+	DeformedTangentBuffer[VertexId * 2 + 1] = RestTangentBuffer[VertexId * 2 + 1];
+#endif
+}

@@ -13,6 +13,7 @@ StructuredBuffer<uint> NeighborCounts;
 StructuredBuffer<uint> NeighborIndices;
 StructuredBuffer<uint> ProposalOwners;
 StructuredBuffer<float4> ProposalPositions;
+StructuredBuffer<float4> AxesIn;
 RWStructuredBuffer<float4> RW_TargetPositions;
 RWStructuredBuffer<int4> RW_State0;
 RWStructuredBuffer<int4> RW_State1;
@@ -20,6 +21,7 @@ RWStructuredBuffer<uint> RW_NeighborCounts;
 RWStructuredBuffer<uint> RW_NeighborIndices;
 RWStructuredBuffer<uint> RW_ProposalOwners;
 RWStructuredBuffer<float4> RW_ProposalPositions;
+RWStructuredBuffer<float4> RW_Axes;
 
 uint TargetCount;
 uint SourceCount;
@@ -49,6 +51,63 @@ float DistSq(float3 A, float3 B)
 {
     float3 D = A - B;
     return dot(D, D);
+}
+
+float3 SafeNormalize3(float3 V, float3 Fallback)
+{
+    float LenSq = dot(V, V);
+    if (LenSq <= 1.0e-8f)
+    {
+        return Fallback;
+    }
+    return V * rsqrt(LenSq);
+}
+
+bool IsValidTargetIndex(int Index)
+{
+    return Index >= 0 && Index < (int)TargetCount;
+}
+
+float3 OrientAxisToReference(float3 Axis, float3 Reference)
+{
+    return dot(Axis, Reference) < 0.0f ? -Axis : Axis;
+}
+
+float3 BuildSpaceColonizationRawAxis(uint Index)
+{
+    int4 NodeState1 = State1[Index];
+    int PrevIndex = NodeState1.y;
+    int NextIndex = NodeState1.z;
+    float3 Position = TargetPositions[Index].xyz;
+    float3 Axis = float3(0.0f, 0.0f, 0.0f);
+
+    if (IsValidTargetIndex(PrevIndex) && IsValidTargetIndex(NextIndex))
+    {
+        Axis = TargetPositions[NextIndex].xyz - TargetPositions[PrevIndex].xyz;
+    }
+    else if (IsValidTargetIndex(NextIndex))
+    {
+        Axis = TargetPositions[NextIndex].xyz - Position;
+    }
+    else if (IsValidTargetIndex(PrevIndex))
+    {
+        Axis = Position - TargetPositions[PrevIndex].xyz;
+    }
+
+    return SafeNormalize3(Axis, float3(1.0f, 0.0f, 0.0f));
+}
+
+void AccumulateNeighborAxis(int NeighborIndex, float3 CenterAxis, float Weight, inout float3 AxisSum, inout float WeightSum)
+{
+    if (!IsValidTargetIndex(NeighborIndex))
+    {
+        return;
+    }
+
+    float3 Axis = SafeNormalize3(AxesIn[NeighborIndex].xyz, CenterAxis);
+    Axis = OrientAxisToReference(Axis, CenterAxis);
+    AxisSum += Axis * Weight;
+    WeightSum += Weight;
 }
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
@@ -293,4 +352,38 @@ void CommitSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThreadI
     TargetState1.w = 1;
     RW_State0[TargetIndex] = TargetState0;
     RW_State1[TargetIndex] = TargetState1;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void BuildSpaceColonizationAxesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint Index = DispatchThreadId.x;
+    if (Index >= TargetCount)
+    {
+        return;
+    }
+
+    float3 Axis = BuildSpaceColonizationRawAxis(Index);
+    RW_Axes[Index] = float4(Axis, 0.0f);
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void SmoothSpaceColonizationAxesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint Index = DispatchThreadId.x;
+    if (Index >= TargetCount)
+    {
+        return;
+    }
+
+    int4 NodeState1 = State1[Index];
+    float3 CenterAxis = SafeNormalize3(AxesIn[Index].xyz, float3(1.0f, 0.0f, 0.0f));
+    float3 AxisSum = CenterAxis * 2.0f;
+    float WeightSum = 2.0f;
+
+    AccumulateNeighborAxis(NodeState1.y, CenterAxis, 1.0f, AxisSum, WeightSum);
+    AccumulateNeighborAxis(NodeState1.z, CenterAxis, 1.0f, AxisSum, WeightSum);
+
+    float3 SmoothedAxis = SafeNormalize3(AxisSum / max(WeightSum, 1.0e-8f), CenterAxis);
+    RW_Axes[Index] = float4(OrientAxisToReference(SmoothedAxis, CenterAxis), 0.0f);
 }

@@ -1,0 +1,23 @@
+// cppcheck suppression list for mcp-unreal C++ plugin (local-only).
+//
+// UE headers are not available for analysis, so many false positives arise
+// from unresolved macros, missing system includes, and UE memory management.
+//
+// Usage:
+//   make cpp-check
+
+// UE system headers are not available.
+missingIncludeSystem
+missingInclude
+
+// UE macros (UCLASS, UPROPERTY, GENERATED_BODY, etc.) are unknown.
+unknownMacro
+
+// UE uses NewObject/MakeShareable — not raw new/delete.
+memleak
+
+// Static functions appear unused without UE module linkage.
+unusedFunction
+
+// UE-generated code triggers this.
+unmatchedSuppression

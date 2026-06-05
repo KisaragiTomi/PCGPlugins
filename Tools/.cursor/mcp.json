@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "CursorMCP对话插件": {
+      "command": "node",
+      "args": [
+        "c:\\Users\\KLW\\.cursor\\extensions\\local.xw-cursor-message-8.8.8\\dist\\mcp-server.mjs"
+      ],
+      "env": {
+        "MESSENGER_DATA_DIR": "C:\\Users\\KLW\\.moyu-message\\198e98b5019e"
+      }
+    }
+  }
+}

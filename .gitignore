@@ -9,6 +9,8 @@ DerivedDataCache/
 Intermediate/
 Saved/
 
+/mcp-unreal/
+
 *.log
 build_output*.txt
 *.sln.DotSettings.user

@@ -1,0 +1,41 @@
+# clang-format configuration for mcp-unreal C++ plugin.
+# Based on Google C++ Style Guide with UE-specific overrides.
+#
+# Usage:
+#   clang-format -i plugin/Source/**/*.cpp plugin/Source/**/*.h
+#   make cpp-fmt          # format in-place
+#   make cpp-fmt-check    # dry-run check (CI)
+
+BasedOnStyle: Google
+
+# Override: UE types are verbose (TSharedPtr<FJsonObject>, etc.)
+ColumnLimit: 100
+
+# UE has strict PCH-first include ordering — never sort.
+SortIncludes: Never
+
+# Code currently indents inside namespace blocks; keep that.
+NamespaceIndentation: All
+
+# UE macros that act as complete statements (no trailing semicolon).
+StatementMacros:
+  - IMPLEMENT_MODULE
+  - DEFINE_LOG_CATEGORY
+  - DECLARE_LOG_CATEGORY_EXTERN
+  - UE_LOG
+  - GENERATED_BODY
+
+# UE iterator macros that behave like for-each loops.
+ForEachMacros:
+  - TActorIterator
+  - TFieldIterator
+
+# Keep lambda body on same line if short enough.
+AllowShortLambdasOnASingleLine: Inline
+
+# Pointer/reference alignment: Google style (Type* ptr).
+PointerAlignment: Left
+
+# Penalties — prefer breaking after return type over exceeding column limit.
+PenaltyReturnTypeOnItsOwnLine: 200
+PenaltyBreakBeforeFirstCallParameter: 19

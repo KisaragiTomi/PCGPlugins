@@ -14,6 +14,7 @@
 #include "Kismet/KismetSystemLibrary.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "DrawDebugHelpers.h"
 #include "GeometryScript/MeshBasicEditFunctions.h"
 #include "GeometryScript/MeshNormalsFunctions.h"
 #include "GeometryGeneral.h"
@@ -43,22 +44,52 @@ class FVineVisualizationMeshCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPoints)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, PathPointMeta)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, PathPointCurveU)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, MeshTriangleVertices)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPointTangents)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPointNormals)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, SegmentMeta)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, GridCellOffsets)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, GridTriangleIndices)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_OutVertices)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float2>, RW_OutUVs)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_OutIndices)
 		SHADER_PARAMETER(uint32, PathPointCount)
 		SHADER_PARAMETER(uint32, SegmentCount)
-		SHADER_PARAMETER(uint32, MeshTriangleCount)
 		SHADER_PARAMETER(uint32, OutputVertexCount)
 		SHADER_PARAMETER(uint32, OutputIndexCount)
 		SHADER_PARAMETER(uint32, ProfileCount)
 		SHADER_PARAMETER(uint32, bTube)
 		SHADER_PARAMETER(float, CircleScale)
 		SHADER_PARAMETER(float, LineScale)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FVineVisualizationMeshCS, "/Plugin/PCGPlugins/Shaders/Private/VineVisualization.usf", "BuildVineVisualizationMeshCS", SF_Compute);
+
+class FVineVisualizationBuildAxesCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FVineVisualizationBuildAxesCS);
+	SHADER_USE_PARAMETER_STRUCT(FVineVisualizationBuildAxesCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPoints)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPointAxes)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, PathPointMeta)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, MeshTriangleVertices)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, GridCellOffsets)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, GridTriangleIndices)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_PathPointTangents)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_PathPointNormals)
+		SHADER_PARAMETER(uint32, PathPointCount)
+		SHADER_PARAMETER(uint32, MeshTriangleCount)
 		SHADER_PARAMETER(FVector3f, GridOrigin)
 		SHADER_PARAMETER(float, GridCellSize)
 		SHADER_PARAMETER(FIntVector, GridDimensions)
@@ -78,7 +109,88 @@ class FVineVisualizationMeshCS : public FGlobalShader
 	}
 };
 
-IMPLEMENT_GLOBAL_SHADER(FVineVisualizationMeshCS, "/Plugin/PCGPlugins/Shaders/Private/VineVisualization.usf", "BuildVineVisualizationMeshCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVineVisualizationBuildAxesCS, "/Plugin/PCGPlugins/Shaders/Private/VineVisualization.usf", "BuildVineVisualizationAxesCS", SF_Compute);
+
+// Voxel-based surface projection shader — replaces the BVH triangle lookup.
+class FVineVisualizationVoxelCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FVineVisualizationVoxelCS);
+	SHADER_USE_PARAMETER_STRUCT(FVineVisualizationVoxelCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPoints)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, PathPointMeta)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, PathPointCurveU)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPointTangents)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPointNormals)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, SegmentMeta)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, VoxelCells)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelNormals)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelTargetPositions)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_OutVertices)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float2>, RW_OutUVs)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_OutIndices)
+		SHADER_PARAMETER(uint32, PathPointCount)
+		SHADER_PARAMETER(uint32, SegmentCount)
+		SHADER_PARAMETER(uint32, OutputVertexCount)
+		SHADER_PARAMETER(uint32, OutputIndexCount)
+		SHADER_PARAMETER(uint32, ProfileCount)
+		SHADER_PARAMETER(uint32, bTube)
+		SHADER_PARAMETER(float, CircleScale)
+		SHADER_PARAMETER(float, LineScale)
+		SHADER_PARAMETER(FVector3f, VoxelOrigin)
+		SHADER_PARAMETER(float, VoxelSize)
+		SHADER_PARAMETER(uint32, VoxelCount)
+		SHADER_PARAMETER(float, VinesOffset)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FVineVisualizationVoxelCS, "/Plugin/PCGPlugins/Shaders/Private/VineVisualizationVoxel.usf", "BuildVineVisualizationVoxelCS", SF_Compute);
+
+class FVineVisualizationVoxelBuildAxesCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FVineVisualizationVoxelBuildAxesCS);
+	SHADER_USE_PARAMETER_STRUCT(FVineVisualizationVoxelBuildAxesCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPoints)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPointAxes)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, PathPointMeta)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, VoxelCells)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelNormals)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelTargetPositions)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_PathPointTangents)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_PathPointNormals)
+		SHADER_PARAMETER(uint32, PathPointCount)
+		SHADER_PARAMETER(FVector3f, VoxelOrigin)
+		SHADER_PARAMETER(float, VoxelSize)
+		SHADER_PARAMETER(uint32, VoxelCount)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FVineVisualizationVoxelBuildAxesCS, "/Plugin/PCGPlugins/Shaders/Private/VineVisualizationVoxel.usf", "BuildVineVisualizationVoxelAxesCS", SF_Compute);
 
 // Uniform grid acceleration structure for GPU nearest-triangle queries
 struct FVineVisualizationGrid
@@ -412,6 +524,51 @@ static float SampleScaleArrayByAlpha(const TArray<float>& Scales, double Alpha, 
 	return FMath::Lerp(Scales[IndexA], Scales[IndexB], float(ScaledIndex - double(IndexA)));
 }
 
+static FVector NormalizeVineAxisOrFallback(const FVector& Axis, const FVector& FallbackAxis = FVector::ZeroVector)
+{
+	const FVector NormalizedAxis = Axis.GetSafeNormal();
+	return NormalizedAxis.IsNearlyZero() ? FallbackAxis.GetSafeNormal() : NormalizedAxis;
+}
+
+static FVector LerpVineAxes(const FVector& AxisA, const FVector& AxisB, double Alpha, const FVector& FallbackAxis = FVector::ZeroVector)
+{
+	const FVector NormalizedA = NormalizeVineAxisOrFallback(AxisA);
+	FVector NormalizedB = NormalizeVineAxisOrFallback(AxisB);
+	if (NormalizedA.IsNearlyZero())
+	{
+		return NormalizedB.IsNearlyZero() ? FallbackAxis.GetSafeNormal() : NormalizedB;
+	}
+	if (NormalizedB.IsNearlyZero())
+	{
+		return NormalizedA;
+	}
+	if (FVector::DotProduct(NormalizedA, NormalizedB) < 0.0)
+	{
+		NormalizedB *= -1.0;
+	}
+
+	return NormalizeVineAxisOrFallback(FMath::Lerp(NormalizedA, NormalizedB, Alpha), NormalizedA);
+}
+
+static FVector SampleAxisArrayByAlpha(const TArray<FVector>& Axes, double Alpha, const FVector& FallbackAxis = FVector::ZeroVector)
+{
+	if (Axes.Num() == 0)
+	{
+		return FallbackAxis.GetSafeNormal();
+	}
+
+	if (Axes.Num() == 1)
+	{
+		return NormalizeVineAxisOrFallback(Axes[0], FallbackAxis);
+	}
+
+	const double ClampedAlpha = FMath::Clamp(Alpha, 0.0, 1.0);
+	const double ScaledIndex = ClampedAlpha * double(Axes.Num() - 1);
+	const int32 IndexA = FMath::Clamp(FMath::FloorToInt(ScaledIndex), 0, Axes.Num() - 1);
+	const int32 IndexB = FMath::Min(IndexA + 1, Axes.Num() - 1);
+	return LerpVineAxes(Axes[IndexA], Axes[IndexB], ScaledIndex - double(IndexA), FallbackAxis);
+}
+
 static void BuildPreparedLinePointScales(
 	const FGeometryScriptPolyPath& SourceLine,
 	const TArray<float>* SourcePointScales,
@@ -489,6 +646,83 @@ static void BuildPreparedLinePointScales(
 	}
 }
 
+static void BuildPreparedLinePointAxes(
+	const FGeometryScriptPolyPath& SourceLine,
+	const TArray<FVector>* SourcePointAxes,
+	int32 OutputPointCount,
+	TArray<FVector>& OutPointAxes)
+{
+	OutPointAxes.Reset();
+	if (OutputPointCount <= 0)
+	{
+		return;
+	}
+
+	OutPointAxes.SetNumUninitialized(OutputPointCount);
+	if (!SourcePointAxes || SourcePointAxes->Num() == 0)
+	{
+		for (FVector& PointAxis : OutPointAxes)
+		{
+			PointAxis = FVector::ZeroVector;
+		}
+		return;
+	}
+
+	const int32 SourceAxisCount = SourcePointAxes->Num();
+	if (SourceAxisCount == 1)
+	{
+		const FVector Axis = NormalizeVineAxisOrFallback((*SourcePointAxes)[0]);
+		for (FVector& PointAxis : OutPointAxes)
+		{
+			PointAxis = Axis;
+		}
+		return;
+	}
+
+	if (SourceLine.Path.IsValid() && SourceLine.Path->Num() == SourceAxisCount && SourceAxisCount > 1)
+	{
+		const TArray<FVector>& SourcePoints = *SourceLine.Path;
+		TArray<double> CumulativeLengths;
+		CumulativeLengths.SetNumZeroed(SourceAxisCount);
+		for (int32 PointIndex = 1; PointIndex < SourceAxisCount; ++PointIndex)
+		{
+			CumulativeLengths[PointIndex] = CumulativeLengths[PointIndex - 1] + FVector::Dist(SourcePoints[PointIndex - 1], SourcePoints[PointIndex]);
+		}
+
+		const double TotalLength = CumulativeLengths.Last();
+		if (TotalLength > UE_SMALL_NUMBER)
+		{
+			int32 SourceSegmentIndex = 0;
+			for (int32 OutputIndex = 0; OutputIndex < OutputPointCount; ++OutputIndex)
+			{
+				const double Alpha = OutputPointCount > 1 ? double(OutputIndex) / double(OutputPointCount - 1) : 0.0;
+				const double TargetLength = Alpha * TotalLength;
+				while (SourceSegmentIndex + 1 < SourceAxisCount && CumulativeLengths[SourceSegmentIndex + 1] < TargetLength)
+				{
+					++SourceSegmentIndex;
+				}
+
+				if (SourceSegmentIndex + 1 >= SourceAxisCount)
+				{
+					OutPointAxes[OutputIndex] = NormalizeVineAxisOrFallback((*SourcePointAxes)[SourceAxisCount - 1]);
+					continue;
+				}
+
+				const double SegmentLength = CumulativeLengths[SourceSegmentIndex + 1] - CumulativeLengths[SourceSegmentIndex];
+				const double SegmentAlpha = SegmentLength > UE_SMALL_NUMBER ? (TargetLength - CumulativeLengths[SourceSegmentIndex]) / SegmentLength : 0.0;
+				OutPointAxes[OutputIndex] = LerpVineAxes((*SourcePointAxes)[SourceSegmentIndex], (*SourcePointAxes)[SourceSegmentIndex + 1], SegmentAlpha);
+			}
+			return;
+		}
+	}
+
+	for (int32 OutputIndex = 0; OutputIndex < OutputPointCount; ++OutputIndex)
+	{
+		const double Alpha = OutputPointCount > 1 ? double(OutputIndex) / double(OutputPointCount - 1) : 0.0;
+		OutPointAxes[OutputIndex] = SampleAxisArrayByAlpha(*SourcePointAxes, Alpha);
+	}
+}
+
 static bool TryFindNearestPointOnVinePrefixMesh(
 	UDynamicMesh* PrefixMesh,
 	const FGeometryScriptDynamicMeshBVH& BVH,
@@ -510,6 +744,18 @@ static void RebuildVinePointScalesForEditedLine(
 	PointScales = MoveTemp(NewPointScales);
 }
 
+static void RebuildVinePointAxesForEditedLine(
+	const FGeometryScriptPolyPath& PreviousLine,
+	const FGeometryScriptPolyPath& NewLine,
+	TArray<FVector>& PointAxes)
+{
+	TArray<FVector> NewPointAxes;
+	const int32 NewPointCount = NewLine.Path.IsValid() ? NewLine.Path->Num() : 0;
+	const TArray<FVector>* ExistingPointAxes = PointAxes.Num() > 0 ? &PointAxes : nullptr;
+	BuildPreparedLinePointAxes(PreviousLine, ExistingPointAxes, NewPointCount, NewPointAxes);
+	PointAxes = MoveTemp(NewPointAxes);
+}
+
 static uint32 BuildVineVisualizationPointSortKey(const FVector& Point)
 {
 	return BuildVineVisualizationRandomSeed(FVector::ZeroVector, Point);
@@ -529,11 +775,13 @@ static bool PrepareVineVisualizationLinesCPU(
 	const TArray<float>& InLineSourceScales,
 	const TArray<FVector>& InLineSourceLocations,
 	const TArray<FVineLinePointScaleData>& InLinePointScales,
+	const TArray<FVineLinePointAxisData>& InLinePointAxes,
 	UDynamicMesh* PrefixMesh,
 	const FGeometryScriptDynamicMeshBVH& BVH,
 	TArray<FGeometryScriptPolyPath>& OutLines,
 	TArray<float>& OutLineSourceScales,
-	TArray<FVineLinePointScaleData>& OutLinePointScales)
+	TArray<FVineLinePointScaleData>& OutLinePointScales,
+	TArray<FVineLinePointAxisData>& OutLinePointAxes)
 {
 	OutLines.Reset();
 	OutLines.Reserve(Lines.Num());
@@ -541,6 +789,8 @@ static bool PrepareVineVisualizationLinesCPU(
 	OutLineSourceScales.Reserve(Lines.Num());
 	OutLinePointScales.Reset();
 	OutLinePointScales.Reserve(Lines.Num());
+	OutLinePointAxes.Reset();
+	OutLinePointAxes.Reserve(Lines.Num());
 
 	if (VV.ResampleLength <= KINDA_SMALL_NUMBER)
 	{
@@ -553,6 +803,8 @@ static bool PrepareVineVisualizationLinesCPU(
 	WorkingLineSourceScales.Reserve(Lines.Num());
 	TArray<FVineLinePointScaleData> WorkingLinePointScales;
 	WorkingLinePointScales.Reserve(Lines.Num());
+	TArray<FVineLinePointAxisData> WorkingLinePointAxes;
+	WorkingLinePointAxes.Reserve(Lines.Num());
 
 	for (int32 LineIdx = 0; LineIdx < Lines.Num(); ++LineIdx)
 	{
@@ -570,10 +822,13 @@ static bool PrepareVineVisualizationLinesCPU(
 
 		const float FallbackScale = InLineSourceScales.IsValidIndex(LineIdx) ? InLineSourceScales[LineIdx] : 1.0f;
 		const TArray<float>* InputPointScales = InLinePointScales.IsValidIndex(LineIdx) ? &InLinePointScales[LineIdx].Values : nullptr;
+		const TArray<FVector>* InputPointAxes = InLinePointAxes.IsValidIndex(LineIdx) ? &InLinePointAxes[LineIdx].Values : nullptr;
 		WorkingLines.Add(Line);
 		WorkingLineSourceScales.Add(FallbackScale);
 		FVineLinePointScaleData& WorkingScaleData = WorkingLinePointScales.AddDefaulted_GetRef();
 		BuildPreparedLinePointScales(Line, InputPointScales, Line.Path->Num(), FallbackScale, WorkingScaleData.Values);
+		FVineLinePointAxisData& WorkingAxisData = WorkingLinePointAxes.AddDefaulted_GetRef();
+		BuildPreparedLinePointAxes(Line, InputPointAxes, Line.Path->Num(), WorkingAxisData.Values);
 	}
 
 	if (WorkingLines.Num() == 0)
@@ -587,6 +842,8 @@ static bool PrepareVineVisualizationLinesCPU(
 	NoiseLineSourceScales.Reserve(WorkingLines.Num());
 	TArray<FVineLinePointScaleData> NoiseLinePointScales;
 	NoiseLinePointScales.Reserve(WorkingLines.Num());
+	TArray<FVineLinePointAxisData> NoiseLinePointAxes;
+	NoiseLinePointAxes.Reserve(WorkingLines.Num());
 
 	TArray<FVector> SampleRangePointsSum;
 	FGeometryScriptSpatialQueryOptions Options;
@@ -599,6 +856,7 @@ static bool PrepareVineVisualizationLinesCPU(
 		}
 
 		TArray<float> CurrentPointScales = WorkingLinePointScales[LineIdx].Values;
+		TArray<FVector> CurrentPointAxes = WorkingLinePointAxes[LineIdx].Values;
 		const float FallbackScale = WorkingLineSourceScales.IsValidIndex(LineIdx) ? WorkingLineSourceScales[LineIdx] : 1.0f;
 		const float ArcLength = UE::Geometry::CurveUtil::ArcLength<float, FVector>(*Line.Path, false);
 		const int32 NumIterations = int32(ArcLength / VV.ResampleLength);
@@ -610,9 +868,11 @@ static bool PrepareVineVisualizationLinesCPU(
 		FGeometryScriptPolyPath PreviousLine = ClonePolyPath(Line);
 		Line = UPolyLine::SmoothLine(Line, 3);
 		RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
+		RebuildVinePointAxesForEditedLine(PreviousLine, Line, CurrentPointAxes);
 		PreviousLine = ClonePolyPath(Line);
 		Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
 		RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
+		RebuildVinePointAxesForEditedLine(PreviousLine, Line, CurrentPointAxes);
 		if (!Line.Path.IsValid() || Line.Path->Num() < 3)
 		{
 			continue;
@@ -640,6 +900,7 @@ static bool PrepareVineVisualizationLinesCPU(
 			PreviousLine = ClonePolyPath(Line);
 			Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
 			RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
+			RebuildVinePointAxesForEditedLine(PreviousLine, Line, CurrentPointAxes);
 			if (!Line.Path.IsValid() || Line.Path->Num() < 3)
 			{
 				break;
@@ -666,6 +927,8 @@ static bool PrepareVineVisualizationLinesCPU(
 		NoiseLineSourceScales.Add(FallbackScale);
 		FVineLinePointScaleData& NoiseScaleData = NoiseLinePointScales.AddDefaulted_GetRef();
 		NoiseScaleData.Values = MoveTemp(CurrentPointScales);
+		FVineLinePointAxisData& NoiseAxisData = NoiseLinePointAxes.AddDefaulted_GetRef();
+		NoiseAxisData.Values = MoveTemp(CurrentPointAxes);
 	}
 
 	if (NoiseLines.Num() == 0 || SampleRangePointsSum.Num() == 0)
@@ -703,6 +966,7 @@ static bool PrepareVineVisualizationLinesCPU(
 		}
 
 		TArray<float> CurrentPointScales = NoiseLinePointScales[LineIdx].Values;
+		TArray<FVector> CurrentPointAxes = NoiseLinePointAxes[LineIdx].Values;
 		const float FallbackScale = NoiseLineSourceScales.IsValidIndex(LineIdx) ? NoiseLineSourceScales[LineIdx] : 1.0f;
 
 		if (!bMainVine)
@@ -732,12 +996,15 @@ static bool PrepareVineVisualizationLinesCPU(
 			FGeometryScriptPolyPath PreviousLine = ClonePolyPath(Line);
 			Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
 			RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
+			RebuildVinePointAxesForEditedLine(PreviousLine, Line, CurrentPointAxes);
 			PreviousLine = ClonePolyPath(Line);
 			Line = UPolyLine::SmoothLine(Line, 3);
 			RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
+			RebuildVinePointAxesForEditedLine(PreviousLine, Line, CurrentPointAxes);
 			PreviousLine = ClonePolyPath(Line);
 			Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
 			RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
+			RebuildVinePointAxesForEditedLine(PreviousLine, Line, CurrentPointAxes);
 
 			if (!Line.Path.IsValid() || Line.Path->Num() < 3)
 			{
@@ -778,9 +1045,11 @@ static bool PrepareVineVisualizationLinesCPU(
 		FGeometryScriptPolyPath PreviousLine = ClonePolyPath(Line);
 		Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
 		RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
+		RebuildVinePointAxesForEditedLine(PreviousLine, Line, CurrentPointAxes);
 		PreviousLine = ClonePolyPath(Line);
 		Line = UPolyLine::SmoothLine(Line, 1);
 		RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
+		RebuildVinePointAxesForEditedLine(PreviousLine, Line, CurrentPointAxes);
 
 		if (!Line.Path.IsValid() || Line.Path->Num() < 3)
 		{
@@ -793,11 +1062,296 @@ static bool PrepareVineVisualizationLinesCPU(
 			BuildPreparedLinePointScales(Line, &CurrentPointScales, Line.Path->Num(), FallbackScale, FixedPointScales);
 			CurrentPointScales = MoveTemp(FixedPointScales);
 		}
+		if (CurrentPointAxes.Num() != Line.Path->Num())
+		{
+			TArray<FVector> FixedPointAxes;
+			BuildPreparedLinePointAxes(Line, &CurrentPointAxes, Line.Path->Num(), FixedPointAxes);
+			CurrentPointAxes = MoveTemp(FixedPointAxes);
+		}
 
 		OutLines.Add(Line);
 		OutLineSourceScales.Add(FallbackScale);
 		FVineLinePointScaleData& OutScaleData = OutLinePointScales.AddDefaulted_GetRef();
 		OutScaleData.Values = MoveTemp(CurrentPointScales);
+		FVineLinePointAxisData& OutAxisData = OutLinePointAxes.AddDefaulted_GetRef();
+		OutAxisData.Values = MoveTemp(CurrentPointAxes);
+	}
+
+	return OutLines.Num() > 0;
+}
+
+// GPU visualization preprocessing keeps only path shaping on CPU.
+// Surface projection, normal sampling, and VinesOffset are resolved in VineVisualizationVoxel.usf.
+static bool PrepareVineVisualizationLinesGPU(
+	const TArray<FGeometryScriptPolyPath>& Lines,
+	const FVineVisualization& VV,
+	bool bMainVine,
+	const TArray<float>& InLineSourceScales,
+	const TArray<FVector>& InLineSourceLocations,
+	const TArray<FVineLinePointScaleData>& InLinePointScales,
+	const TArray<FVineLinePointAxisData>& InLinePointAxes,
+	TArray<FGeometryScriptPolyPath>& OutLines,
+	TArray<float>& OutLineSourceScales,
+	TArray<FVineLinePointScaleData>& OutLinePointScales,
+	TArray<FVineLinePointAxisData>& OutLinePointAxes)
+{
+	OutLines.Reset();
+	OutLines.Reserve(Lines.Num());
+	OutLineSourceScales.Reset();
+	OutLineSourceScales.Reserve(Lines.Num());
+	OutLinePointScales.Reset();
+	OutLinePointScales.Reserve(Lines.Num());
+	OutLinePointAxes.Reset();
+	OutLinePointAxes.Reserve(Lines.Num());
+
+	if (VV.ResampleLength <= KINDA_SMALL_NUMBER)
+	{
+		return false;
+	}
+
+	TArray<FGeometryScriptPolyPath> WorkingLines;
+	WorkingLines.Reserve(Lines.Num());
+	TArray<float> WorkingLineSourceScales;
+	WorkingLineSourceScales.Reserve(Lines.Num());
+	TArray<FVineLinePointScaleData> WorkingLinePointScales;
+	WorkingLinePointScales.Reserve(Lines.Num());
+	TArray<FVineLinePointAxisData> WorkingLinePointAxes;
+	WorkingLinePointAxes.Reserve(Lines.Num());
+
+	for (int32 LineIdx = 0; LineIdx < Lines.Num(); ++LineIdx)
+	{
+		const FGeometryScriptPolyPath& InputLine = Lines[LineIdx];
+		if (!InputLine.Path.IsValid() || InputLine.Path->Num() < 2)
+		{
+			continue;
+		}
+
+		FGeometryScriptPolyPath Line = ClonePolyPath(InputLine);
+		if (InLineSourceLocations.IsValidIndex(LineIdx))
+		{
+			ApplyVineVisualizationSCPointOffset(Line, InLineSourceLocations[LineIdx]);
+		}
+
+		const float FallbackScale = InLineSourceScales.IsValidIndex(LineIdx) ? InLineSourceScales[LineIdx] : 1.0f;
+		const TArray<float>* InputPointScales = InLinePointScales.IsValidIndex(LineIdx) ? &InLinePointScales[LineIdx].Values : nullptr;
+		const TArray<FVector>* InputPointAxes = InLinePointAxes.IsValidIndex(LineIdx) ? &InLinePointAxes[LineIdx].Values : nullptr;
+		WorkingLines.Add(Line);
+		WorkingLineSourceScales.Add(FallbackScale);
+		FVineLinePointScaleData& WorkingScaleData = WorkingLinePointScales.AddDefaulted_GetRef();
+		BuildPreparedLinePointScales(Line, InputPointScales, Line.Path->Num(), FallbackScale, WorkingScaleData.Values);
+		FVineLinePointAxisData& WorkingAxisData = WorkingLinePointAxes.AddDefaulted_GetRef();
+		BuildPreparedLinePointAxes(Line, InputPointAxes, Line.Path->Num(), WorkingAxisData.Values);
+	}
+
+	if (WorkingLines.Num() == 0)
+	{
+		return false;
+	}
+
+	TArray<FGeometryScriptPolyPath> NoiseLines;
+	NoiseLines.Reserve(WorkingLines.Num());
+	TArray<float> NoiseLineSourceScales;
+	NoiseLineSourceScales.Reserve(WorkingLines.Num());
+	TArray<FVineLinePointScaleData> NoiseLinePointScales;
+	NoiseLinePointScales.Reserve(WorkingLines.Num());
+	TArray<FVineLinePointAxisData> NoiseLinePointAxes;
+	NoiseLinePointAxes.Reserve(WorkingLines.Num());
+
+	TArray<FVector> SampleRangePointsSum;
+	for (int32 LineIdx = 0; LineIdx < WorkingLines.Num(); ++LineIdx)
+	{
+		FGeometryScriptPolyPath Line = ClonePolyPath(WorkingLines[LineIdx]);
+		if (!Line.Path.IsValid())
+		{
+			continue;
+		}
+
+		TArray<float> CurrentPointScales = WorkingLinePointScales[LineIdx].Values;
+		TArray<FVector> CurrentPointAxes = WorkingLinePointAxes[LineIdx].Values;
+		const float FallbackScale = WorkingLineSourceScales.IsValidIndex(LineIdx) ? WorkingLineSourceScales[LineIdx] : 1.0f;
+		const float ArcLength = UE::Geometry::CurveUtil::ArcLength<float, FVector>(*Line.Path, false);
+		const int32 NumIterations = int32(ArcLength / VV.ResampleLength);
+		if (NumIterations < 2)
+		{
+			continue;
+		}
+
+		FGeometryScriptPolyPath PreviousLine = ClonePolyPath(Line);
+		Line = UPolyLine::SmoothLine(Line, 3);
+		RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
+		RebuildVinePointAxesForEditedLine(PreviousLine, Line, CurrentPointAxes);
+		PreviousLine = ClonePolyPath(Line);
+		Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
+		RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
+		RebuildVinePointAxesForEditedLine(PreviousLine, Line, CurrentPointAxes);
+		if (!Line.Path.IsValid() || Line.Path->Num() < 3)
+		{
+			continue;
+		}
+
+		for (int32 IterationIndex = 0; IterationIndex < 10; ++IterationIndex)
+		{
+			const int32 VertexCount = Line.Path->Num();
+			for (int32 PointIndex = 0; PointIndex < VertexCount; ++PointIndex)
+			{
+				FVector& VertexLocation = (*Line.Path)[PointIndex];
+
+				UNoise::CurlNoise(VertexLocation, VertexLocation, FVector::ZeroVector, VV.CurlNoiseScale / 10.0f, VV.CurlNoiseFre);
+				const FVector NoisePos = (FVector)(VV.PerlinNoiseFre / 100.0f * VertexLocation);
+				const float OffsetNoise = VV.PerlinNoiseScale * FMath::PerlinNoise3D(NoisePos);
+				const float PerlinOffset = VV.CurveControl ? VV.CurveControl->GetUnadjustedLinearColorValue(PointIndex / double(VertexCount - 1)).R : 0.0f;
+				VertexLocation.X += OffsetNoise * PerlinOffset * (1.0f - float(bMainVine));
+			}
+
+			PreviousLine = ClonePolyPath(Line);
+			Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
+			RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
+			RebuildVinePointAxesForEditedLine(PreviousLine, Line, CurrentPointAxes);
+			if (!Line.Path.IsValid() || Line.Path->Num() < 3)
+			{
+				break;
+			}
+		}
+
+		if (!Line.Path.IsValid() || Line.Path->Num() < 3)
+		{
+			continue;
+		}
+
+		for (FVector& VertexLocation : *Line.Path)
+		{
+			UNoise::CurlNoise(VertexLocation, VertexLocation, FVector::ZeroVector, VV.CurlNoiseScale / 10.0f, VV.CurlNoiseFre);
+		}
+
+		const int32 SampleCount = FMath::Clamp(FMath::FloorToInt(float(Line.Path->Num()) * 0.8f), 0, Line.Path->Num());
+		for (int32 PointIndex = 0; PointIndex < SampleCount; ++PointIndex)
+		{
+			SampleRangePointsSum.Add((*Line.Path)[PointIndex]);
+		}
+
+		NoiseLines.Add(Line);
+		NoiseLineSourceScales.Add(FallbackScale);
+		FVineLinePointScaleData& NoiseScaleData = NoiseLinePointScales.AddDefaulted_GetRef();
+		NoiseScaleData.Values = MoveTemp(CurrentPointScales);
+		FVineLinePointAxisData& NoiseAxisData = NoiseLinePointAxes.AddDefaulted_GetRef();
+		NoiseAxisData.Values = MoveTemp(CurrentPointAxes);
+	}
+
+	if (NoiseLines.Num() == 0 || SampleRangePointsSum.Num() == 0)
+	{
+		return false;
+	}
+
+	SampleRangePointsSum.Sort([](const FVector& A, const FVector& B)
+	{
+		const uint32 AKey = BuildVineVisualizationPointSortKey(A);
+		const uint32 BKey = BuildVineVisualizationPointSortKey(B);
+		if (AKey != BKey)
+		{
+			return AKey < BKey;
+		}
+		if (!FMath::IsNearlyEqual(A.X, B.X))
+		{
+			return A.X < B.X;
+		}
+		if (!FMath::IsNearlyEqual(A.Y, B.Y))
+		{
+			return A.Y < B.Y;
+		}
+		return A.Z < B.Z;
+	});
+	const int32 ReducedSampleCount = FMath::Max(1, SampleRangePointsSum.Num() / 15);
+	SampleRangePointsSum.SetNum(ReducedSampleCount);
+
+	for (int32 LineIdx = 0; LineIdx < NoiseLines.Num(); ++LineIdx)
+	{
+		FGeometryScriptPolyPath Line = ClonePolyPath(NoiseLines[LineIdx]);
+		if (!Line.Path.IsValid() || Line.Path->Num() < 3)
+		{
+			continue;
+		}
+
+		TArray<float> CurrentPointScales = NoiseLinePointScales[LineIdx].Values;
+		TArray<FVector> CurrentPointAxes = NoiseLinePointAxes[LineIdx].Values;
+		const float FallbackScale = NoiseLineSourceScales.IsValidIndex(LineIdx) ? NoiseLineSourceScales[LineIdx] : 1.0f;
+
+		if (!bMainVine)
+		{
+			const int32 VertexCount = Line.Path->Num();
+			for (int32 PointIndex = 0; PointIndex < VertexCount; ++PointIndex)
+			{
+				FVector& VertexLocation = (*Line.Path)[PointIndex];
+				const int32 NearPointIndex = UPointFunction::FindNearPointIteration(SampleRangePointsSum, VertexLocation);
+				if (!SampleRangePointsSum.IsValidIndex(NearPointIndex))
+				{
+					continue;
+				}
+
+				const float Dist = FVector::Dist(SampleRangePointsSum[NearPointIndex], VertexLocation);
+				if (Dist > VV.ResampleLength * VV.MergeDistMult)
+				{
+					continue;
+				}
+
+				const FVector NoisePos = (FVector)(VV.PerlinNoiseFre / 100.0f * VertexLocation);
+				float OffsetNoise = FMath::Abs(FMath::PerlinNoise3D(NoisePos + FVector::OneVector * 10.0f));
+				OffsetNoise = VV.CurveControl ? VV.CurveControl->GetUnadjustedLinearColorValue(OffsetNoise).B : OffsetNoise;
+				VertexLocation = FMath::Lerp(VertexLocation, SampleRangePointsSum[NearPointIndex], OffsetNoise);
+			}
+
+			FGeometryScriptPolyPath PreviousLine = ClonePolyPath(Line);
+			Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
+			RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
+			RebuildVinePointAxesForEditedLine(PreviousLine, Line, CurrentPointAxes);
+			PreviousLine = ClonePolyPath(Line);
+			Line = UPolyLine::SmoothLine(Line, 3);
+			RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
+			RebuildVinePointAxesForEditedLine(PreviousLine, Line, CurrentPointAxes);
+			PreviousLine = ClonePolyPath(Line);
+			Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
+			RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
+			RebuildVinePointAxesForEditedLine(PreviousLine, Line, CurrentPointAxes);
+
+			if (!Line.Path.IsValid() || Line.Path->Num() < 3)
+			{
+				continue;
+			}
+
+		}
+
+		FGeometryScriptPolyPath PreviousLine = ClonePolyPath(Line);
+		Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
+		RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
+		RebuildVinePointAxesForEditedLine(PreviousLine, Line, CurrentPointAxes);
+		PreviousLine = ClonePolyPath(Line);
+		Line = UPolyLine::SmoothLine(Line, 1);
+		RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
+		RebuildVinePointAxesForEditedLine(PreviousLine, Line, CurrentPointAxes);
+
+		if (!Line.Path.IsValid() || Line.Path->Num() < 3)
+		{
+			continue;
+		}
+
+		if (CurrentPointScales.Num() != Line.Path->Num())
+		{
+			TArray<float> FixedPointScales;
+			BuildPreparedLinePointScales(Line, &CurrentPointScales, Line.Path->Num(), FallbackScale, FixedPointScales);
+			CurrentPointScales = MoveTemp(FixedPointScales);
+		}
+		if (CurrentPointAxes.Num() != Line.Path->Num())
+		{
+			TArray<FVector> FixedPointAxes;
+			BuildPreparedLinePointAxes(Line, &CurrentPointAxes, Line.Path->Num(), FixedPointAxes);
+			CurrentPointAxes = MoveTemp(FixedPointAxes);
+		}
+
+		OutLines.Add(Line);
+		OutLineSourceScales.Add(FallbackScale);
+		FVineLinePointScaleData& OutScaleData = OutLinePointScales.AddDefaulted_GetRef();
+		OutScaleData.Values = MoveTemp(CurrentPointScales);
+		FVineLinePointAxisData& OutAxisData = OutLinePointAxes.AddDefaulted_GetRef();
+		OutAxisData.Values = MoveTemp(CurrentPointAxes);
 	}
 
 	return OutLines.Num() > 0;
@@ -818,12 +1372,15 @@ static bool BuildVineVisualizationGPUInput(
 	const UCurveLinearColor* CurveControl,
 	const TArray<float>& LineSourceScales,
 	const TArray<FVineLinePointScaleData>& LinePointScales,
+	const TArray<FVineLinePointAxisData>& LinePointAxes,
 	TArray<FVector4f>& OutPathPoints,
+	TArray<FVector4f>& OutPathPointAxes,
 	TArray<FIntVector4>& OutPathPointMeta,
 	TArray<float>& OutPathPointCurveU,
 	TArray<FIntVector4>& OutSegmentMeta)
 {
 	OutPathPoints.Reset();
+	OutPathPointAxes.Reset();
 	OutPathPointMeta.Reset();
 	OutPathPointCurveU.Reset();
 	OutSegmentMeta.Reset();
@@ -841,6 +1398,7 @@ static bool BuildVineVisualizationGPUInput(
 		// CurveControl.G * SpaceColonization point scale (TargetPointScale * SourcePointScale).
 		const float FallbackPointScale = LineSourceScales.IsValidIndex(LineIndex) ? LineSourceScales[LineIndex] : 1.0f;
 		const TArray<float>* PointScales = LinePointScales.IsValidIndex(LineIndex) ? &LinePointScales[LineIndex].Values : nullptr;
+		const TArray<FVector>* PointAxes = LinePointAxes.IsValidIndex(LineIndex) ? &LinePointAxes[LineIndex].Values : nullptr;
 
 		const TArray<FVector>& Points = *Line.Path;
 		const int32 BaseIndex = OutPathPoints.Num();
@@ -858,7 +1416,9 @@ static bool BuildVineVisualizationGPUInput(
 			const float CurveScale = EvaluateVineScale(CurveControl, PointIndex, PointCount);
 			const float PointScale = PointScales && PointScales->IsValidIndex(PointIndex) ? (*PointScales)[PointIndex] : FallbackPointScale;
 			const float Scale = CurveScale * FMath::Max(PointScale, 0.0f);
+			const FVector PointAxis = PointAxes && PointAxes->IsValidIndex(PointIndex) ? NormalizeVineAxisOrFallback((*PointAxes)[PointIndex]) : FVector::ZeroVector;
 			OutPathPoints.Add(FVector4f(float(Point.X), float(Point.Y), float(Point.Z), Scale));
+			OutPathPointAxes.Add(FVector4f(float(PointAxis.X), float(PointAxis.Y), float(PointAxis.Z), 0.0f));
 			OutPathPointCurveU.Add(CurveU);
 
 			const int32 PrevIndex = BaseIndex + FMath::Max(PointIndex - 1, 0);
@@ -1034,6 +1594,7 @@ static void RefreshFoliageType(UWorld* World, UFoliageType* InFoliageType)
 
 static bool DispatchVineVisualizationGPU(
 	const TArray<FVector4f>& PathPoints,
+	const TArray<FVector4f>& PathPointAxes,
 	const TArray<FIntVector4>& PathPointMeta,
 	const TArray<float>& PathPointCurveU,
 	const TArray<FVector4f>& MeshTriangleVertices,
@@ -1055,7 +1616,12 @@ static bool DispatchVineVisualizationGPU(
 	const uint32 ProfileCount = bTube ? 3u : 2u;
 	const uint32 OutputVertexCount = PathPointCount * ProfileCount;
 	const uint32 OutputIndexCount = bTube ? SegmentCount * ProfileCount * 6u : SegmentCount * 6u;
-	if (PathPointCount == 0 || uint32(PathPointCurveU.Num()) != PathPointCount || SegmentCount == 0 || MeshTriangleCount == 0 || OutputVertexCount == 0 || OutputIndexCount == 0)
+	if (PathPointCount == 0
+		|| uint32(PathPointCurveU.Num()) != PathPointCount
+		|| SegmentCount == 0
+		|| MeshTriangleCount == 0
+		|| OutputVertexCount == 0
+		|| OutputIndexCount == 0)
 	{
 		return false;
 	}
@@ -1083,7 +1649,7 @@ static bool DispatchVineVisualizationGPU(
 	const bool bUseGrid = Grid.TotalCells > 1 && Grid.TriangleIndices.Num() > 0;
 
 	ENQUEUE_RENDER_COMMAND(VineVisualizationGPU)(
-		[PathPoints, PathPointMeta, PathPointCurveU, MeshTriangleVertices, SegmentMeta, Grid, bUseGrid,
+		[PathPoints, PathPointAxes, PathPointMeta, PathPointCurveU, MeshTriangleVertices, SegmentMeta, Grid, bUseGrid,
 		 VertexReadback, UVReadback, IndexReadback, VertexReadbackBytes, UVReadbackBytes, IndexReadbackBytes,
 		 PathPointCount, SegmentCount, MeshTriangleCount, ProfileCount, OutputVertexCount, OutputIndexCount,
 		 bTube, CircleScale, LineScale, &bRenderWorkQueued](FRHICommandListImmediate& RHICmdList)
@@ -1091,6 +1657,7 @@ static bool DispatchVineVisualizationGPU(
 			FRDGBuilder GraphBuilder(RHICmdList);
 
 			const CSHepler::FRDGStructuredBufferRefs PathPointBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, PathPoints, TEXT("VineVisualization.PathPoints"));
+			const CSHepler::FRDGStructuredBufferRefs PathPointAxisBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, PathPointAxes, TEXT("VineVisualization.PathPointAxes"));
 			const CSHepler::FRDGStructuredBufferRefs PathPointMetaBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, PathPointMeta, TEXT("VineVisualization.PathPointMeta"));
 			const CSHepler::FRDGStructuredBufferRefs PathPointCurveUBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, PathPointCurveU, TEXT("VineVisualization.PathPointCurveU"));
 			const CSHepler::FRDGStructuredBufferRefs MeshTriangleBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, MeshTriangleVertices, TEXT("VineVisualization.MeshTriangleVertices"));
@@ -1098,37 +1665,59 @@ static bool DispatchVineVisualizationGPU(
 			const CSHepler::FRDGStructuredBufferRefs OutVertexBuffer = CSHepler::CreateStructuredBuffer<FVector4f>(GraphBuilder, OutputVertexCount, TEXT("VineVisualization.OutVertices"), true, true);
 			const CSHepler::FRDGStructuredBufferRefs OutUVBuffer = CSHepler::CreateStructuredBuffer<FVector2f>(GraphBuilder, OutputVertexCount, TEXT("VineVisualization.OutUVs"), true, true);
 			const CSHepler::FRDGStructuredBufferRefs OutIndexBuffer = CSHepler::CreateStructuredBuffer<uint32>(GraphBuilder, OutputIndexCount, TEXT("VineVisualization.OutIndices"), true, true);
+			CSHepler::FRDGStructuredBufferRefs PathPointTangentA = CSHepler::CreateStructuredBuffer<FVector4f>(GraphBuilder, PathPointCount, TEXT("VineVisualization.PathPointTangentsA"), true, true);
+			CSHepler::FRDGStructuredBufferRefs PathPointNormalA = CSHepler::CreateStructuredBuffer<FVector4f>(GraphBuilder, PathPointCount, TEXT("VineVisualization.PathPointNormalsA"), true, true);
 
 			// Upload grid buffers
 			const CSHepler::FRDGStructuredBufferRefs GridCellOffsetsBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, Grid.CellOffsets, TEXT("VineVisualization.GridCellOffsets"));
 			const CSHepler::FRDGStructuredBufferRefs GridTriangleIndicesBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, Grid.TriangleIndices, TEXT("VineVisualization.GridTriangleIndices"));
+
+			TShaderMapRef<FVineVisualizationBuildAxesCS> BuildAxesShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FVineVisualizationBuildAxesCS::FParameters* BuildAxesParameters = GraphBuilder.AllocParameters<FVineVisualizationBuildAxesCS::FParameters>();
+			BuildAxesParameters->PathPoints = PathPointBuffer.SRV;
+			BuildAxesParameters->PathPointAxes = PathPointAxisBuffer.SRV;
+			BuildAxesParameters->PathPointMeta = PathPointMetaBuffer.SRV;
+			BuildAxesParameters->MeshTriangleVertices = MeshTriangleBuffer.SRV;
+			BuildAxesParameters->GridCellOffsets = GridCellOffsetsBuffer.SRV;
+			BuildAxesParameters->GridTriangleIndices = GridTriangleIndicesBuffer.SRV;
+			BuildAxesParameters->RW_PathPointTangents = PathPointTangentA.UAV;
+			BuildAxesParameters->RW_PathPointNormals = PathPointNormalA.UAV;
+			BuildAxesParameters->PathPointCount = PathPointCount;
+			BuildAxesParameters->MeshTriangleCount = MeshTriangleCount;
+			BuildAxesParameters->GridOrigin = Grid.Origin;
+			BuildAxesParameters->GridCellSize = Grid.CellSize;
+			BuildAxesParameters->GridDimensions = Grid.Dimensions;
+			BuildAxesParameters->GridTotalCells = Grid.TotalCells;
+			BuildAxesParameters->bUseGrid = bUseGrid ? 1u : 0u;
+
+			GraphBuilder.AddPass(
+				RDG_EVENT_NAME("VineVisualization.BuildAxes"),
+				BuildAxesParameters,
+				ERDGPassFlags::Compute,
+				[BuildAxesParameters, BuildAxesShader, PathPointCount](FRHIComputeCommandList& InRHICmdList)
+				{
+					FComputeShaderUtils::Dispatch(InRHICmdList, BuildAxesShader, *BuildAxesParameters, FComputeShaderUtils::GetGroupCount(FIntVector(PathPointCount, 1, 1), 64));
+				});
 
 			TShaderMapRef<FVineVisualizationMeshCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 			FVineVisualizationMeshCS::FParameters* Parameters = GraphBuilder.AllocParameters<FVineVisualizationMeshCS::FParameters>();
 			Parameters->PathPoints = PathPointBuffer.SRV;
 			Parameters->PathPointMeta = PathPointMetaBuffer.SRV;
 			Parameters->PathPointCurveU = PathPointCurveUBuffer.SRV;
-			Parameters->MeshTriangleVertices = MeshTriangleBuffer.SRV;
+			Parameters->PathPointTangents = PathPointTangentA.SRV;
+			Parameters->PathPointNormals = PathPointNormalA.SRV;
 			Parameters->SegmentMeta = SegmentMetaBuffer.SRV;
-			Parameters->GridCellOffsets = GridCellOffsetsBuffer.SRV;
-			Parameters->GridTriangleIndices = GridTriangleIndicesBuffer.SRV;
 			Parameters->RW_OutVertices = OutVertexBuffer.UAV;
 			Parameters->RW_OutUVs = OutUVBuffer.UAV;
 			Parameters->RW_OutIndices = OutIndexBuffer.UAV;
 			Parameters->PathPointCount = PathPointCount;
 			Parameters->SegmentCount = SegmentCount;
-			Parameters->MeshTriangleCount = MeshTriangleCount;
 			Parameters->OutputVertexCount = OutputVertexCount;
 			Parameters->OutputIndexCount = OutputIndexCount;
 			Parameters->ProfileCount = ProfileCount;
 			Parameters->bTube = bTube ? 1u : 0u;
 			Parameters->CircleScale = CircleScale;
 			Parameters->LineScale = LineScale;
-			Parameters->GridOrigin = Grid.Origin;
-			Parameters->GridCellSize = Grid.CellSize;
-			Parameters->GridDimensions = Grid.Dimensions;
-			Parameters->GridTotalCells = Grid.TotalCells;
-			Parameters->bUseGrid = bUseGrid ? 1u : 0u;
 
 			const uint32 DispatchCount = FMath::Max(OutputVertexCount, SegmentCount);
 			GraphBuilder.AddPass(
@@ -1163,6 +1752,250 @@ static bool DispatchVineVisualizationGPU(
 	bool bReadbackSucceeded = false;
 
 	ENQUEUE_RENDER_COMMAND(VineVisualizationGPUReadback)(
+		[VertexReadback, UVReadback, IndexReadback, VertexReadbackBytes, UVReadbackBytes, IndexReadbackBytes, &OutVertices, &OutUVs, &OutIndices, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList)
+		{
+			if (!VertexReadback || !UVReadback || !IndexReadback)
+			{
+				return;
+			}
+
+			if (!VertexReadback->IsReady() || !UVReadback->IsReady() || !IndexReadback->IsReady())
+			{
+				RHICmdList.SubmitAndBlockUntilGPUIdle();
+			}
+
+			bool bLockedAll = true;
+			if (const FVector4f* VertexPtr = static_cast<const FVector4f*>(VertexReadback->Lock(VertexReadbackBytes)))
+			{
+				FMemory::Memcpy(OutVertices.GetData(), VertexPtr, VertexReadbackBytes);
+				VertexReadback->Unlock();
+			}
+			else
+			{
+				bLockedAll = false;
+			}
+
+			if (const FVector2f* UVPtr = static_cast<const FVector2f*>(UVReadback->Lock(UVReadbackBytes)))
+			{
+				FMemory::Memcpy(OutUVs.GetData(), UVPtr, UVReadbackBytes);
+				UVReadback->Unlock();
+			}
+			else
+			{
+				bLockedAll = false;
+			}
+
+			if (const uint32* IndexPtr = static_cast<const uint32*>(IndexReadback->Lock(IndexReadbackBytes)))
+			{
+				FMemory::Memcpy(OutIndices.GetData(), IndexPtr, IndexReadbackBytes);
+				IndexReadback->Unlock();
+			}
+			else
+			{
+				bLockedAll = false;
+			}
+
+			delete VertexReadback;
+			delete UVReadback;
+			delete IndexReadback;
+			bReadbackSucceeded = bLockedAll;
+		});
+
+	FlushRenderingCommands();
+	return bReadbackSucceeded;
+}
+
+// GPU dispatch for voxel-based vine visualization.
+// Replaces triangle mesh + BVH with FCSSurfaceVoxelData sampling.
+static bool DispatchVineVisualizationGPU_Voxel(
+	const TArray<FVector4f>& PathPoints,
+	const TArray<FVector4f>& PathPointAxes,
+	const TArray<FIntVector4>& PathPointMeta,
+	const TArray<float>& PathPointCurveU,
+	const TArray<FIntVector4>& SegmentMeta,
+	bool bTube,
+	float CircleScale,
+	float LineScale,
+	float VinesOffset,
+	const FCSSurfaceVoxelData& VoxelData,
+	TArray<FVector4f>& OutVertices,
+	TArray<FVector2f>& OutUVs,
+	TArray<uint32>& OutIndices)
+{
+	OutVertices.Reset();
+	OutUVs.Reset();
+	OutIndices.Reset();
+
+	const uint32 PathPointCount = uint32(PathPoints.Num());
+	const uint32 SegmentCount = uint32(SegmentMeta.Num());
+	const uint32 ProfileCount = bTube ? 3u : 2u;
+	const uint32 OutputVertexCount = PathPointCount * ProfileCount;
+	const uint32 OutputIndexCount = bTube ? SegmentCount * ProfileCount * 6u : SegmentCount * 6u;
+	if (PathPointCount == 0
+		|| uint32(PathPointCurveU.Num()) != PathPointCount
+		|| SegmentCount == 0
+		|| OutputVertexCount == 0
+		|| OutputIndexCount == 0)
+	{
+		return false;
+	}
+
+	const uint32 VoxelCount = uint32(VoxelData.Cells.Num());
+	if (VoxelCount == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU_Voxel] No voxel data available."));
+		return false;
+	}
+
+	// Convert voxel data to GPU-compatible format
+	TArray<FVector4f> GPUVoxelTargetPositions;
+	TArray<FVector4f> GPUVoxelNormals;
+	TArray<FIntVector4> GPUVoxelCells;
+	GPUVoxelTargetPositions.Reserve(VoxelCount);
+	GPUVoxelNormals.Reserve(VoxelCount);
+	GPUVoxelCells.Reserve(VoxelCount);
+
+	for (uint32 i = 0; i < VoxelCount; ++i)
+	{
+		const FVector& Target = VoxelData.TargetPositions.IsValidIndex(int32(i)) ? VoxelData.TargetPositions[i] : VoxelData.Positions[i];
+		const FVector& Normal = VoxelData.Normals.IsValidIndex(int32(i)) ? VoxelData.Normals[i] : FVector::UpVector;
+		const FIntVector& Cell = VoxelData.Cells[i];
+
+		GPUVoxelTargetPositions.Add(FVector4f(float(Target.X), float(Target.Y), float(Target.Z), 1.0f));
+		GPUVoxelNormals.Add(FVector4f(float(Normal.X), float(Normal.Y), float(Normal.Z), 0.0f));
+		GPUVoxelCells.Add(FIntVector4(Cell.X, Cell.Y, Cell.Z, 0));
+	}
+
+	const uint64 VertexReadbackBytes64 = uint64(OutputVertexCount) * sizeof(FVector4f);
+	const uint64 UVReadbackBytes64 = uint64(OutputVertexCount) * sizeof(FVector2f);
+	const uint64 IndexReadbackBytes64 = uint64(OutputIndexCount) * sizeof(uint32);
+	if (VertexReadbackBytes64 > MAX_uint32 || UVReadbackBytes64 > MAX_uint32 || IndexReadbackBytes64 > MAX_uint32)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU_Voxel] Output is too large for readback. Vertices=%u Indices=%u"), OutputVertexCount, OutputIndexCount);
+		return false;
+	}
+
+	const uint32 VertexReadbackBytes = uint32(VertexReadbackBytes64);
+	const uint32 UVReadbackBytes = uint32(UVReadbackBytes64);
+	const uint32 IndexReadbackBytes = uint32(IndexReadbackBytes64);
+	FRHIGPUBufferReadback* VertexReadback = new FRHIGPUBufferReadback(TEXT("VineVisualizationVoxel_VertexReadback"));
+	FRHIGPUBufferReadback* UVReadback = new FRHIGPUBufferReadback(TEXT("VineVisualizationVoxel_UVReadback"));
+	FRHIGPUBufferReadback* IndexReadback = new FRHIGPUBufferReadback(TEXT("VineVisualizationVoxel_IndexReadback"));
+	bool bRenderWorkQueued = false;
+
+	ENQUEUE_RENDER_COMMAND(VineVisualizationVoxelGPU)(
+		[PathPoints, PathPointAxes, PathPointMeta, PathPointCurveU, SegmentMeta,
+		 GPUVoxelCells, GPUVoxelNormals, GPUVoxelTargetPositions,
+		 VertexReadback, UVReadback, IndexReadback, VertexReadbackBytes, UVReadbackBytes, IndexReadbackBytes,
+		 PathPointCount, SegmentCount, VoxelCount, ProfileCount, OutputVertexCount, OutputIndexCount,
+		 bTube, CircleScale, LineScale, VinesOffset,
+		 VoxelOrigin = FVector3f(VoxelData.VoxelOrigin), VoxelSize = float(VoxelData.VoxelSize),
+		 &bRenderWorkQueued](FRHICommandListImmediate& RHICmdList)
+		{
+			FRDGBuilder GraphBuilder(RHICmdList);
+
+			const CSHepler::FRDGStructuredBufferRefs PathPointBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, PathPoints, TEXT("VineVisualizationVoxel.PathPoints"));
+			const CSHepler::FRDGStructuredBufferRefs PathPointAxisBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, PathPointAxes, TEXT("VineVisualizationVoxel.PathPointAxes"));
+			const CSHepler::FRDGStructuredBufferRefs PathPointMetaBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, PathPointMeta, TEXT("VineVisualizationVoxel.PathPointMeta"));
+			const CSHepler::FRDGStructuredBufferRefs PathPointCurveUBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, PathPointCurveU, TEXT("VineVisualizationVoxel.PathPointCurveU"));
+			const CSHepler::FRDGStructuredBufferRefs SegmentMetaBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, SegmentMeta, TEXT("VineVisualizationVoxel.SegmentMeta"));
+			const CSHepler::FRDGStructuredBufferRefs VoxelCellsBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, GPUVoxelCells, TEXT("VineVisualizationVoxel.VoxelCells"));
+			const CSHepler::FRDGStructuredBufferRefs VoxelNormalsBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, GPUVoxelNormals, TEXT("VineVisualizationVoxel.VoxelNormals"));
+			const CSHepler::FRDGStructuredBufferRefs VoxelTargetPositionsBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, GPUVoxelTargetPositions, TEXT("VineVisualizationVoxel.VoxelTargetPositions"));
+			const CSHepler::FRDGStructuredBufferRefs OutVertexBuffer = CSHepler::CreateStructuredBuffer<FVector4f>(GraphBuilder, OutputVertexCount, TEXT("VineVisualizationVoxel.OutVertices"), true, true);
+			const CSHepler::FRDGStructuredBufferRefs OutUVBuffer = CSHepler::CreateStructuredBuffer<FVector2f>(GraphBuilder, OutputVertexCount, TEXT("VineVisualizationVoxel.OutUVs"), true, true);
+			const CSHepler::FRDGStructuredBufferRefs OutIndexBuffer = CSHepler::CreateStructuredBuffer<uint32>(GraphBuilder, OutputIndexCount, TEXT("VineVisualizationVoxel.OutIndices"), true, true);
+			CSHepler::FRDGStructuredBufferRefs PathPointTangentA = CSHepler::CreateStructuredBuffer<FVector4f>(GraphBuilder, PathPointCount, TEXT("VineVisualizationVoxel.PathPointTangentsA"), true, true);
+			CSHepler::FRDGStructuredBufferRefs PathPointNormalA = CSHepler::CreateStructuredBuffer<FVector4f>(GraphBuilder, PathPointCount, TEXT("VineVisualizationVoxel.PathPointNormalsA"), true, true);
+
+			TShaderMapRef<FVineVisualizationVoxelBuildAxesCS> BuildAxesShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FVineVisualizationVoxelBuildAxesCS::FParameters* BuildAxesParameters = GraphBuilder.AllocParameters<FVineVisualizationVoxelBuildAxesCS::FParameters>();
+			BuildAxesParameters->PathPoints = PathPointBuffer.SRV;
+			BuildAxesParameters->PathPointAxes = PathPointAxisBuffer.SRV;
+			BuildAxesParameters->PathPointMeta = PathPointMetaBuffer.SRV;
+			BuildAxesParameters->VoxelCells = VoxelCellsBuffer.SRV;
+			BuildAxesParameters->VoxelNormals = VoxelNormalsBuffer.SRV;
+			BuildAxesParameters->VoxelTargetPositions = VoxelTargetPositionsBuffer.SRV;
+			BuildAxesParameters->RW_PathPointTangents = PathPointTangentA.UAV;
+			BuildAxesParameters->RW_PathPointNormals = PathPointNormalA.UAV;
+			BuildAxesParameters->PathPointCount = PathPointCount;
+			BuildAxesParameters->VoxelOrigin = VoxelOrigin;
+			BuildAxesParameters->VoxelSize = VoxelSize;
+			BuildAxesParameters->VoxelCount = VoxelCount;
+
+			GraphBuilder.AddPass(
+				RDG_EVENT_NAME("VineVisualizationVoxel.BuildAxes"),
+				BuildAxesParameters,
+				ERDGPassFlags::Compute,
+				[BuildAxesParameters, BuildAxesShader, PathPointCount](FRHIComputeCommandList& InRHICmdList)
+				{
+					FComputeShaderUtils::Dispatch(InRHICmdList, BuildAxesShader, *BuildAxesParameters, FComputeShaderUtils::GetGroupCount(FIntVector(PathPointCount, 1, 1), 64));
+				});
+
+			TShaderMapRef<FVineVisualizationVoxelCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FVineVisualizationVoxelCS::FParameters* Parameters = GraphBuilder.AllocParameters<FVineVisualizationVoxelCS::FParameters>();
+			Parameters->PathPoints = PathPointBuffer.SRV;
+			Parameters->PathPointMeta = PathPointMetaBuffer.SRV;
+			Parameters->PathPointCurveU = PathPointCurveUBuffer.SRV;
+			Parameters->PathPointTangents = PathPointTangentA.SRV;
+			Parameters->PathPointNormals = PathPointNormalA.SRV;
+			Parameters->SegmentMeta = SegmentMetaBuffer.SRV;
+			Parameters->VoxelCells = VoxelCellsBuffer.SRV;
+			Parameters->VoxelNormals = VoxelNormalsBuffer.SRV;
+			Parameters->VoxelTargetPositions = VoxelTargetPositionsBuffer.SRV;
+			Parameters->RW_OutVertices = OutVertexBuffer.UAV;
+			Parameters->RW_OutUVs = OutUVBuffer.UAV;
+			Parameters->RW_OutIndices = OutIndexBuffer.UAV;
+			Parameters->PathPointCount = PathPointCount;
+			Parameters->SegmentCount = SegmentCount;
+			Parameters->OutputVertexCount = OutputVertexCount;
+			Parameters->OutputIndexCount = OutputIndexCount;
+			Parameters->ProfileCount = ProfileCount;
+			Parameters->bTube = bTube ? 1u : 0u;
+			Parameters->CircleScale = CircleScale;
+			Parameters->LineScale = LineScale;
+			Parameters->VoxelOrigin = VoxelOrigin;
+			Parameters->VoxelSize = VoxelSize;
+			Parameters->VoxelCount = VoxelCount;
+			Parameters->VinesOffset = VinesOffset;
+
+			const uint32 DispatchCount = FMath::Max(OutputVertexCount, SegmentCount);
+			GraphBuilder.AddPass(
+				RDG_EVENT_NAME("VineVisualizationVoxelCS"),
+				Parameters,
+				ERDGPassFlags::Compute,
+				[Parameters, ComputeShader, DispatchCount](FRHIComputeCommandList& RHICmdList)
+				{
+					const uint32 GroupCountX = FMath::DivideAndRoundUp(DispatchCount, 64u);
+					SetComputePipelineState(RHICmdList, ComputeShader.GetComputeShader());
+					SetShaderParameters(RHICmdList, ComputeShader, ComputeShader.GetComputeShader(), *Parameters);
+					RHICmdList.DispatchComputeShader(GroupCountX, 1, 1);
+					UnsetShaderUAVs(RHICmdList, ComputeShader, ComputeShader.GetComputeShader());
+				});
+
+			AddEnqueueCopyPass(GraphBuilder, VertexReadback, OutVertexBuffer.Buffer, VertexReadbackBytes);
+			AddEnqueueCopyPass(GraphBuilder, UVReadback, OutUVBuffer.Buffer, UVReadbackBytes);
+			AddEnqueueCopyPass(GraphBuilder, IndexReadback, OutIndexBuffer.Buffer, IndexReadbackBytes);
+			GraphBuilder.Execute();
+			bRenderWorkQueued = true;
+		});
+
+	FlushRenderingCommands();
+
+	if (!bRenderWorkQueued)
+	{
+		delete VertexReadback;
+		delete UVReadback;
+		delete IndexReadback;
+		return false;
+	}
+
+	OutVertices.SetNumZeroed(OutputVertexCount);
+	OutUVs.SetNumZeroed(OutputVertexCount);
+	OutIndices.SetNumZeroed(OutputIndexCount);
+	bool bReadbackSucceeded = false;
+
+	ENQUEUE_RENDER_COMMAND(VineVisualizationVoxelGPUReadback)(
 		[VertexReadback, UVReadback, IndexReadback, VertexReadbackBytes, UVReadbackBytes, IndexReadbackBytes, &OutVertices, &OutUVs, &OutIndices, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList)
 		{
 			if (!VertexReadback || !UVReadback || !IndexReadback)
@@ -1607,6 +2440,7 @@ bool AVineContainer::VisVineCPU(bool MainVine)
 	const TArray<float>& LineSourceScales = MainVine ? TubeLineSourceScales : PlaneLineSourceScales;
 	const TArray<FVector>& LineSourceLocations = MainVine ? TubeLineSourceLocations : PlaneLineSourceLocations;
 	const TArray<FVineLinePointScaleData>& LinePointScales = MainVine ? TubeLinePointScales : PlaneLinePointScales;
+	const TArray<FVineLinePointAxisData>& LinePointAxes = MainVine ? TubeLinePointAxes : PlaneLinePointAxes;
 	
 	if (Lines.Num() == 0)
 		return false;
@@ -1627,6 +2461,7 @@ bool AVineContainer::VisVineCPU(bool MainVine)
 	TArray<FGeometryScriptPolyPath> PreparedLines;
 	TArray<float> PreparedLineSourceScales;
 	TArray<FVineLinePointScaleData> PreparedLinePointScales;
+	TArray<FVineLinePointAxisData> PreparedLinePointAxes;
 	if (!PrepareVineVisualizationLinesCPU(
 		Lines,
 		VV,
@@ -1634,16 +2469,17 @@ bool AVineContainer::VisVineCPU(bool MainVine)
 		LineSourceScales,
 		LineSourceLocations,
 		LinePointScales,
+		LinePointAxes,
 		PrefixMesh,
 		BVH,
 		PreparedLines,
 		PreparedLineSourceScales,
-		PreparedLinePointScales))
+		PreparedLinePointScales,
+		PreparedLinePointAxes))
 	{
 		return false;
 	}
 
-	FGeometryScriptSpatialQueryOptions Options;
 	for (int32 LineIdx = 0; LineIdx < PreparedLines.Num(); ++LineIdx)
 	{
 		FGeometryScriptPolyPath& Line = PreparedLines[LineIdx];
@@ -1652,32 +2488,7 @@ bool AVineContainer::VisVineCPU(bool MainVine)
 
 		//CaluclateVineTransforms
 		TArray<FVector> LineVectors = *Line.Path;
-		int32 LineVertexNum = LineVectors.Num();
-		TArray<FTransform> Transforms;
-		Transforms.Reserve(LineVertexNum);
-		TArray<float> TransformPointScales;
-		TransformPointScales.Reserve(LineVertexNum);
-		
-		for (int32 i = 0; i < LineVertexNum; i++)
-		{
-			FVector Normal;
-			FVector VertexLocation = (*Line.Path)[i];
-			FGeometryScriptTrianglePoint NearestPoint;
-			if (!TryFindNearestPointOnVinePrefixMesh(PrefixMesh, BVH, VertexLocation, Options, NearestPoint, TEXT("VisVine.TransformNormal")))
-			{
-				continue;
-			}
-
-			PrefixMesh->ProcessMesh([&](const FDynamicMesh3& EditMesh)
-			{
-				//Sometimes it will Calculates a downward normal it is wrong
-				Normal = EditMesh.GetTriNormal(NearestPoint.TriangleID);
-			});
-			FVector Tangent = UE::Geometry::CurveUtil::Tangent<double, FVector>(LineVectors, i);
-			Transforms.Add(FTransform(FRotationMatrix::MakeFromXZ(Tangent, Normal).Rotator(), LineVectors[i], FVector::OneVector));
-			TransformPointScales.Add(CurrentPointScales.IsValidIndex(i) ? CurrentPointScales[i] : FallbackScale);
-			//FRotationMatrix::MakeFromXZ()
-		}
+		TArray<FTransform> Transforms = UPolyLine::ConvertPolyPathToTransforms(Line, true);
 		
 		int32 TransformCount = Transforms.Num();
 		if (TransformCount < 3)
@@ -1687,22 +2498,76 @@ bool AVineContainer::VisVineCPU(bool MainVine)
 		{
 			FTransform& Transform = Transforms[i];
 			const float CurveScale = VV.CurveControl->GetUnadjustedLinearColorValue(i / (TransformCount - 1.0)).G;
-			const float PointScale = TransformPointScales.IsValidIndex(i) ? TransformPointScales[i] : FallbackScale;
+			const float PointScale = CurrentPointScales.IsValidIndex(i) ? CurrentPointScales[i] : FallbackScale;
 			const float SweepScale = CurveScale * FMath::Max(PointScale, 0.0f);
 			Transform.SetScale3D(FVector::OneVector * SweepScale);
+		}
+
+		// Compute world-space accumulated V distances (same as GPU PathPointCurveU).
+		// Each transform corresponds to a path point; we accumulate the distance between
+		// consecutive path points to produce a V coordinate that grows linearly with
+		// world length, matching the GPU-mode UV behavior.
+		TArray<float> WorldSpaceV;
+		WorldSpaceV.Reserve(TransformCount);
+		{
+			float AccDist = 0.0f;
+			const TArray<FVector>& PathPoints = LineVectors;
+			for (int32 i = 0; i < TransformCount; ++i)
+			{
+				if (i > 0)
+				{
+					AccDist += float(FVector::Dist(PathPoints[i], PathPoints[i - 1]));
+				}
+				WorldSpaceV.Add(AccDist);
+			}
 		}
 
 		//AddMeshToReuslt
 		if (MainVine)
 		{
+			// Record the starting UV overlay element count so we can fix V after the sweep.
+			int32 StartUVElementCount = 0;
+			TubeMesh->ProcessMesh([&](const FDynamicMesh3& Mesh)
+			{
+				if (Mesh.HasAttributes() && Mesh.Attributes()->NumUVLayers() > 0)
+				{
+					StartUVElementCount = Mesh.Attributes()->GetUVLayer(0)->MaxElementID();
+				}
+			});
+
 			FGeometryScriptPrimitiveOptions PrimitiveOptions;
 			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendSweepPolygon(
 				TubeMesh, PrimitiveOptions, FTransform::Identity, Circle, Transforms, false);
+
+			// Fix UV V-coordinate: replace GeometryScript's default V (0..1 parameterized)
+			// with world-space accumulated distances, matching GPU V = PathPointCurveU[PointIndex].
+			const int32 RingSize = Circle.Num();
+			TubeMesh->EditMesh([&](FDynamicMesh3& Mesh)
+			{
+				if (Mesh.HasAttributes() && Mesh.Attributes()->NumUVLayers() > 0)
+				{
+					UE::Geometry::FDynamicMeshUVOverlay* UVOverlay = Mesh.Attributes()->GetUVLayer(0);
+					for (int32 PtIdx = 0; PtIdx < TransformCount; ++PtIdx)
+					{
+						const float V = WorldSpaceV[PtIdx];
+						for (int32 RingIdx = 0; RingIdx < RingSize; ++RingIdx)
+						{
+							const int32 UVElemIdx = StartUVElementCount + PtIdx * RingSize + RingIdx;
+							if (UVElemIdx < UVOverlay->MaxElementID())
+							{
+								FVector2f UV = UVOverlay->GetElement(UVElemIdx);
+								UV.Y = V;
+								UVOverlay->SetElement(UVElemIdx, UV);
+							}
+						}
+					}
+				}
+			}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
 		}
 		else
 		{
 			TArray<float> Line2DU = {0, 1};
-			TArray<float> Line2DV = UPolyLine::CurveU(Line, false);
+			TArray<float> Line2DV = WorldSpaceV; // World-space accumulated V distances, same as GPU PathPointCurveU
 			FGeometryScriptPrimitiveOptions PrimitiveOptions;
 			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendSweepPolyline(
 				PlaneMesh, PrimitiveOptions, FTransform::Identity, Line2D, Transforms, Line2DU, Line2DV, false);
@@ -1827,8 +2692,9 @@ bool AVineContainer::VisVineGPUInternal(bool MainVine)
 		return false;
 	}
 
-	if (!RebuildVineBVHForPrefixMesh(PrefixMesh, BVH, TEXT("VisVineGPU")))
+	if (CachedSurfaceVoxels.Cells.Num() == 0)
 	{
+		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] No cached surface voxel data for GPU voxel visualization."));
 		return false;
 	}
 
@@ -1836,59 +2702,59 @@ bool AVineContainer::VisVineGPUInternal(bool MainVine)
 	const TArray<float>& LineSourceScales = MainVine ? TubeLineSourceScales : PlaneLineSourceScales;
 	const TArray<FVector>& LineSourceLocations = MainVine ? TubeLineSourceLocations : PlaneLineSourceLocations;
 	const TArray<FVineLinePointScaleData>& LinePointScales = MainVine ? TubeLinePointScales : PlaneLinePointScales;
+	const TArray<FVineLinePointAxisData>& LinePointAxes = MainVine ? TubeLinePointAxes : PlaneLinePointAxes;
 	TArray<float> PreparedLineSourceScales;
 	TArray<FVineLinePointScaleData> PreparedLinePointScales;
-	if (!PrepareVineVisualizationLinesCPU(
+	TArray<FVineLinePointAxisData> PreparedLinePointAxes;
+
+	if (!PrepareVineVisualizationLinesGPU(
 		Lines,
 		VV,
 		MainVine,
 		LineSourceScales,
 		LineSourceLocations,
 		LinePointScales,
-		PrefixMesh,
-		BVH,
+		LinePointAxes,
 		PreparedLines,
 		PreparedLineSourceScales,
-		PreparedLinePointScales))
+		PreparedLinePointScales,
+		PreparedLinePointAxes))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] No valid lines after preprocessing."));
+		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] No valid lines after GPU preprocessing."));
 		return false;
 	}
 
 	TArray<FVector4f> PathPoints;
+	TArray<FVector4f> PathPointAxes;
 	TArray<FIntVector4> PathPointMeta;
 	TArray<float> PathPointCurveU;
 	TArray<FIntVector4> SegmentMeta;
-	if (!BuildVineVisualizationGPUInput(PreparedLines, VV.CurveControl, PreparedLineSourceScales, PreparedLinePointScales, PathPoints, PathPointMeta, PathPointCurveU, SegmentMeta))
+	if (!BuildVineVisualizationGPUInput(PreparedLines, VV.CurveControl, PreparedLineSourceScales, PreparedLinePointScales, PreparedLinePointAxes, PathPoints, PathPointAxes, PathPointMeta, PathPointCurveU, SegmentMeta))
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] Failed to build GPU input buffers."));
-		return false;
-	}
-
-	TArray<FVector4f> MeshTriangleVertices;
-	if (!ExtractDynamicMeshTrianglesForGPU(PrefixMesh, MeshTriangleVertices))
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] Failed to extract PrefixMesh triangles."));
 		return false;
 	}
 
 	TArray<FVector4f> OutVertices;
 	TArray<FVector2f> OutUVs;
 	TArray<uint32> OutIndices;
-	if (!DispatchVineVisualizationGPU(
+
+	if (!DispatchVineVisualizationGPU_Voxel(
 		PathPoints,
+		PathPointAxes,
 		PathPointMeta,
 		PathPointCurveU,
-		MeshTriangleVertices,
 		SegmentMeta,
 		MainVine,
 		VV.CircleScale,
 		VV.LineScale,
+		VV.VinesOffset,
+		CachedSurfaceVoxels,
 		OutVertices,
 		OutUVs,
 		OutIndices))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] GPU dispatch/readback failed."));
+		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] Voxel GPU dispatch/readback failed."));
 		return false;
 	}
 
@@ -1963,6 +2829,8 @@ inline void AVineContainer::Clean()
 	PlaneLineSourceLocations.Empty();
 	TubeLinePointScales.Empty();
 	PlaneLinePointScales.Empty();
+	TubeLinePointAxes.Empty();
+	PlaneLinePointAxes.Empty();
 	DynamicMeshComponent->GetDynamicMesh()->Reset();
 }
 
@@ -2066,10 +2934,11 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result, boo
 		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.BuildBVHForMesh"));
 		MeshCombine = UGeometryScriptLibrary_MeshSpatial::BuildBVHForMesh(MeshCombine, LocalBVH, nullptr);
 	}
-	// 体素化表面计算（ResinRattan移植），数据在GenerateVines返回后自动释放
+	// 体素化表面计算（ResinRattan移植），存入 CachedSurfaceVoxels 供 GPU/CPU 路径使用。
+	// 数据在 GenerateVines 返回后自动析构。
 	{
 		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.GetBoxSceneSurfaceVoxels"));
-		(void)GetBoxSceneSurfaceVoxelsFromGPU(SC.VoxelSize);
+		CachedSurfaceVoxels = GetBoxSceneSurfaceVoxelsFromGPU(SC.VoxelSize);
 	}
 	// 缓存 PrefixMesh 和 BVH，用于投影查询
 	BVH = LocalBVH;
@@ -2089,16 +2958,30 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result, boo
 	TArray<float> GeneratedTubeLineScales;
 	TArray<FVector> GeneratedTubeLineSourceLocations;
 	TArray<FVineLinePointScaleData> GeneratedTubeLinePointScales;
+	TArray<FVineLinePointAxisData> GeneratedTubeLinePointAxes;
 	{
 		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.GenerateTubeLines"));
 		for (int32 i = 0; i < TubeSourceCount; i++)
 		{
 			TArray<FTransform> SCSourceTransform;
 			SCSourceTransform.Add(TubeSourceTransforms[i]);
-			TArray<FSpaceColonizationLineResult> LinesFromSource = UGenerateVines::SpaceColonizationWithScales(
-				SCSourceTransform, TargetTransforms,
-				SC.Iteration, SC.Activetime, 3,
-				SC.RandGrow, SC.Seed, SC.BackGrowRange, MultThread);
+			TArray<FSpaceColonizationLineResult> LinesFromSource = bUseGPUMode
+				? UGenerateVines::SpaceColonizationCSWithScales(
+					SCSourceTransform, TargetTransforms,
+					SC.Iteration, SC.Activetime, 3,
+					SC.RandGrow, SC.Seed, SC.BackGrowRange, 200.0f)
+				: UGenerateVines::SpaceColonizationWithScales(
+					SCSourceTransform, TargetTransforms,
+					SC.Iteration, SC.Activetime, 3,
+					SC.RandGrow, SC.Seed, SC.BackGrowRange, MultThread);
+			if (bUseGPUMode && LinesFromSource.IsEmpty())
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[VineContainer] Tube SpaceColonizationCS produced no lines; falling back to CPU."));
+				LinesFromSource = UGenerateVines::SpaceColonizationWithScales(
+					SCSourceTransform, TargetTransforms,
+					SC.Iteration, SC.Activetime, 3,
+					SC.RandGrow, SC.Seed, SC.BackGrowRange, MultThread);
+			}
 			const float SourceScale = GetVineTransformScale(TubeSourceTransforms[i]);
 			for (FSpaceColonizationLineResult& LineResult : LinesFromSource)
 			{
@@ -2107,6 +2990,8 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result, boo
 				GeneratedTubeLineSourceLocations.Add(TubeSourceTransforms[i].GetLocation());
 				FVineLinePointScaleData& ScaleData = GeneratedTubeLinePointScales.AddDefaulted_GetRef();
 				ScaleData.Values = MoveTemp(LineResult.PointScales);
+				FVineLinePointAxisData& AxisData = GeneratedTubeLinePointAxes.AddDefaulted_GetRef();
+				AxisData.Values = MoveTemp(LineResult.PointAxes);
 			}
 		}
 	}
@@ -2114,6 +2999,7 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result, boo
 	TubeLineSourceScales = GeneratedTubeLineScales;
 	TubeLineSourceLocations = GeneratedTubeLineSourceLocations;
 	TubeLinePointScales = GeneratedTubeLinePointScales;
+	TubeLinePointAxes = GeneratedTubeLinePointAxes;
 
 	// Plane Lines (CPU reference + GPU accelerated comparison)
 	TArray<FGeometryScriptPolyPath> GeneratedPlaneLinesCPU;
@@ -2121,16 +3007,30 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result, boo
 	TArray<float> GeneratedPlaneLineScales;
 	TArray<FVector> GeneratedPlaneLineSourceLocations;
 	TArray<FVineLinePointScaleData> GeneratedPlaneLinePointScales;
+	TArray<FVineLinePointAxisData> GeneratedPlaneLinePointAxes;
 	{
 		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.GeneratePlaneLinesCPUAndCS"));
 		for (int32 i = 0; i < PlaneSourceCount; i++)
 		{
 			TArray<FTransform> SCSourceTransform;
 			SCSourceTransform.Add(PlaneSourceTransforms[i]);
-			TArray<FSpaceColonizationLineResult> LinesFromSource = UGenerateVines::SpaceColonizationWithScales(
-				SCSourceTransform, TargetTransforms,
-				SC.Iteration, SC.Activetime, 3,
-				SC.RandGrow, SC.Seed, SC.BackGrowRange, MultThread);
+			TArray<FSpaceColonizationLineResult> LinesFromSource = bUseGPUMode
+				? UGenerateVines::SpaceColonizationCSWithScales(
+					SCSourceTransform, TargetTransforms,
+					SC.Iteration, SC.Activetime, 3,
+					SC.RandGrow, SC.Seed, SC.BackGrowRange, 200.0f)
+				: UGenerateVines::SpaceColonizationWithScales(
+					SCSourceTransform, TargetTransforms,
+					SC.Iteration, SC.Activetime, 3,
+					SC.RandGrow, SC.Seed, SC.BackGrowRange, MultThread);
+			if (bUseGPUMode && LinesFromSource.IsEmpty())
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[VineContainer] Plane SpaceColonizationCS produced no lines; falling back to CPU."));
+				LinesFromSource = UGenerateVines::SpaceColonizationWithScales(
+					SCSourceTransform, TargetTransforms,
+					SC.Iteration, SC.Activetime, 3,
+					SC.RandGrow, SC.Seed, SC.BackGrowRange, MultThread);
+			}
 			const float SourceScale = GetVineTransformScale(PlaneSourceTransforms[i]);
 			for (FSpaceColonizationLineResult& LineResult : LinesFromSource)
 			{
@@ -2139,6 +3039,8 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result, boo
 				GeneratedPlaneLineSourceLocations.Add(PlaneSourceTransforms[i].GetLocation());
 				FVineLinePointScaleData& ScaleData = GeneratedPlaneLinePointScales.AddDefaulted_GetRef();
 				ScaleData.Values = MoveTemp(LineResult.PointScales);
+				FVineLinePointAxisData& AxisData = GeneratedPlaneLinePointAxes.AddDefaulted_GetRef();
+				AxisData.Values = MoveTemp(LineResult.PointAxes);
 			}
 		}
 	}
@@ -2147,6 +3049,7 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result, boo
 	PlaneLineSourceScales = GeneratedPlaneLineScales;
 	PlaneLineSourceLocations = GeneratedPlaneLineSourceLocations;
 	PlaneLinePointScales = GeneratedPlaneLinePointScales;
+	PlaneLinePointAxes = GeneratedPlaneLinePointAxes;
 
 	// 5. 可视化
 	{
@@ -2228,6 +3131,190 @@ void AVineContainer::GenerateVineAction()
 		MeshComponent->MarkRenderTransformDirty();
 		MeshComponent->MarkRenderStateDirty();
 	}
+}
+
+int32 AVineContainer::DrawDebugVineSurfaceVoxelArrows(
+	float ArrowLength,
+	FLinearColor ArrowColor,
+	float Duration,
+	float Thickness,
+	bool bPersistentLines,
+	bool bDrawVoxelCenters,
+	FLinearColor VoxelCenterColor,
+	float VoxelCenterPointSize,
+	bool bDrawWeightedTargets,
+	FLinearColor WeightedTargetColor,
+	float WeightedTargetPointSize,
+	bool bDrawCenterToTargetLines,
+	FLinearColor CenterToTargetColor,
+	int32 MaxArrowsToDraw)
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return 0;
+	}
+
+	TArray<FTransform> TubeSourceTransforms;
+	TArray<FTransform> PlaneSourceTransforms;
+	TArray<FTransform> TargetTransforms;
+	GetVineInstanceTransforms(TubeVineSource, TubeSourceTransforms);
+	GetVineInstanceTransforms(PlaneVineSource, PlaneSourceTransforms);
+	GetVineInstanceTransforms(GrowTarget, TargetTransforms);
+
+	const int32 TargetCount = TargetTransforms.Num();
+	const int32 SourceCount = TubeSourceTransforms.Num() + PlaneSourceTransforms.Num();
+	if (TargetCount == 0 || SourceCount == 0)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[VineVoxelDebug] Cannot build surface voxels on %s. Targets=%d Sources=%d"),
+			*GetActorNameOrLabel(),
+			TargetCount,
+			SourceCount);
+		return 0;
+	}
+
+	ReferencePoints.Reset();
+	ReferencePoints.Reserve(TargetCount);
+	for (const FTransform& TargetTransform : TargetTransforms)
+	{
+		ReferencePoints.Add(TargetTransform.GetLocation());
+	}
+
+	TArray<FTransform> BBoxTransforms;
+	BBoxTransforms.Reserve(SourceCount + TargetCount);
+	BBoxTransforms.Append(TubeSourceTransforms);
+	BBoxTransforms.Append(PlaneSourceTransforms);
+	BBoxTransforms.Append(TargetTransforms);
+
+	TArray<FVector> BBoxVectors;
+	BBoxVectors.Reserve(BBoxTransforms.Num());
+	for (const FTransform& Transform : BBoxTransforms)
+	{
+		BBoxVectors.Add(Transform.GetLocation());
+	}
+
+	FBox Bounds(BBoxVectors);
+	Bounds = Bounds.ExpandBy(50);
+	if (!Bounds.IsValid)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[VineVoxelDebug] Invalid vine debug bounds on %s."), *GetActorNameOrLabel());
+		return 0;
+	}
+
+	const float SafeVoxelSize = FMath::Max(SC.VoxelSize, 1.0e-3f);
+	VoxelGridSettings.VoxelSize = SafeVoxelSize;
+	VoxelGridSettings.ActivationRadius = SafeVoxelSize * 8.0f;
+	EnsureTriangleCacheByBox(
+		TEXT("VineDebugSurfaceVoxelArrows"),
+		Bounds.GetCenter(),
+		Bounds.GetExtent(),
+		false);
+
+	CachedSurfaceVoxels = GetBoxSceneSurfaceVoxelsFromGPU(SafeVoxelSize);
+	const FCSSurfaceVoxelData& VoxelData = CachedSurfaceVoxels;
+	const int32 AvailableCount = FMath::Min3(VoxelData.Positions.Num(), VoxelData.Normals.Num(), VoxelData.TargetPositions.Num());
+	if (AvailableCount <= 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[VineVoxelDebug] No weighted surface voxel data generated on %s."), *GetActorNameOrLabel());
+		return 0;
+	}
+
+	const int32 DrawLimit = MaxArrowsToDraw > 0
+		? FMath::Min(MaxArrowsToDraw, AvailableCount)
+		: AvailableCount;
+	const float SafeArrowLength = ArrowLength > 0.0f
+		? ArrowLength
+		: FMath::Max(VoxelData.VoxelSize, SC.VoxelSize);
+	const float SafeDuration = FMath::Max(0.0f, Duration);
+	const float SafeThickness = FMath::Max(0.0f, Thickness);
+	const float SafeVoxelPointSize = FMath::Max(0.0f, VoxelCenterPointSize);
+	const float SafeTargetPointSize = FMath::Max(0.0f, WeightedTargetPointSize);
+	const float ArrowHeadSize = FMath::Max(SafeArrowLength * 0.15f, SafeThickness * 4.0f);
+	const FColor ArrowDrawColor = ArrowColor.ToFColor(true);
+	const FColor VoxelCenterDrawColor = VoxelCenterColor.ToFColor(true);
+	const FColor WeightedTargetDrawColor = WeightedTargetColor.ToFColor(true);
+	const FColor CenterToTargetDrawColor = CenterToTargetColor.ToFColor(true);
+
+	auto IsFiniteVector = [](const FVector& Vector)
+	{
+		return FMath::IsFinite(Vector.X) && FMath::IsFinite(Vector.Y) && FMath::IsFinite(Vector.Z);
+	};
+
+	int32 DrawnCount = 0;
+	for (int32 Index = 0; Index < DrawLimit; ++Index)
+	{
+		const FVector& VoxelCenter = VoxelData.Positions[Index];
+		const FVector& WeightedTarget = VoxelData.TargetPositions[Index];
+		if (!IsFiniteVector(VoxelCenter) || !IsFiniteVector(WeightedTarget))
+		{
+			continue;
+		}
+
+		FVector Normal = VoxelData.Normals[Index];
+		if (!IsFiniteVector(Normal) || !Normal.Normalize())
+		{
+			continue;
+		}
+
+		DrawDebugDirectionalArrow(
+			World,
+			WeightedTarget,
+			WeightedTarget + Normal * SafeArrowLength,
+			ArrowHeadSize,
+			ArrowDrawColor,
+			bPersistentLines,
+			SafeDuration,
+			0,
+			SafeThickness);
+
+		if (bDrawVoxelCenters && SafeVoxelPointSize > 0.0f)
+		{
+			DrawDebugPoint(
+				World,
+				VoxelCenter,
+				SafeVoxelPointSize,
+				VoxelCenterDrawColor,
+				bPersistentLines,
+				SafeDuration,
+				0);
+		}
+
+		if (bDrawWeightedTargets && SafeTargetPointSize > 0.0f)
+		{
+			DrawDebugPoint(
+				World,
+				WeightedTarget,
+				SafeTargetPointSize,
+				WeightedTargetDrawColor,
+				bPersistentLines,
+				SafeDuration,
+				0);
+		}
+
+		if (bDrawCenterToTargetLines)
+		{
+			DrawDebugLine(
+				World,
+				VoxelCenter,
+				WeightedTarget,
+				CenterToTargetDrawColor,
+				bPersistentLines,
+				SafeDuration,
+				0,
+				SafeThickness);
+		}
+
+		++DrawnCount;
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[VineVoxelDebug] Drawn weighted surface voxel arrows on %s. Drawn=%d Available=%d VoxelSize=%.3f"),
+		*GetActorNameOrLabel(),
+		DrawnCount,
+		AvailableCount,
+		VoxelData.VoxelSize);
+	return DrawnCount;
 }
 
 void AVineContainer::SaveStaticmesh()

@@ -1,0 +1,616 @@
+// EnhancedHairCardsVertexFactory.ush
+// Custom vertex factory for Enhanced Hair Cards plugin.
+// Provides material-driven hair-card geometry without per-card texture routing.
+
+// Alias so all HairCardsVF.* references in engine includes resolve to ours
+#define HairCardsVF EnhancedHairCardsVF
+
+#include "/Engine/Private/VertexFactoryCommon.ush"
+#include "/Engine/Private/LocalVertexFactoryCommon.ush"
+#include "/Engine/Private/HairStrands/HairStrandsVisibilityCommon.ush"
+
+// Lightweight Hair Attribute node defaults. Final appearance is controlled by
+// the assigned material rather than card texture slots.
+#include "/Plugin/EnhancedHairCards/Private/EnhancedHairCardsAttributes.ush"
+
+#include "/Engine/Generated/UniformBuffers/PrecomputedLightingBuffer.ush"
+
+uint EnhancedDivRoundUp2(uint Value) { return (Value + 1u) >> 1u; }
+
+#if RAYHITGROUPSHADER
+#include "/Engine/Private/RayTracing/RayTracingCommon.ush"
+#include "/Engine/Private/RayTracing/RayTracingHitGroupCommon.ush"
+#endif
+
+#define USE_HAIR_COMPLEX_TRANSMITTANCE 1
+
+#if MANUAL_VERTEX_FETCH
+	Buffer<float4> VertexFetch_InstanceOriginBuffer;
+	Buffer<float4> VertexFetch_InstanceTransformBuffer;
+#endif
+
+// ---------------------------------------------------------------------------
+// Vertex input
+// ---------------------------------------------------------------------------
+
+struct FVertexFactoryInput
+{
+#if MANUAL_VERTEX_FETCH
+	uint VertexId : SV_VertexID;
+#else
+	float4 Position     : ATTRIBUTE0;
+	float4 PrevPosition : ATTRIBUTE1;
+  #if METAL_ES3_1_PROFILE
+	float3 TangentX : ATTRIBUTE2;
+	float4 TangentZ : ATTRIBUTE3;
+  #else
+	half3  TangentX : ATTRIBUTE2;
+	half4  TangentZ : ATTRIBUTE3;
+  #endif
+	float4 Materials    : ATTRIBUTE4;
+	float4 VertexColors : ATTRIBUTE5;
+	float4 UVs          : ATTRIBUTE6;
+
+  #if NUM_MATERIAL_TEXCOORDS_VERTEX
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX >= 1
+	float4 TexCoords0 : ATTRIBUTE7;
+	#endif
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX >= 3
+	float4 TexCoords1 : ATTRIBUTE8;
+	#endif
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX >= 5
+	float4 TexCoords2 : ATTRIBUTE9;
+	#endif
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX >= 7
+	float4 TexCoords3 : ATTRIBUTE10;
+	#endif
+  #endif
+#endif
+
+	VF_GPUSCENE_DECLARE_INPUT_BLOCK(13)
+	VF_INSTANCED_STEREO_DECLARE_INPUT_BLOCK()
+	VF_MOBILE_MULTI_VIEW_DECLARE_INPUT_BLOCK()
+};
+
+#if RAYHITGROUPSHADER
+FVertexFactoryInput LoadVertexFactoryInputForHGS(uint TriangleIndex, int VertexIndex)
+{
+	FTriangleBaseAttributes TriangleAttributes = LoadTriangleBaseAttributes(TriangleIndex);
+	FVertexFactoryInput Input = (FVertexFactoryInput)0;
+#if MANUAL_VERTEX_FETCH
+	Input.VertexId = TriangleAttributes.Indices[VertexIndex];
+#endif
+	VF_GPUSCENE_SET_INPUT_FOR_RT(Input, GetInstanceUserData(), 0U);
+	return Input;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Intermediates
+// ---------------------------------------------------------------------------
+
+struct FVertexFactoryIntermediates
+{
+	half3x3 TangentToLocal;
+	half3x3 TangentToWorld;
+	half    TangentToWorldSign;
+	half4   VertexColors;
+	float2  HairPrimitiveLength;
+	float4  HairPrimitiveMaterial;
+	float   HairPrimitiveGroupIndex;
+
+	FSceneDataIntermediates SceneData;
+};
+
+FPrimitiveSceneData GetPrimitiveData(FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.SceneData.Primitive;
+}
+
+uint GetHairVertexFetchId(FVertexFactoryInput Input)
+{
+#if MANUAL_VERTEX_FETCH
+	return min(Input.VertexId, EnhancedHairCardsVF.MaxVertexCount - 1u);
+#else
+	return 0u;
+#endif
+}
+
+float4 GetEnhancedHairCardsDynamicsData(FVertexFactoryInput Input)
+{
+#if MANUAL_VERTEX_FETCH
+	if ((EnhancedHairCardsVF.DynamicsFlags & 1u) != 0u)
+	{
+		return EnhancedHairCardsVF.DynamicsBuffer[GetHairVertexFetchId(Input)];
+	}
+#endif
+	return float4(0, 0, 1, 0);
+}
+
+float3 GetEnhancedSafeNormal(float3 V, float3 Fallback)
+{
+	const float LenSq = dot(V, V);
+	return LenSq > 1.0e-6f ? V * rsqrt(LenSq) : Fallback;
+}
+
+float3 ApplyEnhancedHairCardsDynamics(FVertexFactoryInput Input, float3 RestPosition, bool bPreviousFrame)
+{
+	const float4 DynamicsData = GetEnhancedHairCardsDynamicsData(Input);
+	const float RootToTip = saturate(DynamicsData.x);
+	if ((EnhancedHairCardsVF.DynamicsFlags & 1u) == 0u || RootToTip <= 0.0f)
+	{
+		return RestPosition;
+	}
+
+	const float Mask = pow(RootToTip, max(EnhancedHairCardsVF.DynamicsTipPower, 0.01f));
+	const float Time = bPreviousFrame ? View.GameTime - (1.0f / 60.0f) : View.GameTime;
+	const float3 WindDirection = GetEnhancedSafeNormal(EnhancedHairCardsVF.DynamicsWindDirection, float3(0, 1, 0));
+	float3 SideDirection = cross(WindDirection, float3(0, 0, 1));
+	SideDirection = GetEnhancedSafeNormal(SideDirection, float3(1, 0, 0));
+
+	const float Phase = DynamicsData.y * 6.2831853f
+		+ Time * EnhancedHairCardsVF.DynamicsFlutterFrequency * 6.2831853f
+		+ RestPosition.x * 0.017f
+		+ RestPosition.z * 0.011f;
+	const float Wave0 = sin(Phase);
+	const float Wave1 = sin(Phase * 1.73f + DynamicsData.z * 2.113f);
+
+	const float3 WindOffset = WindDirection * EnhancedHairCardsVF.DynamicsWindStrength;
+	const float3 FlutterOffset = (WindDirection * Wave0 + SideDirection * Wave1 * DynamicsData.z)
+		* EnhancedHairCardsVF.DynamicsFlutterStrength;
+	const float3 GravityOffset = float3(0, 0, -EnhancedHairCardsVF.DynamicsGravityStrength);
+
+	return RestPosition + (WindOffset + FlutterOffset + GravityOffset)
+		* EnhancedHairCardsVF.DynamicsStrength
+		* Mask;
+}
+
+// ---------------------------------------------------------------------------
+// Vertex data fetch — always outputs full RGBA vertex color
+// ---------------------------------------------------------------------------
+
+struct FHairCardsPoint
+{
+	float3 Position;
+	float  CardLength;
+	float  GroupIndex;
+	float4 Materials;
+	half4  VertexColors;
+};
+
+FHairCardsPoint GetVertexPosition(FVertexFactoryInput Input)
+{
+	half4 VertexColors = half4(1,1,1,1);
+#if MANUAL_VERTEX_FETCH
+	const uint VertexFetchId = GetHairVertexFetchId(Input);
+	const float4 Data      = EnhancedHairCardsVF.PositionBuffer[VertexFetchId];
+	const float4 Materials = EnhancedHairCardsVF.MaterialsBuffer[VertexFetchId];
+	VertexColors = EnhancedHairCardsVF.VertexColorsBuffer[VertexFetchId] FMANUALFETCH_COLOR_COMPONENT_SWIZZLE;
+#else
+	const float4 Data      = Input.Position;
+	const float4 Materials = Input.Materials;
+	VertexColors = Input.VertexColors FCOLOR_COMPONENT_SWIZZLE;
+#endif
+
+	const uint EncodedW = asuint(Data.w);
+
+	FHairCardsPoint Out;
+	Out.Position    = ApplyEnhancedHairCardsDynamics(Input, Data.xyz, false);
+	Out.CardLength  = f16tof32(EncodedW & 0xFFFF);
+	Out.GroupIndex  = (EncodedW >> 16u);
+	Out.Materials   = float4(Materials.xyz * Materials.xyz, Materials.w);
+	Out.VertexColors = VertexColors;
+	return Out;
+}
+
+float3 GetVertexPreviousPosition(FVertexFactoryInput Input)
+{
+#if MANUAL_VERTEX_FETCH
+	const uint VertexFetchId = GetHairVertexFetchId(Input);
+	return ApplyEnhancedHairCardsDynamics(Input, EnhancedHairCardsVF.PreviousPositionBuffer[VertexFetchId].xyz, true);
+#else
+	return ApplyEnhancedHairCardsDynamics(Input, Input.PrevPosition.xyz, true);
+#endif
+}
+
+float2 GetSegmentUVCoord(FVertexFactoryInput Input)
+{
+	return float2(0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// PrimitiveCustomData helper
+// ---------------------------------------------------------------------------
+
+#if ENHANCED_HAIR_CARD_MESH_FACTORY
+float GetEnhancedCustomData(FVertexFactoryIntermediates Intermediates, uint Index)
+{
+	return GetPrimitiveData(Intermediates).CustomPrimitiveData[Index];
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Material pixel parameters — full vertex color + PrimitiveCustomData
+// ---------------------------------------------------------------------------
+
+FMaterialPixelParameters GetMaterialPixelParameters(FVertexFactoryInterpolantsVSToPS Interpolants, float4 SvPosition)
+{
+	FMaterialPixelParameters Result = MakeInitializedMaterialPixelParameters();
+
+	half3 TangentToWorld0 = GetTangentToWorld0(Interpolants).xyz;
+	half4 TangentToWorld2 = GetTangentToWorld2(Interpolants);
+	Result.UnMirrored     = TangentToWorld2.w;
+	Result.Particle.Color = half4(1, 1, 1, 1);
+	Result.TangentToWorld = AssembleTangentToWorld(TangentToWorld0, TangentToWorld2);
+#if USE_WORLDVERTEXNORMAL_CENTER_INTERPOLATION
+	Result.WorldVertexNormal_Center = Interpolants.TangentToWorld2_Center.xyz;
+#endif
+
+	Result.TwoSidedSign              = 1;
+	Result.PrimitiveId               = ToScalarMemory(GetPrimitiveId(Interpolants));
+	Result.HairPrimitiveUV           = float2(Interpolants.HairPrimitiveUV);
+	Result.HairPrimitiveRootUV       = float2(Interpolants.HairPrimitiveRootUV);
+	Result.HairPrimitiveLength       = Interpolants.HairPrimitiveLength;
+	Result.HairPrimitiveGroupIndex   = Interpolants.HairPrimitiveGroupIndex;
+	Result.HairPrimitiveMaterial     = Interpolants.HairPrimitiveMaterial;
+	Result.VertexColor               = GetColor(Interpolants);
+
+#if NUM_TEX_COORD_INTERPOLATORS
+	UNROLL
+	for (int CoordinateIndex = 0; CoordinateIndex < NUM_TEX_COORD_INTERPOLATORS; CoordinateIndex++)
+	{
+		Result.TexCoords[CoordinateIndex] = GetUV(Interpolants, CoordinateIndex);
+	}
+#endif
+
+	return Result;
+}
+
+// ---------------------------------------------------------------------------
+// Tangent space
+// ---------------------------------------------------------------------------
+
+half3x3 CalcTangentToWorldNoScale(FVertexFactoryIntermediates Intermediates, half3x3 TangentToLocal)
+{
+	half3x3 LocalToWorld = DFToFloat3x3(GetPrimitiveData(Intermediates).LocalToWorld);
+	half3 InvScale = GetPrimitiveData(Intermediates).InvNonUniformScale;
+	LocalToWorld[0] *= InvScale.x;
+	LocalToWorld[1] *= InvScale.y;
+	LocalToWorld[2] *= InvScale.z;
+	return mul(TangentToLocal, LocalToWorld);
+}
+
+float3 VertexFactoryGetPreviousInstanceSpacePosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates);
+float3 VertexFactoryGetInstanceSpacePosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates);
+
+// ---------------------------------------------------------------------------
+// UV fetch — supports up to ENHANCED_HAIR_CARDS_MAX_UV channels
+// ---------------------------------------------------------------------------
+
+void GetRootUVsAtlasUVs(FVertexFactoryInput Input, inout float2 OutAtlasUV, inout float2 OutRootUV)
+{
+#if MANUAL_VERTEX_FETCH
+	const uint NumFetchUVs = EnhancedDivRoundUp2(EnhancedHairCardsVF.NumUVs);
+	const uint UVFetchIndex = Input.VertexId * NumFetchUVs;
+	const float4 UVs = EnhancedHairCardsVF.UVsBuffer[UVFetchIndex];
+	OutRootUV  = UVs.xy;
+	OutAtlasUV = UVs.zw;
+#else
+	OutRootUV  = Input.UVs.xy;
+	OutAtlasUV = Input.UVs.zw;
+#endif
+	if ((EnhancedHairCardsVF.Flags & 0x40u) != 0u)
+	{
+		OutAtlasUV.y = 1.0f - OutAtlasUV.y;
+	}
+}
+
+#if NUM_MATERIAL_TEXCOORDS_VERTEX
+void GetTexCoords(FVertexFactoryInput Input, inout float2 OutTexCoords[NUM_MATERIAL_TEXCOORDS_VERTEX])
+{
+#if MANUAL_VERTEX_FETCH
+	const uint NumFetchUVs = EnhancedDivRoundUp2(EnhancedHairCardsVF.NumUVs);
+	UNROLL
+	for (uint CoordIndex = 0; CoordIndex < NUM_MATERIAL_TEXCOORDS_VERTEX; ++CoordIndex)
+	{
+		OutTexCoords[CoordIndex] = 0;
+		if (CoordIndex < EnhancedHairCardsVF.NumUVs)
+		{
+			const uint FetchIndex = Input.VertexId * NumFetchUVs + (CoordIndex >> 1u);
+			const float4 PackedUVs = EnhancedHairCardsVF.UVsBuffer[FetchIndex];
+			OutTexCoords[CoordIndex] = (CoordIndex & 1u) == 0 ? PackedUVs.xy : PackedUVs.zw;
+		}
+	}
+#else
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX > 0
+	OutTexCoords[0] = Input.TexCoords0.xy;
+	#endif
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX > 1
+	OutTexCoords[1] = Input.TexCoords0.zw;
+	#endif
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX > 2
+	OutTexCoords[2] = Input.TexCoords1.xy;
+	#endif
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX > 3
+	OutTexCoords[3] = Input.TexCoords1.zw;
+	#endif
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX > 4
+	OutTexCoords[4] = Input.TexCoords2.xy;
+	#endif
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX > 5
+	OutTexCoords[5] = Input.TexCoords2.zw;
+	#endif
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX > 6
+	OutTexCoords[6] = Input.TexCoords3.xy;
+	#endif
+	#if NUM_MATERIAL_TEXCOORDS_VERTEX > 7
+	OutTexCoords[7] = Input.TexCoords3.zw;
+	#endif
+#endif
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Material vertex parameters
+// ---------------------------------------------------------------------------
+
+FMaterialVertexParameters GetMaterialVertexParameters(
+	FVertexFactoryInput Input,
+	FVertexFactoryIntermediates Intermediates,
+	float3 WorldPosition,
+	half3x3 TangentToLocal,
+	bool bIsPreviousFrame = false)
+{
+	FMaterialVertexParameters Result = MakeInitializedMaterialVertexParameters();
+	Result.SceneData = Intermediates.SceneData;
+	Result.WorldPosition = WorldPosition;
+
+	if (bIsPreviousFrame)
+		Result.PositionInstanceSpace = VertexFactoryGetPreviousInstanceSpacePosition(Input, Intermediates);
+	else
+		Result.PositionInstanceSpace = VertexFactoryGetInstanceSpacePosition(Input, Intermediates);
+
+	Result.PositionPrimitiveSpace = Result.PositionInstanceSpace;
+	Result.VertexColor = Intermediates.VertexColors;
+	Result.TangentToWorld = Intermediates.TangentToWorld;
+	Result.PrevFrameLocalToWorld = GetPrimitiveData(Intermediates).PreviousLocalToWorld;
+	Result.PreSkinnedPosition = GetVertexPreviousPosition(Input);
+	Result.PreSkinnedNormal = TangentToLocal[2];
+	Result.LWCData = MakeMaterialLWCData(Result);
+
+#if NUM_MATERIAL_TEXCOORDS_VERTEX
+	GetTexCoords(Input, Result.TexCoords);
+#endif
+	return Result;
+}
+
+// ---------------------------------------------------------------------------
+// World position helpers
+// ---------------------------------------------------------------------------
+
+float4 CalcWorldPosition(float3 Position, FDFMatrix LocalToWorld)
+{
+	return TransformLocalToTranslatedWorld(Position, LocalToWorld);
+}
+
+half3x3 CalcTangentToLocal(FVertexFactoryInput Input, inout float TangentSign)
+{
+#if MANUAL_VERTEX_FETCH
+	const uint VertexFetchId = GetHairVertexFetchId(Input);
+	const half3 TangentInputX = EnhancedHairCardsVF.NormalsBuffer[VertexFetchId * 2 + 0].xyz;
+	const half4 TangentInputZ = EnhancedHairCardsVF.NormalsBuffer[VertexFetchId * 2 + 1];
+#else
+	const half3 TangentInputX = Input.TangentX.xyz;
+	const half4 TangentInputZ = Input.TangentZ;
+#endif
+
+	half3 TangentX = TangentBias(TangentInputX);
+	half4 TangentZ = TangentBias(TangentInputZ);
+	TangentSign    = TangentZ.w;
+
+	half3 TangentY = cross(TangentZ.xyz, TangentX) * TangentZ.w;
+
+	half3x3 Result;
+	Result[0] = cross(TangentY, TangentZ.xyz) * TangentZ.w;
+	Result[1] = TangentY;
+	Result[2] = TangentZ.xyz;
+	return Result;
+}
+
+half3x3 CalcTangentToWorld(FVertexFactoryIntermediates Intermediates, half3x3 TangentToLocal)
+{
+	return CalcTangentToWorldNoScale(Intermediates, TangentToLocal);
+}
+
+FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput Input)
+{
+	FHairCardsPoint CardsPoint = GetVertexPosition(Input);
+
+	FVertexFactoryIntermediates Intermediates;
+	Intermediates.SceneData               = VF_GPUSCENE_GET_INTERMEDIATES(Input);
+	Intermediates.HairPrimitiveLength     = CardsPoint.CardLength;
+	Intermediates.HairPrimitiveGroupIndex = CardsPoint.GroupIndex;
+	Intermediates.HairPrimitiveMaterial   = CardsPoint.Materials;
+	Intermediates.VertexColors            = CardsPoint.VertexColors;
+
+	float TangentSign;
+	Intermediates.TangentToLocal     = CalcTangentToLocal(Input, TangentSign);
+	Intermediates.TangentToWorld     = CalcTangentToWorld(Intermediates, Intermediates.TangentToLocal);
+	Intermediates.TangentToWorldSign = TangentSign * GetPrimitive_DeterminantSign_FromFlags(GetPrimitiveData(Intermediates).Flags);
+	return Intermediates;
+}
+
+half3x3 VertexFactoryGetTangentToLocal(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.TangentToLocal;
+}
+
+float4 VertexFactoryGetWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return CalcWorldPosition(GetVertexPosition(Input).Position, GetPrimitiveData(Intermediates).LocalToWorld);
+}
+
+float3 VertexFactoryGetInstanceSpacePosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return GetVertexPosition(Input).Position;
+}
+
+float4 VertexFactoryGetRasterizedWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, float4 InWorldPosition)
+{
+	return InWorldPosition;
+}
+
+float3 VertexFactoryGetPositionForVertexLighting(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, float3 TranslatedWorldPosition)
+{
+	return TranslatedWorldPosition;
+}
+
+FVertexFactoryInterpolantsVSToPS VertexFactoryGetInterpolantsVSToPS(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, FMaterialVertexParameters VertexParameters)
+{
+	FVertexFactoryInterpolantsVSToPS Interpolants;
+	Interpolants = (FVertexFactoryInterpolantsVSToPS)0;
+
+	SetTangents(Interpolants, Intermediates.TangentToWorld[0], Intermediates.TangentToWorld[2], Intermediates.TangentToWorldSign);
+	SetColor(Interpolants, Intermediates.VertexColors);
+
+	FHairCardsPoint CardsPoint = GetVertexPosition(Input);
+	Interpolants.HairPrimitiveLength     = CardsPoint.CardLength;
+	Interpolants.HairPrimitiveGroupIndex = CardsPoint.GroupIndex;
+	Interpolants.HairPrimitiveMaterial   = CardsPoint.Materials;
+
+	GetRootUVsAtlasUVs(Input, Interpolants.HairPrimitiveUV, Interpolants.HairPrimitiveRootUV);
+	SetPrimitiveId(Interpolants, Intermediates.SceneData.PrimitiveId);
+
+#if NUM_TEX_COORD_INTERPOLATORS && NUM_MATERIAL_TEXCOORDS_VERTEX
+	float2 TexCoords[NUM_MATERIAL_TEXCOORDS_VERTEX];
+	GetTexCoords(Input, TexCoords);
+	UNROLL
+	for (int CoordinateIndex = 0; CoordinateIndex < min(NUM_MATERIAL_TEXCOORDS_VERTEX, NUM_TEX_COORD_INTERPOLATORS); CoordinateIndex++)
+	{
+		SetUV(Interpolants, CoordinateIndex, TexCoords[CoordinateIndex]);
+	}
+#endif
+
+#if NUM_TEX_COORD_INTERPOLATORS
+	SetUV(Interpolants, 0, Interpolants.HairPrimitiveUV);
+#endif
+
+	return Interpolants;
+}
+
+float4 VertexFactoryGetWorldPosition(FVertexFactoryInput Input)
+{
+	return 0;
+}
+
+float4 VertexFactoryGetWorldPositionRaw(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return TransformLocalToTranslatedWorld(GetVertexPosition(Input).Position, GetPrimitiveData(Intermediates).LocalToWorld);
+}
+
+float4 VertexFactoryGetPreviousWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return DFTransformLocalToTranslatedWorld(GetVertexPreviousPosition(Input), GetPrimitiveData(Intermediates).PreviousLocalToWorld, ResolvedView.PrevPreViewTranslation);
+}
+
+float3 VertexFactoryGetPreviousInstanceSpacePosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return GetVertexPreviousPosition(Input);
+}
+
+float4 VertexFactoryGetTranslatedPrimitiveVolumeBounds(FVertexFactoryInterpolantsVSToPS Interpolants)
+{
+	FPrimitiveSceneData PrimitiveData = GetPrimitiveData(GetPrimitiveId(Interpolants));
+	return float4(DFFastToTranslatedWorld(PrimitiveData.ObjectWorldPosition, ResolvedView.PreViewTranslation), PrimitiveData.ObjectRadius);
+}
+
+uint VertexFactoryGetPrimitiveId(FVertexFactoryInterpolantsVSToPS Interpolants)
+{
+	return GetPrimitiveId(Interpolants);
+}
+
+float3 VertexFactoryGetWorldNormal(FVertexFactoryInput Input)
+{
+	return float3(0, 0, 1);
+}
+
+float3 VertexFactoryGetWorldNormal(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return float3(0, 0, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Ray tracing
+// ---------------------------------------------------------------------------
+
+#if NEEDS_VERTEX_FACTORY_INTERPOLATION
+struct FVertexFactoryRayTracingInterpolants
+{
+	FVertexFactoryInterpolantsVSToPS InterpolantsVSToPS;
+};
+
+float2 VertexFactoryGetRayTracingTextureCoordinate(FVertexFactoryRayTracingInterpolants Interpolants)
+{
+#if NUM_MATERIAL_TEXCOORDS
+	return Interpolants.InterpolantsVSToPS.TexCoords[0].xy;
+#else
+	return float2(0, 0);
+#endif
+}
+
+FVertexFactoryInterpolantsVSToPS VertexFactoryAssignInterpolants(FVertexFactoryRayTracingInterpolants Input)
+{
+	return Input.InterpolantsVSToPS;
+}
+
+FVertexFactoryRayTracingInterpolants VertexFactoryGetRayTracingInterpolants(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, FMaterialVertexParameters VertexParameters)
+{
+	FVertexFactoryRayTracingInterpolants Interpolants;
+	Interpolants.InterpolantsVSToPS = VertexFactoryGetInterpolantsVSToPS(Input, Intermediates, VertexParameters);
+	return Interpolants;
+}
+
+FVertexFactoryRayTracingInterpolants VertexFactoryInterpolate(FVertexFactoryRayTracingInterpolants a, float aInterp, FVertexFactoryRayTracingInterpolants b, float bInterp)
+{
+	FVertexFactoryRayTracingInterpolants O = (FVertexFactoryRayTracingInterpolants)0;
+
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	O.InterpolantsVSToPS.PrimitiveId = a.InterpolantsVSToPS.PrimitiveId;
+  #if NEEDS_LIGHTMAP_COORDINATE
+	O.InterpolantsVSToPS.LightmapDataIndex = a.InterpolantsVSToPS.LightmapDataIndex;
+  #endif
+#endif
+
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.TangentToWorld0.xyz);
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.TangentToWorld2);
+#if INTERPOLATE_VERTEX_COLOR
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.Color);
+#endif
+#if NEEDS_PER_INSTANCE_PARAMS
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.PerInstanceParams);
+#endif
+#if NEEDS_LIGHTMAP_COORDINATE
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.LightMapCoordinate);
+#endif
+#if NUM_TEX_COORD_INTERPOLATORS
+	UNROLL
+	for (int tc = 0; tc < (NUM_TEX_COORD_INTERPOLATORS + 1) / 2; ++tc)
+	{
+		INTERPOLATE_MEMBER(InterpolantsVSToPS.TexCoords[tc]);
+	}
+#elif USE_PARTICLE_SUBUVS
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.TexCoords[0]);
+#endif
+#if HAIR_CARD_MESH_FACTORY
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.HairPrimitiveUV);
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.HairPrimitiveRootUV);
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.HairPrimitiveLength);
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.HairPrimitiveGroupIndex);
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.HairPrimitiveMaterial);
+#endif
+
+	return O;
+}
+#endif
+
+#include "/Engine/Private/VertexFactoryDefaultInterface.ush"

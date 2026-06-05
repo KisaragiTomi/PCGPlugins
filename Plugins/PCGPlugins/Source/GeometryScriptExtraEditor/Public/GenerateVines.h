@@ -58,6 +58,10 @@ public:
 	// Per output point scale. For vine generation this is TargetPointScale * SourcePointScale.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
 	TArray<float> PointScales;
+
+	// Per output point smoothed line axis generated at the end of the GPU queue.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
+	TArray<FVector> PointAxes;
 };
 
 /**

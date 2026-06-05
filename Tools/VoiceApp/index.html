@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Voice Agent</title>
+<style>
+:root {
+  --bg: #0a0a0f;
+  --surface: #15151f;
+  --surface2: #1e1e2e;
+  --border: #2a2a3e;
+  --text: #e4e4ef;
+  --text2: #8888aa;
+  --accent: #6c5ce7;
+  --accent-glow: rgba(108,92,231,0.3);
+  --success: #00cec9;
+  --danger: #ff6b6b;
+  --user-bubble: #2d2d44;
+  --agent-bubble: #1a1a2e;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.header h1 {
+  font-size: 18px;
+  font-weight: 600;
+  background: linear-gradient(135deg, var(--accent), var(--success));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text2);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--danger);
+  transition: background 0.3s;
+}
+
+.status-dot.connected { background: var(--success); }
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  scroll-behavior: smooth;
+  -webkit-overflow-scrolling: touch;
+}
+
+.msg {
+  max-width: 85%;
+  padding: 10px 14px;
+  border-radius: 16px;
+  font-size: 15px;
+  line-height: 1.5;
+  word-break: break-word;
+  animation: fadeIn 0.25s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.msg.user {
+  align-self: flex-end;
+  background: var(--user-bubble);
+  border-bottom-right-radius: 4px;
+}
+
+.msg.agent {
+  align-self: flex-start;
+  background: var(--agent-bubble);
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 4px;
+}
+
+.msg .meta {
+  font-size: 11px;
+  color: var(--text2);
+  margin-bottom: 4px;
+}
+
+.msg .speaking-indicator {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+.msg .speaking-indicator.active::after {
+  content: '';
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--success);
+  animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.4; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1.2); }
+}
+
+.question-card {
+  align-self: flex-start;
+  max-width: 90%;
+  background: var(--surface2);
+  border: 1px solid var(--accent);
+  border-radius: 16px;
+  padding: 14px;
+  animation: fadeIn 0.25s ease;
+}
+
+.question-card .q-text {
+  font-size: 15px;
+  margin-bottom: 10px;
+}
+
+.question-card .q-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.question-card .q-btn {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 14px;
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.2s;
+}
+
+.question-card .q-btn:hover,
+.question-card .q-btn:active {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.controls {
+  flex-shrink: 0;
+  padding: 12px 16px;
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.text-input {
+  flex: 1;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 22px;
+  padding: 10px 16px;
+  color: var(--text);
+  font-size: 15px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.text-input:focus { border-color: var(--accent); }
+.text-input::placeholder { color: var(--text2); }
+
+.btn-mic {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  border: none;
+  background: var(--accent);
+  color: white;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.2s;
+  position: relative;
+}
+
+.btn-mic:active { transform: scale(0.92); }
+
+.btn-mic.recording {
+  background: var(--danger);
+  box-shadow: 0 0 0 6px rgba(255,107,107,0.3);
+  animation: recording-pulse 1.5s infinite;
+}
+
+@keyframes recording-pulse {
+  0%, 100% { box-shadow: 0 0 0 4px rgba(255,107,107,0.2); }
+  50% { box-shadow: 0 0 0 10px rgba(255,107,107,0.4); }
+}
+
+.btn-mic svg { width: 24px; height: 24px; fill: currentColor; }
+
+.btn-send {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: none;
+  background: var(--accent);
+  color: white;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  opacity: 0.5;
+  transition: all 0.2s;
+}
+
+.btn-send.active { opacity: 1; }
+.btn-send:active { transform: scale(0.92); }
+.btn-send svg { width: 20px; height: 20px; fill: currentColor; }
+
+.btn-stop-tts {
+  position: fixed;
+  bottom: 90px;
+  right: 16px;
+  padding: 8px 16px;
+  border-radius: 20px;
+  border: none;
+  background: var(--danger);
+  color: white;
+  font-size: 13px;
+  cursor: pointer;
+  display: none;
+  z-index: 10;
+  animation: fadeIn 0.2s ease;
+}
+
+.btn-stop-tts.visible { display: block; }
+
+.listening-text {
+  position: fixed;
+  top: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--accent);
+  color: white;
+  padding: 8px 20px;
+  border-radius: 20px;
+  font-size: 14px;
+  display: none;
+  z-index: 10;
+  animation: fadeIn 0.2s ease;
+}
+
+.listening-text.visible { display: block; }
+
+.tts-toggle {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text2);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.2s;
+}
+
+.tts-toggle.on { color: var(--success); border-color: var(--success); }
+.tts-toggle svg { width: 18px; height: 18px; fill: currentColor; }
+
+.empty-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: var(--text2);
+  gap: 12px;
+  padding: 40px;
+  text-align: center;
+}
+
+.empty-state svg { width: 48px; height: 48px; fill: var(--text2); opacity: 0.5; }
+.empty-state p { font-size: 14px; line-height: 1.6; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Voice Agent</h1>
+  <div class="status">
+    <div class="status-dot" id="statusDot"></div>
+    <span id="statusText">connecting...</span>
+  </div>
+</div>
+
+<div class="messages" id="messages">
+  <div class="empty-state" id="emptyState">
+    <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+    <p>Press the mic button or type to start chatting.<br>Your voice will be transcribed and sent to the agent.</p>
+  </div>
+</div>
+
+<div class="listening-text" id="listeningBanner">Listening...</div>
+<button class="btn-stop-tts" id="btnStopTts">Stop Speaking</button>
+
+<div class="controls">
+  <button class="tts-toggle on" id="ttsToggle" title="Toggle auto-speak">
+    <svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
+  </button>
+  <input class="text-input" id="textInput" type="text" placeholder="Type a message..." autocomplete="off">
+  <button class="btn-send" id="btnSend">
+    <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+  </button>
+  <button class="btn-mic" id="btnMic">
+    <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+  </button>
+</div>
+
+<script>
+const API = location.origin;
+const messagesEl = document.getElementById('messages');
+const emptyState = document.getElementById('emptyState');
+const textInput = document.getElementById('textInput');
+const btnSend = document.getElementById('btnSend');
+const btnMic = document.getElementById('btnMic');
+const statusDot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+const ttsToggle = document.getElementById('ttsToggle');
+const listeningBanner = document.getElementById('listeningBanner');
+const btnStopTts = document.getElementById('btnStopTts');
+
+let ttsEnabled = true;
+let isRecording = false;
+let recognition = null;
+let currentSpeech = null;
+let sseSource = null;
+
+// SSE connection
+function connectSSE() {
+  if (sseSource) sseSource.close();
+  sseSource = new EventSource(API + '/api/events');
+  
+  sseSource.addEventListener('connected', () => {
+    statusDot.classList.add('connected');
+    statusText.textContent = 'connected';
+  });
+  
+  sseSource.addEventListener('agent_reply', (e) => {
+    const data = JSON.parse(e.data);
+    addMessage('agent', data.text || data.markdown || '');
+    if (ttsEnabled && data.text) speak(data.text);
+  });
+  
+  sseSource.addEventListener('question', (e) => {
+    const data = JSON.parse(e.data);
+    showQuestion(data);
+  });
+  
+  sseSource.onerror = () => {
+    statusDot.classList.remove('connected');
+    statusText.textContent = 'reconnecting...';
+    setTimeout(connectSSE, 3000);
+  };
+}
+
+// TTS
+function speak(text) {
+  if (!ttsEnabled) return;
+  stopSpeaking();
+  
+  const clean = text
+    .replace(/```[\s\S]*?```/g, ' code block ')
+    .replace(/`[^`]+`/g, (m) => m.slice(1, -1))
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/#+\s*/g, '')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/[-*]\s+/g, ', ')
+    .replace(/\n+/g, '. ')
+    .trim();
+  
+  if (!clean) return;
+  
+  const utterance = new SpeechSynthesisUtterance(clean);
+  utterance.lang = 'zh-CN';
+  utterance.rate = 1.1;
+  utterance.pitch = 1.0;
+  
+  const voices = speechSynthesis.getVoices();
+  const zhVoice = voices.find(v => v.lang.startsWith('zh') && v.localService) 
+                || voices.find(v => v.lang.startsWith('zh'));
+  if (zhVoice) utterance.voice = zhVoice;
+  
+  utterance.onstart = () => {
+    btnStopTts.classList.add('visible');
+    markSpeaking(true);
+  };
+  utterance.onend = () => {
+    btnStopTts.classList.remove('visible');
+    markSpeaking(false);
+    currentSpeech = null;
+  };
+  utterance.onerror = () => {
+    btnStopTts.classList.remove('visible');
+    markSpeaking(false);
+    currentSpeech = null;
+  };
+  
+  currentSpeech = utterance;
+  speechSynthesis.speak(utterance);
+}
+
+function stopSpeaking() {
+  speechSynthesis.cancel();
+  btnStopTts.classList.remove('visible');
+  markSpeaking(false);
+  currentSpeech = null;
+}
+
+function markSpeaking(active) {
+  const indicators = messagesEl.querySelectorAll('.speaking-indicator');
+  const last = indicators[indicators.length - 1];
+  if (last) last.classList.toggle('active', active);
+}
+
+// STT
+function initRecognition() {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    btnMic.style.display = 'none';
+    return;
+  }
+  
+  recognition = new SpeechRecognition();
+  recognition.lang = 'zh-CN';
+  recognition.interimResults = true;
+  recognition.continuous = false;
+  recognition.maxAlternatives = 1;
+  
+  let finalTranscript = '';
+  let interimTranscript = '';
+  
+  recognition.onstart = () => {
+    isRecording = true;
+    btnMic.classList.add('recording');
+    listeningBanner.classList.add('visible');
+    finalTranscript = '';
+    interimTranscript = '';
+  };
+  
+  recognition.onresult = (e) => {
+    finalTranscript = '';
+    interimTranscript = '';
+    for (let i = 0; i < e.results.length; i++) {
+      if (e.results[i].isFinal) {
+        finalTranscript += e.results[i][0].transcript;
+      } else {
+        interimTranscript += e.results[i][0].transcript;
+      }
+    }
+    listeningBanner.textContent = finalTranscript + interimTranscript || 'Listening...';
+  };
+  
+  recognition.onend = () => {
+    isRecording = false;
+    btnMic.classList.remove('recording');
+    listeningBanner.classList.remove('visible');
+    
+    const text = (finalTranscript + interimTranscript).trim();
+    if (text) sendMessage(text, 'voice');
+  };
+  
+  recognition.onerror = (e) => {
+    isRecording = false;
+    btnMic.classList.remove('recording');
+    listeningBanner.classList.remove('visible');
+    if (e.error !== 'no-speech' && e.error !== 'aborted') {
+      console.warn('STT error:', e.error);
+    }
+  };
+}
+
+// Messages
+function addMessage(role, text) {
+  if (emptyState) emptyState.remove();
+  
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+  
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+  meta.textContent = role === 'user' ? time : `Agent ${time}`;
+  if (role === 'agent') meta.innerHTML += '<span class="speaking-indicator"></span>';
+  
+  const content = document.createElement('div');
+  content.textContent = text;
+  
+  div.appendChild(meta);
+  div.appendChild(content);
+  messagesEl.appendChild(div);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function showQuestion(data) {
+  if (emptyState) emptyState.remove();
+  
+  const card = document.createElement('div');
+  card.className = 'question-card';
+  
+  const questions = data.questions || [];
+  questions.forEach(q => {
+    const qText = document.createElement('div');
+    qText.className = 'q-text';
+    qText.textContent = q.question;
+    card.appendChild(qText);
+    
+    const opts = document.createElement('div');
+    opts.className = 'q-options';
+    (q.options || []).forEach(opt => {
+      const btn = document.createElement('button');
+      btn.className = 'q-btn';
+      btn.textContent = opt.label;
+      btn.onclick = () => {
+        sendMessage(opt.label, 'answer');
+        card.querySelectorAll('.q-btn').forEach(b => b.disabled = true);
+        btn.style.background = 'var(--accent)';
+      };
+      opts.appendChild(btn);
+    });
+    card.appendChild(opts);
+  });
+  
+  messagesEl.appendChild(card);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  
+  if (ttsEnabled && questions[0]?.question) {
+    speak(questions[0].question + '. ' + (questions[0].options || []).map((o, i) => `${i+1}, ${o.label}`).join('. '));
+  }
+}
+
+async function sendMessage(text, type = 'text') {
+  if (!text.trim()) return;
+  addMessage('user', text);
+  textInput.value = '';
+  updateSendBtn();
+  
+  try {
+    await fetch(API + '/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, type }),
+    });
+  } catch (err) {
+    console.error('Send failed:', err);
+  }
+}
+
+function updateSendBtn() {
+  btnSend.classList.toggle('active', textInput.value.trim().length > 0);
+}
+
+// Event handlers
+btnMic.onclick = () => {
+  if (!recognition) { initRecognition(); if (!recognition) return; }
+  if (isRecording) {
+    recognition.stop();
+  } else {
+    stopSpeaking();
+    recognition.start();
+  }
+};
+
+btnSend.onclick = () => {
+  const text = textInput.value.trim();
+  if (text) sendMessage(text);
+};
+
+textInput.oninput = updateSendBtn;
+textInput.onkeydown = (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    const text = textInput.value.trim();
+    if (text) sendMessage(text);
+  }
+};
+
+ttsToggle.onclick = () => {
+  ttsEnabled = !ttsEnabled;
+  ttsToggle.classList.toggle('on', ttsEnabled);
+  if (!ttsEnabled) stopSpeaking();
+};
+
+btnStopTts.onclick = stopSpeaking;
+
+// Init
+speechSynthesis.getVoices();
+speechSynthesis.onvoiceschanged = () => speechSynthesis.getVoices();
+initRecognition();
+connectSSE();
+</script>
+</body>
+</html>

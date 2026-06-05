@@ -1,0 +1,1 @@
+#include "HairMeshStylingParams.h"

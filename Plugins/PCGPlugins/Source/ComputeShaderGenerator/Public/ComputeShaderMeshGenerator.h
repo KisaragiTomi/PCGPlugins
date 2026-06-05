@@ -99,6 +99,11 @@ public:
 	// 面积加权质心（target position），与 Positions 一一对应。用于更精确的表面匹配。
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	TArray<FVector> TargetPositions;
+
+	// 体素网格的世界空间原点（与 Cells 坐标系对应）。
+	// Cell (cx, cy, cz) 的世界空间中心 = VoxelOrigin + (Cell + 0.5) * VoxelSize。
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
+	FVector VoxelOrigin = FVector::ZeroVector;
 };
 
 struct COMPUTESHADERGENERATOR_API FCSStaticMeshTriangleRDGOutput

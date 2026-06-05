@@ -1,0 +1,197 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1680" height="1280" viewBox="0 0 1680 1280" role="img" aria-labelledby="title desc">
+  <title id="title">EnhancedHairCards Groom Card Logic</title>
+  <desc id="desc">Data flow for converting Unreal Groom imported card meshes into EnhancedHairCards components and rendering them through a custom scene proxy and vertex factory.</desc>
+  <defs>
+    <marker id="arrow-blue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#246b9f"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#3f7a3d"/>
+    </marker>
+    <marker id="arrow-gray" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#686f78"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#18212b" flood-opacity="0.18"/>
+    </filter>
+    <style>
+      .bg { fill: #f6f7f3; }
+      .title { font-family: "Segoe UI", Arial, sans-serif; font-size: 34px; font-weight: 700; fill: #1f2a2f; }
+      .subtitle { font-family: "Segoe UI", Arial, sans-serif; font-size: 18px; fill: #4d5963; }
+      .lane-title { font-family: "Segoe UI", Arial, sans-serif; font-size: 21px; font-weight: 700; fill: #263238; }
+      .lane-note { font-family: "Segoe UI", Arial, sans-serif; font-size: 14px; fill: #65717a; }
+      .box { stroke-width: 2; rx: 8; ry: 8; filter: url(#shadow); }
+      .box-blue { fill: #e8f1f8; stroke: #75a6c9; }
+      .box-green { fill: #edf5e8; stroke: #91b77e; }
+      .box-amber { fill: #f8f0dd; stroke: #d7b86b; }
+      .box-rose { fill: #f7e9e4; stroke: #cf9988; }
+      .box-gray { fill: #eceff1; stroke: #a8b1ba; }
+      .box-violet { fill: #eeeaf6; stroke: #a793c5; }
+      .box-title { font-family: "Segoe UI", Arial, sans-serif; font-size: 17px; font-weight: 700; fill: #24313a; }
+      .box-text { font-family: "Segoe UI", Arial, sans-serif; font-size: 13.5px; fill: #34434d; }
+      .small { font-family: "Segoe UI", Arial, sans-serif; font-size: 12.5px; fill: #4f5d66; }
+      .code { font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; fill: #34434d; }
+      .arrow { fill: none; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+      .arrow-blue { stroke: #246b9f; marker-end: url(#arrow-blue); }
+      .arrow-green { stroke: #3f7a3d; marker-end: url(#arrow-green); }
+      .arrow-gray { stroke: #686f78; marker-end: url(#arrow-gray); }
+      .dash { stroke-dasharray: 8 7; }
+      .label { font-family: "Segoe UI", Arial, sans-serif; font-size: 12.5px; font-weight: 600; fill: #2f4655; }
+      .pill { fill: #ffffff; stroke: #b8c2ca; stroke-width: 1.5; rx: 14; ry: 14; }
+      .warning { fill: #fff8dc; stroke: #d2aa46; stroke-width: 2; rx: 8; ry: 8; }
+      .footer { font-family: "Segoe UI", Arial, sans-serif; font-size: 12px; fill: #56636c; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1680" height="1280"/>
+
+  <text class="title" x="70" y="64">EnhancedHairCards groom card logic</text>
+  <text class="subtitle" x="70" y="95">Current plugin flow: imported Groom Cards are copied into Blueprint components, then rendered or debugged by an independent MeshComponent path.</text>
+
+  <rect x="50" y="125" width="490" height="865" rx="16" fill="#dfeaf2" opacity="0.58"/>
+  <rect x="595" y="125" width="475" height="865" rx="16" fill="#e3eddc" opacity="0.62"/>
+  <rect x="1125" y="125" width="505" height="865" rx="16" fill="#eee6d4" opacity="0.66"/>
+
+  <text class="lane-title" x="75" y="162">1. Editor conversion</text>
+  <text class="lane-note" x="75" y="184">EnhancedHairCardsEditor module</text>
+  <text class="lane-title" x="620" y="162">2. Component state</text>
+  <text class="lane-note" x="620" y="184">UEnhancedHairCardsComponent template / instance</text>
+  <text class="lane-title" x="1150" y="162">3. Runtime render path</text>
+  <text class="lane-note" x="1150" y="184">FPrimitiveSceneProxy + custom Vertex Factory</text>
+
+  <!-- Editor conversion column -->
+  <rect class="box box-blue" x="80" y="220" width="410" height="108"/>
+  <text class="box-title" x="104" y="252">Conversion entry</text>
+  <text class="box-text" x="104" y="278">Blueprint API or commandlet</text>
+  <text class="code" x="104" y="301">ConvertGroomToEnhancedHairCardsBlueprint()</text>
+
+  <rect class="box box-blue" x="80" y="382" width="410" height="128"/>
+  <text class="box-title" x="104" y="414">Collect card descriptions</text>
+  <text class="box-text" x="104" y="440">Read UGroomAsset::GetHairGroupsCards()</text>
+  <text class="box-text" x="104" y="463">Keep only imported meshes</text>
+  <text class="box-text" x="104" y="486">LOD=-1: pick best/lowest LOD per group</text>
+
+  <rect class="box box-blue" x="80" y="560" width="410" height="132"/>
+  <text class="box-title" x="104" y="592">Create Actor Blueprint</text>
+  <text class="box-text" x="104" y="618">SceneRoot</text>
+  <text class="box-text" x="104" y="641">OriginalGroomCards: UGroomComponent</text>
+  <text class="box-text" x="104" y="664">One Enhanced component per card mesh</text>
+
+  <rect class="box box-blue" x="80" y="742" width="410" height="168"/>
+  <text class="box-title" x="104" y="774">Populate each Enhanced component</text>
+  <text class="box-text" x="104" y="800">SourceMesh = CardDesc.ImportedMesh</text>
+  <text class="box-text" x="104" y="823">Copy Group / LOD / description index</text>
+  <text class="box-text" x="104" y="846">Copy material and bInvertUV</text>
+  <text class="box-text" x="104" y="869">Final appearance stays material-driven</text>
+  <text class="box-text" x="104" y="892">Copy guide curves, then save Blueprint</text>
+
+  <path class="arrow arrow-blue" d="M285 328 L285 372"/>
+  <path class="arrow arrow-blue" d="M285 510 L285 550"/>
+  <path class="arrow arrow-blue" d="M285 692 L285 732"/>
+
+  <!-- Component state column -->
+  <rect class="box box-green" x="625" y="220" width="395" height="124"/>
+  <text class="box-title" x="649" y="252">Source payload</text>
+  <text class="box-text" x="649" y="278">UStaticMesh SourceMesh</text>
+  <text class="box-text" x="649" y="301">FEnhancedHairCardsSettings CardSettings</text>
+  <text class="box-text" x="649" y="324">CustomPrimitiveFloats for material nodes</text>
+
+  <rect class="box box-green" x="625" y="390" width="395" height="150"/>
+  <text class="box-title" x="649" y="422">Material-driven appearance</text>
+  <text class="box-text" x="649" y="448">Material assignment controls final look</text>
+  <text class="box-text" x="649" y="471">No card texture slots or layout mapping</text>
+  <text class="box-text" x="649" y="494">Hair Attribute nodes use safe defaults</text>
+  <text class="box-text" x="649" y="517">CustomPrimitiveFloats remain available</text>
+
+  <rect class="box box-green" x="625" y="586" width="395" height="132"/>
+  <text class="box-title" x="649" y="618">Guide curve storage</text>
+  <text class="box-text" x="649" y="644">Try Cards LOD GuideBulkData first</text>
+  <text class="box-text" x="649" y="667">Decode curve and position bulk arrays</text>
+  <text class="box-text" x="649" y="690">Fallback: approximate curves from mesh islands</text>
+
+  <rect class="box box-green" x="625" y="764" width="395" height="132"/>
+  <text class="box-title" x="649" y="796">Blueprint/runtime controls</text>
+  <text class="box-text" x="649" y="822">SetCustomDataFloat(), material assignment</text>
+  <text class="box-text" x="649" y="845">SetDynamicsEnabled/Strength/Wind()</text>
+  <text class="box-text" x="649" y="868">SetGuideDebugEnabled(), RebuildRenderData()</text>
+
+  <path class="arrow arrow-green" d="M490 800 C545 800, 560 282, 615 282"/>
+  <path class="arrow arrow-green" d="M490 846 C548 846, 560 465, 615 465"/>
+  <path class="arrow arrow-green" d="M490 892 C548 892, 560 652, 615 652"/>
+  <path class="arrow arrow-green" d="M822 344 L822 380"/>
+  <path class="arrow arrow-green" d="M822 540 L822 576"/>
+  <path class="arrow arrow-green dash" d="M822 718 L822 754"/>
+
+  <!-- Runtime render column -->
+  <rect class="box box-amber" x="1160" y="220" width="420" height="126"/>
+  <text class="box-title" x="1184" y="252">CreateSceneProxy()</text>
+  <text class="box-text" x="1184" y="278">Requires SourceMesh render data</text>
+  <text class="box-text" x="1184" y="301">Constructs FEnhancedHairCardsSceneProxy</text>
+  <text class="box-text" x="1184" y="324">Copies component settings and material state</text>
+
+  <rect class="box box-amber" x="1160" y="390" width="420" height="158"/>
+  <text class="box-title" x="1184" y="422">Extract StaticMesh LOD0</text>
+  <text class="box-text" x="1184" y="448">Positions, tangents, UVs, colors, indices</text>
+  <text class="box-text" x="1184" y="471">Sections become FMeshBatch ranges</text>
+  <text class="box-text" x="1184" y="494">Card length and group packed into Position.w</text>
+  <text class="box-text" x="1184" y="517">Per-vertex dynamics mask from connected islands</text>
+
+  <rect class="box box-amber" x="1160" y="594" width="420" height="150"/>
+  <text class="box-title" x="1184" y="626">Upload render-thread buffers</text>
+  <text class="box-text" x="1184" y="652">float4 SRVs: Position, PreviousPosition</text>
+  <text class="box-text" x="1184" y="675">Normals, UVs, Materials, VertexColors</text>
+  <text class="box-text" x="1184" y="698">Dynamics plus uint32 index buffer</text>
+  <text class="box-text" x="1184" y="721">Build VF uniform buffer without texture slots</text>
+
+  <rect class="box box-amber" x="1160" y="790" width="420" height="130"/>
+  <text class="box-title" x="1184" y="822">GetDynamicMeshElements()</text>
+  <text class="box-text" x="1184" y="848">If bRenderCardsMesh: add MeshBatch sections</text>
+  <text class="box-text" x="1184" y="871">If GuideDebug: draw stored/fallback guide lines</text>
+  <text class="box-text" x="1184" y="894">Uses dynamic primitive uniform buffer</text>
+
+  <path class="arrow arrow-gray" d="M1020 282 C1080 282, 1095 282, 1150 282"/>
+  <path class="arrow arrow-gray" d="M1020 465 C1080 465, 1095 468, 1150 468"/>
+  <path class="arrow arrow-gray" d="M1020 652 C1080 652, 1095 855, 1150 855"/>
+  <path class="arrow arrow-gray" d="M1370 346 L1370 380"/>
+  <path class="arrow arrow-gray" d="M1370 548 L1370 584"/>
+  <path class="arrow arrow-gray" d="M1370 744 L1370 780"/>
+
+  <!-- Shader row -->
+  <rect x="50" y="1035" width="1580" height="165" rx="16" fill="#e7e2ee" opacity="0.75"/>
+  <text class="lane-title" x="75" y="1072">4. Shader side</text>
+  <text class="lane-note" x="75" y="1094">VF and attribute shader files</text>
+
+  <rect class="box box-violet" x="440" y="1057" width="310" height="90"/>
+  <text class="box-title" x="462" y="1088">VF alias path</text>
+  <text class="box-text" x="462" y="1113">HairCardsVF resolves to</text>
+  <text class="box-text" x="462" y="1132">EnhancedHairCardsVF</text>
+
+  <rect class="box box-violet" x="790" y="1057" width="330" height="90"/>
+  <text class="box-title" x="812" y="1088">Attribute defaults</text>
+  <text class="box-text" x="812" y="1113">Hair Attribute nodes compile</text>
+  <text class="box-text" x="812" y="1132">without texture routing</text>
+
+  <rect class="box box-violet" x="1165" y="1057" width="330" height="90"/>
+  <text class="box-title" x="1187" y="1088">Simple shader dynamics</text>
+  <text class="box-text" x="1187" y="1113">Wind + flutter + gravity</text>
+  <text class="box-text" x="1187" y="1132">by root-to-tip mask</text>
+
+  <path class="arrow arrow-gray" d="M1370 920 C1610 930, 1610 1047, 1475 1047"/>
+  <path class="arrow arrow-gray" d="M1165 1102 L1130 1102"/>
+  <path class="arrow arrow-gray" d="M790 1102 L760 1102"/>
+
+  <!-- Callouts -->
+  <rect class="warning" x="1060" y="930" width="520" height="72"/>
+  <text class="box-title" x="1082" y="957">Important default</text>
+  <text class="box-text" x="1082" y="980">Converted Enhanced components set bRenderCardsMesh=false.</text>
+  <text class="box-text" x="1082" y="997">Enable it to render via this custom mesh path.</text>
+
+  <rect class="pill" x="80" y="938" width="410" height="34"/>
+  <text class="small" x="104" y="960">Original Groom component remains in the BP as a reference/preview path.</text>
+  <rect class="pill" x="625" y="930" width="395" height="42"/>
+  <text class="small" x="649" y="948">Guide debug prefers copied guide curves.</text>
+  <text class="small" x="649" y="966">Mesh-derived guide lines are only a fallback.</text>
+
+  <!-- Footer sources -->
+  <text class="footer" x="70" y="1242">Sources inspected: EnhancedHairCardsConverterLibrary.cpp, EnhancedHairCardsComponent.cpp/.h, EnhancedHairCardsSceneProxy.cpp/.h, EnhancedHairCardsVertexFactory.cpp/.h, EnhancedHairCardsVertexFactory.ush, EnhancedHairCardsAttributes.ush.</text>
+</svg>

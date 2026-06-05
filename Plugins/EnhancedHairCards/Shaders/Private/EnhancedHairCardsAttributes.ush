@@ -1,0 +1,78 @@
+// EnhancedHairCardsAttributes.ush
+// Material-driven compatibility layer for UE Hair Attribute material nodes.
+// The EnhancedHairCards vertex factory does not own texture slots or
+// attribute-channel mapping; these functions return geometry/material defaults.
+
+#pragma once
+
+#include "/Engine/Shared/HairStrandsDefinitions.h"
+
+#if HAIR_CARD_MESH_FACTORY
+
+float GetHairCardsDepth(float2 InAtlasUV, float InDeviceZ)
+{
+	return InDeviceZ;
+}
+
+float3 GetHairCardsTangent(float2 InAtlasUV, half3x3 TangentToWorld, bool bUseTangentSpace)
+{
+	const float3 LocalTangent = float3(0.0f, 1.0f, 0.0f);
+	return bUseTangentSpace ? LocalTangent : normalize(mul(LocalTangent, TangentToWorld));
+}
+
+float GetHairCardsCoverage(float2 InAtlasUV)
+{
+	return 1.0f;
+}
+
+float4 GetHairCardsAuxilaryData(float2 InAtlasUV)
+{
+	return float4(0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+float2 GetHairCardsUV(float2 InAtlasUV)
+{
+	return float2(InAtlasUV.x, 0.5f);
+}
+
+float2 GetHairCardsDimensions(float2 InAtlasUV, float HairPrimitiveLength)
+{
+	return float2(HairPrimitiveLength, 0.01f);
+}
+
+float2 GetHairCardsRootUV(float2 InAtlasUV, float2 InRootUV)
+{
+	return float2(InRootUV.x, 1.0f - InRootUV.y);
+}
+
+float GetHairCardsSeed(float2 InAtlasUV)
+{
+	return 0.0f;
+}
+
+uint3 GetHairCardsClumpID(float2 InAtlasUV)
+{
+	return uint3(0u, 0u, 0u);
+}
+
+float3 GetHairCardsColor(float2 InAtlasUV, float3 InColor)
+{
+	return InColor;
+}
+
+float GetHairCardsRoughness(float2 InAtlasUV, float InCardRoughness)
+{
+	return InCardRoughness;
+}
+
+float GetHairCardsAO(float2 InAtlasUV, float InAO)
+{
+	return InAO;
+}
+
+float GetHairCardsGroupIndex(float2 InAtlasUV, float InCardGroupIndex)
+{
+	return InCardGroupIndex;
+}
+
+#endif // HAIR_CARD_MESH_FACTORY

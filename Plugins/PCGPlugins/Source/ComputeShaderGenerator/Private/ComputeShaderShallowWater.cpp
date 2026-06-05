@@ -22,36 +22,7 @@
 #include "Engine/World.h"
 #include "HAL/IConsoleManager.h"
 #include "UObject/ObjectSaveContext.h"
-
-#if PLATFORM_WINDOWS
-#include "Windows/AllowWindowsPlatformTypes.h"
-#include "ThirdParty/RenderDoc/renderdoc_app.h"
-#include "Windows/HideWindowsPlatformTypes.h"
-
-static RENDERDOC_API_1_1_1* GRenderDocAPI = nullptr;
-
-static void InitRenderDocAPI()
-{
-	if (GRenderDocAPI) return;
-
-	HMODULE RDMod = GetModuleHandleA("renderdoc.dll");
-	if (!RDMod) return;
-
-	auto GetAPIFn = reinterpret_cast<pRENDERDOC_GetAPI>(reinterpret_cast<void*>(GetProcAddress(RDMod, "RENDERDOC_GetAPI")));
-	if (!GetAPIFn) return;
-
-	if (GetAPIFn(eRENDERDOC_API_Version_1_1_1, reinterpret_cast<void**>(&GRenderDocAPI)) != 1)
-	{
-		GRenderDocAPI = nullptr;
-		return;
-	}
-
-	FString CapturePath = FPaths::ProjectSavedDir() / TEXT("RenderDoc") / TEXT("CSSW_Capture");
-	IFileManager::Get().MakeDirectory(*FPaths::GetPath(CapturePath), true);
-	GRenderDocAPI->SetLogFilePathTemplate(TCHAR_TO_ANSI(*CapturePath));
-	UE_LOG(LogTemp, Log, TEXT("[CSSW] RenderDoc API loaded. Capture path: %s"), *CapturePath);
-}
-#endif
+#include "UObject/UObjectIterator.h"
 
 DECLARE_STATS_GROUP(TEXT("CSSW"), STATGROUP_CSSW, STATCAT_Advanced);
 DECLARE_CYCLE_STAT(TEXT("CSSW Execute"), STAT_CSSW_Execute, STATGROUP_CSSW)
@@ -271,6 +242,30 @@ void DeleteReadback(ReadbackType*& Readback)
 
 
 using namespace CSHepler;
+
+static void ReleaseAllCSSWTransientResources()
+{
+	int32 ReleasedActorCount = 0;
+	for (TObjectIterator<ACSShallowWaterCapture> It; It; ++It)
+	{
+		ACSShallowWaterCapture* Actor = *It;
+		if (!Actor || Actor->HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject) || Actor->IsTemplate())
+		{
+			continue;
+		}
+
+		Actor->ReleaseTransientRenderResources();
+		ReleasedActorCount++;
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("[CSSW] Released transient render resources on %d CSSW actor object(s)."), ReleasedActorCount);
+}
+
+static FAutoConsoleCommand CmdCSSWReleaseAllTransientResources(
+	TEXT("pcg.CSSW.ReleaseAllTransientResources"),
+	TEXT("Release transient render resources on every in-memory CSSW actor, including deleted actors retained by editor undo/preview objects."),
+	FConsoleCommandDelegate::CreateStatic(&ReleaseAllCSSWTransientResources));
+
 ACSShallowWaterCapture::ACSShallowWaterCapture()
 {
 	PrimaryActorTick.bCanEverTick = false;
@@ -381,7 +376,6 @@ void ACSShallowWaterCapture::HandleSolverTimerTick(int32 ExpectedSolverReadbackG
 void ACSShallowWaterCapture::StopSimulationRuntime(bool bResetVisualization)
 {
 	ClearSolverTimer();
-	bCaptureNextSolverFrame = false;
 	ResetSolverReadbackState(true, false);
 
 	if (bResetVisualization)
@@ -521,7 +515,6 @@ void ACSShallowWaterCapture::ReleaseShallowWaterTransientResources(const TCHAR* 
 		Context ? Context : TEXT("unknown context"), *GetNameSafe(this));
 
 	ClearSolverTimer();
-	bCaptureNextSolverFrame = false;
 	bSimVisActive = false;
 
 	if (UWorld* World = GetWorld())
@@ -532,11 +525,38 @@ void ACSShallowWaterCapture::ReleaseShallowWaterTransientResources(const TCHAR* 
 	ConstructionDebounceHandle.Invalidate();
 	DebugViewPlaneTimerHandle.Invalidate();
 
+	TArray<AActor*> DebugViewActors;
+	if (UWorld* World = GetWorld())
+	{
+		UGameplayStatics::GetAllActorsOfClassWithTag(World, AStaticMeshActor::StaticClass(), FName("CSSWVM"), DebugViewActors);
+	}
 	if (DebugViewPlaneActor.IsValid())
 	{
-		DebugViewPlaneActor->Destroy();
-		DebugViewPlaneActor.Reset();
+		DebugViewActors.AddUnique(DebugViewPlaneActor.Get());
 	}
+	for (AActor* DebugActor : DebugViewActors)
+	{
+		if (!DebugActor)
+		{
+			continue;
+		}
+
+		if (AStaticMeshActor* MeshActor = Cast<AStaticMeshActor>(DebugActor))
+		{
+			if (UStaticMeshComponent* MeshComponent = MeshActor->GetStaticMeshComponent())
+			{
+				if (UStaticMesh* Mesh = MeshComponent->GetStaticMesh())
+				{
+					MeshComponent->SetMaterial(0, Mesh->GetMaterial(0));
+				}
+				MeshComponent->SetStaticMesh(nullptr);
+				MeshComponent->MarkRenderStateDirty();
+			}
+		}
+		DebugActor->Tags.Remove(FName("CSSWVM"));
+		DebugActor->Destroy();
+	}
+	DebugViewPlaneActor.Reset();
 
 	if (CaptureSceneDepth)
 	{
@@ -557,12 +577,35 @@ void ACSShallowWaterCapture::ReleaseShallowWaterTransientResources(const TCHAR* 
 		return DynamicMaterial ? GetNonTransientFallbackMaterial(DynamicMaterial->Parent, this) : nullptr;
 	};
 
+	// --- 1. Before releasing render targets, clear all texture parameter references
+	//    held by Material Instance Dynamics that point to CSSW-owned render targets.
+	//    Otherwise RHI may hold GPU memory because those MIDs still reference the textures.
+	auto ClearMIDTextureParams = [this](UMaterialInstanceDynamic* MID)
+	{
+		if (!MID || !IsOwnedByCSSWActor(MID, this))
+		{
+			return;
+		}
+		static const FName CSSW_VelHeight(TEXT("CSSW_VelHeight"));
+		static const FName CSSW_DepthWet(TEXT("CSSW_DepthWet"));
+		static const FName CSSW_SimCenter(TEXT("CSSW_SimCenter"));
+		static const FName CSSW_SimInvSize(TEXT("CSSW_SimInvSize"));
+
+		// Unbind render-target texture references so RHI can release the resources.
+		MID->SetTextureParameterValue(CSSW_VelHeight, nullptr);
+		MID->SetTextureParameterValue(CSSW_DepthWet, nullptr);
+		// Reset scalar/vector parameters that point to dynamic sim data.
+		MID->SetVectorParameterValue(CSSW_SimCenter, FLinearColor::Black);
+		MID->SetScalarParameterValue(CSSW_SimInvSize, 0.0f);
+	};
+
 	if (ReusltMesh)
 	{
 		if (UMaterialInstanceDynamic* MID = Cast<UMaterialInstanceDynamic>(ReusltMesh->GetMaterial(0)))
 		{
 			if (IsOwnedByCSSWActor(MID, this))
 			{
+				ClearMIDTextureParams(MID);
 				ReusltMesh->SetMaterial(0, ResolveFallbackMaterial(WaterMaterial, MID));
 			}
 		}
@@ -577,6 +620,7 @@ void ACSShallowWaterCapture::ReleaseShallowWaterTransientResources(const TCHAR* 
 		{
 			if (IsOwnedByCSSWActor(HISM_MID, this))
 			{
+				ClearMIDTextureParams(HISM_MID);
 				SimVisHISM->SetMaterial(0, ResolveFallbackMaterial(WaterMaterial, HISM_MID));
 			}
 		}
@@ -590,6 +634,7 @@ void ACSShallowWaterCapture::ReleaseShallowWaterTransientResources(const TCHAR* 
 		{
 			if (IsOwnedByCSSWActor(DecalMID, this))
 			{
+				ClearMIDTextureParams(DecalMID);
 				CausticsDecal->SetDecalMaterial(ResolveFallbackMaterial(DecalMaterial, DecalMID));
 			}
 		}
@@ -606,6 +651,8 @@ void ACSShallowWaterCapture::ReleaseShallowWaterTransientResources(const TCHAR* 
 	VisWaterMaterial = nullptr;
 	VisDecalMaterial = nullptr;
 
+	// --- 2. Flush the render thread so all pending render commands finish before
+	//    we delete readback objects and release render-target RHI resources.
 	if (FApp::CanEverRender() && IsInGameThread())
 	{
 		FlushRenderingCommands();
@@ -635,6 +682,8 @@ void ACSShallowWaterCapture::ReleaseShallowWaterTransientResources(const TCHAR* 
 	SimUVInvSize = 0.0f;
 	TextureSize = ResolveTextureSize();
 
+	// --- 3. Double-flush: the ReleaseResource() calls above enqueue render-thread
+	//    work to actually free the RHI textures. Must flush again to process those.
 	if (FApp::CanEverRender() && IsInGameThread())
 	{
 		FlushRenderingCommands();
@@ -774,6 +823,15 @@ void ACSShallowWaterCapture::ConstructionComponent()
 
 void ACSShallowWaterCapture::ConstructActor()
 {
+	// Safety: skip construction work if the actor is already being destroyed.
+	// This can happen if the OnConstruction debounce timer fires after the
+	// actor has been deleted from the world but before GC collects it.
+	if (IsActorBeingDestroyed())
+	{
+		bSWConstructionWorkPending = false;
+		return;
+	}
+
 	bSWConstructionWorkPending = true;
 	TGuardValue<bool> ConstructionGuard(bSWConstructionGuardActive, true);
 	StopSimulationRuntime(true);
@@ -850,6 +908,14 @@ void ACSShallowWaterCapture::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	Super::EndPlay(EndPlayReason);
 }
 
+void ACSShallowWaterCapture::Destroyed()
+{
+	StopSimulationRuntime(true);
+	WaitForPendingShallowWaterRendering(TEXT("Destroyed before releasing CSSW resources"));
+	ReleaseShallowWaterTransientResources(TEXT("Destroyed"));
+	Super::Destroyed();
+}
+
 void ACSShallowWaterCapture::BeginDestroy()
 {
 	ReleaseShallowWaterTransientResources(TEXT("BeginDestroy"));
@@ -888,21 +954,6 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 	{
 		ResetSimVisTiles();
 		return;
-	}
-
-	bool bDoCapture = bCaptureNextSolverFrame;
-	if (bDoCapture)
-	{
-		InitRenderDocAPI();
-		if (GRenderDocAPI)
-		{
-			bCaptureNextSolverFrame = false;
-		}
-		else
-		{
-			bDoCapture = false;
-			UE_LOG(LogTemp, Warning, TEXT("[CSSW] RenderDoc not loaded. Launch editor with -RenderDoc flag. Capture request preserved."));
-		}
 	}
 
 	TArray<FVector4f> SourceUVRads;
@@ -1212,15 +1263,11 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 
 	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
 	[R_SceneDepth, R_DebugView, R_VelocityHeight, R_ResultVelHeight, R_ResultDepthWet, R_ResultSmoothHeight, R_TileMask,
-	 SourceUVRads = MoveTemp(SourceUVRads), bDoCapture, bUseSparseIndirect, CapturedWaterfallExpansionIterations,
+	 SourceUVRads = MoveTemp(SourceUVRads), bUseSparseIndirect, CapturedWaterfallExpansionIterations,
 	 CapturedDT, CapturedFriction, CapturedSeaLevel, ActorLocation, CapturedAdvectFoam, CapturedFoamFadeSpeed,
 	 CapturedCloseBound, CapturedInIteration, TileMaskWidth, TileMaskHeight, TileMaskReadbackForRender,
 	 ResultReadbackForRender](FRHICommandListImmediate& RHICmdList)
 	{
-#if PLATFORM_WINDOWS
-		if (bDoCapture && GRenderDocAPI) GRenderDocAPI->StartFrameCapture(nullptr, nullptr);
-#endif
-
 		SCOPED_GPU_STAT(RHICmdList, Stat_ShallowWater);
 		FRDGBuilder GraphBuilder(RHICmdList);
 		{
@@ -1464,10 +1511,6 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 
 		TileMaskReadbackForRender->EnqueueCopy(RHICmdList, R_TileMask->GetRenderTargetTexture());
 		ResultReadbackForRender->EnqueueCopy(RHICmdList, R_ResultVelHeight->GetRenderTargetTexture());
-
-#if PLATFORM_WINDOWS
-		if (bDoCapture && GRenderDocAPI) GRenderDocAPI->EndFrameCapture(nullptr, nullptr);
-#endif
 	});
 
 	TileMaskReadbackWriteIdx = 1 - TileWriteIdx;
@@ -1855,17 +1898,6 @@ void ACSShallowWaterCapture::CaptureSceneDepthNow()
 	CaptureSceneDepth->CaptureScene();
 }
 
-void ACSShallowWaterCapture::RequestRenderDocCapture()
-{
-	bCaptureNextSolverFrame = true;
-}
-
-void ACSShallowWaterCapture::ShallowWaterSolverSoucePointWithCapture(int32 InIteration)
-{
-	bCaptureNextSolverFrame = true;
-	ShallowWaterSolverSoucePoint(InIteration);
-}
-
 void ACSShallowWaterCapture::StartSolver(float TimerRate)
 {
 	ClearSolverTimer();
@@ -2013,6 +2045,13 @@ void ACSShallowWaterCapture::UseBakedResultMesh(UStaticMesh* InBakedMesh, UMater
 	}
 	ReusltMesh->SetVisibility(true);
 	ReusltMesh->MarkRenderStateDirty();
+	if (CausticsDecal && DecalMaterial)
+	{
+		CausticsDecal->Modify();
+		CausticsDecal->SetDecalMaterial(DecalMaterial);
+		CausticsDecal->SetVisibility(true);
+		CausticsDecal->MarkRenderStateDirty();
+	}
 	MarkPackageDirty();
 }
 
@@ -2047,6 +2086,8 @@ void ACSShallowWaterCapture::ShowDebugViewPlane(float Duration)
 	if (!DebugMesh) return;
 
 	FActorSpawnParameters SpawnParams;
+	SpawnParams.Owner = this;
+	SpawnParams.ObjectFlags |= RF_Transient;
 	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 	AStaticMeshActor* Spawned = World->SpawnActor<AStaticMeshActor>(
 		AStaticMeshActor::StaticClass(),
@@ -2064,6 +2105,8 @@ void ACSShallowWaterCapture::ShowDebugViewPlane(float Duration)
 	}
 
 	Spawned->Tags.Add(FName("CSSWVM"));
+	Spawned->SetFlags(RF_Transient);
+	SMC->SetFlags(RF_Transient);
 	DebugViewPlaneActor = Spawned;
 
 	if (Duration > 0.f)

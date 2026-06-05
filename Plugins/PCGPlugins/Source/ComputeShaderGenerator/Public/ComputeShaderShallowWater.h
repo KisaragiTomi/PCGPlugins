@@ -39,19 +39,19 @@ public:
 	virtual void Tick(float DeltaTime) override;
 	virtual bool ShouldTickIfViewportsOnly() const override;
 
-	UPROPERTY(Transient, EditAnywhere, BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, NonTransactional, EditAnywhere, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_DebugView;
-	UPROPERTY(Transient, BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_VelocityHeight;
-	UPROPERTY(Transient, BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_ResultVelHeight;
-	UPROPERTY(Transient, BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_ResultDepthWet;
-	UPROPERTY(Transient, BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_Source;
-	UPROPERTY(Transient, BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_SceneDepth;
-	UPROPERTY(Transient, BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_SmoothHeight;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug", Meta=(Priority=1000))
 	int32 SWUniqueID = -99999;
@@ -81,16 +81,15 @@ public:
 	UHierarchicalInstancedStaticMeshComponent* SimVisHISM;
 	UPROPERTY(BlueprintReadWrite, Category = "Debug")
 	UDecalComponent* CausticsDecal;
-
 	
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	UMaterialInterface* WaterMaterial;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	UMaterialInterface* DecalMaterial;
 
-	UPROPERTY(Transient, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	UMaterialInterface* VisWaterMaterial;
-	UPROPERTY(Transient, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	UMaterialInterface* VisDecalMaterial;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	bool CloseBound = false;
@@ -132,6 +131,7 @@ public:
 	virtual void BeginPlay() override;
 	virtual void PreSave(FObjectPreSaveContext ObjectSaveContext) override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void Destroyed() override;
 	virtual void BeginDestroy() override;
 
 	virtual void OnConstruction(const FTransform& Transform) override;
@@ -215,7 +215,7 @@ public:
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "ComputeShader")
 	void ReleaseTransientRenderResources();
 
-	UPROPERTY(Transient)
+	UPROPERTY(Transient, NonTransactional)
 	UTextureRenderTarget2D* RT_TileMask = nullptr;
 	int32 CachedActiveTileCount = 0;
 	TArray<uint8> CachedTileBits;
@@ -241,15 +241,6 @@ public:
 
 	FTimerHandle ConstructionDebounceHandle;
 	uint64 LastSolverFrameNumber = 0;
-
-	UPROPERTY(Transient, EditAnywhere, BlueprintReadWrite, Category = "Debug|RenderDoc", Meta=(Priority=999))
-	bool bCaptureNextSolverFrame = false;
-
-	UFUNCTION(BlueprintCallable, Category = "Debug|RenderDoc")
-	void RequestRenderDocCapture();
-
-	UFUNCTION(BlueprintCallable, Category = "Debug|RenderDoc")
-	void ShallowWaterSolverSoucePointWithCapture(int32 InIteration);
 
 	UFUNCTION(BlueprintNativeEvent, Category = "ComputeShader")
 	void OnSolverStarted();

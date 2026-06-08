@@ -370,7 +370,7 @@ void ACSShallowWaterCapture::HandleSolverTimerTick(int32 ExpectedSolverReadbackG
 	{
 		ScheduleSolverTimerTick();
 	}
-	ShallowWaterSolverSoucePoint(Iteration);
+	ShallowWaterSolverSoucePoint(SolverIterationsPerFrame);
 }
 
 void ACSShallowWaterCapture::StopSimulationRuntime(bool bResetVisualization)
@@ -940,7 +940,6 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 
 	if (!CheckAndCreateTexture_SWSourcePoint()) return;
 	InIteration = ClampCSSWIterationsPerFrame(InIteration, this);
-	Iteration = InIteration;
 
 	SCOPE_CYCLE_COUNTER(STAT_CSSW_Execute);
 
@@ -1898,11 +1897,11 @@ void ACSShallowWaterCapture::CaptureSceneDepthNow()
 	CaptureSceneDepth->CaptureScene();
 }
 
-void ACSShallowWaterCapture::StartSolver(float TimerRate)
+void ACSShallowWaterCapture::StartSolver(float TimerRate, int32 InIteration)
 {
 	ClearSolverTimer();
 	SolverTimerRate = FMath::Max(TimerRate, 0.0f);
-	Iteration = ClampCSSWIterationsPerFrame(Iteration, this);
+	SolverIterationsPerFrame = ClampCSSWIterationsPerFrame(InIteration, this);
 	if (!CanRunShallowWaterGPUWork(TEXT("StartSolver")))
 	{
 		StopSimulationRuntime(true);
@@ -1926,7 +1925,7 @@ void ACSShallowWaterCapture::StartSolver(float TimerRate)
 	ScheduleSolverTimerTick();
 	OnSolverStarted();
 	UE_LOG(LogTemp, Log, TEXT("[CSSW] StartSolver: %s Iteration=%d CaptureSize=%.2f TextureSize=%.0f TimerRate=%.4f"),
-		*GetName(), Iteration, CaptureSize, TextureSize, SolverTimerRate);
+		*GetName(), SolverIterationsPerFrame, CaptureSize, TextureSize, SolverTimerRate);
 }
 
 void ACSShallowWaterCapture::StopSolver()
@@ -1936,7 +1935,7 @@ void ACSShallowWaterCapture::StopSolver()
 
 void ACSShallowWaterCapture::ToggleSimVisualization(int32 SimIterationsPerFrame)
 {
-	Iteration = ClampCSSWIterationsPerFrame(SimIterationsPerFrame, this);
+	SolverIterationsPerFrame = ClampCSSWIterationsPerFrame(SimIterationsPerFrame, this);
 	if (!CanRunShallowWaterGPUWork(TEXT("ToggleSimVisualization")))
 	{
 		StopSimulationRuntime(true);
@@ -1945,7 +1944,7 @@ void ACSShallowWaterCapture::ToggleSimVisualization(int32 SimIterationsPerFrame)
 
 	if (!IsSolverTimerActive())
 	{
-		StartSolver(SolverTimerRate);
+		StartSolver(SolverTimerRate, SolverIterationsPerFrame);
 		return;
 	}
 

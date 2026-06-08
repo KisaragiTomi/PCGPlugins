@@ -262,7 +262,8 @@ public:
 	}
 
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "ComputeShader", Meta=(ClampMin="0", UIMin="0"))
-	void StartSolver(float TimerRate = 0.0f);
+	void StartSolver(float TimerRate = 0.0f,
+		UPARAM(meta = (ClampMin = "1", ClampMax = "32", UIMin = "1", UIMax = "8")) int32 InIteration = 1);
 
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "ComputeShader")
 	void StopSolver();
@@ -315,6 +316,7 @@ private:
 	FTimerHandle DebugViewPlaneTimerHandle;
 	FTimerHandle SolverTimerHandle;
 	float SolverTimerRate = 0.0f;
+	int32 SolverIterationsPerFrame = 1;
 	bool bSWConstructionGuardActive = false;
 	bool bSWConstructionWorkPending = false;
 };

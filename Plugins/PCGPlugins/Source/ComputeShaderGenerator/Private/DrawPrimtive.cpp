@@ -10,6 +10,23 @@
 #include "RenderTargetPool.h"
 #include "RHIResourceUtils.h"
 #include "Kismet/KismetRenderingLibrary.h"
+#include "Components/InstancedStaticMeshComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "Engine/Engine.h"
+#include "Engine/StaticMesh.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "Engine/World.h"
+#include "GameFramework/Actor.h"
+#include "Landscape.h"
+#include "LandscapeComponent.h"
+#if WITH_EDITOR
+#include "LandscapeDataAccess.h"
+#endif
+#include "RawIndexBuffer.h"
+#include "RenderingThread.h"
+#include "StaticMeshResources.h"
+#include "TextureResource.h"
+#include "UObject/UObjectIterator.h"
 
 struct FCSVertexData
 {
@@ -25,6 +42,554 @@ struct FDrawRasterVertexData
 	FVector4f Position;
 	FVector4f Normal;
 };
+
+namespace
+{
+constexpr float CSBoxWorldZMinExtent = 1.0e-3f;
+
+int32 GetCSTriangleMeshTriangleCount(const FCSTriangleMeshData& TriangleData)
+{
+	const int32 EffectiveVertexCount = TriangleData.VertexCount >= 0
+		? FMath::Clamp(TriangleData.VertexCount, 0, TriangleData.Vertices.Num())
+		: TriangleData.Vertices.Num();
+	const int32 EffectiveIndexCount = TriangleData.IndexCount >= 0
+		? FMath::Clamp(TriangleData.IndexCount, 0, TriangleData.Indices.Num())
+		: TriangleData.Indices.Num();
+	return EffectiveIndexCount >= 3 ? EffectiveIndexCount / 3 : EffectiveVertexCount / 3;
+}
+
+bool IsValidCSTriangleVertexIndex(int32 Index, int32 VertexCount)
+{
+	return Index >= 0 && Index < VertexCount;
+}
+
+bool IsFiniteCSPosition(const FVector& Position)
+{
+	return !Position.ContainsNaN()
+		&& FMath::IsFinite(Position.X)
+		&& FMath::IsFinite(Position.Y)
+		&& FMath::IsFinite(Position.Z);
+}
+
+bool IsDegenerateCSTriangle(const FVector& A, const FVector& B, const FVector& C)
+{
+	return FVector::CrossProduct(B - A, C - A).SizeSquared() <= 1.0e-8;
+}
+
+FVector GetSafeCSTriangleNormal(const FVector& A, const FVector& B, const FVector& C)
+{
+	return FVector::CrossProduct(B - A, C - A).GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
+}
+
+bool ShouldIncludeActorForDrawPrimtiveTag(const AActor* Actor, FName RequiredActorTag)
+{
+	return RequiredActorTag.IsNone() || (Actor && Actor->ActorHasTag(RequiredActorTag));
+}
+
+FBox BuildWorldBoxFromTransformAndSize(const FTransform& BoxTransform, const FVector& BoxSize)
+{
+	const FVector BoxExtent(
+		FMath::Max(0.0, FMath::Abs(BoxSize.X) * 0.5),
+		FMath::Max(0.0, FMath::Abs(BoxSize.Y) * 0.5),
+		FMath::Max(0.0, FMath::Abs(BoxSize.Z) * 0.5));
+	if (BoxExtent.IsNearlyZero())
+	{
+		return FBox(ForceInit);
+	}
+
+	return FBox(-BoxExtent, BoxExtent).TransformBy(BoxTransform);
+}
+
+bool TriangleIntersectsBox(const FVector& A, const FVector& B, const FVector& C, const FBox& QueryBox)
+{
+	if (!QueryBox.IsValid)
+	{
+		return true;
+	}
+
+	FBox TriangleBox(ForceInit);
+	TriangleBox += A;
+	TriangleBox += B;
+	TriangleBox += C;
+	return TriangleBox.Intersect(QueryBox);
+}
+
+bool TriangleIntersectsLocalBox(const FVector& A,
+	const FVector& B,
+	const FVector& C,
+	const FTransform& WorldToBoxTransform,
+	const FVector& BoxExtent)
+{
+	FBox LocalTriangleBox(ForceInit);
+	LocalTriangleBox += WorldToBoxTransform.TransformPosition(A);
+	LocalTriangleBox += WorldToBoxTransform.TransformPosition(B);
+	LocalTriangleBox += WorldToBoxTransform.TransformPosition(C);
+	return LocalTriangleBox.Intersect(FBox(-BoxExtent, BoxExtent));
+}
+
+bool TryAppendTriangleSoup(FCSTriangleMeshData& OutTriangleData,
+	const FVector& A,
+	const FVector& B,
+	const FVector& C,
+	const FVector& Normal,
+	int32 MaxTriangles)
+{
+	if (MaxTriangles > 0 && GetCSTriangleMeshTriangleCount(OutTriangleData) >= MaxTriangles)
+	{
+		return false;
+	}
+
+	if (!IsFiniteCSPosition(A) || !IsFiniteCSPosition(B) || !IsFiniteCSPosition(C) || IsDegenerateCSTriangle(A, B, C))
+	{
+		return true;
+	}
+
+	const FVector SafeNormal = Normal.GetSafeNormal(UE_SMALL_NUMBER, GetSafeCSTriangleNormal(A, B, C));
+	OutTriangleData.Vertices.Add(A);
+	OutTriangleData.Vertices.Add(B);
+	OutTriangleData.Vertices.Add(C);
+	OutTriangleData.VertexNormals.Add(SafeNormal);
+	OutTriangleData.VertexNormals.Add(SafeNormal);
+	OutTriangleData.VertexNormals.Add(SafeNormal);
+	OutTriangleData.VertexCount = OutTriangleData.Vertices.Num();
+	OutTriangleData.IndexCount = 0;
+	return true;
+}
+
+bool TryAppendTriangleSoupOrientedToNormal(FCSTriangleMeshData& OutTriangleData,
+	const FVector& A,
+	const FVector& B,
+	const FVector& C,
+	const FVector& DesiredNormal,
+	int32 MaxTriangles)
+{
+	FVector SafeDesiredNormal = DesiredNormal.GetSafeNormal(UE_SMALL_NUMBER, GetSafeCSTriangleNormal(A, B, C));
+	if (FVector::DotProduct(GetSafeCSTriangleNormal(A, B, C), SafeDesiredNormal) < 0.0)
+	{
+		return TryAppendTriangleSoup(OutTriangleData, A, C, B, SafeDesiredNormal, MaxTriangles);
+	}
+
+	return TryAppendTriangleSoup(OutTriangleData, A, B, C, SafeDesiredNormal, MaxTriangles);
+}
+
+FVector MakeLandscapeNormalFaceUp(const FVector& Normal)
+{
+	FVector SafeNormal = Normal.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
+	if (SafeNormal.Z < 0.0)
+	{
+		SafeNormal *= -1.0;
+	}
+	return SafeNormal;
+}
+
+void AppendTriangleMeshDataInsideLocalBox(FCSTriangleMeshData& OutTriangleData,
+	const FCSTriangleMeshData& SourceTriangleData,
+	int32 MaxTriangles,
+	const FTransform& WorldToBoxTransform,
+	const FVector& BoxExtent)
+{
+	const int32 EffectiveVertexCount = SourceTriangleData.VertexCount >= 0
+		? FMath::Clamp(SourceTriangleData.VertexCount, 0, SourceTriangleData.Vertices.Num())
+		: SourceTriangleData.Vertices.Num();
+	const int32 EffectiveIndexCount = SourceTriangleData.IndexCount >= 0
+		? FMath::Clamp(SourceTriangleData.IndexCount, 0, SourceTriangleData.Indices.Num())
+		: SourceTriangleData.Indices.Num();
+	const bool bUseIndices = EffectiveIndexCount >= 3;
+	const int32 TriangleCount = bUseIndices ? EffectiveIndexCount / 3 : EffectiveVertexCount / 3;
+	const bool bUseVertexNormals = SourceTriangleData.VertexNormals.Num() >= EffectiveVertexCount;
+
+	for (int32 TriangleIndex = 0; TriangleIndex < TriangleCount; ++TriangleIndex)
+	{
+		if (MaxTriangles > 0 && GetCSTriangleMeshTriangleCount(OutTriangleData) >= MaxTriangles)
+		{
+			break;
+		}
+
+		int32 I0 = TriangleIndex * 3 + 0;
+		int32 I1 = TriangleIndex * 3 + 1;
+		int32 I2 = TriangleIndex * 3 + 2;
+		if (bUseIndices)
+		{
+			I0 = SourceTriangleData.Indices[TriangleIndex * 3 + 0];
+			I1 = SourceTriangleData.Indices[TriangleIndex * 3 + 1];
+			I2 = SourceTriangleData.Indices[TriangleIndex * 3 + 2];
+		}
+
+		if (!IsValidCSTriangleVertexIndex(I0, EffectiveVertexCount)
+			|| !IsValidCSTriangleVertexIndex(I1, EffectiveVertexCount)
+			|| !IsValidCSTriangleVertexIndex(I2, EffectiveVertexCount))
+		{
+			continue;
+		}
+
+		const FVector& A = SourceTriangleData.Vertices[I0];
+		const FVector& B = SourceTriangleData.Vertices[I1];
+		const FVector& C = SourceTriangleData.Vertices[I2];
+		if (!TriangleIntersectsLocalBox(A, B, C, WorldToBoxTransform, BoxExtent))
+		{
+			continue;
+		}
+
+		const FVector Normal = bUseVertexNormals
+			? ((SourceTriangleData.VertexNormals[I0] + SourceTriangleData.VertexNormals[I1] + SourceTriangleData.VertexNormals[I2]) / 3.0).GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector)
+			: GetSafeCSTriangleNormal(A, B, C);
+		if (!TryAppendTriangleSoup(OutTriangleData, A, B, C, Normal, MaxTriangles))
+		{
+			break;
+		}
+	}
+}
+
+void NormalizeTriangleMeshDataWinding(FCSTriangleMeshData& TriangleData)
+{
+	const int32 EffectiveVertexCount = TriangleData.VertexCount >= 0
+		? FMath::Clamp(TriangleData.VertexCount, 0, TriangleData.Vertices.Num())
+		: TriangleData.Vertices.Num();
+	const int32 EffectiveIndexCount = TriangleData.IndexCount >= 0
+		? FMath::Clamp(TriangleData.IndexCount, 0, TriangleData.Indices.Num())
+		: TriangleData.Indices.Num();
+	const bool bUseIndices = EffectiveIndexCount >= 3;
+	const int32 TriangleCount = bUseIndices ? EffectiveIndexCount / 3 : EffectiveVertexCount / 3;
+	const bool bHasVertexNormals = TriangleData.VertexNormals.Num() >= EffectiveVertexCount;
+
+	for (int32 TriangleIndex = 0; TriangleIndex < TriangleCount; ++TriangleIndex)
+	{
+		int32 I0 = TriangleIndex * 3 + 0;
+		int32 I1 = TriangleIndex * 3 + 1;
+		int32 I2 = TriangleIndex * 3 + 2;
+		if (bUseIndices)
+		{
+			I0 = TriangleData.Indices[TriangleIndex * 3 + 0];
+			I1 = TriangleData.Indices[TriangleIndex * 3 + 1];
+			I2 = TriangleData.Indices[TriangleIndex * 3 + 2];
+		}
+
+		if (!IsValidCSTriangleVertexIndex(I0, EffectiveVertexCount)
+			|| !IsValidCSTriangleVertexIndex(I1, EffectiveVertexCount)
+			|| !IsValidCSTriangleVertexIndex(I2, EffectiveVertexCount))
+		{
+			continue;
+		}
+
+		const FVector& A = TriangleData.Vertices[I0];
+		const FVector& B = TriangleData.Vertices[I1];
+		const FVector& C = TriangleData.Vertices[I2];
+		const FVector WindingNormal = GetSafeCSTriangleNormal(A, B, C);
+		FVector DesiredNormal = WindingNormal;
+		if (bHasVertexNormals)
+		{
+			DesiredNormal = ((TriangleData.VertexNormals[I0] + TriangleData.VertexNormals[I1] + TriangleData.VertexNormals[I2]) / 3.0)
+				.GetSafeNormal(UE_SMALL_NUMBER, WindingNormal);
+		}
+
+		if (FVector::DotProduct(WindingNormal, DesiredNormal) < 0.0)
+		{
+			if (bUseIndices)
+			{
+				Swap(TriangleData.Indices[TriangleIndex * 3 + 1], TriangleData.Indices[TriangleIndex * 3 + 2]);
+			}
+			else
+			{
+				Swap(TriangleData.Vertices[I1], TriangleData.Vertices[I2]);
+				if (bHasVertexNormals)
+				{
+					Swap(TriangleData.VertexNormals[I1], TriangleData.VertexNormals[I2]);
+				}
+			}
+		}
+	}
+}
+
+void AppendStaticMeshComponentTriangles(UStaticMeshComponent* StaticMeshComponent,
+	const FBox& QueryBox,
+	const FTransform& WorldToBoxTransform,
+	const FVector& BoxExtent,
+	int32 LODIndex,
+	int32 MaxTriangles,
+	FCSTriangleMeshData& OutTriangleData)
+{
+	if (!StaticMeshComponent)
+	{
+		return;
+	}
+
+	UStaticMesh* StaticMesh = StaticMeshComponent->GetStaticMesh();
+	if (!StaticMesh)
+	{
+		return;
+	}
+
+	FStaticMeshRenderData* RenderData = StaticMesh->GetRenderData();
+	if (!RenderData || RenderData->LODResources.Num() == 0)
+	{
+		return;
+	}
+
+	const int32 SafeLODIndex = FMath::Clamp(LODIndex, 0, RenderData->LODResources.Num() - 1);
+	FStaticMeshLODResources& LOD = RenderData->LODResources[SafeLODIndex];
+	if (LOD.GetNumTriangles() <= 0)
+	{
+		return;
+	}
+
+	const FIndexArrayView Indices = LOD.IndexBuffer.GetArrayView();
+	FPositionVertexBuffer& PositionBuffer = LOD.VertexBuffers.PositionVertexBuffer;
+	FStaticMeshVertexBuffer& VertexBuffer = LOD.VertexBuffers.StaticMeshVertexBuffer;
+
+	auto AppendWithTransform = [&](const FTransform& LocalToWorld)
+	{
+		for (int32 TriangleIndex = 0; TriangleIndex < LOD.GetNumTriangles(); ++TriangleIndex)
+		{
+			if (MaxTriangles > 0 && GetCSTriangleMeshTriangleCount(OutTriangleData) >= MaxTriangles)
+			{
+				return;
+			}
+
+			const uint32 I0 = Indices[TriangleIndex * 3 + 0];
+			const uint32 I1 = Indices[TriangleIndex * 3 + 1];
+			const uint32 I2 = Indices[TriangleIndex * 3 + 2];
+			if (I0 >= PositionBuffer.GetNumVertices()
+				|| I1 >= PositionBuffer.GetNumVertices()
+				|| I2 >= PositionBuffer.GetNumVertices())
+			{
+				continue;
+			}
+
+			const FVector A = LocalToWorld.TransformPosition(FVector(PositionBuffer.VertexPosition(I0)));
+			const FVector B = LocalToWorld.TransformPosition(FVector(PositionBuffer.VertexPosition(I1)));
+			const FVector C = LocalToWorld.TransformPosition(FVector(PositionBuffer.VertexPosition(I2)));
+			if (!TriangleIntersectsBox(A, B, C, QueryBox)
+				|| !TriangleIntersectsLocalBox(A, B, C, WorldToBoxTransform, BoxExtent))
+			{
+				continue;
+			}
+
+			FVector Normal = GetSafeCSTriangleNormal(A, B, C);
+			if (I0 < VertexBuffer.GetNumVertices()
+				&& I1 < VertexBuffer.GetNumVertices()
+				&& I2 < VertexBuffer.GetNumVertices())
+			{
+				const FVector N0 = LocalToWorld.TransformVector(FVector(VertexBuffer.VertexTangentZ(I0)));
+				const FVector N1 = LocalToWorld.TransformVector(FVector(VertexBuffer.VertexTangentZ(I1)));
+				const FVector N2 = LocalToWorld.TransformVector(FVector(VertexBuffer.VertexTangentZ(I2)));
+				Normal = ((N0 + N1 + N2) / 3.0).GetSafeNormal(UE_SMALL_NUMBER, Normal);
+			}
+
+			if (!TryAppendTriangleSoupOrientedToNormal(OutTriangleData, A, B, C, Normal, MaxTriangles))
+			{
+				return;
+			}
+		}
+	};
+
+	if (UInstancedStaticMeshComponent* InstancedComponent = Cast<UInstancedStaticMeshComponent>(StaticMeshComponent))
+	{
+		const FBox LocalMeshBounds = StaticMesh->GetBoundingBox();
+		for (int32 InstanceIndex = 0; InstanceIndex < InstancedComponent->GetInstanceCount(); ++InstanceIndex)
+		{
+			if (MaxTriangles > 0 && GetCSTriangleMeshTriangleCount(OutTriangleData) >= MaxTriangles)
+			{
+				break;
+			}
+
+			FTransform InstanceTransform = FTransform::Identity;
+			InstancedComponent->GetInstanceTransform(InstanceIndex, InstanceTransform, true);
+			if (!LocalMeshBounds.TransformBy(InstanceTransform).Intersect(QueryBox))
+			{
+				continue;
+			}
+			AppendWithTransform(InstanceTransform);
+		}
+		return;
+	}
+
+	if (!StaticMeshComponent->Bounds.GetBox().Intersect(QueryBox))
+	{
+		return;
+	}
+
+	AppendWithTransform(StaticMeshComponent->GetComponentTransform());
+}
+
+void AppendLandscapeTriangles(UWorld* World,
+	const FBox& QueryBox,
+	const FTransform& WorldToBoxTransform,
+	const FVector& BoxExtent,
+	FName RequiredActorTag,
+	int32 MaxTriangles,
+	FCSTriangleMeshData& OutTriangleData)
+{
+#if WITH_EDITOR
+	if (!World)
+	{
+		return;
+	}
+
+	for (TObjectIterator<ULandscapeComponent> It; It; ++It)
+	{
+		ULandscapeComponent* LandscapeComponent = *It;
+		if (!IsValid(LandscapeComponent)
+			|| LandscapeComponent->IsTemplate()
+			|| !LandscapeComponent->IsRegistered()
+			|| LandscapeComponent->GetWorld() != World)
+		{
+			continue;
+		}
+
+		ALandscapeProxy* LandscapeProxy = LandscapeComponent->GetLandscapeProxy();
+		if (!LandscapeProxy || !ShouldIncludeActorForDrawPrimtiveTag(LandscapeProxy, RequiredActorTag))
+		{
+			continue;
+		}
+
+		if (!LandscapeComponent->Bounds.GetBox().Intersect(QueryBox))
+		{
+			continue;
+		}
+
+		const int32 ComponentSizeQuads = LandscapeComponent->ComponentSizeQuads;
+		if (ComponentSizeQuads <= 0)
+		{
+			continue;
+		}
+
+		FLandscapeComponentDataInterface LandscapeData(LandscapeComponent, 0, false);
+		if (!LandscapeData.GetRawHeightData())
+		{
+			continue;
+		}
+
+		for (int32 Y = 0; Y < ComponentSizeQuads; ++Y)
+		{
+			for (int32 X = 0; X < ComponentSizeQuads; ++X)
+			{
+				if (MaxTriangles > 0 && GetCSTriangleMeshTriangleCount(OutTriangleData) >= MaxTriangles)
+				{
+					return;
+				}
+
+				FVector P00;
+				FVector P10;
+				FVector P01;
+				FVector P11;
+				FVector TangentX;
+				FVector TangentY;
+				FVector N00;
+				FVector N10;
+				FVector N01;
+				FVector N11;
+				LandscapeData.GetWorldPositionTangents(X, Y, P00, TangentX, TangentY, N00);
+				LandscapeData.GetWorldPositionTangents(X + 1, Y, P10, TangentX, TangentY, N10);
+				LandscapeData.GetWorldPositionTangents(X, Y + 1, P01, TangentX, TangentY, N01);
+				LandscapeData.GetWorldPositionTangents(X + 1, Y + 1, P11, TangentX, TangentY, N11);
+
+				if (TriangleIntersectsBox(P00, P10, P11, QueryBox)
+					&& TriangleIntersectsLocalBox(P00, P10, P11, WorldToBoxTransform, BoxExtent))
+				{
+					if (!TryAppendTriangleSoupOrientedToNormal(OutTriangleData, P00, P10, P11, MakeLandscapeNormalFaceUp(N00 + N10 + N11), MaxTriangles))
+					{
+						return;
+					}
+				}
+
+				if (TriangleIntersectsBox(P00, P11, P01, QueryBox)
+					&& TriangleIntersectsLocalBox(P00, P11, P01, WorldToBoxTransform, BoxExtent))
+				{
+					if (!TryAppendTriangleSoupOrientedToNormal(OutTriangleData, P00, P11, P01, MakeLandscapeNormalFaceUp(N00 + N11 + N01), MaxTriangles))
+					{
+						return;
+					}
+				}
+			}
+		}
+	}
+#else
+	(void)World;
+	(void)QueryBox;
+	(void)WorldToBoxTransform;
+	(void)BoxExtent;
+	(void)RequiredActorTag;
+	(void)MaxTriangles;
+	(void)OutTriangleData;
+#endif
+}
+
+uint32 BuildTriangleUploadData(const FCSTriangleMeshData& TriangleData, TArray<FVector4f>& OutVertices)
+{
+	const int32 EffectiveVertexCount = TriangleData.VertexCount >= 0
+		? FMath::Clamp(TriangleData.VertexCount, 0, TriangleData.Vertices.Num())
+		: TriangleData.Vertices.Num();
+	const int32 EffectiveIndexCount = TriangleData.IndexCount >= 0
+		? FMath::Clamp(TriangleData.IndexCount, 0, TriangleData.Indices.Num())
+		: TriangleData.Indices.Num();
+	const bool bUseIndices = EffectiveIndexCount >= 3;
+	const int32 TriangleCount = bUseIndices ? EffectiveIndexCount / 3 : EffectiveVertexCount / 3;
+	if (TriangleCount <= 0)
+	{
+		return 0;
+	}
+
+	OutVertices.Reset(TriangleCount * 3);
+	OutVertices.Reserve(TriangleCount * 3);
+	for (int32 TriangleIndex = 0; TriangleIndex < TriangleCount; ++TriangleIndex)
+	{
+		int32 I0 = TriangleIndex * 3 + 0;
+		int32 I1 = TriangleIndex * 3 + 1;
+		int32 I2 = TriangleIndex * 3 + 2;
+		if (bUseIndices)
+		{
+			I0 = TriangleData.Indices[TriangleIndex * 3 + 0];
+			I1 = TriangleData.Indices[TriangleIndex * 3 + 1];
+			I2 = TriangleData.Indices[TriangleIndex * 3 + 2];
+		}
+
+		if (!IsValidCSTriangleVertexIndex(I0, EffectiveVertexCount)
+			|| !IsValidCSTriangleVertexIndex(I1, EffectiveVertexCount)
+			|| !IsValidCSTriangleVertexIndex(I2, EffectiveVertexCount))
+		{
+			continue;
+		}
+
+		const FVector& A = TriangleData.Vertices[I0];
+		const FVector& B = TriangleData.Vertices[I1];
+		const FVector& C = TriangleData.Vertices[I2];
+		if (!IsFiniteCSPosition(A) || !IsFiniteCSPosition(B) || !IsFiniteCSPosition(C) || IsDegenerateCSTriangle(A, B, C))
+		{
+			continue;
+		}
+
+		OutVertices.Add(FVector4f(FVector3f(A), 1.0f));
+		OutVertices.Add(FVector4f(FVector3f(B), 1.0f));
+		OutVertices.Add(FVector4f(FVector3f(C), 1.0f));
+	}
+
+	return uint32(OutVertices.Num() / 3);
+}
+
+bool EnsureR32FloatRenderTarget(UTextureRenderTarget2D* RenderTarget, float EmptyHeight)
+{
+	if (!RenderTarget || RenderTarget->SizeX <= 0 || RenderTarget->SizeY <= 0)
+	{
+		return false;
+	}
+
+	const bool bNeedsRecreate = RenderTarget->RenderTargetFormat != RTF_R32f || !RenderTarget->bSupportsUAV;
+	if (!bNeedsRecreate)
+	{
+		return true;
+	}
+
+	const int32 Width = RenderTarget->SizeX;
+	const int32 Height = RenderTarget->SizeY;
+	RenderTarget->ReleaseResource();
+	RenderTarget->RenderTargetFormat = RTF_R32f;
+	RenderTarget->bSupportsUAV = true;
+	RenderTarget->ClearColor = FLinearColor(EmptyHeight, 0.0f, 0.0f, 1.0f);
+	RenderTarget->InitAutoFormat(Width, Height);
+	RenderTarget->UpdateResourceImmediate(true);
+	return true;
+}
+}
 
 class FVertexDataDeclaration : public FRenderResource
 {
@@ -285,11 +850,44 @@ public:
 	}
 };
 
+class FDrawBoxWorldZHeightCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FDrawBoxWorldZHeightCS);
+	SHADER_USE_PARAMETER_STRUCT(FDrawBoxWorldZHeightCS, FGlobalShader);
+
+public:
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, BoxHeightTriangleData)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, BoxHeightTriangleCounter)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, RW_HeightTexture)
+		SHADER_PARAMETER(uint32, BoxHeightTriangleCount)
+		SHADER_PARAMETER(uint32, bUseTriangleCounter)
+		SHADER_PARAMETER(FMatrix44f, WorldToBox)
+		SHADER_PARAMETER(FVector3f, BoxExtent)
+		SHADER_PARAMETER(FIntPoint, OutputSize)
+		SHADER_PARAMETER(float, EmptyHeight)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return true;
+	}
+
+	static inline void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 8);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Y"), 8);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Z"), 1);
+	}
+};
+
 IMPLEMENT_GLOBAL_SHADER(FDrawInstanceHeightVS, "/Plugin/PCGPlugins/Shaders/Private/DrawPrimtive.usf", "MainVertexShader", SF_Vertex);
 IMPLEMENT_GLOBAL_SHADER(FDrawInstanceHeightPS, "/Plugin/PCGPlugins/Shaders/Private/DrawPrimtive.usf", "MainPixelShader", SF_Pixel);
 IMPLEMENT_GLOBAL_SHADER(FDrawInstancesCS, "/Plugin/PCGPlugins/Shaders/Private/DrawPrimtive.usf", "DrawInstancesCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FDrawInstancesRasterVS, "/Plugin/PCGPlugins/Shaders/Private/DrawPrimtive.usf", "DrawInstancesRasterVS", SF_Vertex);
 IMPLEMENT_GLOBAL_SHADER(FDrawInstancesRasterPS, "/Plugin/PCGPlugins/Shaders/Private/DrawPrimtive.usf", "DrawInstancesRasterPS", SF_Pixel);
+IMPLEMENT_GLOBAL_SHADER(FDrawBoxWorldZHeightCS, "/Plugin/PCGPlugins/Shaders/Private/DrawPrimtive.usf", "DrawBoxWorldZHeightCS", SF_Compute);
 
 
 BEGIN_SHADER_PARAMETER_STRUCT(FDrawInstanceHeight, )
@@ -308,6 +906,272 @@ END_SHADER_PARAMETER_STRUCT()
 TGlobalResource<FVertexDataDeclaration> VertexDataResource;
 TGlobalResource<FDrawRasterVertexDeclaration> DrawRasterVertexDataResource;
 TGlobalResource<FSimpleScreenVertexBuffer> GSimpleScreenVertexBuffer;
+
+FCSBoxWorldZHeightRDGOutput UCSDrawPrimtive::AddBoxWorldZHeightToRDG(
+	FRDGBuilder& GraphBuilder,
+	const FCSBoxWorldZHeightRDGInput& Input)
+{
+	FCSBoxWorldZHeightRDGOutput Output;
+
+	FRDGTextureRef HeightTexture = Input.OutputTexture;
+	if (HeightTexture && HeightTexture->Desc.Format != PF_R32_FLOAT)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[UCSDrawPrimtive::AddBoxWorldZHeightToRDG] OutputTexture must be PF_R32_FLOAT. A new R32 texture will be created."));
+		HeightTexture = nullptr;
+	}
+
+	FIntPoint OutputSize = HeightTexture ? HeightTexture->Desc.Extent : Input.OutputSize;
+	OutputSize.X = FMath::Max(1, OutputSize.X);
+	OutputSize.Y = FMath::Max(1, OutputSize.Y);
+	Output.OutputSize = OutputSize;
+
+	if (!HeightTexture)
+	{
+		const FRDGTextureDesc HeightDesc = FRDGTextureDesc::Create2D(
+			OutputSize,
+			PF_R32_FLOAT,
+			FClearValueBinding(FLinearColor(Input.EmptyHeight, 0.0f, 0.0f, 1.0f)),
+			TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable);
+		HeightTexture = GraphBuilder.CreateTexture(HeightDesc, TEXT("CS.BoxWorldZHeight.Texture"));
+	}
+	Output.HeightTexture = HeightTexture;
+
+	FRDGTextureUAVRef HeightUAV = GraphBuilder.CreateUAV(HeightTexture);
+	AddClearUAVPass(GraphBuilder, HeightUAV, Input.EmptyHeight);
+
+	const FVector BoxExtent(
+		FMath::Abs(Input.BoxSize.X) * 0.5,
+		FMath::Abs(Input.BoxSize.Y) * 0.5,
+		FMath::Abs(Input.BoxSize.Z) * 0.5);
+	if (!Input.TriangleVerticesSRV
+		|| BoxExtent.X <= CSBoxWorldZMinExtent
+		|| BoxExtent.Y <= CSBoxWorldZMinExtent
+		|| BoxExtent.Z <= CSBoxWorldZMinExtent
+		|| (Input.TriangleCount == 0 && !Input.TriangleCounterSRV))
+	{
+		return Output;
+	}
+
+	FRDGBufferSRVRef TriangleCounterSRV = Input.TriangleCounterSRV;
+	if (!TriangleCounterSRV)
+	{
+		FRDGBufferRef DummyCounterBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1),
+			TEXT("CS.BoxWorldZHeight.DummyCounter"));
+		uint32* DummyCounterUploadData = GraphBuilder.AllocPODArray<uint32>(1);
+		*DummyCounterUploadData = Input.TriangleCount;
+		GraphBuilder.QueueBufferUpload(DummyCounterBuffer, DummyCounterUploadData, sizeof(uint32));
+		TriangleCounterSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(DummyCounterBuffer, PF_R32_UINT));
+	}
+
+	FDrawBoxWorldZHeightCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FDrawBoxWorldZHeightCS::FParameters>();
+	PassParameters->BoxHeightTriangleData = Input.TriangleVerticesSRV;
+	PassParameters->BoxHeightTriangleCounter = TriangleCounterSRV;
+	PassParameters->RW_HeightTexture = HeightUAV;
+	PassParameters->BoxHeightTriangleCount = Input.TriangleCount;
+	PassParameters->bUseTriangleCounter = Input.TriangleCounterSRV ? 1u : 0u;
+	PassParameters->WorldToBox = FMatrix44f(Input.BoxTransform.Inverse().ToMatrixWithScale());
+	PassParameters->BoxExtent = FVector3f(BoxExtent);
+	PassParameters->OutputSize = OutputSize;
+	PassParameters->EmptyHeight = Input.EmptyHeight;
+
+	TShaderMapRef<FDrawBoxWorldZHeightCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(
+		GraphBuilder,
+		RDG_EVENT_NAME("%s", Input.DebugName ? Input.DebugName : TEXT("CS.BoxWorldZHeight")),
+		ERDGPassFlags::Compute,
+		ComputeShader,
+		PassParameters,
+		FComputeShaderUtils::GetGroupCount(FIntVector(OutputSize.X, OutputSize.Y, 1), FIntVector(8, 8, 1)));
+
+	return Output;
+}
+
+FCSBoxWorldZHeightRDGOutput UCSDrawPrimtive::AddStaticMeshTrianglesWorldZHeightToRDG(
+	FRDGBuilder& GraphBuilder,
+	const FCSStaticMeshTriangleRDGOutput& TriangleOutput,
+	FTransform BoxTransform,
+	FVector BoxSize,
+	FIntPoint OutputSize,
+	FRDGTextureRef OutputTexture,
+	float EmptyHeight,
+	const TCHAR* DebugName)
+{
+	FCSBoxWorldZHeightRDGInput Input;
+	Input.TriangleVerticesSRV = TriangleOutput.TriangleVerticesSRV;
+	Input.TriangleCounterSRV = TriangleOutput.TriangleCounterSRV;
+	Input.TriangleCount = TriangleOutput.MaxTriangles;
+	Input.BoxTransform = BoxTransform;
+	Input.BoxSize = BoxSize;
+	Input.OutputSize = OutputSize;
+	Input.OutputTexture = OutputTexture;
+	Input.EmptyHeight = EmptyHeight;
+	Input.DebugName = DebugName;
+	return AddBoxWorldZHeightToRDG(GraphBuilder, Input);
+}
+
+FCSBoxWorldZHeightRDGOutput UCSDrawPrimtive::AddTriangleMeshWorldZHeightToRDG(
+	FRDGBuilder& GraphBuilder,
+	const FCSTriangleMeshData& TriangleData,
+	FTransform BoxTransform,
+	FVector BoxSize,
+	FIntPoint OutputSize,
+	FRDGTextureRef OutputTexture,
+	float EmptyHeight,
+	const TCHAR* DebugName)
+{
+	FCSBoxWorldZHeightRDGInput Input;
+	Input.BoxTransform = BoxTransform;
+	Input.BoxSize = BoxSize;
+	Input.OutputSize = OutputSize;
+	Input.OutputTexture = OutputTexture;
+	Input.EmptyHeight = EmptyHeight;
+	Input.DebugName = DebugName;
+
+	TArray<FVector4f> TriangleVertices;
+	const uint32 TriangleCount = BuildTriangleUploadData(TriangleData, TriangleVertices);
+	Input.TriangleCount = TriangleCount;
+	if (TriangleCount > 0)
+	{
+		FVector4f* UploadData = GraphBuilder.AllocPODArray<FVector4f>(TriangleVertices.Num());
+		FMemory::Memcpy(UploadData, TriangleVertices.GetData(), TriangleVertices.Num() * sizeof(FVector4f));
+
+		FRDGBufferRef TriangleBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), TriangleVertices.Num()),
+			TEXT("CS.BoxWorldZHeight.UploadedTriangles"));
+		GraphBuilder.QueueBufferUpload(TriangleBuffer, UploadData, TriangleVertices.Num() * sizeof(FVector4f));
+		Input.TriangleVerticesSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(TriangleBuffer, PF_A32B32G32R32F));
+	}
+
+	return AddBoxWorldZHeightToRDG(GraphBuilder, Input);
+}
+
+FCSTriangleMeshData UCSDrawPrimtive::GetTaggedBoxSceneTriangles(
+	UObject* WorldContextObject,
+	FTransform BoxTransform,
+	FVector BoxSize,
+	FName RequiredActorTag,
+	int32 LODIndex,
+	int32 MaxTriangles)
+{
+	FCSTriangleMeshData OutTriangleData;
+
+	UWorld* World = GEngine ? GEngine->GetWorldFromContextObject(WorldContextObject, EGetWorldErrorMode::ReturnNull) : nullptr;
+	if (!World)
+	{
+		return OutTriangleData;
+	}
+
+	const FBox QueryBox = BuildWorldBoxFromTransformAndSize(BoxTransform, BoxSize);
+	const FVector BoxExtent(
+		FMath::Abs(BoxSize.X) * 0.5,
+		FMath::Abs(BoxSize.Y) * 0.5,
+		FMath::Abs(BoxSize.Z) * 0.5);
+	if (!QueryBox.IsValid
+		|| BoxExtent.X <= CSBoxWorldZMinExtent
+		|| BoxExtent.Y <= CSBoxWorldZMinExtent
+		|| BoxExtent.Z <= CSBoxWorldZMinExtent)
+	{
+		return OutTriangleData;
+	}
+
+	const FTransform WorldToBoxTransform = BoxTransform.Inverse();
+	const int32 SafeMaxTriangles = FMath::Max(1, MaxTriangles);
+
+	FCSTriangleMeshData LandscapeTriangleData;
+	AppendLandscapeTriangles(World, QueryBox, WorldToBoxTransform, BoxExtent, RequiredActorTag, SafeMaxTriangles, LandscapeTriangleData);
+	AppendTriangleMeshDataInsideLocalBox(OutTriangleData, LandscapeTriangleData, SafeMaxTriangles, WorldToBoxTransform, BoxExtent);
+
+	for (TObjectIterator<UStaticMeshComponent> It; It; ++It)
+	{
+		if (GetCSTriangleMeshTriangleCount(OutTriangleData) >= SafeMaxTriangles)
+		{
+			break;
+		}
+
+		UStaticMeshComponent* StaticMeshComponent = *It;
+		if (!IsValid(StaticMeshComponent)
+			|| StaticMeshComponent->IsTemplate()
+			|| !StaticMeshComponent->IsRegistered()
+			|| StaticMeshComponent->GetWorld() != World)
+		{
+			continue;
+		}
+
+		AActor* SourceActor = StaticMeshComponent->GetOwner();
+		if (!ShouldIncludeActorForDrawPrimtiveTag(SourceActor, RequiredActorTag))
+		{
+			continue;
+		}
+
+		AppendStaticMeshComponentTriangles(
+			StaticMeshComponent,
+			QueryBox,
+			WorldToBoxTransform,
+			BoxExtent,
+			LODIndex,
+			SafeMaxTriangles,
+			OutTriangleData);
+	}
+
+	OutTriangleData.VertexCount = OutTriangleData.Vertices.Num();
+	OutTriangleData.IndexCount = 0;
+	NormalizeTriangleMeshDataWinding(OutTriangleData);
+	return OutTriangleData;
+}
+
+bool UCSDrawPrimtive::DrawTaggedBoxSceneWorldZHeight(
+	UObject* WorldContextObject,
+	FTransform BoxTransform,
+	FVector BoxSize,
+	UTextureRenderTarget2D* HeightRenderTarget,
+	FName RequiredActorTag,
+	int32 LODIndex,
+	int32 MaxTriangles,
+	float EmptyHeight)
+{
+	if (!EnsureR32FloatRenderTarget(HeightRenderTarget, EmptyHeight))
+	{
+		return false;
+	}
+
+	FCSTriangleMeshData TriangleData = GetTaggedBoxSceneTriangles(
+		WorldContextObject,
+		BoxTransform,
+		BoxSize,
+		RequiredActorTag,
+		LODIndex,
+		MaxTriangles);
+
+	FTextureRenderTargetResource* HeightResource = HeightRenderTarget->GameThread_GetRenderTargetResource();
+	const FIntPoint OutputSize(HeightRenderTarget->SizeX, HeightRenderTarget->SizeY);
+
+	ENQUEUE_RENDER_COMMAND(CSDrawTaggedBoxSceneWorldZHeight)(
+		[TriangleData = MoveTemp(TriangleData), HeightResource, BoxTransform, BoxSize, OutputSize, EmptyHeight](FRHICommandListImmediate& RHICmdList)
+		{
+			if (!HeightResource || !HeightResource->GetRenderTargetTexture().IsValid())
+			{
+				return;
+			}
+
+			FRDGBuilder GraphBuilder(RHICmdList);
+			FRDGTextureRef ExternalHeightTexture = RegisterExternalTexture(GraphBuilder, HeightResource->GetRenderTargetTexture(), TEXT("CS.BoxWorldZHeight.ExternalRT"));
+			UCSDrawPrimtive::AddTriangleMeshWorldZHeightToRDG(
+				GraphBuilder,
+				TriangleData,
+				BoxTransform,
+				BoxSize,
+				OutputSize,
+				ExternalHeightTexture,
+				EmptyHeight,
+				TEXT("CS.DrawTaggedBoxSceneWorldZHeight"));
+			GraphBuilder.Execute();
+		});
+
+	FlushRenderingCommands();
+	return true;
+}
+
 void UCSDrawPrimtive::DrawInstances(UTextureRenderTarget2D* RT_TextureTarget, UTextureRenderTarget2D* RT_Depth, UTextureRenderTarget2D* RT_DebugView, FTransform CameraTransform, float CaptureWidth, TArray<FTransform> InstanceTransforms, UStaticMesh* InStaticMesh)
 {
 	constexpr float EmptyDepthValue = 100000.0f;

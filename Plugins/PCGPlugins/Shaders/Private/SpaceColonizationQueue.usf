@@ -132,35 +132,19 @@ void InitializeSpaceColonizationQueueCS(uint3 DispatchThreadId : SV_DispatchThre
 void MarkSpaceColonizationSourcesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
     uint SourceIndex = DispatchThreadId.x;
-    if (SourceIndex >= SourceCount || TargetCount == 0)
+    if (SourceIndex >= SourceCount || SourceIndex >= TargetCount)
     {
         return;
     }
 
-    float3 Source = SourcePositions[SourceIndex].xyz;
-    uint BestIndex = 0;
-    float BestDistSq = 3.402823466e+38f;
-
-    for (uint i = 0; i < TargetCount; ++i)
-    {
-        float D = DistSq(InitialTargetPositions[i].xyz, Source);
-        if (D < BestDistSq)
-        {
-            BestDistSq = D;
-            BestIndex = i;
-        }
-    }
-
-    int4 BestState0 = RW_State0[BestIndex];
-    int4 BestState1 = RW_State1[BestIndex];
-    float4 BestPosition = InitialTargetPositions[BestIndex];
-    BestPosition.w *= SourcePositions[SourceIndex].w;
-    BestState0.x = 0;
-    BestState0.z = 1;
-    BestState1.x = (int)BestIndex;
-    RW_TargetPositions[BestIndex] = BestPosition;
-    RW_State0[BestIndex] = BestState0;
-    RW_State1[BestIndex] = BestState1;
+    int4 SourceState0 = RW_State0[SourceIndex];
+    int4 SourceState1 = RW_State1[SourceIndex];
+    SourceState0.x = 0;
+    SourceState0.z = 1;
+    SourceState1.x = (int)SourceIndex;
+    RW_TargetPositions[SourceIndex] = SourcePositions[SourceIndex];
+    RW_State0[SourceIndex] = SourceState0;
+    RW_State1[SourceIndex] = SourceState1;
 }
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
@@ -174,8 +158,14 @@ void BuildSpaceColonizationNeighborsCS(uint3 DispatchThreadId : SV_DispatchThrea
 
     float Radius = max(InfluenceRadius, 1.0f);
     float RadiusSq = Radius * Radius;
-    float3 Center = InitialTargetPositions[Index].xyz;
+    float3 Center = TargetPositions[Index].xyz;
     uint Count = 0u;
+    uint NeighborBase = Index * MaxNeighbors;
+
+    for (uint ClearOffset = 0u; ClearOffset < MaxNeighbors; ++ClearOffset)
+    {
+        RW_NeighborIndices[NeighborBase + ClearOffset] = 0xffffffffu;
+    }
 
     for (uint Candidate = 0; Candidate < TargetCount; ++Candidate)
     {
@@ -184,19 +174,50 @@ void BuildSpaceColonizationNeighborsCS(uint3 DispatchThreadId : SV_DispatchThrea
             continue;
         }
 
-        if (DistSq(InitialTargetPositions[Candidate].xyz, Center) > RadiusSq)
+        float CandidateDistSq = DistSq(TargetPositions[Candidate].xyz, Center);
+        if (CandidateDistSq > RadiusSq)
         {
             continue;
         }
 
+        uint InsertOffset = min(Count, MaxNeighbors);
+        uint SortedCount = min(Count, MaxNeighbors);
+        for (uint ExistingOffset = 0u; ExistingOffset < SortedCount; ++ExistingOffset)
+        {
+            uint ExistingIndex = RW_NeighborIndices[NeighborBase + ExistingOffset];
+            if (ExistingIndex >= TargetCount)
+            {
+                InsertOffset = ExistingOffset;
+                break;
+            }
+
+            float ExistingDistSq = DistSq(TargetPositions[ExistingIndex].xyz, Center);
+            if (CandidateDistSq < ExistingDistSq)
+            {
+                InsertOffset = ExistingOffset;
+                break;
+            }
+        }
+
         if (Count < MaxNeighbors)
         {
-            RW_NeighborIndices[Index * MaxNeighbors + Count] = Candidate;
             Count += 1u;
         }
+        else if (InsertOffset >= MaxNeighbors)
+        {
+            continue;
+        }
+
+        uint LastOffset = min(Count, MaxNeighbors) - 1u;
+        for (uint ShiftOffset = LastOffset; ShiftOffset > InsertOffset; --ShiftOffset)
+        {
+            RW_NeighborIndices[NeighborBase + ShiftOffset] = RW_NeighborIndices[NeighborBase + ShiftOffset - 1u];
+        }
+
+        RW_NeighborIndices[NeighborBase + InsertOffset] = Candidate;
     }
 
-    RW_NeighborCounts[Index] = Count;
+    RW_NeighborCounts[Index] = min(Count, MaxNeighbors);
 }
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
@@ -243,7 +264,6 @@ void ProposeSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThread
         return;
     }
 
-    float3 OriginalCurrent = InitialTargetPositions[P].xyz;
     float3 RuntimeCurrent = TargetPositions[P].xyz;
     float SourceScale = 1.0f;
     int StartId = SourceState1.x;
@@ -272,15 +292,44 @@ void ProposeSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThread
             continue;
         }
 
-        float3 OriginalAttractor = InitialTargetPositions[AttractorIndex].xyz;
-        float D = DistSq(OriginalAttractor, OriginalCurrent);
-        DirSum += OriginalAttractor - OriginalCurrent;
-        AssociateCount += 1u;
-
+        float3 RuntimeAttractor = TargetPositions[AttractorIndex].xyz;
+        float D = DistSq(RuntimeAttractor, RuntimeCurrent);
         if (D < NearAttractorDistSq)
         {
             NearAttractorDistSq = D;
             NearAttractor = AttractorIndex;
+        }
+
+        uint NearestSource = 0xffffffffu;
+        float NearestSourceDistSq = 3.402823466e+38f;
+        uint AttractorNeighborCount = min(NeighborCounts[AttractorIndex], MaxNeighbors);
+        uint AttractorNeighborBase = AttractorIndex * MaxNeighbors;
+        for (uint SourceOffset = 0u; SourceOffset < AttractorNeighborCount; ++SourceOffset)
+        {
+            uint CandidateSource = NeighborIndices[AttractorNeighborBase + SourceOffset];
+            if (CandidateSource >= TargetCount)
+            {
+                continue;
+            }
+
+            if (State0[CandidateSource].x != 0)
+            {
+                continue;
+            }
+
+            float CandidateDistSq = DistSq(TargetPositions[CandidateSource].xyz, RuntimeAttractor);
+            if (CandidateDistSq < NearestSourceDistSq)
+            {
+                NearestSourceDistSq = CandidateDistSq;
+                NearestSource = CandidateSource;
+            }
+        }
+
+        float InfluenceRadiusSq = InfluenceRadius * InfluenceRadius;
+        if (NearestSource == P && NearestSourceDistSq * 1.21f < InfluenceRadiusSq)
+        {
+            DirSum += RuntimeAttractor - RuntimeCurrent;
+            AssociateCount += 1u;
         }
     }
 

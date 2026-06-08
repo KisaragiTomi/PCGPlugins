@@ -10,13 +10,21 @@ StructuredBuffer<int4> PathPointMeta;
 StructuredBuffer<float> PathPointCurveU;
 StructuredBuffer<float4> PathPointTangents;
 StructuredBuffer<float4> PathPointNormals;
+StructuredBuffer<float4> PathPointSurfaceTargets;
+StructuredBuffer<float4> PathPointSurfaceNormals;
 StructuredBuffer<int4> SegmentMeta;
 StructuredBuffer<int4> VoxelCells;
 StructuredBuffer<uint> VoxelHashSlots;
 StructuredBuffer<float4> VoxelNormals;
 StructuredBuffer<float4> VoxelTargetPositions;
+StructuredBuffer<int4> TargetBucketRanges;
+StructuredBuffer<uint> TargetBucketRangeCounts;
+StructuredBuffer<uint> TargetBucketVoxelIndices;
+StructuredBuffer<uint> TargetBucketHashSlots;
 RWStructuredBuffer<float4> RW_PathPointTangents;
 RWStructuredBuffer<float4> RW_PathPointNormals;
+RWStructuredBuffer<float4> RW_PathPointSurfaceTargets;
+RWStructuredBuffer<float4> RW_PathPointSurfaceNormals;
 RWStructuredBuffer<float4> RW_OutVertices;
 RWStructuredBuffer<float2> RW_OutUVs;
 RWStructuredBuffer<uint> RW_OutIndices;
@@ -34,7 +42,19 @@ float3 VoxelOrigin;
 float VoxelSize;
 uint VoxelCount;
 uint VoxelHashSlotCount;
+float3 TargetBucketOrigin;
+float TargetBucketSize;
+uint TargetBucketCount;
+uint TargetBucketHashSlotCount;
+uint TargetBucketSearchRadius;
 float VinesOffset;
+
+static const int VINE_VOXEL_NEAREST_SEARCH_RADIUS = 8;
+static const int VINE_VOXEL_WEIGHTED_SAMPLE_COUNT = 8;
+static const uint VINE_VOXEL_SAMPLE_MODE_FAIL = 0u;
+static const uint VINE_VOXEL_SAMPLE_MODE_NEIGHBOR = 1u;
+static const uint VINE_VOXEL_SAMPLE_MODE_LOCAL = 2u;
+static const uint VINE_VOXEL_SAMPLE_MODE_BUCKET = 3u;
 
 float3 SafeNormalize3(float3 V, float3 Fallback)
 {
@@ -90,6 +110,200 @@ int FindVoxelIndexForCell(int3 QueryCell)
     return -1;
 }
 
+int3 GetTargetBucketCell(float3 Position)
+{
+    return int3(floor((Position - TargetBucketOrigin) / max(TargetBucketSize, 1.0e-8f)));
+}
+
+int FindTargetBucketRangeForCell(int3 QueryBucket)
+{
+    if (TargetBucketCount == 0u || TargetBucketHashSlotCount == 0u)
+    {
+        return -1;
+    }
+
+    uint Mask = TargetBucketHashSlotCount - 1u;
+    uint Slot = HashVoxelCell(QueryBucket) & Mask;
+    for (uint Probe = 0u; Probe < TargetBucketHashSlotCount; ++Probe)
+    {
+        uint PackedRangeIndex = TargetBucketHashSlots[Slot];
+        if (PackedRangeIndex == 0u)
+        {
+            return -1;
+        }
+
+        uint RangeIndex = PackedRangeIndex - 1u;
+        if (RangeIndex < TargetBucketCount && all(TargetBucketRanges[RangeIndex].xyz == QueryBucket))
+        {
+            return int(RangeIndex);
+        }
+
+        Slot = (Slot + 1u) & Mask;
+    }
+
+    return -1;
+}
+
+bool FindNearestTargetBucketSample(float3 Query, out float3 OutTarget, out float3 OutNormal)
+{
+    OutTarget = Query;
+    OutNormal = float3(0.0f, 0.0f, 1.0f);
+
+    if (VoxelCount == 0u || TargetBucketCount == 0u || TargetBucketHashSlotCount == 0u || TargetBucketSize <= 1.0e-8f)
+    {
+        return false;
+    }
+
+    int3 QueryBucket = GetTargetBucketCell(Query);
+    float BestDistSq[VINE_VOXEL_WEIGHTED_SAMPLE_COUNT];
+    int BestVoxelIndex[VINE_VOXEL_WEIGHTED_SAMPLE_COUNT];
+    for (int BestIndex = 0; BestIndex < VINE_VOXEL_WEIGHTED_SAMPLE_COUNT; ++BestIndex)
+    {
+        BestDistSq[BestIndex] = 3.402823466e+38f;
+        BestVoxelIndex[BestIndex] = -1;
+    }
+
+    int MaxRadius = min(int(TargetBucketSearchRadius), 16);
+
+    [loop]
+    for (int Radius = 0; Radius <= MaxRadius; ++Radius)
+    {
+        [loop]
+        for (int Z = -Radius; Z <= Radius; ++Z)
+        {
+            [loop]
+            for (int Y = -Radius; Y <= Radius; ++Y)
+            {
+                [loop]
+                for (int X = -Radius; X <= Radius; ++X)
+                {
+                    if (Radius > 0 && max(max(abs(X), abs(Y)), abs(Z)) != Radius)
+                    {
+                        continue;
+                    }
+
+                    int RangeIndex = FindTargetBucketRangeForCell(QueryBucket + int3(X, Y, Z));
+                    if (RangeIndex < 0)
+                    {
+                        continue;
+                    }
+
+                    uint Start = (uint)max(TargetBucketRanges[RangeIndex].w, 0);
+                    uint Count = TargetBucketRangeCounts[RangeIndex];
+                    [loop]
+                    for (uint ItemIndex = 0u; ItemIndex < Count; ++ItemIndex)
+                    {
+                        uint PackedIndex = Start + ItemIndex;
+                        uint VoxelIdx = TargetBucketVoxelIndices[PackedIndex];
+                        if (VoxelIdx >= VoxelCount)
+                        {
+                            continue;
+                        }
+
+                        float3 Target = VoxelTargetPositions[VoxelIdx].xyz;
+                        float3 Delta = Query - Target;
+                        float DistSq = dot(Delta, Delta);
+                        [unroll]
+                        for (int BestIndex = 0; BestIndex < VINE_VOXEL_WEIGHTED_SAMPLE_COUNT; ++BestIndex)
+                        {
+                            if (DistSq < BestDistSq[BestIndex])
+                            {
+                                [unroll(7)]
+                                for (int ShiftIndex = VINE_VOXEL_WEIGHTED_SAMPLE_COUNT - 1; ShiftIndex > 0; --ShiftIndex)
+                                {
+                                    if (ShiftIndex > BestIndex)
+                                    {
+                                        BestDistSq[ShiftIndex] = BestDistSq[ShiftIndex - 1];
+                                        BestVoxelIndex[ShiftIndex] = BestVoxelIndex[ShiftIndex - 1];
+                                    }
+                                }
+
+                                BestDistSq[BestIndex] = DistSq;
+                                BestVoxelIndex[BestIndex] = int(VoxelIdx);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        float NextShellDist = max(0.0f, (float(Radius) - 0.5f) * TargetBucketSize);
+        if (BestVoxelIndex[VINE_VOXEL_WEIGHTED_SAMPLE_COUNT - 1] >= 0 && BestDistSq[VINE_VOXEL_WEIGHTED_SAMPLE_COUNT - 1] <= NextShellDist * NextShellDist)
+        {
+            break;
+        }
+    }
+
+    if (BestVoxelIndex[0] < 0)
+    {
+        return false;
+    }
+
+    float3 SumWeightedTarget = float3(0.0f, 0.0f, 0.0f);
+    float3 SumWeightedNormal = float3(0.0f, 0.0f, 0.0f);
+    float TotalWeight = 0.0f;
+    [unroll]
+    for (int BestIndex = 0; BestIndex < VINE_VOXEL_WEIGHTED_SAMPLE_COUNT; ++BestIndex)
+    {
+        int VoxelIdx = BestVoxelIndex[BestIndex];
+        if (VoxelIdx < 0)
+        {
+            continue;
+        }
+
+        float Weight = 1.0f / max(BestDistSq[BestIndex], 1.0e-8f);
+        SumWeightedTarget += VoxelTargetPositions[VoxelIdx].xyz * Weight;
+        SumWeightedNormal += VoxelNormals[VoxelIdx].xyz * Weight;
+        TotalWeight += Weight;
+    }
+
+    if (TotalWeight <= 1.0e-8f)
+    {
+        return false;
+    }
+
+    OutTarget = SumWeightedTarget / TotalWeight;
+    OutNormal = SafeNormalize3(SumWeightedNormal / TotalWeight, float3(0.0f, 0.0f, 1.0f));
+    return true;
+}
+
+void AccumulateVoxelProjectionSample(
+    float3 Query,
+    int VoxelIdx,
+    float BaseWeight,
+    inout float3 SumWeightedTarget,
+    inout float3 SumWeightedNormal,
+    inout float TotalWeight,
+    inout int ValidSampleCount)
+{
+    if (VoxelIdx < 0 || BaseWeight <= 1.0e-8f)
+    {
+        return;
+    }
+
+    uint VoxelIndex = (uint)VoxelIdx;
+    if (VoxelIndex >= VoxelCount)
+    {
+        return;
+    }
+
+    float3 Target = VoxelTargetPositions[VoxelIndex].xyz;
+    float3 Normal = VoxelNormals[VoxelIndex].xyz;
+    float3 Delta = Query - Target;
+    float DistSq = dot(Delta, Delta);
+    float Weight = BaseWeight / max(DistSq, 1.0e-8f);
+    if (Weight <= 1.0e-8f)
+    {
+        return;
+    }
+
+    SumWeightedTarget += Target * Weight;
+    SumWeightedNormal += Normal * Weight;
+    TotalWeight += Weight;
+    ++ValidSampleCount;
+}
+
 // 8-neighbor voxel lookup with two-stage weighting:
 // Stage 1: Tri-Linear grid interpolation weight
 // Stage 2: Inverse distance squared to VoxelTargetPosition
@@ -99,15 +313,16 @@ bool SampleVoxelNeighbors(float3 Query, out float3 OutTarget, out float3 OutNorm
     OutTarget = Query;
     OutNormal = float3(0.0f, 0.0f, 1.0f);
 
-    if (VoxelCount == 0u)
+    if (VoxelCount == 0u || VoxelSize <= 1.0e-8f)
     {
         return false;
     }
 
-    // Compute base cell and intra-cell local coordinates
-    float3 Local = (Query - VoxelOrigin) / VoxelSize;
-    int3 BaseCell = int3(floor(Local));
-    float3 CellLocal = clamp(Local - float3(BaseCell), 0.0f, 1.0f);
+    // Voxel samples are stored at cell centers, so interpolate around
+    // (Cell + 0.5) rather than cell minima.
+    float3 LocalCenter = (Query - VoxelOrigin) / VoxelSize - 0.5f;
+    int3 BaseCell = int3(floor(LocalCenter));
+    float3 CellLocal = clamp(LocalCenter - float3(BaseCell), 0.0f, 1.0f);
 
     // Tri-Linear weights for 8 corners
     float W[8];
@@ -128,21 +343,25 @@ bool SampleVoxelNeighbors(float3 Query, out float3 OutTarget, out float3 OutNorm
     float3 SumWeightedTarget = float3(0.0f, 0.0f, 0.0f);
     float3 SumWeightedNormal = float3(0.0f, 0.0f, 0.0f);
     float TotalWeight = 0.0f;
+    int ValidNeighborCount = 0;
 
+    [unroll]
     for (int Corner = 0; Corner < 8; ++Corner)
     {
         float TriW = W[Corner];
-        if (TriW <= 1.0e-8f)
-        {
-            continue;
-        }
-
         int3 CornerCell = BaseCell + Offsets[Corner];
 
         // Hash lookup keeps per-sample voxel matching off the full VoxelCells scan.
         int VoxelIdx = FindVoxelIndexForCell(CornerCell);
 
         if (VoxelIdx < 0)
+        {
+            continue;
+        }
+
+        ++ValidNeighborCount;
+
+        if (TriW <= 1.0e-8f)
         {
             continue;
         }
@@ -163,7 +382,9 @@ bool SampleVoxelNeighbors(float3 Query, out float3 OutTarget, out float3 OutNorm
         TotalWeight += FinalW;
     }
 
-    if (TotalWeight <= 1.0e-8f)
+    // Surface voxels are sparse. Probe all 8 interpolation corners, but blend
+    // the valid corners found instead of failing unless every corner exists.
+    if (ValidNeighborCount <= 0 || TotalWeight <= 1.0e-8f)
     {
         return false;
     }
@@ -171,6 +392,144 @@ bool SampleVoxelNeighbors(float3 Query, out float3 OutTarget, out float3 OutNorm
     OutTarget = SumWeightedTarget / TotalWeight;
     OutNormal = SafeNormalize3(SumWeightedNormal / TotalWeight, float3(0.0f, 0.0f, 1.0f));
     return true;
+}
+
+bool SampleVoxelNeighborsExpanded(float3 Query, out float3 OutTarget, out float3 OutNormal, out uint OutSampleMode)
+{
+    OutTarget = Query;
+    OutNormal = float3(0.0f, 0.0f, 1.0f);
+    OutSampleMode = VINE_VOXEL_SAMPLE_MODE_FAIL;
+
+    if (VoxelCount == 0u || VoxelSize <= 1.0e-8f)
+    {
+        return false;
+    }
+
+    float3 LocalCenter = (Query - VoxelOrigin) / VoxelSize - 0.5f;
+    int3 BaseCell = int3(floor(LocalCenter));
+    float3 CellLocal = clamp(LocalCenter - float3(BaseCell), 0.0f, 1.0f);
+
+    float W[8];
+    W[0] = (1.0f - CellLocal.x) * (1.0f - CellLocal.y) * (1.0f - CellLocal.z);
+    W[1] = (          CellLocal.x) * (1.0f - CellLocal.y) * (1.0f - CellLocal.z);
+    W[2] = (1.0f - CellLocal.x) * (          CellLocal.y) * (1.0f - CellLocal.z);
+    W[3] = (          CellLocal.x) * (          CellLocal.y) * (1.0f - CellLocal.z);
+    W[4] = (1.0f - CellLocal.x) * (1.0f - CellLocal.y) * (          CellLocal.z);
+    W[5] = (          CellLocal.x) * (1.0f - CellLocal.y) * (          CellLocal.z);
+    W[6] = (1.0f - CellLocal.x) * (          CellLocal.y) * (          CellLocal.z);
+    W[7] = (          CellLocal.x) * (          CellLocal.y) * (          CellLocal.z);
+
+    int3 Offsets[8] = {
+        int3(0,0,0), int3(1,0,0), int3(0,1,0), int3(1,1,0),
+        int3(0,0,1), int3(1,0,1), int3(0,1,1), int3(1,1,1)
+    };
+
+    int FarthestVoxelIdx = -1;
+    float FarthestDistSq = -1.0f;
+
+    [loop]
+    for (int Radius = 0; Radius <= VINE_VOXEL_NEAREST_SEARCH_RADIUS; ++Radius)
+    {
+        float3 SumWeightedTarget = float3(0.0f, 0.0f, 0.0f);
+        float3 SumWeightedNormal = float3(0.0f, 0.0f, 0.0f);
+        float TotalWeight = 0.0f;
+        int ValidSampleCount = 0;
+
+        if (Radius == 0)
+        {
+            [unroll]
+            for (int Corner = 0; Corner < 8; ++Corner)
+            {
+                AccumulateVoxelProjectionSample(
+                    Query,
+                    FindVoxelIndexForCell(BaseCell + Offsets[Corner]),
+                    W[Corner],
+                    SumWeightedTarget,
+                    SumWeightedNormal,
+                    TotalWeight,
+                    ValidSampleCount);
+            }
+        }
+        else
+        {
+            int MinOffset = -Radius;
+            int MaxOffset = Radius + 1;
+            [loop]
+            for (int Z = MinOffset; Z <= MaxOffset; ++Z)
+            {
+                [loop]
+                for (int Y = MinOffset; Y <= MaxOffset; ++Y)
+                {
+                    [loop]
+                    for (int X = MinOffset; X <= MaxOffset; ++X)
+                    {
+                        if (X != MinOffset && X != MaxOffset
+                            && Y != MinOffset && Y != MaxOffset
+                            && Z != MinOffset && Z != MaxOffset)
+                        {
+                            continue;
+                        }
+
+                        int VoxelIdx = FindVoxelIndexForCell(BaseCell + int3(X, Y, Z));
+                        if (VoxelIdx < 0 || uint(VoxelIdx) >= VoxelCount)
+                        {
+                            continue;
+                        }
+
+                        float3 Target = VoxelTargetPositions[VoxelIdx].xyz;
+                        float DistSq = dot(Query - Target, Query - Target);
+                        if (DistSq > FarthestDistSq)
+                        {
+                            FarthestDistSq = DistSq;
+                            FarthestVoxelIdx = VoxelIdx;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (ValidSampleCount > 0 && TotalWeight > 1.0e-8f)
+        {
+            OutTarget = SumWeightedTarget / TotalWeight;
+            OutNormal = SafeNormalize3(SumWeightedNormal / TotalWeight, float3(0.0f, 0.0f, 1.0f));
+            OutSampleMode = Radius == 0 ? VINE_VOXEL_SAMPLE_MODE_NEIGHBOR : VINE_VOXEL_SAMPLE_MODE_LOCAL;
+            return true;
+        }
+    }
+
+    if (FarthestVoxelIdx >= 0)
+    {
+        OutTarget = VoxelTargetPositions[FarthestVoxelIdx].xyz;
+        OutNormal = SafeNormalize3(VoxelNormals[FarthestVoxelIdx].xyz, float3(0.0f, 0.0f, 1.0f));
+        OutSampleMode = VINE_VOXEL_SAMPLE_MODE_LOCAL;
+        return true;
+    }
+
+    return false;
+}
+
+bool FindNearestVoxelSample(float3 Query, out float3 OutTarget, out float3 OutNormal, out uint OutSampleMode)
+{
+    OutTarget = Query;
+    OutNormal = float3(0.0f, 0.0f, 1.0f);
+    OutSampleMode = VINE_VOXEL_SAMPLE_MODE_FAIL;
+
+    // Prefer the local expanding voxel interpolation around the query point.
+    // The target bucket search is only a fallback for sparse surface regions.
+    uint NeighborSampleMode = VINE_VOXEL_SAMPLE_MODE_FAIL;
+    if (SampleVoxelNeighborsExpanded(Query, OutTarget, OutNormal, NeighborSampleMode))
+    {
+        OutSampleMode = NeighborSampleMode;
+        return true;
+    }
+
+    if (FindNearestTargetBucketSample(Query, OutTarget, OutNormal))
+    {
+        OutSampleMode = VINE_VOXEL_SAMPLE_MODE_BUCKET;
+        return true;
+    }
+
+    return false;
 }
 
 uint GetLinePointIndex(uint PointIndex, int Offset)
@@ -212,7 +571,7 @@ void BuildOrthonormalFrame(float3 Tangent, float3 Normal, out float3 OutTangent,
     OutNormal = SafeNormalize3(cross(OutTangent, OutBinormal), OutNormal);
 }
 
-void BuildRawVoxelVineFrame(uint PointIndex, out float3 OutTangent, out float3 OutNormal)
+void BuildRawVoxelVineFrame(uint PointIndex, out float3 OutTangent, out float3 OutNormal, out float3 OutSurfaceTarget, out float3 OutSurfaceNormal, out bool bOutHasVoxelSample, out uint OutSampleMode)
 {
     uint PrevIndex = GetLinePointIndex(PointIndex, -1);
     uint NextIndex = GetLinePointIndex(PointIndex, 1);
@@ -226,9 +585,15 @@ void BuildRawVoxelVineFrame(uint PointIndex, out float3 OutTangent, out float3 O
 
     float3 Target;
     float3 SampledNormal;
-    SampleVoxelNeighbors(PathPoints[PointIndex].xyz, Target, SampledNormal);
-    SampledNormal = SafeNormalize3(SampledNormal, GetFallbackFrameNormal(OutTangent));
+    uint SampleMode = VINE_VOXEL_SAMPLE_MODE_FAIL;
+    bool bHasVoxelSample = FindNearestVoxelSample(PathPoints[PointIndex].xyz, Target, SampledNormal, SampleMode);
+    float3 FallbackNormal = GetFallbackFrameNormal(OutTangent);
+    SampledNormal = bHasVoxelSample ? SafeNormalize3(SampledNormal, FallbackNormal) : FallbackNormal;
     OutNormal = BuildFrameNormalFromTangent(OutTangent, SampledNormal);
+    OutSurfaceTarget = bHasVoxelSample ? Target : PathPoints[PointIndex].xyz;
+    OutSurfaceNormal = bHasVoxelSample ? SampledNormal : OutNormal;
+    bOutHasVoxelSample = bHasVoxelSample;
+    OutSampleMode = bHasVoxelSample ? SampleMode : VINE_VOXEL_SAMPLE_MODE_FAIL;
 }
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
@@ -242,9 +607,91 @@ void BuildVineVisualizationVoxelAxesCS(uint3 DispatchThreadId : SV_DispatchThrea
 
     float3 Tangent;
     float3 Normal;
-    BuildRawVoxelVineFrame(PointIndex, Tangent, Normal);
+    float3 SurfaceTarget;
+    float3 SurfaceNormal;
+    bool bHasVoxelSample;
+    uint SampleMode;
+    BuildRawVoxelVineFrame(PointIndex, Tangent, Normal, SurfaceTarget, SurfaceNormal, bHasVoxelSample, SampleMode);
     RW_PathPointTangents[PointIndex] = float4(Tangent, 0.0f);
     RW_PathPointNormals[PointIndex] = float4(Normal, 0.0f);
+    RW_PathPointSurfaceTargets[PointIndex] = float4(SurfaceTarget, bHasVoxelSample ? float(SampleMode) : 0.0f);
+    RW_PathPointSurfaceNormals[PointIndex] = float4(SafeNormalize3(SurfaceNormal, Normal), 0.0f);
+}
+
+void AccumulateProjectedSurfaceSmoothSample(
+    uint SampleIndex,
+    float Weight,
+    float3 CenterNormal,
+    inout float3 SumTarget,
+    inout float3 SumNormal,
+    inout float TotalWeight)
+{
+    if (SampleIndex >= PathPointCount || Weight <= 1.0e-8f)
+    {
+        return;
+    }
+
+    float4 PackedTarget = PathPointSurfaceTargets[SampleIndex];
+    if (PackedTarget.w <= 0.5f)
+    {
+        return;
+    }
+
+    float3 SampleNormal = SafeNormalize3(PathPointSurfaceNormals[SampleIndex].xyz, CenterNormal);
+    SampleNormal = OrientAxisToReference(SampleNormal, CenterNormal);
+    SumTarget += PackedTarget.xyz * Weight;
+    SumNormal += SampleNormal * Weight;
+    TotalWeight += Weight;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void SmoothVineVisualizationVoxelProjectionCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint PointIndex = DispatchThreadId.x;
+    if (PointIndex >= PathPointCount)
+    {
+        return;
+    }
+
+    float4 CenterTarget = PathPointSurfaceTargets[PointIndex];
+    float4 CenterNormalPacked = PathPointSurfaceNormals[PointIndex];
+    RW_PathPointSurfaceTargets[PointIndex] = CenterTarget;
+    RW_PathPointSurfaceNormals[PointIndex] = CenterNormalPacked;
+
+    if (CenterTarget.w <= 0.5f || PathPointCount == 0u)
+    {
+        return;
+    }
+
+    int4 Meta = PathPointMeta[PointIndex];
+    int BaseIndex = max(Meta.z, 0);
+    int PointCount = max(Meta.w, 1);
+    int LocalIndex = int(PointIndex) - BaseIndex;
+    if (PointCount < 3 || LocalIndex <= 0 || LocalIndex >= PointCount - 1)
+    {
+        return;
+    }
+
+    int LastIndex = int(PathPointCount) - 1;
+    uint PrevIndex = (uint)min(max(Meta.x, 0), LastIndex);
+    uint NextIndex = (uint)min(max(Meta.y, 0), LastIndex);
+
+    float3 CenterNormal = SafeNormalize3(CenterNormalPacked.xyz, float3(0.0f, 0.0f, 1.0f));
+    float3 SumTarget = float3(0.0f, 0.0f, 0.0f);
+    float3 SumNormal = float3(0.0f, 0.0f, 0.0f);
+    float TotalWeight = 0.0f;
+
+    AccumulateProjectedSurfaceSmoothSample(PointIndex, 2.0f, CenterNormal, SumTarget, SumNormal, TotalWeight);
+    AccumulateProjectedSurfaceSmoothSample(PrevIndex, 1.0f, CenterNormal, SumTarget, SumNormal, TotalWeight);
+    AccumulateProjectedSurfaceSmoothSample(NextIndex, 1.0f, CenterNormal, SumTarget, SumNormal, TotalWeight);
+
+    if (TotalWeight <= 1.0e-8f)
+    {
+        return;
+    }
+
+    RW_PathPointSurfaceTargets[PointIndex] = float4(SumTarget / TotalWeight, CenterTarget.w);
+    RW_PathPointSurfaceNormals[PointIndex] = float4(SafeNormalize3(SumNormal / TotalWeight, CenterNormal), 0.0f);
 }
 
 float2 GetProfilePoint(uint ProfileIndex)
@@ -301,19 +748,18 @@ void BuildVineVisualizationVoxelCS(uint3 DispatchThreadId : SV_DispatchThreadID)
             float3 NextPos = PathPoints[NextIndex].xyz;
             float3 FallbackTangent = SafeNormalize3(NextPos - PrevPos, float3(1.0f, 0.0f, 0.0f));
             float3 Tangent = SafeNormalize3(PathPointTangents[PointIndex].xyz, FallbackTangent);
-
-            // Voxel-based surface sampling replaces BVH-based closest point projection
-            float3 Target, SampledNormal;
-            SampleVoxelNeighbors(Query, Target, SampledNormal);
-            float3 Normal = SafeNormalize3(PathPointNormals[PointIndex].xyz, GetFallbackFrameNormal(Tangent));
+            float3 RawFrameNormal = SafeNormalize3(PathPointNormals[PointIndex].xyz, GetFallbackFrameNormal(Tangent));
+            float4 PackedSurfaceTarget = PathPointSurfaceTargets[PointIndex];
+            bool bHasVoxelSample = PackedSurfaceTarget.w > 0.5f;
+            float3 SurfaceNormal = bHasVoxelSample ? SafeNormalize3(PathPointSurfaceNormals[PointIndex].xyz, RawFrameNormal) : RawFrameNormal;
             float3 FrameTangent;
             float3 FrameNormal;
             float3 Binormal;
-            BuildOrthonormalFrame(Tangent, Normal, FrameTangent, FrameNormal, Binormal);
+            BuildOrthonormalFrame(Tangent, SurfaceNormal, FrameTangent, FrameNormal, Binormal);
 
             float2 Profile = GetProfilePoint(ProfileIndex) * Scale;
-            // GPU owns final surface anchoring and offset for the voxel path.
-            float3 Center = Target + SafeNormalize3(SampledNormal, Normal) * VinesOffset;
+            float3 SurfaceTarget = bHasVoxelSample ? PackedSurfaceTarget.xyz : Query;
+            float3 Center = SurfaceTarget + SurfaceNormal * VinesOffset;
             float3 OutPosition = Center + Binormal * Profile.x + FrameNormal * Profile.y;
 
             RW_OutVertices[Index] = float4(OutPosition, 1.0f);

@@ -36,7 +36,7 @@ RWTexture2D<float4> RW_TriangleNormalTexture;
 RWBuffer<float4> RW_OutVoxelTargetPositions;
 RWBuffer<int> RW_SurfaceVoxelTargetOffsetSums;
 RWBuffer<uint> RW_SurfaceVoxelTargetWeightSums;
-RWBuffer<int4> RW_OutVoxelCells;
+RWBuffer<uint4> RW_OutVoxelCells;
 RWBuffer<float4> RW_BlurredVoxelNormals;
 RWBuffer<float4> RW_BlurredVoxelTargetPositions;
 
@@ -502,6 +502,20 @@ float3 ClosestPointOnTriangle(float3 P, float3 A, float3 B, float3 C)
 	return A + AB * V + AC * W;
 }
 
+float3 ResolveTriangleSoupNormal(float3 P0, float3 P1, float3 P2, float3 N0, float3 N1, float3 N2)
+{
+	float3 Normal = N0 + N1 + N2;
+	if (dot(Normal, Normal) <= 1.0e-8f || any(isnan(Normal)))
+	{
+		Normal = cross(P1 - P0, P2 - P0);
+	}
+	if (dot(Normal, Normal) <= 1.0e-8f || any(isnan(Normal)))
+	{
+		return float3(0.0f, 0.0f, 0.0f);
+	}
+	return normalize(Normal);
+}
+
 #define CS_CLIPPED_TRI_MAX_VERTICES 16
 #define CS_SURFACE_VOXEL_NORMAL_QUANTIZE 4096.0f
 #define CS_SURFACE_VOXEL_TARGET_QUANTIZE 4096.0f
@@ -679,6 +693,12 @@ void AccumulateSurfaceVoxelTarget(uint VoxelIndex, float3 TargetPosition, float 
 
 	float3 Center = RW_OutVoxelPositions[VoxelIndex].xyz;
 	float3 Offset = TargetPosition - Center;
+	float MaxTargetDistance = max(SurfaceVoxelSize * 2.0f, 1.0e-4f);
+	if (any(isnan(TargetPosition)) || dot(Offset, Offset) > MaxTargetDistance * MaxTargetDistance)
+	{
+		return;
+	}
+
 	float SafeWeight = clamp(TargetWeight, 0.0f, 65536.0f);
 	int3 QuantizedOffset = int3(round(clamp(Offset * SafeWeight, -32768.0f, 32768.0f) * CS_SURFACE_VOXEL_TARGET_QUANTIZE));
 	uint QuantizedWeight = max(1u, uint(round(SafeWeight * CS_SURFACE_VOXEL_TARGET_QUANTIZE)));
@@ -717,17 +737,33 @@ void AppendSurfaceVoxel(int3 Cell, float3 Normal, float3 TargetPosition, float N
 		}
 		if (PreviousValue == Key)
 		{
+			uint PackedVoxelIndex = 0u;
 			[unroll]
 			for (uint WaitIndex = 0u; WaitIndex < 16u; ++WaitIndex)
 			{
-				uint PackedVoxelIndex = RW_SurfaceVoxelHashIndices[Slot];
+				PackedVoxelIndex = RW_SurfaceVoxelHashIndices[Slot];
 				if (PackedVoxelIndex != 0u)
 				{
-					AccumulateSurfaceVoxelNormal(PackedVoxelIndex - 1u, Normal, NormalWeight);
+					break;
+				}
+			}
+
+			if (PackedVoxelIndex == 0u)
+			{
+				return;
+			}
+
+			uint VoxelIndex = PackedVoxelIndex - 1u;
+			if (VoxelIndex < SurfaceVoxelCapacity)
+			{
+				int3 StoredCell = asint(RW_OutVoxelCells[VoxelIndex].xyz);
+				if (all(StoredCell == Cell))
+				{
+					AccumulateSurfaceVoxelNormal(VoxelIndex, Normal, NormalWeight);
+					AccumulateSurfaceVoxelTarget(VoxelIndex, TargetPosition, NormalWeight);
 					return;
 				}
 			}
-			return;
 		}
 	}
 
@@ -758,8 +794,12 @@ void AppendSurfaceVoxel(int3 Cell, float3 Normal, float3 TargetPosition, float N
 	RW_OutVoxelPositions[OutIndex] = float4(Center, 1.0f);
 	RW_OutVoxelNormals[OutIndex] = float4(Normal, 0.0f);
 	RW_OutVoxelTargetPositions[OutIndex] = float4(Center, 1.0f);
-	RW_OutVoxelCells[OutIndex] = int4(Cell, 0);
-	RW_SurfaceVoxelHashIndices[ClaimedSlot] = OutIndex + 1u;
+	RW_OutVoxelCells[OutIndex] = asuint(int4(Cell, 0));
+
+	DeviceMemoryBarrier();
+	uint PreviousPackedVoxelIndex = 0u;
+	InterlockedExchange(RW_SurfaceVoxelHashIndices[ClaimedSlot], OutIndex + 1u, PreviousPackedVoxelIndex);
+
 	AccumulateSurfaceVoxelNormal(OutIndex, Normal, NormalWeight);
 	AccumulateSurfaceVoxelTarget(OutIndex, TargetPosition, NormalWeight);
 }
@@ -793,16 +833,16 @@ uint FindVoxelIndexForCell(int3 Cell)
 		uint PackedVoxelIndex = RW_SurfaceVoxelHashIndices[Slot];
 		if (PackedVoxelIndex == 0u)
 		{
-			return INVALID_VOXEL_INDEX;
+			continue;
 		}
 
 		uint VoxelIndex = PackedVoxelIndex - 1u;
 		if (VoxelIndex >= SurfaceVoxelCapacity)
 		{
-			return INVALID_VOXEL_INDEX;
+			continue;
 		}
 
-		int3 StoredCell = RW_OutVoxelCells[VoxelIndex].xyz;
+		int3 StoredCell = asint(RW_OutVoxelCells[VoxelIndex].xyz);
 		if (all(StoredCell == Cell))
 		{
 			return VoxelIndex;
@@ -836,16 +876,17 @@ void TriangleSurfaceVoxelsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	float3 P1 = TriangleVertices[VertexBase + 1u].xyz;
 	float3 P2 = TriangleVertices[VertexBase + 2u].xyz;
 
-	float3 N = TriangleNormals[VertexBase + 0u].xyz + TriangleNormals[VertexBase + 1u].xyz + TriangleNormals[VertexBase + 2u].xyz;
-	if (dot(N, N) <= 1.0e-8f || any(isnan(N)))
-	{
-		N = cross(P1 - P0, P2 - P0);
-	}
+	float3 N = ResolveTriangleSoupNormal(
+		P0,
+		P1,
+		P2,
+		TriangleNormals[VertexBase + 0u].xyz,
+		TriangleNormals[VertexBase + 1u].xyz,
+		TriangleNormals[VertexBase + 2u].xyz);
 	if (dot(N, N) <= 1.0e-8f || any(isnan(N)))
 	{
 		return;
 	}
-	N = normalize(N);
 
 	float CellSize = max(SurfaceVoxelSize, 1.0e-4f);
 	float BoundaryBias = CellSize * 1.0e-4f;
@@ -915,7 +956,8 @@ void FinalizeSurfaceVoxelNormalsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		}
 	}
 
-	float3 TargetPosition = RW_OutVoxelPositions[VoxelIndex].xyz;
+	float3 VoxelCenter = RW_OutVoxelPositions[VoxelIndex].xyz;
+	float3 TargetPosition = VoxelCenter;
 	uint TargetWeightSum = RW_SurfaceVoxelTargetWeightSums[VoxelIndex];
 	if (TargetWeightSum > 0u)
 	{
@@ -926,6 +968,13 @@ void FinalizeSurfaceVoxelNormalsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 			(float)RW_SurfaceVoxelTargetOffsetSums[TargetBase + 2u]);
 		float3 AverageOffset = OffsetSum / float(TargetWeightSum);
 		TargetPosition += AverageOffset;
+	}
+
+	float3 TargetOffset = TargetPosition - VoxelCenter;
+	float MaxTargetDistance = max(SurfaceVoxelSize * 2.0f, 1.0e-4f);
+	if (any(isnan(TargetPosition)) || dot(TargetOffset, TargetOffset) > MaxTargetDistance * MaxTargetDistance)
+	{
+		TargetPosition = VoxelCenter;
 	}
 
 	RW_OutVoxelNormals[VoxelIndex] = float4(Dir, 0.0f);
@@ -1013,16 +1062,17 @@ void ScatterTrianglesToVoxelCacheCS(uint3 DispatchThreadId : SV_DispatchThreadID
 			continue;
 		}
 
-		float3 Normal = TriangleNormals[VertexBase + 0u].xyz + TriangleNormals[VertexBase + 1u].xyz + TriangleNormals[VertexBase + 2u].xyz;
-		if (dot(Normal, Normal) <= 1.0e-8f || any(isnan(Normal)))
-		{
-			Normal = cross(P1 - P0, P2 - P0);
-		}
+		float3 Normal = ResolveTriangleSoupNormal(
+			P0,
+			P1,
+			P2,
+			TriangleNormals[VertexBase + 0u].xyz,
+			TriangleNormals[VertexBase + 1u].xyz,
+			TriangleNormals[VertexBase + 2u].xyz);
 		if (dot(Normal, Normal) <= 1.0e-8f || any(isnan(Normal)))
 		{
 			continue;
 		}
-		Normal = normalize(Normal);
 
 		if (WrittenCount >= MaxTrianglesPerVoxel)
 		{
@@ -1076,7 +1126,7 @@ void BlurSurfaceVoxelsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	}
 
 	uint Radius = max(SurfaceVoxelBlurRadius, 1u);
-	int3 CenterCell = RW_OutVoxelCells[VoxelIndex].xyz;
+	int3 CenterCell = asint(RW_OutVoxelCells[VoxelIndex].xyz);
 
 	float3 TargetSum = float3(0.0f, 0.0f, 0.0f);
 	float3 DirSum = float3(0.0f, 0.0f, 0.0f);

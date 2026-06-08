@@ -384,7 +384,7 @@ class FTriangleSurfaceVoxelsCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutVoxelTargetPositions)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<int>, RW_SurfaceVoxelTargetOffsetSums)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_SurfaceVoxelTargetWeightSums)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<int4>, RW_OutVoxelCells)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint4>, RW_OutVoxelCells)
 		SHADER_PARAMETER(FVector3f, SurfaceVoxelOrigin)
 		SHADER_PARAMETER(float, SurfaceVoxelSize)
 		SHADER_PARAMETER(float, SurfaceThickness)
@@ -416,12 +416,13 @@ class FFinalizeSurfaceVoxelNormalsCS : public FGlobalShader
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<int>, SurfaceVoxelNormalSums)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SurfaceVoxelNormalCounts)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<int>, RW_SurfaceVoxelTargetOffsetSums)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, RW_SurfaceVoxelTargetWeightSums)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, RW_OutVoxelPositions)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<int>, RW_SurfaceVoxelTargetOffsetSums)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_SurfaceVoxelTargetWeightSums)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutVoxelPositions)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutVoxelNormals)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutVoxelTargetPositions)
 		SHADER_PARAMETER(uint32, SurfaceVoxelCapacity)
+		SHADER_PARAMETER(float, SurfaceVoxelSize)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -445,12 +446,12 @@ class FBlurSurfaceVoxelsCS : public FGlobalShader
 	SHADER_USE_PARAMETER_STRUCT(FBlurSurfaceVoxelsCS, FGlobalShader);
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, RW_SurfaceVoxelCounter)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, RW_OutVoxelNormals)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, RW_OutVoxelTargetPositions)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<int4>, RW_OutVoxelCells)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, RW_SurfaceVoxelHashSlots)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, RW_SurfaceVoxelHashIndices)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_SurfaceVoxelCounter)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutVoxelNormals)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutVoxelTargetPositions)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint4>, RW_OutVoxelCells)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_SurfaceVoxelHashSlots)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_SurfaceVoxelHashIndices)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_BlurredVoxelNormals)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_BlurredVoxelTargetPositions)
 		SHADER_PARAMETER(uint32, SurfaceVoxelCapacity)
@@ -1046,6 +1047,14 @@ bool IsFiniteCSVertex(const FVector& Vertex)
 		&& FMath::IsFinite(Vertex.Z);
 }
 
+bool IsFiniteCSVector4(const FVector4f& Vector)
+{
+	return FMath::IsFinite(Vector.X)
+		&& FMath::IsFinite(Vector.Y)
+		&& FMath::IsFinite(Vector.Z)
+		&& FMath::IsFinite(Vector.W);
+}
+
 bool IsDegenerateCSTriangle(const FVector& A, const FVector& B, const FVector& C)
 {
 	const FVector AB = B - A;
@@ -1323,7 +1332,10 @@ void BuildBoxSceneLandscapeTrianglesInternal(UWorld* World,
 #endif
 }
 
-void BuildBoxSceneTriangleRequestsInternal(UWorld* World, const FBox& QueryBox, int32 LODIndex, TArray<FCSStaticMeshTriangleRequest>& OutRequests)
+void BuildBoxSceneTriangleRequestsInternal(UWorld* World,
+	const FBox& QueryBox,
+	int32 LODIndex,
+	TArray<FCSStaticMeshTriangleRequest>& OutRequests)
 {
 	OutRequests.Reset();
 	if (!World || !QueryBox.IsValid)
@@ -2101,16 +2113,13 @@ FCSSurfaceVoxelRDGOutput AddTriangleSurfaceVoxelsToRDGInternal(
 	FFinalizeSurfaceVoxelNormalsCS::FParameters* FinalizeParameters = GraphBuilder.AllocParameters<FFinalizeSurfaceVoxelNormalsCS::FParameters>();
 	FinalizeParameters->SurfaceVoxelNormalSums = Output.VoxelNormalSumsSRV;
 	FinalizeParameters->SurfaceVoxelNormalCounts = Output.VoxelNormalCountsSRV;
-	FinalizeParameters->RW_SurfaceVoxelTargetOffsetSums = Output.VoxelTargetOffsetSumsUAV
-		? GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelTargetOffsetSums, PF_R32_SINT))
-		: nullptr;
-	FinalizeParameters->RW_SurfaceVoxelTargetWeightSums = Output.VoxelTargetWeightSumsUAV
-		? GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelTargetWeightSums, PF_R32_UINT))
-		: nullptr;
-	FinalizeParameters->RW_OutVoxelPositions = Output.VoxelPositionsSRV;
+	FinalizeParameters->RW_SurfaceVoxelTargetOffsetSums = Output.VoxelTargetOffsetSumsUAV;
+	FinalizeParameters->RW_SurfaceVoxelTargetWeightSums = Output.VoxelTargetWeightSumsUAV;
+	FinalizeParameters->RW_OutVoxelPositions = Output.VoxelPositionsUAV;
 	FinalizeParameters->RW_OutVoxelNormals = Output.VoxelNormalsUAV;
 	FinalizeParameters->RW_OutVoxelTargetPositions = Output.VoxelTargetPositionsUAV;
 	FinalizeParameters->SurfaceVoxelCapacity = VoxelCapacity;
+	FinalizeParameters->SurfaceVoxelSize = SafeVoxelSize;
 	GraphBuilder.AddPass(
 		RDG_EVENT_NAME("%s.FinalizeSurfaceVoxelNormals", DebugName),
 		FinalizeParameters,
@@ -2138,18 +2147,18 @@ FCSSurfaceVoxelRDGOutput AddTriangleSurfaceVoxelsToRDGInternal(
 			for (uint32 Iter = 0u; Iter < BlurIters; ++Iter)
 			{
 				const bool bReadFromOriginal = (CurrentNormalsIdx == 0);
-				FRDGBufferSRVRef SrcNormalsSRV = bReadFromOriginal ? Output.VoxelNormalsSRV : Output.BlurredVoxelNormalsSRV;
-				FRDGBufferSRVRef SrcTargetsSRV = bReadFromOriginal ? Output.VoxelTargetPositionsSRV : Output.BlurredVoxelTargetPositionsSRV;
+				FRDGBufferUAVRef SrcNormalsUAV = bReadFromOriginal ? Output.VoxelNormalsUAV : Output.BlurredVoxelNormalsUAV;
+				FRDGBufferUAVRef SrcTargetsUAV = bReadFromOriginal ? Output.VoxelTargetPositionsUAV : Output.BlurredVoxelTargetPositionsUAV;
 				FRDGBufferUAVRef DstNormalsUAV = bReadFromOriginal ? Output.BlurredVoxelNormalsUAV : Output.VoxelNormalsUAV;
 				FRDGBufferUAVRef DstTargetsUAV = bReadFromOriginal ? Output.BlurredVoxelTargetPositionsUAV : Output.VoxelTargetPositionsUAV;
 
 				FBlurSurfaceVoxelsCS::FParameters* BlurParameters = GraphBuilder.AllocParameters<FBlurSurfaceVoxelsCS::FParameters>();
-				BlurParameters->RW_SurfaceVoxelCounter = Output.VoxelCounterSRV;
-				BlurParameters->RW_OutVoxelNormals = SrcNormalsSRV;
-				BlurParameters->RW_OutVoxelTargetPositions = SrcTargetsSRV;
-				BlurParameters->RW_OutVoxelCells = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelCells, PF_R32G32B32A32_UINT));
-				BlurParameters->RW_SurfaceVoxelHashSlots = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelHashSlots, PF_R32_UINT));
-				BlurParameters->RW_SurfaceVoxelHashIndices = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelHashIndices, PF_R32_UINT));
+				BlurParameters->RW_SurfaceVoxelCounter = Output.VoxelCounterUAV;
+				BlurParameters->RW_OutVoxelNormals = SrcNormalsUAV;
+				BlurParameters->RW_OutVoxelTargetPositions = SrcTargetsUAV;
+				BlurParameters->RW_OutVoxelCells = Output.VoxelCellsUAV;
+				BlurParameters->RW_SurfaceVoxelHashSlots = Output.VoxelHashSlotsUAV;
+				BlurParameters->RW_SurfaceVoxelHashIndices = Output.VoxelHashIndicesUAV;
 				BlurParameters->RW_BlurredVoxelNormals = DstNormalsUAV;
 				BlurParameters->RW_BlurredVoxelTargetPositions = DstTargetsUAV;
 				BlurParameters->SurfaceVoxelCapacity = VoxelCapacity;
@@ -2253,12 +2262,28 @@ FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPU()
 
 FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPUFiltered(float ReferenceFilterDistance)
 {
+	const TArray<FVector> ReferencePointsForRender = ReferencePoints;
+	return ReadBoxSceneTrianglesFromGPUFilteredInternal(
+		GetGeneratorBoundsWorldBox(),
+		ReferencePointsForRender,
+		ReferenceFilterDistance,
+		TEXT("[GetBoxSceneTrianglesFromGPU]"),
+		this,
+		ExcludedActorTag);
+}
+
+FCSTriangleMeshData AComputeShaderMeshGenerator::ReadBoxSceneTrianglesFromGPUFilteredInternal(const FBox& QueryBox,
+	const TArray<FVector>& ReferencePointsForRender,
+	float ReferenceFilterDistance,
+	const TCHAR* LogPrefix,
+	const AActor* ExcludedActor,
+	FName ExcludedActorTagForResolve)
+{
 	FCSTriangleMeshData OutTriangleData;
 	LastTriangleTextureData.bValid = false;
 	LastTriangleTextureData.VertexCount = 0;
 	LastTriangleTextureData.TriangleCount = 0;
 	LastTriangleTextureData.IndexCount = 0;
-	const TArray<FVector> ReferencePointsForRender = ReferencePoints;
 
 	UWorld* World = GetWorld();
 	if (!World)
@@ -2266,7 +2291,6 @@ FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPUFilt
 		return OutTriangleData;
 	}
 
-	const FBox QueryBox = GetGeneratorBoundsWorldBox();
 	if (!QueryBox.IsValid)
 	{
 		return OutTriangleData;
@@ -2274,7 +2298,7 @@ FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPUFilt
 
 	const int32 SafeMaxTriangles = FMath::Max(1, MaxTriangles);
 	TArray<FCSStaticMeshTriangleRequest> Requests;
-	BuildBoxSceneTriangleRequests(World, QueryBox, Requests);
+	BuildBoxSceneTriangleRequestsInternal(World, QueryBox, VoxelGridSettings.LODIndex, Requests);
 
 	FCSTriangleMeshData LandscapeTriangleData;
 	BuildBoxSceneLandscapeTrianglesInternal(
@@ -2293,8 +2317,8 @@ FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPUFilt
 	TArray<FResolvedStaticMeshTriangleRequest> ResolvedRequests;
 	ResolveStaticMeshTriangleRequests(
 		Requests,
-		this,
-		ExcludedActorTag,
+		ExcludedActor,
+		ExcludedActorTagForResolve,
 		true,
 		ResolvedRequests);
 	if (ResolvedRequests.IsEmpty() && !bHasLandscapeTriangles)
@@ -2310,7 +2334,7 @@ FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPUFilt
 		const int32 RemainingTriangles = SafeMaxTriangles - CurrentTriangleCount;
 		if (RemainingTriangles <= 0)
 		{
-			UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneTrianglesFromGPU] MaxTriangles reached; remaining scene triangles are skipped. MaxTriangles=%d"), SafeMaxTriangles);
+			UE_LOG(LogTemp, Warning, TEXT("%s MaxTriangles reached; remaining scene triangles are skipped. MaxTriangles=%d"), LogPrefix, SafeMaxTriangles);
 			break;
 		}
 
@@ -2322,7 +2346,7 @@ FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPUFilt
 			RemainingTriangles,
 			RequestTriangleData))
 		{
-			UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneTrianglesFromGPU] Failed to read back a static mesh triangle batch."));
+			UE_LOG(LogTemp, Warning, TEXT("%s Failed to read back a static mesh triangle batch."), LogPrefix);
 			break;
 		}
 
@@ -2338,7 +2362,7 @@ FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPUFilt
 	OutTriangleData.VertexCount = EffectiveVertexCount;
 	OutTriangleData.IndexCount = 0;
 	NormalizeTriangleMeshDataWinding(OutTriangleData);
-	StoreTriangleTextureData(OutTriangleData, ReferenceFilterDistance);
+	StoreTriangleTextureData(OutTriangleData, ReferenceFilterDistance, QueryBox);
 	return OutTriangleData;
 }
 
@@ -2369,6 +2393,8 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 
 	const int32 SafeMaxTriangles = FMath::Max(1, MaxTriangles);
 	const int32 SafeMaxVoxels = FMath::Max(1, MaxVoxels);
+	const int32 SafeSurfaceVoxelBlurIterations = FMath::Max(0, SurfaceVoxelBlurIterations);
+	const int32 SafeSurfaceVoxelBlurRadius = FMath::Max(1, SurfaceVoxelBlurRadius);
 	TArray<FCSStaticMeshTriangleRequest> Requests;
 	BuildBoxSceneTriangleRequests(World, QueryBox, Requests);
 
@@ -2423,7 +2449,8 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 	ENQUEUE_RENDER_COMMAND(GetBoxSceneSurfaceVoxelsFromGPUGPU)(
 		[ResolvedRequests = MoveTemp(ResolvedRequests), TotalStaticMeshTriangleCount, LandscapeTriangleData = MoveTemp(LandscapeTriangleData), PositionReadback, NormalReadback, TargetPositionReadback, CellReadback, CounterReadback, CounterReadbackBytes,
 		 SafeMaxTriangles, SafeMaxVoxels, VoxelOrigin = QueryBox.Min, SafeVoxelSize = OutVoxelData.VoxelSize,
-		 SafeMaxVoxelCellsPerTriangle = FMath::Max(1, MaxVoxelCellsPerTriangle), &bRenderWorkQueued, &bHasGPUOutput, &VoxelCapacity, &ActualVoxelReadbackBytes, &ActualVoxelCellReadbackBytes](FRHICommandListImmediate& RHICmdList)
+		 SafeMaxVoxelCellsPerTriangle = FMath::Max(1, MaxVoxelCellsPerTriangle), SafeSurfaceVoxelBlurIterations, SafeSurfaceVoxelBlurRadius,
+		 &bRenderWorkQueued, &bHasGPUOutput, &VoxelCapacity, &ActualVoxelReadbackBytes, &ActualVoxelCellReadbackBytes](FRHICommandListImmediate& RHICmdList)
 		{
 			FRDGBuilder GraphBuilder(RHICmdList);
 			const TArray<FVector> EmptyReferencePoints;
@@ -2449,8 +2476,8 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 				SafeMaxVoxels,
 				0,
 				SafeMaxVoxelCellsPerTriangle,
-				0,
-				1,
+				SafeSurfaceVoxelBlurIterations,
+				SafeSurfaceVoxelBlurRadius,
 				TEXT("CS.BoxSceneSurfaceVoxels"));
 
 			if (VoxelOutput.VoxelPositions
@@ -2632,18 +2659,77 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 	OutVoxelData.Normals.Reserve(EffectiveVoxelCount);
 	OutVoxelData.TargetPositions.Reserve(EffectiveVoxelCount);
 	OutVoxelData.Cells.Reserve(EffectiveVoxelCount);
+	int32 InvalidPositionCount = 0;
+	int32 InvalidNormalCount = 0;
+	int32 InvalidTargetCount = 0;
+	int32 InvalidTargetVectorCount = 0;
+	int32 InvalidTargetWCount = 0;
+	int32 FarTargetCount = 0;
+	const double MaxTargetDistanceSq = FMath::Square(double(FMath::Max(OutVoxelData.VoxelSize * 2.0f, UE_KINDA_SMALL_NUMBER)));
 	for (int32 VoxelIndex = 0; VoxelIndex < EffectiveVoxelCount; ++VoxelIndex)
 	{
 		const FVector4f& Position = PositionData[VoxelIndex];
 		const FVector4f& Normal = NormalData[VoxelIndex];
 		const FVector4f& TargetPosition = TargetPositionData[VoxelIndex];
 		const FIntVector4& Cell = CellData[VoxelIndex];
-		OutVoxelData.Positions.Add(FVector(Position.X, Position.Y, Position.Z));
-		OutVoxelData.Normals.Add(FVector(Normal.X, Normal.Y, Normal.Z));
-		OutVoxelData.TargetPositions.Add(FVector(TargetPosition.X, TargetPosition.Y, TargetPosition.Z));
+
+		if (!IsFiniteCSVector4(Position) || Position.W <= 0.0f)
+		{
+			++InvalidPositionCount;
+			continue;
+		}
+
+		const FVector VoxelCenter(Position.X, Position.Y, Position.Z);
+		FVector SafeNormal(Normal.X, Normal.Y, Normal.Z);
+		if (!IsFiniteCSVector4(Normal) || !SafeNormal.Normalize())
+		{
+			SafeNormal = FVector::UpVector;
+			++InvalidNormalCount;
+		}
+
+		FVector SafeTarget(TargetPosition.X, TargetPosition.Y, TargetPosition.Z);
+		const bool bFiniteTarget = IsFiniteCSVector4(TargetPosition);
+		const bool bPositiveTargetW = TargetPosition.W > 0.0f;
+		const bool bTargetWithinVoxel = bFiniteTarget
+			&& FVector::DistSquared(SafeTarget, VoxelCenter) <= MaxTargetDistanceSq;
+		const bool bValidTarget = bFiniteTarget && bPositiveTargetW && bTargetWithinVoxel;
+		if (!bValidTarget)
+		{
+			if (!bFiniteTarget)
+			{
+				++InvalidTargetVectorCount;
+			}
+			else if (!bPositiveTargetW)
+			{
+				++InvalidTargetWCount;
+			}
+			else
+			{
+				++FarTargetCount;
+			}
+			SafeTarget = VoxelCenter;
+			++InvalidTargetCount;
+		}
+
+		OutVoxelData.Positions.Add(VoxelCenter);
+		OutVoxelData.Normals.Add(SafeNormal);
+		OutVoxelData.TargetPositions.Add(SafeTarget);
 		OutVoxelData.Cells.Add(FIntVector(Cell.X, Cell.Y, Cell.Z));
 	}
-	OutVoxelData.VoxelCount = EffectiveVoxelCount;
+	OutVoxelData.VoxelCount = OutVoxelData.Positions.Num();
+	if (InvalidPositionCount > 0 || InvalidNormalCount > 0 || InvalidTargetCount > 0)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[GetBoxSceneSurfaceVoxelsFromGPU] Sanitized surface voxel readback. Input=%d Output=%d InvalidPositions=%d InvalidNormals=%d InvalidTargets=%d InvalidTargetVectors=%d InvalidTargetW=%d FarTargets=%d"),
+			EffectiveVoxelCount,
+			OutVoxelData.VoxelCount,
+			InvalidPositionCount,
+			InvalidNormalCount,
+			InvalidTargetCount,
+			InvalidTargetVectorCount,
+			InvalidTargetWCount,
+			FarTargetCount);
+	}
 	LastSurfaceVoxelData = OutVoxelData;
 	StoreSurfaceVoxelTextureData(OutVoxelData, QueryBox.Min);
 	return OutVoxelData;
@@ -2660,6 +2746,11 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 	const float SafeVoxelSize = FMath::Max(VoxelSize, UE_KINDA_SMALL_NUMBER);
 	const TArray<FVector> ReferencePointsForRender = ReferencePoints;
 	const float SafeFilterDistance = (ReferencePointsForRender.IsEmpty()) ? 0.0f : FMath::Max(0.0f, ReferenceFilterDistance);
+	LastSurfaceVoxelData = FCSSurfaceVoxelData();
+	LastSurfaceVoxelData.VoxelSize = SafeVoxelSize;
+	LastSurfaceVoxelTextureData.bValid = false;
+	LastSurfaceVoxelTextureData.VoxelCount = 0;
+	LastSurfaceVoxelTextureData.VoxelSize = SafeVoxelSize;
 
 	UWorld* World = GetWorld();
 	if (!World)
@@ -2675,6 +2766,8 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 
 	const int32 SafeMaxTriangles = FMath::Max(1, MaxTriangles);
 	const int32 SafeMaxVoxels = FMath::Max(1, MaxVoxels);
+	const int32 SafeSurfaceVoxelBlurIterations = FMath::Max(0, SurfaceVoxelBlurIterations);
+	const int32 SafeSurfaceVoxelBlurRadius = FMath::Max(1, SurfaceVoxelBlurRadius);
 	TArray<FCSStaticMeshTriangleRequest> Requests;
 	BuildBoxSceneTriangleRequests(World, QueryBox, Requests);
 
@@ -2716,19 +2809,22 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 
 	FRHIGPUBufferReadback* PositionReadback = new FRHIGPUBufferReadback(TEXT("FilteredSurfaceVoxels_PositionReadback"));
 	FRHIGPUBufferReadback* NormalReadback = new FRHIGPUBufferReadback(TEXT("FilteredSurfaceVoxels_NormalReadback"));
+	FRHIGPUBufferReadback* TargetPositionReadback = new FRHIGPUBufferReadback(TEXT("FilteredSurfaceVoxels_TargetPositionReadback"));
+	FRHIGPUBufferReadback* CellReadback = new FRHIGPUBufferReadback(TEXT("FilteredSurfaceVoxels_CellReadback"));
 	FRHIGPUBufferReadback* CounterReadback = new FRHIGPUBufferReadback(TEXT("FilteredSurfaceVoxels_CounterReadback"));
 	bool bRenderWorkQueued = false;
 	bool bHasGPUOutput = false;
 	int32 VoxelCapacity = 0;
 	uint32 ActualVoxelReadbackBytes = 0;
+	uint32 ActualVoxelCellReadbackBytes = 0;
 
 	ENQUEUE_RENDER_COMMAND(GetBoxSceneFilteredSurfaceVoxelsGPU)(
 		[ResolvedRequests = MoveTemp(ResolvedRequests), TotalStaticMeshTriangleCount, LandscapeTriangleData = MoveTemp(LandscapeTriangleData),
-		 PositionReadback, NormalReadback, CounterReadback, CounterReadbackBytes,
+		 PositionReadback, NormalReadback, TargetPositionReadback, CellReadback, CounterReadback, CounterReadbackBytes,
 		 SafeMaxTriangles, SafeMaxVoxels, VoxelOrigin = QueryBox.Min, SafeVoxelSize,
 		 SafeMaxVoxelCellsPerTriangle = FMath::Max(1, MaxVoxelCellsPerTriangle),
-		 ReferencePointsForRender, SafeFilterDistance,
-		 &bRenderWorkQueued, &bHasGPUOutput, &VoxelCapacity, &ActualVoxelReadbackBytes](FRHICommandListImmediate& RHICmdList)
+		 ReferencePointsForRender, SafeFilterDistance, SafeSurfaceVoxelBlurIterations, SafeSurfaceVoxelBlurRadius,
+		 &bRenderWorkQueued, &bHasGPUOutput, &VoxelCapacity, &ActualVoxelReadbackBytes, &ActualVoxelCellReadbackBytes](FRHICommandListImmediate& RHICmdList)
 		{
 			FRDGBuilder GraphBuilder(RHICmdList);
 			const FCSTriangleMeshData* InitialTriangleData = GetTriangleMeshDataTriangleCount(LandscapeTriangleData) > 0 ? &LandscapeTriangleData : nullptr;
@@ -2753,16 +2849,23 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 				SafeMaxVoxels,
 				0,
 				SafeMaxVoxelCellsPerTriangle,
-				0,
-				1,
+				SafeSurfaceVoxelBlurIterations,
+				SafeSurfaceVoxelBlurRadius,
 				TEXT("CS.FilteredSurfaceVoxels"));
 
-			if (VoxelOutput.VoxelPositions && VoxelOutput.VoxelNormals && VoxelOutput.VoxelCounter)
+			if (VoxelOutput.VoxelPositions
+				&& VoxelOutput.VoxelNormals
+				&& VoxelOutput.VoxelTargetPositions
+				&& VoxelOutput.VoxelCells
+				&& VoxelOutput.VoxelCounter)
 			{
 				VoxelCapacity = int32(VoxelOutput.MaxVoxels);
 				ActualVoxelReadbackBytes = uint32(uint64(VoxelOutput.MaxVoxels) * sizeof(FVector4f));
+				ActualVoxelCellReadbackBytes = uint32(uint64(VoxelOutput.MaxVoxels) * sizeof(FIntVector4));
 				AddEnqueueCopyPass(GraphBuilder, PositionReadback, VoxelOutput.VoxelPositions, ActualVoxelReadbackBytes);
 				AddEnqueueCopyPass(GraphBuilder, NormalReadback, VoxelOutput.VoxelNormals, ActualVoxelReadbackBytes);
+				AddEnqueueCopyPass(GraphBuilder, TargetPositionReadback, VoxelOutput.VoxelTargetPositions, ActualVoxelReadbackBytes);
+				AddEnqueueCopyPass(GraphBuilder, CellReadback, VoxelOutput.VoxelCells, ActualVoxelCellReadbackBytes);
 				AddEnqueueCopyPass(GraphBuilder, CounterReadback, VoxelOutput.VoxelCounter, CounterReadbackBytes);
 				bHasGPUOutput = true;
 			}
@@ -2777,47 +2880,77 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 	{
 		delete PositionReadback;
 		delete NormalReadback;
+		delete TargetPositionReadback;
+		delete CellReadback;
 		delete CounterReadback;
 		return;
 	}
 
 	TArray<FVector4f> PositionData;
 	TArray<FVector4f> NormalData;
+	TArray<FVector4f> TargetPositionData;
+	TArray<FIntVector4> CellData;
 	PositionData.SetNumZeroed(VoxelCapacity);
 	NormalData.SetNumZeroed(VoxelCapacity);
+	TargetPositionData.SetNumZeroed(VoxelCapacity);
+	CellData.SetNumZeroed(VoxelCapacity);
 	uint32 VoxelCount = 0;
 	bool bReadbackSucceeded = false;
 
 	ENQUEUE_RENDER_COMMAND(GetBoxSceneFilteredSurfaceVoxelsReadback)(
-		[PositionReadback, NormalReadback, CounterReadback, ActualVoxelReadbackBytes, CounterReadbackBytes,
-		 &PositionData, &NormalData, &VoxelCount, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList)
+		[PositionReadback, NormalReadback, TargetPositionReadback, CellReadback, CounterReadback, ActualVoxelReadbackBytes, ActualVoxelCellReadbackBytes, CounterReadbackBytes,
+		 &PositionData, &NormalData, &TargetPositionData, &CellData, &VoxelCount, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList)
 		{
-			if (!PositionReadback || !NormalReadback || !CounterReadback)
+			if (!PositionReadback || !NormalReadback || !TargetPositionReadback || !CellReadback || !CounterReadback)
 			{
 				return;
 			}
 
-			if (!PositionReadback->IsReady() || !NormalReadback->IsReady() || !CounterReadback->IsReady())
+			if (!PositionReadback->IsReady()
+				|| !NormalReadback->IsReady()
+				|| !TargetPositionReadback->IsReady()
+				|| !CellReadback->IsReady()
+				|| !CounterReadback->IsReady())
 			{
 				RHICmdList.SubmitAndBlockUntilGPUIdle();
 			}
 
-			if (!PositionReadback->IsReady() || !NormalReadback->IsReady() || !CounterReadback->IsReady())
+			if (!PositionReadback->IsReady()
+				|| !NormalReadback->IsReady()
+				|| !TargetPositionReadback->IsReady()
+				|| !CellReadback->IsReady()
+				|| !CounterReadback->IsReady())
 			{
 				UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneFilteredSurfaceVoxels] GPU readback was not ready after flush."));
 				delete PositionReadback;
 				delete NormalReadback;
+				delete TargetPositionReadback;
+				delete CellReadback;
 				delete CounterReadback;
 				return;
 			}
 
 			if (PositionReadback->GetGPUSizeBytes() < ActualVoxelReadbackBytes ||
 				NormalReadback->GetGPUSizeBytes() < ActualVoxelReadbackBytes ||
+				TargetPositionReadback->GetGPUSizeBytes() < ActualVoxelReadbackBytes ||
+				CellReadback->GetGPUSizeBytes() < ActualVoxelCellReadbackBytes ||
 				CounterReadback->GetGPUSizeBytes() < CounterReadbackBytes)
 			{
-				UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneFilteredSurfaceVoxels] GPU readback size mismatch."));
+				UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneFilteredSurfaceVoxels] GPU readback size mismatch. Position=%llu/%u Normal=%llu/%u Target=%llu/%u Cell=%llu/%u Counter=%llu/%u"),
+					PositionReadback->GetGPUSizeBytes(),
+					ActualVoxelReadbackBytes,
+					NormalReadback->GetGPUSizeBytes(),
+					ActualVoxelReadbackBytes,
+					TargetPositionReadback->GetGPUSizeBytes(),
+					ActualVoxelReadbackBytes,
+					CellReadback->GetGPUSizeBytes(),
+					ActualVoxelCellReadbackBytes,
+					CounterReadback->GetGPUSizeBytes(),
+					CounterReadbackBytes);
 				delete PositionReadback;
 				delete NormalReadback;
+				delete TargetPositionReadback;
+				delete CellReadback;
 				delete CounterReadback;
 				return;
 			}
@@ -2843,6 +2976,26 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 				bLockedAll = false;
 			}
 
+			if (const FVector4f* TargetPositionPtr = static_cast<const FVector4f*>(TargetPositionReadback->Lock(ActualVoxelReadbackBytes)))
+			{
+				FMemory::Memcpy(TargetPositionData.GetData(), TargetPositionPtr, ActualVoxelReadbackBytes);
+				TargetPositionReadback->Unlock();
+			}
+			else
+			{
+				bLockedAll = false;
+			}
+
+			if (const FIntVector4* CellPtr = static_cast<const FIntVector4*>(CellReadback->Lock(ActualVoxelCellReadbackBytes)))
+			{
+				FMemory::Memcpy(CellData.GetData(), CellPtr, ActualVoxelCellReadbackBytes);
+				CellReadback->Unlock();
+			}
+			else
+			{
+				bLockedAll = false;
+			}
+
 			if (const uint32* CounterPtr = static_cast<const uint32*>(CounterReadback->Lock(CounterReadbackBytes)))
 			{
 				VoxelCount = *CounterPtr;
@@ -2855,6 +3008,8 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 
 			delete PositionReadback;
 			delete NormalReadback;
+			delete TargetPositionReadback;
+			delete CellReadback;
 			delete CounterReadback;
 			bReadbackSucceeded = bLockedAll;
 		});
@@ -2874,20 +3029,89 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 
 	OutPositions.Reserve(EffectiveVoxelCount);
 	OutNormals.Reserve(EffectiveVoxelCount);
+	FCSSurfaceVoxelData FilteredVoxelData;
+	FilteredVoxelData.Positions.Reserve(EffectiveVoxelCount);
+	FilteredVoxelData.Normals.Reserve(EffectiveVoxelCount);
+	FilteredVoxelData.TargetPositions.Reserve(EffectiveVoxelCount);
+	FilteredVoxelData.Cells.Reserve(EffectiveVoxelCount);
+	FilteredVoxelData.VoxelSize = SafeVoxelSize;
+	FilteredVoxelData.VoxelOrigin = QueryBox.Min;
+	int32 InvalidPositionCount = 0;
+	int32 InvalidNormalCount = 0;
+	int32 InvalidTargetCount = 0;
+	int32 InvalidTargetVectorCount = 0;
+	int32 InvalidTargetWCount = 0;
+	int32 FarTargetCount = 0;
+	const double MaxTargetDistanceSq = FMath::Square(double(FMath::Max(SafeVoxelSize * 2.0f, UE_KINDA_SMALL_NUMBER)));
 	for (int32 VoxelIndex = 0; VoxelIndex < EffectiveVoxelCount; ++VoxelIndex)
 	{
 		const FVector4f& Position = PositionData[VoxelIndex];
 		const FVector4f& Normal = NormalData[VoxelIndex];
-		OutPositions.Add(FVector(Position.X, Position.Y, Position.Z));
-		OutNormals.Add(FVector(Normal.X, Normal.Y, Normal.Z));
+		const FVector4f& TargetPosition = TargetPositionData[VoxelIndex];
+		const FIntVector4& Cell = CellData[VoxelIndex];
+
+		if (!IsFiniteCSVector4(Position) || Position.W <= 0.0f)
+		{
+			++InvalidPositionCount;
+			continue;
+		}
+
+		const FVector VoxelCenter(Position.X, Position.Y, Position.Z);
+		FVector SafeNormal(Normal.X, Normal.Y, Normal.Z);
+		if (!IsFiniteCSVector4(Normal) || !SafeNormal.Normalize())
+		{
+			SafeNormal = FVector::UpVector;
+			++InvalidNormalCount;
+		}
+
+		FVector SafeTarget(TargetPosition.X, TargetPosition.Y, TargetPosition.Z);
+		const bool bFiniteTarget = IsFiniteCSVector4(TargetPosition);
+		const bool bPositiveTargetW = TargetPosition.W > 0.0f;
+		const bool bTargetWithinVoxel = bFiniteTarget
+			&& FVector::DistSquared(SafeTarget, VoxelCenter) <= MaxTargetDistanceSq;
+		const bool bValidTarget = bFiniteTarget && bPositiveTargetW && bTargetWithinVoxel;
+		if (!bValidTarget)
+		{
+			if (!bFiniteTarget)
+			{
+				++InvalidTargetVectorCount;
+			}
+			else if (!bPositiveTargetW)
+			{
+				++InvalidTargetWCount;
+			}
+			else
+			{
+				++FarTargetCount;
+			}
+			SafeTarget = VoxelCenter;
+			++InvalidTargetCount;
+		}
+
+		FilteredVoxelData.Positions.Add(VoxelCenter);
+		FilteredVoxelData.Normals.Add(SafeNormal);
+		FilteredVoxelData.TargetPositions.Add(SafeTarget);
+		FilteredVoxelData.Cells.Add(FIntVector(Cell.X, Cell.Y, Cell.Z));
+		OutPositions.Add(VoxelCenter);
+		OutNormals.Add(SafeNormal);
+	}
+	FilteredVoxelData.VoxelCount = FilteredVoxelData.Positions.Num();
+	if (InvalidPositionCount > 0 || InvalidNormalCount > 0 || InvalidTargetCount > 0)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[GetBoxSceneFilteredSurfaceVoxels] Sanitized surface voxel readback. Input=%d Output=%d InvalidPositions=%d InvalidNormals=%d InvalidTargets=%d InvalidTargetVectors=%d InvalidTargetW=%d FarTargets=%d"),
+			EffectiveVoxelCount,
+			FilteredVoxelData.VoxelCount,
+			InvalidPositionCount,
+			InvalidNormalCount,
+			InvalidTargetCount,
+			InvalidTargetVectorCount,
+			InvalidTargetWCount,
+			FarTargetCount);
 	}
 
 	// Update cached data
-	LastSurfaceVoxelData.Positions = OutPositions;
-	LastSurfaceVoxelData.Normals = OutNormals;
-	LastSurfaceVoxelData.VoxelCount = EffectiveVoxelCount;
-	LastSurfaceVoxelData.VoxelSize = SafeVoxelSize;
-	LastSurfaceVoxelData.VoxelOrigin = QueryBox.Min;
+	LastSurfaceVoxelData = FilteredVoxelData;
 	StoreSurfaceVoxelTextureData(LastSurfaceVoxelData, QueryBox.Min);
 }
 
@@ -3154,7 +3378,7 @@ UTextureRenderTarget2D* AComputeShaderMeshGenerator::GetOrCreateGeneratedDataRen
 	return RenderTarget.Get();
 }
 
-void AComputeShaderMeshGenerator::StoreTriangleTextureData(const FCSTriangleMeshData& TriangleData, float ReferenceFilterDistance)
+void AComputeShaderMeshGenerator::StoreTriangleTextureData(const FCSTriangleMeshData& TriangleData, float ReferenceFilterDistance, FBox SourceWorldBounds)
 {
 	const int32 EffectiveVertexCount = TriangleData.VertexCount >= 0
 		? FMath::Clamp(TriangleData.VertexCount, 0, TriangleData.Vertices.Num())
@@ -3167,10 +3391,7 @@ void AComputeShaderMeshGenerator::StoreTriangleTextureData(const FCSTriangleMesh
 		: EffectiveVertexCount / 3;
 	if (EffectiveVertexCount <= 0 || TriangleCount <= 0)
 	{
-		LastTriangleTextureData.bValid = false;
-		LastTriangleTextureData.VertexCount = 0;
-		LastTriangleTextureData.TriangleCount = 0;
-		LastTriangleTextureData.IndexCount = 0;
+		ClearTriangleTextureData();
 		return;
 	}
 
@@ -3193,7 +3414,7 @@ void AComputeShaderMeshGenerator::StoreTriangleTextureData(const FCSTriangleMesh
 		1);
 	if (!VertexRT || !NormalRT || !MetaRT)
 	{
-		LastTriangleTextureData.bValid = false;
+		ClearTriangleTextureData();
 		return;
 	}
 
@@ -3224,7 +3445,7 @@ void AComputeShaderMeshGenerator::StoreTriangleTextureData(const FCSTriangleMesh
 		NormalPixels[VertexIndex] = FLinearColor(float(Normal.X), float(Normal.Y), float(Normal.Z), 0.0f);
 	}
 
-	const FBox SourceBounds = GetGeneratorBoundsWorldBox();
+	const FBox SourceBounds = SourceWorldBounds.IsValid ? SourceWorldBounds : GetGeneratorBoundsWorldBox();
 	TArray<FLinearColor> MetaPixels;
 	MetaPixels.SetNumZeroed(8);
 	MetaPixels[0] = FLinearColor(float(TriangleCount), float(EffectiveVertexCount), float(EffectiveIndexCount), ReferenceFilterDistance);
@@ -3255,8 +3476,8 @@ void AComputeShaderMeshGenerator::StoreSurfaceVoxelTextureData(const FCSSurfaceV
 		: SurfaceVoxelData.Positions.Num();
 	if (EffectiveVoxelCount <= 0)
 	{
-		LastSurfaceVoxelTextureData.bValid = false;
-		LastSurfaceVoxelTextureData.VoxelCount = 0;
+		ClearSurfaceVoxelTextureData();
+		LastSurfaceVoxelData.VoxelSize = SurfaceVoxelData.VoxelSize;
 		LastSurfaceVoxelTextureData.VoxelSize = SurfaceVoxelData.VoxelSize;
 		return;
 	}
@@ -3273,14 +3494,24 @@ void AComputeShaderMeshGenerator::StoreSurfaceVoxelTextureData(const FCSSurfaceV
 		TEXT("CSMeshGenerator_LastSurfaceVoxelNormalRT"),
 		VoxelTextureSize.X,
 		VoxelTextureSize.Y);
+	UTextureRenderTarget2D* TargetRT = GetOrCreateGeneratedDataRenderTarget(
+		LastSurfaceVoxelTextureData.VoxelTargetRT,
+		TEXT("CSMeshGenerator_LastSurfaceVoxelTargetRT"),
+		VoxelTextureSize.X,
+		VoxelTextureSize.Y);
+	UTextureRenderTarget2D* CellRT = GetOrCreateGeneratedDataRenderTarget(
+		LastSurfaceVoxelTextureData.VoxelCellRT,
+		TEXT("CSMeshGenerator_LastSurfaceVoxelCellRT"),
+		VoxelTextureSize.X,
+		VoxelTextureSize.Y);
 	UTextureRenderTarget2D* MetaRT = GetOrCreateGeneratedDataRenderTarget(
 		LastSurfaceVoxelTextureData.VoxelMetaRT,
 		TEXT("CSMeshGenerator_LastSurfaceVoxelMetaRT"),
 		8,
 		1);
-	if (!PositionRT || !NormalRT || !MetaRT)
+	if (!PositionRT || !NormalRT || !TargetRT || !CellRT || !MetaRT)
 	{
-		LastSurfaceVoxelTextureData.bValid = false;
+		ClearSurfaceVoxelTextureData();
 		return;
 	}
 
@@ -3289,6 +3520,10 @@ void AComputeShaderMeshGenerator::StoreSurfaceVoxelTextureData(const FCSSurfaceV
 	PositionPixels.SetNumZeroed(TexturePixelCount);
 	TArray<FLinearColor> NormalPixels;
 	NormalPixels.SetNumZeroed(TexturePixelCount);
+	TArray<FLinearColor> TargetPixels;
+	TargetPixels.SetNumZeroed(TexturePixelCount);
+	TArray<FLinearColor> CellPixels;
+	CellPixels.SetNumZeroed(TexturePixelCount);
 	for (int32 VoxelIndex = 0; VoxelIndex < EffectiveVoxelCount; ++VoxelIndex)
 	{
 		const FVector& Position = SurfaceVoxelData.Positions[VoxelIndex];
@@ -3299,6 +3534,23 @@ void AComputeShaderMeshGenerator::StoreSurfaceVoxelTextureData(const FCSSurfaceV
 			: FVector::UpVector;
 		Normal = Normal.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
 		NormalPixels[VoxelIndex] = FLinearColor(float(Normal.X), float(Normal.Y), float(Normal.Z), 0.0f);
+
+		FVector Target = SurfaceVoxelData.TargetPositions.IsValidIndex(VoxelIndex)
+			? SurfaceVoxelData.TargetPositions[VoxelIndex]
+			: Position;
+		if (!IsFiniteCSVertex(Target))
+		{
+			Target = Position;
+		}
+		TargetPixels[VoxelIndex] = FLinearColor(float(Target.X), float(Target.Y), float(Target.Z), 1.0f);
+
+		FIntVector Cell = SurfaceVoxelData.Cells.IsValidIndex(VoxelIndex)
+			? SurfaceVoxelData.Cells[VoxelIndex]
+			: FIntVector(
+				FMath::FloorToInt((Position.X - VoxelOrigin.X) / FMath::Max(SurfaceVoxelData.VoxelSize, UE_KINDA_SMALL_NUMBER)),
+				FMath::FloorToInt((Position.Y - VoxelOrigin.Y) / FMath::Max(SurfaceVoxelData.VoxelSize, UE_KINDA_SMALL_NUMBER)),
+				FMath::FloorToInt((Position.Z - VoxelOrigin.Z) / FMath::Max(SurfaceVoxelData.VoxelSize, UE_KINDA_SMALL_NUMBER)));
+		CellPixels[VoxelIndex] = FLinearColor(float(Cell.X), float(Cell.Y), float(Cell.Z), 0.0f);
 	}
 
 	const FBox SourceBounds = GetGeneratorBoundsWorldBox();
@@ -3312,9 +3564,12 @@ void AComputeShaderMeshGenerator::StoreSurfaceVoxelTextureData(const FCSSurfaceV
 	MetaPixels[3] = SourceBounds.IsValid
 		? FLinearColor(float(SourceBounds.Max.X), float(SourceBounds.Max.Y), float(SourceBounds.Max.Z), 1.0f)
 		: FLinearColor::Black;
+	MetaPixels[4] = FLinearColor(float(VoxelTextureSize.X), float(VoxelTextureSize.Y), 1.0f, 0.0f);
 
 	UploadLinearColorsToRenderTarget(PositionRT, MoveTemp(PositionPixels));
 	UploadLinearColorsToRenderTarget(NormalRT, MoveTemp(NormalPixels));
+	UploadLinearColorsToRenderTarget(TargetRT, MoveTemp(TargetPixels));
+	UploadLinearColorsToRenderTarget(CellRT, MoveTemp(CellPixels));
 	UploadLinearColorsToRenderTarget(MetaRT, MoveTemp(MetaPixels));
 
 	LastSurfaceVoxelTextureData.bValid = true;
@@ -3350,6 +3605,14 @@ void AComputeShaderMeshGenerator::ClearSurfaceVoxelTextureData()
 	if (LastSurfaceVoxelTextureData.VoxelNormalRT)
 	{
 		LastSurfaceVoxelTextureData.VoxelNormalRT->ReleaseResource();
+	}
+	if (LastSurfaceVoxelTextureData.VoxelTargetRT)
+	{
+		LastSurfaceVoxelTextureData.VoxelTargetRT->ReleaseResource();
+	}
+	if (LastSurfaceVoxelTextureData.VoxelCellRT)
+	{
+		LastSurfaceVoxelTextureData.VoxelCellRT->ReleaseResource();
 	}
 	if (LastSurfaceVoxelTextureData.VoxelMetaRT)
 	{

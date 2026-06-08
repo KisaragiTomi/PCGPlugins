@@ -4,15 +4,11 @@
 
 #include "CoreMinimal.h"
 #include "DynamicMeshActor.h"
-#include "Noise.h"
 #include "PolyLine.h"
 #include "Components/InstancedStaticMeshComponent.h"
-#include "Curve/CurveUtil.h"
 #include "Curves/CurveLinearColor.h"
 #include "GeometryScript/GeometryScriptTypes.h"
 #include "ComputeShaderMeshGenerator.h"
-#include "GeometryScript/MeshPrimitiveFunctions.h"
-#include "GeometryScript/MeshSpatialFunctions.h"
 #include "InstancedFoliage.h"
 #include "InstancedFoliageActor.h"
 #include "FoliageType.h"
@@ -66,7 +62,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
 	float VinesOffset = 5;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
-	UCurveLinearColor* CurveControl;
+	UCurveLinearColor* CurveControl = nullptr;
 };
 
 struct FVineLinePointScaleData
@@ -98,22 +94,12 @@ public:
 	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
 	UInstancedStaticMeshComponent* PlaneVineSource;
 	
-	FGeometryScriptDynamicMeshBVH BVH;
 	
 	FBox InstanceBound;
 	
-	UPROPERTY(Transient)
-	TObjectPtr<UDynamicMesh> PrefixMesh;
-
-	// Voxel 化表面数据（ResinRattan 移植），用于藤蔓顶点投射和法线获取。
-	// GenerateVines() 中填充，函数返回时自动析构。
-	FCSSurfaceVoxelData CachedSurfaceVoxels;
-
-	UPROPERTY(Transient)
-	TObjectPtr<UDynamicMesh> OutTubeMesh;
-
-	UPROPERTY(Transient)
-	TObjectPtr<UDynamicMesh> OutPlaneMesh;
+	// Triangle surface data used by the CPU/BVH vine visualization path.
+	// Filled by GenerateVines().
+	FCSTriangleMeshData CachedSurfaceTriangles;
 
 	UPROPERTY(Transient)
 	TObjectPtr<AStaticMeshActor> GeneratedStaticMeshActor;
@@ -131,7 +117,7 @@ public:
 	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
 	UFoliageType* PlaneType;
 
-	// Per-line source instance scale kept for compatibility with old generated data.
+	// Per-line source instance scale used by GPU input packing.
 	TArray<float> TubeLineSourceScales;
 	TArray<float> PlaneLineSourceScales;
 
@@ -140,7 +126,7 @@ public:
 	TArray<FVector> PlaneLineSourceLocations;
 
 	// Per-line/per-point scale from SpaceColonization: TargetPointScale * SourcePointScale.
-	// GPU visualization interpolates these through preprocessing and multiplies vine thickness by them.
+	// GPU visualization multiplies vine thickness by them during input packing.
 	TArray<FVineLinePointScaleData> TubeLinePointScales;
 	TArray<FVineLinePointScaleData> PlaneLinePointScales;
 
@@ -153,6 +139,27 @@ public:
 	UPROPERTY(BlueprintReadWrite, Category = "VisVine")
 	bool bUseGPUMode = true;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine", meta = (ClampMin = "0"))
+	int32 GenerateVineVoxelNormalBlurIterations = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine", meta = (ClampMin = "0"))
+	int32 VisVineGPUAxisSmoothIterations = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine", meta = (ClampMin = "0"))
+	int32 VisVineGPUPostProjectionSmoothIterations = 3;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
+	bool bDrawGPUProjectionVoxelDebugPoints = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "0"))
+	int32 GPUProjectionVoxelDebugPointLimit = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "0.0"))
+	float GPUProjectionVoxelDebugDuration = 10.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "0.0"))
+	float SCStageDebugPointDuration = 10.0f;
+
 	UPROPERTY(BlueprintReadWrite)
 	FVineVisualization VV;
 	
@@ -163,6 +170,10 @@ public:
 	bool VisVine(bool MainVine, bool bUseGPU = true);
 
 private:
+	// Voxelized surface data used by the GPU vine visualization path.
+	// Filled by GenerateVines().
+	FCSSurfaceVoxelData CachedSurfaceVoxels;
+
 	bool VisVineCPU(bool MainVine);
 	bool VisVineGPUInternal(bool MainVine);
 
@@ -178,11 +189,6 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
 	virtual void ImportFoliageToTransformArray(UFoliageType* InFoliageType);
-	UFUNCTION(BlueprintPure, Category = ContainerCheck)
-	UDynamicMesh* GetTubeMesh();
-
-	UFUNCTION(BlueprintPure, Category = ContainerCheck)
-	UDynamicMesh* GetPlaneMesh();
 
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
 	virtual void ExportTransformArrayToFoliage(UFoliageType* InFoliageType);
@@ -198,6 +204,12 @@ public:
 
 	UFUNCTION(BlueprintCallable, BlueprintCallable, Category = "VineActions")
 	void GenerateVineAction();
+
+	UFUNCTION(BlueprintCallable, Category = "VineActions|Debug", meta = (DevelopmentOnly, DisplayName = "Draw Cached Vine Surface Voxel Points"))
+	int32 DrawDebugCachedVineSurfaceVoxelPoints();
+
+	UFUNCTION(BlueprintCallable, Category = "VineActions|Debug", meta = (DevelopmentOnly, DisplayName = "Draw Cached Vine SC Stage Points"))
+	int32 DrawDebugCachedVineSCStagePoints(bool bDrawTube = true, bool bDrawPlane = true);
 
 	UFUNCTION(BlueprintCallable, Category = "VineActions|Debug", meta = (DevelopmentOnly, DisplayName = "Draw Debug Vine Surface Voxel Arrows"))
 	int32 DrawDebugVineSurfaceVoxelArrows(

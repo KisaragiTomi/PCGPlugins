@@ -97,4 +97,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static TArray<FSpaceColonizationLineResult> SpaceColonizationCSWithScales(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, int32 Iterations =
 											   50, int32 Activetime = 20, int32 BackGrowCount = 8, float Ranggrow = 0.5, float Seed = 0.2, float BackGrowRange = 0.8, float InfluenceRadius = 200.0f);
+
+	static TArray<FSpaceColonizationLineResult> SpaceColonizationCSWithScalesForVisualization(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, int32 Iterations =
+											   50, int32 Activetime = 20, int32 BackGrowCount = 8, float Ranggrow = 0.5, float Seed = 0.2, float BackGrowRange = 0.8, float InfluenceRadius = 200.0f);
 };

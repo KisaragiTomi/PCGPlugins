@@ -550,8 +550,7 @@ bool UCSShallowWaterProcess::StartSWSolver(ACSShallowWaterCapture*& OutCSSWActor
 		return false;
 	}
 
-	OutCSSWActor->Iteration = Iteration;
-	OutCSSWActor->StartSolver(TimerRate);
+	OutCSSWActor->StartSolver(TimerRate, Iteration);
 
 	return true;
 }

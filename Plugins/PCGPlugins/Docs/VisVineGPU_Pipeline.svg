@@ -1,218 +1,215 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 1520" font-family="Consolas, monospace" font-size="12">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1540" role="img" aria-labelledby="title desc">
+  <title id="title">VisVine GPU Voxel Pipeline</title>
+  <desc id="desc">Current AVineContainer VisVine GPU path: CPU line preparation, voxel buffer upload, RDG compute passes, GPU readback, and DynamicMesh append.</desc>
   <defs>
-    <marker id="arr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
-      <path d="M0,0 L8,3 L0,6 Z" fill="#334155"/>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#334155"/>
     </marker>
-    <marker id="arr-g" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
-      <path d="M0,0 L8,3 L0,6 Z" fill="#16a34a"/>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#15803d"/>
     </marker>
-    <marker id="arr-r" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
-      <path d="M0,0 L8,3 L0,6 Z" fill="#dc2626"/>
-    </marker>
+    <linearGradient id="headerGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#e0f2fe"/>
+      <stop offset=".55" stop-color="#f8fafc"/>
+      <stop offset="1" stop-color="#dcfce7"/>
+    </linearGradient>
+    <style>
+      text { font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; fill: #1e293b; }
+      .mono { font-family: Consolas, "Cascadia Mono", monospace; }
+      .h1 { font-size: 27px; font-weight: 700; }
+      .subtitle { font-size: 14px; fill: #475569; }
+      .phaseTitle { font-size: 15px; font-weight: 700; }
+      .nodeTitle { font-size: 13px; font-weight: 700; }
+      .body { font-size: 11px; fill: #334155; }
+      .tiny { font-size: 10px; fill: #64748b; }
+      .label { font-size: 10px; font-weight: 700; }
+      .band { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.2; }
+      .cpu { fill: #dbeafe; stroke: #2563eb; stroke-width: 1.4; }
+      .gpu { fill: #dcfce7; stroke: #16a34a; stroke-width: 1.4; }
+      .io { fill: #fef3c7; stroke: #d97706; stroke-width: 1.4; }
+      .mesh { fill: #f3e8ff; stroke: #7c3aed; stroke-width: 1.4; }
+      .data { fill: #f8fafc; stroke: #94a3b8; stroke-width: 1.1; }
+      .warn { fill: #fee2e2; stroke: #dc2626; stroke-width: 1.1; }
+      .arrow { stroke: #334155; stroke-width: 1.6; fill: none; marker-end: url(#arrow); }
+      .arrowThin { stroke: #334155; stroke-width: 1.2; fill: none; marker-end: url(#arrow); }
+      .arrowGpu { stroke: #15803d; stroke-width: 1.5; fill: none; marker-end: url(#arrowGreen); }
+      .dash { stroke-dasharray: 6 4; }
+    </style>
   </defs>
 
-  <!-- Title -->
-  <text x="550" y="30" text-anchor="middle" font-size="18" font-weight="bold" fill="#0f172a">AVineContainer::VisVine(bool MainVine, bUseGPU=true)</text>
-  <text x="550" y="50" text-anchor="middle" font-size="12" fill="#64748b">Shared CPU preprocess + GPU-accelerated vine sweep mesh generation pipeline</text>
+  <rect width="1280" height="1540" fill="#f8fafc"/>
 
-  <!-- Legend -->
-  <rect x="30" y="65" width="14" height="14" rx="2" fill="#dbeafe" stroke="#2563eb"/>
-  <text x="50" y="77" font-size="10" fill="#1e293b">CPU (Game Thread)</text>
-  <rect x="170" y="65" width="14" height="14" rx="2" fill="#dcfce7" stroke="#16a34a"/>
-  <text x="190" y="77" font-size="10" fill="#1e293b">GPU Compute Shader</text>
-  <rect x="340" y="65" width="14" height="14" rx="2" fill="#fef3c7" stroke="#d97706"/>
-  <text x="360" y="77" font-size="10" fill="#1e293b">GPU ↔ CPU Readback</text>
-  <rect x="510" y="65" width="14" height="14" rx="2" fill="#fce7f3" stroke="#db2777"/>
-  <text x="530" y="77" font-size="10" fill="#1e293b">Error / Early Exit</text>
+  <rect x="32" y="24" width="1216" height="96" rx="10" fill="url(#headerGrad)" stroke="#cbd5e1"/>
+  <text class="h1" x="640" y="62" text-anchor="middle">VisVine GPU Voxel 流程</text>
+  <text class="subtitle mono" x="640" y="88" text-anchor="middle">AVineContainer::VisVine(MainVine, bUseGPU=true) -> VisVineGPUInternal()</text>
+  <text class="tiny" x="640" y="108" text-anchor="middle">当前实现基于 CachedSurfaceVoxels 与 VineVisualizationVoxel.usf，不再走旧的 triangle soup 最近点查询图</text>
 
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <!-- STEP 1: Input Validation -->
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <rect x="60" y="95" width="980" height="65" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.2"/>
-  <text x="80" y="115" font-size="12" font-weight="bold" fill="#1e40af">① Input Validation</text>
-  <text x="80" y="132" font-size="10" fill="#334155">• Select Lines = MainVine ? TubeLines : PlaneLines</text>
-  <text x="80" y="146" font-size="10" fill="#334155">• Check: Lines.Num() > 0, CurveControl != null, ContainerMesh valid, PrefixMesh valid</text>
-  <text x="700" y="132" font-size="10" fill="#dc2626">→ return false if any check fails</text>
+  <g transform="translate(52 138)">
+    <rect class="cpu" x="0" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="26" y="14">CPU / Game Thread</text>
+    <rect class="gpu" x="182" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="208" y="14">GPU Compute / RDG</text>
+    <rect class="io" x="382" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="408" y="14">GPU Readback</text>
+    <rect class="mesh" x="558" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="584" y="14">DynamicMesh 输出</text>
+    <rect class="warn" x="754" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="780" y="14">early return false</text>
+  </g>
 
-  <!-- Arrow -->
-  <line x1="550" y1="160" x2="550" y2="175" stroke="#334155" stroke-width="1.2" marker-end="url(#arr)"/>
+  <!-- Phase 0 -->
+  <rect class="band" x="48" y="182" width="1184" height="118" rx="9"/>
+  <text class="phaseTitle" x="70" y="212" fill="#1d4ed8">0. 入口与校验</text>
+  <rect class="cpu" x="76" y="232" width="260" height="46" rx="6"/>
+  <text class="nodeTitle mono" x="206" y="252" text-anchor="middle">VisVine(MainVine, true)</text>
+  <text class="tiny" x="206" y="268" text-anchor="middle">选择 GPU 分支</text>
+  <path class="arrowThin" d="M336 255 H390"/>
+  <rect class="cpu" x="392" y="224" width="316" height="62" rx="6"/>
+  <text class="nodeTitle mono" x="550" y="244" text-anchor="middle">VisVineGPUInternal()</text>
+  <text class="body" x="412" y="262">Lines = MainVine ? TubeLines : PlaneLines</text>
+  <text class="tiny" x="412" y="277">LineSourceScales / Locations / PointScales 随分支选择</text>
+  <path class="arrowThin" d="M708 255 H762"/>
+  <rect class="warn" x="764" y="215" width="420" height="80" rx="6"/>
+  <text class="nodeTitle" x="784" y="238">必要条件</text>
+  <text class="body" x="784" y="256">Lines 非空，ResampleLength 有效，DynamicMeshComponent 有效</text>
+  <text class="body" x="784" y="273">CurveControl 自动创建；CachedSurfaceVoxels.Cells 必须非空</text>
 
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <!-- STEP 2: BVH Rebuild -->
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <rect x="60" y="178" width="980" height="50" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.2"/>
-  <text x="80" y="198" font-size="12" font-weight="bold" fill="#1e40af">② RebuildVineBVHForPrefixMesh</text>
-  <text x="80" y="215" font-size="10" fill="#334155">Build BVH spatial index from PrefixMesh (collision surface) for nearest-point queries</text>
+  <path class="arrow" d="M640 300 V338"/>
 
-  <line x1="550" y1="228" x2="550" y2="243" stroke="#334155" stroke-width="1.2" marker-end="url(#arr)"/>
+  <!-- Phase 1 -->
+  <rect class="band" x="48" y="338" width="1184" height="310" rx="9"/>
+  <text class="phaseTitle" x="70" y="368" fill="#1d4ed8">1. CPU 线预处理与 GPU 输入打包</text>
 
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <!-- STEP 3: PrepareVineVisualizationLinesCPU -->
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <rect x="60" y="246" width="980" height="100" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.2"/>
-  <text x="80" y="266" font-size="12" font-weight="bold" fill="#1e40af">③ PrepareVineVisualizationLinesCPU (CPU preprocessing)</text>
-  <text x="80" y="284" font-size="10" fill="#334155">For each PolyPath in Lines:</text>
-  <rect x="100" y="290" width="200" height="22" rx="3" fill="#eff6ff" stroke="#93c5fd"/>
-  <text x="200" y="305" text-anchor="middle" font-size="10" fill="#1e40af">SmoothLine(3)</text>
-  <line x1="300" y1="301" x2="320" y2="301" stroke="#334155" stroke-width="1" marker-end="url(#arr)"/>
-  <rect x="322" y="290" width="200" height="22" rx="3" fill="#eff6ff" stroke="#93c5fd"/>
-  <text x="422" y="305" text-anchor="middle" font-size="10" fill="#1e40af">ResampleByLength</text>
-  <line x1="522" y1="301" x2="542" y2="301" stroke="#334155" stroke-width="1" marker-end="url(#arr)"/>
-  <rect x="544" y="290" width="200" height="22" rx="3" fill="#eff6ff" stroke="#93c5fd"/>
-  <text x="644" y="305" text-anchor="middle" font-size="10" fill="#1e40af">SmoothLine(1)</text>
-  <line x1="744" y1="301" x2="764" y2="301" stroke="#334155" stroke-width="1" marker-end="url(#arr)"/>
-  <rect x="766" y="290" width="200" height="22" rx="3" fill="#eff6ff" stroke="#93c5fd"/>
-  <text x="866" y="305" text-anchor="middle" font-size="10" fill="#1e40af">ResampleByLength</text>
-  <text x="80" y="335" font-size="10" fill="#6b7280">Filter: skip paths with ArcLength / ResampleLength &lt; 2 or final point count &lt; 3</text>
+  <rect class="data" x="76" y="392" width="248" height="130" rx="6"/>
+  <text class="nodeTitle" x="96" y="416">输入数据</text>
+  <text class="body" x="96" y="438">TubeLines / PlaneLines</text>
+  <text class="body" x="96" y="456">CachedSurfaceVoxels</text>
+  <text class="body" x="96" y="474">VV.CurveControl 与噪声参数</text>
+  <text class="body" x="96" y="492">LinePointScales</text>
+  <text class="tiny" x="96" y="510">GPU/CPU 分支共享同一套预处理逻辑</text>
 
-  <line x1="550" y1="346" x2="550" y2="361" stroke="#334155" stroke-width="1.2" marker-end="url(#arr)"/>
+  <path class="arrowThin" d="M324 457 H366"/>
 
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <!-- STEP 4: BuildVineVisualizationGPUInput -->
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <rect x="60" y="364" width="980" height="130" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.2"/>
-  <text x="80" y="384" font-size="12" font-weight="bold" fill="#1e40af">④ BuildVineVisualizationGPUInput (CPU → GPU buffer packing)</text>
+  <rect class="cpu" x="368" y="386" width="430" height="192" rx="7"/>
+  <text class="nodeTitle mono" x="583" y="412" text-anchor="middle">PrepareVineVisualizationLinesCPU_Voxel()</text>
+  <rect x="394" y="431" width="176" height="30" rx="5" fill="#eff6ff" stroke="#93c5fd"/>
+  <text class="label" x="482" y="451" text-anchor="middle">SC point jitter</text>
+  <rect x="594" y="431" width="176" height="30" rx="5" fill="#eff6ff" stroke="#93c5fd"/>
+  <text class="label" x="682" y="451" text-anchor="middle">Smooth / Resample</text>
+  <path class="arrowThin" d="M570 446 H592"/>
+  <rect x="394" y="475" width="176" height="38" rx="5" fill="#eff6ff" stroke="#93c5fd"/>
+  <text class="label" x="482" y="493" text-anchor="middle">10x voxel snap</text>
+  <text class="tiny" x="482" y="507" text-anchor="middle">Curl + Perlin</text>
+  <rect x="594" y="475" width="176" height="38" rx="5" fill="#eff6ff" stroke="#93c5fd"/>
+  <text class="label" x="682" y="493" text-anchor="middle">plane merge</text>
+  <text class="tiny" x="682" y="507" text-anchor="middle">sample 80%, reduce /15</text>
+  <path class="arrowThin" d="M570 494 H592"/>
+  <rect x="444" y="529" width="276" height="34" rx="5" fill="#eff6ff" stroke="#93c5fd"/>
+  <text class="label" x="582" y="550" text-anchor="middle">最终投影到 voxel surface + VinesOffset</text>
 
-  <rect x="80" y="395" width="280" height="85" rx="4" fill="#fff" stroke="#94a3b8"/>
-  <text x="220" y="412" text-anchor="middle" font-size="10" font-weight="bold" fill="#334155">PathPoints [float4 × N_pts]</text>
-  <text x="220" y="428" text-anchor="middle" font-size="9" fill="#334155">xyz = world position</text>
-  <text x="220" y="442" text-anchor="middle" font-size="9" fill="#334155">w = sweep scale (from CurveControl.G)</text>
-  <text x="220" y="460" text-anchor="middle" font-size="9" fill="#6b7280">All paths concatenated sequentially</text>
-  <text x="220" y="474" text-anchor="middle" font-size="9" fill="#6b7280">into one flat buffer</text>
+  <path class="arrowThin" d="M798 482 H842"/>
 
-  <rect x="390" y="395" width="280" height="85" rx="4" fill="#fff" stroke="#94a3b8"/>
-  <text x="530" y="412" text-anchor="middle" font-size="10" font-weight="bold" fill="#334155">PathPointMeta [int4 × N_pts]</text>
-  <text x="530" y="428" text-anchor="middle" font-size="9" fill="#334155">x = prev point index (global)</text>
-  <text x="530" y="442" text-anchor="middle" font-size="9" fill="#334155">y = next point index (global)</text>
-  <text x="530" y="456" text-anchor="middle" font-size="9" fill="#334155">z = path base index</text>
-  <text x="530" y="470" text-anchor="middle" font-size="9" fill="#334155">w = path point count</text>
+  <rect class="cpu" x="844" y="386" width="326" height="192" rx="7"/>
+  <text class="nodeTitle mono" x="1007" y="412" text-anchor="middle">BuildVineVisualizationGPUInput()</text>
+  <text class="body" x="866" y="438">PathPoints: xyz=位置，w=厚度倍率</text>
+  <text class="body" x="866" y="456">PathPointAxes: 预留/平滑轴</text>
+  <text class="body" x="866" y="474">PathPointMeta: prev / next / base / count</text>
+  <text class="body" x="866" y="492">PathPointCurveU: 累积长度</text>
+  <text class="body" x="866" y="510">SegmentMeta: 每段 start / end</text>
+  <text class="tiny" x="866" y="534">PathPoints.w = CurveControl.G * SC point scale</text>
 
-  <rect x="700" y="395" width="280" height="85" rx="4" fill="#fff" stroke="#94a3b8"/>
-  <text x="840" y="412" text-anchor="middle" font-size="10" font-weight="bold" fill="#334155">SegmentMeta [int4 × N_seg]</text>
-  <text x="840" y="428" text-anchor="middle" font-size="9" fill="#334155">x = start point index</text>
-  <text x="840" y="442" text-anchor="middle" font-size="9" fill="#334155">y = end point index</text>
-  <text x="840" y="456" text-anchor="middle" font-size="9" fill="#334155">z, w = reserved</text>
-  <text x="840" y="474" text-anchor="middle" font-size="9" fill="#6b7280">One segment per consecutive pair</text>
+  <path class="arrow" d="M1008 578 V682"/>
 
-  <line x1="550" y1="494" x2="550" y2="509" stroke="#334155" stroke-width="1.2" marker-end="url(#arr)"/>
+  <!-- Phase 2 -->
+  <rect class="band" x="48" y="682" width="1184" height="408" rx="9"/>
+  <text class="phaseTitle" x="70" y="712" fill="#15803d">2. Render Thread / RDG：Voxel GPU Dispatch</text>
 
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <!-- STEP 5: ExtractDynamicMeshTrianglesForGPU -->
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <rect x="60" y="512" width="980" height="55" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.2"/>
-  <text x="80" y="532" font-size="12" font-weight="bold" fill="#1e40af">⑤ ExtractDynamicMeshTrianglesForGPU</text>
-  <text x="80" y="549" font-size="10" fill="#334155">PrefixMesh → MeshTriangleVertices [float4 × N_tri×3] — flat triangle soup for GPU nearest-surface queries</text>
-  <text x="80" y="562" font-size="9" fill="#6b7280">Each triangle = 3 consecutive float4 (xyz=position, w=1)</text>
+  <rect class="cpu" x="76" y="736" width="302" height="158" rx="7"/>
+  <text class="nodeTitle" x="96" y="761">Voxel 上传准备</text>
+  <text class="body" x="96" y="784">Cells -> GPUVoxelCells</text>
+  <text class="body" x="96" y="802">TargetPositions / Normals 做 finite 校验</text>
+  <text class="body" x="96" y="820">BuildVineVoxelHashSlots()</text>
+  <text class="tiny" x="96" y="842">失败时保留 1 slot，shader 线性查找 fallback</text>
+  <text class="tiny" x="96" y="864">输出大小超 MAX_uint32 时提前失败</text>
 
-  <line x1="550" y1="567" x2="550" y2="582" stroke="#334155" stroke-width="1.2" marker-end="url(#arr)"/>
+  <path class="arrowThin" d="M378 815 H428"/>
 
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <!-- STEP 6: GPU Dispatch -->
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <rect x="60" y="585" width="980" height="310" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
-  <text x="80" y="607" font-size="13" font-weight="bold" fill="#166534">⑥ DispatchVineVisualizationGPU — FVineVisualizationMeshCS</text>
-  <text x="80" y="623" font-size="10" fill="#334155">Single compute shader pass: builds sweep mesh vertices + indices on GPU</text>
+  <rect class="gpu" x="430" y="724" width="344" height="186" rx="7"/>
+  <text class="nodeTitle" x="452" y="750">RDG buffer 创建</text>
+  <text class="body" x="452" y="773">上传 SRV: PathPoints / Meta / CurveU / SegmentMeta</text>
+  <text class="body" x="452" y="791">上传 SRV: VoxelCells / HashSlots / Normals / Targets</text>
+  <text class="body" x="452" y="809">输出 UAV: OutVertices / OutUVs / OutIndices</text>
+  <text class="body" x="452" y="827">中间 UAV: PathPointTangents / Normals / SurfaceTarget ping-pong</text>
+  <text class="tiny mono" x="452" y="852">ENQUEUE_RENDER_COMMAND(VineVisualizationVoxelGPU)</text>
+  <text class="tiny" x="452" y="875">GraphBuilder.Execute() 后标记 bRenderWorkQueued</text>
 
-  <!-- Input SRVs -->
-  <rect x="80" y="635" width="440" height="90" rx="4" fill="#f0fdf4" stroke="#86efac"/>
-  <text x="300" y="652" text-anchor="middle" font-size="10" font-weight="bold" fill="#166534">Input SRVs</text>
-  <text x="100" y="668" font-size="9" fill="#334155">PathPoints (StructuredBuffer&lt;float4&gt;)</text>
-  <text x="100" y="682" font-size="9" fill="#334155">PathPointMeta (StructuredBuffer&lt;int4&gt;)</text>
-  <text x="100" y="696" font-size="9" fill="#334155">MeshTriangleVertices (StructuredBuffer&lt;float4&gt;)</text>
-  <text x="100" y="710" font-size="9" fill="#334155">SegmentMeta (StructuredBuffer&lt;int4&gt;)</text>
+  <path class="arrowGpu" d="M774 817 H826"/>
 
-  <!-- Output UAVs -->
-  <rect x="560" y="635" width="440" height="90" rx="4" fill="#f0fdf4" stroke="#86efac"/>
-  <text x="780" y="652" text-anchor="middle" font-size="10" font-weight="bold" fill="#166534">Output UAVs</text>
-  <text x="580" y="668" font-size="9" fill="#334155">RW_OutVertices (RWStructuredBuffer&lt;float4&gt;) [N_pts × ProfileCount]</text>
-  <text x="580" y="682" font-size="9" fill="#334155">RW_OutIndices (RWStructuredBuffer&lt;uint&gt;) [N_seg × ProfileCount × 6]</text>
-  <text x="580" y="700" font-size="9" fill="#6b7280">Tube: ProfileCount=3 (triangle cross-section)</text>
-  <text x="580" y="714" font-size="9" fill="#6b7280">Plane: ProfileCount=2 (flat ribbon cross-section)</text>
+  <rect class="gpu" x="828" y="724" width="356" height="88" rx="7"/>
+  <text class="nodeTitle mono" x="1006" y="748" text-anchor="middle">Pass A: BuildVineVisualizationVoxelAxesCS</text>
+  <text class="body" x="850" y="770">每个 PathPoint 计算 tangent / normal</text>
+  <text class="body" x="850" y="788">SampleVoxelNeighbors() 采样 voxel surface normal</text>
 
-  <!-- Uniforms -->
-  <rect x="80" y="735" width="920" height="55" rx="4" fill="#f0fdf4" stroke="#86efac"/>
-  <text x="300" y="752" text-anchor="middle" font-size="10" font-weight="bold" fill="#166534">Uniforms</text>
-  <text x="100" y="768" font-size="9" fill="#334155">PathPointCount, SegmentCount, MeshTriangleCount, OutputVertexCount, OutputIndexCount</text>
-  <text x="100" y="782" font-size="9" fill="#334155">ProfileCount, bTube, CircleScale, LineScale (VinesOffset already applied in shared preprocess)</text>
+  <path class="arrowGpu" d="M1006 812 V830"/>
 
-  <!-- Shader logic -->
-  <rect x="80" y="800" width="920" height="80" rx="4" fill="#bbf7d0" stroke="#16a34a" stroke-width="1.3"/>
-  <text x="540" y="818" text-anchor="middle" font-size="11" font-weight="bold" fill="#166534">Compute Shader Logic (per thread = per output vertex or segment)</text>
-  <text x="100" y="836" font-size="9" fill="#334155">1. Read PathPoint position + scale, compute tangent from prev/next via PathPointMeta</text>
-  <text x="100" y="850" font-size="9" fill="#334155">2. Find nearest triangle in MeshTriangleVertices → compute surface normal</text>
-  <text x="100" y="864" font-size="9" fill="#334155">3. Build local frame (tangent × normal) at the pre-offset shared centerline position</text>
-  <text x="100" y="878" font-size="9" fill="#334155">4. Extrude cross-section profile (circle or line) at each point, write vertices + triangle indices</text>
+  <rect class="gpu" x="828" y="832" width="356" height="72" rx="7"/>
+  <text class="nodeTitle mono" x="1006" y="855" text-anchor="middle">Pass B: SmoothProjectionCS x N</text>
+  <text class="body" x="850" y="877">投射后平滑 SurfaceTarget / SurfaceNormal</text>
+  <text class="tiny" x="850" y="893">N 为蓝图参数，默认 3；ping-pong 输出最终投射结果</text>
 
-  <line x1="550" y1="895" x2="550" y2="910" stroke="#334155" stroke-width="1.2" marker-end="url(#arr)"/>
+  <path class="arrowGpu" d="M1006 904 V922"/>
 
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <!-- STEP 7: Readback -->
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <rect x="60" y="913" width="980" height="75" rx="6" fill="#fef3c7" stroke="#d97706" stroke-width="1.2"/>
-  <text x="80" y="933" font-size="12" font-weight="bold" fill="#92400e">⑦ GPU → CPU Readback</text>
-  <text x="80" y="950" font-size="10" fill="#334155">FlushRenderingCommands() → SubmitAndBlockUntilGPUIdle()</text>
-  <text x="80" y="966" font-size="10" fill="#334155">Lock VertexReadback → Memcpy OutVertices[N_pts × ProfileCount]</text>
-  <text x="80" y="982" font-size="10" fill="#334155">Lock IndexReadback → Memcpy OutIndices[N_seg × ProfileCount × 6]</text>
+  <rect class="gpu" x="828" y="924" width="356" height="82" rx="7"/>
+  <text class="nodeTitle mono" x="1006" y="946" text-anchor="middle">Pass C: BuildVineVisualizationVoxelCS</text>
+  <text class="body" x="850" y="966">Center = smoothed Target + Normal * VinesOffset</text>
+  <text class="body" x="850" y="984">使用 smoothed SurfaceNormal 做截面变形</text>
+  <text class="tiny mono" x="850" y="998">DispatchCount = max(OutputVertexCount, SegmentCount)</text>
 
-  <line x1="550" y1="988" x2="550" y2="1003" stroke="#334155" stroke-width="1.2" marker-end="url(#arr)"/>
+  <path class="arrowGpu" d="M1006 1006 V1020"/>
 
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <!-- STEP 8: BuildDynamicMesh -->
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <rect x="60" y="1006" width="980" height="70" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.2"/>
-  <text x="80" y="1026" font-size="12" font-weight="bold" fill="#1e40af">⑧ BuildDynamicMeshFromGPUVineOutput</text>
-  <text x="80" y="1043" font-size="10" fill="#334155">OutVertices (float4 → FVector3d) + OutIndices (uint32 triplets) → FDynamicMesh3</text>
-  <text x="80" y="1059" font-size="10" fill="#334155">RecomputeNormals, set MaterialID = MainVine ? 0 : 1</text>
-  <text x="80" y="1072" font-size="9" fill="#6b7280">Validates: skip degenerate triangles, check vertex count matches</text>
+  <rect class="io" x="368" y="1018" width="816" height="48" rx="7"/>
+  <text class="nodeTitle" x="390" y="1040">AddEnqueueCopyPass()</text>
+  <text class="body" x="560" y="1040">OutVertices / OutUVs / OutIndices / smoothed targets -> FRHIGPUBufferReadback</text>
+  <path class="arrowThin" d="M776 1066 V1126"/>
 
-  <line x1="550" y1="1076" x2="550" y2="1091" stroke="#334155" stroke-width="1.2" marker-end="url(#arr)"/>
+  <!-- Phase 3 -->
+  <rect class="band" x="48" y="1126" width="1184" height="292" rx="9"/>
+  <text class="phaseTitle" x="70" y="1156" fill="#92400e">3. CPU readback 与 DynamicMesh 输出</text>
 
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <!-- STEP 9: Append to Container -->
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <rect x="60" y="1094" width="980" height="70" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.2"/>
-  <text x="80" y="1114" font-size="12" font-weight="bold" fill="#1e40af">⑨ Append to ContainerMesh + Assign MaterialID</text>
-  <text x="80" y="1131" font-size="10" fill="#334155">AppendMesh(ContainerMesh, VineMesh) → EditMesh: set MaterialID for new triangles</text>
-  <text x="80" y="1148" font-size="10" fill="#334155">NotifyMeshUpdated() + UpdateBounds()</text>
-  <text x="80" y="1160" font-size="9" fill="#6b7280">MaterialID 0 = Tube vine material, MaterialID 1 = Plane vine material</text>
+  <rect class="io" x="76" y="1182" width="306" height="94" rx="7"/>
+  <text class="nodeTitle" x="98" y="1207">GPU -> CPU Readback</text>
+  <text class="body" x="98" y="1228">FlushRenderingCommands()</text>
+  <text class="body" x="98" y="1246">必要时 SubmitAndBlockUntilGPUIdle()</text>
+  <text class="body" x="98" y="1264">Lock / Memcpy / Unlock 三个 buffer</text>
 
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <!-- Output -->
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <line x1="550" y1="1164" x2="550" y2="1185" stroke="#334155" stroke-width="1.5" marker-end="url(#arr)"/>
-  <rect x="300" y="1188" width="500" height="40" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
-  <text x="550" y="1212" text-anchor="middle" font-size="13" font-weight="bold" fill="#166534">✓ DynamicMeshComponent Updated (return true)</text>
+  <path class="arrowThin" d="M382 1230 H432"/>
 
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <!-- Comparison box -->
-  <!-- ══════════════════════════════════════════════════════════════════ -->
-  <rect x="60" y="1250" width="980" height="250" rx="6" fill="#fff" stroke="#e2e8f0" stroke-width="1"/>
-  <text x="550" y="1275" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e293b">VisVine GPU vs CPU after parameter alignment</text>
+  <rect class="cpu" x="434" y="1182" width="280" height="94" rx="7"/>
+  <text class="nodeTitle" x="456" y="1207">UV 与网格构建</text>
+  <text class="body mono" x="456" y="1228">RecomputeVineOutputUVs...</text>
+  <text class="body mono" x="456" y="1246">BuildDynamicMeshFromGPU...</text>
+  <text class="tiny" x="456" y="1264">过滤退化三角形，重算法线</text>
 
-  <line x1="550" y1="1285" x2="550" y2="1490" stroke="#e2e8f0" stroke-width="1"/>
+  <path class="arrowThin" d="M714 1230 H764"/>
 
-  <!-- Left: GPU -->
-  <text x="300" y="1305" text-anchor="middle" font-size="11" font-weight="bold" fill="#16a34a">GPU branch</text>
-  <text x="80" y="1325" font-size="10" fill="#334155">• Shared preprocess: same noise, BVH snap, merge, and scale resample</text>
-  <text x="80" y="1343" font-size="10" fill="#334155">• Surface normals: GPU brute-force triangle search</text>
-  <text x="80" y="1361" font-size="10" fill="#334155">• Sweep extrusion: GPU parallel per-vertex</text>
-  <text x="80" y="1379" font-size="10" fill="#334155">• Index generation: GPU parallel per-segment</text>
-  <text x="80" y="1397" font-size="10" fill="#334155">• Mesh rebuild: readback into DynamicMesh after dispatch</text>
-  <text x="80" y="1415" font-size="10" fill="#334155">• Single dispatch: O(max(N_pts, N_seg)) threads</text>
-  <text x="80" y="1433" font-size="10" fill="#334155">• Readback cost: 2 buffer locks</text>
-  <text x="80" y="1455" font-size="10" font-weight="bold" fill="#16a34a">Best for: large vine counts, real-time preview</text>
+  <rect class="mesh" x="766" y="1182" width="406" height="94" rx="7"/>
+  <text class="nodeTitle" x="788" y="1207">Append 到 ContainerMesh</text>
+  <text class="body" x="788" y="1228">AppendMesh(ContainerMesh, VineMesh)</text>
+  <text class="body" x="788" y="1246">MaterialID: tube=0, plane=1</text>
+  <text class="body" x="788" y="1264">NotifyMeshUpdated / UpdateBounds / dirty render state</text>
 
-  <!-- Right: CPU -->
-  <text x="820" y="1305" text-anchor="middle" font-size="11" font-weight="bold" fill="#2563eb">CPU branch</text>
-  <text x="570" y="1325" font-size="10" fill="#334155">• Shared preprocess: same noise, BVH snap, merge, and scale resample</text>
-  <text x="570" y="1343" font-size="10" fill="#334155">• Sweep extrusion: GeometryScript AppendSweepPolyline</text>
-  <text x="570" y="1361" font-size="10" fill="#334155">• UV generation: UPolyLine::CurveU length-based V</text>
-  <text x="570" y="1379" font-size="10" fill="#334155">• Mesh append/material: DynamicMesh on game thread</text>
-  <text x="570" y="1397" font-size="10" fill="#334155">• No GPU dispatch or readback</text>
-  <text x="570" y="1415" font-size="10" fill="#334155">• Sequential sweep over prepared centerlines</text>
-  <text x="570" y="1433" font-size="10" fill="#334155">• Same user parameters before branch-specific profile generation</text>
-  <text x="570" y="1455" font-size="10" font-weight="bold" fill="#2563eb">Best for: reference path, debugging parity</text>
+  <path class="arrow" d="M640 1276 V1318"/>
+  <rect x="312" y="1318" width="656" height="58" rx="10" fill="#ecfdf5" stroke="#16a34a" stroke-width="2"/>
+  <text class="nodeTitle" x="640" y="1342" text-anchor="middle" fill="#166534">return true</text>
+  <text class="body" x="640" y="1360" text-anchor="middle">DynamicMeshComponent 中已经追加当前 MainVine 对应的藤蔓网格</text>
 
-  <!-- Dispatch detail -->
-  <text x="550" y="1490" text-anchor="middle" font-size="9" fill="#6b7280">Dispatch: FComputeShaderUtils::Dispatch(CS, max(OutputVertexCount, SegmentCount), 1, 1) / GroupSize=64</text>
+  <!-- Data bridge labels -->
+  <rect class="data" x="76" y="1438" width="1096" height="56" rx="7"/>
+  <text class="nodeTitle" x="100" y="1462">源码锚点</text>
+  <text class="body mono" x="100" y="1481">GeometryEditorActor.cpp: VisVineGPUInternal(), PrepareVineVisualizationLinesCPU_Voxel(), BuildVineVisualizationGPUInput(), DispatchVineVisualizationGPU_Voxel()</text>
+  <text class="body mono" x="100" y="1499">Shaders/Private/VineVisualizationVoxel.usf: BuildVineVisualizationVoxelAxesCS(), BuildVineVisualizationVoxelCS()</text>
+
+  <!-- Vertical phase separators -->
+  <path class="arrowThin dash" d="M640 648 V682"/>
+  <path class="arrowThin dash" d="M640 1090 V1126"/>
 </svg>

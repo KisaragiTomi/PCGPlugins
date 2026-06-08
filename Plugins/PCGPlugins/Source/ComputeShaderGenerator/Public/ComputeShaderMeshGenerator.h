@@ -260,7 +260,15 @@ struct COMPUTESHADERGENERATOR_API FCSMeshGeneratorSurfaceVoxelTextureDataHandle
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data")
 	TObjectPtr<UTextureRenderTarget2D> VoxelNormalRT = nullptr;
 
-	// Small metadata texture. Pixel 0 = counts/size, pixels 1-3 = origin/bounds/dimensions.
+	// One RGBA32f texel per sampled surface voxel. xyz = weighted surface target, w = 1.
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data")
+	TObjectPtr<UTextureRenderTarget2D> VoxelTargetRT = nullptr;
+
+	// One RGBA32f texel per sampled surface voxel. xyz = integer voxel cell encoded as floats, w = 0.
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data")
+	TObjectPtr<UTextureRenderTarget2D> VoxelCellRT = nullptr;
+
+	// Small metadata texture. Pixel 0 = counts/size, pixels 1-4 = origin/bounds/dimensions.
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data")
 	TObjectPtr<UTextureRenderTarget2D> VoxelMetaRT = nullptr;
 };
@@ -885,8 +893,15 @@ protected:
 	void InitializeFreePages();
 	/** Allocates UAV-capable render targets sized for cache metadata, triangle vertices, and triangle normals. */
 	void CreateCacheRenderTargets();
+	/** Shared GPU triangle readback path for generator-bounds queries. */
+	FCSTriangleMeshData ReadBoxSceneTrianglesFromGPUFilteredInternal(const FBox& QueryBox,
+		const TArray<FVector>& ReferencePointsForRender,
+		float ReferenceFilterDistance,
+		const TCHAR* LogPrefix,
+		const AActor* ExcludedActor,
+		FName ExcludedActorTagForResolve);
 	/** Stores CPU triangle data into generated-data texture targets and updates LastTriangleTextureData. */
-	void StoreTriangleTextureData(const FCSTriangleMeshData& TriangleData, float ReferenceFilterDistance);
+	void StoreTriangleTextureData(const FCSTriangleMeshData& TriangleData, float ReferenceFilterDistance, FBox SourceWorldBounds = FBox(ForceInit));
 	/** Stores CPU surface-voxel data into generated-data texture targets and updates LastSurfaceVoxelTextureData. */
 	void StoreSurfaceVoxelTextureData(const FCSSurfaceVoxelData& SurfaceVoxelData, FVector VoxelOrigin);
 	/** Releases triangle generated-data textures and invalidates the triangle data handle. */

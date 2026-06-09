@@ -1,0 +1,36 @@
+---
+description: "UE C++ 编码约定：DD 作为 DrawDebug 系列函数的简写"
+globs: "**/*.cpp,**/*.h,**/*.hpp,**/*.cxx"
+alwaysApply: true
+---
+
+# DrawDebug 简写约定
+
+1. 编写 UE C++ 代码时，使用 `DD` 作为 `DrawDebug` 系列函数的简写前缀。
+   - `DD::Line`    → `DrawDebugLine`
+   - `DD::Sphere`  → `DrawDebugSphere`
+   - `DD::Box`     → `DrawDebugBox`
+   - `DD::Point`   → `DrawDebugPoint`
+   - `DD::Circle`  → `DrawDebugCircle`
+   - `DD::Arrow`   → `DrawDebugArrow`
+   - `DD::String`  → `DrawDebugString`
+   - `DD::Capsule` → `DrawDebugCapsule`
+   - 依此类推，所有 `DrawDebug*` 函数均可用 `DD::*` 简写。
+
+2. 当用户提到 "DD" 或 "DrawDebug" 时，自动理解为其指代 `DrawDebug*` 系列函数。
+
+3. 若需定义 `DD` 命名空间别名，可在项目公共头文件中添加：
+
+```cpp
+namespace DD = DrawDebug;
+```
+
+或使用宏简化调用：
+
+```cpp
+#define DD_LINE(World, Start, End, Color, bPersistent, Lifetime, DepthPriority, Thickness) \
+    DrawDebugLine(World, Start, End, Color, bPersistent, Lifetime, DepthPriority, Thickness)
+```
+
+推荐使用第一种 `namespace` 别名方式，更安全且符合现代 C++ 规范。
+

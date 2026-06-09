@@ -12,6 +12,7 @@
 #include "Kismet/KismetRenderingLibrary.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "DrawDebugHelpers.h"
 #include "Engine/Engine.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/TextureRenderTarget2D.h"
@@ -71,7 +72,7 @@ bool IsFiniteCSPosition(const FVector& Position)
 		&& FMath::IsFinite(Position.Z);
 }
 
-bool IsDegenerateCSTriangle(const FVector& A, const FVector& B, const FVector& C)
+bool IsDegenerateDrawPrimtiveCSTriangle(const FVector& A, const FVector& B, const FVector& C)
 {
 	return FVector::CrossProduct(B - A, C - A).SizeSquared() <= 1.0e-8;
 }
@@ -100,7 +101,7 @@ FBox BuildWorldBoxFromTransformAndSize(const FTransform& BoxTransform, const FVe
 	return FBox(-BoxExtent, BoxExtent).TransformBy(BoxTransform);
 }
 
-bool TriangleIntersectsBox(const FVector& A, const FVector& B, const FVector& C, const FBox& QueryBox)
+bool DrawPrimtiveTriangleIntersectsBox(const FVector& A, const FVector& B, const FVector& C, const FBox& QueryBox)
 {
 	if (!QueryBox.IsValid)
 	{
@@ -127,7 +128,7 @@ bool TriangleIntersectsLocalBox(const FVector& A,
 	return LocalTriangleBox.Intersect(FBox(-BoxExtent, BoxExtent));
 }
 
-bool TryAppendTriangleSoup(FCSTriangleMeshData& OutTriangleData,
+bool TryAppendDrawPrimtiveTriangleSoup(FCSTriangleMeshData& OutTriangleData,
 	const FVector& A,
 	const FVector& B,
 	const FVector& C,
@@ -139,7 +140,7 @@ bool TryAppendTriangleSoup(FCSTriangleMeshData& OutTriangleData,
 		return false;
 	}
 
-	if (!IsFiniteCSPosition(A) || !IsFiniteCSPosition(B) || !IsFiniteCSPosition(C) || IsDegenerateCSTriangle(A, B, C))
+	if (!IsFiniteCSPosition(A) || !IsFiniteCSPosition(B) || !IsFiniteCSPosition(C) || IsDegenerateDrawPrimtiveCSTriangle(A, B, C))
 	{
 		return true;
 	}
@@ -156,7 +157,7 @@ bool TryAppendTriangleSoup(FCSTriangleMeshData& OutTriangleData,
 	return true;
 }
 
-bool TryAppendTriangleSoupOrientedToNormal(FCSTriangleMeshData& OutTriangleData,
+bool TryAppendDrawPrimtiveTriangleSoupOrientedToNormal(FCSTriangleMeshData& OutTriangleData,
 	const FVector& A,
 	const FVector& B,
 	const FVector& C,
@@ -166,13 +167,13 @@ bool TryAppendTriangleSoupOrientedToNormal(FCSTriangleMeshData& OutTriangleData,
 	FVector SafeDesiredNormal = DesiredNormal.GetSafeNormal(UE_SMALL_NUMBER, GetSafeCSTriangleNormal(A, B, C));
 	if (FVector::DotProduct(GetSafeCSTriangleNormal(A, B, C), SafeDesiredNormal) < 0.0)
 	{
-		return TryAppendTriangleSoup(OutTriangleData, A, C, B, SafeDesiredNormal, MaxTriangles);
+		return TryAppendDrawPrimtiveTriangleSoup(OutTriangleData, A, C, B, SafeDesiredNormal, MaxTriangles);
 	}
 
-	return TryAppendTriangleSoup(OutTriangleData, A, B, C, SafeDesiredNormal, MaxTriangles);
+	return TryAppendDrawPrimtiveTriangleSoup(OutTriangleData, A, B, C, SafeDesiredNormal, MaxTriangles);
 }
 
-FVector MakeLandscapeNormalFaceUp(const FVector& Normal)
+FVector MakeDrawPrimtiveLandscapeNormalFaceUp(const FVector& Normal)
 {
 	FVector SafeNormal = Normal.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
 	if (SafeNormal.Z < 0.0)
@@ -233,14 +234,14 @@ void AppendTriangleMeshDataInsideLocalBox(FCSTriangleMeshData& OutTriangleData,
 		const FVector Normal = bUseVertexNormals
 			? ((SourceTriangleData.VertexNormals[I0] + SourceTriangleData.VertexNormals[I1] + SourceTriangleData.VertexNormals[I2]) / 3.0).GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector)
 			: GetSafeCSTriangleNormal(A, B, C);
-		if (!TryAppendTriangleSoup(OutTriangleData, A, B, C, Normal, MaxTriangles))
+		if (!TryAppendDrawPrimtiveTriangleSoup(OutTriangleData, A, B, C, Normal, MaxTriangles))
 		{
 			break;
 		}
 	}
 }
 
-void NormalizeTriangleMeshDataWinding(FCSTriangleMeshData& TriangleData)
+void NormalizeDrawPrimtiveTriangleMeshDataWinding(FCSTriangleMeshData& TriangleData)
 {
 	const int32 EffectiveVertexCount = TriangleData.VertexCount >= 0
 		? FMath::Clamp(TriangleData.VertexCount, 0, TriangleData.Vertices.Num())
@@ -358,7 +359,7 @@ void AppendStaticMeshComponentTriangles(UStaticMeshComponent* StaticMeshComponen
 			const FVector A = LocalToWorld.TransformPosition(FVector(PositionBuffer.VertexPosition(I0)));
 			const FVector B = LocalToWorld.TransformPosition(FVector(PositionBuffer.VertexPosition(I1)));
 			const FVector C = LocalToWorld.TransformPosition(FVector(PositionBuffer.VertexPosition(I2)));
-			if (!TriangleIntersectsBox(A, B, C, QueryBox)
+			if (!DrawPrimtiveTriangleIntersectsBox(A, B, C, QueryBox)
 				|| !TriangleIntersectsLocalBox(A, B, C, WorldToBoxTransform, BoxExtent))
 			{
 				continue;
@@ -375,7 +376,7 @@ void AppendStaticMeshComponentTriangles(UStaticMeshComponent* StaticMeshComponen
 				Normal = ((N0 + N1 + N2) / 3.0).GetSafeNormal(UE_SMALL_NUMBER, Normal);
 			}
 
-			if (!TryAppendTriangleSoupOrientedToNormal(OutTriangleData, A, B, C, Normal, MaxTriangles))
+			if (!TryAppendDrawPrimtiveTriangleSoupOrientedToNormal(OutTriangleData, A, B, C, Normal, MaxTriangles))
 			{
 				return;
 			}
@@ -483,19 +484,19 @@ void AppendLandscapeTriangles(UWorld* World,
 				LandscapeData.GetWorldPositionTangents(X, Y + 1, P01, TangentX, TangentY, N01);
 				LandscapeData.GetWorldPositionTangents(X + 1, Y + 1, P11, TangentX, TangentY, N11);
 
-				if (TriangleIntersectsBox(P00, P10, P11, QueryBox)
+				if (DrawPrimtiveTriangleIntersectsBox(P00, P10, P11, QueryBox)
 					&& TriangleIntersectsLocalBox(P00, P10, P11, WorldToBoxTransform, BoxExtent))
 				{
-					if (!TryAppendTriangleSoupOrientedToNormal(OutTriangleData, P00, P10, P11, MakeLandscapeNormalFaceUp(N00 + N10 + N11), MaxTriangles))
+					if (!TryAppendDrawPrimtiveTriangleSoupOrientedToNormal(OutTriangleData, P00, P10, P11, MakeDrawPrimtiveLandscapeNormalFaceUp(N00 + N10 + N11), MaxTriangles))
 					{
 						return;
 					}
 				}
 
-				if (TriangleIntersectsBox(P00, P11, P01, QueryBox)
+				if (DrawPrimtiveTriangleIntersectsBox(P00, P11, P01, QueryBox)
 					&& TriangleIntersectsLocalBox(P00, P11, P01, WorldToBoxTransform, BoxExtent))
 				{
-					if (!TryAppendTriangleSoupOrientedToNormal(OutTriangleData, P00, P11, P01, MakeLandscapeNormalFaceUp(N00 + N11 + N01), MaxTriangles))
+					if (!TryAppendDrawPrimtiveTriangleSoupOrientedToNormal(OutTriangleData, P00, P11, P01, MakeDrawPrimtiveLandscapeNormalFaceUp(N00 + N11 + N01), MaxTriangles))
 					{
 						return;
 					}
@@ -553,7 +554,7 @@ uint32 BuildTriangleUploadData(const FCSTriangleMeshData& TriangleData, TArray<F
 		const FVector& A = TriangleData.Vertices[I0];
 		const FVector& B = TriangleData.Vertices[I1];
 		const FVector& C = TriangleData.Vertices[I2];
-		if (!IsFiniteCSPosition(A) || !IsFiniteCSPosition(B) || !IsFiniteCSPosition(C) || IsDegenerateCSTriangle(A, B, C))
+		if (!IsFiniteCSPosition(A) || !IsFiniteCSPosition(B) || !IsFiniteCSPosition(C) || IsDegenerateDrawPrimtiveCSTriangle(A, B, C))
 		{
 			continue;
 		}
@@ -1116,7 +1117,7 @@ FCSTriangleMeshData UCSDrawPrimtive::GetTaggedBoxSceneTriangles(
 
 	OutTriangleData.VertexCount = OutTriangleData.Vertices.Num();
 	OutTriangleData.IndexCount = 0;
-	NormalizeTriangleMeshDataWinding(OutTriangleData);
+	NormalizeDrawPrimtiveTriangleMeshDataWinding(OutTriangleData);
 	return OutTriangleData;
 }
 
@@ -1170,6 +1171,83 @@ bool UCSDrawPrimtive::DrawTaggedBoxSceneWorldZHeight(
 
 	FlushRenderingCommands();
 	return true;
+}
+
+int32 UCSDrawPrimtive::DrawDebugBoxSceneWorldZHeightSamples(
+	UObject* WorldContextObject,
+	FTransform BoxTransform,
+	FVector BoxSize,
+	UTextureRenderTarget2D* HeightRenderTarget,
+	float Duration)
+{
+	if (Duration <= 0.0f || !HeightRenderTarget)
+	{
+		return 0;
+	}
+
+	UWorld* World = GEngine ? GEngine->GetWorldFromContextObject(WorldContextObject, EGetWorldErrorMode::ReturnNull) : nullptr;
+	if (!World)
+	{
+		return 0;
+	}
+
+	const int32 TextureWidth = HeightRenderTarget->SizeX;
+	const int32 TextureHeight = HeightRenderTarget->SizeY;
+	if (TextureWidth <= 0 || TextureHeight <= 0)
+	{
+		return 0;
+	}
+
+	FTextureRenderTargetResource* RTResource = HeightRenderTarget->GameThread_GetRenderTargetResource();
+	if (!RTResource)
+	{
+		return 0;
+	}
+
+	TArray<FLinearColor> Pixels;
+	FReadSurfaceDataFlags ReadFlags(RCM_MinMax);
+	RTResource->ReadLinearColorPixels(Pixels, ReadFlags, FIntRect(0, 0, TextureWidth, TextureHeight));
+	if (Pixels.Num() < TextureWidth * TextureHeight)
+	{
+		return 0;
+	}
+
+	constexpr int32 DebugSampleCount = 100;
+	const FVector SafeBoxSize(
+		FMath::Max(FMath::Abs(BoxSize.X), KINDA_SMALL_NUMBER),
+		FMath::Max(FMath::Abs(BoxSize.Y), KINDA_SMALL_NUMBER),
+		FMath::Abs(BoxSize.Z));
+	const FVector LocalMin(-SafeBoxSize.X * 0.5, -SafeBoxSize.Y * 0.5, 0.0);
+	const FVector LocalSize(SafeBoxSize.X, SafeBoxSize.Y, 0.0);
+	int32 DrawnPointCount = 0;
+
+	for (int32 SampleY = 0; SampleY < DebugSampleCount; ++SampleY)
+	{
+		const float V = (static_cast<float>(SampleY) + 0.5f) / static_cast<float>(DebugSampleCount);
+		const int32 TextureY = FMath::Clamp(FMath::FloorToInt(V * static_cast<float>(TextureHeight)), 0, TextureHeight - 1);
+
+		for (int32 SampleX = 0; SampleX < DebugSampleCount; ++SampleX)
+		{
+			const float U = (static_cast<float>(SampleX) + 0.5f) / static_cast<float>(DebugSampleCount);
+			const int32 TextureX = FMath::Clamp(FMath::FloorToInt(U * static_cast<float>(TextureWidth)), 0, TextureWidth - 1);
+			const int32 PixelIndex = TextureY * TextureWidth + TextureX;
+			const float WorldZ = Pixels[PixelIndex].R;
+			if (!FMath::IsFinite(WorldZ))
+			{
+				continue;
+			}
+
+			FVector DebugPoint = BoxTransform.TransformPosition(FVector(
+				LocalMin.X + U * LocalSize.X,
+				LocalMin.Y + V * LocalSize.Y,
+				0.0));
+			DebugPoint.Z = WorldZ;
+			DrawDebugPoint(World, DebugPoint, 6.0f, FColor::Cyan, false, Duration, 0);
+			++DrawnPointCount;
+		}
+	}
+
+	return DrawnPointCount;
 }
 
 void UCSDrawPrimtive::DrawInstances(UTextureRenderTarget2D* RT_TextureTarget, UTextureRenderTarget2D* RT_Depth, UTextureRenderTarget2D* RT_DebugView, FTransform CameraTransform, float CaptureWidth, TArray<FTransform> InstanceTransforms, UStaticMesh* InStaticMesh)

@@ -36,6 +36,14 @@ public:
 	float BackGrowRange = .8f;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
 	float VoxelSize = 2.5f;
+
+	// SpaceColonization-specific parameters
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	int32 BackGrowCount = 3;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	bool bMultithread = true;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options, meta = (ClampMin = "0"))
+	float InfluenceRadius = 200.0f;
 };
 
 USTRUCT(BlueprintType, meta = (DisplayName = "VV Options"))
@@ -61,6 +69,14 @@ public:
 	float MergeDistMult = 3;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
 	float VinesOffset = 5;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Options|UV", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float UVScaleInfluence = 1.0f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Options|UV", meta = (ClampMin = "0.001", ClampMax = "1.0"))
+	float UVScaleFloor = 0.08f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Options|UV", meta = (ClampMin = "0.0", ClampMax = "4.0"))
+	float UVScalePower = 1.25f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Options|UV", meta = (ClampMin = "0.000001"))
+	float UVLengthScale = 1.0f;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
 	UCurveLinearColor* CurveControl = nullptr;
 };

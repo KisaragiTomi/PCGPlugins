@@ -13,7 +13,6 @@ StructuredBuffer<uint> NeighborCounts;
 StructuredBuffer<uint> NeighborIndices;
 StructuredBuffer<uint> ProposalOwners;
 StructuredBuffer<float4> ProposalPositions;
-StructuredBuffer<float4> AxesIn;
 RWStructuredBuffer<float4> RW_TargetPositions;
 RWStructuredBuffer<int4> RW_State0;
 RWStructuredBuffer<int4> RW_State1;
@@ -21,7 +20,6 @@ RWStructuredBuffer<uint> RW_NeighborCounts;
 RWStructuredBuffer<uint> RW_NeighborIndices;
 RWStructuredBuffer<uint> RW_ProposalOwners;
 RWStructuredBuffer<float4> RW_ProposalPositions;
-RWStructuredBuffer<float4> RW_Axes;
 
 uint TargetCount;
 uint SourceCount;
@@ -53,63 +51,6 @@ float DistSq(float3 A, float3 B)
     return dot(D, D);
 }
 
-float3 SafeNormalize3(float3 V, float3 Fallback)
-{
-    float LenSq = dot(V, V);
-    if (LenSq <= 1.0e-8f)
-    {
-        return Fallback;
-    }
-    return V * rsqrt(LenSq);
-}
-
-bool IsValidTargetIndex(int Index)
-{
-    return Index >= 0 && Index < (int)TargetCount;
-}
-
-float3 OrientAxisToReference(float3 Axis, float3 Reference)
-{
-    return dot(Axis, Reference) < 0.0f ? -Axis : Axis;
-}
-
-float3 BuildSpaceColonizationRawAxis(uint Index)
-{
-    int4 NodeState1 = State1[Index];
-    int PrevIndex = NodeState1.y;
-    int NextIndex = NodeState1.z;
-    float3 Position = TargetPositions[Index].xyz;
-    float3 Axis = float3(0.0f, 0.0f, 0.0f);
-
-    if (IsValidTargetIndex(PrevIndex) && IsValidTargetIndex(NextIndex))
-    {
-        Axis = TargetPositions[NextIndex].xyz - TargetPositions[PrevIndex].xyz;
-    }
-    else if (IsValidTargetIndex(NextIndex))
-    {
-        Axis = TargetPositions[NextIndex].xyz - Position;
-    }
-    else if (IsValidTargetIndex(PrevIndex))
-    {
-        Axis = Position - TargetPositions[PrevIndex].xyz;
-    }
-
-    return SafeNormalize3(Axis, float3(1.0f, 0.0f, 0.0f));
-}
-
-void AccumulateNeighborAxis(int NeighborIndex, float3 CenterAxis, float Weight, inout float3 AxisSum, inout float WeightSum)
-{
-    if (!IsValidTargetIndex(NeighborIndex))
-    {
-        return;
-    }
-
-    float3 Axis = SafeNormalize3(AxesIn[NeighborIndex].xyz, CenterAxis);
-    Axis = OrientAxisToReference(Axis, CenterAxis);
-    AxisSum += Axis * Weight;
-    WeightSum += Weight;
-}
-
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
 void InitializeSpaceColonizationQueueCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
@@ -132,19 +73,35 @@ void InitializeSpaceColonizationQueueCS(uint3 DispatchThreadId : SV_DispatchThre
 void MarkSpaceColonizationSourcesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
     uint SourceIndex = DispatchThreadId.x;
-    if (SourceIndex >= SourceCount || SourceIndex >= TargetCount)
+    if (SourceIndex >= SourceCount || TargetCount == 0)
     {
         return;
     }
 
-    int4 SourceState0 = RW_State0[SourceIndex];
-    int4 SourceState1 = RW_State1[SourceIndex];
-    SourceState0.x = 0;
-    SourceState0.z = 1;
-    SourceState1.x = (int)SourceIndex;
-    RW_TargetPositions[SourceIndex] = SourcePositions[SourceIndex];
-    RW_State0[SourceIndex] = SourceState0;
-    RW_State1[SourceIndex] = SourceState1;
+    float3 Source = SourcePositions[SourceIndex].xyz;
+    uint BestIndex = 0;
+    float BestDistSq = 3.402823466e+38f;
+
+    for (uint i = 0; i < TargetCount; ++i)
+    {
+        float D = DistSq(InitialTargetPositions[i].xyz, Source);
+        if (D < BestDistSq)
+        {
+            BestDistSq = D;
+            BestIndex = i;
+        }
+    }
+
+    int4 BestState0 = RW_State0[BestIndex];
+    int4 BestState1 = RW_State1[BestIndex];
+    float4 BestPosition = InitialTargetPositions[BestIndex];
+    BestPosition.w *= SourcePositions[SourceIndex].w;
+    BestState0.x = 0;
+    BestState0.z = 1;
+    BestState1.x = (int)BestIndex;
+    RW_TargetPositions[BestIndex] = BestPosition;
+    RW_State0[BestIndex] = BestState0;
+    RW_State1[BestIndex] = BestState1;
 }
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
@@ -158,14 +115,8 @@ void BuildSpaceColonizationNeighborsCS(uint3 DispatchThreadId : SV_DispatchThrea
 
     float Radius = max(InfluenceRadius, 1.0f);
     float RadiusSq = Radius * Radius;
-    float3 Center = TargetPositions[Index].xyz;
+    float3 Center = InitialTargetPositions[Index].xyz;
     uint Count = 0u;
-    uint NeighborBase = Index * MaxNeighbors;
-
-    for (uint ClearOffset = 0u; ClearOffset < MaxNeighbors; ++ClearOffset)
-    {
-        RW_NeighborIndices[NeighborBase + ClearOffset] = 0xffffffffu;
-    }
 
     for (uint Candidate = 0; Candidate < TargetCount; ++Candidate)
     {
@@ -174,50 +125,19 @@ void BuildSpaceColonizationNeighborsCS(uint3 DispatchThreadId : SV_DispatchThrea
             continue;
         }
 
-        float CandidateDistSq = DistSq(TargetPositions[Candidate].xyz, Center);
-        if (CandidateDistSq > RadiusSq)
+        if (DistSq(InitialTargetPositions[Candidate].xyz, Center) > RadiusSq)
         {
             continue;
-        }
-
-        uint InsertOffset = min(Count, MaxNeighbors);
-        uint SortedCount = min(Count, MaxNeighbors);
-        for (uint ExistingOffset = 0u; ExistingOffset < SortedCount; ++ExistingOffset)
-        {
-            uint ExistingIndex = RW_NeighborIndices[NeighborBase + ExistingOffset];
-            if (ExistingIndex >= TargetCount)
-            {
-                InsertOffset = ExistingOffset;
-                break;
-            }
-
-            float ExistingDistSq = DistSq(TargetPositions[ExistingIndex].xyz, Center);
-            if (CandidateDistSq < ExistingDistSq)
-            {
-                InsertOffset = ExistingOffset;
-                break;
-            }
         }
 
         if (Count < MaxNeighbors)
         {
+            RW_NeighborIndices[Index * MaxNeighbors + Count] = Candidate;
             Count += 1u;
         }
-        else if (InsertOffset >= MaxNeighbors)
-        {
-            continue;
-        }
-
-        uint LastOffset = min(Count, MaxNeighbors) - 1u;
-        for (uint ShiftOffset = LastOffset; ShiftOffset > InsertOffset; --ShiftOffset)
-        {
-            RW_NeighborIndices[NeighborBase + ShiftOffset] = RW_NeighborIndices[NeighborBase + ShiftOffset - 1u];
-        }
-
-        RW_NeighborIndices[NeighborBase + InsertOffset] = Candidate;
     }
 
-    RW_NeighborCounts[Index] = min(Count, MaxNeighbors);
+    RW_NeighborCounts[Index] = Count;
 }
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
@@ -264,6 +184,7 @@ void ProposeSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThread
         return;
     }
 
+    float3 OriginalCurrent = InitialTargetPositions[P].xyz;
     float3 RuntimeCurrent = TargetPositions[P].xyz;
     float SourceScale = 1.0f;
     int StartId = SourceState1.x;
@@ -292,44 +213,15 @@ void ProposeSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThread
             continue;
         }
 
-        float3 RuntimeAttractor = TargetPositions[AttractorIndex].xyz;
-        float D = DistSq(RuntimeAttractor, RuntimeCurrent);
+        float3 OriginalAttractor = InitialTargetPositions[AttractorIndex].xyz;
+        float D = DistSq(OriginalAttractor, OriginalCurrent);
+        DirSum += OriginalAttractor - OriginalCurrent;
+        AssociateCount += 1u;
+
         if (D < NearAttractorDistSq)
         {
             NearAttractorDistSq = D;
             NearAttractor = AttractorIndex;
-        }
-
-        uint NearestSource = 0xffffffffu;
-        float NearestSourceDistSq = 3.402823466e+38f;
-        uint AttractorNeighborCount = min(NeighborCounts[AttractorIndex], MaxNeighbors);
-        uint AttractorNeighborBase = AttractorIndex * MaxNeighbors;
-        for (uint SourceOffset = 0u; SourceOffset < AttractorNeighborCount; ++SourceOffset)
-        {
-            uint CandidateSource = NeighborIndices[AttractorNeighborBase + SourceOffset];
-            if (CandidateSource >= TargetCount)
-            {
-                continue;
-            }
-
-            if (State0[CandidateSource].x != 0)
-            {
-                continue;
-            }
-
-            float CandidateDistSq = DistSq(TargetPositions[CandidateSource].xyz, RuntimeAttractor);
-            if (CandidateDistSq < NearestSourceDistSq)
-            {
-                NearestSourceDistSq = CandidateDistSq;
-                NearestSource = CandidateSource;
-            }
-        }
-
-        float InfluenceRadiusSq = InfluenceRadius * InfluenceRadius;
-        if (NearestSource == P && NearestSourceDistSq * 1.21f < InfluenceRadiusSq)
-        {
-            DirSum += RuntimeAttractor - RuntimeCurrent;
-            AssociateCount += 1u;
         }
     }
 
@@ -401,38 +293,4 @@ void CommitSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThreadI
     TargetState1.w = 1;
     RW_State0[TargetIndex] = TargetState0;
     RW_State1[TargetIndex] = TargetState1;
-}
-
-[numthreads(THREADGROUPSIZE_X, 1, 1)]
-void BuildSpaceColonizationAxesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
-{
-    uint Index = DispatchThreadId.x;
-    if (Index >= TargetCount)
-    {
-        return;
-    }
-
-    float3 Axis = BuildSpaceColonizationRawAxis(Index);
-    RW_Axes[Index] = float4(Axis, 0.0f);
-}
-
-[numthreads(THREADGROUPSIZE_X, 1, 1)]
-void SmoothSpaceColonizationAxesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
-{
-    uint Index = DispatchThreadId.x;
-    if (Index >= TargetCount)
-    {
-        return;
-    }
-
-    int4 NodeState1 = State1[Index];
-    float3 CenterAxis = SafeNormalize3(AxesIn[Index].xyz, float3(1.0f, 0.0f, 0.0f));
-    float3 AxisSum = CenterAxis * 2.0f;
-    float WeightSum = 2.0f;
-
-    AccumulateNeighborAxis(NodeState1.y, CenterAxis, 1.0f, AxisSum, WeightSum);
-    AccumulateNeighborAxis(NodeState1.z, CenterAxis, 1.0f, AxisSum, WeightSum);
-
-    float3 SmoothedAxis = SafeNormalize3(AxisSum / max(WeightSum, 1.0e-8f), CenterAxis);
-    RW_Axes[Index] = float4(OrientAxisToReference(SmoothedAxis, CenterAxis), 0.0f);
 }

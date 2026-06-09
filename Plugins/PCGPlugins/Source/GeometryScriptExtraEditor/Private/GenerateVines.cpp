@@ -82,7 +82,7 @@ class FSpaceColonizationQueueBuildNeighborsCS : public FGlobalShader
 	SHADER_USE_PARAMETER_STRUCT(FSpaceColonizationQueueBuildNeighborsCS, FGlobalShader);
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, TargetPositions)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, InitialTargetPositions)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_NeighborCounts)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_NeighborIndices)
 		SHADER_PARAMETER(uint32, TargetCount)
@@ -132,7 +132,6 @@ class FSpaceColonizationQueueProposeCS : public FGlobalShader
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, InitialTargetPositions)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, SourcePositions)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, TargetPositions)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, State0)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, State1)
@@ -141,13 +140,11 @@ class FSpaceColonizationQueueProposeCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_ProposalOwners)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_ProposalPositions)
 		SHADER_PARAMETER(uint32, TargetCount)
-		SHADER_PARAMETER(uint32, SourceCount)
 		SHADER_PARAMETER(uint32, MaxNeighbors)
 		SHADER_PARAMETER(uint32, Iteration)
 		SHADER_PARAMETER(uint32, Activetime)
 		SHADER_PARAMETER(float, RandGrow)
 		SHADER_PARAMETER(float, Seed)
-		SHADER_PARAMETER(float, InfluenceRadius)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -189,62 +186,12 @@ class FSpaceColonizationQueueCommitCS : public FGlobalShader
 	}
 };
 
-class FSpaceColonizationQueueBuildAxesCS : public FGlobalShader
-{
-	DECLARE_GLOBAL_SHADER(FSpaceColonizationQueueBuildAxesCS);
-	SHADER_USE_PARAMETER_STRUCT(FSpaceColonizationQueueBuildAxesCS, FGlobalShader);
-
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, TargetPositions)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, State1)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_Axes)
-		SHADER_PARAMETER(uint32, TargetCount)
-	END_SHADER_PARAMETER_STRUCT()
-
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
-	}
-};
-
-class FSpaceColonizationQueueSmoothAxesCS : public FGlobalShader
-{
-	DECLARE_GLOBAL_SHADER(FSpaceColonizationQueueSmoothAxesCS);
-	SHADER_USE_PARAMETER_STRUCT(FSpaceColonizationQueueSmoothAxesCS, FGlobalShader);
-
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, State1)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, AxesIn)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_Axes)
-		SHADER_PARAMETER(uint32, TargetCount)
-	END_SHADER_PARAMETER_STRUCT()
-
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
-	}
-};
-
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueInitCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "InitializeSpaceColonizationQueueCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueMarkSourcesCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "MarkSpaceColonizationSourcesCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueBuildNeighborsCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "BuildSpaceColonizationNeighborsCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueResetProposalsCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "ResetSpaceColonizationProposalsCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueProposeCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "ProposeSpaceColonizationGrowthCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueCommitCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "CommitSpaceColonizationGrowthCS", SF_Compute);
-IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueBuildAxesCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "BuildSpaceColonizationAxesCS", SF_Compute);
-IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueSmoothAxesCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "SmoothSpaceColonizationAxesCS", SF_Compute);
 
 namespace
 {
@@ -264,21 +211,6 @@ constexpr bool bSpaceColonizationStepLogs = true;
 constexpr int32 SpaceColonizationStepLogSampleCount = 6;
 constexpr uint32 SpaceColonizationInvalidProposalOwner = 0xffffffffu;
 
-enum class ESpaceColonizationLineResultMode : uint8
-{
-	VisualizationTipToRoot,
-	SourceToTipAnchored
-};
-
-template <typename ValueType>
-static void ReverseSpaceColonizationArray(TArray<ValueType>& Values)
-{
-	for (int32 FrontIndex = 0, BackIndex = Values.Num() - 1; FrontIndex < BackIndex; ++FrontIndex, --BackIndex)
-	{
-		Values.Swap(FrontIndex, BackIndex);
-	}
-}
-
 static float GetSpaceColonizationTransformScale(const FTransform& Transform)
 {
 	const FVector Scale = Transform.GetScale3D();
@@ -286,59 +218,6 @@ static float GetSpaceColonizationTransformScale(const FTransform& Transform)
 }
 
 static void BuildSpaceColonizationScaleLookups(
-	const TArray<FTransform>& SourceTransforms,
-	const TArray<FTransform>& TargetTransforms,
-	TArray<float>& OutTargetPointScales,
-	TArray<float>& OutStartSourceScales,
-	TArray<FVector>* OutStartSourceLocations = nullptr,
-	TArray<uint8>* OutStartSourceLocationValid = nullptr)
-{
-	OutTargetPointScales.Reset();
-	OutStartSourceScales.Reset();
-	if (OutStartSourceLocations)
-	{
-		OutStartSourceLocations->Reset();
-	}
-	if (OutStartSourceLocationValid)
-	{
-		OutStartSourceLocationValid->Reset();
-	}
-
-	OutTargetPointScales.Reserve(SourceTransforms.Num() + TargetTransforms.Num());
-	for (int32 SourceIndex = 0; SourceIndex < SourceTransforms.Num(); ++SourceIndex)
-	{
-		OutTargetPointScales.Add(1.0f);
-	}
-
-	OutStartSourceScales.Reserve(SourceTransforms.Num());
-	if (OutStartSourceLocations)
-	{
-		OutStartSourceLocations->Reserve(SourceTransforms.Num());
-	}
-	if (OutStartSourceLocationValid)
-	{
-		OutStartSourceLocationValid->Reserve(SourceTransforms.Num());
-	}
-	for (const FTransform& SourceTransform : SourceTransforms)
-	{
-		OutStartSourceScales.Add(GetSpaceColonizationTransformScale(SourceTransform));
-		if (OutStartSourceLocations)
-		{
-			OutStartSourceLocations->Add(SourceTransform.GetLocation());
-		}
-		if (OutStartSourceLocationValid)
-		{
-			OutStartSourceLocationValid->Add(1);
-		}
-	}
-
-	for (const FTransform& TargetTransform : TargetTransforms)
-	{
-		OutTargetPointScales.Add(GetSpaceColonizationTransformScale(TargetTransform));
-	}
-}
-
-static void BuildSpaceColonizationCPUScaleLookups(
 	const TArray<FTransform>& SourceTransforms,
 	const TArray<FTransform>& TargetTransforms,
 	TArray<float>& OutTargetPointScales,
@@ -371,25 +250,6 @@ static void BuildSpaceColonizationCPUScaleLookups(
 			OutStartSourceScales[NearPointIndex] = GetSpaceColonizationTransformScale(SourceTransform);
 		}
 	}
-}
-
-static bool ResolveSpaceColonizationStartSourceLocation(
-	int32 StartId,
-	const TArray<FVector>* StartSourceLocations,
-	const TArray<uint8>* StartSourceLocationValid,
-	FVector& OutSourceLocation)
-{
-	if (!StartSourceLocations || !StartSourceLocations->IsValidIndex(StartId))
-	{
-		return false;
-	}
-	if (StartSourceLocationValid && (!StartSourceLocationValid->IsValidIndex(StartId) || (*StartSourceLocationValid)[StartId] == 0))
-	{
-		return false;
-	}
-
-	OutSourceLocation = (*StartSourceLocations)[StartId];
-	return true;
 }
 
 static float ResolveSpaceColonizationOutputScale(
@@ -465,85 +325,6 @@ struct FSpaceColonizationCSDebugData
 static FString FormatSpaceColonizationVector(const FVector& Vector)
 {
 	return FString::Printf(TEXT("(%.2f, %.2f, %.2f)"), Vector.X, Vector.Y, Vector.Z);
-}
-
-static void LogSpaceColonizationSourcePositionCheck(
-	const TCHAR* Version,
-	const TCHAR* Phase,
-	const TArray<FVector4f>& ExpectedSourcePositions,
-	const TArray<FVector4f>& ActualTargetPositions,
-	int32 SourceCount)
-{
-	if (!bSpaceColonizationStepLogs)
-	{
-		return;
-	}
-
-	const int32 CheckCount = FMath::Min(SourceCount, FMath::Min(ExpectedSourcePositions.Num(), ActualTargetPositions.Num()));
-	if (CheckCount <= 0)
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[SpaceColonizationStep][%s][%s][SourcePositionCheck] No sources to compare. SourceCount=%d Expected=%d Actual=%d"),
-			Version,
-			Phase,
-			SourceCount,
-			ExpectedSourcePositions.Num(),
-			ActualTargetPositions.Num());
-		return;
-	}
-
-	constexpr double PositionTolerance = 0.5;
-	constexpr double ScaleTolerance = 1.0e-4;
-	int32 MismatchCount = 0;
-	double TotalDistance = 0.0;
-	double MaxDistance = 0.0;
-	double MaxScaleDiff = 0.0;
-	FString Samples;
-
-	for (int32 SourceIndex = 0; SourceIndex < CheckCount; ++SourceIndex)
-	{
-		const FVector4f& ExpectedSource = ExpectedSourcePositions[SourceIndex];
-		const FVector4f& ActualTarget = ActualTargetPositions[SourceIndex];
-		const FVector ExpectedLocation(ExpectedSource.X, ExpectedSource.Y, ExpectedSource.Z);
-		const FVector ActualLocation(ActualTarget.X, ActualTarget.Y, ActualTarget.Z);
-		const double Distance = FVector::Dist(ExpectedLocation, ActualLocation);
-		const double ScaleDiff = FMath::Abs(double(ExpectedSource.W) - double(ActualTarget.W));
-		TotalDistance += Distance;
-		MaxDistance = FMath::Max(MaxDistance, Distance);
-		MaxScaleDiff = FMath::Max(MaxScaleDiff, ScaleDiff);
-		if (Distance > PositionTolerance || ScaleDiff > ScaleTolerance)
-		{
-			++MismatchCount;
-		}
-
-		if (SourceIndex < SpaceColonizationStepLogSampleCount)
-		{
-			if (!Samples.IsEmpty())
-			{
-				Samples += TEXT(" | ");
-			}
-			Samples += FString::Printf(
-				TEXT("#%d Expected=%s Actual=%s Dist=%.4f Scale=%.4f/%.4f"),
-				SourceIndex,
-				*FormatSpaceColonizationVector(ExpectedLocation),
-				*FormatSpaceColonizationVector(ActualLocation),
-				Distance,
-				ExpectedSource.W,
-				ActualTarget.W);
-		}
-	}
-
-	UE_LOG(LogTemp, Warning,
-		TEXT("[SpaceColonizationStep][%s][%s][SourcePositionCheck] Sources=%d Checked=%d Mismatch=%d PosAvgDiff=%.4f PosMaxDiff=%.4f ScaleMaxDiff=%.6f Samples=%s"),
-		Version,
-		Phase,
-		SourceCount,
-		CheckCount,
-		MismatchCount,
-		TotalDistance / double(CheckCount),
-		MaxDistance,
-		MaxScaleDiff,
-		Samples.IsEmpty() ? TEXT("none") : *Samples);
 }
 
 static FSpaceColonizationQueueDebugStats BuildSpaceColonizationQueueDebugStats(
@@ -838,8 +619,7 @@ static void ConvertSpaceColonizationGPUStateToAttributes(
 	const TArray<FSpaceColonizationGPUState4>& State0Data,
 	const TArray<FSpaceColonizationGPUState4>& State1Data,
 	TArray<FVector>& OutTargetLocations,
-	TArray<FSpaceColonizationAttribute>& OutSCAttributes,
-	const TArray<FVector4f>* AxisData = nullptr)
+	TArray<FSpaceColonizationAttribute>& OutSCAttributes)
 {
 	const int32 TargetCount = FMath::Min(TargetPositionData.Num(), FMath::Min(State0Data.Num(), State1Data.Num()));
 	OutTargetLocations.SetNum(TargetCount);
@@ -860,15 +640,6 @@ static void ConvertSpaceColonizationGPUStateToAttributes(
 		Attribute.PrePt = State1.Y;
 		Attribute.NextPt = State1.Z;
 		Attribute.BranchCount = State1.W;
-		if (AxisData && AxisData->IsValidIndex(Index))
-		{
-			const FVector4f& Axis = (*AxisData)[Index];
-			Attribute.N = FVector(Axis.X, Axis.Y, Axis.Z).GetSafeNormal();
-		}
-		else
-		{
-			Attribute.N = FVector::ZeroVector;
-		}
 	}
 }
 
@@ -1219,7 +990,6 @@ static void DeleteSpaceColonizationCSReadbacks(
 	FRHIGPUBufferReadback*& TargetReadback,
 	FRHIGPUBufferReadback*& State0Readback,
 	FRHIGPUBufferReadback*& State1Readback,
-	FRHIGPUBufferReadback*& AxisReadback,
 	FRHIGPUBufferReadback*& InitialTargetDebugReadback,
 	FRHIGPUBufferReadback*& InitialState0DebugReadback,
 	FRHIGPUBufferReadback*& InitialState1DebugReadback,
@@ -1233,7 +1003,6 @@ static void DeleteSpaceColonizationCSReadbacks(
 	delete TargetReadback;
 	delete State0Readback;
 	delete State1Readback;
-	delete AxisReadback;
 	delete InitialTargetDebugReadback;
 	delete InitialState0DebugReadback;
 	delete InitialState1DebugReadback;
@@ -1241,7 +1010,6 @@ static void DeleteSpaceColonizationCSReadbacks(
 	TargetReadback = nullptr;
 	State0Readback = nullptr;
 	State1Readback = nullptr;
-	AxisReadback = nullptr;
 	InitialTargetDebugReadback = nullptr;
 	InitialState0DebugReadback = nullptr;
 	InitialState1DebugReadback = nullptr;
@@ -1269,7 +1037,6 @@ static bool AreSpaceColonizationCSReadbacksReady(
 	FRHIGPUBufferReadback* TargetReadback,
 	FRHIGPUBufferReadback* State0Readback,
 	FRHIGPUBufferReadback* State1Readback,
-	FRHIGPUBufferReadback* AxisReadback,
 	FRHIGPUBufferReadback* InitialTargetDebugReadback,
 	FRHIGPUBufferReadback* InitialState0DebugReadback,
 	FRHIGPUBufferReadback* InitialState1DebugReadback,
@@ -1283,7 +1050,6 @@ static bool AreSpaceColonizationCSReadbacksReady(
 	return TargetReadback && TargetReadback->IsReady()
 		&& State0Readback && State0Readback->IsReady()
 		&& State1Readback && State1Readback->IsReady()
-		&& AxisReadback && AxisReadback->IsReady()
 		&& InitialTargetDebugReadback && InitialTargetDebugReadback->IsReady()
 		&& InitialState0DebugReadback && InitialState0DebugReadback->IsReady()
 		&& InitialState1DebugReadback && InitialState1DebugReadback->IsReady()
@@ -1311,10 +1077,9 @@ static bool BuildSpaceColonizationQueueCSImpl(
 	OutSCAttributes.Reset();
 
 	const int32 SourceCount = SourceTransforms.Num();
-	const int32 TargetTransformCount = InTargetTransforms.Num();
-	const int32 TargetCount = SourceCount + TargetTransformCount;
-	LogSpaceColonizationInput(TEXT("CS"), SourceCount, TargetTransformCount, Iteration, Activetime, RandGrow, Seed, InfluenceRadius, false);
-	if (SourceCount == 0 || TargetTransformCount == 0 || Iteration <= 0)
+	const int32 TargetCount = InTargetTransforms.Num();
+	LogSpaceColonizationInput(TEXT("CS"), SourceCount, TargetCount, Iteration, Activetime, RandGrow, Seed, InfluenceRadius, false);
+	if (SourceCount == 0 || TargetCount == 0 || Iteration <= 0)
 	{
 		return false;
 	}
@@ -1332,18 +1097,12 @@ static bool BuildSpaceColonizationQueueCSImpl(
 			}
 
 			InitialTargetPositions.Reserve(TargetCount);
-			for (const FTransform& Transform : SourceTransforms)
-			{
-				const FVector Location = Transform.GetLocation();
-				InitialTargetPositions.Add(FVector4f((FVector3f)Location, 1.0f));
-			}
 			for (const FTransform& Transform : InTargetTransforms)
 			{
 				const FVector Location = Transform.GetLocation();
 				InitialTargetPositions.Add(FVector4f((FVector3f)Location, GetSpaceColonizationTransformScale(Transform)));
 			}
 		}
-		const TArray<FVector4f> ExpectedSourcePositions = SourcePositions;
 
 		const uint64 TargetReadbackBytes64 = sizeof(FVector4f) * uint64(TargetCount);
 		const uint64 StateReadbackBytes64 = sizeof(FSpaceColonizationGPUState4) * uint64(TargetCount);
@@ -1366,7 +1125,6 @@ static bool BuildSpaceColonizationQueueCSImpl(
 		FRHIGPUBufferReadback* TargetReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_TargetReadback"));
 		FRHIGPUBufferReadback* State0Readback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_State0Readback"));
 		FRHIGPUBufferReadback* State1Readback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_State1Readback"));
-		FRHIGPUBufferReadback* AxisReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_AxisReadback"));
 		FRHIGPUBufferReadback* InitialTargetDebugReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_Debug_InitialTarget"));
 		FRHIGPUBufferReadback* InitialState0DebugReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_Debug_InitialState0"));
 		FRHIGPUBufferReadback* InitialState1DebugReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_Debug_InitialState1"));
@@ -1397,7 +1155,7 @@ static bool BuildSpaceColonizationQueueCSImpl(
 			GV_TIME_SCOPE(TEXT("SpaceColonizationCS.Queue.DispatchAndFlush"));
 			ENQUEUE_RENDER_COMMAND(SpaceColonizationQueueCS)(
 				[SourcePositions = MoveTemp(SourcePositions), InitialTargetPositions = MoveTemp(InitialTargetPositions),
-				 TargetReadback, State0Readback, State1Readback, AxisReadback, TargetReadbackBytes, StateReadbackBytes,
+				 TargetReadback, State0Readback, State1Readback, TargetReadbackBytes, StateReadbackBytes,
 				 UIntReadbackBytes, InitialTargetDebugReadback, InitialState0DebugReadback, InitialState1DebugReadback,
 				 NeighborCountsDebugReadback, ResetProposalOwnerDebugReadbacks, ProposalOwnerDebugReadbacks,
 				 IterationTargetDebugReadbacks, IterationState0DebugReadbacks, IterationState1DebugReadbacks,
@@ -1415,8 +1173,6 @@ static bool BuildSpaceColonizationQueueCSImpl(
 					CREATE_RDG_STRUCTURED_UAV_SRV(NeighborIndices, uint32, NeighborIndexCount, TEXT("SpaceColonizationQueue_NeighborIndices"))
 					CREATE_RDG_STRUCTURED_UAV_SRV(ProposalOwners, uint32, TargetCount, TEXT("SpaceColonizationQueue_ProposalOwners"))
 					CREATE_RDG_STRUCTURED_UAV_SRV(ProposalPositions, FVector4f, TargetCount, TEXT("SpaceColonizationQueue_ProposalPositions"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(AxisA, FVector4f, TargetCount, TEXT("SpaceColonizationQueue_AxisA"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(AxisB, FVector4f, TargetCount, TEXT("SpaceColonizationQueue_AxisB"))
 
 					TShaderMapRef<FSpaceColonizationQueueInitCS> InitShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 					FSpaceColonizationQueueInitCS::FParameters* InitParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueInitCS::FParameters>();
@@ -1457,7 +1213,7 @@ static bool BuildSpaceColonizationQueueCSImpl(
 
 					TShaderMapRef<FSpaceColonizationQueueBuildNeighborsCS> BuildNeighborsShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 					FSpaceColonizationQueueBuildNeighborsCS::FParameters* BuildNeighborsParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueBuildNeighborsCS::FParameters>();
-					BuildNeighborsParameters->TargetPositions = TargetSRV;
+					BuildNeighborsParameters->InitialTargetPositions = InitialTargetSRV;
 					BuildNeighborsParameters->RW_NeighborCounts = NeighborCountsUAV;
 					BuildNeighborsParameters->RW_NeighborIndices = NeighborIndicesUAV;
 					BuildNeighborsParameters->TargetCount = uint32(TargetCount);
@@ -1494,7 +1250,6 @@ static bool BuildSpaceColonizationQueueCSImpl(
 
 						FSpaceColonizationQueueProposeCS::FParameters* ProposeParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueProposeCS::FParameters>();
 						ProposeParameters->InitialTargetPositions = InitialTargetSRV;
-						ProposeParameters->SourcePositions = SourceSRV;
 						ProposeParameters->TargetPositions = TargetSRV;
 						ProposeParameters->State0 = State0SRV;
 						ProposeParameters->State1 = State1SRV;
@@ -1503,13 +1258,11 @@ static bool BuildSpaceColonizationQueueCSImpl(
 						ProposeParameters->RW_ProposalOwners = ProposalOwnersUAV;
 						ProposeParameters->RW_ProposalPositions = ProposalPositionsUAV;
 						ProposeParameters->TargetCount = uint32(TargetCount);
-						ProposeParameters->SourceCount = uint32(SourceCount);
 						ProposeParameters->MaxNeighbors = uint32(MaxNeighborsPerTarget);
 						ProposeParameters->Iteration = uint32(IterationIndex);
 						ProposeParameters->Activetime = uint32(FMath::Max(Activetime, 0));
 						ProposeParameters->RandGrow = RandGrow;
 						ProposeParameters->Seed = Seed;
-						ProposeParameters->InfluenceRadius = InfluenceRadius;
 						GraphBuilder.AddPass(
 							RDG_EVENT_NAME("SpaceColonizationQueue.Propose"),
 							ProposeParameters,
@@ -1541,45 +1294,9 @@ static bool BuildSpaceColonizationQueueCSImpl(
 						AddEnqueueCopyPass(GraphBuilder, IterationState1DebugReadbacks[IterationIndex], State1Buffer, StateReadbackBytes);
 					}
 
-					TShaderMapRef<FSpaceColonizationQueueBuildAxesCS> BuildAxesShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-					FSpaceColonizationQueueBuildAxesCS::FParameters* BuildAxesParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueBuildAxesCS::FParameters>();
-					BuildAxesParameters->TargetPositions = TargetSRV;
-					BuildAxesParameters->State1 = State1SRV;
-					BuildAxesParameters->RW_Axes = AxisAUAV;
-					BuildAxesParameters->TargetCount = uint32(TargetCount);
-					GraphBuilder.AddPass(
-						RDG_EVENT_NAME("SpaceColonizationQueue.BuildAxes"),
-						BuildAxesParameters,
-						ERDGPassFlags::Compute,
-						[BuildAxesParameters, BuildAxesShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
-						{
-							FComputeShaderUtils::Dispatch(InRHICmdList, BuildAxesShader, *BuildAxesParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
-						});
-
-					bool bReadAxisA = true;
-					TShaderMapRef<FSpaceColonizationQueueSmoothAxesCS> SmoothAxesShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-					for (int32 SmoothIterationIndex = 0; SmoothIterationIndex < 3; ++SmoothIterationIndex)
-					{
-						FSpaceColonizationQueueSmoothAxesCS::FParameters* SmoothAxesParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueSmoothAxesCS::FParameters>();
-						SmoothAxesParameters->State1 = State1SRV;
-						SmoothAxesParameters->AxesIn = bReadAxisA ? AxisASRV : AxisBSRV;
-						SmoothAxesParameters->RW_Axes = bReadAxisA ? AxisBUAV : AxisAUAV;
-						SmoothAxesParameters->TargetCount = uint32(TargetCount);
-						GraphBuilder.AddPass(
-							RDG_EVENT_NAME("SpaceColonizationQueue.SmoothAxes.%d", SmoothIterationIndex + 1),
-							SmoothAxesParameters,
-							ERDGPassFlags::Compute,
-							[SmoothAxesParameters, SmoothAxesShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
-							{
-								FComputeShaderUtils::Dispatch(InRHICmdList, SmoothAxesShader, *SmoothAxesParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
-							});
-						bReadAxisA = !bReadAxisA;
-					}
-
 					AddEnqueueCopyPass(GraphBuilder, TargetReadback, TargetBuffer, TargetReadbackBytes);
 					AddEnqueueCopyPass(GraphBuilder, State0Readback, State0Buffer, StateReadbackBytes);
 					AddEnqueueCopyPass(GraphBuilder, State1Readback, State1Buffer, StateReadbackBytes);
-					AddEnqueueCopyPass(GraphBuilder, AxisReadback, bReadAxisA ? AxisABuffer : AxisBBuffer, TargetReadbackBytes);
 
 					GraphBuilder.Execute();
 					bRenderWorkQueued = true;
@@ -1594,7 +1311,6 @@ static bool BuildSpaceColonizationQueueCSImpl(
 				TargetReadback,
 				State0Readback,
 				State1Readback,
-				AxisReadback,
 				InitialTargetDebugReadback,
 				InitialState0DebugReadback,
 				InitialState1DebugReadback,
@@ -1608,11 +1324,9 @@ static bool BuildSpaceColonizationQueueCSImpl(
 		}
 
 		TArray<FVector4f> TargetPositionData;
-		TArray<FVector4f> AxisData;
 		TArray<FSpaceColonizationGPUState4> State0Data;
 		TArray<FSpaceColonizationGPUState4> State1Data;
 		TargetPositionData.SetNumZeroed(TargetCount);
-		AxisData.SetNumZeroed(TargetCount);
 		State0Data.SetNumZeroed(TargetCount);
 		State1Data.SetNumZeroed(TargetCount);
 		bool bReadbackSucceeded = false;
@@ -1620,12 +1334,12 @@ static bool BuildSpaceColonizationQueueCSImpl(
 		{
 			GV_TIME_SCOPE(TEXT("SpaceColonizationCS.Queue.ReadbackAndFlush"));
 			ENQUEUE_RENDER_COMMAND(SpaceColonizationQueueCSReadback)(
-				[TargetReadback, State0Readback, State1Readback, AxisReadback, InitialTargetDebugReadback, InitialState0DebugReadback, InitialState1DebugReadback,
+				[TargetReadback, State0Readback, State1Readback, InitialTargetDebugReadback, InitialState0DebugReadback, InitialState1DebugReadback,
 				 NeighborCountsDebugReadback, ResetProposalOwnerDebugReadbacks, ProposalOwnerDebugReadbacks, IterationTargetDebugReadbacks,
 				 IterationState0DebugReadbacks, IterationState1DebugReadbacks, TargetReadbackBytes, StateReadbackBytes, UIntReadbackBytes,
-				 TargetCount, &TargetPositionData, &AxisData, &State0Data, &State1Data, &CSDebugData, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList) mutable
+				 TargetCount, &TargetPositionData, &State0Data, &State1Data, &CSDebugData, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList) mutable
 				{
-					if (!TargetReadback || !State0Readback || !State1Readback || !AxisReadback)
+					if (!TargetReadback || !State0Readback || !State1Readback)
 					{
 						return;
 					}
@@ -1634,7 +1348,6 @@ static bool BuildSpaceColonizationQueueCSImpl(
 						TargetReadback,
 						State0Readback,
 						State1Readback,
-						AxisReadback,
 						InitialTargetDebugReadback,
 						InitialState0DebugReadback,
 						InitialState1DebugReadback,
@@ -1652,7 +1365,6 @@ static bool BuildSpaceColonizationQueueCSImpl(
 						TargetReadback,
 						State0Readback,
 						State1Readback,
-						AxisReadback,
 						InitialTargetDebugReadback,
 						InitialState0DebugReadback,
 						InitialState1DebugReadback,
@@ -1668,7 +1380,6 @@ static bool BuildSpaceColonizationQueueCSImpl(
 							TargetReadback,
 							State0Readback,
 							State1Readback,
-							AxisReadback,
 							InitialTargetDebugReadback,
 							InitialState0DebugReadback,
 							InitialState1DebugReadback,
@@ -1683,7 +1394,6 @@ static bool BuildSpaceColonizationQueueCSImpl(
 
 					bool bLockedAll =
 						LockSpaceColonizationReadbackToArray(TargetReadback, TargetReadbackBytes, TargetCount, TargetPositionData) &&
-						LockSpaceColonizationReadbackToArray(AxisReadback, TargetReadbackBytes, TargetCount, AxisData) &&
 						LockSpaceColonizationReadbackToArray(State0Readback, StateReadbackBytes, TargetCount, State0Data) &&
 						LockSpaceColonizationReadbackToArray(State1Readback, StateReadbackBytes, TargetCount, State1Data);
 
@@ -1730,7 +1440,6 @@ static bool BuildSpaceColonizationQueueCSImpl(
 						TargetReadback,
 						State0Readback,
 						State1Readback,
-						AxisReadback,
 						InitialTargetDebugReadback,
 						InitialState0DebugReadback,
 						InitialState1DebugReadback,
@@ -1753,14 +1462,9 @@ static bool BuildSpaceColonizationQueueCSImpl(
 
 		{
 			GV_TIME_SCOPE(TEXT("SpaceColonizationCS.Queue.CopyResults"));
-			ConvertSpaceColonizationGPUStateToAttributes(TargetPositionData, State0Data, State1Data, OutTargetLocations, OutSCAttributes, &AxisData);
+			ConvertSpaceColonizationGPUStateToAttributes(TargetPositionData, State0Data, State1Data, OutTargetLocations, OutSCAttributes);
 		}
 
-		if (CSDebugData.bInitialReadbackSucceeded)
-		{
-			LogSpaceColonizationSourcePositionCheck(TEXT("CS"), TEXT("AfterMarkSources"), ExpectedSourcePositions, CSDebugData.InitialTargetPositions, SourceCount);
-		}
-		LogSpaceColonizationSourcePositionCheck(TEXT("CS"), TEXT("Final"), ExpectedSourcePositions, TargetPositionData, SourceCount);
 		LogSpaceColonizationCSDebugData(CSDebugData);
 		return true;
 	}
@@ -1892,6 +1596,7 @@ static void BuildSpaceColonizationQueueImpl(
 				for (const int32 Index : OutSCAttributes[p].Associates)
 				{
 					const FVector Dir = (OutTargetLocations[Index] - OutTargetLocations[p]);
+					//Dir.Normalize();
 					DirSum += Dir;
 				}
 				DirSum.Normalize();
@@ -1984,6 +1689,7 @@ static void BuildSpaceColonizationQueueImpl(
 				for (const int32 Index : OutSCAttributes[p].Associates)
 				{
 					const FVector Dir = (OutTargetLocations[Index] - OutTargetLocations[p]);
+					//Dir.Normalize();
 					DirSum += Dir;
 				}
 				DirSum.Normalize();
@@ -2040,10 +1746,7 @@ static TArray<FSpaceColonizationLineResult> BuildSpaceColonizationLineResultsImp
 	TArray<FSpaceColonizationAttribute>& SCAttributes,
 	int32 BackGrowCount,
 	const TArray<float>& TargetPointScales,
-	const TArray<float>& StartSourceScales,
-	ESpaceColonizationLineResultMode ResultMode,
-	const TArray<FVector>* StartSourceLocations = nullptr,
-	const TArray<uint8>* StartSourceLocationValid = nullptr)
+	const TArray<float>& StartSourceScales)
 {
 	GV_TIME_SCOPE(TEXT("SpaceColonization.BuildLines"));
 	TArray<FSpaceColonizationLineResult> Lines;
@@ -2053,9 +1756,7 @@ static TArray<FSpaceColonizationLineResult> BuildSpaceColonizationLineResultsImp
 		return Lines;
 	}
 
-	const int32 MaxBacktrackSteps = ResultMode == ESpaceColonizationLineResultMode::SourceToTipAnchored
-		? FMath::Max(NumPt, 1)
-		: 100;
+	constexpr int32 MaxBacktrackSteps = 100;
 	const int32 PreForkAncestorCount = FMath::Clamp(BackGrowCount, 0, MaxBacktrackSteps);
 	constexpr int32 PreservedBranchCount = 3;
 
@@ -2097,16 +1798,11 @@ static TArray<FSpaceColonizationLineResult> BuildSpaceColonizationLineResultsImp
 
 		TArray<FVector> Line;
 		TArray<float> LinePointScales;
-		TArray<FVector> LinePointAxes;
-		TArray<int32> PathNodeIndices;
 		int32 LineCount = 0;
 		int32 CurrentIndex = p;
-		int32 ForkAttenuationStartPathIndex = INDEX_NONE;
 
 		Line.Add(TargetLocations[CurrentIndex]);
 		LinePointScales.Add(ResolveSpaceColonizationOutputScale(CurrentIndex, SCAttributes, TargetPointScales, StartSourceScales));
-		LinePointAxes.Add(SCAttributes[CurrentIndex].N.GetSafeNormal());
-		PathNodeIndices.Add(CurrentIndex);
 		//float LineLength = 0;
 		while (LineCount < MaxBacktrackSteps)
 		{
@@ -2119,16 +1815,10 @@ static TArray<FSpaceColonizationLineResult> BuildSpaceColonizationLineResultsImp
 
 			Line.Add(TargetLocations[PreIndex]);
 			LinePointScales.Add(ResolveSpaceColonizationOutputScale(PreIndex, SCAttributes, TargetPointScales, StartSourceScales));
-			LinePointAxes.Add(SCAttributes[PreIndex].N.GetSafeNormal());
 			CurrentIndex = PreIndex;
 			LineCount += 1;
-			PathNodeIndices.Add(CurrentIndex);
-			if (ResultMode == ESpaceColonizationLineResultMode::VisualizationTipToRoot
-				&& SCAttributes[CurrentIndex].BranchCount > PreservedBranchCount
-				&& BranchOrderByNode[ChildIndex] > PreservedBranchCount)
+			if (SCAttributes[CurrentIndex].BranchCount > PreservedBranchCount && BranchOrderByNode[ChildIndex] > PreservedBranchCount)
 			{
-				ForkAttenuationStartPathIndex = PathNodeIndices.Num() - 1;
-
 				// Keep a fixed number of ancestors before the cutoff fork. Fork ancestors count
 				// the same as regular points, so consecutive forks are preserved as points.
 				for (int32 PreForkAncestorIndex = 0; PreForkAncestorIndex < PreForkAncestorCount && LineCount < MaxBacktrackSteps; ++PreForkAncestorIndex)
@@ -2141,10 +1831,8 @@ static TArray<FSpaceColonizationLineResult> BuildSpaceColonizationLineResultsImp
 
 					Line.Add(TargetLocations[BeforeForkIndex]);
 					LinePointScales.Add(ResolveSpaceColonizationOutputScale(BeforeForkIndex, SCAttributes, TargetPointScales, StartSourceScales));
-					LinePointAxes.Add(SCAttributes[BeforeForkIndex].N.GetSafeNormal());
 					CurrentIndex = BeforeForkIndex;
 					LineCount += 1;
-					PathNodeIndices.Add(CurrentIndex);
 				}
 				break;
 			}
@@ -2156,52 +1844,6 @@ static TArray<FSpaceColonizationLineResult> BuildSpaceColonizationLineResultsImp
 			continue;
 		}
 
-		if (ResultMode == ESpaceColonizationLineResultMode::SourceToTipAnchored)
-		{
-			const int32 StartId = SCAttributes[p].Startid;
-			FVector SourceLocation;
-			if (ResolveSpaceColonizationStartSourceLocation(StartId, StartSourceLocations, StartSourceLocationValid, SourceLocation))
-			{
-				if (Line.Num() > 0 && FVector::DistSquared(Line.Last(), SourceLocation) <= 1.0)
-				{
-					Line.Last() = SourceLocation;
-				}
-				else
-				{
-					Line.Add(SourceLocation);
-					LinePointScales.Add(ResolveSpaceColonizationOutputScale(StartId, SCAttributes, TargetPointScales, StartSourceScales));
-					const FVector SourceAxis = SCAttributes.IsValidIndex(StartId)
-						? SCAttributes[StartId].N.GetSafeNormal()
-						: (LinePointAxes.Num() > 0 ? LinePointAxes.Last() : FVector::ZeroVector);
-					LinePointAxes.Add(SourceAxis);
-					PathNodeIndices.Add(StartId);
-				}
-			}
-
-			ReverseSpaceColonizationArray(Line);
-			ReverseSpaceColonizationArray(LinePointScales);
-			ReverseSpaceColonizationArray(LinePointAxes);
-			ReverseSpaceColonizationArray(PathNodeIndices);
-		}
-
-		// Only taper the retained root-to-fork connector after a cutoff fork.
-		// The independent branch body before the fork should keep its normal thickness.
-		const int32 PathPointCount = PathNodeIndices.Num();
-		if (ForkAttenuationStartPathIndex != INDEX_NONE)
-		{
-			const int32 AttenuationStart = FMath::Clamp(ForkAttenuationStartPathIndex, 0, PathPointCount - 1);
-			const int32 AttenuationPointCount = PathPointCount - AttenuationStart;
-			for (int32 PathIdx = AttenuationStart; PathIdx < PathPointCount; ++PathIdx)
-			{
-				// Line is built from tip to root: PathIdx=0 is tip, PathIdx=N-1 is rootmost
-				const float Alpha = AttenuationPointCount > 1
-					? static_cast<float>(PathIdx - AttenuationStart) / static_cast<float>(AttenuationPointCount - 1)
-					: 0.0f;
-				const float Attenuation = FMath::Lerp(1.0f, 0.1f, Alpha);
-				LinePointScales[PathIdx] *= Attenuation;
-			}
-		}
-
 		FGeometryScriptPolyPath PolyPath;
 		PolyPath.Reset();
 		*PolyPath.Path = Line;
@@ -2209,7 +1851,6 @@ static TArray<FSpaceColonizationLineResult> BuildSpaceColonizationLineResultsImp
 		FSpaceColonizationLineResult LineResult;
 		LineResult.Path = PolyPath;
 		LineResult.PointScales = MoveTemp(LinePointScales);
-		LineResult.PointAxes = MoveTemp(LinePointAxes);
 		Lines.Add(MoveTemp(LineResult));
 	}
 
@@ -2225,65 +1866,6 @@ static TArray<FGeometryScriptPolyPath> ExtractSpaceColonizationPaths(const TArra
 		Lines.Add(LineResult.Path);
 	}
 	return Lines;
-}
-
-static TArray<FSpaceColonizationLineResult> SpaceColonizationCSWithScalesImpl(
-	TArray<FTransform> SourceTransforms,
-	TArray<FTransform> TargetTransforms,
-	int32 Iterations,
-	int32 Activetime,
-	int32 BackGrowCount,
-	float Ranggrow,
-	float Seed,
-	float BackGrowRange,
-	float InfluenceRadius,
-	ESpaceColonizationLineResultMode ResultMode)
-{
-	GV_TIME_SCOPE(TEXT("SpaceColonization.TotalCS"));
-	(void)BackGrowRange;
-	TArray<FVector> TargetLocations;
-	TArray<FSpaceColonizationAttribute> SCAttributes;
-	TArray<float> TargetPointScales;
-	TArray<float> StartSourceScales;
-	TArray<FVector> StartSourceLocations;
-	TArray<uint8> StartSourceLocationValid;
-	BuildSpaceColonizationScaleLookups(
-		SourceTransforms,
-		TargetTransforms,
-		TargetPointScales,
-		StartSourceScales,
-		&StartSourceLocations,
-		&StartSourceLocationValid);
-
-	if (!BuildSpaceColonizationQueueCSImpl(
-		SourceTransforms,
-		TargetTransforms,
-		Iterations,
-		Activetime,
-		Ranggrow,
-		Seed,
-		InfluenceRadius,
-		TargetLocations,
-		SCAttributes))
-	{
-		return {};
-	}
-
-	const TArray<FVector>* SourceLocationsPtr = ResultMode == ESpaceColonizationLineResultMode::SourceToTipAnchored
-		? &StartSourceLocations
-		: nullptr;
-	const TArray<uint8>* SourceLocationValidPtr = ResultMode == ESpaceColonizationLineResultMode::SourceToTipAnchored
-		? &StartSourceLocationValid
-		: nullptr;
-	return BuildSpaceColonizationLineResultsImpl(
-		TargetLocations,
-		SCAttributes,
-		BackGrowCount,
-		TargetPointScales,
-		StartSourceScales,
-		ResultMode,
-		SourceLocationsPtr,
-		SourceLocationValidPtr);
 }
 }
 
@@ -2337,29 +1919,408 @@ TArray<FSpaceColonizationLineResult> UGenerateVines::SpaceColonizationWithScales
 {
 	GV_TIME_SCOPE(TEXT("SpaceColonization.TotalCPU"));
 	(void)BackGrowRange;
-	TArray<FVector> TargetLocations;
-	TArray<FSpaceColonizationAttribute> SCAttributes;
+
+	// ============================================================
+	//  1. Build Scale Lookups
+	// ============================================================
 	TArray<float> TargetPointScales;
 	TArray<float> StartSourceScales;
-	BuildSpaceColonizationCPUScaleLookups(SourceTransforms, TargetTransforms, TargetPointScales, StartSourceScales);
-	BuildSpaceColonizationQueueImpl(
-		SourceTransforms,
-		TargetTransforms,
-		Iteration,
-		Activetime,
-		RandGrow,
-		Seed,
-		MultThread,
-		TargetLocations,
-		SCAttributes);
+	{
+		TargetPointScales.Reset();
+		StartSourceScales.Reset();
 
-	return BuildSpaceColonizationLineResultsImpl(
-		TargetLocations,
-		SCAttributes,
-		BackGrowCount,
-		TargetPointScales,
-		StartSourceScales,
-		ESpaceColonizationLineResultMode::VisualizationTipToRoot);
+		const int32 ScaleTargetCount = TargetTransforms.Num();
+		TargetPointScales.Reserve(ScaleTargetCount);
+		StartSourceScales.Init(1.0f, ScaleTargetCount);
+		if (ScaleTargetCount > 0)
+		{
+			TArray<FVector> ScaleTargetLocations;
+			ScaleTargetLocations.Reserve(ScaleTargetCount);
+			for (const FTransform& TargetTransform : TargetTransforms)
+			{
+				ScaleTargetLocations.Add(TargetTransform.GetLocation());
+				TargetPointScales.Add(GetSpaceColonizationTransformScale(TargetTransform));
+			}
+
+			for (const FTransform& SourceTransform : SourceTransforms)
+			{
+				const int32 NearPointIndex = UPointFunction::FindNearPointIteration(ScaleTargetLocations, SourceTransform.GetLocation());
+				if (NearPointIndex != -1)
+				{
+					StartSourceScales[NearPointIndex] = GetSpaceColonizationTransformScale(SourceTransform);
+				}
+			}
+		}
+	}
+
+	// ============================================================
+	//  2. Build Space Colonization Queue
+	// ============================================================
+	TArray<FVector> TargetLocations;
+	TArray<FSpaceColonizationAttribute> SCAttributes;
+	{
+		GV_TIME_SCOPE(TEXT("SpaceColonization.QueueCPU.Total"));
+		TargetLocations.Reset();
+		SCAttributes.Reset();
+
+		LogSpaceColonizationInput(TEXT("CPU"), SourceTransforms.Num(), TargetTransforms.Num(), Iteration, Activetime, RandGrow, Seed, 200.0f, MultThread);
+
+		if (SourceTransforms.Num() == 0 || TargetTransforms.Num() == 0)
+		{
+			goto BuildLines;
+		}
+
+		TArray<FVector> SourceLocations;
+		{
+			GV_TIME_SCOPE(TEXT("SpaceColonization.QueueCPU.PreparePositions"));
+			SourceLocations.Reserve(SourceTransforms.Num());
+			TargetLocations.Reserve(TargetTransforms.Num());
+			SCAttributes.SetNum(TargetTransforms.Num());
+
+			for (const FTransform& Transform : SourceTransforms)
+			{
+				SourceLocations.Add(Transform.GetLocation());
+			}
+
+			for (const FTransform& Transform : TargetTransforms)
+			{
+				TargetLocations.Add(Transform.GetLocation());
+			}
+
+			for (const FVector& SourceLocation : SourceLocations)
+			{
+				const int32 Nearpt = UPointFunction::FindNearPointIteration(TargetLocations, SourceLocation);
+				if (Nearpt == -1)
+				{
+					continue;
+				}
+
+				SCAttributes[Nearpt].Attractor = false;
+				SCAttributes[Nearpt].Startpt = true;
+				SCAttributes[Nearpt].Startid = Nearpt;
+			}
+		}
+		LogSpaceColonizationQueueState(TEXT("CPU"), TEXT("AfterMarkSources"), -1, TargetLocations, SCAttributes);
+
+		float Infrad = 200;
+		const int32 ThreadPointNum = 1;
+		const int32 NumPt = TargetLocations.Num();
+		const int32 MaxNeighborsPerTarget = FMath::Clamp(SpaceColonizationMaxNeighborsPerTarget, 1, FMath::Max(NumPt, 1));
+		const TArray<FVector> InitialTargetLocations = TargetLocations;
+		TArray<uint32> NeighborCounts;
+		TArray<int32> NeighborIndices;
+		BuildSpaceColonizationCPUNeighbors(InitialTargetLocations, Infrad, MaxNeighborsPerTarget, NeighborCounts, NeighborIndices);
+		LogSpaceColonizationNeighborCounts(TEXT("CPU"), NeighborCounts);
+
+		double ResetAssociatesMs = 0.0;
+		double FindAssociatesMs = 0.0;
+		double MergeAssociatesMs = 0.0;
+		double ProposeGrowthMs = 0.0;
+		double CommitGrowthMs = 0.0;
+
+		for (int32 i = 0; i < Iteration; i++)
+		{
+			double StageStartSeconds = FPlatformTime::Seconds();
+			for (int32 p = 0; p < NumPt; p++)
+			{
+				SCAttributes[p].Associates.Reset();
+			}
+			ResetAssociatesMs += (FPlatformTime::Seconds() - StageStartSeconds) * 1000.0;
+			LogSpaceColonizationAssociates(TEXT("CPU"), TEXT("AfterResetAssociates"), i, SCAttributes);
+
+			if (MultThread)
+			{
+				SCOPE_CYCLE_COUNTER(STAT_SpaceColonizationMultThread)
+				StageStartSeconds = FPlatformTime::Seconds();
+				PopulateSpaceColonizationAssociatesFromNeighbors(TargetLocations, Infrad, NeighborCounts, NeighborIndices, MaxNeighborsPerTarget, SCAttributes);
+				FindAssociatesMs += (FPlatformTime::Seconds() - StageStartSeconds) * 1000.0;
+				LogSpaceColonizationAssociates(TEXT("CPU"), TEXT("AfterFindAssociates"), i, SCAttributes);
+
+				StageStartSeconds = FPlatformTime::Seconds();
+				TArray<TTuple<FIndex3i, FVector>> ProcessResult = ProcessAsync::ProcessAsync<TTuple<FIndex3i, FVector>>(NumPt, ThreadPointNum, [&](const int32 p)
+				{
+					TTuple<FIndex3i, FVector> ThreadCalculate;
+					ThreadCalculate.Key = FIndex3i(-1, -1, 0);
+					const float Grow = FMath::RandRange(0, 1);
+					if (SCAttributes[p].Attractor == true
+						|| SCAttributes[p].SpawnCount < i - Activetime
+						|| (Grow < RandGrow && i > 10)
+						|| SCAttributes[p].Associates.Num() == 0
+						|| SCAttributes[p].BranchCount > 2)
+					{
+						return ThreadCalculate;
+					}
+
+					int32 NearPt = -1;
+					float NearestDist = 0.0f;
+					if (!FindSpaceColonizationNearestAttractorFromNeighbors(
+						p,
+						TargetLocations,
+						SCAttributes,
+						NeighborCounts,
+						NeighborIndices,
+						MaxNeighborsPerTarget,
+						NearPt,
+						NearestDist))
+					{
+						return ThreadCalculate;
+					}
+
+					FVector DirSum = FVector::ZeroVector;
+					for (const int32 Index : SCAttributes[p].Associates)
+					{
+						const FVector Dir = (TargetLocations[Index] - TargetLocations[p]);
+						DirSum += Dir;
+					}
+					DirSum.Normalize();
+
+					ThreadCalculate.Key = FIndex3i(p, NearPt, 1);
+					ThreadCalculate.Value = TargetLocations[p] + DirSum * NearestDist;
+
+					return ThreadCalculate;
+				});
+				ProposeGrowthMs += (FPlatformTime::Seconds() - StageStartSeconds) * 1000.0;
+
+				StageStartSeconds = FPlatformTime::Seconds();
+				TArray<FSpaceColonizationGrowthDebugEvent> GrowthEvents;
+				for (int32 j = 0; j < ProcessResult.Num(); j++)
+				{
+					if (ProcessResult[j].Key.C == 0)
+					{
+						continue;
+					}
+
+					const int32 p = ProcessResult[j].Key.A;
+					const int32 NearPt = ProcessResult[j].Key.B;
+					const FVector OldTargetPosition = TargetLocations[NearPt];
+					const int32 AssociateCount = SCAttributes[p].Associates.Num();
+					SCAttributes[p].SpawnCount += 1;
+					TargetLocations[NearPt] = ProcessResult[j].Value;
+					SCAttributes[NearPt].Startid = SCAttributes[p].Startid;
+					SCAttributes[NearPt].SpawnCount = SCAttributes[p].SpawnCount;
+					SCAttributes[NearPt].Attractor = false;
+					SCAttributes[NearPt].End = true;
+					SCAttributes[NearPt].BranchCount = 1;
+					SCAttributes[p].End = false;
+
+					SCAttributes[NearPt].PrePt = p;
+					SCAttributes[p].NextPt = NearPt;
+					SCAttributes[p].BranchCount += 1;
+
+					FSpaceColonizationGrowthDebugEvent& Event = GrowthEvents.AddDefaulted_GetRef();
+					Event.SourceIndex = p;
+					Event.TargetIndex = NearPt;
+					Event.AssociateCount = AssociateCount;
+					Event.ParentSpawnAfter = SCAttributes[p].SpawnCount;
+					Event.ParentBranchAfter = SCAttributes[p].BranchCount;
+					Event.OldTargetPosition = OldTargetPosition;
+					Event.NewTargetPosition = TargetLocations[NearPt];
+					Event.MoveDistance = FVector::Dist(OldTargetPosition, TargetLocations[NearPt]);
+				}
+				CommitGrowthMs += (FPlatformTime::Seconds() - StageStartSeconds) * 1000.0;
+				LogSpaceColonizationGrowthEvents(TEXT("CPU"), TEXT("AfterProposeGrowth"), i, GrowthEvents);
+				LogSpaceColonizationQueueState(TEXT("CPU"), TEXT("AfterCommitGrowth"), i, TargetLocations, SCAttributes);
+			}
+			else
+			{
+				SCOPE_CYCLE_COUNTER(STAT_SpaceColonization)
+				StageStartSeconds = FPlatformTime::Seconds();
+				PopulateSpaceColonizationAssociatesFromNeighbors(TargetLocations, Infrad, NeighborCounts, NeighborIndices, MaxNeighborsPerTarget, SCAttributes);
+				FindAssociatesMs += (FPlatformTime::Seconds() - StageStartSeconds) * 1000.0;
+				LogSpaceColonizationAssociates(TEXT("CPU"), TEXT("AfterFindAssociates"), i, SCAttributes);
+
+				StageStartSeconds = FPlatformTime::Seconds();
+				TArray<FSpaceColonizationGrowthDebugEvent> GrowthEvents;
+				for (int32 p = 0; p < NumPt; p++)
+				{
+					const float Grow = FMath::RandRange(0, 1);
+					if (SCAttributes[p].Attractor == true
+						|| SCAttributes[p].SpawnCount < i - Activetime
+						|| (Grow < RandGrow && i > 10)
+						|| SCAttributes[p].Associates.Num() == 0
+						|| SCAttributes[p].BranchCount > 2)
+					{
+						continue;
+					}
+
+					int32 NearPt = -1;
+					float NearestDist = 0.0f;
+					if (!FindSpaceColonizationNearestAttractorFromNeighbors(
+						p,
+						TargetLocations,
+						SCAttributes,
+						NeighborCounts,
+						NeighborIndices,
+						MaxNeighborsPerTarget,
+						NearPt,
+						NearestDist))
+					{
+						continue;
+					}
+
+					FVector DirSum = FVector::ZeroVector;
+					for (const int32 Index : SCAttributes[p].Associates)
+					{
+						const FVector Dir = (TargetLocations[Index] - TargetLocations[p]);
+						DirSum += Dir;
+					}
+					DirSum.Normalize();
+
+					const FVector OldTargetPosition = TargetLocations[NearPt];
+					const int32 AssociateCount = SCAttributes[p].Associates.Num();
+					const FVector NewTargetPosition = TargetLocations[p] + DirSum * NearestDist;
+					SCAttributes[p].SpawnCount += 1;
+					TargetLocations[NearPt] = NewTargetPosition;
+					SCAttributes[NearPt].Startid = SCAttributes[p].Startid;
+					SCAttributes[NearPt].SpawnCount = SCAttributes[p].SpawnCount;
+					SCAttributes[NearPt].Attractor = false;
+					SCAttributes[NearPt].End = true;
+					SCAttributes[NearPt].BranchCount = 1;
+					SCAttributes[p].End = false;
+
+					SCAttributes[NearPt].PrePt = p;
+					SCAttributes[p].NextPt = NearPt;
+					SCAttributes[p].BranchCount += 1;
+
+					FSpaceColonizationGrowthDebugEvent& Event = GrowthEvents.AddDefaulted_GetRef();
+					Event.SourceIndex = p;
+					Event.TargetIndex = NearPt;
+					Event.AssociateCount = AssociateCount;
+					Event.ParentSpawnAfter = SCAttributes[p].SpawnCount;
+					Event.ParentBranchAfter = SCAttributes[p].BranchCount;
+					Event.OldTargetPosition = OldTargetPosition;
+					Event.NewTargetPosition = NewTargetPosition;
+					Event.MoveDistance = FVector::Dist(OldTargetPosition, NewTargetPosition);
+				}
+				CommitGrowthMs += (FPlatformTime::Seconds() - StageStartSeconds) * 1000.0;
+				LogSpaceColonizationGrowthEvents(TEXT("CPU"), TEXT("AfterProposeGrowth"), i, GrowthEvents);
+				LogSpaceColonizationQueueState(TEXT("CPU"), TEXT("AfterCommitGrowth"), i, TargetLocations, SCAttributes);
+			}
+		}
+
+#if GV_ENABLE_PERF_LOGS
+		PCG_DEBUG_LOG(LogTemp, Display,
+			TEXT("[GenerateVinesTiming] SpaceColonization.QueueCPU.Iterations: Iterations=%d Sources=%d Targets=%d MultThread=%s ResetAssociates=%.3f ms FindAssociates=%.3f ms MergeAssociates=%.3f ms ProposeGrowth=%.3f ms CommitGrowth=%.3f ms"),
+			Iteration,
+			SourceTransforms.Num(),
+			TargetTransforms.Num(),
+			MultThread ? TEXT("true") : TEXT("false"),
+			ResetAssociatesMs,
+			FindAssociatesMs,
+			MergeAssociatesMs,
+			ProposeGrowthMs,
+			CommitGrowthMs);
+#endif
+	}
+
+	// ============================================================
+	//  3. Build Line Results
+	// ============================================================
+BuildLines:
+	{
+		GV_TIME_SCOPE(TEXT("SpaceColonization.BuildLines"));
+		TArray<FSpaceColonizationLineResult> Lines;
+		const int32 NumPt = TargetLocations.Num();
+		if (NumPt == 0 || SCAttributes.Num() != NumPt)
+		{
+			return Lines;
+		}
+
+		constexpr int32 MaxBacktrackSteps = 100;
+		const int32 PreForkAncestorCount = FMath::Clamp(BackGrowCount, 0, MaxBacktrackSteps);
+		constexpr int32 PreservedBranchCount = 3;
+
+		TArray<int32> BranchOrderByNode;
+		BranchOrderByNode.Init(0, NumPt);
+		for (int32 ChildIndex = 0; ChildIndex < NumPt; ++ChildIndex)
+		{
+			const int32 ParentIndex = SCAttributes[ChildIndex].PrePt;
+			if (ParentIndex < 0 || ParentIndex >= NumPt)
+			{
+				continue;
+			}
+
+			int32 BranchOrder = 1;
+			for (int32 SiblingIndex = 0; SiblingIndex < NumPt; ++SiblingIndex)
+			{
+				if (SiblingIndex == ChildIndex || SCAttributes[SiblingIndex].PrePt != ParentIndex)
+				{
+					continue;
+				}
+
+				const int32 SiblingSpawnCount = SCAttributes[SiblingIndex].SpawnCount;
+				const int32 ChildSpawnCount = SCAttributes[ChildIndex].SpawnCount;
+				if (SiblingSpawnCount < ChildSpawnCount || (SiblingSpawnCount == ChildSpawnCount && SiblingIndex < ChildIndex))
+				{
+					BranchOrder += 1;
+				}
+			}
+			BranchOrderByNode[ChildIndex] = BranchOrder;
+		}
+
+		for (int32 p = 0; p < NumPt; p++)
+		{
+			if (SCAttributes[p].End != true)
+			{
+				continue;
+			}
+
+			TArray<FVector> Line;
+			TArray<float> LinePointScales;
+			int32 LineCount = 0;
+			int32 CurrentIndex = p;
+
+			Line.Add(TargetLocations[CurrentIndex]);
+			LinePointScales.Add(ResolveSpaceColonizationOutputScale(CurrentIndex, SCAttributes, TargetPointScales, StartSourceScales));
+			while (LineCount < MaxBacktrackSteps)
+			{
+				const int32 ChildIndex = CurrentIndex;
+				const int32 PreIndex = SCAttributes[CurrentIndex].PrePt;
+				if (PreIndex < 0 || PreIndex >= NumPt)
+				{
+					break;
+				}
+
+				Line.Add(TargetLocations[PreIndex]);
+				LinePointScales.Add(ResolveSpaceColonizationOutputScale(PreIndex, SCAttributes, TargetPointScales, StartSourceScales));
+				CurrentIndex = PreIndex;
+				LineCount += 1;
+				if (SCAttributes[CurrentIndex].BranchCount > PreservedBranchCount && BranchOrderByNode[ChildIndex] > PreservedBranchCount)
+				{
+					for (int32 PreForkAncestorIndex = 0; PreForkAncestorIndex < PreForkAncestorCount && LineCount < MaxBacktrackSteps; ++PreForkAncestorIndex)
+					{
+						const int32 BeforeForkIndex = SCAttributes[CurrentIndex].PrePt;
+						if (BeforeForkIndex < 0 || BeforeForkIndex >= NumPt)
+						{
+							break;
+						}
+
+						Line.Add(TargetLocations[BeforeForkIndex]);
+						LinePointScales.Add(ResolveSpaceColonizationOutputScale(BeforeForkIndex, SCAttributes, TargetPointScales, StartSourceScales));
+						CurrentIndex = BeforeForkIndex;
+						LineCount += 1;
+					}
+					break;
+				}
+			}
+
+			if (Line.Num() == 0)
+			{
+				continue;
+			}
+
+			FGeometryScriptPolyPath PolyPath;
+			PolyPath.Reset();
+			*PolyPath.Path = Line;
+
+			FSpaceColonizationLineResult LineResult;
+			LineResult.Path = PolyPath;
+			LineResult.PointScales = MoveTemp(LinePointScales);
+			Lines.Add(MoveTemp(LineResult));
+		}
+
+		return Lines;
+	}
 }
 
 TArray<FGeometryScriptPolyPath> UGenerateVines::SpaceColonizationCS(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, int32 Iterations, int32 Activetime, int32 BackGrowCount, float Ranggrow, float Seed, float BackGrowRange, float InfluenceRadius)
@@ -2378,30 +2339,78 @@ TArray<FGeometryScriptPolyPath> UGenerateVines::SpaceColonizationCS(TArray<FTran
 
 TArray<FSpaceColonizationLineResult> UGenerateVines::SpaceColonizationCSWithScales(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, int32 Iterations, int32 Activetime, int32 BackGrowCount, float Ranggrow, float Seed, float BackGrowRange, float InfluenceRadius)
 {
-	return SpaceColonizationCSWithScalesImpl(
+	GV_TIME_SCOPE(TEXT("SpaceColonization.TotalCS"));
+	(void)BackGrowRange;
+	TArray<FVector> TargetLocations;
+	TArray<FSpaceColonizationAttribute> SCAttributes;
+	TArray<float> TargetPointScales;
+	TArray<float> StartSourceScales;
+	BuildSpaceColonizationScaleLookups(SourceTransforms, TargetTransforms, TargetPointScales, StartSourceScales);
+	if (!BuildSpaceColonizationQueueCSImpl(
 		SourceTransforms,
 		TargetTransforms,
 		Iterations,
 		Activetime,
-		BackGrowCount,
 		Ranggrow,
 		Seed,
-		BackGrowRange,
 		InfluenceRadius,
-		ESpaceColonizationLineResultMode::SourceToTipAnchored);
+		TargetLocations,
+		SCAttributes))
+	{
+		return {};
+	}
+
+	return BuildSpaceColonizationLineResultsImpl(TargetLocations, SCAttributes, BackGrowCount, TargetPointScales, StartSourceScales);
 }
 
-TArray<FSpaceColonizationLineResult> UGenerateVines::SpaceColonizationCSWithScalesForVisualization(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, int32 Iterations, int32 Activetime, int32 BackGrowCount, float Ranggrow, float Seed, float BackGrowRange, float InfluenceRadius)
+// ---- Struct overloads (delegate to individual-parameter versions) ----
+
+void UGenerateVines::BuildSpaceColonizationQueue(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms,
+	const FSpaceColonizationOptions& Options,
+	TArray<FVector>& OutTargetLocations, TArray<FSpaceColonizationAttribute>& OutSCAttributes)
 {
-	return SpaceColonizationCSWithScalesImpl(
-		SourceTransforms,
-		TargetTransforms,
-		Iterations,
-		Activetime,
-		BackGrowCount,
-		Ranggrow,
-		Seed,
-		BackGrowRange,
-		InfluenceRadius,
-		ESpaceColonizationLineResultMode::VisualizationTipToRoot);
+	BuildSpaceColonizationQueue(SourceTransforms, TargetTransforms,
+		Options.Iteration, Options.Activetime, Options.RandGrow, Options.Seed, Options.bMultithread,
+		OutTargetLocations, OutSCAttributes);
+}
+
+bool UGenerateVines::BuildSpaceColonizationQueueCS(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms,
+	const FSpaceColonizationOptions& Options,
+	TArray<FVector>& OutTargetLocations, TArray<FSpaceColonizationAttribute>& OutSCAttributes)
+{
+	return BuildSpaceColonizationQueueCS(SourceTransforms, TargetTransforms,
+		Options.Iteration, Options.Activetime, Options.RandGrow, Options.Seed, Options.InfluenceRadius,
+		OutTargetLocations, OutSCAttributes);
+}
+
+TArray<FGeometryScriptPolyPath> UGenerateVines::SpaceColonization(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms,
+	const FSpaceColonizationOptions& Options)
+{
+	return SpaceColonization(SourceTransforms, TargetTransforms,
+		Options.Iteration, Options.Activetime, Options.BackGrowCount,
+		Options.RandGrow, Options.Seed, Options.BackGrowRange, Options.bMultithread);
+}
+
+TArray<FSpaceColonizationLineResult> UGenerateVines::SpaceColonizationWithScales(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms,
+	const FSpaceColonizationOptions& Options)
+{
+	return SpaceColonizationWithScales(SourceTransforms, TargetTransforms,
+		Options.Iteration, Options.Activetime, Options.BackGrowCount,
+		Options.RandGrow, Options.Seed, Options.BackGrowRange, Options.bMultithread);
+}
+
+TArray<FGeometryScriptPolyPath> UGenerateVines::SpaceColonizationCS(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms,
+	const FSpaceColonizationOptions& Options)
+{
+	return SpaceColonizationCS(SourceTransforms, TargetTransforms,
+		Options.Iteration, Options.Activetime, Options.BackGrowCount,
+		Options.RandGrow, Options.Seed, Options.BackGrowRange, Options.InfluenceRadius);
+}
+
+TArray<FSpaceColonizationLineResult> UGenerateVines::SpaceColonizationCSWithScales(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms,
+	const FSpaceColonizationOptions& Options)
+{
+	return SpaceColonizationCSWithScales(SourceTransforms, TargetTransforms,
+		Options.Iteration, Options.Activetime, Options.BackGrowCount,
+		Options.RandGrow, Options.Seed, Options.BackGrowRange, Options.InfluenceRadius);
 }

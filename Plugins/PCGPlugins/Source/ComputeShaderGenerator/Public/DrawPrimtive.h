@@ -94,6 +94,15 @@ public:
 		int32 MaxTriangles = 200000,
 		float EmptyHeight = 0.0f);
 
+	/** Reads a world-Z height render target and draws a fixed 100x100 debug point grid. Duration <= 0 skips debug drawing. */
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader|DrawPrimtive|Debug", meta = (WorldContext = "WorldContextObject"))
+	static int32 DrawDebugBoxSceneWorldZHeightSamples(
+		UObject* WorldContextObject,
+		FTransform BoxTransform,
+		FVector BoxSize,
+		UTextureRenderTarget2D* HeightRenderTarget,
+		float Duration);
+
 	/** Blueprint helper: gathers scene mesh triangles in BoxTransform/BoxSize, filtering by actor tag when set. */
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader|DrawPrimtive", meta = (WorldContext = "WorldContextObject"))
 	static FCSTriangleMeshData GetTaggedBoxSceneTriangles(

@@ -221,6 +221,84 @@ static double GetVinePolyPathLength(const FGeometryScriptPolyPath& Line)
 	return Length;
 }
 
+static float GetSanitizedVineUVScale(float Scale)
+{
+	return FMath::IsFinite(Scale) ? FMath::Max(Scale, 0.0f) : 0.0f;
+}
+
+static void BuildVineScaleWeightedCurveUFromSegmentLengths(
+	const TArray<float>& SegmentLengths,
+	const TArray<float>& PointScales,
+	const FVineVisualization& VV,
+	TArray<float>& OutCurveU)
+{
+	OutCurveU.Reset();
+
+	const int32 PointCount = PointScales.Num();
+	if (PointCount <= 0)
+	{
+		return;
+	}
+
+	OutCurveU.SetNumZeroed(PointCount);
+	if (PointCount == 1)
+	{
+		return;
+	}
+
+	float MaxScale = 1.0e-8f;
+	for (const float Scale : PointScales)
+	{
+		MaxScale = FMath::Max(MaxScale, GetSanitizedVineUVScale(Scale));
+	}
+
+	const float Influence = FMath::Clamp(VV.UVScaleInfluence, 0.0f, 1.0f);
+	const float ScaleFloor = FMath::Clamp(VV.UVScaleFloor, 0.001f, 1.0f);
+	const float ScalePower = FMath::Clamp(VV.UVScalePower, 0.0f, 4.0f);
+	const float LengthScale = FMath::Max(VV.UVLengthScale, 1.0e-8f);
+
+	for (int32 PointIndex = 1; PointIndex < PointCount; ++PointIndex)
+	{
+		const float SegmentLength = SegmentLengths.IsValidIndex(PointIndex - 1) ? FMath::Max(SegmentLengths[PointIndex - 1], 0.0f) : 0.0f;
+		const float PrevScale = FMath::Max(GetSanitizedVineUVScale(PointScales[PointIndex - 1]) / MaxScale, ScaleFloor);
+		const float CurrScale = FMath::Max(GetSanitizedVineUVScale(PointScales[PointIndex]) / MaxScale, ScaleFloor);
+		const float AverageScale = FMath::Max((PrevScale + CurrScale) * 0.5f, 1.0e-8f);
+		const float InverseScale = 1.0f / FMath::Pow(AverageScale, ScalePower);
+		const float Weight = (1.0f - Influence) + Influence * InverseScale;
+		OutCurveU[PointIndex] = OutCurveU[PointIndex - 1] + SegmentLength * FMath::Max(Weight, 1.0e-8f) * LengthScale;
+	}
+}
+
+static void BuildVineScaleWeightedCurveUFromPoints(
+	const TArray<FVector>& Points,
+	const TArray<float>& PointScales,
+	const FVineVisualization& VV,
+	TArray<float>& OutCurveU)
+{
+	const int32 PointCount = Points.Num();
+	if (PointCount <= 0)
+	{
+		OutCurveU.Reset();
+		return;
+	}
+
+	TArray<float> SafePointScales;
+	SafePointScales.SetNumUninitialized(PointCount);
+	for (int32 PointIndex = 0; PointIndex < PointCount; ++PointIndex)
+	{
+		SafePointScales[PointIndex] = PointScales.IsValidIndex(PointIndex) ? PointScales[PointIndex] : 1.0f;
+	}
+
+	TArray<float> SegmentLengths;
+	SegmentLengths.Reserve(FMath::Max(PointCount - 1, 0));
+	for (int32 PointIndex = 1; PointIndex < PointCount; ++PointIndex)
+	{
+		SegmentLengths.Add(float(FVector::Dist(Points[PointIndex - 1], Points[PointIndex])));
+	}
+
+	BuildVineScaleWeightedCurveUFromSegmentLengths(SegmentLengths, SafePointScales, VV, OutCurveU);
+}
+
 static float GetVineTransformScale(const FTransform& Transform)
 {
 	const FVector Scale = Transform.GetScale3D();
@@ -305,6 +383,90 @@ static int32 DrawVineSCStageDebugPoints(
 	}
 
 	return DrawnCount;
+}
+
+static void LogVineSCStageTargetTransformMatch(
+	const TCHAR* Label,
+	const TArray<FGeometryScriptPolyPath>& Lines,
+	const TArray<FTransform>& TargetTransforms)
+{
+	TArray<FVector> TargetLocations;
+	TargetLocations.Reserve(TargetTransforms.Num());
+	for (const FTransform& TargetTransform : TargetTransforms)
+	{
+		TargetLocations.Add(TargetTransform.GetLocation());
+	}
+
+	constexpr double MatchTolerance = 0.5;
+	int32 PointCount = 0;
+	int32 MatchCount = 0;
+	double TotalNearestDistance = 0.0;
+	double MaxNearestDistance = 0.0;
+	FString Samples;
+
+	for (const FGeometryScriptPolyPath& Line : Lines)
+	{
+		if (!Line.Path.IsValid())
+		{
+			continue;
+		}
+
+		for (const FVector& Point : *Line.Path)
+		{
+			double NearestDistance = TNumericLimits<double>::Max();
+			int32 NearestTargetIndex = INDEX_NONE;
+			for (int32 TargetIndex = 0; TargetIndex < TargetLocations.Num(); ++TargetIndex)
+			{
+				const double Distance = FVector::Dist(Point, TargetLocations[TargetIndex]);
+				if (Distance < NearestDistance)
+				{
+					NearestDistance = Distance;
+					NearestTargetIndex = TargetIndex;
+				}
+			}
+
+			if (NearestDistance <= MatchTolerance)
+			{
+				++MatchCount;
+			}
+			if (NearestDistance < TNumericLimits<double>::Max())
+			{
+				TotalNearestDistance += NearestDistance;
+				MaxNearestDistance = FMath::Max(MaxNearestDistance, NearestDistance);
+			}
+
+			if (PointCount < 6)
+			{
+				if (!Samples.IsEmpty())
+				{
+					Samples += TEXT(" | ");
+				}
+				Samples += FString::Printf(
+					TEXT("#%d Point=(%.2f, %.2f, %.2f) NearestTarget=%d Dist=%.4f"),
+					PointCount,
+					Point.X,
+					Point.Y,
+					Point.Z,
+					NearestTargetIndex,
+					NearestDistance);
+			}
+			++PointCount;
+		}
+	}
+
+	const bool bAllPointsMatchTargetTransforms = PointCount > 0 && MatchCount == PointCount;
+	const double AverageNearestDistance = PointCount > 0 ? TotalNearestDistance / double(PointCount) : 0.0;
+	UE_LOG(LogTemp, Display,
+		TEXT("[VineSCStageTargetTransformCheck][%s] Lines=%d Targets=%d Points=%d Matches=%d AllPointsMatchTargetTransforms=%s AvgNearestDist=%.4f MaxNearestDist=%.4f Samples=%s"),
+		Label,
+		Lines.Num(),
+		TargetTransforms.Num(),
+		PointCount,
+		MatchCount,
+		bAllPointsMatchTargetTransforms ? TEXT("true") : TEXT("false"),
+		AverageNearestDistance,
+		MaxNearestDistance,
+		Samples.IsEmpty() ? TEXT("none") : *Samples);
 }
 
 static constexpr float VineSCStageDebugPointSize = 8.0f;
@@ -1405,7 +1567,7 @@ static float EvaluateVineScale(const UCurveLinearColor* CurveControl, int32 Inde
 
 static bool BuildVineVisualizationGPUInput(
 	const TArray<FGeometryScriptPolyPath>& Lines,
-	const UCurveLinearColor* CurveControl,
+	const FVineVisualization& VV,
 	const TArray<float>& LineSourceScales,
 	const TArray<FVineLinePointScaleData>& LinePointScales,
 	const TArray<FVineLinePointAxisData>& LinePointAxes,
@@ -1439,23 +1601,28 @@ static bool BuildVineVisualizationGPUInput(
 		const TArray<FVector>& Points = *Line.Path;
 		const int32 BaseIndex = OutPathPoints.Num();
 		const int32 PointCount = Points.Num();
-		float CurveU = 0.0f;
+
+		TArray<float> FinalPointScales;
+		FinalPointScales.SetNumUninitialized(PointCount);
+		for (int32 PointIndex = 0; PointIndex < PointCount; ++PointIndex)
+		{
+			const float CurveScale = EvaluateVineScale(VV.CurveControl, PointIndex, PointCount);
+			const float PointScale = PointScales && PointScales->IsValidIndex(PointIndex) ? (*PointScales)[PointIndex] : FallbackPointScale;
+			FinalPointScales[PointIndex] = CurveScale * FMath::Max(PointScale, 0.0f);
+		}
+
+		TArray<float> LineCurveU;
+		BuildVineScaleWeightedCurveUFromPoints(Points, FinalPointScales, VV, LineCurveU);
 
 		for (int32 PointIndex = 0; PointIndex < PointCount; ++PointIndex)
 		{
 			const FVector& Point = Points[PointIndex];
-			if (PointIndex > 0)
-			{
-				CurveU += float(FVector::Dist(Points[PointIndex], Points[PointIndex - 1]));
-			}
 
-			const float CurveScale = EvaluateVineScale(CurveControl, PointIndex, PointCount);
-			const float PointScale = PointScales && PointScales->IsValidIndex(PointIndex) ? (*PointScales)[PointIndex] : FallbackPointScale;
-			const float Scale = CurveScale * FMath::Max(PointScale, 0.0f);
+			const float Scale = FinalPointScales[PointIndex];
 			const FVector PointAxis = PointAxes && PointAxes->IsValidIndex(PointIndex) ? NormalizeVineAxisOrFallback((*PointAxes)[PointIndex]) : FVector::ZeroVector;
 			OutPathPoints.Add(FVector4f(float(Point.X), float(Point.Y), float(Point.Z), Scale));
 			OutPathPointAxes.Add(FVector4f(float(PointAxis.X), float(PointAxis.Y), float(PointAxis.Z), 0.0f));
-			OutPathPointCurveU.Add(CurveU);
+			OutPathPointCurveU.Add(LineCurveU.IsValidIndex(PointIndex) ? LineCurveU[PointIndex] : 0.0f);
 
 			const int32 PrevIndex = BaseIndex + FMath::Max(PointIndex - 1, 0);
 			const int32 NextIndex = BaseIndex + FMath::Min(PointIndex + 1, PointCount - 1);
@@ -2304,8 +2471,10 @@ static void LogVineGPUProjectionStats(
 
 static void RecomputeVineOutputUVsFromGeneratedLength(
 	const TArray<FVector4f>& Vertices,
+	const TArray<FVector4f>& PathPoints,
 	const TArray<FIntVector4>& SegmentMeta,
 	uint32 ProfileCount,
+	const FVineVisualization& VV,
 	TArray<FVector2f>& UVs)
 {
 	if (ProfileCount == 0 || Vertices.Num() == 0 || UVs.Num() != Vertices.Num())
@@ -2319,26 +2488,66 @@ static void RecomputeVineOutputUVsFromGeneratedLength(
 		return;
 	}
 
-	TArray<float> GeneratedCurveU;
-	GeneratedCurveU.SetNumZeroed(PointCount);
+	TArray<float> SegmentLengths;
+	TArray<float> PointScales;
+	SegmentLengths.Init(-1.0f, FMath::Max(PointCount - 1, 0));
+	PointScales.SetNumUninitialized(PointCount);
+	for (int32 PointIndex = 0; PointIndex < PointCount; ++PointIndex)
+	{
+		PointScales[PointIndex] = PathPoints.IsValidIndex(PointIndex) ? PathPoints[PointIndex].W : 1.0f;
+	}
 
 	for (const FIntVector4& Segment : SegmentMeta)
 	{
 		const int32 APoint = Segment.X;
 		const int32 BPoint = Segment.Y;
-		if (!GeneratedCurveU.IsValidIndex(APoint) || !GeneratedCurveU.IsValidIndex(BPoint))
+		if (!PointScales.IsValidIndex(APoint) || !PointScales.IsValidIndex(BPoint) || BPoint != APoint + 1 || !SegmentLengths.IsValidIndex(APoint))
 		{
 			continue;
 		}
 
 		const FVector ACenter = GetVineOutputProfileCenter(Vertices, APoint, ProfileCount);
 		const FVector BCenter = GetVineOutputProfileCenter(Vertices, BPoint, ProfileCount);
-		GeneratedCurveU[BPoint] = GeneratedCurveU[APoint] + float(FVector::Dist(ACenter, BCenter));
+		SegmentLengths[APoint] = float(FVector::Dist(ACenter, BCenter));
+	}
+
+	TArray<float> GeneratedCurveU;
+	GeneratedCurveU.SetNumZeroed(PointCount);
+	for (int32 RunStart = 0; RunStart < PointCount;)
+	{
+		int32 RunEnd = RunStart;
+		while (RunEnd < PointCount - 1 && SegmentLengths.IsValidIndex(RunEnd) && SegmentLengths[RunEnd] >= 0.0f)
+		{
+			++RunEnd;
+		}
+
+		const int32 RunPointCount = RunEnd - RunStart + 1;
+		TArray<float> RunSegmentLengths;
+		TArray<float> RunPointScales;
+		RunSegmentLengths.Reserve(FMath::Max(RunPointCount - 1, 0));
+		RunPointScales.Reserve(RunPointCount);
+		for (int32 PointIndex = RunStart; PointIndex <= RunEnd; ++PointIndex)
+		{
+			RunPointScales.Add(PointScales[PointIndex]);
+			if (PointIndex < RunEnd)
+			{
+				RunSegmentLengths.Add(SegmentLengths[PointIndex]);
+			}
+		}
+
+		TArray<float> RunCurveU;
+		BuildVineScaleWeightedCurveUFromSegmentLengths(RunSegmentLengths, RunPointScales, VV, RunCurveU);
+		for (int32 LocalIndex = 0; LocalIndex < RunCurveU.Num(); ++LocalIndex)
+		{
+			GeneratedCurveU[RunStart + LocalIndex] = RunCurveU[LocalIndex];
+		}
+
+		RunStart = RunEnd + 1;
 	}
 
 	for (int32 PointIndex = 0; PointIndex < PointCount; ++PointIndex)
 	{
-		const float V = GeneratedCurveU[PointIndex];
+		const float V = GeneratedCurveU.IsValidIndex(PointIndex) ? GeneratedCurveU[PointIndex] : 0.0f;
 		const int32 BaseIndex = PointIndex * int32(ProfileCount);
 		for (uint32 ProfileIndex = 0; ProfileIndex < ProfileCount; ++ProfileIndex)
 		{
@@ -2768,17 +2977,16 @@ bool AVineContainer::VisVineCPU(bool MainVine)
 			Transform.SetScale3D(FVector::OneVector * CurveScale * FMath::Max(PointScale, 0.0f));
 		}
 
-		TArray<float> WorldSpaceV;
-		WorldSpaceV.Reserve(TransformCount);
-		float AccumulatedDistance = 0.0f;
-		for (int32 PointIndex = 0; PointIndex < TransformCount; ++PointIndex)
+		TArray<float> FinalPointScales;
+		FinalPointScales.SetNumUninitialized(TransformCount);
+		for (int32 TransformIndex = 0; TransformIndex < TransformCount; ++TransformIndex)
 		{
-			if (PointIndex > 0 && LineVectors.IsValidIndex(PointIndex) && LineVectors.IsValidIndex(PointIndex - 1))
-			{
-				AccumulatedDistance += float(FVector::Dist(LineVectors[PointIndex], LineVectors[PointIndex - 1]));
-			}
-			WorldSpaceV.Add(AccumulatedDistance);
+			const FVector Scale = Transforms[TransformIndex].GetScale3D();
+			FinalPointScales[TransformIndex] = FMath::Max3(FMath::Abs(Scale.X), FMath::Abs(Scale.Y), FMath::Abs(Scale.Z));
 		}
+
+		TArray<float> WorldSpaceV;
+		BuildVineScaleWeightedCurveUFromPoints(LineVectors, FinalPointScales, VV, WorldSpaceV);
 
 		FGeometryScriptPrimitiveOptions PrimitiveOptions;
 		if (MainVine)
@@ -2946,7 +3154,7 @@ bool AVineContainer::VisVineGPUInternal(bool MainVine)
 	const double BuildGPUInputStartSeconds = FPlatformTime::Seconds();
 	if (!BuildVineVisualizationGPUInput(
 		PreparedLines,
-		VV.CurveControl,
+		VV,
 		PreparedLineSourceScales,
 		PreparedLinePointScales,
 		PreparedLinePointAxes,
@@ -2998,7 +3206,7 @@ bool AVineContainer::VisVineGPUInternal(bool MainVine)
 		VV.VinesOffset);
 
 	const double RecomputeUVStartSeconds = FPlatformTime::Seconds();
-	RecomputeVineOutputUVsFromGeneratedLength(OutVertices, SegmentMeta, MainVine ? 3u : 2u, OutUVs);
+	RecomputeVineOutputUVsFromGeneratedLength(OutVertices, PathPoints, SegmentMeta, MainVine ? 3u : 2u, VV, OutUVs);
 	const double RecomputeUVMs = (FPlatformTime::Seconds() - RecomputeUVStartSeconds) * 1000.0;
 
 	const int32 MaterialID = MainVine ? 0 : 1;
@@ -3129,7 +3337,7 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result, boo
 	GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.Total"));
 	(void)ExtrudeScale;
 	(void)Result;
-	(void)MultThread;
+	SC.bMultithread = MultThread;
 
 	// 1. 收集 Source / Target Transforms
 	TArray<FTransform> TubeSourceTransforms;
@@ -3220,9 +3428,7 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result, boo
 			TArray<FTransform> SCSourceTransform;
 			SCSourceTransform.Add(TubeSourceTransforms[i]);
 			TArray<FSpaceColonizationLineResult> LinesFromSource = UGenerateVines::SpaceColonizationWithScales(
-				SCSourceTransform, TargetTransforms,
-				SC.Iteration, SC.Activetime, 3,
-				SC.RandGrow, SC.Seed, SC.BackGrowRange, MultThread);
+				SCSourceTransform, TargetTransforms, SC);
 			const float SourceScale = GetVineTransformScale(TubeSourceTransforms[i]);
 			for (FSpaceColonizationLineResult& LineResult : LinesFromSource)
 			{
@@ -3255,9 +3461,7 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result, boo
 			TArray<FTransform> SCSourceTransform;
 			SCSourceTransform.Add(PlaneSourceTransforms[i]);
 			TArray<FSpaceColonizationLineResult> LinesFromSource = UGenerateVines::SpaceColonizationWithScales(
-				SCSourceTransform, TargetTransforms,
-				SC.Iteration, SC.Activetime, 3,
-				SC.RandGrow, SC.Seed, SC.BackGrowRange, MultThread);
+				SCSourceTransform, TargetTransforms, SC);
 			const float SourceScale = GetVineTransformScale(PlaneSourceTransforms[i]);
 			for (FSpaceColonizationLineResult& LineResult : LinesFromSource)
 			{
@@ -3276,6 +3480,9 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result, boo
 	PlaneLineSourceLocations = GeneratedPlaneLineSourceLocations;
 	PlaneLinePointScales = GeneratedPlaneLinePointScales;
 	PlaneLinePointAxes = GeneratedPlaneLinePointAxes;
+
+	LogVineSCStageTargetTransformMatch(TEXT("Tube"), TubeLines, TargetTransforms);
+	LogVineSCStageTargetTransformMatch(TEXT("Plane"), PlaneLines, TargetTransforms);
 
 	if (bUseGPUMode && bDrawGPUProjectionVoxelDebugPoints && GPUProjectionVoxelDebugDuration > 0.0f)
 	{

@@ -59,10 +59,12 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
 	TArray<float> PointScales;
 
-	// Per output point smoothed line axis generated at the end of the GPU queue.
+	// Kept for the current vine visualization path; the 20260530 SC algorithm does not generate these directly.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
 	TArray<FVector> PointAxes;
 };
+
+struct FSpaceColonizationOptions;
 
 /**
  *
@@ -72,6 +74,8 @@ class GEOMETRYSCRIPTEXTRAEDITOR_API UGenerateVines : public UBlueprintFunctionLi
 {
 	GENERATED_BODY()
 public:
+	// ---- Blueprint-callable (individual parameters, for BP compatibility) ----
+
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static void BuildSpaceColonizationQueue(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms,
 		int32 Iterations, int32 Activetime, float RandGrow, float Seed, bool MultThread,
@@ -98,6 +102,25 @@ public:
 	static TArray<FSpaceColonizationLineResult> SpaceColonizationCSWithScales(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, int32 Iterations =
 											   50, int32 Activetime = 20, int32 BackGrowCount = 8, float Ranggrow = 0.5, float Seed = 0.2, float BackGrowRange = 0.8, float InfluenceRadius = 200.0f);
 
-	static TArray<FSpaceColonizationLineResult> SpaceColonizationCSWithScalesForVisualization(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, int32 Iterations =
-											   50, int32 Activetime = 20, int32 BackGrowCount = 8, float Ranggrow = 0.5, float Seed = 0.2, float BackGrowRange = 0.8, float InfluenceRadius = 200.0f);
+	// ---- C++ struct overloads (use FSpaceColonizationOptions for cleaner call sites) ----
+
+	static void BuildSpaceColonizationQueue(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms,
+		const FSpaceColonizationOptions& Options,
+		TArray<FVector>& OutTargetLocations, TArray<FSpaceColonizationAttribute>& OutSCAttributes);
+
+	static bool BuildSpaceColonizationQueueCS(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms,
+		const FSpaceColonizationOptions& Options,
+		TArray<FVector>& OutTargetLocations, TArray<FSpaceColonizationAttribute>& OutSCAttributes);
+
+	static TArray<FGeometryScriptPolyPath> SpaceColonization(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms,
+		const FSpaceColonizationOptions& Options);
+
+	static TArray<FSpaceColonizationLineResult> SpaceColonizationWithScales(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms,
+		const FSpaceColonizationOptions& Options);
+
+	static TArray<FGeometryScriptPolyPath> SpaceColonizationCS(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms,
+		const FSpaceColonizationOptions& Options);
+
+	static TArray<FSpaceColonizationLineResult> SpaceColonizationCSWithScales(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms,
+		const FSpaceColonizationOptions& Options);
 };

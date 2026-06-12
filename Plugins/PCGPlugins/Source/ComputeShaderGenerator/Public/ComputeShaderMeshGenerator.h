@@ -1,12 +1,14 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "DynamicMeshActor.h"
+#include "GameFramework/Actor.h"
 #include "Components/BoxComponent.h"
+#include "Components/DynamicMeshComponent.h"
 #include "Components/SceneComponent.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "RenderGraphBuilder.h"
 #include "UDynamicMesh.h"
+#include "ComputeShaderDebugParams.h"
 #include "ComputeShaderMeshGenerator.generated.h"
 
 class AActor;
@@ -440,7 +442,7 @@ struct COMPUTESHADERGENERATOR_API FCSInstancePaintComponentSlot
 };
 
 UCLASS(Blueprintable)
-class COMPUTESHADERGENERATOR_API AComputeShaderMeshGenerator : public ADynamicMeshActor
+class COMPUTESHADERGENERATOR_API AComputeShaderMeshGenerator : public AActor
 {
 	GENERATED_BODY()
 
@@ -448,12 +450,18 @@ public:
 	/** Creates the generator actor, scene root, bounds component, and DynamicMesh rendering defaults. */
 	AComputeShaderMeshGenerator(const FObjectInitializer& ObjectInitializer);
 
+	/** Returns the DynamicMeshComponent owned by this actor. */
+	UDynamicMeshComponent* GetDynamicMeshComponent() const { return DynamicMeshComponent; }
+
 	// -------------------------------------------------------------------------
 	// Core System
 	// -------------------------------------------------------------------------
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator")
 	TObjectPtr<USceneComponent> SceneRoot;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator")
+	TObjectPtr<UDynamicMeshComponent> DynamicMeshComponent;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator")
 	TObjectPtr<UBoxComponent> GeneratorBounds;
@@ -474,12 +482,6 @@ public:
 
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
 	int32 MaxVoxels = 2000000;
-
-	// Per-triangle surface voxelization budget. This is intended to limit how many
-	// voxel cells one large triangle may scan when VoxelSize is small; MaxVoxels is
-	// the separate total output capacity.
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
-	int32 MaxVoxelCellsPerTriangle = 4096;
 
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "0.001"))
 	float QuadScale = 1.0f;
@@ -531,6 +533,10 @@ public:
 
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data|Debug")
 	FCSSurfaceVoxelData LastSurfaceVoxelData;
+
+	/** Triangle surface data used by the CPU/BVH vine visualization path.
+	 *  Filled by GenerateVines(). */
+	FCSTriangleMeshData CachedSurfaceTriangles;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Mesh|Debug")
 	int64 GeneratorTimeCode = -1;
@@ -709,67 +715,33 @@ public:
 	/** Draws debug direction lines and optional points from the last cached surface-voxel data. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug", meta = (DevelopmentOnly))
 	int32 DrawDebugLastSurfaceVoxelDirections(
-		float DirectionLength = 0.0f,
-		FLinearColor DirectionColor = FLinearColor::Blue,
-		float Duration = 5.0f,
-		float Thickness = 2.0f,
-		bool bPersistentLines = false,
-		bool bDrawPoints = true,
-		FLinearColor PointColor = FLinearColor::Yellow,
-		float PointSize = 8.0f,
-		int32 MaxDirectionsToDraw = 0) const;
+		const FCSDebugLastVoxelDirectionOptions& Options = FCSDebugLastVoxelDirectionOptions()) const;
 
 	/** Draws debug arrows and optional points from the last cached surface-voxel data. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug", meta = (DevelopmentOnly, DisplayName = "Draw Debug Last Surface Voxel Arrows"))
 	int32 DrawDebugLastSurfaceVoxelArrows(
-		float ArrowLength = 0.0f,
-		FLinearColor ArrowColor = FLinearColor::Blue,
-		float Duration = 5.0f,
-		float Thickness = 2.0f,
-		bool bPersistentLines = false,
-		bool bDrawPoints = true,
-		FLinearColor PointColor = FLinearColor::Yellow,
-		float PointSize = 8.0f,
-		int32 MaxArrowsToDraw = 0) const;
+		const FCSDebugLastVoxelArrowOptions& Options = FCSDebugLastVoxelArrowOptions()) const;
 
 	/** Regenerates bounded scene surface voxels and draws their normals as debug direction lines. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug", meta = (DevelopmentOnly))
 	int32 DrawDebugBoxSceneSurfaceVoxelDirections(
-		float VoxelSize = 10.0f,
-		float DirectionLength = 0.0f,
-		FLinearColor DirectionColor = FLinearColor::Blue,
-		float Duration = 5.0f,
-		float Thickness = 2.0f,
-		bool bPersistentLines = false,
-		bool bDrawPoints = true,
-		FLinearColor PointColor = FLinearColor::Yellow,
-		float PointSize = 8.0f,
-		int32 MaxDirectionsToDraw = 0);
+		const FCSDebugBoxVoxelDirectionOptions& Options);
 
 	/** Regenerates bounded scene surface voxels and draws their normals as debug arrows. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug", meta = (DevelopmentOnly, DisplayName = "Draw Debug Box Scene Surface Voxel Arrows"))
 	int32 DrawDebugBoxSceneSurfaceVoxelArrows(
-		float VoxelSize = 10.0f,
-		float ArrowLength = 0.0f,
-		FLinearColor ArrowColor = FLinearColor::Blue,
-		float Duration = 5.0f,
-		float Thickness = 2.0f,
-		bool bPersistentLines = false,
-		bool bDrawPoints = true,
-		FLinearColor PointColor = FLinearColor::Yellow,
-		float PointSize = 8.0f,
-		int32 MaxArrowsToDraw = 0);
+		const FCSDebugBoxVoxelArrowOptions& Options);
 
 	/** Draws active cache voxel cells, optionally limited to one request and including the cache bounds. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Triangle Cache|Debug", meta = (DevelopmentOnly))
 	int32 DrawDebugActiveVoxels(
-		FName RequestId = NAME_None,
-		FLinearColor DebugColor = FLinearColor::Green,
-		float Duration = 5.0f,
-		float Thickness = 2.0f,
-		bool bPersistentLines = false,
-		bool bDrawCacheBounds = true,
-		int32 MaxVoxelsToDraw = 0) const;
+		const FCSDebugActiveVoxelOptions& Options = FCSDebugActiveVoxelOptions()) const;
+
+	/** Spawns a temporary ADynamicMeshActor at this actor's location,
+	 *  converts CachedSurfaceTriangles into a DynamicMesh,
+	 *  and destroys the actor after LifetimeSeconds. */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Debug", meta = (DevelopmentOnly, DisplayName = "Spawn Debug Surface Triangles DynamicMesh Actor"))
+	void SpawnDebugSurfaceTrianglesDynamicMeshActor(float LifetimeSeconds = 10.0f);
 
 	// -------------------------------------------------------------------------
 	// Core System - Dynamic Mesh Helpers

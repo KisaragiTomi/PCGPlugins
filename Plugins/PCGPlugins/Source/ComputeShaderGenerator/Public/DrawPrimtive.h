@@ -63,7 +63,7 @@ public:
 
 	static FCSBoxWorldZHeightRDGOutput AddStaticMeshTrianglesWorldZHeightToRDG(
 		FRDGBuilder& GraphBuilder,
-		const FCSStaticMeshTriangleRDGOutput& TriangleOutput,
+		const FCSStaticMeshTriangleRDGOutput& TriangleOutput, 
 		FTransform BoxTransform,
 		FVector BoxSize,
 		FIntPoint OutputSize,
@@ -103,7 +103,8 @@ public:
 		UTextureRenderTarget2D* HeightRenderTarget,
 		float Duration);
 
-	/** Blueprint helper: gathers scene mesh triangles in BoxTransform/BoxSize, filtering by actor tag when set. */
+	/** Blueprint helper: gathers scene mesh triangles in BoxTransform/BoxSize, filtering by actor tag when set.
+	 *  When bAlwaysIncludeLandscape is true, landscape terrain is gathered regardless of the actor tag. */
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader|DrawPrimtive", meta = (WorldContext = "WorldContextObject"))
 	static FCSTriangleMeshData GetTaggedBoxSceneTriangles(
 		UObject* WorldContextObject,
@@ -111,7 +112,8 @@ public:
 		FVector BoxSize,
 		FName RequiredActorTag = NAME_None,
 		int32 LODIndex = 0,
-		int32 MaxTriangles = 200000);
+		int32 MaxTriangles = 200000,
+		bool bAlwaysIncludeLandscape = false);
 };
 
 class FCSDrawPrimtive : public FCustomRenderPassBase

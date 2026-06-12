@@ -244,8 +244,53 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 		return NewVID;
 	};
 
+	int32 DbgDryInstancesSkipped = 0;
+
+	// Precompute the source mesh XY bounds so we can map each instance's footprint into the
+	// result texture and skip instances that contain no wet content at all.
+	FBox2f SrcBoundsXY(ForceInit);
+	for (int32 i = 0; i < SrcNumVerts; i++)
+	{
+		SrcBoundsXY += FVector2f(SrcPositions[i].X, SrcPositions[i].Y);
+	}
+
+	auto InstanceHasWetContent = [&](const FTransform& InstT) -> bool
+	{
+		// Build the instance's world-space XY footprint from the source mesh bounds corners.
+		const FVector2f Corners[4] = {
+			FVector2f(SrcBoundsXY.Min.X, SrcBoundsXY.Min.Y),
+			FVector2f(SrcBoundsXY.Max.X, SrcBoundsXY.Min.Y),
+			FVector2f(SrcBoundsXY.Min.X, SrcBoundsXY.Max.Y),
+			FVector2f(SrcBoundsXY.Max.X, SrcBoundsXY.Max.Y),
+		};
+		float MinU = 1.f, MinV = 1.f, MaxU = 0.f, MaxV = 0.f;
+		for (const FVector2f& C : Corners)
+		{
+			const FVector W = InstT.TransformPosition(FVector(C.X, C.Y, 0.f));
+			const float U = ((float)W.X + HalfCapture) * InvCapture;
+			const float V = ((float)W.Y + HalfCapture) * InvCapture;
+			MinU = FMath::Min(MinU, U); MaxU = FMath::Max(MaxU, U);
+			MinV = FMath::Min(MinV, V); MaxV = FMath::Max(MaxV, V);
+		}
+		const int32 PX0 = FMath::Clamp(FMath::FloorToInt32(MinU * RTWidth), 0, RTWidth - 1);
+		const int32 PX1 = FMath::Clamp(FMath::FloorToInt32(MaxU * RTWidth), 0, RTWidth - 1);
+		const int32 PY0 = FMath::Clamp(FMath::FloorToInt32(MinV * RTHeight), 0, RTHeight - 1);
+		const int32 PY1 = FMath::Clamp(FMath::FloorToInt32(MaxV * RTHeight), 0, RTHeight - 1);
+		for (int32 PY = PY0; PY <= PY1; PY++)
+		{
+			for (int32 PX = PX0; PX <= PX1; PX++)
+			{
+				if (Pixels[PY * RTWidth + PX].B.GetFloat() > DryThreshold) return true;
+			}
+		}
+		return false;
+	};
+
 	for (const FTransform& InstT : InstanceTransforms)
 	{
+		// Skip whole instances that have no wet content; only baked tiles with water survive.
+		if (!InstanceHasWetContent(InstT)) { DbgDryInstancesSkipped++; continue; }
+
 		for (int32 Tri = 0; Tri < SrcNumTris; Tri++)
 		{
 			DbgTotalTris++;
@@ -324,8 +369,8 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 		}
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("[CSSW] Bake: Total=%d, DrySkip=%d, DegenSkip=%d, Created=%d, Instances=%d"),
-		DbgTotalTris, DbgDrySkipped, DbgDegenerateSkipped, DbgCreated, InstanceTransforms.Num());
+	UE_LOG(LogTemp, Log, TEXT("[CSSW] Bake: Total=%d, DryInstSkip=%d, DrySkip=%d, DegenSkip=%d, Created=%d, Instances=%d"),
+		DbgTotalTris, DbgDryInstancesSkipped, DbgDrySkipped, DbgDegenerateSkipped, DbgCreated, InstanceTransforms.Num());
 
 	if (DbgCreated == 0)
 	{
@@ -508,7 +553,7 @@ void UCSShallowWaterProcess::DebugDumpSWPassResults(ACSShallowWaterCapture* InCS
 	};
 
 	TArray<FRTEntry> RTsToSave = {
-		{ InCSSWActor->RT_SceneDepth,       TEXT("Debug_SceneDepth") },
+		{ InCSSWActor->RT_VoxelTerrain,     TEXT("Debug_VoxelTerrain") },
 		{ InCSSWActor->RT_VelocityHeight,   TEXT("Debug_VelocityHeight") },
 		{ InCSSWActor->RT_ResultVelHeight,   TEXT("Debug_ResultVelHeight") },
 		{ InCSSWActor->RT_ResultDepthWet,    TEXT("Debug_ResultDepthWet") },

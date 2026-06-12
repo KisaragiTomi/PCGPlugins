@@ -311,7 +311,7 @@ void BuildOrthonormalFrame(float3 Tangent, float3 Normal, out float3 OutTangent,
 }
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
-void BuildVineVisualizationAxesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+void BuildVVAxesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
     uint PointIndex = DispatchThreadId.x;
     if (PointIndex >= PathPointCount)
@@ -345,7 +345,7 @@ float2 GetProfilePoint(uint ProfileIndex)
 }
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
-void BuildVineVisualizationMeshCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+void BuildVVMeshCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
     uint Index = DispatchThreadId.x;
 

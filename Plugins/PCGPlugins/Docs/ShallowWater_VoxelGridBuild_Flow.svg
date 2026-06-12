@@ -1,0 +1,241 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 1620" role="img" aria-labelledby="title desc">
+  <title id="title">ShallowWater Terrain Voxel Grid Build Flow</title>
+  <desc id="desc">Algorithm flow for ACSShallowWaterCapture::BuildTerrainVoxelGrid, called once from StartSolver. CPU gathers tagged box scene triangles and defines the grid scale; the GPU rasterizes a transient dense bit grid, counts per-column runs, prefix-sums them, reads back a single total, then emits a compact sparse run-length (CSR) terrain voxel grid. The dense scratch is released immediately.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#334155"/>
+    </marker>
+    <marker id="arrowGpu" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#15803d"/>
+    </marker>
+    <marker id="arrowWarn" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#dc2626"/>
+    </marker>
+    <linearGradient id="headerGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#e0f2fe"/>
+      <stop offset=".48" stop-color="#f8fafc"/>
+      <stop offset="1" stop-color="#dcfce7"/>
+    </linearGradient>
+    <style>
+      text { font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; fill: #172033; }
+      .mono { font-family: Consolas, "Cascadia Mono", monospace; }
+      .title { font-size: 29px; font-weight: 700; }
+      .subtitle { font-size: 14px; fill: #475569; }
+      .phase { font-size: 16px; font-weight: 700; }
+      .nodeTitle { font-size: 13px; font-weight: 700; }
+      .body { font-size: 11px; fill: #334155; }
+      .tiny { font-size: 10px; fill: #64748b; }
+      .tag { font-size: 10px; font-weight: 700; }
+      .band { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.2; }
+      .cpu { fill: #dbeafe; stroke: #2563eb; stroke-width: 1.35; }
+      .gpu { fill: #dcfce7; stroke: #16a34a; stroke-width: 1.35; }
+      .gpuScan { fill: #ecfdf5; stroke: #059669; stroke-width: 1.35; }
+      .data { fill: #f8fafc; stroke: #94a3b8; stroke-width: 1.1; }
+      .io { fill: #fef3c7; stroke: #d97706; stroke-width: 1.25; }
+      .persist { fill: #f3e8ff; stroke: #7c3aed; stroke-width: 1.25; }
+      .warn { fill: #fee2e2; stroke: #dc2626; stroke-width: 1.1; }
+      .softCpu { fill: #eff6ff; stroke: #93c5fd; stroke-width: 1; }
+      .softGpu { fill: #f0fdf4; stroke: #86efac; stroke-width: 1; }
+      .softData { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1; }
+      .arrow { stroke: #334155; stroke-width: 1.55; fill: none; marker-end: url(#arrow); }
+      .arrowThin { stroke: #334155; stroke-width: 1.15; fill: none; marker-end: url(#arrow); }
+      .arrowGpuLine { stroke: #15803d; stroke-width: 1.45; fill: none; marker-end: url(#arrowGpu); }
+      .arrowWarnLine { stroke: #dc2626; stroke-width: 1.1; fill: none; marker-end: url(#arrowWarn); }
+      .dash { stroke-dasharray: 6 5; }
+    </style>
+  </defs>
+
+  <rect width="1440" height="1620" fill="#f8fafc"/>
+
+  <!-- ===== HEADER ===== -->
+  <rect x="36" y="26" width="1368" height="104" rx="10" fill="url(#headerGrad)" stroke="#cbd5e1"/>
+  <text class="title" x="720" y="67" text-anchor="middle">ShallowWater 地形体素网格 构建流程</text>
+  <text class="subtitle mono" x="720" y="94" text-anchor="middle">ACSShallowWaterCapture::StartSolver() -&gt; BuildTerrainVoxelGrid()</text>
+  <text class="tiny" x="720" y="116" text-anchor="middle">CPU 采集 box 内带 SWCaptureTag 的场景三角形并定标；GPU 光栅化稠密位网格 → 统计列游程 → 前缀和 → 回读总数 → 发射紧凑稀疏 CSR 体素网格</text>
+
+  <!-- ===== LEGEND ===== -->
+  <g transform="translate(58 150)">
+    <rect class="cpu" x="0" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="27" y="14">CPU / Game Thread</text>
+    <rect class="gpu" x="188" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="215" y="14">GPU Compute / RDG</text>
+    <rect class="gpuScan" x="390" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="417" y="14">GPU 前缀和扫描</text>
+    <rect class="data" x="560" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="587" y="14">结构化数据 / 缓冲</text>
+    <rect class="io" x="730" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="757" y="14">Readback</text>
+    <rect class="persist" x="872" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="899" y="14">持久 CSR 网格</text>
+    <rect class="warn" x="1058" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="1085" y="14">提前返回 / 无效</text>
+  </g>
+
+  <!-- ===== PHASE 0: 入口与校验 ===== -->
+  <rect class="band" x="54" y="194" width="1332" height="150" rx="9"/>
+  <text class="phase" x="80" y="224" fill="#1d4ed8">0. 入口、释放旧网格、必要校验</text>
+
+  <rect class="cpu" x="82" y="246" width="246" height="60" rx="7"/>
+  <text class="nodeTitle mono" x="205" y="270" text-anchor="middle">StartSolver()</text>
+  <text class="tiny" x="205" y="290" text-anchor="middle">仅在开始解算时调用一次</text>
+
+  <path class="arrowThin" d="M328 276 H372"/>
+  <rect class="cpu" x="374" y="240" width="300" height="72" rx="7"/>
+  <text class="nodeTitle mono" x="524" y="263" text-anchor="middle">BuildTerrainVoxelGrid()</text>
+  <text class="body" x="396" y="283">ReleaseTerrainVoxelGrid()：释放上次的持久网格</text>
+  <text class="tiny" x="396" y="301">持久网格稀疏，构建期另用瞬态稠密网格</text>
+
+  <path class="arrowThin" d="M674 276 H716"/>
+  <rect class="warn" x="718" y="236" width="636" height="80" rx="7"/>
+  <text class="nodeTitle" x="742" y="258">提前返回条件</text>
+  <text class="body" x="742" y="278">CanRunShallowWaterGPUWork 为假，或 Box 无效 → 直接 return</text>
+  <text class="body" x="742" y="296">box 内无场景三角形（TriangleCount &lt;= 0）→ 警告并 return</text>
+  <path class="arrowWarnLine dash" d="M1268 316 V330"/>
+
+  <path class="arrow" d="M720 344 V374"/>
+
+  <!-- ===== PHASE 1: CPU 采集与定标 ===== -->
+  <rect class="band" x="54" y="374" width="1332" height="306" rx="9"/>
+  <text class="phase" x="80" y="404" fill="#1d4ed8">1. CPU 网格定标 + 三角形采集（决定 GridXY / GridZ / 物理尺度 / Z 裁剪）</text>
+
+  <rect class="cpu" x="82" y="424" width="392" height="148" rx="7"/>
+  <text class="nodeTitle" x="278" y="448" text-anchor="middle">确定网格尺寸（夹紧 GridZ）</text>
+  <text class="body" x="104" y="470">GridXY = TextureSize（与模拟分辨率 1:1）</text>
+  <text class="body" x="104" y="488">GridZ 先 = GridXY，再被两条约束夹紧：</text>
+  <text class="body" x="116" y="506">① 瞬态稠密位网格预算 2Gbit/XY格子 ≈ 256MB</text>
+  <text class="body" x="116" y="524">② GridZ ≤ 65535（run 用 16 位端点编码）</text>
+  <text class="tiny" x="104" y="546">只夹 GridZ；GridXY 必须等于模拟分辨率</text>
+  <text class="tiny" x="104" y="562">高度图 1:1 写入地形纹理，不可缩放 XY</text>
+
+  <rect class="cpu" x="494" y="424" width="392" height="148" rx="7"/>
+  <text class="nodeTitle" x="690" y="448" text-anchor="middle">物理尺度 + 水面以上 Z 裁剪</text>
+  <text class="body" x="516" y="470">XY 范围 = CaptureSize × CaptureSize</text>
+  <text class="body" x="516" y="488">CellSizeXY = CaptureSize / GridXY</text>
+  <text class="body" x="516" y="506">MaxTriangleWorldZ = 最高 source.Z</text>
+  <text class="body" x="528" y="524">+ VoxelMaxAboveSourceZ</text>
+  <text class="tiny" x="516" y="546">高于此 Z 的三角形被丢弃，防止悬空物体</text>
+  <text class="tiny" x="516" y="562">被误当地形；无 source 时禁用裁剪</text>
+
+  <rect class="cpu" x="906" y="424" width="448" height="148" rx="7"/>
+  <text class="nodeTitle mono" x="1130" y="448" text-anchor="middle">GetTaggedBoxSceneTriangles()</text>
+  <text class="body" x="928" y="470">采集 box 内带 SWCaptureTag 的场景几何</text>
+  <text class="body" x="928" y="488">+ landscape 三角形（强制包含 landscape）</text>
+  <text class="body" x="928" y="506">数量上限 VoxelMaxSceneTriangles</text>
+  <text class="body" x="928" y="524">遍历顶点 → FVector4f，统计世界 Z 范围</text>
+  <text class="tiny" x="928" y="546">[MinWorldZ, MaxWorldZ] 加 margin</text>
+  <text class="tiny" x="928" y="562">→ CellSizeZ = WorldHeight / GridZ</text>
+
+  <path class="arrowThin" d="M474 498 H492"/>
+  <path class="arrowThin" d="M886 498 H904"/>
+
+  <rect class="data" x="180" y="592" width="1080" height="68" rx="7"/>
+  <text class="nodeTitle" x="720" y="615" text-anchor="middle">CPU 端定标结果（写入成员）</text>
+  <text class="body mono" x="720" y="636" text-anchor="middle">VoxelGridSize=(GridXY,GridXY,GridZ)  VoxelBoxExtentXY  VoxelCellSizeXY  VoxelGridMinWorldZ  VoxelCellSizeZ</text>
+  <text class="tiny" x="720" y="652" text-anchor="middle">TriangleVertices[] 准备上传；ColumnCount = GridXY×GridXY；OccupancyWordCount = ceil(GridXY²×GridZ / 32)</text>
+
+  <path class="arrow" d="M720 660 V692"/>
+
+  <!-- ===== PHASE 2: GPU 构建管线 ===== -->
+  <rect class="band" x="54" y="692" width="1332" height="560" rx="9"/>
+  <text class="phase" x="80" y="722" fill="#15803d">2. GPU 构建（全程留显存，仅回读 1 个标量）：VoxelFill → CountRuns → ScanBlocks → ScanBlockSums → AddOffsets → 回读 TotalRuns → EmitRuns</text>
+
+  <!-- upload -->
+  <rect class="cpu" x="82" y="742" width="270" height="80" rx="7"/>
+  <text class="nodeTitle" x="217" y="765" text-anchor="middle">上传 + 创建 RDG 缓冲</text>
+  <text class="body" x="104" y="785">QueueBufferUpload: 三角形 + 计数</text>
+  <text class="tiny" x="104" y="804">DenseOccupancy(位网格), Coverage,</text>
+  <text class="tiny" x="104" y="818">RunCount, RunStart, BlockSums, TotalCount</text>
+
+  <path class="arrowGpuLine" d="M352 782 H398"/>
+
+  <!-- GPU container -->
+  <rect class="gpu" x="400" y="738" width="954" height="380" rx="8"/>
+
+  <!-- Pass Fill -->
+  <rect class="gpu" x="424" y="760" width="906" height="52" rx="6"/>
+  <text class="nodeTitle mono" x="448" y="781">Pass 1 · FShallowWaterVoxelFill</text>
+  <text class="tiny" x="448" y="800">每三角形一线程：WorldToBox 变换后散射光栅化进 DenseOccupancy（每体素 1 bit）+ 标记每列 Coverage；超 MaxTriangleWorldZ 丢弃</text>
+
+  <path class="arrowGpuLine" d="M877 812 V828"/>
+
+  <!-- Pass CountRuns -->
+  <rect class="gpu" x="424" y="828" width="906" height="52" rx="6"/>
+  <text class="nodeTitle mono" x="448" y="849">Pass 2 · FShallowWaterVoxelCountRuns</text>
+  <text class="tiny" x="448" y="868">每列一线程：竖直扫描 DenseOccupancy，统计连续占用段（run）数量 → ColumnRunCount[col]（一段竖直长体素压成一个 run）</text>
+
+  <path class="arrowGpuLine" d="M877 880 V896"/>
+
+  <!-- three-pass scan group -->
+  <rect class="gpuScan" x="424" y="896" width="906" height="150" rx="6"/>
+  <text class="nodeTitle" x="877" y="917" text-anchor="middle">三趟前缀和：把 ColumnRunCount 扫成全局 RunStart 偏移 + 求 TotalRuns</text>
+
+  <rect class="softGpu" x="444" y="930" width="282" height="96" rx="5"/>
+  <text class="nodeTitle mono" x="585" y="950" text-anchor="middle">Pass 3 · ScanBlocks</text>
+  <text class="tiny" x="585" y="970" text-anchor="middle">块内 exclusive scan</text>
+  <text class="tiny" x="585" y="986" text-anchor="middle">→ RunStart（块内偏移）</text>
+  <text class="tiny" x="585" y="1002" text-anchor="middle">块总和 → BlockSums</text>
+
+  <path class="arrowGpuLine" d="M726 978 H746"/>
+  <rect class="softGpu" x="748" y="930" width="282" height="96" rx="5"/>
+  <text class="nodeTitle mono" x="889" y="950" text-anchor="middle">Pass 4 · ScanBlockSums</text>
+  <text class="tiny" x="889" y="970" text-anchor="middle">对 BlockSums 做 exclusive</text>
+  <text class="tiny" x="889" y="986" text-anchor="middle">scan + 求总数</text>
+  <text class="tiny" x="889" y="1002" text-anchor="middle">→ TotalCount(标量)</text>
+
+  <path class="arrowGpuLine" d="M1030 978 H1050"/>
+  <rect class="softGpu" x="1052" y="930" width="258" height="96" rx="5"/>
+  <text class="nodeTitle mono" x="1181" y="950" text-anchor="middle">Pass 5 · AddOffsets</text>
+  <text class="tiny" x="1181" y="970" text-anchor="middle">块偏移加回每列起点</text>
+  <text class="tiny" x="1181" y="986" text-anchor="middle">→ RunStart（全局偏移）</text>
+  <text class="tiny" x="1181" y="1002" text-anchor="middle">CSR row-offset 完成</text>
+
+  <!-- readback -->
+  <path class="arrowGpuLine" d="M877 1046 V1062"/>
+  <rect class="io" x="424" y="1062" width="906" height="46" rx="6"/>
+  <text class="nodeTitle" x="448" y="1082">AddEnqueueCopyPass → 回读 TotalCount</text>
+  <text class="tiny" x="448" y="1098">唯一一次 CPU 往返：FlushRenderingCommands 后 Lock 读出 TotalRuns（必要时 SubmitAndBlockUntilGPUIdle），用于精确分配 Runs[]</text>
+
+  <path class="arrow" d="M877 1118 V1140"/>
+
+  <!-- TotalRuns branch -->
+  <rect class="warn" x="424" y="1140" width="440" height="92" rx="7"/>
+  <text class="nodeTitle" x="448" y="1162">TotalRuns == 0（无占用体素）</text>
+  <text class="body" x="448" y="1182">释放全部 scratch（Coverage / RunCount /</text>
+  <text class="body" x="448" y="1200">RunStart / Dense），bVoxelGridValid = false</text>
+  <text class="tiny" x="448" y="1220">地形纹理保持空值，警告并 return</text>
+
+  <rect class="gpu" x="890" y="1140" width="440" height="92" rx="7"/>
+  <text class="nodeTitle mono" x="914" y="1162">Pass 6 · FShallowWaterVoxelEmitRuns</text>
+  <text class="body" x="914" y="1182">复用 DenseOccupancy + 全局 RunStart 偏移</text>
+  <text class="body" x="914" y="1200">每列写出打包 run（不重新光栅化）</text>
+  <text class="tiny" x="914" y="1220">run 打包：低16位 zStart，高16位 zEnd</text>
+
+  <path class="arrowGpuLine" d="M1110 1232 V1284"/>
+
+  <!-- ===== PHASE 3: 持久化 ===== -->
+  <rect class="band" x="54" y="1284" width="1332" height="240" rx="9"/>
+  <text class="phase" x="80" y="1314" fill="#6d28d9">3. 持久化 CSR 网格 + 释放稠密临时网格</text>
+
+  <rect class="persist" x="82" y="1334" width="700" height="120" rx="7"/>
+  <text class="nodeTitle" x="432" y="1357" text-anchor="middle">保留 4 个 CSR 风格持久缓冲（常驻显存，占用小）</text>
+  <text class="body mono" x="104" y="1379">VoxelColumnRunStartBuffer  — 每列 run 起点偏移</text>
+  <text class="body mono" x="104" y="1397">VoxelColumnRunCountBuffer  — 每列 run 数量</text>
+  <text class="body mono" x="104" y="1415">VoxelRunsBuffer            — 打包 run（zStart/zEnd）</text>
+  <text class="body mono" x="104" y="1433">VoxelCoverageBuffer        — 每列覆盖标记</text>
+  <text class="tiny" x="104" y="1449">记录 VoxelTotalRunCount 等元数据；bVoxelHeightMapInitialized = false</text>
+
+  <path class="arrowThin" d="M782 1394 H826"/>
+
+  <rect class="warn" x="828" y="1334" width="526" height="58" rx="7"/>
+  <text class="nodeTitle" x="864" y="1356">立即释放稠密临时位网格</text>
+  <text class="tiny" x="864" y="1376">DenseOccupancyPooled.SafeRelease()：它只是构建中转，吃显存大，不持久化</text>
+
+  <rect class="data" x="828" y="1402" width="526" height="52" rx="7"/>
+  <text class="nodeTitle" x="864" y="1423">置有效标志</text>
+  <text class="tiny mono" x="864" y="1442">bVoxelGridValid = RunStart &amp;&amp; RunCount &amp;&amp; Runs &amp;&amp; Coverage 均有效</text>
+
+  <path class="arrow" d="M720 1524 V1544"/>
+  <rect x="250" y="1544" width="940" height="48" rx="8" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.8"/>
+  <text class="nodeTitle" x="720" y="1566" text-anchor="middle" fill="#5b21b6">持久稀疏地形体素网格构建完成 — 供解算迭代查询</text>
+  <text class="tiny" x="720" y="1583" text-anchor="middle" fill="#6d28d9">设计取舍：持久层稀疏存储省显存、单次 CPU 往返、GridXY 强制等于模拟分辨率（思路镜像 VoxelCavitySpan.usf）</text>
+</svg>

@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Delegates/Delegate.h"
 #include "Modules/ModuleManager.h"
+#include "ComputeShaderDebugParams.h"
 
 class AComputeShaderMeshGenerator;
 class AGPUSkeletalTree;

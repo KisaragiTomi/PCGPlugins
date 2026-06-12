@@ -10,6 +10,7 @@
 #include "RenderGraphResources.h"
 #include "RenderGraphUtils.h"
 #include "RenderGraphBuilder.h"
+#include "RHIGPUReadback.h"
 #include "RenderTargetPool.h"
 #include "ComputeShaderGenerateHepler.h"
 #include "EngineUtils.h"
@@ -43,6 +44,8 @@
 #include "Runtime/Experimental/Voronoi/Private/voro++/src/container.hh"
 #include "Subsystems/EditorAssetSubsystem.h"
 #include "MeshDescription.h"
+#include "DrawDebugHelpers.h"
+#include "Engine/World.h"
 #include "StaticMeshAttributes.h"
 
 
@@ -426,24 +429,6 @@ UMaterialInstance* UCSAssetProcess::FindOrCreateMaterialInstanceAsset(FString As
 	return OutMaterialInstance;;
 }
 
-void UCSAssetProcess::GetDistanceToNearestSurface(UTextureRenderTarget2D* InDebugView)
-{
-	FEditorViewportClient* EditorViewportClient = StaticCast<FEditorViewportClient*>(GEditor->GetActiveViewport()->GetClient());
-	FViewport* Viewport = EditorViewportClient->Viewport;
-	FSceneViewFamilyContext ViewFamily(FSceneViewFamily::ConstructionValues(Viewport, EditorViewportClient->GetScene(), EditorViewportClient->EngineShowFlags));
-	// ViewFamily.viewinf
-	// FSceneRenderer
-	FSceneView* SceneView = EditorViewportClient->CalcSceneView(&ViewFamily);
-	SceneView->Family->GetSceneRenderer()->GetSceneUniforms();
-	// FScene* Scene;
-	// // FDistanceFieldSceneData& DFData = Scene->DistanceFieldSceneData;
-	// Scene->GetRenderScene();
-	
-	// SceneView
-	// SceneView->bIsViewInfo
-	UComputeShaderBasicFunction::CalDistanceToNearestSurface(SceneView, InDebugView);
-}
-
 void UCSAssetProcess::CreateDebugTexture(AActor* TargetActor, UTextureRenderTarget2D* InDebugView, FString DebugName)
 {
 	ULevel* CurrentLevel =TargetActor ->GetLevel();
@@ -565,31 +550,4 @@ void UCSAssetProcess::DisplaceMeshByRTBlueChannel(
 
 	UE_LOG(LogTemp, Log, TEXT("DisplaceMeshByRTBlueChannel: Displaced %d verts, wrote vertex colors on '%s'."),
 		NumVertexInstances, *InStaticMesh->GetName());
-}
-
-void UCSAssetProcess::SampleGlobalDistanceField(
-	UObject* WorldContextObject,
-	const TArray<FVector>& WorldPositions,
-	TArray<float>& OutDistances,
-	TArray<FVector>& OutGradients)
-{
-	OutDistances.Reset();
-	OutGradients.Reset();
-	if (!WorldContextObject || WorldPositions.IsEmpty()) return;
-
-#if WITH_EDITOR
-	FEditorViewportClient* EditorViewportClient = StaticCast<FEditorViewportClient*>(
-		GEditor->GetActiveViewport()->GetClient());
-	if (!EditorViewportClient) return;
-
-	FViewport* Viewport = EditorViewportClient->Viewport;
-	FSceneViewFamilyContext ViewFamily(
-		FSceneViewFamily::ConstructionValues(
-			Viewport, EditorViewportClient->GetScene(), EditorViewportClient->EngineShowFlags));
-	FSceneView* SceneView = EditorViewportClient->CalcSceneView(&ViewFamily);
-	if (!SceneView) return;
-
-	UComputeShaderBasicFunction::SampleGlobalDistanceFieldAtPositions(
-		SceneView, WorldPositions, OutDistances, OutGradients);
-#endif
 }

@@ -1,0 +1,60 @@
+//#pragma
+
+#include "/Engine/Public/Platform.ush"
+
+#include "/Plugin/PCGPlugins/Shaders/Private/General.usf"
+
+#ifndef THREADGROUPSIZE_X
+#define THREADGROUPSIZE_X 64
+#endif
+
+#ifndef THREADGROUPSIZE_Y
+#define THREADGROUPSIZE_Y 1
+#endif
+
+#ifndef THREADGROUPSIZE_Z
+#define THREADGROUPSIZE_Z 1
+#endif
+
+// Input: control points (xyz=world position, w reserved), NumCtrl of them
+Buffer<float4> ControlPoints;
+// Output: position (xyz=position, w=valid flag), tangent (xyz=tangent direction, w=0)
+RWBuffer<float4> RW_OutPositions;
+RWBuffer<float4> RW_OutTangents;
+
+int NumControlPoints;
+int NumSamples;
+
+float4 LoadCtrl(int Index, int NumCtrl)
+{
+    return ControlPoints[clamp(Index, 0, NumCtrl - 1)];
+}
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void SmoothSplineEval(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    int SampleId = DispatchThreadId.x;
+    if (SampleId >= NumSamples) return;
+
+    int NumCtrl = max(NumControlPoints, 2);
+
+    float Alpha = NumSamples > 1 ? (float) SampleId / (float) (NumSamples - 1) : 0.0;
+
+    int SegIndex;
+    float LocalT;
+    BSplineMapGlobalAlpha(Alpha, NumCtrl, SegIndex, LocalT);
+
+    // Endpoint clamp so the curve ends stay close to the control points
+    float3 P0 = LoadCtrl(SegIndex - 1, NumCtrl).xyz;
+    float3 P1 = LoadCtrl(SegIndex,     NumCtrl).xyz;
+    float3 P2 = LoadCtrl(SegIndex + 1, NumCtrl).xyz;
+    float3 P3 = LoadCtrl(SegIndex + 2, NumCtrl).xyz;
+
+    float3 Pos = BSplinePosition(P0, P1, P2, P3, LocalT);
+    float3 Tan = BSplineTangent(P0, P1, P2, P3, LocalT);
+    float TanLen = length(Tan);
+    Tan = TanLen > 1e-5 ? Tan / TanLen : float3(1, 0, 0);
+
+    RW_OutPositions[SampleId] = float4(Pos, 1.0);
+    RW_OutTangents[SampleId] = float4(Tan, 0.0);
+}

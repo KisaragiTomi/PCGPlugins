@@ -1053,7 +1053,8 @@ FCSTriangleMeshData UCSDrawPrimtive::GetTaggedBoxSceneTriangles(
 	FVector BoxSize,
 	FName RequiredActorTag,
 	int32 LODIndex,
-	int32 MaxTriangles)
+	int32 MaxTriangles,
+	bool bAlwaysIncludeLandscape)
 {
 	FCSTriangleMeshData OutTriangleData;
 
@@ -1080,7 +1081,8 @@ FCSTriangleMeshData UCSDrawPrimtive::GetTaggedBoxSceneTriangles(
 	const int32 SafeMaxTriangles = FMath::Max(1, MaxTriangles);
 
 	FCSTriangleMeshData LandscapeTriangleData;
-	AppendLandscapeTriangles(World, QueryBox, WorldToBoxTransform, BoxExtent, RequiredActorTag, SafeMaxTriangles, LandscapeTriangleData);
+	const FName LandscapeRequiredTag = bAlwaysIncludeLandscape ? NAME_None : RequiredActorTag;
+	AppendLandscapeTriangles(World, QueryBox, WorldToBoxTransform, BoxExtent, LandscapeRequiredTag, SafeMaxTriangles, LandscapeTriangleData);
 	AppendTriangleMeshDataInsideLocalBox(OutTriangleData, LandscapeTriangleData, SafeMaxTriangles, WorldToBoxTransform, BoxExtent);
 
 	for (TObjectIterator<UStaticMeshComponent> It; It; ++It)

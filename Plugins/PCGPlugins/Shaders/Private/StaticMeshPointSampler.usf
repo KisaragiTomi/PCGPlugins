@@ -64,8 +64,6 @@ uint bUseBounds;
 uint bUseReferenceFilter;
 uint SurfaceVoxelCapacity;
 uint SurfaceVoxelHashSlotCount;
-// Per-triangle safety budget for the surface voxel cell scan.
-uint MaxSurfaceVoxelCellsPerTriangle;
 // Blur neighbourhood radius for mean filter (0=disabled, 1=3x3x3)
 uint SurfaceVoxelBlurRadius;
 uint DirtyVoxelCount;
@@ -750,6 +748,8 @@ void AppendSurfaceVoxel(int3 Cell, float3 Normal, float3 TargetPosition, float N
 
 			if (PackedVoxelIndex == 0u)
 			{
+				uint PrevDropped = 0u;
+				InterlockedAdd(RW_SurfaceVoxelCounter[1], 1u, PrevDropped);
 				return;
 			}
 
@@ -769,6 +769,8 @@ void AppendSurfaceVoxel(int3 Cell, float3 Normal, float3 TargetPosition, float N
 
 	if (!bClaimedSlot)
 	{
+		uint PrevDroppedHash = 0u;
+		InterlockedAdd(RW_SurfaceVoxelCounter[1], 1u, PrevDroppedHash);
 		return;
 	}
 
@@ -778,6 +780,8 @@ void AppendSurfaceVoxel(int3 Cell, float3 Normal, float3 TargetPosition, float N
 		uint CurrentVoxelCount = RW_SurfaceVoxelCounter[0];
 		if (CurrentVoxelCount >= SurfaceVoxelCapacity)
 		{
+			uint PrevDroppedCap = 0u;
+			InterlockedAdd(RW_SurfaceVoxelCounter[1], 1u, PrevDroppedCap);
 			return;
 		}
 

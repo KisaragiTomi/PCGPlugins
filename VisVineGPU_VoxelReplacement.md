@@ -6,10 +6,10 @@
 
 | 角色 | 发生位置 | 代码行 | 数据 | 产物 |
 |------|----------|--------|------|------|
-| **A: 位置投射** | CPU `PrepareVineVisualizationLinesCPU` | L628 | BVH 最近点查询 → `NearestPoint.Position` | 路径顶点投影到 mesh 表面（10 次迭代 noise 循环中每帧重做） |
+| **A: 位置投射** | CPU `PrepareVVLinesCPU` | L628 | BVH 最近点查询 → `NearestPoint.Position` | 路径顶点投影到 mesh 表面（10 次迭代 noise 循环中每帧重做） |
 | **B: 位置投射（Plane merge）** | CPU 同上 | L750 | BVH 最近点查询 → `NearestPoint.Position` | Plane 藤蔓合并后重新投射到表面 |
 | **C: 法线偏移** | CPU 同上 | L762-776 | BVH 最近点查询 → `EditMesh.GetTriNormal(TriangleID)` | `VertexLocation += Normal * VinesOffset` 沿表面法线外推 |
-| **D: 法线获取（GPU）** | GPU `BuildVineVisualizationMeshCS` | L306-309 | 网格 → 三角面遍历 → 法线 | 构建局部坐标系（Tangent/Binormal/FrameNormal）用于剖面顶点生成 |
+| **D: 法线获取（GPU）** | GPU `BuildVVMeshCS` | L306-309 | 网格 → 三角面遍历 → 法线 | 构建局部坐标系（Tangent/Binormal/FrameNormal）用于剖面顶点生成 |
 
 **关键发现**：
 - GPU 端 `FindClosestMeshPoint` 返回的 `Projected` 位置**实际上未被使用**（L321 `Center = Query` 始终用原始路径点），GPU 只需要法线来构建局部坐标系
@@ -108,7 +108,7 @@ if (TotalW > KINDA_SMALL_NUMBER)
 }
 ```
 
-#### 2.2 修改 `PrepareVineVisualizationLinesCPU`
+#### 2.2 修改 `PrepareVVLinesCPU`
 
 | 角色 | 旧代码 | 新代码 |
 |------|--------|--------|
@@ -122,11 +122,11 @@ if (TotalW > KINDA_SMALL_NUMBER)
 
 ```cpp
 // 旧签名
-static bool PrepareVineVisualizationLinesCPU(
+static bool PrepareVVLinesCPU(
     ..., UDynamicMesh* PrefixMesh, const FGeometryScriptDynamicMeshBVH& BVH, ...);
 
 // 新签名（体素版）
-static bool PrepareVineVisualizationLinesCPU_Voxel(
+static bool PrepareVVLinesCPU_Voxel(
     ..., const FCSSurfaceVoxelData& VoxelData, ...);
 ```
 
@@ -135,7 +135,7 @@ static bool PrepareVineVisualizationLinesCPU_Voxel(
 
 **路径 2: 函数内部分支**
 
-在现有 `PrepareVineVisualizationLinesCPU` 内部，用 `FCSSurfaceVoxelData` 可空性决定走 BVH 还是体素路径。
+在现有 `PrepareVVLinesCPU` 内部，用 `FCSSurfaceVoxelData` 可空性决定走 BVH 还是体素路径。
 
 **推荐路径 1**：改动范围可控，旧路径完整保留。
 
@@ -216,7 +216,7 @@ groupshared uint   gs_VoxelValid[VOXEL_WINDOW_SIZE * VOXEL_WINDOW_SIZE * VOXEL_W
 
 优化点：实际窗口大小 = 线程组内顶点覆盖的 cell 范围 + 1（因为每个顶点采样 8 个角）。64 个线程通常覆盖 4×4×4 范围 → 窗口约 5×5×5。
 
-#### 3.3 新计算着色器 `VineVisualizationVoxel.usf`
+#### 3.3 新计算着色器 `VVVoxel.usf`
 
 ```hlsl
 // ===== 输入（替代 MeshTriangleVertices + Grid） =====
@@ -282,7 +282,7 @@ uint3 GetCornerCell(int3 BaseCell, uint CornerIdx)
 }
 
 [numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, 1)]
-void VineVisualizationVoxelCS(uint3 DT : SV_DispatchThreadID, uint GI : SV_GroupIndex)
+void VVVoxelCS(uint3 DT : SV_DispatchThreadID, uint GI : SV_GroupIndex)
 {
     // === Phase 1: 计算 group 内顶点范围，确定 voxel 窗口 ===
     uint VertexIdx = DT.x;
@@ -358,8 +358,8 @@ void VineVisualizationVoxelCS(uint3 DT : SV_DispatchThreadID, uint GI : SV_Group
 
 | 改动 | 说明 |
 |------|------|
-| 新增 `FVineVisualizationVoxelCS` 全局着色器类 | `IMPLEMENT_GLOBAL_SHADER`，`THREADGROUPSIZE_X=64` ，`THREADGROUPSIZE_Y=1` |
-| 新增 `DispatchVineVisualizationGPU_Voxel()` | 上传 VoxelPositions + Normals + TargetPositions + Cells + HashTable，替代 MeshTriangles + Grid |
+| 新增 `FVVVoxelCS` 全局着色器类 | `IMPLEMENT_GLOBAL_SHADER`，`THREADGROUPSIZE_X=64` ，`THREADGROUPSIZE_Y=1` |
+| 新增 `DispatchVVGPU_Voxel()` | 上传 VoxelPositions + Normals + TargetPositions + Cells + HashTable，替代 MeshTriangles + Grid |
 | HashTable 复用体素化阶段已有的 `VoxelHashSlots` + `VoxelHashIndices` 结构 | 无需重新构建（体素化时已生成） |
 | `VisVineGPUInternal` 调用新 dispatch | 移除 `ExtractDynamicMeshTrianglesForGPU`、`BuildUniformGridForTriangles` |
 
@@ -400,7 +400,7 @@ void VineVisualizationVoxelCS(uint3 DT : SV_DispatchThreadID, uint GI : SV_Group
 | GPU 查询逻辑 | `WorldToGridCell` → 遍历三角面 → `ClosestPointOnTriangle` / 单线 | **Shared memory** 协作装载 voxel 窗口 → 每线程本地 8 点采样 → 加权 |
 | GPU 法线质量 | `cross(B-A, C-A)` 单三角面法线 | 面积加权 + blur（GPU 预计算）+ 距离² 平滑插值 |
 | GPU 顶点定位 | `Center = Query`（原始路径点，未用投射结果） | `Center = 加权目标位置`（更贴合表面） |
-| 回退路径 | — | `VisVineCPU` + 旧 `PrepareVineVisualizationLinesCPU` 完整保留 |
+| 回退路径 | — | `VisVineCPU` + 旧 `PrepareVVLinesCPU` 完整保留 |
 
 ## 风险与回退
 

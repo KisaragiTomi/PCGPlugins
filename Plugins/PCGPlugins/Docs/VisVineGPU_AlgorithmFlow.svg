@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 1740" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 2110" role="img" aria-labelledby="title desc">
   <title id="title">VisVineGPU Algorithm Flow</title>
-  <desc id="desc">Algorithm flow for AVineContainer::VisVineGPUInternal, including CPU preprocessing, voxel acceleration data, RDG compute passes, readback, and DynamicMesh append.</desc>
+  <desc id="desc">Algorithm flow for AVineContainer::VisVineGPUInternal. CPU smooths/resamples lines only — surface projection, CurlNoise, PerlinNoise, smoothing, final projection, optional surface resample, tangent rebuild and tangent smoothing all run on the GPU inside DispatchVVGPU_Voxel.</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
       <path d="M0,0 L10,4 L0,8 Z" fill="#334155"/>
@@ -29,6 +29,8 @@
       .band { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.2; }
       .cpu { fill: #dbeafe; stroke: #2563eb; stroke-width: 1.35; }
       .gpu { fill: #dcfce7; stroke: #16a34a; stroke-width: 1.35; }
+      .gpuNoise { fill: #ecfdf5; stroke: #059669; stroke-width: 1.35; }
+      .gpuPerlin { fill: #fef9c3; stroke: #ca8a04; stroke-width: 1.35; }
       .data { fill: #f8fafc; stroke: #94a3b8; stroke-width: 1.1; }
       .io { fill: #fef3c7; stroke: #d97706; stroke-width: 1.25; }
       .mesh { fill: #f3e8ff; stroke: #7c3aed; stroke-width: 1.25; }
@@ -41,34 +43,39 @@
       .arrowGpuLine { stroke: #15803d; stroke-width: 1.45; fill: none; marker-end: url(#arrowGpu); }
       .arrowWarnLine { stroke: #dc2626; stroke-width: 1.1; fill: none; marker-end: url(#arrowWarn); }
       .dash { stroke-dasharray: 6 5; }
-      .laneLabel { font-size: 12px; font-weight: 700; fill: #475569; letter-spacing: 0; }
     </style>
   </defs>
 
-  <rect width="1440" height="1740" fill="#f8fafc"/>
+  <rect width="1440" height="2110" fill="#f8fafc"/>
 
+  <!-- ===== HEADER ===== -->
   <rect x="36" y="26" width="1368" height="104" rx="10" fill="url(#headerGrad)" stroke="#cbd5e1"/>
   <text class="title" x="720" y="67" text-anchor="middle">VisVineGPU 算法流程</text>
   <text class="subtitle mono" x="720" y="94" text-anchor="middle">AVineContainer::VisVine(MainVine, true) -&gt; VisVineGPUInternal()</text>
-  <text class="tiny" x="720" y="116" text-anchor="middle">当前路径使用 CachedSurfaceVoxels + VineVisualizationVoxel.usf，在 GPU 上采样体素表面并生成藤蔓 sweep mesh</text>
+  <text class="tiny" x="720" y="116" text-anchor="middle">CPU 只做线条平滑重采样；表面投射、CurlNoise、PerlinNoise、平滑、最终投射、切线重建/平滑统一在 GPU 完成 (DispatchVVGPU_Voxel)</text>
 
+  <!-- ===== LEGEND ===== -->
   <g transform="translate(58 150)">
     <rect class="cpu" x="0" y="0" width="18" height="18" rx="3"/>
     <text class="body" x="27" y="14">CPU / Game Thread</text>
     <rect class="gpu" x="188" y="0" width="18" height="18" rx="3"/>
     <text class="body" x="215" y="14">GPU Compute / RDG</text>
-    <rect class="data" x="390" y="0" width="18" height="18" rx="3"/>
-    <text class="body" x="417" y="14">结构化数据</text>
-    <rect class="io" x="532" y="0" width="18" height="18" rx="3"/>
-    <text class="body" x="559" y="14">Readback</text>
-    <rect class="mesh" x="668" y="0" width="18" height="18" rx="3"/>
-    <text class="body" x="695" y="14">DynamicMesh 输出</text>
-    <rect class="warn" x="874" y="0" width="18" height="18" rx="3"/>
-    <text class="body" x="901" y="14">失败返回 false / fallback</text>
+    <rect class="gpuNoise" x="390" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="417" y="14">GPU CurlNoise</text>
+    <rect class="gpuPerlin" x="560" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="587" y="14">GPU PerlinNoise</text>
+    <rect class="data" x="730" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="757" y="14">结构化数据</text>
+    <rect class="io" x="872" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="899" y="14">Readback</text>
+    <rect class="mesh" x="1008" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="1035" y="14">DynamicMesh 输出</text>
+    <rect class="warn" x="1224" y="0" width="18" height="18" rx="3"/>
+    <text class="body" x="1251" y="14">失败返回 false</text>
   </g>
 
-  <!-- Phase 0 -->
-  <rect class="band" x="54" y="194" width="1332" height="142" rx="9"/>
+  <!-- ===== PHASE 0: 入口与校验 ===== -->
+  <rect class="band" x="54" y="194" width="1332" height="156" rx="9"/>
   <text class="phase" x="80" y="224" fill="#1d4ed8">0. 入口、分支选择、必要校验</text>
 
   <rect class="cpu" x="82" y="246" width="238" height="56" rx="7"/>
@@ -76,206 +83,233 @@
   <text class="tiny" x="201" y="286" text-anchor="middle">bUseGPU 为 true 时进入 GPU 分支</text>
 
   <path class="arrowThin" d="M320 274 H368"/>
-  <rect class="cpu" x="370" y="238" width="298" height="72" rx="7"/>
-  <text class="nodeTitle mono" x="519" y="261" text-anchor="middle">VisVineGPUInternal()</text>
-  <text class="body" x="394" y="281">Lines = TubeLines 或 PlaneLines</text>
+  <rect class="cpu" x="370" y="238" width="350" height="72" rx="7"/>
+  <text class="nodeTitle mono" x="545" y="261" text-anchor="middle">VisVineGPUInternal()</text>
+  <text class="body" x="394" y="281">Lines = TubeLines（仅处理 Tube，无 Plane 分支）</text>
   <text class="tiny" x="394" y="297">同步选择 SourceScales / Locations / PointScales</text>
 
-  <path class="arrowThin" d="M668 274 H716"/>
-  <rect class="warn" x="718" y="232" width="626" height="86" rx="7"/>
-  <text class="nodeTitle" x="742" y="254">提前失败条件</text>
-  <text class="body" x="742" y="274">Lines 为空，VV.ResampleLength 无效，DynamicMeshComponent 或 ContainerMesh 无效</text>
-  <text class="body" x="742" y="292">CachedSurfaceVoxels.Cells 为空；CurveControl 为空时会先 NewObject 创建</text>
-  <path class="arrowWarnLine dash" d="M1256 318 V332"/>
+  <path class="arrowThin" d="M720 274 H760"/>
+  <rect class="warn" x="762" y="232" width="592" height="86" rx="7"/>
+  <text class="nodeTitle" x="786" y="254">提前失败条件</text>
+  <text class="body" x="786" y="274">Lines 为空，VV.ResampleLength 无效，DynamicMeshComponent 或 ContainerMesh 无效</text>
+  <text class="body" x="786" y="292">CachedSurfaceVoxels.Cells 为空（由 GenerateVines 在之前填充）</text>
+  <path class="arrowWarnLine dash" d="M1268 318 V332"/>
 
-  <path class="arrow" d="M720 336 V372"/>
+  <path class="arrow" d="M720 350 V378"/>
 
-  <!-- Phase 1 -->
-  <rect class="band" x="54" y="372" width="1332" height="284" rx="9"/>
-  <text class="phase" x="80" y="402" fill="#1d4ed8">1. CPU 线处理：保留中心线语义，不在 CPU 做表面投影</text>
+  <!-- ===== PHASE 1: CPU 线预处理（仅平滑重采样） ===== -->
+  <rect class="band" x="54" y="378" width="1332" height="266" rx="9"/>
+  <text class="phase" x="80" y="408" fill="#1d4ed8">1. CPU 线预处理：仅平滑 + 重采样（无表面投射、无噪声 — 全部移至 GPU）</text>
 
-  <rect class="data" x="82" y="426" width="238" height="164" rx="7"/>
-  <text class="nodeTitle" x="104" y="450">输入线与参数</text>
-  <text class="body" x="104" y="472">TubeLines / PlaneLines</text>
-  <text class="body" x="104" y="490">VV: ResampleLength, Noise, Merge</text>
-  <text class="body" x="104" y="508">CurveControl: R/B/G 通道</text>
-  <text class="body" x="104" y="526">SC source location / point scale</text>
-  <text class="tiny" x="104" y="550">输出仍是中心线；表面吸附推迟到 GPU</text>
+  <rect class="data" x="82" y="428" width="220" height="130" rx="7"/>
+  <text class="nodeTitle" x="104" y="452">输入线与参数</text>
+  <text class="body" x="104" y="472">TubeLines</text>
+  <text class="body" x="104" y="490">VV: ResampleLength, Noise</text>
+  <text class="body" x="104" y="508">CurveControl: R/G/B 通道</text>
+  <text class="body" x="104" y="526">SC source location / scale</text>
+  <text class="tiny" x="104" y="548">不再需要 BVH 缓存 — 投射全在 GPU</text>
 
-  <path class="arrowThin" d="M320 508 H362"/>
-  <rect class="cpu" x="364" y="422" width="430" height="180" rx="7"/>
-  <text class="nodeTitle mono" x="579" y="446" text-anchor="middle">PrepareVineVisualizationLinesGPU_NoCPUProjection()</text>
-  <rect class="softCpu" x="392" y="468" width="160" height="34" rx="5"/>
-  <text class="tag" x="472" y="489" text-anchor="middle">clone + SC jitter</text>
-  <rect class="softCpu" x="586" y="468" width="160" height="34" rx="5"/>
-  <text class="tag" x="666" y="489" text-anchor="middle">SmoothLine(3)</text>
-  <path class="arrowThin" d="M552 485 H584"/>
-  <rect class="softCpu" x="392" y="518" width="160" height="34" rx="5"/>
-  <text class="tag" x="472" y="539" text-anchor="middle">ResampleByLength</text>
-  <rect class="softCpu" x="586" y="518" width="160" height="34" rx="5"/>
-  <text class="tag" x="666" y="539" text-anchor="middle">Curl + Perlin</text>
-  <path class="arrowThin" d="M552 535 H584"/>
-  <rect class="softCpu" x="462" y="568" width="214" height="24" rx="5"/>
-  <text class="tiny" x="569" y="584" text-anchor="middle">plane: sample 80%, reduce /15, merge, smooth</text>
+  <path class="arrowThin" d="M302 493 H344"/>
 
-  <path class="arrowThin" d="M794 512 H840"/>
-  <rect class="cpu" x="842" y="422" width="212" height="180" rx="7"/>
-  <text class="nodeTitle" x="864" y="446">轴向构建</text>
-  <text class="body mono" x="864" y="468">BuildVineVisualization</text>
-  <text class="body mono" x="864" y="484">LinePointAxes()</text>
-  <text class="body" x="864" y="510">按 PreparedLines 重新计算</text>
-  <text class="body" x="864" y="528">tangent/axis 数据</text>
-  <text class="tiny" x="864" y="554">支持 VisVineGPUAxisSmoothIterations</text>
+  <rect class="cpu" x="346" y="428" width="620" height="190" rx="7"/>
+  <text class="nodeTitle mono" x="656" y="454" text-anchor="middle">VisVineGPUInternal 内联线预处理（无 CPU 投射）</text>
 
-  <path class="arrowThin" d="M1054 512 H1100"/>
-  <rect class="cpu" x="1102" y="422" width="242" height="180" rx="7"/>
-  <text class="nodeTitle mono" x="1223" y="446" text-anchor="middle">BuildVineVisualizationGPUInput()</text>
-  <text class="body" x="1124" y="470">PathPoints: xyz + scale</text>
-  <text class="body" x="1124" y="488">PathPointAxes: smoothed axis</text>
-  <text class="body" x="1124" y="506">PathPointMeta: prev/next/base/count</text>
-  <text class="body" x="1124" y="524">PathPointCurveU: 累积长度</text>
-  <text class="body" x="1124" y="542">SegmentMeta: 每段两端点</text>
-  <text class="tiny" x="1124" y="566">scale = CurveControl.G * point scale</text>
+  <rect class="softCpu" x="368" y="474" width="130" height="28" rx="4"/>
+  <text class="tag" x="433" y="492" text-anchor="middle">clone + SC offset</text>
+  <path class="arrowThin" d="M498 488 H530"/>
+  <rect class="softCpu" x="532" y="474" width="120" height="28" rx="4"/>
+  <text class="tag" x="592" y="492" text-anchor="middle">SmoothLine(3)</text>
+  <path class="arrowThin" d="M652 488 H684"/>
+  <rect class="softCpu" x="686" y="474" width="154" height="28" rx="4"/>
+  <text class="tag" x="763" y="492" text-anchor="middle">ResamppleByLength</text>
 
-  <path class="arrow" d="M1224 602 V690"/>
+  <rect class="warn" x="368" y="518" width="472" height="46" rx="5"/>
+  <text class="tag" x="604" y="536" text-anchor="middle">⚠ 不再做 CPU 表面投射、CurlNoise / PerlinNoise、Plane merge</text>
+  <text class="tiny" x="604" y="554" text-anchor="middle">以上操作全部移至 GPU: ApplyVVNoiseCS + ApplyVVPerlinNoiseCS</text>
 
-  <!-- Phase 2 -->
-  <rect class="band" x="54" y="690" width="1332" height="286" rx="9"/>
-  <text class="phase" x="80" y="720" fill="#1d4ed8">2. CPU 准备体素加速数据：让 shader 快速找到表面 target/normal</text>
+  <rect class="softCpu" x="368" y="578" width="472" height="26" rx="5"/>
+  <text class="tag" x="604" y="595" text-anchor="middle">输出: 仅平滑重采样后的 PreparedLines / Scales（点未吸附到表面）</text>
 
-  <rect class="data" x="82" y="746" width="272" height="154" rx="7"/>
-  <text class="nodeTitle" x="104" y="770">CachedSurfaceVoxels</text>
-  <text class="body" x="104" y="792">Cells: 体素 cell 坐标</text>
-  <text class="body" x="104" y="810">Positions: cell center fallback</text>
-  <text class="body" x="104" y="828">TargetPositions: 贴近表面的目标点</text>
-  <text class="body" x="104" y="846">Normals: 表面法线</text>
-  <text class="tiny" x="104" y="870">Target 距离中心超过 2 * VoxelSize 时回退中心</text>
+  <path class="arrowThin" d="M966 523 H1016"/>
 
-  <path class="arrowThin" d="M354 823 H404"/>
-  <rect class="cpu" x="406" y="740" width="286" height="166" rx="7"/>
-  <text class="nodeTitle" x="428" y="764">Sanitize + upload arrays</text>
-  <text class="body" x="428" y="786">GPUVoxelCells</text>
-  <text class="body" x="428" y="804">GPUVoxelTargetPositions</text>
-  <text class="body" x="428" y="822">GPUVoxelNormals</text>
-  <text class="body" x="428" y="840">输出大小做 MAX_uint32 检查</text>
-  <text class="tiny" x="428" y="864">非法 target/normal 会记录统计并回退</text>
+  <rect class="data" x="1018" y="428" width="242" height="140" rx="7"/>
+  <text class="nodeTitle" x="1139" y="452" text-anchor="middle">PreparedLines / Scales</text>
+  <text class="body" x="1040" y="478">平滑 + 重采样后的中心线</text>
+  <text class="body" x="1040" y="496">点未经过投射（原始位置）</text>
+  <text class="tiny" x="1040" y="520">每点 scale = CurveControl.G × pointScale</text>
+  <text class="tiny" x="1040" y="536">VisVineGPUNoiseIterations (默认 10) 控制</text>
+  <text class="tiny" x="1040" y="550">GPU voxel + CurlNoise + PerlinNoise</text>
 
-  <path class="arrowThin" d="M692 823 H742"/>
-  <rect class="cpu" x="744" y="740" width="286" height="166" rx="7"/>
-  <text class="nodeTitle" x="766" y="764">Acceleration buffers</text>
-  <text class="body mono" x="766" y="786">BuildVineVoxelHashSlots()</text>
-  <text class="tiny" x="766" y="804">cell -&gt; voxel index, open addressing</text>
-  <text class="body mono" x="766" y="830">BuildVineTargetBucketBuffers()</text>
-  <text class="tiny" x="766" y="848">target position bucket -&gt; voxel list</text>
-  <text class="tiny" x="766" y="872">hash 失败时 shader 仍可走线性或局部 fallback</text>
+  <path class="arrow" d="M720 644 V678"/>
 
-  <path class="arrowThin" d="M1030 823 H1080"/>
-  <rect class="gpu" x="1082" y="740" width="262" height="166" rx="7"/>
-  <text class="nodeTitle" x="1104" y="764">RDG structured buffers</text>
-  <text class="body" x="1104" y="786">上传 Path / Voxel / Bucket SRV</text>
-  <text class="body" x="1104" y="804">创建 OutVertices / OutUVs / OutIndices UAV</text>
-  <text class="body" x="1104" y="822">创建 Tangent / Normal / SurfaceTarget UAV</text>
-  <text class="tiny mono" x="1104" y="848">ENQUEUE_RENDER_COMMAND</text>
-  <text class="tiny mono" x="1104" y="866">FRDGBuilder::Execute()</text>
+  <!-- ===== PHASE 2: GPU 输入打包 ===== -->
+  <rect class="band" x="54" y="678" width="1332" height="244" rx="9"/>
+  <text class="phase" x="80" y="708" fill="#1d4ed8">2. GPU 输入打包（轴向交给 GPU 计算）</text>
 
-  <path class="arrowGpuLine" d="M1214 906 V1010"/>
+  <rect class="cpu" x="82" y="728" width="286" height="156" rx="7"/>
+  <text class="nodeTitle mono" x="225" y="752" text-anchor="middle">PreparedLinePointAxes = 空数组</text>
+  <text class="body" x="104" y="780">CPU 端不再构建 axis 数据</text>
+  <text class="body" x="104" y="798">所有切线由 GPU Pass A 从</text>
+  <text class="body" x="104" y="816">noised 点计算，并在 Pass PT</text>
+  <text class="body" x="104" y="834">基于最终 surface target 重建</text>
+  <text class="body" x="104" y="852">再由 Pass AS 做切线平滑</text>
+  <text class="tiny" x="104" y="876">VisVineGPUAxisSmoothIterations 控制平滑次数</text>
 
-  <!-- Phase 3 -->
-  <rect class="band" x="54" y="1010" width="1332" height="434" rx="9"/>
-  <text class="phase" x="80" y="1040" fill="#15803d">3. GPU 算法核心：投射到 voxel 记录的最近三角形点，再按蓝图参数 smooth，最后变形 sweep 出 mesh</text>
+  <path class="arrowThin" d="M368 806 H410"/>
+  <rect class="cpu" x="412" y="728" width="300" height="174" rx="7"/>
+  <text class="nodeTitle mono" x="562" y="752" text-anchor="middle">BuildVVGPUInput()</text>
+  <text class="body" x="434" y="776">PathPoints: xyz + scale</text>
+  <text class="body" x="434" y="794">PathPointAxes: 初始轴向种子</text>
+  <text class="body" x="434" y="812">PathPointMeta: prev/next/base/count</text>
+  <text class="body" x="434" y="830">PathPointCurveU: 累积长度</text>
+  <text class="body" x="434" y="848">SegmentMeta: 每段两端点</text>
+  <text class="tiny" x="434" y="872">scale = CurveControl.G × point scale</text>
+  <text class="tiny" x="434" y="888">输入点未投射 — GPU Pass N 做投射</text>
 
-  <rect class="gpu" x="82" y="1068" width="578" height="296" rx="8"/>
-  <text class="nodeTitle mono" x="371" y="1094" text-anchor="middle">Pass A: BuildVineVisualizationVoxelAxesCS</text>
-  <text class="body" x="112" y="1118">每个 PathPoint 一个线程，计算 tangent、surface target、surface normal、frame normal</text>
+  <rect class="data" x="772" y="728" width="582" height="174" rx="7"/>
+  <text class="nodeTitle" x="1063" y="752" text-anchor="middle">DispatchVVGPU_Voxel 入参</text>
+  <text class="body" x="794" y="776">CircleScale, LineScale, VinesOffset, TinyZJitter = 0.1</text>
+  <text class="body" x="794" y="794">AxisSmoothIterations / PostProjectionSmoothIterations</text>
+  <text class="body" x="794" y="812">PostProjectionSmoothKernelRadius / PostProjectionSmallSmoothIterations</text>
+  <text class="body" x="794" y="830">CurlNoiseScale/10, CurlNoiseFre, PerlinNoiseScale, PerlinNoiseFre</text>
+  <text class="body" x="794" y="848">VisVineGPUNoiseIterations, CachedSurfaceVoxels</text>
+  <text class="tiny" x="794" y="872">bTube = true（Tube 截面）</text>
+  <text class="tiny" x="794" y="888">输出: OutVertices / OutUVs / OutIndices / SurfaceTargets</text>
 
-  <rect class="softGpu" x="112" y="1140" width="224" height="52" rx="6"/>
-  <text class="tag" x="224" y="1162" text-anchor="middle">1. Raw tangent</text>
-  <text class="tiny" x="224" y="1179" text-anchor="middle">prev/next + PathPointAxes 定向</text>
-  <path class="arrowGpuLine" d="M336 1166 H386"/>
+  <path class="arrowThin" d="M712 815 H770"/>
+  <path class="arrow" d="M712 902 V962"/>
 
-  <rect class="softGpu" x="388" y="1140" width="224" height="52" rx="6"/>
-  <text class="tag" x="500" y="1162" text-anchor="middle">2. FindNearestVoxelSample()</text>
-  <text class="tiny" x="500" y="1179" text-anchor="middle">查询 target + normal</text>
+  <!-- ===== PHASE 3: GPU 核心 ===== -->
+  <rect class="band" x="54" y="962" width="1332" height="902" rx="9"/>
+  <text class="phase" x="80" y="992" fill="#15803d">3. GPU 统一计算: CurlNoise投射 → 建轴 → PerlinNoise → 最终投射 → 表面重采样 → 平滑 → 重建切线 → 平滑切线 → 变形扫掠</text>
 
-  <rect class="softData" x="112" y="1214" width="500" height="104" rx="6"/>
-  <text class="nodeTitle" x="134" y="1238">采样优先级</text>
-  <text class="body" x="154" y="1260">A. 8 邻插值：trilinear * inverse-distance 加权，命中 voxel target 后投射</text>
-  <text class="body" x="154" y="1278">B. Local shell search: 8 邻未命中时半径 1..8 逐圈扩展搜索 voxel</text>
-  <text class="body" x="154" y="1296">C. Target bucket search: 搜 target-position bucket，稀疏区域 fallback</text>
-  <text class="tiny" x="154" y="1312">全部失败时使用 Query 点和 fallback frame normal</text>
+  <!-- CPU-side voxel preparation -->
+  <rect class="cpu" x="82" y="1014" width="572" height="138" rx="7"/>
+  <text class="nodeTitle" x="368" y="1038" text-anchor="middle">DispatchVVGPU_Voxel (CPU 侧准备)</text>
 
-  <path class="arrowGpuLine" d="M362 1318 V1338"/>
-  <rect class="softGpu" x="184" y="1338" width="356" height="42" rx="6"/>
-  <text class="tag" x="362" y="1360" text-anchor="middle">输出 PathPointTangents / Normals / SurfaceTargets</text>
-  <text class="tiny" x="362" y="1375" text-anchor="middle">SurfaceTargets.w 记录 sample mode: neighbor / local / bucket / fail</text>
+  <rect class="softCpu" x="104" y="1056" width="170" height="42" rx="5"/>
+  <text class="tag" x="189" y="1074" text-anchor="middle">Sanitize voxels</text>
+  <text class="tiny" x="189" y="1090" text-anchor="middle">非法 target/normal 回退统计</text>
 
-  <path class="arrowGpuLine" d="M660 1216 H738"/>
+  <path class="arrowThin" d="M274 1076 H294"/>
+  <rect class="softCpu" x="296" y="1056" width="170" height="42" rx="5"/>
+  <text class="tag" x="381" y="1074" text-anchor="middle">BuildVoxelHashSlots</text>
+  <text class="tiny" x="381" y="1090" text-anchor="middle">cell→voxel index 哈希表</text>
 
-  <rect class="gpu" x="740" y="1068" width="604" height="296" rx="8"/>
-  <text class="nodeTitle mono" x="1042" y="1094" text-anchor="middle">Pass B/C: Smooth Projection -> BuildVineVisualizationVoxelCS</text>
-  <text class="body" x="770" y="1118">先对投射结果做 N 次 ping-pong smooth，再进入顶点/索引生成</text>
+  <path class="arrowThin" d="M466 1076 H486"/>
+  <rect class="softCpu" x="488" y="1056" width="144" height="42" rx="5"/>
+  <text class="tag" x="560" y="1074" text-anchor="middle">BuildTargetBuckets</text>
+  <text class="tiny" x="560" y="1090" text-anchor="middle">位置桶加速结构</text>
 
-  <rect class="softGpu" x="770" y="1136" width="544" height="58" rx="6"/>
-  <text class="tag" x="1042" y="1158" text-anchor="middle">Pass B: SmoothVineVisualizationVoxelProjectionCS x N</text>
-  <text class="tiny" x="1042" y="1175" text-anchor="middle">N = VisVineGPUPostProjectionSmoothIterations，默认 3；平滑 SurfaceTarget / SurfaceNormal</text>
+  <rect class="softData" x="160" y="1112" width="436" height="28" rx="5"/>
+  <text class="tag" x="378" y="1130" text-anchor="middle">上传 RDG buffers: Cells / HashSlots / Normals / TargetPositions / TargetBuckets</text>
 
-  <path class="arrowGpuLine" d="M1042 1194 V1214"/>
-  <rect class="softGpu" x="770" y="1214" width="246" height="70" rx="6"/>
-  <text class="tag" x="893" y="1236" text-anchor="middle">Pass C vertex deform</text>
-  <text class="body" x="790" y="1256">Frame 使用 smoothed SurfaceNormal</text>
-  <text class="body" x="790" y="1272">Center = smoothed Target + Normal * VinesOffset</text>
+  <path class="arrowGpuLine" d="M654 1083 H700"/>
 
-  <path class="arrowGpuLine" d="M1016 1249 H1066"/>
-  <rect class="softGpu" x="1068" y="1214" width="246" height="70" rx="6"/>
-  <text class="tag" x="1191" y="1236" text-anchor="middle">Profile extrusion</text>
-  <text class="body" x="1088" y="1256">Tube: 3 点三角截面 * CircleScale</text>
-  <text class="body" x="1088" y="1272">Plane: 2 点 ribbon * LineScale</text>
+  <!-- GPU side -->
+  <rect class="gpu" x="702" y="1014" width="642" height="778" rx="8"/>
 
-  <path class="arrowGpuLine" d="M1191 1284 V1302"/>
-  <rect class="softGpu" x="912" y="1302" width="402" height="38" rx="6"/>
-  <text class="tag" x="1113" y="1324" text-anchor="middle">写出 RW_OutVertices / RW_OutUVs</text>
+  <!-- Pass N: CurlNoise Loop -->
+  <rect class="gpuNoise" x="728" y="1036" width="590" height="64" rx="6"/>
+  <text class="nodeTitle mono" x="1023" y="1058" text-anchor="middle">Pass N: ApplyVVNoiseCS（CurlNoise + 投射循环）</text>
+  <text class="body" x="748" y="1078">每点一线程: VoxelProjection (FindNearestVoxelSample → 吸附表面 target) → CurlNoise</text>
+  <text class="tiny" x="748" y="1093">循环 NoiseIterations (默认 10) 次，输出 PathPointsNoised（下游几何源）</text>
 
-  <path class="arrowGpuLine" d="M1015 1321 V1348"/>
-  <rect class="softGpu" x="770" y="1348" width="544" height="32" rx="6"/>
-  <text class="tiny" x="1042" y="1368" text-anchor="middle">Index &lt; SegmentCount: 写 RW_OutIndices；Tube 每段 ProfileCount * 2 三角形，Plane 每段 2 三角形</text>
+  <path class="arrowGpuLine" d="M1023 1100 V1116"/>
 
-  <rect class="data" x="206" y="1390" width="1028" height="32" rx="6"/>
-  <text class="tiny mono" x="720" y="1411" text-anchor="middle">DispatchCount = max(OutputVertexCount, SegmentCount), THREADGROUPSIZE_X = 64</text>
+  <!-- Pass A: BuildAxes -->
+  <rect class="softGpu" x="728" y="1116" width="590" height="58" rx="6"/>
+  <text class="nodeTitle mono" x="1023" y="1138" text-anchor="middle">Pass A: BuildVVVoxelAxesCS</text>
+  <text class="tiny" x="1023" y="1158" text-anchor="middle">从 noised 点计算 tangent / surfaceTarget / surfaceNormal（写入 A 组缓冲）</text>
 
-  <path class="arrowGpuLine" d="M720 1444 V1480"/>
+  <path class="arrowGpuLine" d="M1023 1174 V1190"/>
 
-  <!-- Phase 4 -->
-  <rect class="band" x="54" y="1480" width="1332" height="190" rx="9"/>
-  <text class="phase" x="80" y="1510" fill="#92400e">4. Readback、UV 修正、DynamicMesh 追加</text>
+  <!-- Pass P: PerlinNoise -->
+  <rect class="gpuPerlin" x="728" y="1190" width="590" height="58" rx="6"/>
+  <text class="nodeTitle mono" x="1023" y="1212" text-anchor="middle">Pass P: ApplyVVPerlinNoiseCS</text>
+  <text class="tiny" x="1023" y="1232" text-anchor="middle">沿 SurfaceNormal 偏移 SurfaceTarget: offset = PerlinNoiseScale × PerlinNoise3D(Target × Fre/100)</text>
 
-  <rect class="io" x="82" y="1538" width="286" height="86" rx="7"/>
-  <text class="nodeTitle" x="104" y="1562">GPU -&gt; CPU readback</text>
-  <text class="body" x="104" y="1584">AddEnqueueCopyPass 到 FRHIGPUBufferReadback</text>
-  <text class="body" x="104" y="1602">FlushRenderingCommands，必要时等待 GPU idle</text>
-  <text class="tiny" x="104" y="1618">Lock / Memcpy / Unlock: vertices, uvs, indices, targets</text>
+  <path class="arrowGpuLine" d="M1023 1248 V1264"/>
 
-  <path class="arrowThin" d="M368 1582 H418"/>
-  <rect class="cpu" x="420" y="1538" width="272" height="86" rx="7"/>
-  <text class="nodeTitle" x="442" y="1562">CPU 后处理</text>
-  <text class="body mono" x="442" y="1584">LogVineGPUProjectionStats()</text>
-  <text class="body mono" x="442" y="1602">RecomputeVineOutputUVs...</text>
-  <text class="tiny" x="442" y="1618">按生成网格长度重算 UV V</text>
+  <!-- Pass FP: Final Surface Projection (now before smoothing) -->
+  <rect class="gpu" x="728" y="1264" width="590" height="60" rx="6"/>
+  <text class="nodeTitle mono" x="1023" y="1286" text-anchor="middle">Pass FP: FinalProjectVVVoxelCS（最终表面投射 + VinesOffset 外推）</text>
+  <text class="tiny" x="1023" y="1306" text-anchor="middle">将 Perlin 偏移后的点用 voxel (FindNearestVoxelSample) 投回表面，得 Surface Target / Normal，再沿法线外推 VinesOffset 作为最终中心线</text>
 
-  <path class="arrowThin" d="M692 1582 H742"/>
-  <rect class="mesh" x="744" y="1538" width="272" height="86" rx="7"/>
-  <text class="nodeTitle" x="766" y="1562">Build DynamicMesh</text>
-  <text class="body mono" x="766" y="1584">BuildDynamicMeshFromGPUVineOutput()</text>
-  <text class="body" x="766" y="1602">过滤退化三角形，重算法线</text>
-  <text class="tiny" x="766" y="1618">MaterialID: tube=0, plane=1</text>
+  <path class="arrowGpuLine" d="M1023 1324 V1340"/>
 
-  <path class="arrowThin" d="M1016 1582 H1066"/>
-  <rect class="mesh" x="1068" y="1538" width="276" height="86" rx="7"/>
-  <text class="nodeTitle" x="1090" y="1562">Append 到场景网格</text>
-  <text class="body" x="1090" y="1584">AppendMesh(ContainerMesh, VineMesh)</text>
-  <text class="body" x="1090" y="1602">TransformDynamicMeshToLocalSpace()</text>
-  <text class="tiny" x="1090" y="1618">NotifyMeshUpdated / UpdateBounds / dirty render state</text>
+  <!-- Pass RS: Surface resample (uniform arc-length), now BEFORE smoothing -->
+  <rect class="softGpu" x="728" y="1340" width="590" height="58" rx="6"/>
+  <text class="nodeTitle mono" x="1023" y="1362" text-anchor="middle">Pass RS: ResampleVVSurfaceCS（最终投射后、平滑前）</text>
+  <text class="tiny" x="1023" y="1382" text-anchor="middle">bVisVineGPUResampleSurfaceEnabled 开启时，按弧长把各 vine 的 SurfaceTarget/Normal 等距重分布（点数不变，端点锚定）</text>
 
-  <path class="arrow" d="M720 1670 V1698"/>
-  <rect x="452" y="1698" width="536" height="30" rx="8" fill="#ecfdf5" stroke="#16a34a" stroke-width="1.8"/>
-  <text class="nodeTitle" x="720" y="1719" text-anchor="middle" fill="#166534">return true: 当前 tube 或 plane 藤蔓网格已追加到 DynamicMeshComponent</text>
+  <path class="arrowGpuLine" d="M1023 1398 V1414"/>
+
+  <!-- Pass B: Smooth path ping-pong (now smooths the resampled surface, two-stage) -->
+  <rect class="softGpu" x="728" y="1414" width="590" height="72" rx="6"/>
+  <text class="nodeTitle mono" x="1023" y="1436" text-anchor="middle">Pass B: SmoothVVVoxelPathCS（两段 ping-pong）</text>
+  <text class="tiny" x="1023" y="1455" text-anchor="middle">宽核段 ×PostProjectionSmoothIterations（半径 PostProjectionSmoothKernelRadius）抹平 Z 折痕</text>
+  <text class="tiny" x="1023" y="1471" text-anchor="middle">后接 radius-1 清理段 ×PostProjectionSmallSmoothIterations，平滑重采样后的 SurfaceTarget / SurfaceNormal</text>
+
+  <path class="arrowGpuLine" d="M1023 1486 V1502"/>
+
+  <!-- Pass PT: Rebuild tangents + parallel-transport roll axis -->
+  <rect class="softGpu" x="728" y="1502" width="590" height="58" rx="6"/>
+  <text class="nodeTitle mono" x="1023" y="1524" text-anchor="middle">Pass PT: BuildVVParallelTransportFrameCS</text>
+  <text class="tiny" x="1023" y="1544" text-anchor="middle">用最终 SurfaceTarget 重建 tangent，并沿每条线平行传输 roll 轴（仅起点用 surface normal 播种）以最小化扭曲</text>
+
+  <path class="arrowGpuLine" d="M1023 1560 V1576"/>
+
+  <!-- Pass AS: Axis (tangent) smoothing ping-pong -->
+  <rect class="softGpu" x="728" y="1576" width="590" height="58" rx="6"/>
+  <text class="nodeTitle mono" x="1023" y="1598" text-anchor="middle">Pass AS: SmoothVVTangentsCS × AxisSmoothIterations</text>
+  <text class="tiny" x="1023" y="1618" text-anchor="middle">ping-pong 平滑 PathPointTangents（中心权重 2，邻居权重 1），紧接网格生成之前</text>
+
+  <path class="arrowGpuLine" d="M1023 1634 V1650"/>
+
+  <!-- Pass C: Build mesh -->
+  <rect class="softGpu" x="728" y="1650" width="590" height="58" rx="6"/>
+  <text class="nodeTitle mono" x="1023" y="1672" text-anchor="middle">Pass C: BuildVVVoxelCS（变形 + 扫掠出网格）</text>
+  <text class="tiny" x="1023" y="1692" text-anchor="middle">Center = FinalTarget + FinalNormal × TinyZJitter（VinesOffset 已在 Pass FP 写入 FinalTarget）；Tube 截面 3 点三角；Jitter = Hash × 0.1</text>
+
+  <rect class="softData" x="728" y="1720" width="590" height="50" rx="5"/>
+  <text class="tag" x="1023" y="1740" text-anchor="middle">写出 RW_OutVertices / RW_OutUVs / RW_OutIndices + SurfaceTargets</text>
+  <text class="tiny" x="1023" y="1758" text-anchor="middle">DispatchCount = max(OutputVertexCount, SegmentCount)，THREADGROUPSIZE_X = 64</text>
+
+  <path class="arrowGpuLine" d="M1344 1774 V1936"/>
+
+  <!-- ===== PHASE 4: Readback ===== -->
+  <rect class="band" x="54" y="1884" width="1332" height="160" rx="9"/>
+  <text class="phase" x="80" y="1914" fill="#92400e">4. GPU→CPU Readback, UV 修正, DynamicMesh 追加</text>
+
+  <rect class="io" x="82" y="1936" width="286" height="86" rx="7"/>
+  <text class="nodeTitle" x="104" y="1958">GPU → CPU readback</text>
+  <text class="body" x="104" y="1978">ENQUEUE_RENDER_COMMAND 读回</text>
+  <text class="body" x="104" y="1996">FRHIGPUBufferReadback: Vertices / UVs / Indices / SurfaceTargets</text>
+  <text class="tiny" x="104" y="2014">FlushRenderingCommands，必要时 SubmitAndBlockUntilGPUIdle</text>
+
+  <path class="arrowThin" d="M368 1979 H410"/>
+  <rect class="cpu" x="412" y="1936" width="272" height="86" rx="7"/>
+  <text class="nodeTitle" x="430" y="1958">CPU 后处理</text>
+  <text class="body mono" x="430" y="1978">LogVineGPUProjectionStats()</text>
+  <text class="body mono" x="430" y="1996">RecomputeVineOutputUVsFromGeneratedLength()</text>
+  <text class="tiny" x="430" y="2014">按生成网格长度重算 UV V</text>
+
+  <path class="arrowThin" d="M684 1979 H726"/>
+  <rect class="mesh" x="728" y="1936" width="272" height="86" rx="7"/>
+  <text class="nodeTitle" x="750" y="1958">Build DynamicMesh</text>
+  <text class="body mono" x="750" y="1978">BuildDynamicMeshFromGPUVineOutput()</text>
+  <text class="body" x="750" y="1996">过滤退化三角形，重算法线</text>
+  <text class="tiny" x="750" y="2014">MaterialID: tube = 0</text>
+
+  <path class="arrowThin" d="M1000 1979 H1042"/>
+  <rect class="mesh" x="1044" y="1936" width="300" height="86" rx="7"/>
+  <text class="nodeTitle" x="1066" y="1958">Append 到场景网格</text>
+  <text class="body" x="1066" y="1978">AppendMesh(ContainerMesh, VineMesh)</text>
+  <text class="body" x="1066" y="1996">TransformDynamicMeshToLocalSpace()</text>
+  <text class="tiny" x="1066" y="2014">NotifyMeshUpdated / UpdateBounds / dirty render state</text>
+
+  <path class="arrow" d="M720 2044 V2064"/>
+  <rect x="290" y="2064" width="860" height="30" rx="8" fill="#ecfdf5" stroke="#16a34a" stroke-width="1.8"/>
+  <text class="nodeTitle" x="720" y="2085" text-anchor="middle" fill="#166534">return true: 带体素投射 + CurlNoise + PerlinNoise + 最终投射 + 表面重采样 + 平滑 + 切线重建/平滑 的 Tube 藤蔓网格已追加到 DynamicMeshComponent</text>
 </svg>

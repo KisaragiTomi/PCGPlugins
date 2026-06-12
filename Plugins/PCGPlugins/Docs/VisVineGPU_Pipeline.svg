@@ -42,7 +42,7 @@
   <rect x="32" y="24" width="1216" height="96" rx="10" fill="url(#headerGrad)" stroke="#cbd5e1"/>
   <text class="h1" x="640" y="62" text-anchor="middle">VisVine GPU Voxel 流程</text>
   <text class="subtitle mono" x="640" y="88" text-anchor="middle">AVineContainer::VisVine(MainVine, bUseGPU=true) -> VisVineGPUInternal()</text>
-  <text class="tiny" x="640" y="108" text-anchor="middle">当前实现基于 CachedSurfaceVoxels 与 VineVisualizationVoxel.usf，不再走旧的 triangle soup 最近点查询图</text>
+  <text class="tiny" x="640" y="108" text-anchor="middle">当前实现基于 CachedSurfaceVoxels 与 VVVoxel.usf，不再走旧的 triangle soup 最近点查询图</text>
 
   <g transform="translate(52 138)">
     <rect class="cpu" x="0" y="0" width="18" height="18" rx="3"/>
@@ -91,7 +91,7 @@
   <path class="arrowThin" d="M324 457 H366"/>
 
   <rect class="cpu" x="368" y="386" width="430" height="192" rx="7"/>
-  <text class="nodeTitle mono" x="583" y="412" text-anchor="middle">PrepareVineVisualizationLinesCPU_Voxel()</text>
+  <text class="nodeTitle mono" x="583" y="412" text-anchor="middle">PrepareVVLinesCPU_Voxel()</text>
   <rect x="394" y="431" width="176" height="30" rx="5" fill="#eff6ff" stroke="#93c5fd"/>
   <text class="label" x="482" y="451" text-anchor="middle">SC point jitter</text>
   <rect x="594" y="431" width="176" height="30" rx="5" fill="#eff6ff" stroke="#93c5fd"/>
@@ -110,7 +110,7 @@
   <path class="arrowThin" d="M798 482 H842"/>
 
   <rect class="cpu" x="844" y="386" width="326" height="192" rx="7"/>
-  <text class="nodeTitle mono" x="1007" y="412" text-anchor="middle">BuildVineVisualizationGPUInput()</text>
+  <text class="nodeTitle mono" x="1007" y="412" text-anchor="middle">BuildVVGPUInput()</text>
   <text class="body" x="866" y="438">PathPoints: xyz=位置，w=厚度倍率</text>
   <text class="body" x="866" y="456">PathPointAxes: 预留/平滑轴</text>
   <text class="body" x="866" y="474">PathPointMeta: prev / next / base / count</text>
@@ -140,13 +140,13 @@
   <text class="body" x="452" y="791">上传 SRV: VoxelCells / HashSlots / Normals / Targets</text>
   <text class="body" x="452" y="809">输出 UAV: OutVertices / OutUVs / OutIndices</text>
   <text class="body" x="452" y="827">中间 UAV: PathPointTangents / Normals / SurfaceTarget ping-pong</text>
-  <text class="tiny mono" x="452" y="852">ENQUEUE_RENDER_COMMAND(VineVisualizationVoxelGPU)</text>
+  <text class="tiny mono" x="452" y="852">ENQUEUE_RENDER_COMMAND(VVVoxelGPU)</text>
   <text class="tiny" x="452" y="875">GraphBuilder.Execute() 后标记 bRenderWorkQueued</text>
 
   <path class="arrowGpu" d="M774 817 H826"/>
 
   <rect class="gpu" x="828" y="724" width="356" height="88" rx="7"/>
-  <text class="nodeTitle mono" x="1006" y="748" text-anchor="middle">Pass A: BuildVineVisualizationVoxelAxesCS</text>
+  <text class="nodeTitle mono" x="1006" y="748" text-anchor="middle">Pass A: BuildVVVoxelAxesCS</text>
   <text class="body" x="850" y="770">每个 PathPoint 计算 tangent / normal</text>
   <text class="body" x="850" y="788">SampleVoxelNeighbors() 采样 voxel surface normal</text>
 
@@ -160,7 +160,7 @@
   <path class="arrowGpu" d="M1006 904 V922"/>
 
   <rect class="gpu" x="828" y="924" width="356" height="82" rx="7"/>
-  <text class="nodeTitle mono" x="1006" y="946" text-anchor="middle">Pass C: BuildVineVisualizationVoxelCS</text>
+  <text class="nodeTitle mono" x="1006" y="946" text-anchor="middle">Pass C: BuildVVVoxelCS</text>
   <text class="body" x="850" y="966">Center = smoothed Target + Normal * VinesOffset</text>
   <text class="body" x="850" y="984">使用 smoothed SurfaceNormal 做截面变形</text>
   <text class="tiny mono" x="850" y="998">DispatchCount = max(OutputVertexCount, SegmentCount)</text>
@@ -206,8 +206,8 @@
   <!-- Data bridge labels -->
   <rect class="data" x="76" y="1438" width="1096" height="56" rx="7"/>
   <text class="nodeTitle" x="100" y="1462">源码锚点</text>
-  <text class="body mono" x="100" y="1481">GeometryEditorActor.cpp: VisVineGPUInternal(), PrepareVineVisualizationLinesCPU_Voxel(), BuildVineVisualizationGPUInput(), DispatchVineVisualizationGPU_Voxel()</text>
-  <text class="body mono" x="100" y="1499">Shaders/Private/VineVisualizationVoxel.usf: BuildVineVisualizationVoxelAxesCS(), BuildVineVisualizationVoxelCS()</text>
+  <text class="body mono" x="100" y="1481">GeometryEditorActor.cpp: VisVineGPUInternal(), PrepareVVLinesCPU_Voxel(), BuildVVGPUInput(), DispatchVVGPU_Voxel()</text>
+  <text class="body mono" x="100" y="1499">Shaders/Private/VVVoxel.usf: BuildVVVoxelAxesCS(), BuildVVVoxelCS()</text>
 
   <!-- Vertical phase separators -->
   <path class="arrowThin dash" d="M640 648 V682"/>

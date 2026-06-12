@@ -1,0 +1,289 @@
+// Box GDF occupancy -> per-XY-column cavity spans (CSR layout), fully on GPU.
+//
+// A "cavity span" is the closed empty gap between two adjacent vertical solid runs
+// in one XY column. Example: if z=5 and z=10 are blocked with empty space between,
+// the gap [5,10] is one cavity voxel. Neighbours reach a column's variable-height
+// spans through a uniform XY index via the CSR offset/count arrays.
+//
+// Storage (sparse: XY is a full grid, Z is variable-length spans per column):
+//   ColumnSpanStart[col] : CSR offset of this column's spans in Spans[]
+//   ColumnSpanCount[col] : number of cavity spans in this column
+//   Spans[s]             : packed span, low 16 bits = zStart cell, high 16 bits = zEnd cell
+//
+// Passes:
+//   GDF_FILL_OCCUPANCY    : sample the Global Distance Field at each voxel centre,
+//                           dist <= threshold => occupied bit set in a dense bit grid.
+//   COUNT_CAVITY          : per column, cavity count = max(solidRunCount - 1, 0).
+//   SCAN_BLOCKS           : per-block exclusive prefix sum of counts -> ColumnSpanStart,
+//                           per-block totals -> BlockSums.
+//   SCAN_BLOCKSUMS        : single-group exclusive scan of BlockSums, writes grand total.
+//   ADD_OFFSETS           : ColumnSpanStart[i] += scanned BlockSums[block(i)].
+//   EMIT_CAVITY           : per column, emit packed cavity spans into Spans[].
+
+#if VOXEL_GDF_FILL_OCCUPANCY
+#include "/Engine/Private/Common.ush"
+#else
+#include "/Engine/Public/Platform.ush"
+#endif
+
+#if VOXEL_GDF_FILL_OCCUPANCY
+#include "/Engine/Private/DistanceField/GlobalDistanceFieldShared.ush"
+#endif
+
+#ifndef THREADGROUPSIZE_X
+#define THREADGROUPSIZE_X 8
+#endif
+#ifndef THREADGROUPSIZE_Y
+#define THREADGROUPSIZE_Y 8
+#endif
+#ifndef THREADGROUPSIZE_Z
+#define THREADGROUPSIZE_Z 1
+#endif
+
+#ifndef SCAN_BLOCK_SIZE
+#define SCAN_BLOCK_SIZE 256
+#endif
+
+int3  VoxelGridSize;     // (GridX, GridY, GridZ)
+uint  ColumnCount;       // GridX * GridY
+
+uint PackSpan(uint zStart, uint zEnd)
+{
+	return (zStart & 0xFFFFu) | ((zEnd & 0xFFFFu) << 16u);
+}
+
+// ─── Pass: GDF fill occupancy (sample Global Distance Field per voxel centre) ───
+
+#if VOXEL_GDF_FILL_OCCUPANCY
+
+float3 VoxelBoxLocalMin;   // box-local position of cell (0,0,0) min corner (= -BoxSize/2)
+float3 VoxelCellSizeLocal; // box-local size of one voxel cell
+float4x4 VoxelBoxToWorld;  // box-local -> world transform (handles rotation/translation)
+float  OccupancyThreshold; // GDF distance <= threshold => occupied
+RWBuffer<uint> RW_Occupancy; // dense bit grid: GridX*GridY*GridZ bits
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void FillOccupancyCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	int X = (int)DispatchThreadId.x;
+	int Y = (int)DispatchThreadId.y;
+	int Z = (int)DispatchThreadId.z;
+	if (X >= VoxelGridSize.x || Y >= VoxelGridSize.y || Z >= VoxelGridSize.z)
+		return;
+
+	float3 LocalCentre = VoxelBoxLocalMin + (float3(X, Y, Z) + 0.5) * VoxelCellSizeLocal;
+	float3 CellCentre = mul(float4(LocalCentre, 1.0), VoxelBoxToWorld).xyz;
+	float3 TranslatedWorldPos = CellCentre + View_PreViewTranslationHigh;
+	float Distance = GetDistanceToNearestSurfaceGlobal(TranslatedWorldPos);
+
+	if (Distance <= OccupancyThreshold)
+	{
+		uint Index = (uint(Z) * uint(VoxelGridSize.y) + uint(Y)) * uint(VoxelGridSize.x) + uint(X);
+		uint Word  = Index >> 5u;
+		uint Bit   = Index & 31u;
+		uint Ignored;
+		InterlockedOr(RW_Occupancy[Word], 1u << Bit, Ignored);
+	}
+}
+
+#endif // VOXEL_GDF_FILL_OCCUPANCY
+
+// ─── Shared dense-occupancy reader for the column passes ───────────
+
+#if defined(VOXEL_COUNT_CAVITY) || defined(VOXEL_EMIT_CAVITY)
+
+Buffer<uint> B_Occupancy;
+
+bool IsVoxelSet(int x, int y, int z)
+{
+	uint Index = (uint(z) * uint(VoxelGridSize.y) + uint(y)) * uint(VoxelGridSize.x) + uint(x);
+	uint Word  = Index >> 5u;
+	uint Bit   = Index & 31u;
+	return (B_Occupancy[Word] & (1u << Bit)) != 0u;
+}
+
+// Count contiguous vertical solid runs in this column. A cavity is the gap
+// between two adjacent solid runs, so cavityCount = max(solidRunCount - 1, 0).
+uint CountSolidRuns(int X, int Y)
+{
+	uint RunCount = 0;
+	bool bPrev = false;
+	for (int Z = 0; Z < VoxelGridSize.z; ++Z)
+	{
+		bool bCur = IsVoxelSet(X, Y, Z);
+		if (bCur && !bPrev)
+			++RunCount;
+		bPrev = bCur;
+	}
+	return RunCount;
+}
+
+#endif
+
+// ─── Pass: Count cavity spans per column ───────────────────────────
+
+#ifdef VOXEL_COUNT_CAVITY
+
+RWBuffer<uint> RW_ColumnSpanCount;
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, 1)]
+void CountCavityCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	int X = (int)DispatchThreadId.x;
+	int Y = (int)DispatchThreadId.y;
+	if (X >= VoxelGridSize.x || Y >= VoxelGridSize.y)
+		return;
+
+	uint SolidRuns = CountSolidRuns(X, Y);
+	uint CavityCount = SolidRuns > 0u ? (SolidRuns - 1u) : 0u;
+	RW_ColumnSpanCount[Y * VoxelGridSize.x + X] = CavityCount;
+}
+
+#endif // VOXEL_COUNT_CAVITY
+
+// ─── Pass: per-block exclusive prefix sum of span counts ───────────
+//
+// Linear column index space [0, ColumnCount). Each group scans SCAN_BLOCK_SIZE
+// counts, writes the exclusive prefix into ColumnSpanStart, and the block total
+// into BlockSums[groupId].
+
+#ifdef VOXEL_SCAN_BLOCKS
+
+Buffer<uint>   B_ColumnSpanCount;
+RWBuffer<uint> RW_ColumnSpanStart;
+RWBuffer<uint> RW_BlockSums;
+
+groupshared uint ScanTemp[SCAN_BLOCK_SIZE];
+
+[numthreads(SCAN_BLOCK_SIZE, 1, 1)]
+void ScanBlocksCS(uint3 DispatchThreadId : SV_DispatchThreadID, uint GroupIndex : SV_GroupIndex, uint3 GroupId : SV_GroupID)
+{
+	uint GlobalIndex = DispatchThreadId.x;
+	uint v = (GlobalIndex < ColumnCount) ? B_ColumnSpanCount[GlobalIndex] : 0u;
+	ScanTemp[GroupIndex] = v;
+	GroupMemoryBarrierWithGroupSync();
+
+	// Inclusive Hillis-Steele scan.
+	[unroll]
+	for (uint Offset = 1u; Offset < SCAN_BLOCK_SIZE; Offset <<= 1u)
+	{
+		uint Added = (GroupIndex >= Offset) ? ScanTemp[GroupIndex - Offset] : 0u;
+		GroupMemoryBarrierWithGroupSync();
+		ScanTemp[GroupIndex] += Added;
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	// Convert inclusive -> exclusive prefix.
+	uint Exclusive = ScanTemp[GroupIndex] - v;
+	if (GlobalIndex < ColumnCount)
+		RW_ColumnSpanStart[GlobalIndex] = Exclusive;
+
+	if (GroupIndex == SCAN_BLOCK_SIZE - 1u)
+		RW_BlockSums[GroupId.x] = ScanTemp[GroupIndex];
+}
+
+#endif // VOXEL_SCAN_BLOCKS
+
+// ─── Pass: exclusive scan of block sums (single group) ─────────────
+
+#ifdef VOXEL_SCAN_BLOCKSUMS
+
+RWBuffer<uint> RW_BlockSums;   // in: per-block totals, out: exclusive prefix per block
+RWBuffer<uint> RW_TotalCount;  // out: grand total span count (single element)
+uint           NumBlocks;
+
+groupshared uint BlockTemp[SCAN_BLOCK_SIZE];
+
+[numthreads(SCAN_BLOCK_SIZE, 1, 1)]
+void ScanBlockSumsCS(uint GroupIndex : SV_GroupIndex)
+{
+	uint v = (GroupIndex < NumBlocks) ? RW_BlockSums[GroupIndex] : 0u;
+	BlockTemp[GroupIndex] = v;
+	GroupMemoryBarrierWithGroupSync();
+
+	[unroll]
+	for (uint Offset = 1u; Offset < SCAN_BLOCK_SIZE; Offset <<= 1u)
+	{
+		uint Added = (GroupIndex >= Offset) ? BlockTemp[GroupIndex - Offset] : 0u;
+		GroupMemoryBarrierWithGroupSync();
+		BlockTemp[GroupIndex] += Added;
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	uint Exclusive = BlockTemp[GroupIndex] - v;
+	if (GroupIndex < NumBlocks)
+		RW_BlockSums[GroupIndex] = Exclusive;
+
+	// Last valid lane holds the inclusive total of all blocks.
+	if (GroupIndex == NumBlocks - 1u)
+		RW_TotalCount[0] = BlockTemp[GroupIndex];
+}
+
+#endif // VOXEL_SCAN_BLOCKSUMS
+
+// ─── Pass: add scanned block offsets back to per-column starts ─────
+
+#ifdef VOXEL_ADD_OFFSETS
+
+Buffer<uint>   B_BlockSums; // exclusive prefix per block
+RWBuffer<uint> RW_ColumnSpanStart;
+
+[numthreads(SCAN_BLOCK_SIZE, 1, 1)]
+void AddOffsetsCS(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_GroupID)
+{
+	uint GlobalIndex = DispatchThreadId.x;
+	if (GlobalIndex >= ColumnCount)
+		return;
+	RW_ColumnSpanStart[GlobalIndex] += B_BlockSums[GroupId.x];
+}
+
+#endif // VOXEL_ADD_OFFSETS
+
+// ─── Pass: emit packed cavity spans (per XY column) ────────────────
+
+#ifdef VOXEL_EMIT_CAVITY
+
+Buffer<uint>   B_ColumnSpanStart;
+RWBuffer<uint> RW_Spans;
+uint           TotalSpanCapacity;
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, 1)]
+void EmitCavityCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	int X = (int)DispatchThreadId.x;
+	int Y = (int)DispatchThreadId.y;
+	if (X >= VoxelGridSize.x || Y >= VoxelGridSize.y)
+		return;
+
+	uint WriteOffset = B_ColumnSpanStart[Y * VoxelGridSize.x + X];
+
+	// Walk the column, remembering the top cell of the previous solid run.
+	// When a new solid run opens, the gap (prevTop, curStart) is a cavity span
+	// stored inclusively as [prevTop, curStart] to match the example [5,10].
+	int PrevSolidTop = -1;
+	int RunStart = -1;
+	bool bPrev = false;
+	for (int Z = 0; Z < VoxelGridSize.z; ++Z)
+	{
+		bool bCur = IsVoxelSet(X, Y, Z);
+		if (bCur && !bPrev)
+		{
+			RunStart = Z;
+			if (PrevSolidTop >= 0)
+			{
+				if (WriteOffset < TotalSpanCapacity)
+					RW_Spans[WriteOffset] = PackSpan((uint)PrevSolidTop, (uint)RunStart);
+				++WriteOffset;
+			}
+		}
+		else if (!bCur && bPrev)
+		{
+			PrevSolidTop = Z - 1; // close run [RunStart, Z-1]
+		}
+		bPrev = bCur;
+	}
+	if (bPrev)
+		PrevSolidTop = VoxelGridSize.z - 1;
+}
+
+#endif // VOXEL_EMIT_CAVITY

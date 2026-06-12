@@ -22,6 +22,21 @@ struct FCSSPlinePointData
 	TArray<TArray<FLinearColor>> PointData;
 };
 
+/**
+ * Unified blend mode for all CS landscape edit layers (Temp / Layer / Landscape).
+ * Integer order MUST stay in sync with the TempLayerBlend branch in CSLandscape.usf.
+ */
+UENUM(BlueprintType)
+enum class ECSLandscapeBlendMode : uint8
+{
+	Alpha         UMETA(DisplayName = "Alpha Lerp (Lerp toward generated height)"),
+	Override      UMETA(DisplayName = "Override (Replace within alpha mask)"),
+	Additive      UMETA(DisplayName = "Additive (Height += Delta * Alpha)"),
+	Subtract      UMETA(DisplayName = "Subtract (Height -= Delta * Alpha)"),
+	Multiply      UMETA(DisplayName = "Multiply (Height *= Generated * Alpha + (1-Alpha))"),
+	MaterialDrive UMETA(DisplayName = "Material Driven (Per-pixel blend from material texture)")
+};
+
 USTRUCT()
 struct COMPUTESHADERGENERATOR_API FCSReadLandscapeData
 {
@@ -74,14 +89,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	static void UpPixelsMask(UTextureRenderTarget2D* InTextureTarget, UTextureRenderTarget2D* OutUpTexture, float Threshold = .8, int32 Channel = 0);
 	
-	// UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	// static void UpPixelsMask(UTextureRenderTarget2D* InTextureTarget, UTextureRenderTarget2D* OutUpTexture, float Threshold = .8, int32 Channel = 0);
-	//
 	
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	static void DrawTextureOut(UTextureRenderTarget2D* InTextureTarget, UTextureRenderTarget2D* OutTextureTarget);
-	
-
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	static void ExtentMaskFast(UTextureRenderTarget2D* InTextureTarget, UTextureRenderTarget2D* InDebugView, int32 Channel = 0, int32 NumExtend = 1);
 
@@ -107,26 +115,67 @@ public:
 	                             FLinearColor> SplinePoints, FIntPoint TextureSizeXY, FIntVector GroupCount
 	);
 
-	static void CalDistanceToNearestSurface(FSceneView* SceneView, UTextureRenderTarget2D* InDebugView);
+	// ─── 通用平滑曲线（三次 B-Spline）：曲线逼近控制点，段间 C2 连续 ───────────
 
-	static void SampleGlobalDistanceFieldAtPositions(
-		FSceneView* SceneView,
-		const TArray<FVector>& WorldPositions,
-		TArray<float>& OutDistances,
-		TArray<FVector>& OutGradients);
+	/** RDG 流程版：在 GPU 上对一组控制点做三次 B-Spline 重采样。
+	 *  ControlPoints: xyz=世界位置（w 备用）；NumSamples: 输出采样点数。
+	 *  输出两个 buffer：OutPositions(xyz=位置,w=有效) 与 OutTangents(xyz=切线方向)。*/
+	static void RDG_SmoothSpline(
+		FRDGBuilder& GraphBuilder,
+		const TArray<FVector4f>& ControlPoints,
+		int32 NumSamples,
+		FRDGBufferRef& OutPositions,
+		FRDGBufferRef& OutTangents);
+
+	/** 蓝图版：输入一条 Spline，在 GPU 上做三次 B-Spline 平滑重采样，
+	 *  读回结果后用 DrawDebugPoint 画位置、DrawDebugArrow 画切线方向，默认停留 5 秒。 */
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader", meta = (WorldContext = "WorldContextObject"))
+	static void DrawSmoothSplinePoints(
+		UObject* WorldContextObject,
+		USplineComponent* InSpline,
+		int32 NumSamples = 64,
+		float Duration = 5.f,
+		float PointSize = 12.f,
+		float ArrowLength = 50.f);
+
+	// ─── GSDF 蓝图入口（纯异步，fire-and-forget）─────────────────────
+	// GSDF 参数数据只存在于渲染器内部的真 FViewInfo 上，且只在 base pass 之后才就绪，
+	// 任何手工构造的 FSceneView 都拿不到。因此这两个入口只负责把采样请求投递给
+	// FGDFSampleService（内部 SceneViewExtension + 异步 readback），结果就绪后在游戏
+	// 线程回调里用 DrawDebug 点阵/线段直接可视化。它们不返回值、不写 RenderTarget。
+
+	/** 盒内 Resolution^3 均匀点采样 GSDF，结果就绪后按阈值用 DrawDebugPoint 画出。 */
+	UFUNCTION(BlueprintCallable, Category = "DistanceField", meta = (WorldContext = "WorldContextObject"))
+	static void DebugDrawDistanceFieldInBox(
+		UObject* WorldContextObject,
+		FVector BoxCenter,
+		FVector BoxExtent,
+		int32 Resolution = 16,
+		float DistanceThreshold = 50.0f,
+		float PointSize = 8.0f,
+		float Duration = 5.0f,
+		bool bColorByDistance = true);
+
+	/** 旋转盒内体素化 GSDF，把每 XY 列的空腔压成 cavity span（CSR），结果就绪后用竖直线段画出。 */
+	UFUNCTION(BlueprintCallable, Category = "DistanceField", meta = (WorldContext = "WorldContextObject"))
+	static void DebugDrawVoxelCavitySpansInBox(
+		UObject* WorldContextObject,
+		FVector BoxCenter,
+		FVector BoxExtent,
+		FRotator BoxRotation,
+		int32 GridX = 64,
+		int32 GridZ = 64,
+		float OccupancyThreshold = 0.0f,
+		float Duration = 5.0f,
+		float LineThickness = 2.0f);
 
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	static void CopyTexture(UTextureRenderTarget2D* InOrig, UTextureRenderTarget2D* InCopy);
-	
-	static void DrawCopyTexture(FRDGBuilder& GraphBuilder, FRDGTextureUAVRef RDGUAV_CopySource, UTextureRenderTarget2D* RT_CopyTarget);
 	
 	static void DrawCopyTexture(FRDGBuilder& GraphBuilder, FRDGTextureUAVRef RDGUAV_CopySource, FRDGTextureRef& RDG_CopyTarget);
 
 	static void BuildTextureArray(FRDGBuilder& GraphBuilder, int32& Index, FRDGTextureRef& RDG_CopySource, FRDGTextureUAVRef
 	                              & RDG_CopyTarget, FIntVector& GroupCount);
-
-	// static void GenerateWorldCaptureTransform(FRDGBuilder& GraphBuilder, int32& Index, FRDGTextureRef& RDG_CopySource, FRDGTextureUAVRef
-	// 						  & RDG_CopyTarget, FIntVector& GroupCount);
 
 
 #if WITH_EDITOR

@@ -4,8 +4,15 @@
 #define THREADGROUPSIZE_X 64
 #endif
 
-StructuredBuffer<float4> InitialTargetPositions;
+struct FTargetState
+{
+	float4 Position;
+	int4 State0;
+	int4 State1;
+};
+
 StructuredBuffer<float4> SourcePositions;
+StructuredBuffer<float4> InitialTargetPositions;
 StructuredBuffer<float4> TargetPositions;
 StructuredBuffer<int4> State0;
 StructuredBuffer<int4> State1;
@@ -61,10 +68,8 @@ void InitializeSpaceColonizationQueueCS(uint3 DispatchThreadId : SV_DispatchThre
     }
 
     RW_TargetPositions[Index] = InitialTargetPositions[Index];
-
     // State0: x Attractor, y End, z Startpt, w SpawnCount
     RW_State0[Index] = int4(1, 0, 0, 0);
-
     // State1: x Startid, y PrePt, z NextPt, w BranchCount
     RW_State1[Index] = int4(0, -1, -1, 0);
 }
@@ -92,15 +97,15 @@ void MarkSpaceColonizationSourcesCS(uint3 DispatchThreadId : SV_DispatchThreadID
         }
     }
 
-    int4 BestState0 = RW_State0[BestIndex];
-    int4 BestState1 = RW_State1[BestIndex];
     float4 BestPosition = InitialTargetPositions[BestIndex];
     BestPosition.w *= SourcePositions[SourceIndex].w;
+    RW_TargetPositions[BestIndex] = BestPosition;
+    int4 BestState0 = RW_State0[BestIndex];
     BestState0.x = 0;
     BestState0.z = 1;
-    BestState1.x = (int)BestIndex;
-    RW_TargetPositions[BestIndex] = BestPosition;
     RW_State0[BestIndex] = BestState0;
+    int4 BestState1 = RW_State1[BestIndex];
+    BestState1.x = (int)BestIndex;
     RW_State1[BestIndex] = BestState1;
 }
 
@@ -162,18 +167,15 @@ void ProposeSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThread
         return;
     }
 
-    int4 SourceState0 = State0[P];
-    int4 SourceState1 = State1[P];
-
-    if (SourceState0.x != 0)
+    if (State0[P].x != 0)
     {
         return;
     }
-    if (SourceState0.w < ((int)Iteration - (int)Activetime))
+    if (State0[P].w < ((int)Iteration - (int)Activetime))
     {
         return;
     }
-    if (SourceState1.w > 2)
+    if (State1[P].w > 2)
     {
         return;
     }
@@ -187,7 +189,7 @@ void ProposeSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThread
     float3 OriginalCurrent = InitialTargetPositions[P].xyz;
     float3 RuntimeCurrent = TargetPositions[P].xyz;
     float SourceScale = 1.0f;
-    int StartId = SourceState1.x;
+    int StartId = State1[P].x;
     if (StartId >= 0 && StartId < (int)TargetCount)
     {
         float StartTargetScale = max(abs(InitialTargetPositions[StartId].w), 1.0e-6f);
@@ -237,7 +239,9 @@ void ProposeSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThread
     }
 
     float NearestDist = sqrt(NearAttractorDistSq);
-    float3 NewPosition = RuntimeCurrent + DirSum * rsqrt(DirLenSq) * NearestDist;
+    // [DEBUG] DirSum directional influence temporarily zeroed — branch stays at current position
+    // TODO: revert to: float3 NewPosition = RuntimeCurrent + DirSum * rsqrt(DirLenSq) * NearestDist;
+    float3 NewPosition = RuntimeCurrent;
     RW_ProposalPositions[P] = float4(NewPosition, SourceScale);
     InterlockedMin(RW_ProposalOwners[NearAttractor], P);
 }
@@ -263,12 +267,12 @@ void CommitSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThreadI
         return;
     }
 
+    float4 ParentPosition = RW_TargetPositions[SourceIndex];
     int4 ParentState0 = RW_State0[SourceIndex];
     int4 ParentState1 = RW_State1[SourceIndex];
-    int4 TargetState0 = RW_State0[TargetIndex];
-    int4 TargetState1 = RW_State1[TargetIndex];
+    int4 CurrentState0 = RW_State0[TargetIndex];
 
-    if (ParentState0.x != 0 || ParentState1.w > 2 || TargetState0.x == 0)
+    if (ParentState0.x != 0 || ParentState1.w > 2 || CurrentState0.x == 0)
     {
         return;
     }
@@ -278,19 +282,12 @@ void CommitSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThreadI
     ParentState0.y = 0;
     ParentState1.z = (int)TargetIndex;
     ParentState1.w += 1;
+    RW_TargetPositions[SourceIndex] = ParentPosition;
     RW_State0[SourceIndex] = ParentState0;
     RW_State1[SourceIndex] = ParentState1;
 
     float TargetPointScale = InitialTargetPositions[TargetIndex].w;
     RW_TargetPositions[TargetIndex] = float4(ProposedPosition.xyz, TargetPointScale * ProposedPosition.w);
-    TargetState0.x = 0;
-    TargetState0.y = 1;
-    TargetState0.z = 0;
-    TargetState0.w = ParentState0.w;
-    TargetState1.x = ParentStartId;
-    TargetState1.y = (int)SourceIndex;
-    TargetState1.z = -1;
-    TargetState1.w = 1;
-    RW_State0[TargetIndex] = TargetState0;
-    RW_State1[TargetIndex] = TargetState1;
+    RW_State0[TargetIndex] = int4(0, 1, 0, ParentState0.w);
+    RW_State1[TargetIndex] = int4(ParentStartId, (int)SourceIndex, -1, 1);
 }

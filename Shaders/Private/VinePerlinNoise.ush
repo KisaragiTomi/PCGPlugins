@@ -1,0 +1,138 @@
+#pragma once
+
+/*
+ * VinePerlinNoise.ush
+ *
+ * Exact HLSL port of FMath::PerlinNoise3D and UNoise::CurlNoise so the GPU vine
+ * noise pass produces per-point results matching the original CPU path.
+ *
+ * - VinePerlinPermutation matches FMathPerlinHelpers::Permutation (512 entries, 256 repeated 2x).
+ * - VinePerlinNoise3D mirrors FMath::PerlinNoise3D (improved Perlin noise, 0.97 scale + clamp).
+ * - VineCurlNoise mirrors UNoise::CurlNoise (finite-difference curl, h=0.001, Frequency/=100).
+ */
+
+#ifndef VINE_PERLIN_NOISE_USH
+#define VINE_PERLIN_NOISE_USH
+
+// random permutation of 256 numbers, repeated 2x (matches FMathPerlinHelpers::Permutation)
+static const int VinePerlinPermutation[512] = {
+    63, 9, 212, 205, 31, 128, 72, 59, 137, 203, 195, 170, 181, 115, 165, 40, 116, 139, 175, 225, 132, 99, 222, 2, 41, 15, 197, 93, 169, 90, 228, 43, 221, 38, 206, 204, 73, 17, 97, 10, 96, 47, 32, 138, 136, 30, 219,
+    78, 224, 13, 193, 88, 134, 211, 7, 112, 176, 19, 106, 83, 75, 217, 85, 0, 98, 140, 229, 80, 118, 151, 117, 251, 103, 242, 81, 238, 172, 82, 110, 4, 227, 77, 243, 46, 12, 189, 34, 188, 200, 161, 68, 76, 171, 194,
+    57, 48, 247, 233, 51, 105, 5, 23, 42, 50, 216, 45, 239, 148, 249, 84, 70, 125, 108, 241, 62, 66, 64, 240, 173, 185, 250, 49, 6, 37, 26, 21, 244, 60, 223, 255, 16, 145, 27, 109, 58, 102, 142, 253, 120, 149, 160,
+    124, 156, 79, 186, 135, 127, 14, 121, 22, 65, 54, 153, 91, 213, 174, 24, 252, 131, 192, 190, 202, 208, 35, 94, 231, 56, 95, 183, 163, 111, 147, 25, 67, 36, 92, 236, 71, 166, 1, 187, 100, 130, 143, 237, 178, 158,
+    104, 184, 159, 177, 52, 214, 230, 119, 87, 114, 201, 179, 198, 3, 248, 182, 39, 11, 152, 196, 113, 20, 232, 69, 141, 207, 234, 53, 86, 180, 226, 74, 150, 218, 29, 133, 8, 44, 123, 28, 146, 89, 101, 154, 220, 126,
+    155, 122, 210, 168, 254, 162, 129, 33, 18, 209, 61, 191, 199, 157, 245, 55, 164, 167, 215, 246, 144, 107, 235,
+
+    63, 9, 212, 205, 31, 128, 72, 59, 137, 203, 195, 170, 181, 115, 165, 40, 116, 139, 175, 225, 132, 99, 222, 2, 41, 15, 197, 93, 169, 90, 228, 43, 221, 38, 206, 204, 73, 17, 97, 10, 96, 47, 32, 138, 136, 30, 219,
+    78, 224, 13, 193, 88, 134, 211, 7, 112, 176, 19, 106, 83, 75, 217, 85, 0, 98, 140, 229, 80, 118, 151, 117, 251, 103, 242, 81, 238, 172, 82, 110, 4, 227, 77, 243, 46, 12, 189, 34, 188, 200, 161, 68, 76, 171, 194,
+    57, 48, 247, 233, 51, 105, 5, 23, 42, 50, 216, 45, 239, 148, 249, 84, 70, 125, 108, 241, 62, 66, 64, 240, 173, 185, 250, 49, 6, 37, 26, 21, 244, 60, 223, 255, 16, 145, 27, 109, 58, 102, 142, 253, 120, 149, 160,
+    124, 156, 79, 186, 135, 127, 14, 121, 22, 65, 54, 153, 91, 213, 174, 24, 252, 131, 192, 190, 202, 208, 35, 94, 231, 56, 95, 183, 163, 111, 147, 25, 67, 36, 92, 236, 71, 166, 1, 187, 100, 130, 143, 237, 178, 158,
+    104, 184, 159, 177, 52, 214, 230, 119, 87, 114, 201, 179, 198, 3, 248, 182, 39, 11, 152, 196, 113, 20, 232, 69, 141, 207, 234, 53, 86, 180, 226, 74, 150, 218, 29, 133, 8, 44, 123, 28, 146, 89, 101, 154, 220, 126,
+    155, 122, 210, 168, 254, 162, 129, 33, 18, 209, 61, 191, 199, 157, 245, 55, 164, 167, 215, 246, 144, 107, 235
+};
+
+float VinePerlinGrad3(int Hash, float X, float Y, float Z)
+{
+    switch (Hash & 15)
+    {
+    // 12 cube midpoints
+    case 0: return X + Z;
+    case 1: return X + Y;
+    case 2: return Y + Z;
+    case 3: return -X + Y;
+    case 4: return -X + Z;
+    case 5: return -X - Y;
+    case 6: return -Y + Z;
+    case 7: return X - Y;
+    case 8: return X - Z;
+    case 9: return Y - Z;
+    case 10: return -X - Z;
+    case 11: return -Y - Z;
+    // 4 vertices of regular tetrahedron
+    case 12: return X + Y;
+    case 13: return -X + Y;
+    case 14: return -Y + Z;
+    case 15: return -Y - Z;
+    default: return 0.0f;
+    }
+}
+
+float VinePerlinSmoothCurve(float X)
+{
+    return X * X * X * (X * (X * 6.0f - 15.0f) + 10.0f);
+}
+
+// Mirrors FMath::PerlinNoise3D (UE 5.7).
+float VinePerlinNoise3D(float3 Location)
+{
+    float Xfl = floor(Location.x);
+    float Yfl = floor(Location.y);
+    float Zfl = floor(Location.z);
+    int Xi = ((int)Xfl) & 255;
+    int Yi = ((int)Yfl) & 255;
+    int Zi = ((int)Zfl) & 255;
+    float X = Location.x - Xfl;
+    float Y = Location.y - Yfl;
+    float Z = Location.z - Zfl;
+    float Xm1 = X - 1.0f;
+    float Ym1 = Y - 1.0f;
+    float Zm1 = Z - 1.0f;
+
+    int A = VinePerlinPermutation[Xi] + Yi;
+    int AA = VinePerlinPermutation[A] + Zi;
+    int AB = VinePerlinPermutation[A + 1] + Zi;
+
+    int B = VinePerlinPermutation[Xi + 1] + Yi;
+    int BA = VinePerlinPermutation[B] + Zi;
+    int BB = VinePerlinPermutation[B + 1] + Zi;
+
+    float U = VinePerlinSmoothCurve(X);
+    float V = VinePerlinSmoothCurve(Y);
+    float W = VinePerlinSmoothCurve(Z);
+
+    float Result = 0.97f *
+        lerp(lerp(lerp(VinePerlinGrad3(VinePerlinPermutation[AA], X, Y, Z), VinePerlinGrad3(VinePerlinPermutation[BA], Xm1, Y, Z), U),
+                  lerp(VinePerlinGrad3(VinePerlinPermutation[AB], X, Ym1, Z), VinePerlinGrad3(VinePerlinPermutation[BB], Xm1, Ym1, Z), U),
+                  V),
+             lerp(lerp(VinePerlinGrad3(VinePerlinPermutation[AA + 1], X, Y, Zm1), VinePerlinGrad3(VinePerlinPermutation[BA + 1], Xm1, Y, Zm1), U),
+                  lerp(VinePerlinGrad3(VinePerlinPermutation[AB + 1], X, Ym1, Zm1), VinePerlinGrad3(VinePerlinPermutation[BB + 1], Xm1, Ym1, Zm1), U),
+                  V),
+             W);
+
+    return clamp(Result, -1.0f, 1.0f);
+}
+
+// Mirrors UNoise::CurlNoise (finite-difference curl, h=0.001, Frequency/=100).
+// Returns the displaced position (CPU's Out_AddedPos).
+float3 VineCurlNoise(float3 Pos, float3 Offset, float Strength, float Frequency)
+{
+    float3 Curl = float3(0.0f, 0.0f, 0.0f);
+    float h = 0.001f;
+    float n, n1, a, b;
+    Frequency /= 100.0f;
+    float3 NoisePos = (Pos + Offset) * Frequency;
+    n = VinePerlinNoise3D(NoisePos);
+
+    n1 = VinePerlinNoise3D(NoisePos - float3(0.0f, h, 0.0f));
+    a = (n - n1) / h;
+
+    n1 = VinePerlinNoise3D(NoisePos - float3(0.0f, 0.0f, h));
+    b = (n - n1) / h;
+    Curl.x = a - b;
+
+    a = (n - n1) / h;
+
+    n1 = VinePerlinNoise3D(NoisePos - float3(h, 0.0f, 0.0f));
+    b = (n - n1) / h;
+    Curl.y = a - b;
+
+    a = (n - n1) / h;
+
+    n1 = VinePerlinNoise3D(NoisePos - float3(0.0f, h, 0.0f));
+    b = (n - n1) / h;
+    Curl.z = a - b;
+
+    return Pos + Curl * Strength;
+}
+
+#endif // VINE_PERLIN_NOISE_USH

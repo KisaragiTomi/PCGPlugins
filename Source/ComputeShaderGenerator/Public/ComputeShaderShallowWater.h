@@ -5,11 +5,11 @@
 #include "Engine/TextureRenderTarget2D.h"
 #include "Components/BoxComponent.h"
 #include "Kismet/KismetRenderingLibrary.h"
-#include "Components/SceneCaptureComponent2D.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "Components/DecalComponent.h"
 #include "RenderGraphBuilder.h"
+#include "RenderGraphResources.h"
 #include "RHIGPUReadback.h"
 #include "TimerManager.h"
 
@@ -39,19 +39,19 @@ public:
 	virtual void Tick(float DeltaTime) override;
 	virtual bool ShouldTickIfViewportsOnly() const override;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, NonTransactional, EditAnywhere, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_DebugView;
-	UPROPERTY(BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_VelocityHeight;
-	UPROPERTY(BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_ResultVelHeight;
-	UPROPERTY(BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_ResultDepthWet;
-	UPROPERTY(BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_Source;
-	UPROPERTY(BlueprintReadWrite, Category = "Debug")
-	UTextureRenderTarget2D* RT_SceneDepth;
-	UPROPERTY(BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "Debug")
+	UTextureRenderTarget2D* RT_VoxelTerrain;
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_SmoothHeight;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug", Meta=(Priority=1000))
 	int32 SWUniqueID = -99999;
@@ -61,8 +61,6 @@ public:
 
 	USceneComponent* SceneComponent;
 	UBoxComponent* Box;
-	UPROPERTY(BlueprintReadWrite, Category = "Debug")
-	USceneCaptureComponent2D* CaptureSceneDepth;
 	UPROPERTY(BlueprintReadWrite, Category = "Debug")
 	UStaticMesh* DebugMesh;
 	UPROPERTY(BlueprintReadWrite, Category = "Debug")
@@ -81,20 +79,19 @@ public:
 	UHierarchicalInstancedStaticMeshComponent* SimVisHISM;
 	UPROPERTY(BlueprintReadWrite, Category = "Debug")
 	UDecalComponent* CausticsDecal;
-
 	
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	UMaterialInterface* WaterMaterial;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	UMaterialInterface* DecalMaterial;
 
-	UPROPERTY(BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	UMaterialInterface* VisWaterMaterial;
-	UPROPERTY(BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	UMaterialInterface* VisDecalMaterial;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	bool CloseBound = false;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000, ClampMin="1", UIMin="1"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000, ClampMin="1", ClampMax="32", UIMin="1", UIMax="8"))
 	int32 Iteration = 1;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	int32 HeightSmoothIteration = 1;
@@ -132,23 +129,36 @@ public:
 	virtual void BeginPlay() override;
 	virtual void PreSave(FObjectPreSaveContext ObjectSaveContext) override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void Destroyed() override;
+	virtual void BeginDestroy() override;
 
 	virtual void OnConstruction(const FTransform& Transform) override;
 	
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
+	void ConstructionComponent();
+
+	void ConstructActor();
+
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	bool CheckAndCreateTexture_SWSourcePoint()
 	{
-		if (RT_SceneDepth == nullptr) RT_SceneDepth = UKismetRenderingLibrary::CreateRenderTarget2D(this, TextureSize, TextureSize, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor::Black, true, false);
-		CaptureSceneDepth->TextureTarget = RT_SceneDepth;
-		if (RT_DebugView == nullptr) RT_DebugView = UKismetRenderingLibrary::CreateRenderTarget2D(this, TextureSize, TextureSize, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor::Black, true, false);
-		if (RT_VelocityHeight == nullptr) RT_VelocityHeight = UKismetRenderingLibrary::CreateRenderTarget2D(this, TextureSize, TextureSize, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor(0, 0, -9999, 1), true, false);
-		if (RT_ResultVelHeight == nullptr) RT_ResultVelHeight = UKismetRenderingLibrary::CreateRenderTarget2D(this, TextureSize, TextureSize, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(0, 0, -9999, 1), true, false);
-		if (RT_Source == nullptr) RT_Source = UKismetRenderingLibrary::CreateRenderTarget2D(this, TextureSize, TextureSize, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(MaxHeight, 0, 0, 0), true, false);
-		if (RT_SmoothHeight == nullptr) RT_SmoothHeight = UKismetRenderingLibrary::CreateRenderTarget2D(this, TextureSize, TextureSize, ETextureRenderTargetFormat::RTF_RGBA32f,FLinearColor(-9999, -9999, -9999, -9999), true, false);
+		if (!CanRunShallowWaterGPUWork(TEXT("CheckAndCreateTexture_SWSourcePoint"))) return false;
+
+		const int32 SafeTextureSize = ResolveTextureSize();
+		TextureSize = SafeTextureSize;
+
+		if (RT_VoxelTerrain == nullptr) RT_VoxelTerrain = UKismetRenderingLibrary::CreateRenderTarget2D(this, SafeTextureSize, SafeTextureSize, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor(MaxHeight + 9000, 0, 0, 1), false, true);
+		if (RT_DebugView == nullptr) RT_DebugView = UKismetRenderingLibrary::CreateRenderTarget2D(this, SafeTextureSize, SafeTextureSize, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor::Black, true, false);
+		if (RT_VelocityHeight == nullptr) RT_VelocityHeight = UKismetRenderingLibrary::CreateRenderTarget2D(this, SafeTextureSize, SafeTextureSize, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor(0, 0, -9999, 1), true, false);
+		if (RT_ResultVelHeight == nullptr) RT_ResultVelHeight = UKismetRenderingLibrary::CreateRenderTarget2D(this, SafeTextureSize, SafeTextureSize, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(0, 0, -9999, 1), true, false);
+		if (RT_Source == nullptr) RT_Source = UKismetRenderingLibrary::CreateRenderTarget2D(this, SafeTextureSize, SafeTextureSize, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(MaxHeight, 0, 0, 0), true, false);
+		if (RT_SmoothHeight == nullptr) RT_SmoothHeight = UKismetRenderingLibrary::CreateRenderTarget2D(this, SafeTextureSize, SafeTextureSize, ETextureRenderTargetFormat::RTF_RGBA32f,FLinearColor(-9999, -9999, -9999, -9999), true, false);
+		if (!RT_VoxelTerrain || !RT_DebugView || !RT_VelocityHeight || !RT_ResultVelHeight || !RT_Source || !RT_SmoothHeight) return false;
 
 		if (RT_ResultDepthWet == nullptr)
 		{
-			RT_ResultDepthWet = UKismetRenderingLibrary::CreateRenderTarget2D(this, TextureSize, TextureSize, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(-9999, -9999, -9999, -9999), true, false);
+			RT_ResultDepthWet = UKismetRenderingLibrary::CreateRenderTarget2D(this, SafeTextureSize, SafeTextureSize, ETextureRenderTargetFormat::RTF_RGBA16f, FLinearColor(-9999, -9999, -9999, -9999), true, false);
+			if (!RT_ResultDepthWet) return false;
 			UKismetRenderingLibrary::ClearRenderTarget2D(this, RT_ResultDepthWet,  FLinearColor(-9999, -9999, -9999, -9999));
 			CleanDepthWet = true;
 		}
@@ -163,8 +173,6 @@ public:
 		SetMaterialParameter();
 		return true;
 	}
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	void ConstructionComponent();
 	
 	UFUNCTION(BlueprintPure, Category = "SWParameter")
 	int32 GetWaterfallExpansionCount() const
@@ -197,23 +205,62 @@ public:
 	UFUNCTION(BlueprintNativeEvent)
 	void SetMaterialParameter();
 	virtual void SetMaterialParameter_Implementation();
-	
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	void CaptureSceneDepthNow();
 
-	UPROPERTY()
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "ComputeShader")
+	void ReleaseTransientRenderResources();
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter|Voxel", Meta=(Priority=1000))
+	int32 VoxelMaxSceneTriangles = 200000;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter|Voxel", Meta=(Priority=1000))
+	float MaxWaterRisePerFrame = 40.0f;
+	// When rebuilding the terrain height map, the search starts at the most recent water surface and
+	// expands outward (up and down). Voxels more than this many cm ABOVE the water surface are ignored.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter|Voxel", Meta=(Priority=1000))
+	float VoxelMaxAboveWaterSurface = 50.0f;
+
+	// Terrain voxelization ignores scene triangles whose world Z is higher than the highest source
+	// point plus this margin (cm). Keeps source-overhead geometry (ceilings, overhangs) out of the
+	// terrain. Only the build step uses it; with no sources the cap is disabled.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter|Voxel", Meta=(Priority=1000))
+	float VoxelMaxAboveSourceZ = 0.0f;
+
+	// Persistent SPARSE terrain voxel grid built from box-overlapping geometry at StartSolver.
+	// XY is a full grid; Z is variable-length runs per column (CSR layout):
+	//   VoxelColumnRunStartBuffer[col] : offset into VoxelRunsBuffer
+	//   VoxelColumnRunCountBuffer[col] : number of runs in the column
+	//   VoxelRunsBuffer[r]             : packed run (low16 = zStart cell, high16 = zEnd cell)
+	// Plus per-XY coverage for the 2/3 fill test. Non-UObject GPU resources,
+	// lifetime = StartSolver -> StopSolver/teardown.
+	TRefCountPtr<FRDGPooledBuffer> VoxelColumnRunStartBuffer;
+	TRefCountPtr<FRDGPooledBuffer> VoxelColumnRunCountBuffer;
+	TRefCountPtr<FRDGPooledBuffer> VoxelRunsBuffer;
+	TRefCountPtr<FRDGPooledBuffer> VoxelCoverageBuffer;
+	uint32 VoxelTotalRunCount = 0;
+	FIntVector VoxelGridSize = FIntVector::ZeroValue;
+	float VoxelBoxExtentXY = 0.0f;
+	float VoxelCellSizeXY = 0.0f;
+	float VoxelGridMinWorldZ = 0.0f;
+	float VoxelCellSizeZ = 0.0f;
+	bool bVoxelGridValid = false;
+	bool bVoxelHeightMapInitialized = false;
+
+	// Builds the persistent terrain voxel grid from geometry inside the simulation box.
+	void BuildTerrainVoxelGrid();
+	// Releases the persistent terrain voxel grid GPU resources.
+	void ReleaseTerrainVoxelGrid();
+
+	UPROPERTY(Transient, NonTransactional)
 	UTextureRenderTarget2D* RT_TileMask = nullptr;
-	int32 CachedActiveTileCount = 0;
-	TArray<uint8> CachedTileBits;
-	TArray<int32> ISMTileSlots;
+
+	// Static visualization instance grid. Built once at construction time (BuildSimVisInstanceGrid),
+	// covering the whole CaptureSize x CaptureSize fluid box. Instances are NOT added/removed during
+	// simulation; dry tiles simply render nothing through the water material. These describe the grid
+	// layout so bake can map each instance back to its footprint in the result texture.
+	int32 SimVisGridCountX = 0;
+	int32 SimVisGridCountY = 0;
+	float SimVisTileWorldSize = 0.0f;
+
 	static constexpr int32 ReadbackBufferCount = 2;
-	FRHIGPUTextureReadback* TileMaskReadback[ReadbackBufferCount] = {};
-	int32 TileMaskReadbackWriteIdx = 0;
-	int32 TileMaskReadbackWidth = 0;
-	int32 TileMaskReadbackHeight = 0;
-	int32 TileMaskReadbackCopyWidth[ReadbackBufferCount] = {};
-	int32 TileMaskReadbackCopyHeight[ReadbackBufferCount] = {};
-	int32 TileMaskReadbackGeneration[ReadbackBufferCount] = {};
 
 	FRHIGPUTextureReadback* ResultReadback[ReadbackBufferCount] = {};
 	int32 ResultReadbackWriteIdx = 0;
@@ -227,15 +274,6 @@ public:
 
 	FTimerHandle ConstructionDebounceHandle;
 	uint64 LastSolverFrameNumber = 0;
-
-	UPROPERTY(Transient, EditAnywhere, BlueprintReadWrite, Category = "Debug|RenderDoc", Meta=(Priority=999))
-	bool bCaptureNextSolverFrame = false;
-
-	UFUNCTION(BlueprintCallable, Category = "Debug|RenderDoc")
-	void RequestRenderDocCapture();
-
-	UFUNCTION(BlueprintCallable, Category = "Debug|RenderDoc")
-	void ShallowWaterSolverSoucePointWithCapture(int32 InIteration);
 
 	UFUNCTION(BlueprintNativeEvent, Category = "ComputeShader")
 	void OnSolverStarted();
@@ -257,7 +295,8 @@ public:
 	}
 
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "ComputeShader", Meta=(ClampMin="0", UIMin="0"))
-	void StartSolver(float TimerRate = 0.0f);
+	void StartSolver(float TimerRate = 0.0f,
+		UPARAM(meta = (ClampMin = "1", ClampMax = "32", UIMin = "1", UIMax = "8")) int32 InIteration = 1);
 
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "ComputeShader")
 	void StopSolver();
@@ -265,7 +304,7 @@ public:
 	DECLARE_DELEGATE_OneParam(FOnBakeResultMesh, ACSShallowWaterCapture*);
 	static FOnBakeResultMesh OnBakeResultMeshDelegate;
 
-	UFUNCTION(CallInEditor, Category = "SWParameter", Meta=(DevelopmentOnly))
+	UFUNCTION(BlueprintCallable, Category = "SWParameter", Meta=(DevelopmentOnly))
 	void BakeResultMesh();
 
 	UFUNCTION(BlueprintNativeEvent, Category = "ComputeShader|Bake")
@@ -278,7 +317,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader|Bake")
 	void UseSimulationResultMesh();
 
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader", Meta=(ClampMin="1", UIMin="1"))
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader", Meta=(ClampMin="1", ClampMax="32", UIMin="1", UIMax="8"))
 	void ToggleSimVisualization(int32 SimIterationsPerFrame = 1);
 
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "ComputeShader")
@@ -290,6 +329,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Debug|DebugViewPlane")
 	void ShowDebugViewPlane(float Duration = 5.0f);
 
+	// Reads back the persistent run-length terrain voxel grid and draws one debug line per vertical
+	// run (a long voxel becomes a single full-height line). Requires a valid voxel grid (StartSolver
+	// must have built it). Duration is the debug line lifetime in seconds.
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "ComputeShader|Debug", Meta=(ClampMin="0", UIMin="0"))
+	void VisualizeVoxelRuns(float Duration = 5.0f);
+
 private:
 	void ClearSolverTimer();
 	bool IsSolverTimerActive() const;
@@ -298,13 +343,24 @@ private:
 	void StopSimulationRuntime(bool bResetVisualization);
 	void UpdateSimulationPreviewMesh();
 	bool EnsureSimVisHISMReady();
+	// Builds the full static visualization instance grid covering the whole fluid box.
+	// Called once at construction; instances persist for the actor's lifetime.
+	void BuildSimVisInstanceGrid();
 	void ResetSimVisTiles();
 	void ResetSolverReadbackState(bool bAdvanceGeneration, bool bClearCachedResult);
+	void WaitForPendingShallowWaterRendering(const TCHAR* Context) const;
+	bool IsShallowWaterConstructionBlocked() const;
+	bool CanRunShallowWaterGPUWork(const TCHAR* Context) const;
+	int32 ResolveTextureSize() const;
+	void ReleaseShallowWaterTransientResources(const TCHAR* Context);
 
 	TWeakObjectPtr<AActor> DebugViewPlaneActor;
 	FTimerHandle DebugViewPlaneTimerHandle;
 	FTimerHandle SolverTimerHandle;
 	float SolverTimerRate = 0.0f;
+	int32 SolverIterationsPerFrame = 1;
+	bool bSWConstructionGuardActive = false;
+	bool bSWConstructionWorkPending = false;
 };
 
 

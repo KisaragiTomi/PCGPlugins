@@ -182,7 +182,7 @@ TArray<FTransform> ACSBoxRangeGenerator::GenerateTransformsInternal()
 					}
 				// 检查上方是否为地表
 				End = Start + FVector(0, 0, 10000);
-					if(UKismetSystemLibrary::LineTraceSingle(GetWorld(), Start, End, ETraceTypeQuery::TraceTypeQuery1, true, ActorsToIgnore, EDrawDebugTrace::None, OutHit, true))
+					if (UKismetSystemLibrary::LineTraceSingle(GetWorld(), Start, End, ETraceTypeQuery::TraceTypeQuery1, true, ActorsToIgnore, EDrawDebugTrace::None, OutHit, true))
 					{
 						if (Cast<ALandscape>(OutHit.GetActor()))
 						{

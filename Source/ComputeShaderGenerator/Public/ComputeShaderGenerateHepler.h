@@ -73,7 +73,7 @@ FRDGBufferRef Name##Buffer = Name##Refs.Buffer; \
 FRDGBufferSRVRef Name##SRV = Name##Refs.SRV;
 
 #define CREATE_RDG_STRUCTURED_UAV_SRV(Name, ElementType, ElementCount, DebugName) \
-CSHepler::FRDGStructuredBufferRefs Name##Refs = CSHepler::CreateStructuredBuffer<ElementType>(GraphBuilder, ElementCount, DebugName, true, true); \
+CSHepler::FRDGStructuredBufferRefs Name##Refs = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(ElementType), ElementCount, DebugName, true, true); \
 FRDGBufferRef Name##Buffer = Name##Refs.Buffer; \
 FRDGBufferUAVRef Name##UAV = Name##Refs.UAV; \
 FRDGBufferSRVRef Name##SRV = Name##Refs.SRV;
@@ -113,15 +113,9 @@ namespace CSHepler
 	}
 
 	template<typename ElementType>
-	inline FRDGStructuredBufferRefs CreateStructuredBuffer(FRDGBuilder& GraphBuilder, uint32 NumElements, const TCHAR* Name = TEXT("StructuredBuffer"), bool bCreateUAV = true, bool bCreateSRV = true)
-	{
-		return CreateStructuredBuffer(GraphBuilder, sizeof(ElementType), NumElements, Name, bCreateUAV, bCreateSRV);
-	}
-
-	template<typename ElementType>
 	inline FRDGStructuredBufferRefs CreateUploadedStructuredBuffer(FRDGBuilder& GraphBuilder, const TArray<ElementType>& ArrayData, const TCHAR* Name = TEXT("StructuredBuffer"), bool bCreateUAV = false, bool bCreateSRV = true)
 	{
-		FRDGStructuredBufferRefs Refs = CreateStructuredBuffer<ElementType>(GraphBuilder, uint32(ArrayData.Num()), Name, bCreateUAV, bCreateSRV);
+		FRDGStructuredBufferRefs Refs = CreateStructuredBuffer(GraphBuilder, sizeof(ElementType), uint32(ArrayData.Num()), Name, bCreateUAV, bCreateSRV);
 		if (Refs.Buffer)
 		{
 			GraphBuilder.QueueBufferUpload(Refs.Buffer, ArrayData.GetData(), sizeof(ElementType) * ArrayData.Num());

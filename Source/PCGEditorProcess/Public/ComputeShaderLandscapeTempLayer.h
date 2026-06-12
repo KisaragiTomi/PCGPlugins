@@ -2,25 +2,12 @@
 
 #include "CoreMinimal.h"
 #include "Engine/TextureRenderTarget2D.h"
-#include "LandscapeEditLayerRenderer.h"
-#include "LandscapeEditLayerRendererState.h"
-#include "LandscapeEditLayerTargetTypeState.h"
-#include "LandscapeEditLayerTypes.h"
-#include "LandscapeEditTypes.h"
+#include "CSLandscapeEditLayerBase.h"
 #include "Components/BoxComponent.h"
+#include "ComputeShaderBasicFunction.h"
 #include "ComputeShaderLandscapeTempLayer.generated.h"
 
 class ALandscape;
-
-UENUM(BlueprintType)
-enum class ETempLayerBlendMode : uint8
-{
-	Additive     UMETA(DisplayName = "Additive (Height += Delta * Alpha)"),
-	AlphaLerp    UMETA(DisplayName = "Alpha Lerp (Lerp toward generated height)"),
-	Override     UMETA(DisplayName = "Override (Replace within alpha mask)"),
-	Subtract     UMETA(DisplayName = "Subtract (Height -= Delta * Alpha)"),
-	Multiply     UMETA(DisplayName = "Multiply (Height *= Generated * Alpha + (1-Alpha))")
-};
 
 UENUM(BlueprintType)
 enum class ETempLayerSourceMode : uint8
@@ -38,10 +25,7 @@ enum class ETempLayerSourceMode : uint8
  * Remove or disable this actor to instantly revert the terrain change.
  */
 UCLASS(Blueprintable, meta = (DisplayName = "CS Temp Landscape Layer"))
-class PCGEDITORPROCESS_API ACSLandscapeTempLayer : public AActor
-#if CPP && WITH_EDITOR
-	, public ILandscapeEditLayerRenderer
-#endif
+class PCGEDITORPROCESS_API ACSLandscapeTempLayer : public ACSLandscapeEditLayerBase
 {
 	GENERATED_BODY()
 
@@ -77,7 +61,7 @@ public:
 	// --- Blend Settings ---
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "TempLayer|Blend")
-	ETempLayerBlendMode BlendMode = ETempLayerBlendMode::Additive;
+	ECSLandscapeBlendMode BlendMode = ECSLandscapeBlendMode::Additive;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "TempLayer|Blend", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float LayerAlpha = 1.0f;
@@ -106,26 +90,9 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "TempLayer")
 	void CommitToLandscape();
 
-	UFUNCTION(BlueprintCallable, Category = "TempLayer")
-	void RequestLandscapeUpdate(bool bInUserTriggered = false);
-
-	// --- Edit Layer Renderer Interface ---
+	// --- Edit Layer Renderer Interface (only the per-subclass parts) ---
 
 #if WITH_EDITOR
-	virtual FString GetEditLayerRendererDebugName() const override;
-
-	virtual void GetRendererStateInfo(
-		const UE::Landscape::EditLayers::FMergeContext* InMergeContext,
-		UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutSupportedTargetTypeState,
-		UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutEnabledTargetTypeState,
-		TArray<UE::Landscape::EditLayers::FTargetLayerGroup>& OutTargetLayerGroups) const override;
-
-	virtual TArray<UE::Landscape::EditLayers::FEditLayerRenderItem> GetRenderItems(
-		const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const override;
-
-	virtual UE::Landscape::EditLayers::ERenderFlags GetRenderFlags(
-		const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const override;
-
 	virtual bool RenderLayer(
 		UE::Landscape::EditLayers::FRenderParams& RenderParams,
 		UE::Landscape::FRDGBuilderRecorder& RDGBuilderRecorder) override;
@@ -138,6 +105,9 @@ public:
 #endif
 
 protected:
+	/** Temp layer always contributes once a brush region is valid. */
+	virtual bool IsLayerEnabledForMerge() const override { return true; }
+
 	UPROPERTY()
 	USceneComponent* SceneRoot;
 
@@ -147,14 +117,6 @@ protected:
 	UPROPERTY(Transient)
 	UTextureRenderTarget2D* RT_InternalResult = nullptr;
 
-	UPROPERTY()
-	FGuid OwnedEditLayerGuid;
-
-	friend class UCSLandscapeEditLayer;
-
-	bool bHasResult = false;
-
-	ALandscape* FindLandscape() const;
 	void EnsureRTs(const FIntPoint& InSize);
 	void RunBlendCS(UTextureRenderTarget2D* InCombinedResult, UTextureRenderTarget2D* OutResult, const FIntPoint& Size);
 };

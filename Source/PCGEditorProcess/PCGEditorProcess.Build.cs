@@ -1,4 +1,4 @@
-﻿// Copyright Epic Games, Inc. All Rights Reserved.
+// Copyright Epic Games, Inc. All Rights Reserved.
 
 using System;
 using System.IO;
@@ -63,7 +63,9 @@ public class PCGEditorProcess : ModuleRules
 				"MaterialUtilities",
 				"Blutility",
 				"LandscapeEditorUtilities",
+				"AnimationCore",
 				"MeshDescription",
+				"SkeletalMeshDescription",
 				"StaticMeshDescription",
 			}
 			);

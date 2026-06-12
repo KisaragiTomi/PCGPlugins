@@ -1,0 +1,595 @@
+#if VOXEL_GDF_FILL
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DistanceField/GlobalDistanceFieldShared.ush"
+#else
+#include "/Engine/Public/Platform.ush"
+#endif
+
+// Sparse voxel-grid terrain capture for the shallow water solver.
+//
+// Build (one-time at StartSolver):
+//   VoxelFillCS   : scatter scene triangles into a TRANSIENT dense bit occupancy grid + per-XY coverage.
+//   CountRunsCS   : per XY column, count vertical occupied runs (run = a contiguous span of Z cells).
+//   EmitRunsCS    : per XY column, emit (zStart,zEnd) runs into a compact Runs buffer (CSR layout).
+// Per-frame:
+//   BuildHeightMapCS : collapse the sparse runs into the sim terrain height (T_SceneDepth).
+//
+// Persistent storage is sparse: XY is a full grid, Z is variable-length runs per column.
+//   ColumnRunStart[col] : offset of this column's runs in Runs[]
+//   ColumnRunCount[col] : number of runs in this column
+//   Runs[r]             : packed run, low 16 bits = zStart cell, high 16 bits = zEnd cell (inclusive)
+//
+// Conventions:
+//   - XY rasterization happens in box-local space (handles box rotation).
+//   - Z is kept in WORLD space and converted to the sim's "SceneHeight = worldZ - ActorZ"
+//     convention only when writing the height map. This matches the old SceneCapture path.
+
+#ifndef MAX_HEIGHT
+#define MAX_HEIGHT 10000
+#endif
+
+#ifndef THREADGROUPSIZE_X
+#define THREADGROUPSIZE_X 64
+#endif
+
+#ifndef THREADGROUPSIZE_Y
+#define THREADGROUPSIZE_Y 1
+#endif
+
+#ifndef THREADGROUPSIZE_Z
+#define THREADGROUPSIZE_Z 1
+#endif
+
+#ifndef VOXEL_SUBSAMPLES
+#define VOXEL_SUBSAMPLES 4
+#endif
+
+// Tile size of the simulation compact passes (must match NUM_THREADS_PER_GROUP_DIMENSION in C++).
+#ifndef SIM_TILE_SIZE
+#define SIM_TILE_SIZE 16
+#endif
+
+int3  VoxelGridSize;     // (GridX, GridY, GridZ)
+float VoxelBoxExtentXY;  // half footprint in box-local space (= CaptureSize * 0.5)
+float VoxelCellSizeXY;   // box-local XY cell size (= CaptureSize / GridX)
+float VoxelGridMinWorldZ;// world-space Z of the bottom of the voxel volume
+float VoxelInvCellSizeZ; // 1 / world-space Z cell size
+float VoxelCellSizeZ;    // world-space Z cell size
+float VoxelMaxTriangleWorldZ; // world-space Z cap: ignore scene geometry above the highest source point (a huge value disables the cap)
+
+float EdgeFunctionVoxel(float2 A, float2 B, float2 P)
+{
+	return (P.x - A.x) * (B.y - A.y) - (P.y - A.y) * (B.x - A.x);
+}
+
+uint PackRun(uint zStart, uint zEnd)
+{
+	return (zStart & 0xFFFFu) | ((zEnd & 0xFFFFu) << 16u);
+}
+
+uint RunZStart(uint Packed) { return Packed & 0xFFFFu; }
+uint RunZEnd(uint Packed)   { return (Packed >> 16u) & 0xFFFFu; }
+
+// ─── Pass: Voxel Fill (transient dense occupancy) ───────────────────
+
+#ifdef VOXEL_FILL
+
+Buffer<float4> VoxelTriangleData;       // world positions, 3 verts per triangle
+Buffer<uint>   VoxelTriangleCounter;
+uint           VoxelTriangleCount;
+uint           bUseVoxelTriangleCounter;
+float4x4       WorldToBox;
+RWBuffer<uint> RW_VoxelOccupancy; // TRANSIENT bit-packed occupancy (GridX*GridY*GridZ bits)
+RWBuffer<uint> RW_VoxelCoverage;  // per XY cell: summed in-triangle subsample hits
+
+void MarkVoxel(int x, int y, int z)
+{
+	if (x < 0 || y < 0 || z < 0 || x >= VoxelGridSize.x || y >= VoxelGridSize.y || z >= VoxelGridSize.z)
+		return;
+	uint Index = (uint(z) * uint(VoxelGridSize.y) + uint(y)) * uint(VoxelGridSize.x) + uint(x);
+	uint Word  = Index >> 5u;
+	uint Bit   = Index & 31u;
+	uint Ignored;
+	InterlockedOr(RW_VoxelOccupancy[Word], 1u << Bit, Ignored);
+}
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void VoxelFillCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint TriIndex = DispatchThreadId.x;
+	uint EffectiveCount = bUseVoxelTriangleCounter != 0
+		? min(VoxelTriangleCounter[0], VoxelTriangleCount)
+		: VoxelTriangleCount;
+	if (TriIndex >= EffectiveCount)
+		return;
+
+	uint TriBase = TriIndex * 3u;
+	float3 W0 = VoxelTriangleData[TriBase + 0].xyz;
+	float3 W1 = VoxelTriangleData[TriBase + 1].xyz;
+	float3 W2 = VoxelTriangleData[TriBase + 2].xyz;
+
+	// Reject geometry that sits entirely above the highest source point (e.g. ceilings, overhangs).
+	if (min(W0.z, min(W1.z, W2.z)) > VoxelMaxTriangleWorldZ)
+		return;
+
+	float3 L0 = mul(float4(W0, 1.0), WorldToBox).xyz;
+	float3 L1 = mul(float4(W1, 1.0), WorldToBox).xyz;
+	float3 L2 = mul(float4(W2, 1.0), WorldToBox).xyz;
+
+	float2 P0 = L0.xy;
+	float2 P1 = L1.xy;
+	float2 P2 = L2.xy;
+
+	float Area = EdgeFunctionVoxel(P0, P1, P2);
+	if (abs(Area) < 1e-6)
+		return;
+	float InvArea = 1.0 / Area;
+
+	float2 PMin = min(P0, min(P1, P2));
+	float2 PMax = max(P0, max(P1, P2));
+
+	int CXMin = (int)floor((PMin.x + VoxelBoxExtentXY) / VoxelCellSizeXY);
+	int CXMax = (int)floor((PMax.x + VoxelBoxExtentXY) / VoxelCellSizeXY);
+	int CYMin = (int)floor((PMin.y + VoxelBoxExtentXY) / VoxelCellSizeXY);
+	int CYMax = (int)floor((PMax.y + VoxelBoxExtentXY) / VoxelCellSizeXY);
+
+	CXMin = clamp(CXMin, 0, VoxelGridSize.x - 1);
+	CXMax = clamp(CXMax, 0, VoxelGridSize.x - 1);
+	CYMin = clamp(CYMin, 0, VoxelGridSize.y - 1);
+	CYMax = clamp(CYMax, 0, VoxelGridSize.y - 1);
+
+	const int K = VOXEL_SUBSAMPLES;
+	const float InvK = 1.0 / (float)K;
+
+	for (int CY = CYMin; CY <= CYMax; ++CY)
+	{
+		float CellMinLocalY = -VoxelBoxExtentXY + CY * VoxelCellSizeXY;
+		for (int CX = CXMin; CX <= CXMax; ++CX)
+		{
+			float CellMinLocalX = -VoxelBoxExtentXY + CX * VoxelCellSizeXY;
+			int Covered = 0;
+			for (int SY = 0; SY < K; ++SY)
+			{
+				float SampleLocalY = CellMinLocalY + (SY + 0.5) * InvK * VoxelCellSizeXY;
+				for (int SX = 0; SX < K; ++SX)
+				{
+					float SampleLocalX = CellMinLocalX + (SX + 0.5) * InvK * VoxelCellSizeXY;
+					float2 SP = float2(SampleLocalX, SampleLocalY);
+
+					float B0 = EdgeFunctionVoxel(P1, P2, SP) * InvArea;
+					float B1 = EdgeFunctionVoxel(P2, P0, SP) * InvArea;
+					float B2 = EdgeFunctionVoxel(P0, P1, SP) * InvArea;
+					if (B0 < 0.0 || B1 < 0.0 || B2 < 0.0)
+						continue;
+
+					++Covered;
+					float WorldZ = B0 * W0.z + B1 * W1.z + B2 * W2.z;
+					// Skip samples above the highest source point so source-overhead geometry never becomes terrain.
+					if (WorldZ > VoxelMaxTriangleWorldZ)
+						continue;
+					int VZ = (int)floor((WorldZ - VoxelGridMinWorldZ) * VoxelInvCellSizeZ);
+					MarkVoxel(CX, CY, VZ);
+				}
+			}
+			if (Covered > 0)
+			{
+				uint Ignored;
+				InterlockedAdd(RW_VoxelCoverage[CY * VoxelGridSize.x + CX], (uint)Covered, Ignored);
+			}
+		}
+	}
+}
+
+#endif // VOXEL_FILL
+
+// ─── Pass: GDF Fill (sample Global Distance Field, OR-merge into the SAME occupancy) ───
+//
+// Runs after the triangle VoxelFill on the same dense bit grid. A voxel is marked solid when
+// the Global Distance Field reports any surface inside it, i.e. distance to the nearest surface
+// is within the voxel's half-diagonal. This marks both surface-crossing and interior-solid voxels.
+// Columns that pick up any GDF hit also get their coverage bumped so the height-map's 2/3 coverage
+// gate treats GDF-only terrain as valid.
+
+#ifdef VOXEL_GDF_FILL
+
+float4x4       VoxelBoxToWorld;   // box-local -> world (yaw-aligned: box-local Z == world Z)
+RWBuffer<uint> RW_VoxelOccupancy; // shared dense bit grid (same layout as VoxelFill)
+RWBuffer<uint> RW_VoxelCoverage;  // per XY cell coverage (shared with VoxelFill)
+
+void MarkVoxelGDF(int x, int y, int z)
+{
+	uint Index = (uint(z) * uint(VoxelGridSize.y) + uint(y)) * uint(VoxelGridSize.x) + uint(x);
+	uint Word  = Index >> 5u;
+	uint Bit   = Index & 31u;
+	uint Ignored;
+	InterlockedOr(RW_VoxelOccupancy[Word], 1u << Bit, Ignored);
+}
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void GDFFillCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	int X = (int)DispatchThreadId.x;
+	int Y = (int)DispatchThreadId.y;
+	int Z = (int)DispatchThreadId.z;
+	if (X >= VoxelGridSize.x || Y >= VoxelGridSize.y || Z >= VoxelGridSize.z)
+		return;
+
+	// Box-local XY cell centre (handles yaw); world Z is exact (grid Z axis is world Z).
+	float LocalX = -VoxelBoxExtentXY + (X + 0.5) * VoxelCellSizeXY;
+	float LocalY = -VoxelBoxExtentXY + (Y + 0.5) * VoxelCellSizeXY;
+	float WorldZ = VoxelGridMinWorldZ + (Z + 0.5) * VoxelCellSizeZ;
+
+	float3 W = mul(float4(LocalX, LocalY, 0.0, 1.0), VoxelBoxToWorld).xyz; // W.xy = world XY
+	float3 WorldPos = float3(W.x, W.y, WorldZ);
+
+	// Reject geometry above the source-Z cap (matches the triangle path).
+	if (WorldZ > VoxelMaxTriangleWorldZ)
+		return;
+
+	float3 TranslatedWorldPos = WorldPos + View_PreViewTranslationHigh;
+	float Distance = GetDistanceToNearestSurfaceGlobal(TranslatedWorldPos);
+
+	// Solid if any surface lies inside this voxel: dist <= half voxel diagonal.
+	float HalfDiagonal = 0.5 * sqrt(2.0 * VoxelCellSizeXY * VoxelCellSizeXY + VoxelCellSizeZ * VoxelCellSizeZ);
+	if (Distance <= HalfDiagonal)
+	{
+		MarkVoxelGDF(X, Y, Z);
+		uint Ignored;
+		InterlockedMax(RW_VoxelCoverage[Y * VoxelGridSize.x + X], (uint)(VOXEL_SUBSAMPLES * VOXEL_SUBSAMPLES), Ignored);
+	}
+}
+
+#endif // VOXEL_GDF_FILL
+
+// ─── Shared dense-occupancy reader for run passes ───────────────────
+
+#if defined(VOXEL_COUNT_RUNS) || defined(VOXEL_EMIT_RUNS)
+
+Buffer<uint> B_VoxelOccupancy; // transient dense occupancy from VoxelFill
+
+bool IsDenseVoxelSet(int x, int y, int z)
+{
+	uint Index = (uint(z) * uint(VoxelGridSize.y) + uint(y)) * uint(VoxelGridSize.x) + uint(x);
+	uint Word  = Index >> 5u;
+	uint Bit   = Index & 31u;
+	return (B_VoxelOccupancy[Word] & (1u << Bit)) != 0u;
+}
+
+#endif
+
+// ─── Pass: Count Runs (per XY column) ───────────────────────────────
+
+#ifdef VOXEL_COUNT_RUNS
+
+RWBuffer<uint> RW_ColumnRunCount; // [GridX*GridY] number of runs per column
+
+[numthreads(SIM_TILE_SIZE, SIM_TILE_SIZE, 1)]
+void CountRunsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	int X = (int)DispatchThreadId.x;
+	int Y = (int)DispatchThreadId.y;
+	if (X >= VoxelGridSize.x || Y >= VoxelGridSize.y)
+		return;
+
+	uint RunCount = 0;
+	bool bPrev = false;
+	for (int Z = 0; Z < VoxelGridSize.z; ++Z)
+	{
+		bool bCur = IsDenseVoxelSet(X, Y, Z);
+		if (bCur && !bPrev)
+			++RunCount; // rising edge starts a new run
+		bPrev = bCur;
+	}
+
+	RW_ColumnRunCount[Y * VoxelGridSize.x + X] = RunCount;
+}
+
+#endif // VOXEL_COUNT_RUNS
+
+// ─── CSR offset build: GPU exclusive prefix sum of per-column run counts ───
+//
+// Mirrors VoxelCavitySpan.usf. The column index space is linear [0, ColumnCount)
+// with col = Y * GridX + X, matching CountRuns/EmitRuns. Three passes:
+//   SCAN_BLOCKS    : per-block exclusive prefix sum of counts -> ColumnRunStart,
+//                    per-block totals -> BlockSums.
+//   SCAN_BLOCKSUMS : single-group exclusive scan of BlockSums, writes grand total.
+//   ADD_OFFSETS    : ColumnRunStart[i] += scanned BlockSums[block(i)].
+
+#ifndef SCAN_BLOCK_SIZE
+#define SCAN_BLOCK_SIZE 256
+#endif
+
+#ifdef VOXEL_SCAN_BLOCKS
+
+uint           ColumnCount;
+Buffer<uint>   B_ColumnRunCount;
+RWBuffer<uint> RW_ColumnRunStart;
+RWBuffer<uint> RW_BlockSums;
+
+groupshared uint ScanTemp[SCAN_BLOCK_SIZE];
+
+[numthreads(SCAN_BLOCK_SIZE, 1, 1)]
+void ScanBlocksCS(uint3 DispatchThreadId : SV_DispatchThreadID, uint GroupIndex : SV_GroupIndex, uint3 GroupId : SV_GroupID)
+{
+	uint GlobalIndex = DispatchThreadId.x;
+	uint v = (GlobalIndex < ColumnCount) ? B_ColumnRunCount[GlobalIndex] : 0u;
+	ScanTemp[GroupIndex] = v;
+	GroupMemoryBarrierWithGroupSync();
+
+	[unroll]
+	for (uint Offset = 1u; Offset < SCAN_BLOCK_SIZE; Offset <<= 1u)
+	{
+		uint Added = (GroupIndex >= Offset) ? ScanTemp[GroupIndex - Offset] : 0u;
+		GroupMemoryBarrierWithGroupSync();
+		ScanTemp[GroupIndex] += Added;
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	uint Exclusive = ScanTemp[GroupIndex] - v;
+	if (GlobalIndex < ColumnCount)
+		RW_ColumnRunStart[GlobalIndex] = Exclusive;
+
+	if (GroupIndex == SCAN_BLOCK_SIZE - 1u)
+		RW_BlockSums[GroupId.x] = ScanTemp[GroupIndex];
+}
+
+#endif // VOXEL_SCAN_BLOCKS
+
+#ifdef VOXEL_SCAN_BLOCKSUMS
+
+RWBuffer<uint> RW_BlockSums;   // in: per-block totals, out: exclusive prefix per block
+RWBuffer<uint> RW_TotalCount;  // out: grand total run count (single element)
+uint           NumBlocks;
+
+groupshared uint BlockTemp[SCAN_BLOCK_SIZE];
+groupshared uint SegmentCarry; // running exclusive offset carried across segments
+
+// Single-group exclusive scan over an arbitrarily long BlockSums buffer.
+// The buffer is walked in serial segments of SCAN_BLOCK_SIZE; each segment runs a
+// Hillis-Steele scan, is biased by the carry accumulated from all earlier segments,
+// then advances the carry by its own total. This removes the old NumBlocks <= SCAN_BLOCK_SIZE
+// limit (which previously capped ColumnCount at SCAN_BLOCK_SIZE^2) without a second dispatch level.
+[numthreads(SCAN_BLOCK_SIZE, 1, 1)]
+void ScanBlockSumsCS(uint GroupIndex : SV_GroupIndex)
+{
+	if (GroupIndex == 0u)
+		SegmentCarry = 0u;
+	GroupMemoryBarrierWithGroupSync();
+
+	const uint NumSegments = (NumBlocks + SCAN_BLOCK_SIZE - 1u) / SCAN_BLOCK_SIZE;
+	for (uint Seg = 0u; Seg < NumSegments; ++Seg)
+	{
+		uint Index = Seg * SCAN_BLOCK_SIZE + GroupIndex;
+		uint v = (Index < NumBlocks) ? RW_BlockSums[Index] : 0u;
+		BlockTemp[GroupIndex] = v;
+		GroupMemoryBarrierWithGroupSync();
+
+		[unroll]
+		for (uint Offset = 1u; Offset < SCAN_BLOCK_SIZE; Offset <<= 1u)
+		{
+			uint Added = (GroupIndex >= Offset) ? BlockTemp[GroupIndex - Offset] : 0u;
+			GroupMemoryBarrierWithGroupSync();
+			BlockTemp[GroupIndex] += Added;
+			GroupMemoryBarrierWithGroupSync();
+		}
+
+		uint Exclusive = (BlockTemp[GroupIndex] - v) + SegmentCarry;
+		if (Index < NumBlocks)
+			RW_BlockSums[Index] = Exclusive;
+
+		// Advance the carry by this segment's inclusive total (last lane holds it).
+		GroupMemoryBarrierWithGroupSync();
+		if (GroupIndex == 0u)
+			SegmentCarry += BlockTemp[SCAN_BLOCK_SIZE - 1u];
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	if (GroupIndex == 0u)
+		RW_TotalCount[0] = SegmentCarry;
+}
+
+#endif // VOXEL_SCAN_BLOCKSUMS
+
+#ifdef VOXEL_ADD_OFFSETS
+
+uint           ColumnCount;
+Buffer<uint>   B_BlockSums; // exclusive prefix per block
+RWBuffer<uint> RW_ColumnRunStart;
+
+[numthreads(SCAN_BLOCK_SIZE, 1, 1)]
+void AddOffsetsCS(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_GroupID)
+{
+	uint GlobalIndex = DispatchThreadId.x;
+	if (GlobalIndex >= ColumnCount)
+		return;
+	RW_ColumnRunStart[GlobalIndex] += B_BlockSums[GroupId.x];
+}
+
+#endif // VOXEL_ADD_OFFSETS
+
+// ─── Pass: Emit Runs (per XY column) ────────────────────────────────
+
+#ifdef VOXEL_EMIT_RUNS
+
+Buffer<uint>   B_ColumnRunStart; // [GridX*GridY] CSR start offset (exclusive prefix sum of counts)
+RWBuffer<uint> RW_Runs;          // packed (zStart,zEnd) runs
+uint           TotalRunCapacity;
+
+[numthreads(SIM_TILE_SIZE, SIM_TILE_SIZE, 1)]
+void EmitRunsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	int X = (int)DispatchThreadId.x;
+	int Y = (int)DispatchThreadId.y;
+	if (X >= VoxelGridSize.x || Y >= VoxelGridSize.y)
+		return;
+
+	uint WriteOffset = B_ColumnRunStart[Y * VoxelGridSize.x + X];
+
+	int RunStart = -1;
+	bool bPrev = false;
+	for (int Z = 0; Z < VoxelGridSize.z; ++Z)
+	{
+		bool bCur = IsDenseVoxelSet(X, Y, Z);
+		if (bCur && !bPrev)
+		{
+			RunStart = Z; // open a run
+		}
+		else if (!bCur && bPrev)
+		{
+			// close run [RunStart, Z-1]
+			if (WriteOffset < TotalRunCapacity)
+				RW_Runs[WriteOffset] = PackRun((uint)RunStart, (uint)(Z - 1));
+			++WriteOffset;
+		}
+		bPrev = bCur;
+	}
+	if (bPrev)
+	{
+		// trailing run reaching the top
+		if (WriteOffset < TotalRunCapacity)
+			RW_Runs[WriteOffset] = PackRun((uint)RunStart, (uint)(VoxelGridSize.z - 1));
+		++WriteOffset;
+	}
+}
+
+#endif // VOXEL_EMIT_RUNS
+
+// ─── Pass: Build Height Map (per-frame, reads sparse runs) ──────────
+
+#ifdef VOXEL_BUILD_HEIGHTMAP
+
+Buffer<uint> B_ColumnRunStart;  // [GridX*GridY]
+Buffer<uint> B_ColumnRunCount;  // [GridX*GridY]
+Buffer<uint> B_Runs;            // packed runs
+Buffer<uint> B_VoxelCoverage;   // [GridX*GridY]
+Texture2D              T_TileMask;       // RT_TileMask, .x > 0.5 => active tile
+Texture2D              T_PrevResultVelHeight; // .z = previous-frame liquid surface (local: worldZ - ActorZ)
+RWTexture2D<float4>    RW_SceneDepth;    // sim terrain texture (.x = depth)
+StructuredBuffer<float4> B_SourceUVRads; // per-source (uv.xy, worldZ, radiusUV)
+int                    bInitialBuild;    // 1 => ignore tile mask & liquid clamp, fill everything
+uint                   VoxelCoverageThreshold; // ceil(2/3 * K*K)
+float                  VoxelActorLocationZ;
+float                  VoxelMaxRiseAboveLiquid;   // per-frame rise clamp reference (cm)
+float                  VoxelMaxAboveWaterSurface; // ignore voxels this many cm above the water surface (cm)
+int                    SourceCount;      // number of valid source points this frame
+
+[numthreads(SIM_TILE_SIZE, SIM_TILE_SIZE, 1)]
+void BuildHeightMapCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	int X = (int)DispatchThreadId.x;
+	int Y = (int)DispatchThreadId.y;
+	if (X >= VoxelGridSize.x || Y >= VoxelGridSize.y)
+		return;
+
+	// Non-active tiles keep their previous terrain value untouched.
+	if (bInitialBuild == 0)
+	{
+		int2 Tile = int2(X / SIM_TILE_SIZE, Y / SIM_TILE_SIZE);
+		if (T_TileMask.Load(int3(Tile, 0)).x < 0.5)
+			return;
+	}
+
+	uint ColIndex = Y * VoxelGridSize.x + X;
+	uint Coverage = B_VoxelCoverage[ColIndex];
+	if (Coverage < VoxelCoverageThreshold)
+		return; // not enough triangle coverage in this column -> keep previous terrain
+
+	uint RunCount = B_ColumnRunCount[ColIndex];
+	if (RunCount == 0)
+		return;
+	uint RunStartOffset = B_ColumnRunStart[ColIndex];
+
+	// Liquid reference in local space (worldZ - ActorZ).
+	float LiquidLocalZ = T_PrevResultVelHeight.Load(int3(X, Y, 0)).z;
+	bool bHasLiquid = LiquidLocalZ > -9000.0;
+
+	// When this active column has no liquid reference (neither here nor carried over from the sim),
+	// try to borrow a water surface from the nearest source point whose XY falls inside this column's
+	// tile. This lets a freshly-placed source seed the terrain surface near the spawn before any
+	// water has spread. Initial full builds keep the plain "highest occupied voxel" behaviour.
+	if (!bHasLiquid && bInitialBuild == 0 && SourceCount > 0)
+	{
+		// Column center in grid-UV space (matches the source UV convention: uv = relativePos / boxSize).
+		float2 ColUV = (float2(X, Y) + 0.5) / float2(VoxelGridSize.x, VoxelGridSize.y);
+		int2 ColTile = int2(X / SIM_TILE_SIZE, Y / SIM_TILE_SIZE);
+
+		float BestSrcDist = 3.0e30;
+		float BestSrcLocalZ = 0.0;
+		bool bFoundSrc = false;
+		for (int s = 0; s < SourceCount; ++s)
+		{
+			float4 Src = B_SourceUVRads[s];
+			if (Src.w <= 0.0)
+				continue;
+			// Restrict to sources that live inside this column's tile footprint.
+			int2 SrcCell = (int2)floor(Src.xy * float2(VoxelGridSize.x, VoxelGridSize.y));
+			int2 SrcTile = int2(SrcCell.x / SIM_TILE_SIZE, SrcCell.y / SIM_TILE_SIZE);
+			if (SrcTile.x != ColTile.x || SrcTile.y != ColTile.y)
+				continue;
+			float D = distance(ColUV, Src.xy);
+			if (D < BestSrcDist)
+			{
+				BestSrcDist = D;
+				BestSrcLocalZ = Src.z - VoxelActorLocationZ; // world Z -> local convention
+				bFoundSrc = true;
+			}
+		}
+		if (bFoundSrc)
+		{
+			LiquidLocalZ = BestSrcLocalZ;
+			bHasLiquid = true; // route through the "search toward liquid surface" branch below
+		}
+	}
+
+	bool bFound = false;
+	float SurfaceLocalZ = 0.0;
+
+	if (bInitialBuild != 0 || !bHasLiquid)
+	{
+		// No water reference yet: take the highest occupied cell (top-down). Runs are sorted
+		// ascending, so the last run's top cell is the global maximum.
+		uint Packed = B_Runs[RunStartOffset + (RunCount - 1u)];
+		int ZTop = (int)RunZEnd(Packed);
+		SurfaceLocalZ = (VoxelGridMinWorldZ + (ZTop + 0.5) * VoxelCellSizeZ) - VoxelActorLocationZ;
+		bFound = true;
+	}
+	else
+	{
+		// Search outward from the most recent water surface (both up and down) for the nearest
+		// occupied cell, ignoring cells more than VoxelMaxAboveWaterSurface above the surface.
+		float Cap = LiquidLocalZ + VoxelMaxAboveWaterSurface;
+		float BestDist = 3.0e30;
+		for (uint r = 0; r < RunCount; ++r)
+		{
+			uint Packed = B_Runs[RunStartOffset + r];
+			int ZBot = (int)RunZStart(Packed);
+			int ZTop = (int)RunZEnd(Packed);
+			// This run's lowest cell is already above the cap -> all later (higher) runs are too.
+			float RunBotLocalZ = (VoxelGridMinWorldZ + (ZBot + 0.5) * VoxelCellSizeZ) - VoxelActorLocationZ;
+			if (RunBotLocalZ > Cap)
+				break;
+			for (int Z = ZBot; Z <= ZTop; ++Z)
+			{
+				float LocalZ = (VoxelGridMinWorldZ + (Z + 0.5) * VoxelCellSizeZ) - VoxelActorLocationZ;
+				if (LocalZ > Cap)
+					break; // within a run Z increases -> nothing lower remains in this run
+				float Dist = abs(LocalZ - LiquidLocalZ);
+				if (Dist < BestDist)
+				{
+					BestDist = Dist;
+					SurfaceLocalZ = LocalZ;
+					bFound = true;
+				}
+			}
+		}
+	}
+
+	if (bFound)
+	{
+		float Depth = (float)MAX_HEIGHT - SurfaceLocalZ;
+		RW_SceneDepth[DispatchThreadId.xy] = float4(Depth, 0, 0, 1);
+	}
+	// else: keep previous terrain value (do not write)
+}
+
+#endif // VOXEL_BUILD_HEIGHTMAP

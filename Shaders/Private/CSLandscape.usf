@@ -227,16 +227,16 @@ void TempLayerBlend(uint3 DispatchThreadId)
 
 	float FinalHeight = CombinedHeight;
 
-	// BlendMode: 0=Additive, 1=AlphaLerp, 2=Override, 3=Subtract, 4=Multiply
-	if (TempBlendMode == 0)
+	// BlendMode (ECSLandscapeBlendMode): 0=Alpha,1=Override,2=Additive,3=Subtract,4=Multiply
+	if (TempBlendMode == 2)
 	{
 		FinalHeight = CombinedHeight + HeightDelta * Alpha;
 	}
-	else if (TempBlendMode == 1)
+	else if (TempBlendMode == 0)
 	{
 		FinalHeight = lerp(CombinedHeight, HeightDelta, Alpha);
 	}
-	else if (TempBlendMode == 2)
+	else if (TempBlendMode == 1)
 	{
 		FinalHeight = lerp(CombinedHeight, HeightDelta, Alpha);
 	}

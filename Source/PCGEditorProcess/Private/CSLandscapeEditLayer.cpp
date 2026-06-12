@@ -1,7 +1,5 @@
 #include "CSLandscapeEditLayer.h"
-#include "ComputeShaderLandscape.h"
-#include "ComputeShaderLandscapeLayer.h"
-#include "ComputeShaderLandscapeTempLayer.h"
+#include "CSLandscapeEditLayerBase.h"
 #include "EngineUtils.h"
 #include "Landscape.h"
 
@@ -22,17 +20,14 @@ TArray<UE::Landscape::EditLayers::FEditLayerRendererState> UCSLandscapeEditLayer
 	const FGuid MyGuid = GetGuid();
 
 	// Only return the Actor that owns this specific Edit Layer
-	auto TryAdd = [&](auto* Actor)
+	for (TActorIterator<ACSLandscapeEditLayerBase> It(World); It; ++It)
 	{
-		if (!IsValid(Actor)) return;
-		if (Actor->OwnedEditLayerGuid != MyGuid) return;
+		ACSLandscapeEditLayerBase* Actor = *It;
+		if (!IsValid(Actor)) continue;
+		if (Actor->OwnedEditLayerGuid != MyGuid) continue;
 		TScriptInterface<ILandscapeEditLayerRenderer> Renderer(Actor);
 		if (Renderer) States.Emplace(InMergeContext, Renderer);
-	};
-
-	for (TActorIterator<ACSLandscape> It(World); It; ++It) TryAdd(*It);
-	for (TActorIterator<ACSLandscapeLayer> It(World); It; ++It) TryAdd(*It);
-	for (TActorIterator<ACSLandscapeTempLayer> It(World); It; ++It) TryAdd(*It);
+	}
 
 	return States;
 }

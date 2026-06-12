@@ -64,28 +64,28 @@ float4 BlurPixel(SamplerState Sampler, Texture2D BlurTexture, uint3 DispatchThre
     uint PixelBoundSize = BT_SHAREFIND;
     int2 globalPos = DispatchThreadId.xy;
 
-    // 加载主区域到共享内存
+    // Load the main region into shared memory
     shareBlur[GroupThreadId.x + PixelBoundSize][GroupThreadId.y + PixelBoundSize] = BlurTexture[DispatchThreadId.xy].xyz;
  
-    // 左边缘
+    // Left edge
     if (GroupThreadId.x < PixelBoundSize)
     {
         int2 pos = globalPos - int2(PixelBoundSize, 0);
         shareBlur[GroupThreadId.x][GroupThreadId.y + PixelBoundSize] = BlurTexture[clamp(pos, int2(0,0), MaxCell)].xyz;
     }
-    // 右边缘
+    // Right edge
     if (GroupThreadId.x >= THREADGROUPSIZE_X - PixelBoundSize)
     {
         int2 pos = globalPos + int2(PixelBoundSize, 0);
         shareBlur[GroupThreadId.x + PixelBoundSize * 2][GroupThreadId.y + PixelBoundSize] = BlurTexture[clamp(pos, int2(0,0), MaxCell)].xyz;
     }
-    // 上边缘
+    // Top edge
     if (GroupThreadId.y < PixelBoundSize)
     {
         int2 pos = globalPos - int2(0, PixelBoundSize);
         shareBlur[GroupThreadId.x + PixelBoundSize][GroupThreadId.y] = BlurTexture[clamp(pos, int2(0,0), MaxCell)].xyz;
     }
-    // 下边缘
+    // Bottom edge
     if (GroupThreadId.y >= THREADGROUPSIZE_X - PixelBoundSize)
     {
         int2 pos = globalPos + int2(0, PixelBoundSize);
@@ -114,10 +114,10 @@ float4 BlurPixel(SamplerState Sampler, Texture2D BlurTexture, uint3 DispatchThre
 	}
     
 	
-    // 同步线程
+    // Sync threads
     GroupMemoryBarrierWithGroupSync();
 
-    // 计算模糊（从共享内存读取）
+    // Compute blur (read from shared memory)
 	float4 sum = 0;
 	for (int dy = -BT_SHAREFIND; dy <= BT_SHAREFIND; ++dy) 
 	{

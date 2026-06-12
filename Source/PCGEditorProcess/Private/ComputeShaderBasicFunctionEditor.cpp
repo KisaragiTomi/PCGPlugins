@@ -28,7 +28,7 @@ using namespace CSHepler;
 
 UTextureRenderTarget2D* UComputeShaderBasicFunctionEditor::GenerateHeightNormal(FVector Center, FVector Extent, int32 OutSize)
 {
-	FReadLandscapeData LandscapeData;
+	FCSReadLandscapeData LandscapeData;
 	ULandscapeExtra::CreateLandscapeTextureData(LandscapeData, Center, Extent);
 	int32 HeightDataSize = FMath::CeilToInt(FMath::Pow(LandscapeData.Colors16.Num(), .5));
 	

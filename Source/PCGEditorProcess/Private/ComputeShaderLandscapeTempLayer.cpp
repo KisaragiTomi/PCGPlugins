@@ -250,57 +250,7 @@ void ACSLandscapeTempLayer::RunBlendCS(
 	FlushRenderingCommands();
 }
 
-ALandscape* ACSLandscapeTempLayer::FindLandscape() const
-{
-	if (!GetWorld()) return nullptr;
-	for (TActorIterator<ALandscape> It(GetWorld()); It; ++It)
-	{
-		return *It;
-	}
-	return nullptr;
-}
-
-void ACSLandscapeTempLayer::RequestLandscapeUpdate(bool bInUserTriggered)
-{
 #if WITH_EDITOR
-	ALandscape* Landscape = FindLandscape();
-	if (Landscape)
-	{
-		Landscape->RequestLayersContentUpdateForceAll(ELandscapeLayerUpdateMode::Update_All, bInUserTriggered);
-	}
-#endif
-}
-
-#if WITH_EDITOR
-
-FString ACSLandscapeTempLayer::GetEditLayerRendererDebugName() const
-{
-	return FString::Printf(TEXT("ACSLandscapeTempLayer_%s"), *GetName());
-}
-
-void ACSLandscapeTempLayer::GetRendererStateInfo(
-	const UE::Landscape::EditLayers::FMergeContext* InMergeContext,
-	UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutSupportedTargetTypeState,
-	UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutEnabledTargetTypeState,
-	TArray<UE::Landscape::EditLayers::FTargetLayerGroup>& OutTargetLayerGroups) const
-{
-	OutSupportedTargetTypeState.AddTargetTypeMask(ELandscapeToolTargetTypeFlags::Heightmap);
-	OutEnabledTargetTypeState.AddTargetTypeMask(ELandscapeToolTargetTypeFlags::Heightmap);
-}
-
-TArray<UE::Landscape::EditLayers::FEditLayerRenderItem> ACSLandscapeTempLayer::GetRenderItems(
-	const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const
-{
-	using namespace UE::Landscape::EditLayers;
-	FEditLayerTargetTypeState EnabledState(InMergeContext, ELandscapeToolTargetTypeFlags::Heightmap);
-	return { FEditLayerRenderItem(EnabledState, FInputWorldArea::CreateInfinite(), FOutputWorldArea::CreateLocalComponent(), false) };
-}
-
-UE::Landscape::EditLayers::ERenderFlags ACSLandscapeTempLayer::GetRenderFlags(
-	const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const
-{
-	return UE::Landscape::EditLayers::ERenderFlags::RenderMode_Immediate;
-}
 
 bool ACSLandscapeTempLayer::RenderLayer(
 	UE::Landscape::EditLayers::FRenderParams& RenderParams,
@@ -339,44 +289,12 @@ void ACSLandscapeTempLayer::CommitToLandscape()
 #if WITH_EDITOR
 	if (!RT_InternalResult) return;
 
-	ALandscape* Landscape = FindLandscape();
-	if (!Landscape) return;
-
 	FVector Center = BrushBox->Bounds.Origin;
 	FVector Extent = BrushBox->Bounds.BoxExtent;
-	FReadLandscapeData LandscapeData;
+	FCSReadLandscapeData LandscapeData;
 	ULandscapeExtra::CreateLandscapeTextureData(LandscapeData, Center, Extent);
-	if (LandscapeData.TextureSize.X + LandscapeData.TextureSize.Y < 32) return;
 
-	int32 XNum = RT_InternalResult->SizeX;
-	TArray<FLinearColor> ResultColors;
-	UKismetRenderingLibrary::ReadRenderTargetRaw(this, RT_InternalResult, ResultColors, false);
-
-	TArray<uint16> HeightData;
-	HeightData.Reserve(LandscapeData.TextureValidSize.X * LandscapeData.TextureValidSize.Y);
-
-	float LandscapeScaleZ = Landscape->GetActorScale3D().Z;
-	for (int32 Y = 0; Y < LandscapeData.TextureValidSize.Y; Y++)
-	{
-		for (int32 X = 0; X < LandscapeData.TextureValidSize.X; X++)
-		{
-			float Height = ResultColors[X + Y * XNum].A / LandscapeScaleZ;
-			HeightData.Add(LandscapeDataAccess::GetTexHeight(Height));
-		}
-	}
-
-	FLandscapeEditDataInterface LandscapeEdit(Landscape->GetLandscapeInfo());
-	LandscapeEdit.SetShouldDirtyPackage(true);
-
-	const FLandscapeLayer* Layer = Landscape->GetLayerConst(0);
-	FGuid LayerGuid = Layer ? Layer->EditLayer->GetGuid() : FGuid();
-	FScopedSetLandscapeEditingLayer Scope(Landscape, LayerGuid,
-		[=] { Landscape->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_All); });
-
-	LandscapeEdit.SetHeightData(
-		LandscapeData.ReadRange.X, LandscapeData.ReadRange.Y,
-		LandscapeData.ReadRange.Z, LandscapeData.ReadRange.W,
-		(uint16*)HeightData.GetData(), 0, true, nullptr, nullptr, nullptr);
+	BakeResultToLandscape(RT_InternalResult, LandscapeData, /*bClearLayerFirst*/ false, /*bWriteAlphaBlendAndFlags*/ false);
 
 	Destroy();
 #endif

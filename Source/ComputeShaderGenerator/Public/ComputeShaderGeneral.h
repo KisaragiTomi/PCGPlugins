@@ -497,6 +497,36 @@ public:
 // IMPLEMENT_GLOBAL_SHADER moved to ComputeShaderBasicFunction.cpp
 
 
+class COMPUTESHADERGENERATOR_API FSmoothSplineEval : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FSmoothSplineEval);
+	SHADER_USE_PARAMETER_STRUCT(FSmoothSplineEval, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, ControlPoints)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutPositions)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTangents)
+		SHADER_PARAMETER(int32, NumControlPoints)
+		SHADER_PARAMETER(int32, NumSamples)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return true;
+	}
+
+	static inline void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Y"), 1);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Z"), 1);
+	}
+};
+
+// IMPLEMENT_GLOBAL_SHADER moved to ComputeShaderBasicFunction.cpp
+
+
 class COMPUTESHADERGENERATOR_API FGlobalDistanceFieldForCS : public FGlobalShader
 {
 public:
@@ -564,6 +594,159 @@ public:
 			OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), NUM_THREADS_PER_GROUP_DIMENSION_X);
 			OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Y"), NUM_THREADS_PER_GROUP_DIMENSION_Y);
 		}
+	}
+};
+
+// ─── Box GDF -> per-column cavity spans (CSR), fully on GPU ─────────
+//
+// Six passes share one .usf (VoxelCavitySpan.usf). All but the GDF-fill pass are
+// plain buffer compute; the GDF-fill pass needs the View + GlobalDistanceField bindings.
+
+#ifndef VOXEL_CAVITY_SCAN_BLOCK_SIZE
+#define VOXEL_CAVITY_SCAN_BLOCK_SIZE 256
+#endif
+
+class COMPUTESHADERGENERATOR_API FVoxelCavityGDFFill : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FVoxelCavityGDFFill);
+	SHADER_USE_PARAMETER_STRUCT(FVoxelCavityGDFFill, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(FIntVector, VoxelGridSize)
+		SHADER_PARAMETER(uint32, ColumnCount)
+		SHADER_PARAMETER(FVector3f, VoxelBoxLocalMin)
+		SHADER_PARAMETER(FVector3f, VoxelCellSizeLocal)
+		SHADER_PARAMETER(FMatrix44f, VoxelBoxToWorld)
+		SHADER_PARAMETER(float, OccupancyThreshold)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_Occupancy)
+		SHADER_PARAMETER_STRUCT_INCLUDE(FGlobalDistanceFieldParameters2, GlobalDistanceFieldParameters)
+		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+		SHADER_PARAMETER_SAMPLER(SamplerState, Sampler)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+	static inline void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 8);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Y"), 8);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Z"), 1);
+		OutEnvironment.SetDefine(TEXT("VOXEL_GDF_FILL_OCCUPANCY"), 1);
+		OutEnvironment.SetDefine(TEXT("USE_DISTANCEFIELD"), 1);
+	}
+};
+
+class COMPUTESHADERGENERATOR_API FVoxelCavityCount : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FVoxelCavityCount);
+	SHADER_USE_PARAMETER_STRUCT(FVoxelCavityCount, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(FIntVector, VoxelGridSize)
+		SHADER_PARAMETER(uint32, ColumnCount)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, B_Occupancy)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_ColumnSpanCount)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters) { return true; }
+	static inline void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 8);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Y"), 8);
+		OutEnvironment.SetDefine(TEXT("VOXEL_COUNT_CAVITY"), 1);
+	}
+};
+
+class COMPUTESHADERGENERATOR_API FVoxelCavityScanBlocks : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FVoxelCavityScanBlocks);
+	SHADER_USE_PARAMETER_STRUCT(FVoxelCavityScanBlocks, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(FIntVector, VoxelGridSize)
+		SHADER_PARAMETER(uint32, ColumnCount)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, B_ColumnSpanCount)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_ColumnSpanStart)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_BlockSums)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters) { return true; }
+	static inline void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("SCAN_BLOCK_SIZE"), VOXEL_CAVITY_SCAN_BLOCK_SIZE);
+		OutEnvironment.SetDefine(TEXT("VOXEL_SCAN_BLOCKS"), 1);
+	}
+};
+
+class COMPUTESHADERGENERATOR_API FVoxelCavityScanBlockSums : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FVoxelCavityScanBlockSums);
+	SHADER_USE_PARAMETER_STRUCT(FVoxelCavityScanBlockSums, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(FIntVector, VoxelGridSize)
+		SHADER_PARAMETER(uint32, ColumnCount)
+		SHADER_PARAMETER(uint32, NumBlocks)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_BlockSums)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_TotalCount)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters) { return true; }
+	static inline void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("SCAN_BLOCK_SIZE"), VOXEL_CAVITY_SCAN_BLOCK_SIZE);
+		OutEnvironment.SetDefine(TEXT("VOXEL_SCAN_BLOCKSUMS"), 1);
+	}
+};
+
+class COMPUTESHADERGENERATOR_API FVoxelCavityAddOffsets : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FVoxelCavityAddOffsets);
+	SHADER_USE_PARAMETER_STRUCT(FVoxelCavityAddOffsets, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(FIntVector, VoxelGridSize)
+		SHADER_PARAMETER(uint32, ColumnCount)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, B_BlockSums)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_ColumnSpanStart)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters) { return true; }
+	static inline void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("SCAN_BLOCK_SIZE"), VOXEL_CAVITY_SCAN_BLOCK_SIZE);
+		OutEnvironment.SetDefine(TEXT("VOXEL_ADD_OFFSETS"), 1);
+	}
+};
+
+class COMPUTESHADERGENERATOR_API FVoxelCavityEmit : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FVoxelCavityEmit);
+	SHADER_USE_PARAMETER_STRUCT(FVoxelCavityEmit, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(FIntVector, VoxelGridSize)
+		SHADER_PARAMETER(uint32, ColumnCount)
+		SHADER_PARAMETER(uint32, TotalSpanCapacity)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, B_Occupancy)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, B_ColumnSpanStart)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_Spans)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters) { return true; }
+	static inline void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 8);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Y"), 8);
+		OutEnvironment.SetDefine(TEXT("VOXEL_EMIT_CAVITY"), 1);
 	}
 };
 

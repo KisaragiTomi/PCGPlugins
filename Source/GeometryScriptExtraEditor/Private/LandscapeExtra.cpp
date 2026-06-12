@@ -303,7 +303,7 @@ TArray<FLinearColor> ULandscapeExtra::GetLandscapeData( FVector Center, FVector 
 	
 }
 
-void ULandscapeExtra::CreateLandscapeTextureData(FReadLandscapeData& LandscapeData, FVector Center, FVector Extent, int32 ExtentPlus)
+void ULandscapeExtra::CreateLandscapeTextureData(FCSReadLandscapeData& LandscapeData, FVector Center, FVector Extent, int32 ExtentPlus)
 {
 	
 	TArray<FLinearColor> OutHeightNormals;

@@ -17,5 +17,6 @@ struct COMPUTESHADERGENERATOR_API FStaticMeshRenderDataPointSampleRequest
 class COMPUTESHADERGENERATOR_API FStaticMeshRenderDataPointSampler
 {
 public:
+	static bool SamplePointsSync(const TArray<FStaticMeshRenderDataPointSampleRequest>& Requests, TArray<FVector>& OutPoints);
 	static bool SamplePointsSync(const TArray<FStaticMeshRenderDataPointSampleRequest>& Requests, TArray<FVector>& OutPoints, TArray<int32>& OutPointsPerRequest);
 };

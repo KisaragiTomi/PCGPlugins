@@ -49,7 +49,7 @@ void CS_Promote(
     
 	GroupMemoryBarrierWithGroupSync(); 
 
-	// Reduction: halve step by step comparing the minimum
+	// 归约：逐步折半比较最小值
 	for (uint stride = 128; stride > 0; stride >>= 1)
 	{
 		if (GroupThreadId.x < stride) {
@@ -69,7 +69,7 @@ void CPF_Init(uint3 DispatchThreadId)
 	float MaxCell = 0;
 	InputTexture.GetDimensions(MaxCell, MaxCell);
 	
-	float label = DispatchThreadId.y * MaxCell + DispatchThreadId.x + 1; // +1 to avoid clashing with 0
+	float label = DispatchThreadId.y * MaxCell + DispatchThreadId.x + 1; // +1避免0冲突
 	if (InputTexture[DispatchThreadId.xy][Channel] > 0)
 	{
 		RW_LabelBufferA[DispatchThreadId.xy].xy = DispatchThreadId.xy;

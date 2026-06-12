@@ -1,14 +1,12 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "GameFramework/Actor.h"
+#include "DynamicMeshActor.h"
 #include "Components/BoxComponent.h"
-#include "Components/DynamicMeshComponent.h"
 #include "Components/SceneComponent.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "RenderGraphBuilder.h"
 #include "UDynamicMesh.h"
-#include "ComputeShaderDebugParams.h"
 #include "ComputeShaderMeshGenerator.generated.h"
 
 class AActor;
@@ -93,19 +91,6 @@ public:
 	// 生成 voxel 时使用的 cell size，后续转 mesh 时可作为默认面片大小。
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	float VoxelSize = 0.0f;
-
-	// 体素整数网格坐标，与 Positions 一一对应（-1 索引为无效）。
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
-	TArray<FIntVector> Cells;
-
-	// 面积加权质心（target position），与 Positions 一一对应。用于更精确的表面匹配。
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
-	TArray<FVector> TargetPositions;
-
-	// 体素网格的世界空间原点（与 Cells 坐标系对应）。
-	// Cell (cx, cy, cz) 的世界空间中心 = VoxelOrigin + (Cell + 0.5) * VoxelSize。
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
-	FVector VoxelOrigin = FVector::ZeroVector;
 };
 
 struct COMPUTESHADERGENERATOR_API FCSStaticMeshTriangleRDGOutput
@@ -163,30 +148,6 @@ struct COMPUTESHADERGENERATOR_API FCSSurfaceVoxelRDGOutput
 	FRDGBufferRef VoxelNormalCounts = nullptr;
 	FRDGBufferUAVRef VoxelNormalCountsUAV = nullptr;
 	FRDGBufferSRVRef VoxelNormalCountsSRV = nullptr;
-
-	// Ported from ResinRattan: target-position accumulation (clipped centroid)
-	FRDGBufferRef VoxelTargetPositions = nullptr;
-	FRDGBufferUAVRef VoxelTargetPositionsUAV = nullptr;
-	FRDGBufferSRVRef VoxelTargetPositionsSRV = nullptr;
-
-	FRDGBufferRef VoxelTargetOffsetSums = nullptr;
-	FRDGBufferUAVRef VoxelTargetOffsetSumsUAV = nullptr;
-
-	FRDGBufferRef VoxelTargetWeightSums = nullptr;
-	FRDGBufferUAVRef VoxelTargetWeightSumsUAV = nullptr;
-
-	// Integer grid cell per voxel, required for spatial blur neighbour lookup.
-	FRDGBufferRef VoxelCells = nullptr;
-	FRDGBufferUAVRef VoxelCellsUAV = nullptr;
-
-	// Blur output buffers (read when blur is enabled).
-	FRDGBufferRef BlurredVoxelNormals = nullptr;
-	FRDGBufferUAVRef BlurredVoxelNormalsUAV = nullptr;
-	FRDGBufferSRVRef BlurredVoxelNormalsSRV = nullptr;
-
-	FRDGBufferRef BlurredVoxelTargetPositions = nullptr;
-	FRDGBufferUAVRef BlurredVoxelTargetPositionsUAV = nullptr;
-	FRDGBufferSRVRef BlurredVoxelTargetPositionsSRV = nullptr;
 
 	uint32 MaxVoxels = 0;
 	uint32 HashSlotCount = 0;
@@ -262,15 +223,7 @@ struct COMPUTESHADERGENERATOR_API FCSMeshGeneratorSurfaceVoxelTextureDataHandle
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data")
 	TObjectPtr<UTextureRenderTarget2D> VoxelNormalRT = nullptr;
 
-	// One RGBA32f texel per sampled surface voxel. xyz = weighted surface target, w = 1.
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data")
-	TObjectPtr<UTextureRenderTarget2D> VoxelTargetRT = nullptr;
-
-	// One RGBA32f texel per sampled surface voxel. xyz = integer voxel cell encoded as floats, w = 0.
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data")
-	TObjectPtr<UTextureRenderTarget2D> VoxelCellRT = nullptr;
-
-	// Small metadata texture. Pixel 0 = counts/size, pixels 1-4 = origin/bounds/dimensions.
+	// Small metadata texture. Pixel 0 = counts/size, pixels 1-3 = origin/bounds/dimensions.
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data")
 	TObjectPtr<UTextureRenderTarget2D> VoxelMetaRT = nullptr;
 };
@@ -442,7 +395,7 @@ struct COMPUTESHADERGENERATOR_API FCSInstancePaintComponentSlot
 };
 
 UCLASS(Blueprintable)
-class COMPUTESHADERGENERATOR_API AComputeShaderMeshGenerator : public AActor
+class COMPUTESHADERGENERATOR_API AComputeShaderMeshGenerator : public ADynamicMeshActor
 {
 	GENERATED_BODY()
 
@@ -450,18 +403,12 @@ public:
 	/** Creates the generator actor, scene root, bounds component, and DynamicMesh rendering defaults. */
 	AComputeShaderMeshGenerator(const FObjectInitializer& ObjectInitializer);
 
-	/** Returns the DynamicMeshComponent owned by this actor. */
-	UDynamicMeshComponent* GetDynamicMeshComponent() const { return DynamicMeshComponent; }
-
 	// -------------------------------------------------------------------------
 	// Core System
 	// -------------------------------------------------------------------------
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator")
 	TObjectPtr<USceneComponent> SceneRoot;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator")
-	TObjectPtr<UDynamicMeshComponent> DynamicMeshComponent;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator")
 	TObjectPtr<UBoxComponent> GeneratorBounds;
@@ -483,6 +430,12 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
 	int32 MaxVoxels = 2000000;
 
+	// Per-triangle surface voxelization budget. This is intended to limit how many
+	// voxel cells one large triangle may scan when VoxelSize is small; MaxVoxels is
+	// the separate total output capacity.
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
+	int32 MaxVoxelCellsPerTriangle = 4096;
+
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "0.001"))
 	float QuadScale = 1.0f;
 
@@ -491,18 +444,6 @@ public:
 
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1.0"))
 	float DynamicMeshCullBoundsScale = 10.0f;
-
-	// -------------------------------------------------------------------------
-	// Surface Voxel Blur — ResinRattan port
-	// -------------------------------------------------------------------------
-
-	/** Number of 3D mean-filter iterations applied after voxelization. 0 = disabled. */
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "0"))
-	int32 SurfaceVoxelBlurIterations = 0;
-
-	/** Neighbourhood radius for the 3D mean filter. 1 = 3x3x3 Moore neighbourhood. */
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
-	int32 SurfaceVoxelBlurRadius = 1;
 
 	// -------------------------------------------------------------------------
 	// Dirty Cache System
@@ -533,11 +474,7 @@ public:
 
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data|Debug")
 	FCSSurfaceVoxelData LastSurfaceVoxelData;
-
-	/** Triangle surface data used by the CPU/BVH vine visualization path.
-	 *  Filled by GenerateVines(). */
-	FCSTriangleMeshData CachedSurfaceTriangles;
-
+	
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Mesh|Debug")
 	int64 GeneratorTimeCode = -1;
 
@@ -629,16 +566,13 @@ public:
 		const TCHAR* DebugName = TEXT("CS.StaticMeshTriangles"),
 		bool bNaniteOnlyFallbackMesh = true);
 
-	/** Adds RDG compute passes that voxelize extracted triangle surfaces into GPU voxel buffers.
-	 *  Includes centroid-based target positions and optional spatial blur pass. */
+	/** Adds RDG compute passes that voxelize extracted triangle surfaces into GPU voxel buffers. */
 	FCSSurfaceVoxelRDGOutput AddTriangleSurfaceVoxelsToRDG(
 		FRDGBuilder& GraphBuilder,
 		const FCSStaticMeshTriangleRDGOutput& TriangleOutput,
 		FVector VoxelOrigin,
 		float VoxelSize = 10.0f,
 		int32 HashSlotCount = 0,
-		int32 BlurIterations = 0,
-		int32 BlurRadius = 1,
 		const TCHAR* DebugName = TEXT("CS.SurfaceVoxels"));
 
 
@@ -715,33 +649,67 @@ public:
 	/** Draws debug direction lines and optional points from the last cached surface-voxel data. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug", meta = (DevelopmentOnly))
 	int32 DrawDebugLastSurfaceVoxelDirections(
-		const FCSDebugLastVoxelDirectionOptions& Options = FCSDebugLastVoxelDirectionOptions()) const;
+		float DirectionLength = 0.0f,
+		FLinearColor DirectionColor = FLinearColor::Blue,
+		float Duration = 5.0f,
+		float Thickness = 2.0f,
+		bool bPersistentLines = false,
+		bool bDrawPoints = true,
+		FLinearColor PointColor = FLinearColor::Yellow,
+		float PointSize = 8.0f,
+		int32 MaxDirectionsToDraw = 0) const;
 
 	/** Draws debug arrows and optional points from the last cached surface-voxel data. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug", meta = (DevelopmentOnly, DisplayName = "Draw Debug Last Surface Voxel Arrows"))
 	int32 DrawDebugLastSurfaceVoxelArrows(
-		const FCSDebugLastVoxelArrowOptions& Options = FCSDebugLastVoxelArrowOptions()) const;
+		float ArrowLength = 0.0f,
+		FLinearColor ArrowColor = FLinearColor::Blue,
+		float Duration = 5.0f,
+		float Thickness = 2.0f,
+		bool bPersistentLines = false,
+		bool bDrawPoints = true,
+		FLinearColor PointColor = FLinearColor::Yellow,
+		float PointSize = 8.0f,
+		int32 MaxArrowsToDraw = 0) const;
 
 	/** Regenerates bounded scene surface voxels and draws their normals as debug direction lines. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug", meta = (DevelopmentOnly))
 	int32 DrawDebugBoxSceneSurfaceVoxelDirections(
-		const FCSDebugBoxVoxelDirectionOptions& Options);
+		float VoxelSize = 10.0f,
+		float DirectionLength = 0.0f,
+		FLinearColor DirectionColor = FLinearColor::Blue,
+		float Duration = 5.0f,
+		float Thickness = 2.0f,
+		bool bPersistentLines = false,
+		bool bDrawPoints = true,
+		FLinearColor PointColor = FLinearColor::Yellow,
+		float PointSize = 8.0f,
+		int32 MaxDirectionsToDraw = 0);
 
 	/** Regenerates bounded scene surface voxels and draws their normals as debug arrows. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug", meta = (DevelopmentOnly, DisplayName = "Draw Debug Box Scene Surface Voxel Arrows"))
 	int32 DrawDebugBoxSceneSurfaceVoxelArrows(
-		const FCSDebugBoxVoxelArrowOptions& Options);
+		float VoxelSize = 10.0f,
+		float ArrowLength = 0.0f,
+		FLinearColor ArrowColor = FLinearColor::Blue,
+		float Duration = 5.0f,
+		float Thickness = 2.0f,
+		bool bPersistentLines = false,
+		bool bDrawPoints = true,
+		FLinearColor PointColor = FLinearColor::Yellow,
+		float PointSize = 8.0f,
+		int32 MaxArrowsToDraw = 0);
 
 	/** Draws active cache voxel cells, optionally limited to one request and including the cache bounds. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Triangle Cache|Debug", meta = (DevelopmentOnly))
 	int32 DrawDebugActiveVoxels(
-		const FCSDebugActiveVoxelOptions& Options = FCSDebugActiveVoxelOptions()) const;
-
-	/** Spawns a temporary ADynamicMeshActor at this actor's location,
-	 *  converts CachedSurfaceTriangles into a DynamicMesh,
-	 *  and destroys the actor after LifetimeSeconds. */
-	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Debug", meta = (DevelopmentOnly, DisplayName = "Spawn Debug Surface Triangles DynamicMesh Actor"))
-	void SpawnDebugSurfaceTrianglesDynamicMeshActor(float LifetimeSeconds = 10.0f);
+		FName RequestId = NAME_None,
+		FLinearColor DebugColor = FLinearColor::Green,
+		float Duration = 5.0f,
+		float Thickness = 2.0f,
+		bool bPersistentLines = false,
+		bool bDrawCacheBounds = true,
+		int32 MaxVoxelsToDraw = 0) const;
 
 	// -------------------------------------------------------------------------
 	// Core System - Dynamic Mesh Helpers
@@ -865,15 +833,8 @@ protected:
 	void InitializeFreePages();
 	/** Allocates UAV-capable render targets sized for cache metadata, triangle vertices, and triangle normals. */
 	void CreateCacheRenderTargets();
-	/** Shared GPU triangle readback path for generator-bounds queries. */
-	FCSTriangleMeshData ReadBoxSceneTrianglesFromGPUFilteredInternal(const FBox& QueryBox,
-		const TArray<FVector>& ReferencePointsForRender,
-		float ReferenceFilterDistance,
-		const TCHAR* LogPrefix,
-		const AActor* ExcludedActor,
-		FName ExcludedActorTagForResolve);
 	/** Stores CPU triangle data into generated-data texture targets and updates LastTriangleTextureData. */
-	void StoreTriangleTextureData(const FCSTriangleMeshData& TriangleData, float ReferenceFilterDistance, FBox SourceWorldBounds = FBox(ForceInit));
+	void StoreTriangleTextureData(const FCSTriangleMeshData& TriangleData, float ReferenceFilterDistance);
 	/** Stores CPU surface-voxel data into generated-data texture targets and updates LastSurfaceVoxelTextureData. */
 	void StoreSurfaceVoxelTextureData(const FCSSurfaceVoxelData& SurfaceVoxelData, FVector VoxelOrigin);
 	/** Releases triangle generated-data textures and invalidates the triangle data handle. */

@@ -38,6 +38,16 @@ public:
 	static UMaterialInstance* FindOrCreateMaterialInstanceAsset(FString AssetName, FString AssetPath, UMaterialInterface* Parent);
 	
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
+	static void GetDistanceToNearestSurface(UTextureRenderTarget2D* InDebugView);
+
+	UFUNCTION(BlueprintCallable, Category = "DistanceField", meta = (WorldContext = "WorldContextObject"))
+	static void SampleGlobalDistanceField(
+		UObject* WorldContextObject,
+		const TArray<FVector>& WorldPositions,
+		TArray<float>& OutDistances,
+		TArray<FVector>& OutGradients);
+
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	static void CreateDebugTexture(AActor* TargetActor, UTextureRenderTarget2D* InDebugView, FString DebugName);
 
 	/**

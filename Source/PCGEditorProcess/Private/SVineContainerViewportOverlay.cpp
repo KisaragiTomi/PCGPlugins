@@ -145,8 +145,9 @@ FText SVineContainerViewportOverlay::GetLineCountText() const
 	if (const AVineContainer* Container = VineContainer.Get())
 	{
 		return FText::Format(
-			LOCTEXT("LineCountFormat", "Tube {0}"),
-			FText::AsNumber(Container->TubeLines.Num()));
+			LOCTEXT("LineCountFormat", "Tube {0}   Plane {1}"),
+			FText::AsNumber(Container->TubeLines.Num()),
+			FText::AsNumber(Container->PlaneLines.Num()));
 	}
 
 	return FText::GetEmpty();

@@ -4,7 +4,14 @@
 #include "Components/PoseableMeshComponent.h"
 #include "ReferenceSkeleton.h"
 
-FGPUSkeletalTreeGenerateMeshRequest AGPUSkeletalTree::OnGenerateTreeEditorRequest;
+#if WITH_EDITOR
+#include "Animation/Skeleton.h"
+#include "MeshDescription.h"
+#include "SkeletalMeshAttributes.h"
+#include "Rendering/SkeletalMeshLODModel.h"
+#include "Rendering/SkeletalMeshModel.h"
+#include "Rendering/SkeletalMeshRenderData.h"
+#endif
 
 AGPUSkeletalTree::AGPUSkeletalTree()
 {
@@ -40,14 +47,9 @@ void AGPUSkeletalTree::BeginPlay()
 void AGPUSkeletalTree::GenerateTree()
 {
 #if WITH_EDITOR
-	if (OnGenerateTreeEditorRequest.IsBound())
-	{
-		OnGenerateTreeEditorRequest.Execute(this);
-		return;
-	}
+	BuildSkeleton();
+	BuildMesh();
 #endif
-
-	UE_LOG(LogTemp, Warning, TEXT("AGPUSkeletalTree::GenerateTree requires the PCGEditorProcess editor module. Assign SkeletalMeshOverride for runtime use."));
 }
 
 void AGPUSkeletalTree::ApplySkeletalMeshOverride()
@@ -65,19 +67,6 @@ void AGPUSkeletalTree::ApplySkeletalMesh(USkeletalMesh* Mesh)
 	TreeMeshComp->SetSkinnedAssetAndUpdate(Mesh);
 	GeneratedMesh = nullptr;
 	GeneratedSkeleton = nullptr;
-	BuildBoneHierarchyFromMesh(Mesh);
-}
-
-void AGPUSkeletalTree::SetGeneratedSkeletalMesh(USkeletalMesh* Mesh, USkeleton* Skeleton)
-{
-	if (!TreeMeshComp)
-	{
-		return;
-	}
-
-	GeneratedMesh = Mesh;
-	GeneratedSkeleton = Skeleton;
-	TreeMeshComp->SetSkinnedAssetAndUpdate(Mesh);
 	BuildBoneHierarchyFromMesh(Mesh);
 }
 
@@ -208,6 +197,156 @@ void AGPUSkeletalTree::AddCylinderSegment(
 
 void AGPUSkeletalTree::BuildMesh()
 {
+#if WITH_EDITOR
+	if (BoneHierarchy.Num() == 0) return;
+
+	GeneratedSkeleton = NewObject<USkeleton>(this, NAME_None, RF_Transient);
+
+	FReferenceSkeleton RefSkel;
+	{
+		FReferenceSkeletonModifier Modifier(RefSkel, nullptr);
+		for (int32 i = 0; i < BoneHierarchy.Num(); ++i)
+		{
+			const FBoneData& BD = BoneHierarchy[i];
+			FMeshBoneInfo Info(BD.Name, BD.Name.ToString(), BD.ParentIndex);
+			Modifier.Add(Info, BD.LocalTransform, i == 0);
+		}
+	}
+
+	{
+		FReferenceSkeletonModifier SkelMod(GeneratedSkeleton);
+		for (int32 i = 0; i < BoneHierarchy.Num(); ++i)
+		{
+			const FBoneData& BD = BoneHierarchy[i];
+			FMeshBoneInfo Info(BD.Name, BD.Name.ToString(), BD.ParentIndex);
+			SkelMod.Add(Info, BD.LocalTransform, i == 0);
+		}
+	}
+
+	TArray<FVector3f> AllVerts;
+	TArray<int32> AllIndices;
+	TArray<FVector3f> AllNormals;
+	TArray<FVector2f> AllUVs;
+	TArray<int32> AllBoneIdx;
+	TArray<float> AllBoneWeight;
+
+	TArray<FTransform> WorldBonePoses;
+	WorldBonePoses.SetNum(BoneHierarchy.Num());
+	for (int32 i = 0; i < BoneHierarchy.Num(); ++i)
+	{
+		if (BoneHierarchy[i].ParentIndex == INDEX_NONE)
+			WorldBonePoses[i] = BoneHierarchy[i].LocalTransform;
+		else
+			WorldBonePoses[i] = BoneHierarchy[i].LocalTransform * WorldBonePoses[BoneHierarchy[i].ParentIndex];
+	}
+
+	const FTreeBranchParams& P = TreeParams;
+	for (int32 i = 1; i < BoneHierarchy.Num(); ++i)
+	{
+		int32 ParentIdx = BoneHierarchy[i].ParentIndex;
+		FVector Start = WorldBonePoses[ParentIdx].GetLocation();
+		FVector End = WorldBonePoses[i].GetLocation();
+
+		bool bTrunk = BoneHierarchy[i].Name.ToString().StartsWith(TEXT("Trunk"));
+		float RadS, RadE;
+		if (bTrunk)
+		{
+			int32 TrunkOrdinal = i - 1;
+			int32 ParentOrdinal = ParentIdx == 0 ? 0 : ParentIdx - 1;
+			float T0 = float(ParentOrdinal) / P.TrunkSegments;
+			float T1 = float(TrunkOrdinal) / P.TrunkSegments;
+			RadS = FMath::Lerp(P.TrunkRadiusBase, P.TrunkRadiusTip, T0);
+			RadE = FMath::Lerp(P.TrunkRadiusBase, P.TrunkRadiusTip, T1);
+		}
+		else
+		{
+			RadS = P.BranchRadius;
+			RadE = P.BranchRadius * 0.4f;
+		}
+
+		AddCylinderSegment(AllVerts, AllIndices, AllNormals, AllUVs,
+			AllBoneIdx, AllBoneWeight,
+			Start, End, RadS, RadE, P.RadialSegments, ParentIdx, i);
+	}
+
+	GeneratedMesh = NewObject<USkeletalMesh>(this, NAME_None, RF_Transient);
+	GeneratedMesh->SetSkeleton(GeneratedSkeleton);
+	GeneratedMesh->SetRefSkeleton(RefSkel);
+
+	FMeshDescription MeshDesc;
+	FSkeletalMeshAttributes SkelAttrs(MeshDesc);
+	SkelAttrs.Register();
+
+	for (int32 i = 0; i < BoneHierarchy.Num(); ++i)
+	{
+		FBoneID BoneID = SkelAttrs.CreateBone();
+		SkelAttrs.GetBoneNames().Set(BoneID, BoneHierarchy[i].Name);
+		SkelAttrs.GetBoneParentIndices().Set(BoneID, BoneHierarchy[i].ParentIndex);
+		SkelAttrs.GetBonePoses().Set(BoneID, BoneHierarchy[i].LocalTransform);
+	}
+
+	TArray<FVertexID> VertexIDs;
+	VertexIDs.Reserve(AllVerts.Num());
+	auto VertexPositions = SkelAttrs.GetVertexPositions();
+	for (int32 v = 0; v < AllVerts.Num(); ++v)
+	{
+		FVertexID VID = MeshDesc.CreateVertex();
+		VertexPositions.Set(VID, AllVerts[v]);
+		VertexIDs.Add(VID);
+	}
+
+	FSkinWeightsVertexAttributesRef SkinWeights = SkelAttrs.GetVertexSkinWeights();
+	for (int32 v = 0; v < AllVerts.Num(); ++v)
+	{
+		UE::AnimationCore::FBoneWeights BW;
+		BW.SetBoneWeight(UE::AnimationCore::FBoneWeight(AllBoneIdx[v], AllBoneWeight[v]));
+		SkinWeights.Set(FVertexID(v), BW);
+	}
+
+	FPolygonGroupID PolyGroup = MeshDesc.CreatePolygonGroup();
+
+	auto VertInstanceNormals = SkelAttrs.GetVertexInstanceNormals();
+	auto VertInstanceUVs = SkelAttrs.GetVertexInstanceUVs();
+
+	for (int32 t = 0; t < AllIndices.Num(); t += 3)
+	{
+		TArray<FVertexInstanceID> TriVerts;
+		TriVerts.Reserve(3);
+
+		for (int32 c = 0; c < 3; ++c)
+		{
+			int32 Idx = AllIndices[t + c];
+			FVertexInstanceID VIID = MeshDesc.CreateVertexInstance(VertexIDs[Idx]);
+			VertInstanceNormals.Set(VIID, AllNormals[Idx]);
+			VertInstanceUVs.Set(VIID, 0, AllUVs[Idx]);
+			TriVerts.Add(VIID);
+		}
+
+		MeshDesc.CreatePolygon(PolyGroup, TriVerts);
+	}
+
+	FSkeletalMeshLODInfo& LODInfo = GeneratedMesh->AddLODInfo();
+	LODInfo.ReductionSettings.NumOfTrianglesPercentage = 1.0f;
+	LODInfo.ReductionSettings.NumOfVertPercentage = 1.0f;
+	LODInfo.LODHysteresis = 0.02f;
+	LODInfo.bAllowCPUAccess = true;
+
+	GeneratedMesh->GetImportedModel()->LODModels.Add(new FSkeletalMeshLODModel());
+	GeneratedMesh->CreateMeshDescription(0, MoveTemp(MeshDesc));
+
+	USkeletalMesh::FCommitMeshDescriptionParams CommitParams;
+	CommitParams.bMarkPackageDirty = false;
+	GeneratedMesh->CommitMeshDescription(0, CommitParams);
+
+	GeneratedMesh->CalculateInvRefMatrices();
+
+	FBoxSphereBounds Bounds(FBox(FVector(-100, -100, 0), FVector(100, 100, P.TrunkHeight)));
+	GeneratedMesh->SetImportedBounds(Bounds);
+
+	GeneratedMesh->Build();
+
+	TreeMeshComp->SetSkinnedAssetAndUpdate(GeneratedMesh);
+#endif
 }
 
 void AGPUSkeletalTree::Tick(float DeltaTime)

@@ -640,39 +640,3 @@ float3 CalNormal(Texture2D<float4> SceneDepth, uint3 DispatchThreadId, float Max
     // float2 Normal = float2::CrossProduct(DX, DY).GetSafeNormal();
 }
 
-
-// ===== Cubic B-Spline smooth curve =====
-// Uniform cubic B-Spline: the curve approximates the control points (does not pass through them), C2-continuous across segments.
-// A segment is defined by 4 adjacent control points P0..P3, with t in [0,1] falling between P1 and P2.
-
-float3 BSplinePosition(float3 P0, float3 P1, float3 P2, float3 P3, float t)
-{
-    float t2 = t * t;
-    float t3 = t2 * t;
-    float b0 = (-t3 + 3.0 * t2 - 3.0 * t + 1.0) / 6.0;
-    float b1 = (3.0 * t3 - 6.0 * t2 + 4.0) / 6.0;
-    float b2 = (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) / 6.0;
-    float b3 = t3 / 6.0;
-    return b0 * P0 + b1 * P1 + b2 * P2 + b3 * P3;
-}
-
-float3 BSplineTangent(float3 P0, float3 P1, float3 P2, float3 P3, float t)
-{
-    float t2 = t * t;
-    float d0 = (-3.0 * t2 + 6.0 * t - 3.0) / 6.0;
-    float d1 = (9.0 * t2 - 12.0 * t) / 6.0;
-    float d2 = (-9.0 * t2 + 6.0 * t + 3.0) / 6.0;
-    float d3 = (3.0 * t2) / 6.0;
-    return d0 * P0 + d1 * P1 + d2 * P2 + d3 * P3;
-}
-
-// Maps the global parameter a in [0,1] to a segment: NumCtrl control points form NumCtrl-1 segments.
-// Outputs SegIndex (the control-point index of P1 for that segment) and the local t within the segment.
-void BSplineMapGlobalAlpha(float a, int NumCtrl, out int SegIndex, out float LocalT)
-{
-    int NumSeg = max(NumCtrl - 1, 1);
-    float g = saturate(a) * NumSeg;
-    SegIndex = min((int) floor(g), NumSeg - 1);
-    LocalT = g - SegIndex;
-}
-

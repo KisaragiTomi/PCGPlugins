@@ -7,11 +7,30 @@
 #include "GeometryScript/GeometryScriptTypes.h"
 #include "LandscapeComponent.h"
 #include "UDynamicMesh.h"
-#include "ComputeShaderBasicFunction.h"
 #include "LandscapeExtra.generated.h"
 
 
 
+
+USTRUCT()
+struct GEOMETRYSCRIPTEXTRAEDITOR_API FReadLandscapeData
+{
+GENERATED_BODY()
+	TArray<FLinearColor> Colors;
+	TArray<FFloat16Color> Colors16;
+	TArray<FLinearColor> ValidColors;
+	FIntVector4 ReadRange = FIntVector4(0, 0, 0, 0);
+	FIntVector2 TextureSize = FIntVector2(0, 0);
+	FIntVector2 TextureValidSize = FIntVector2(0, 0);
+	FVector2f ValidUVRange = FVector2f::Zero();
+	FVector MapMin = FVector::ZeroVector;
+	FVector MapMax = FVector::ZeroVector;
+	FVector ValidMapMin = FVector::ZeroVector;
+	FVector ValidMapMax = FVector::ZeroVector;
+	FTransform Transform = FTransform::Identity;
+	FBoxSphereBounds ValidTextureBounds;
+	FBoxSphereBounds TextureBounds;
+};
 
 UCLASS()
 class GEOMETRYSCRIPTEXTRAEDITOR_API ULandscapeExtra : public UBlueprintFunctionLibrary
@@ -28,7 +47,7 @@ public:
 	static TArray<FLinearColor> GetLandscapeData(FVector Center, FVector Extent, int32 ExtentPlus = 1);
 	
 
-	static void CreateLandscapeTextureData(FCSReadLandscapeData& LandscapeData, FVector Center, FVector Extent, int32 ExtentPlus = 1);
+	static void CreateLandscapeTextureData(FReadLandscapeData& LandscapeData, FVector Center, FVector Extent, int32 ExtentPlus = 1);
 	                                                       
 
 

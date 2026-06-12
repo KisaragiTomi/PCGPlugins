@@ -32,14 +32,6 @@ RWTexture2D<float4> RW_VoxelMetaTexture;
 RWTexture2D<float4> RW_TriangleVertexTexture;
 RWTexture2D<float4> RW_TriangleNormalTexture;
 
-// --- Surface voxel target position / blur buffers (ported from ResinRattan) ---
-RWBuffer<float4> RW_OutVoxelTargetPositions;
-RWBuffer<int> RW_SurfaceVoxelTargetOffsetSums;
-RWBuffer<uint> RW_SurfaceVoxelTargetWeightSums;
-RWBuffer<uint4> RW_OutVoxelCells;
-RWBuffer<float4> RW_BlurredVoxelNormals;
-RWBuffer<float4> RW_BlurredVoxelTargetPositions;
-
 float4x4 LocalToWorld;
 float3 BoundsMin;
 float3 BoundsMax;
@@ -64,8 +56,8 @@ uint bUseBounds;
 uint bUseReferenceFilter;
 uint SurfaceVoxelCapacity;
 uint SurfaceVoxelHashSlotCount;
-// Blur neighbourhood radius for mean filter (0=disabled, 1=3x3x3)
-uint SurfaceVoxelBlurRadius;
+// Per-triangle safety budget for the surface voxel cell scan.
+uint MaxSurfaceVoxelCellsPerTriangle;
 uint DirtyVoxelCount;
 uint CacheGeneration;
 uint GridSizeX;
@@ -500,23 +492,8 @@ float3 ClosestPointOnTriangle(float3 P, float3 A, float3 B, float3 C)
 	return A + AB * V + AC * W;
 }
 
-float3 ResolveTriangleSoupNormal(float3 P0, float3 P1, float3 P2, float3 N0, float3 N1, float3 N2)
-{
-	float3 Normal = N0 + N1 + N2;
-	if (dot(Normal, Normal) <= 1.0e-8f || any(isnan(Normal)))
-	{
-		Normal = cross(P1 - P0, P2 - P0);
-	}
-	if (dot(Normal, Normal) <= 1.0e-8f || any(isnan(Normal)))
-	{
-		return float3(0.0f, 0.0f, 0.0f);
-	}
-	return normalize(Normal);
-}
-
 #define CS_CLIPPED_TRI_MAX_VERTICES 16
 #define CS_SURFACE_VOXEL_NORMAL_QUANTIZE 4096.0f
-#define CS_SURFACE_VOXEL_TARGET_QUANTIZE 4096.0f
 
 float GetAxisValue(float3 P, uint Axis)
 {
@@ -582,10 +559,8 @@ uint ClipPolygonWithAxisPlane(
 	return OutCount;
 }
 
-float ComputeTriangleVoxelIntersectionAreaCentroid(float3 P0, float3 P1, float3 P2, int3 Cell, float3 UnitNormal, float CellSize, out float3 ClippedCentroid)
+float ComputeTriangleVoxelIntersectionArea(float3 P0, float3 P1, float3 P2, int3 Cell, float3 UnitNormal, float CellSize)
 {
-	ClippedCentroid = float3(0.0f, 0.0f, 0.0f);
-
 	float3 BoxMin = SurfaceVoxelOrigin + float3(Cell) * CellSize;
 	float3 BoxMax = BoxMin + CellSize;
 
@@ -609,42 +584,19 @@ float ComputeTriangleVoxelIntersectionAreaCentroid(float3 P0, float3 P1, float3 
 	Count = ClipPolygonWithAxisPlane(PolyB, Count, PolyA, 2u, BoxMax.z, false);
 	if (Count < 3u) { return 0.0f; }
 
+	float3 AreaVector = float3(0.0f, 0.0f, 0.0f);
 	float3 Origin = PolyA[0];
-	float TotalArea = 0.0f;
-	float3 CentroidSum = float3(0.0f, 0.0f, 0.0f);
+	[loop]
 	for (uint VertexIndex = 1u; VertexIndex + 1u < CS_CLIPPED_TRI_MAX_VERTICES; ++VertexIndex)
 	{
 		if (VertexIndex + 1u >= Count)
 		{
 			break;
 		}
-
-		float3 A = Origin;
-		float3 B = PolyA[VertexIndex];
-		float3 C = PolyA[VertexIndex + 1u];
-		float Area = 0.5f * abs(dot(cross(B - A, C - A), UnitNormal));
-		if (Area <= 1.0e-12f || isnan(Area))
-		{
-			continue;
-		}
-
-		TotalArea += Area;
-		CentroidSum += ((A + B + C) / 3.0f) * Area;
+		AreaVector += cross(PolyA[VertexIndex] - Origin, PolyA[VertexIndex + 1u] - Origin);
 	}
 
-	if (TotalArea <= 1.0e-12f)
-	{
-		return 0.0f;
-	}
-
-	ClippedCentroid = CentroidSum / TotalArea;
-	return TotalArea;
-}
-
-float ComputeTriangleVoxelIntersectionArea(float3 P0, float3 P1, float3 P2, int3 Cell, float3 UnitNormal, float CellSize)
-{
-	float3 ClippedCentroid;
-	return ComputeTriangleVoxelIntersectionAreaCentroid(P0, P1, P2, Cell, UnitNormal, CellSize, ClippedCentroid);
+	return 0.5f * abs(dot(AreaVector, UnitNormal));
 }
 
 float ComputeSurfaceVoxelNormalWeight(float3 P0, float3 P1, float3 P2, int3 Cell, float3 UnitNormal, float CellSize)
@@ -677,38 +629,7 @@ void AccumulateSurfaceVoxelNormal(uint VoxelIndex, float3 Normal, float NormalWe
 	InterlockedAdd(RW_SurfaceVoxelNormalCounts[VoxelIndex], 1u);
 }
 
-void AccumulateSurfaceVoxelTarget(uint VoxelIndex, float3 TargetPosition, float TargetWeight)
-{
-	if (VoxelIndex >= SurfaceVoxelCapacity)
-	{
-		return;
-	}
-
-	if (TargetWeight <= 1.0e-8f || isnan(TargetWeight))
-	{
-		return;
-	}
-
-	float3 Center = RW_OutVoxelPositions[VoxelIndex].xyz;
-	float3 Offset = TargetPosition - Center;
-	float MaxTargetDistance = max(SurfaceVoxelSize * 2.0f, 1.0e-4f);
-	if (any(isnan(TargetPosition)) || dot(Offset, Offset) > MaxTargetDistance * MaxTargetDistance)
-	{
-		return;
-	}
-
-	float SafeWeight = clamp(TargetWeight, 0.0f, 65536.0f);
-	int3 QuantizedOffset = int3(round(clamp(Offset * SafeWeight, -32768.0f, 32768.0f) * CS_SURFACE_VOXEL_TARGET_QUANTIZE));
-	uint QuantizedWeight = max(1u, uint(round(SafeWeight * CS_SURFACE_VOXEL_TARGET_QUANTIZE)));
-	uint Base = VoxelIndex * 4u;
-
-	InterlockedAdd(RW_SurfaceVoxelTargetOffsetSums[Base + 0u], QuantizedOffset.x);
-	InterlockedAdd(RW_SurfaceVoxelTargetOffsetSums[Base + 1u], QuantizedOffset.y);
-	InterlockedAdd(RW_SurfaceVoxelTargetOffsetSums[Base + 2u], QuantizedOffset.z);
-	InterlockedAdd(RW_SurfaceVoxelTargetWeightSums[VoxelIndex], QuantizedWeight);
-}
-
-void AppendSurfaceVoxel(int3 Cell, float3 Normal, float3 TargetPosition, float NormalWeight)
+void AppendSurfaceVoxel(int3 Cell, float3 Normal, float NormalWeight)
 {
 	if (SurfaceVoxelCapacity == 0u || SurfaceVoxelHashSlotCount == 0u || NormalWeight <= 1.0e-8f || isnan(NormalWeight))
 	{
@@ -735,42 +656,22 @@ void AppendSurfaceVoxel(int3 Cell, float3 Normal, float3 TargetPosition, float N
 		}
 		if (PreviousValue == Key)
 		{
-			uint PackedVoxelIndex = 0u;
 			[unroll]
 			for (uint WaitIndex = 0u; WaitIndex < 16u; ++WaitIndex)
 			{
-				PackedVoxelIndex = RW_SurfaceVoxelHashIndices[Slot];
+				uint PackedVoxelIndex = RW_SurfaceVoxelHashIndices[Slot];
 				if (PackedVoxelIndex != 0u)
 				{
-					break;
-				}
-			}
-
-			if (PackedVoxelIndex == 0u)
-			{
-				uint PrevDropped = 0u;
-				InterlockedAdd(RW_SurfaceVoxelCounter[1], 1u, PrevDropped);
-				return;
-			}
-
-			uint VoxelIndex = PackedVoxelIndex - 1u;
-			if (VoxelIndex < SurfaceVoxelCapacity)
-			{
-				int3 StoredCell = asint(RW_OutVoxelCells[VoxelIndex].xyz);
-				if (all(StoredCell == Cell))
-				{
-					AccumulateSurfaceVoxelNormal(VoxelIndex, Normal, NormalWeight);
-					AccumulateSurfaceVoxelTarget(VoxelIndex, TargetPosition, NormalWeight);
+					AccumulateSurfaceVoxelNormal(PackedVoxelIndex - 1u, Normal, NormalWeight);
 					return;
 				}
 			}
+			return;
 		}
 	}
 
 	if (!bClaimedSlot)
 	{
-		uint PrevDroppedHash = 0u;
-		InterlockedAdd(RW_SurfaceVoxelCounter[1], 1u, PrevDroppedHash);
 		return;
 	}
 
@@ -780,8 +681,6 @@ void AppendSurfaceVoxel(int3 Cell, float3 Normal, float3 TargetPosition, float N
 		uint CurrentVoxelCount = RW_SurfaceVoxelCounter[0];
 		if (CurrentVoxelCount >= SurfaceVoxelCapacity)
 		{
-			uint PrevDroppedCap = 0u;
-			InterlockedAdd(RW_SurfaceVoxelCounter[1], 1u, PrevDroppedCap);
 			return;
 		}
 
@@ -797,63 +696,8 @@ void AppendSurfaceVoxel(int3 Cell, float3 Normal, float3 TargetPosition, float N
 	float3 Center = SurfaceVoxelOrigin + (float3(Cell) + 0.5f) * max(SurfaceVoxelSize, 1.0e-4f);
 	RW_OutVoxelPositions[OutIndex] = float4(Center, 1.0f);
 	RW_OutVoxelNormals[OutIndex] = float4(Normal, 0.0f);
-	RW_OutVoxelTargetPositions[OutIndex] = float4(Center, 1.0f);
-	RW_OutVoxelCells[OutIndex] = asuint(int4(Cell, 0));
-
-	DeviceMemoryBarrier();
-	uint PreviousPackedVoxelIndex = 0u;
-	InterlockedExchange(RW_SurfaceVoxelHashIndices[ClaimedSlot], OutIndex + 1u, PreviousPackedVoxelIndex);
-
+	RW_SurfaceVoxelHashIndices[ClaimedSlot] = OutIndex + 1u;
 	AccumulateSurfaceVoxelNormal(OutIndex, Normal, NormalWeight);
-	AccumulateSurfaceVoxelTarget(OutIndex, TargetPosition, NormalWeight);
-}
-
-#define INVALID_VOXEL_INDEX 0xffffffffu
-
-uint FindVoxelIndexForCell(int3 Cell)
-{
-	if (SurfaceVoxelHashSlotCount == 0u)
-	{
-		return INVALID_VOXEL_INDEX;
-	}
-
-	uint Hash = HashCell(Cell);
-	uint Key = Hash + 1u;
-	Key = Key == 0u ? 1u : Key;
-
-	for (uint ProbeIndex = 0u; ProbeIndex < 8u; ++ProbeIndex)
-	{
-		uint Slot = (Hash + ProbeIndex * 1103515245u) % SurfaceVoxelHashSlotCount;
-		uint StoredKey = RW_SurfaceVoxelHashSlots[Slot];
-		if (StoredKey == 0u)
-		{
-			return INVALID_VOXEL_INDEX;
-		}
-		if (StoredKey != Key)
-		{
-			continue;
-		}
-
-		uint PackedVoxelIndex = RW_SurfaceVoxelHashIndices[Slot];
-		if (PackedVoxelIndex == 0u)
-		{
-			continue;
-		}
-
-		uint VoxelIndex = PackedVoxelIndex - 1u;
-		if (VoxelIndex >= SurfaceVoxelCapacity)
-		{
-			continue;
-		}
-
-		int3 StoredCell = asint(RW_OutVoxelCells[VoxelIndex].xyz);
-		if (all(StoredCell == Cell))
-		{
-			return VoxelIndex;
-		}
-	}
-
-	return INVALID_VOXEL_INDEX;
 }
 
 int3 SurfacePointToVoxelCell(float3 Point, float3 Normal)
@@ -880,17 +724,16 @@ void TriangleSurfaceVoxelsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	float3 P1 = TriangleVertices[VertexBase + 1u].xyz;
 	float3 P2 = TriangleVertices[VertexBase + 2u].xyz;
 
-	float3 N = ResolveTriangleSoupNormal(
-		P0,
-		P1,
-		P2,
-		TriangleNormals[VertexBase + 0u].xyz,
-		TriangleNormals[VertexBase + 1u].xyz,
-		TriangleNormals[VertexBase + 2u].xyz);
+	float3 N = TriangleNormals[VertexBase + 0u].xyz + TriangleNormals[VertexBase + 1u].xyz + TriangleNormals[VertexBase + 2u].xyz;
+	if (dot(N, N) <= 1.0e-8f || any(isnan(N)))
+	{
+		N = cross(P1 - P0, P2 - P0);
+	}
 	if (dot(N, N) <= 1.0e-8f || any(isnan(N)))
 	{
 		return;
 	}
+	N = normalize(N);
 
 	float CellSize = max(SurfaceVoxelSize, 1.0e-4f);
 	float BoundaryBias = CellSize * 1.0e-4f;
@@ -925,13 +768,10 @@ void TriangleSurfaceVoxelsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		uint LocalY = LocalRem / SpanX;
 		uint LocalX = LocalRem - LocalY * SpanX;
 		int3 Cell = MinCell + int3((int)LocalX, (int)LocalY, (int)LocalZ);
-
-		float3 TargetPosition;
-		float IntersectionArea = ComputeTriangleVoxelIntersectionAreaCentroid(VoxelP0, VoxelP1, VoxelP2, Cell, N, CellSize, TargetPosition);
-		float NormalWeight = IntersectionArea / max(CellSize * CellSize, 1.0e-8f);
+		float NormalWeight = ComputeSurfaceVoxelNormalWeight(VoxelP0, VoxelP1, VoxelP2, Cell, N, CellSize);
 		if (NormalWeight > 1.0e-8f)
 		{
-			AppendSurfaceVoxel(Cell, N, TargetPosition, NormalWeight);
+			AppendSurfaceVoxel(Cell, N, NormalWeight);
 		}
 	}
 }
@@ -946,43 +786,28 @@ void FinalizeSurfaceVoxelNormalsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	}
 
 	uint NormalCount = SurfaceVoxelNormalCounts[VoxelIndex];
-	float3 Dir = float3(0.0f, 0.0f, 1.0f);
-	if (NormalCount > 0u)
+	if (NormalCount == 0u)
 	{
-		uint NormalBase = VoxelIndex * 4u;
-		float3 NormalSum = float3(
-			(float)SurfaceVoxelNormalSums[NormalBase + 0u],
-			(float)SurfaceVoxelNormalSums[NormalBase + 1u],
-			(float)SurfaceVoxelNormalSums[NormalBase + 2u]);
-		if (dot(NormalSum, NormalSum) > 1.0e-8f && !any(isnan(NormalSum)))
-		{
-			Dir = normalize(NormalSum);
-		}
+		return;
 	}
 
-	float3 VoxelCenter = RW_OutVoxelPositions[VoxelIndex].xyz;
-	float3 TargetPosition = VoxelCenter;
-	uint TargetWeightSum = RW_SurfaceVoxelTargetWeightSums[VoxelIndex];
-	if (TargetWeightSum > 0u)
+	uint NormalBase = VoxelIndex * 4u;
+	float3 NormalSum = float3(
+		(float)SurfaceVoxelNormalSums[NormalBase + 0u],
+		(float)SurfaceVoxelNormalSums[NormalBase + 1u],
+		(float)SurfaceVoxelNormalSums[NormalBase + 2u]);
+
+	float3 BlendedNormal = NormalSum;
+	if (dot(BlendedNormal, BlendedNormal) <= 1.0e-8f || any(isnan(BlendedNormal)))
 	{
-		uint TargetBase = VoxelIndex * 4u;
-		float3 OffsetSum = float3(
-			(float)RW_SurfaceVoxelTargetOffsetSums[TargetBase + 0u],
-			(float)RW_SurfaceVoxelTargetOffsetSums[TargetBase + 1u],
-			(float)RW_SurfaceVoxelTargetOffsetSums[TargetBase + 2u]);
-		float3 AverageOffset = OffsetSum / float(TargetWeightSum);
-		TargetPosition += AverageOffset;
+		BlendedNormal = RW_OutVoxelNormals[VoxelIndex].xyz;
+	}
+	if (dot(BlendedNormal, BlendedNormal) <= 1.0e-8f || any(isnan(BlendedNormal)))
+	{
+		BlendedNormal = float3(0.0f, 0.0f, 1.0f);
 	}
 
-	float3 TargetOffset = TargetPosition - VoxelCenter;
-	float MaxTargetDistance = max(SurfaceVoxelSize * 2.0f, 1.0e-4f);
-	if (any(isnan(TargetPosition)) || dot(TargetOffset, TargetOffset) > MaxTargetDistance * MaxTargetDistance)
-	{
-		TargetPosition = VoxelCenter;
-	}
-
-	RW_OutVoxelNormals[VoxelIndex] = float4(Dir, 0.0f);
-	RW_OutVoxelTargetPositions[VoxelIndex] = float4(TargetPosition, 1.0f);
+	RW_OutVoxelNormals[VoxelIndex] = float4(normalize(BlendedNormal), 0.0f);
 }
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
@@ -1066,17 +891,16 @@ void ScatterTrianglesToVoxelCacheCS(uint3 DispatchThreadId : SV_DispatchThreadID
 			continue;
 		}
 
-		float3 Normal = ResolveTriangleSoupNormal(
-			P0,
-			P1,
-			P2,
-			TriangleNormals[VertexBase + 0u].xyz,
-			TriangleNormals[VertexBase + 1u].xyz,
-			TriangleNormals[VertexBase + 2u].xyz);
+		float3 Normal = TriangleNormals[VertexBase + 0u].xyz + TriangleNormals[VertexBase + 1u].xyz + TriangleNormals[VertexBase + 2u].xyz;
+		if (dot(Normal, Normal) <= 1.0e-8f || any(isnan(Normal)))
+		{
+			Normal = cross(P1 - P0, P2 - P0);
+		}
 		if (dot(Normal, Normal) <= 1.0e-8f || any(isnan(Normal)))
 		{
 			continue;
 		}
+		Normal = normalize(Normal);
 
 		if (WrittenCount >= MaxTrianglesPerVoxel)
 		{
@@ -1112,70 +936,4 @@ void ScatterTrianglesToVoxelCacheCS(uint3 DispatchThreadId : SV_DispatchThreadID
 	}
 
 	RW_VoxelMetaTexture[MetaCoord] = float4(1.0f, (float)CacheGeneration, (float)TriStart, bOverflow ? -(float)WrittenCount : (float)WrittenCount);
-}
-
-// =============================================================================
-// Surface voxel spatial blur — ported from ResinRattan surface_voxel.comp
-// 3D mean filter over a Moore neighbourhood.
-// =============================================================================
-
-[numthreads(THREADGROUPSIZE_X, 1, 1)]
-void BlurSurfaceVoxelsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
-{
-	uint VoxelIndex = DispatchThreadId.x;
-	uint VoxelCount = min(RW_SurfaceVoxelCounter[0], SurfaceVoxelCapacity);
-	if (VoxelIndex >= VoxelCount)
-	{
-		return;
-	}
-
-	uint Radius = max(SurfaceVoxelBlurRadius, 1u);
-	int3 CenterCell = asint(RW_OutVoxelCells[VoxelIndex].xyz);
-
-	float3 TargetSum = float3(0.0f, 0.0f, 0.0f);
-	float3 DirSum = float3(0.0f, 0.0f, 0.0f);
-	uint SampleCount = 0u;
-
-	int R = (int)Radius;
-	for (int dZ = -R; dZ <= R; ++dZ)
-	{
-		for (int dY = -R; dY <= R; ++dY)
-		{
-			for (int dX = -R; dX <= R; ++dX)
-			{
-				int3 NeighborCell = CenterCell + int3(dX, dY, dZ);
-				uint NeighborIndex = FindVoxelIndexForCell(NeighborCell);
-				if (NeighborIndex == INVALID_VOXEL_INDEX || NeighborIndex >= VoxelCount)
-				{
-					continue;
-				}
-
-				float3 NeighborTarget = RW_OutVoxelTargetPositions[NeighborIndex].xyz;
-				float3 NeighborDir = RW_OutVoxelNormals[NeighborIndex].xyz;
-				if (any(isnan(NeighborTarget)) || any(isnan(NeighborDir)))
-				{
-					continue;
-				}
-
-				TargetSum += NeighborTarget;
-				if (dot(NeighborDir, NeighborDir) > 1.0e-8f)
-				{
-					DirSum += normalize(NeighborDir);
-				}
-				SampleCount += 1u;
-			}
-		}
-	}
-
-	if (SampleCount == 0u)
-	{
-		RW_BlurredVoxelTargetPositions[VoxelIndex] = RW_OutVoxelTargetPositions[VoxelIndex];
-		RW_BlurredVoxelNormals[VoxelIndex] = RW_OutVoxelNormals[VoxelIndex];
-		return;
-	}
-
-	float3 BlurredTarget = TargetSum / float(SampleCount);
-	float3 BlurredDir = dot(DirSum, DirSum) > 1.0e-8f ? normalize(DirSum) : RW_OutVoxelNormals[VoxelIndex].xyz;
-	RW_BlurredVoxelTargetPositions[VoxelIndex] = float4(BlurredTarget, 1.0f);
-	RW_BlurredVoxelNormals[VoxelIndex] = float4(normalize(BlurredDir), 0.0f);
 }

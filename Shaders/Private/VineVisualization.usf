@@ -5,19 +5,13 @@
 #endif
 
 StructuredBuffer<float4> PathPoints;
-StructuredBuffer<float4> PathPointAxes;
 StructuredBuffer<int4> PathPointMeta;
 StructuredBuffer<float> PathPointCurveU;
-StructuredBuffer<float4> PathPointTangents;
-StructuredBuffer<float4> PathPointNormals;
 StructuredBuffer<float4> MeshTriangleVertices;
 StructuredBuffer<int4> SegmentMeta;
 StructuredBuffer<uint> GridCellOffsets;
 StructuredBuffer<uint> GridTriangleIndices;
-RWStructuredBuffer<float4> RW_PathPointTangents;
-RWStructuredBuffer<float4> RW_PathPointNormals;
 RWStructuredBuffer<float4> RW_OutVertices;
-RWStructuredBuffer<float2> RW_OutUVs;
 RWStructuredBuffer<uint> RW_OutIndices;
 
 uint PathPointCount;
@@ -27,6 +21,7 @@ uint OutputVertexCount;
 uint OutputIndexCount;
 uint ProfileCount;
 uint bTube;
+float VinesOffset;
 float CircleScale;
 float LineScale;
 
@@ -252,80 +247,6 @@ void FindClosestMeshPoint(float3 Query, out float3 OutPosition, out float3 OutNo
     }
 }
 
-uint GetLinePointIndex(uint PointIndex, int Offset)
-{
-    int4 Meta = PathPointMeta[PointIndex];
-    int BaseIndex = max(Meta.z, 0);
-    int PointCount = max(Meta.w, 1);
-    int LastIndex = min(BaseIndex + PointCount - 1, int(PathPointCount) - 1);
-    return (uint)min(max(int(PointIndex) + Offset, BaseIndex), LastIndex);
-}
-
-float3 GetFallbackFrameNormal(float3 Tangent)
-{
-    float3 Up = abs(Tangent.z) < 0.9f ? float3(0.0f, 0.0f, 1.0f) : float3(0.0f, 1.0f, 0.0f);
-    return SafeNormalize3(Up - Tangent * dot(Up, Tangent), float3(0.0f, 1.0f, 0.0f));
-}
-
-float3 OrientAxisToReference(float3 Axis, float3 Reference)
-{
-    return dot(Axis, Reference) < 0.0f ? -Axis : Axis;
-}
-
-void BuildRawVineFrame(uint PointIndex, out float3 OutTangent, out float3 OutNormal)
-{
-    uint PrevIndex = GetLinePointIndex(PointIndex, -1);
-    uint NextIndex = GetLinePointIndex(PointIndex, 1);
-    float3 PrevPos = PathPoints[PrevIndex].xyz;
-    float3 NextPos = PathPoints[NextIndex].xyz;
-    float3 RawTangent = SafeNormalize3(NextPos - PrevPos, float3(1.0f, 0.0f, 0.0f));
-    float3 SmoothedAxis = PathPointAxes[PointIndex].xyz;
-    OutTangent = dot(SmoothedAxis, SmoothedAxis) > 1.0e-8f
-        ? OrientAxisToReference(SafeNormalize3(SmoothedAxis, RawTangent), RawTangent)
-        : RawTangent;
-
-    float3 Projected;
-    float3 SampledNormal;
-    FindClosestMeshPoint(PathPoints[PointIndex].xyz, Projected, SampledNormal);
-    SampledNormal = SafeNormalize3(SampledNormal, GetFallbackFrameNormal(OutTangent));
-    OutNormal = SafeNormalize3(SampledNormal - OutTangent * dot(SampledNormal, OutTangent), GetFallbackFrameNormal(OutTangent));
-}
-
-float3 BuildFrameNormalFromTangent(float3 Tangent, float3 Normal)
-{
-    float3 FallbackNormal = GetFallbackFrameNormal(Tangent);
-    return SafeNormalize3(Normal - Tangent * dot(Normal, Tangent), FallbackNormal);
-}
-
-void BuildOrthonormalFrame(float3 Tangent, float3 Normal, out float3 OutTangent, out float3 OutNormal, out float3 OutBinormal)
-{
-    OutTangent = SafeNormalize3(Tangent, float3(1.0f, 0.0f, 0.0f));
-    OutNormal = BuildFrameNormalFromTangent(OutTangent, Normal);
-    OutBinormal = cross(OutNormal, OutTangent);
-    if (dot(OutBinormal, OutBinormal) <= 1.0e-8f)
-    {
-        OutBinormal = cross(GetFallbackFrameNormal(OutTangent), OutTangent);
-    }
-    OutBinormal = SafeNormalize3(OutBinormal, float3(0.0f, 1.0f, 0.0f));
-    OutNormal = SafeNormalize3(cross(OutTangent, OutBinormal), OutNormal);
-}
-
-[numthreads(THREADGROUPSIZE_X, 1, 1)]
-void BuildVVAxesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
-{
-    uint PointIndex = DispatchThreadId.x;
-    if (PointIndex >= PathPointCount)
-    {
-        return;
-    }
-
-    float3 Tangent;
-    float3 Normal;
-    BuildRawVineFrame(PointIndex, Tangent, Normal);
-    RW_PathPointTangents[PointIndex] = float4(Tangent, 0.0f);
-    RW_PathPointNormals[PointIndex] = float4(Normal, 0.0f);
-}
-
 float2 GetProfilePoint(uint ProfileIndex)
 {
     if (bTube != 0u)
@@ -345,7 +266,7 @@ float2 GetProfilePoint(uint ProfileIndex)
 }
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
-void BuildVVMeshCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+void BuildVineVisualizationMeshCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
     uint Index = DispatchThreadId.x;
 
@@ -380,20 +301,29 @@ void BuildVVMeshCS(uint3 DispatchThreadId : SV_DispatchThreadID)
             float Scale = PackedPoint.w;
             float3 PrevPos = PathPoints[PrevIndex].xyz;
             float3 NextPos = PathPoints[NextIndex].xyz;
-            float3 FallbackTangent = SafeNormalize3(NextPos - PrevPos, float3(1.0f, 0.0f, 0.0f));
-            float3 Tangent = SafeNormalize3(PathPointTangents[PointIndex].xyz, FallbackTangent);
-            float3 Normal = SafeNormalize3(PathPointNormals[PointIndex].xyz, GetFallbackFrameNormal(Tangent));
-            float3 FrameTangent;
-            float3 FrameNormal;
-            float3 Binormal;
-            BuildOrthonormalFrame(Tangent, Normal, FrameTangent, FrameNormal, Binormal);
+            float3 Tangent = SafeNormalize3(NextPos - PrevPos, float3(1.0f, 0.0f, 0.0f));
+
+            float3 Projected;
+            float3 Normal;
+            FindClosestMeshPoint(Query, Projected, Normal);
+            Normal = SafeNormalize3(Normal, float3(0.0f, 0.0f, 1.0f));
+
+            float3 Binormal = cross(Normal, Tangent);
+            if (dot(Binormal, Binormal) <= 1.0e-8f)
+            {
+                Binormal = cross(float3(0.0f, 0.0f, 1.0f), Tangent);
+            }
+            Binormal = SafeNormalize3(Binormal, float3(0.0f, 1.0f, 0.0f));
+            float3 FrameNormal = SafeNormalize3(cross(Tangent, Binormal), Normal);
 
             float2 Profile = GetProfilePoint(ProfileIndex) * Scale;
-            float3 Center = Query;
+            float3 Center = Projected + Normal * VinesOffset;
             float3 OutPosition = Center + Binormal * Profile.x + FrameNormal * Profile.y;
 
-            RW_OutVertices[Index] = float4(OutPosition, 1.0f);
-            RW_OutUVs[Index] = float2(U, V);
+            // Pack UV into output: xyz = position, w = encoded UV (U in upper 16 bits, V in lower 16 bits)
+            // Use asfloat/asuint to pack two half-precision values
+            uint PackedUV = (f32tof16(U) << 16u) | f32tof16(V);
+            RW_OutVertices[Index] = float4(OutPosition, asfloat(PackedUV));
         }
     }
 

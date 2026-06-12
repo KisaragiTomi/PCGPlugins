@@ -65,7 +65,6 @@ float  SeaLevel;
 float  ActorLocationZ;
 float  AdvectFoam;
 float  FoamFadeSpeed;
-float  MaxWaterRisePerFrame;
 float2 CopyValidUV;
 SamplerState Sampler;
 
@@ -584,13 +583,6 @@ void CalShallowWaterResult_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId
 	DepthWet.z = WetAvg;
 	DepthWet.x = WaterMax;
 	DepthWet.w = (ValidCount / Count - .49) * 2;
-
-	// Limit the water surface to rise at most MaxWaterRisePerFrame (cm) per frame.
-	// RW_ResultVelHeight still holds the previous frame's result here (copied in before iteration).
-	// MaxWaterRisePerFrame is set very large by non-solver passes (e.g. SetHeight) to disable the clamp.
-	float PrevResultHeight = RW_ResultVelHeight[DispatchThreadId.xy].z;
-	if (PrevResultHeight > -9000.0)
-		ResultHeight = min(ResultHeight, PrevResultHeight + MaxWaterRisePerFrame);
 
 	RW_ResultDepthWet[DispatchThreadId.xy]     = DepthWet;
 	RW_ResultVelHeight[DispatchThreadId.xy]    = float4(VelHeightFoam.xy, ResultHeight, ResultForm);

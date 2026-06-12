@@ -3,3 +3,4 @@ Config/*
 !Config/DefaultPCGPlugins.ini
 Intermediate/
 ThirdParty/
+backup/

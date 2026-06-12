@@ -3,10 +3,13 @@
 #include "CoreMinimal.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "ComputeShaderMeshFill.h"
-#include "ComputeShaderBasicFunction.h"
 #include "ComputeShaderSceneCapture.h"
 #include "ComputeShaderShallowWater.h"
-#include "CSLandscapeEditLayerBase.h"
+#include "LandscapeEditLayerRenderer.h"
+#include "LandscapeEditLayerRendererState.h"
+#include "LandscapeEditLayerTargetTypeState.h"
+#include "LandscapeEditLayerTypes.h"
+#include "LandscapeEditTypes.h"
 #include "LandscapeExtra.h"
 #include "Components/BoxComponent.h"
 //
@@ -17,7 +20,10 @@ class USplineComponent;
 class ALandscape;
 
 UCLASS()
-class PCGEDITORPROCESS_API ACSLandscape : public ACSLandscapeEditLayerBase
+class PCGEDITORPROCESS_API ACSLandscape : public AActor
+#if CPP && WITH_EDITOR
+	, public ILandscapeEditLayerRenderer
+#endif
 {
 GENERATED_BODY()
 public:
@@ -38,9 +44,9 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LandscapeData")
 	UBoxComponent* Box;
 
-	FCSReadLandscapeData Orig_LandscapeData;
+	FReadLandscapeData Orig_LandscapeData;
 
-	FCSReadLandscapeData Copy_LandscapeData;
+	FReadLandscapeData Copy_LandscapeData;
 
 	FVector BoxMin = FVector::ZeroVector;
 	FVector BoxMax = FVector::ZeroVector;
@@ -101,8 +107,26 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader|Debug")
 	void DebugExportRT(UTextureRenderTarget2D* InRT, const FString& AssetName = TEXT("RT_Debug"));
 
+	/** Request the owning Landscape to re-merge all edit layers. */
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
+	void RequestLandscapeUpdate(bool bInUserTriggered = false);
+
 #if WITH_EDITOR
-	// --- ILandscapeEditLayerRenderer interface (only the per-subclass parts) ---
+	// --- ILandscapeEditLayerRenderer interface ---
+	virtual FString GetEditLayerRendererDebugName() const override;
+
+	virtual void GetRendererStateInfo(
+		const UE::Landscape::EditLayers::FMergeContext* InMergeContext,
+		UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutSupportedTargetTypeState,
+		UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutEnabledTargetTypeState,
+		TArray<UE::Landscape::EditLayers::FTargetLayerGroup>& OutTargetLayerGroups) const override;
+
+	virtual TArray<UE::Landscape::EditLayers::FEditLayerRenderItem> GetRenderItems(
+		const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const override;
+
+	virtual UE::Landscape::EditLayers::ERenderFlags GetRenderFlags(
+		const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const override;
+
 	virtual bool RenderLayer(
 		UE::Landscape::EditLayers::FRenderParams& RenderParams,
 		UE::Landscape::FRDGBuilderRecorder& RDGBuilderRecorder) override;
@@ -111,12 +135,26 @@ public:
 #endif
 
 protected:
+	bool bHasResult = false;
+
+	/** GUID of the Edit Layer this actor owns on the Landscape. */
+	UPROPERTY()
+	FGuid OwnedEditLayerGuid;
+
 	/** Persistent copy of RT_Result, serialized with the actor so data survives level save/load. */
 	UPROPERTY()
 	UTexture2D* PersistentResult = nullptr;
 
-	/** Only contribute to heightmap merge when enabled by the user. */
-	virtual bool ShouldSupportHeightmap() const override { return bAffectHeightmap; }
+	friend class UCSLandscapeEditLayer;
+
+	/** Find the first ALandscape in the world. */
+	ALandscape* FindLandscape() const;
+
+	/** Ensure our Edit Layer exists on the Landscape; create if missing. */
+	void EnsureEditLayer();
+
+	/** Remove our Edit Layer from the Landscape. */
+	void RemoveEditLayer();
 
 	/** Blend CS result into the Merge pipeline's scratch RT (called from RenderLayer). */
 	void ApplyResultToCombined(UTextureRenderTarget2D* InCombinedResult, UTextureRenderTarget2D* OutResult, const FIntPoint& Size);
@@ -129,6 +167,9 @@ protected:
 
 public:
 	virtual void PostLoad() override;
+	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void Destroyed() override;
 };
 
 

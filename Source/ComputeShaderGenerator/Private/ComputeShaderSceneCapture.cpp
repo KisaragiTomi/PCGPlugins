@@ -182,7 +182,7 @@ bool ACSGenerateCaptureScene::CreateLandscapeMesh()
 ;
 	// FVector Center = Box->Bounds.Origin;
 	// FVector Extent = Box->Bounds.BoxExtent;
-	// if (PreCenter == Center && PreExtent == Extent && Mesh->GetTriangleCount() > 0) return false;
+	// if(PreCenter == Center && PreExtent == Extent && Mesh->GetTriangleCount() > 0) return false;
 	//
 	// PreCenter = Center;
 	// PreExtent = Extent;

@@ -109,6 +109,12 @@ public:
 		return Acc;
 	}
 
+	template<typename T, typename R>
+	static R Reduce(const TArray<T>& Input, TFunctionRef<R(R, T)> Lambda, R Init)
+	{
+		return Reduce<T, R>(TArrayView<const T>(Input), Lambda, MoveTemp(Init));
+	}
+
 	// ==================== BlueprintCallable 具体化 ====================
 
 	UFUNCTION(BlueprintCallable, Category = "Math|Reduction", meta = (DisplayName = "Reduce Int32 Sum"))
@@ -148,6 +154,12 @@ public:
 		return Reduce<T, int32>(Input, [&Predicate](int32 Acc, T V) {
 			return Acc + (Predicate(V) ? 1 : 0);
 		}, 0);
+	}
+
+	template<typename T>
+	static int32 CountIf(const TArray<T>& Input, TFunctionRef<bool(T)> Predicate)
+	{
+		return CountIf(TArrayView<const T>(Input), Predicate);
 	}
 
 	// 自定义 lambda 归约（仅 C++）

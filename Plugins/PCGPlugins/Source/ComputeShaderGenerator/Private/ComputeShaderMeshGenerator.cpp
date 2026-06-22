@@ -1,5 +1,6 @@
 #include "ComputeShaderMeshGenerator.h"
 
+#include "ComputeShaderBasicFunction.h"
 #include "DynamicMeshActor.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "RenderGraphBuilder.h"
@@ -22,6 +23,7 @@
 #include "HAL/IConsoleManager.h"
 #include "Landscape.h"
 #include "LandscapeComponent.h"
+#include "LandscapeProxy.h"
 #include "MeshDescription.h"
 #include "MeshDescriptionToDynamicMesh.h"
 #if WITH_EDITOR
@@ -39,6 +41,10 @@
 #include <openvdb/tools/ParticlesToLevelSet.h>
 #include <openvdb/tools/VolumeToMesh.h>
 
+// Voxel cache cell key. The header unifies the cell key type on FIntVector; this alias keeps the
+// legacy name used throughout the cache implementation pointing at that same type.
+using FCSMeshGeneratorVoxelKey = FIntVector;
+
 namespace
 {
 constexpr int32 CSGeneratorMinTextureDimension = 1;
@@ -46,6 +52,26 @@ constexpr int32 CSGeneratorDefaultTextureDimension = 1;
 constexpr float CSGeneratorMinVoxelSize = 1.0e-3f;
 const FName CSGeneratorDefaultRequestId(TEXT("Default"));
 
+
+void ReleaseRTAndNull(TObjectPtr<UTextureRenderTarget2D>& RT)
+{
+	if (RT) { RT->ReleaseResource(); RT = nullptr; }
+}
+
+void InitCacheRT(UTextureRenderTarget2D* RT, int32 Width, int32 Height)
+{
+	if (!RT) { return; }
+	RT->RenderTargetFormat = RTF_RGBA32f;
+	RT->ClearColor = FLinearColor::Black;
+	RT->bCanCreateUAV = true;
+	RT->InitAutoFormat(Width, Height);
+	RT->UpdateResourceImmediate(true);
+}
+
+bool IsValidCacheRT(const UTextureRenderTarget2D* RT)
+{
+	return RT && RT->bCanCreateUAV && RT->SizeX > 0 && RT->SizeY > 0;
+}
 
 bool IsFiniteCSGeneratorVector(const FVector& Vector)
 {
@@ -86,60 +112,13 @@ FIntPoint GetLinearDataTextureSize(int64 ElementCount, int32 MaxTextureDimension
 
 void UploadLinearColorsToRenderTarget(UTextureRenderTarget2D* RenderTarget, TArray<FLinearColor> Colors)
 {
-	if (!RenderTarget || RenderTarget->SizeX <= 0 || RenderTarget->SizeY <= 0)
-	{
-		return;
-	}
+	if (!RenderTarget || RenderTarget->SizeX <= 0 || RenderTarget->SizeY <= 0) return;
 
-	const int32 Width = RenderTarget->SizeX;
-	const int32 Height = RenderTarget->SizeY;
-	const int32 PixelCount = Width * Height;
-	if (Colors.Num() < PixelCount)
-	{
-		Colors.SetNumZeroed(PixelCount);
-	}
-	else if (Colors.Num() > PixelCount)
-	{
-		Colors.SetNum(PixelCount, EAllowShrinking::No);
-	}
+	const int32 PixelCount = RenderTarget->SizeX * RenderTarget->SizeY;
+	if (Colors.Num() < PixelCount) Colors.SetNumZeroed(PixelCount);
+	else if (Colors.Num() > PixelCount) Colors.SetNum(PixelCount, EAllowShrinking::No);
 
-	FTextureRenderTargetResource* TextureTarget = RenderTarget->GameThread_GetRenderTargetResource();
-	ENQUEUE_RENDER_COMMAND(CSMeshGeneratorUploadLinearColorsToRenderTarget)(
-		[TextureTarget, Colors = MoveTemp(Colors), Width, Height](FRHICommandListImmediate& RHICmdList)
-		{
-			if (!TextureTarget)
-			{
-				return;
-			}
-
-			FTextureRHIRef TextureRHI = TextureTarget->GetRenderTargetTexture();
-			if (!TextureRHI.IsValid())
-			{
-				return;
-			}
-
-			uint32 DestStride = 0;
-			void* DestData = RHILockTexture2D(TextureRHI, 0, RLM_WriteOnly, DestStride, false);
-			if (!DestData || DestStride == 0)
-			{
-				if (DestData)
-				{
-					RHIUnlockTexture2D(TextureRHI, 0, false);
-				}
-				return;
-			}
-
-			constexpr uint32 PixelBytes = sizeof(FLinearColor);
-			const uint32 RowBytes = uint32(Width) * PixelBytes;
-			const uint8* SourceBytes = reinterpret_cast<const uint8*>(Colors.GetData());
-			uint8* DestBytes = static_cast<uint8*>(DestData);
-			for (int32 Y = 0; Y < Height; ++Y)
-			{
-				FMemory::Memcpy(DestBytes + uint64(Y) * DestStride, SourceBytes + uint64(Y) * RowBytes, RowBytes);
-			}
-			RHIUnlockTexture2D(TextureRHI, 0, false);
-		});
-	FlushRenderingCommands();
+	UComputeShaderBasicFunction::DrawLinearColorsToRenderTarget32(RenderTarget, MoveTemp(Colors));
 }
 
 class FCSGeneratorVDBParticleList
@@ -584,7 +563,7 @@ struct FResolvedStaticMeshTriangleRequest
 bool IsValidCSTriangleIndex(int32 Index, int32 VertexCount);
 bool IsFiniteCSVertex(const FVector& Vertex);
 bool IsDegenerateCSTriangle(const FVector& A, const FVector& B, const FVector& C);
-bool ShouldExcludeStaticMeshTriangleRequest(const FCSStaticMeshTriangleRequest& Request, const AActor* ExcludedActor, FName ExcludedActorTag);
+bool ShouldExcludeStaticMeshTriangleRequest(const FCSStaticMeshTriangleRequest& Request, const AActor* ExcludedActor, const TArray<FName>& ExcludedActorTags);
 
 int32 GetTriangleMeshDataTriangleCount(const FCSTriangleMeshData& TriangleData)
 {
@@ -1063,7 +1042,7 @@ bool IsDegenerateCSTriangle(const FVector& A, const FVector& B, const FVector& C
 	return AreaSq4 <= 1.0e-8;
 }
 
-bool ShouldExcludeStaticMeshTriangleRequest(const FCSStaticMeshTriangleRequest& Request, const AActor* ExcludedActor, FName ExcludedActorTag)
+bool ShouldExcludeStaticMeshTriangleRequest(const FCSStaticMeshTriangleRequest& Request, const AActor* ExcludedActor, const TArray<FName>& ExcludedActorTags)
 {
 	const AActor* SourceActor = Request.SourceActor;
 	if (!SourceActor)
@@ -1076,13 +1055,20 @@ bool ShouldExcludeStaticMeshTriangleRequest(const FCSStaticMeshTriangleRequest& 
 		return true;
 	}
 
-	return !ExcludedActorTag.IsNone() && SourceActor->ActorHasTag(ExcludedActorTag);
+	for (const FName& Tag : ExcludedActorTags)
+	{
+		if (!Tag.IsNone() && SourceActor->ActorHasTag(Tag))
+		{
+			return true;
+		}
+	}
+	return false;
 }
 
 uint64 ResolveStaticMeshTriangleRequests(
 	const TArray<FCSStaticMeshTriangleRequest>& Requests,
 	const AActor* ExcludedActor,
-	FName ExcludedActorTag,
+	const TArray<FName>& ExcludedActorTags,
 	bool bNaniteOnlyFallbackMesh,
 	TArray<FResolvedStaticMeshTriangleRequest>& OutResolvedRequests)
 {
@@ -1092,7 +1078,7 @@ uint64 ResolveStaticMeshTriangleRequests(
 	uint64 TotalTriangleCount = 0;
 	for (const FCSStaticMeshTriangleRequest& Request : Requests)
 	{
-		if (ShouldExcludeStaticMeshTriangleRequest(Request, ExcludedActor, ExcludedActorTag))
+		if (ShouldExcludeStaticMeshTriangleRequest(Request, ExcludedActor, ExcludedActorTags))
 		{
 			continue;
 		}
@@ -1252,7 +1238,11 @@ void BuildBoxSceneLandscapeTrianglesInternal(UWorld* World,
 	const TArray<FVector>& ReferencePoints,
 	float ReferenceFilterDistance,
 	int32 MaxTriangles,
-	FCSTriangleMeshData& OutTriangleData)
+	FCSTriangleMeshData& OutTriangleData,
+	const FTransform* WorldToLocalBoxTransform = nullptr,
+	const FVector* LocalBoxExtent = nullptr,
+	FName RequiredActorTag = NAME_None,
+	bool bSortComponentsByDistance = true)
 {
 	OutTriangleData = FCSTriangleMeshData();
 
@@ -1261,6 +1251,16 @@ void BuildBoxSceneLandscapeTrianglesInternal(UWorld* World,
 	{
 		return;
 	}
+
+	const bool bHasOBBFilter = WorldToLocalBoxTransform && LocalBoxExtent;
+
+	struct FLandscapeComponentEntry
+	{
+		ULandscapeComponent* Component;
+		double DistSqToCenter;
+	};
+	TArray<FLandscapeComponentEntry> CandidateComponents;
+	const FVector QueryCenter = QueryBox.GetCenter();
 
 	for (TObjectIterator<ULandscapeComponent> It; It; ++It)
 	{
@@ -1271,6 +1271,15 @@ void BuildBoxSceneLandscapeTrianglesInternal(UWorld* World,
 			|| LandscapeComponent->GetWorld() != World)
 		{
 			continue;
+		}
+
+		if (!RequiredActorTag.IsNone())
+		{
+			ALandscapeProxy* LandscapeProxy = LandscapeComponent->GetLandscapeProxy();
+			if (!LandscapeProxy || !LandscapeProxy->ActorHasTag(RequiredActorTag))
+			{
+				continue;
+			}
 		}
 
 		if (!LandscapeComponent->Bounds.GetBox().Intersect(QueryBox))
@@ -1284,16 +1293,36 @@ void BuildBoxSceneLandscapeTrianglesInternal(UWorld* World,
 			continue;
 		}
 
-		FLandscapeComponentDataInterface LandscapeData(LandscapeComponent, 0, false);
+		const double DistSq = FVector::DistSquared(LandscapeComponent->Bounds.Origin, QueryCenter);
+		CandidateComponents.Add({ LandscapeComponent, DistSq });
+	}
+
+	if (bSortComponentsByDistance)
+	{
+		CandidateComponents.Sort([](const FLandscapeComponentEntry& A, const FLandscapeComponentEntry& B)
+		{
+			return A.DistSqToCenter < B.DistSqToCenter;
+		});
+	}
+
+	for (const FLandscapeComponentEntry& Entry : CandidateComponents)
+	{
+		FLandscapeComponentDataInterface LandscapeData(Entry.Component, 0, false);
 		if (!LandscapeData.GetRawHeightData())
 		{
 			continue;
 		}
 
+		const int32 ComponentSizeQuads = Entry.Component->ComponentSizeQuads;
 		for (int32 Y = 0; Y < ComponentSizeQuads; ++Y)
 		{
 			for (int32 X = 0; X < ComponentSizeQuads; ++X)
 			{
+				if (MaxTriangles > 0 && GetTriangleMeshDataTriangleCount(OutTriangleData) >= MaxTriangles)
+				{
+					return;
+				}
+
 				FVector P00;
 				FVector P10;
 				FVector P01;
@@ -1309,7 +1338,31 @@ void BuildBoxSceneLandscapeTrianglesInternal(UWorld* World,
 				LandscapeData.GetWorldPositionTangents(X, Y + 1, P01, TangentX, TangentY, N01);
 				LandscapeData.GetWorldPositionTangents(X + 1, Y + 1, P11, TangentX, TangentY, N11);
 
-				if (TriangleIntersectsBox(P00, P10, P11, QueryBox) && PassTriangleReferenceFilterCPU(P00, P10, P11, ReferencePoints, ReferenceFilterDistance))
+				auto PassesAllFilters = [&](const FVector& A, const FVector& B, const FVector& C) -> bool
+				{
+					if (!TriangleIntersectsBox(A, B, C, QueryBox))
+					{
+						return false;
+					}
+					if (bHasOBBFilter)
+					{
+						FBox LocalTriBox(ForceInit);
+						LocalTriBox += WorldToLocalBoxTransform->TransformPosition(A);
+						LocalTriBox += WorldToLocalBoxTransform->TransformPosition(B);
+						LocalTriBox += WorldToLocalBoxTransform->TransformPosition(C);
+						if (!LocalTriBox.Intersect(FBox(-*LocalBoxExtent, *LocalBoxExtent)))
+						{
+							return false;
+						}
+					}
+					if (!PassTriangleReferenceFilterCPU(A, B, C, ReferencePoints, ReferenceFilterDistance))
+					{
+						return false;
+					}
+					return true;
+				};
+
+				if (PassesAllFilters(P00, P10, P11))
 				{
 					const FVector Tri0Normal = MakeLandscapeNormalFaceUp(N00 + N10 + N11);
 					if (!TryAppendTriangleSoupOrientedToNormal(OutTriangleData, P00, P10, P11, Tri0Normal, MaxTriangles))
@@ -1318,7 +1371,7 @@ void BuildBoxSceneLandscapeTrianglesInternal(UWorld* World,
 					}
 				}
 
-				if (TriangleIntersectsBox(P00, P11, P01, QueryBox) && PassTriangleReferenceFilterCPU(P00, P11, P01, ReferencePoints, ReferenceFilterDistance))
+				if (PassesAllFilters(P00, P11, P01))
 				{
 					const FVector Tri1Normal = MakeLandscapeNormalFaceUp(N00 + N11 + N01);
 					if (!TryAppendTriangleSoupOrientedToNormal(OutTriangleData, P00, P11, P01, Tri1Normal, MaxTriangles))
@@ -1329,8 +1382,44 @@ void BuildBoxSceneLandscapeTrianglesInternal(UWorld* World,
 			}
 		}
 	}
+#else
+	(void)World; (void)QueryBox; (void)ReferencePoints; (void)ReferenceFilterDistance;
+	(void)MaxTriangles; (void)OutTriangleData; (void)WorldToLocalBoxTransform;
+	(void)LocalBoxExtent; (void)RequiredActorTag; (void)bSortComponentsByDistance;
 #endif
 }
+
+} // close anonymous namespace for member function definitions
+
+// Public static wrappers
+void AComputeShaderMeshGenerator::BuildBoxSceneLandscapeTriangles(UWorld* World,
+	const FBox& QueryBox,
+	const TArray<FVector>& InReferencePoints,
+	float InReferenceFilterDistance,
+	int32 MaxTriangles,
+	FCSTriangleMeshData& OutTriangleData)
+{
+	BuildBoxSceneLandscapeTrianglesInternal(World, QueryBox, InReferencePoints,
+		InReferenceFilterDistance, MaxTriangles, OutTriangleData);
+}
+
+void AComputeShaderMeshGenerator::BuildBoxSceneLandscapeTriangles(UWorld* World,
+	const FBox& QueryBox,
+	const TArray<FVector>& InReferencePoints,
+	float InReferenceFilterDistance,
+	int32 MaxTriangles,
+	FCSTriangleMeshData& OutTriangleData,
+	const FTransform* WorldToLocalBoxTransform,
+	const FVector* LocalBoxExtent,
+	FName RequiredActorTag,
+	bool bSortComponentsByDistance)
+{
+	BuildBoxSceneLandscapeTrianglesInternal(World, QueryBox, InReferencePoints,
+		InReferenceFilterDistance, MaxTriangles, OutTriangleData,
+		WorldToLocalBoxTransform, LocalBoxExtent, RequiredActorTag, bSortComponentsByDistance);
+}
+
+namespace { // reopen anonymous namespace
 
 void BuildBoxSceneTriangleRequestsInternal(UWorld* World,
 	const FBox& QueryBox,
@@ -1435,10 +1524,20 @@ void AComputeShaderMeshGenerator::BuildActorSceneTriangleRequests(TArray<AActor*
 			continue;
 		}
 
-		if (ExcludedActorTag != NAME_None && Actor->ActorHasTag(ExcludedActorTag))
 		{
-			// 这里提前跳过只是减少 request 数量；真正的统一保护仍在 AddStaticMeshTrianglesToRDGInternal。
-			continue;
+			bool bExcluded = false;
+			for (const FName& Tag : ExcludedActorTags)
+			{
+				if (!Tag.IsNone() && Actor->ActorHasTag(Tag))
+				{
+					bExcluded = true;
+					break;
+				}
+			}
+			if (bExcluded)
+			{
+				continue;
+			}
 		}
 
 		TArray<UStaticMeshComponent*> StaticMeshComponents;
@@ -1719,14 +1818,14 @@ FCSStaticMeshTriangleRDGOutput AddStaticMeshTrianglesToRDGInternal(
 	const FCSTriangleMeshData* InitialTriangleData,
 	const TCHAR* DebugName,
 	const AActor* ExcludedActor,
-	FName ExcludedActorTag,
+	const TArray<FName>& ExcludedActorTags,
 	bool bNaniteOnlyFallbackMesh = true)
 {
 	TArray<FResolvedStaticMeshTriangleRequest> ResolvedRequests;
 	const uint64 TotalTriangleCount = ResolveStaticMeshTriangleRequests(
 		Requests,
 		ExcludedActor,
-		ExcludedActorTag,
+		ExcludedActorTags,
 		bNaniteOnlyFallbackMesh,
 		ResolvedRequests);
 
@@ -2206,191 +2305,34 @@ FCSSurfaceVoxelRDGOutput AddTriangleSurfaceVoxelsToRDGInternal(
 // Core System - Public GPU Extraction
 // -----------------------------------------------------------------------------
 
-FCSStaticMeshTriangleRDGOutput AComputeShaderMeshGenerator::AddStaticMeshTrianglesToRDG(
+
+
+FCSSurfaceVoxelRDGOutput AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsToRDG(
 	FRDGBuilder& GraphBuilder,
 	FRHICommandListImmediate& RHICmdList,
-	const TArray<FCSStaticMeshTriangleRequest>& Requests,
-	float ReferenceFilterDistance,
-	const TCHAR* DebugName,
-	bool bNaniteOnlyFallbackMesh)
-{
-	return AddStaticMeshTrianglesToRDGInternal(
-		GraphBuilder,
-		RHICmdList,
-		Requests,
-		ReferencePoints,
-		ReferenceFilterDistance,
-		FMath::Max(1, MaxTriangles),
-		nullptr,
-		DebugName,
-		this,
-		ExcludedActorTag,
-		bNaniteOnlyFallbackMesh);
-}
-
-FCSSurfaceVoxelRDGOutput AComputeShaderMeshGenerator::AddTriangleSurfaceVoxelsToRDG(
-	FRDGBuilder& GraphBuilder,
-	const FCSStaticMeshTriangleRDGOutput& TriangleOutput,
-	FVector VoxelOrigin,
 	float VoxelSize,
-	int32 HashSlotCount,
-	int32 BlurIterations,
-	int32 BlurRadius,
 	const TCHAR* DebugName)
 {
-	return AddTriangleSurfaceVoxelsToRDGInternal(
-		GraphBuilder,
-		TriangleOutput,
-		VoxelOrigin,
-		VoxelSize,
-		0.0f,
-		FMath::Max(1, MaxVoxels),
-		HashSlotCount,
-		BlurIterations,
-		BlurRadius,
-		DebugName);
-}
-
-FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPU()
-{
-	return GetBoxSceneTrianglesFromGPUFiltered(0.0f);
-}
-
-FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPUFiltered(float ReferenceFilterDistance)
-{
-	const TArray<FVector> ReferencePointsForRender = ReferencePoints;
-	return ReadBoxSceneTrianglesFromGPUFilteredInternal(
-		GetGeneratorBoundsWorldBox(),
-		ReferencePointsForRender,
-		ReferenceFilterDistance,
-		TEXT("[GetBoxSceneTrianglesFromGPU]"),
-		this,
-		ExcludedActorTag);
-}
-
-FCSTriangleMeshData AComputeShaderMeshGenerator::ReadBoxSceneTrianglesFromGPUFilteredInternal(const FBox& QueryBox,
-	const TArray<FVector>& ReferencePointsForRender,
-	float ReferenceFilterDistance,
-	const TCHAR* LogPrefix,
-	const AActor* ExcludedActor,
-	FName ExcludedActorTagForResolve)
-{
-	FCSTriangleMeshData OutTriangleData;
-	LastTriangleTextureData.bValid = false;
-	LastTriangleTextureData.VertexCount = 0;
-	LastTriangleTextureData.TriangleCount = 0;
-	LastTriangleTextureData.IndexCount = 0;
+	FCSSurfaceVoxelRDGOutput Output;
 
 	UWorld* World = GetWorld();
 	if (!World)
 	{
-		return OutTriangleData;
-	}
-
-	if (!QueryBox.IsValid)
-	{
-		return OutTriangleData;
-	}
-
-	const int32 SafeMaxTriangles = FMath::Max(1, MaxTriangles);
-	TArray<FCSStaticMeshTriangleRequest> Requests;
-	BuildBoxSceneTriangleRequestsInternal(World, QueryBox, VoxelGridSettings.LODIndex, Requests);
-
-	FCSTriangleMeshData LandscapeTriangleData;
-	BuildBoxSceneLandscapeTrianglesInternal(
-		World,
-		QueryBox,
-		ReferencePointsForRender,
-		ReferenceFilterDistance,
-		SafeMaxTriangles,
-		LandscapeTriangleData);
-	const bool bHasLandscapeTriangles = GetTriangleMeshDataTriangleCount(LandscapeTriangleData) > 0;
-	if (Requests.IsEmpty() && !bHasLandscapeTriangles)
-	{
-		return OutTriangleData;
-	}
-
-	TArray<FResolvedStaticMeshTriangleRequest> ResolvedRequests;
-	ResolveStaticMeshTriangleRequests(
-		Requests,
-		ExcludedActor,
-		ExcludedActorTagForResolve,
-		true,
-		ResolvedRequests);
-	if (ResolvedRequests.IsEmpty() && !bHasLandscapeTriangles)
-	{
-		return OutTriangleData;
-	}
-
-	AppendTriangleMeshData(OutTriangleData, LandscapeTriangleData, SafeMaxTriangles);
-
-	for (const FResolvedStaticMeshTriangleRequest& Request : ResolvedRequests)
-	{
-		const int32 CurrentTriangleCount = GetTriangleMeshDataTriangleCount(OutTriangleData);
-		const int32 RemainingTriangles = SafeMaxTriangles - CurrentTriangleCount;
-		if (RemainingTriangles <= 0)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("%s MaxTriangles reached; remaining scene triangles are skipped. MaxTriangles=%d"), LogPrefix, SafeMaxTriangles);
-			break;
-		}
-
-		FCSTriangleMeshData RequestTriangleData;
-		if (!ReadbackResolvedStaticMeshTriangleRequestSync(
-			Request,
-			ReferencePointsForRender,
-			ReferenceFilterDistance,
-			RemainingTriangles,
-			RequestTriangleData))
-		{
-			UE_LOG(LogTemp, Warning, TEXT("%s Failed to read back a static mesh triangle batch."), LogPrefix);
-			break;
-		}
-
-		AppendTriangleMeshData(OutTriangleData, RequestTriangleData, SafeMaxTriangles);
-	}
-
-	const int32 EffectiveVertexCount = OutTriangleData.Vertices.Num();
-	if (EffectiveVertexCount <= 0)
-	{
-		return OutTriangleData;
-	}
-
-	OutTriangleData.VertexCount = EffectiveVertexCount;
-	OutTriangleData.IndexCount = 0;
-	NormalizeTriangleMeshDataWinding(OutTriangleData);
-	StoreTriangleTextureData(OutTriangleData, ReferenceFilterDistance, QueryBox);
-	return OutTriangleData;
-}
-
-FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU(float VoxelSize)
-{
-	FCSSurfaceVoxelData OutVoxelData;
-	OutVoxelData.VoxelSize = FMath::Max(VoxelSize, UE_KINDA_SMALL_NUMBER);
-	LastSurfaceVoxelData = FCSSurfaceVoxelData();
-	LastSurfaceVoxelData.VoxelSize = OutVoxelData.VoxelSize;
-	LastSurfaceVoxelTextureData.bValid = false;
-	LastSurfaceVoxelTextureData.VoxelCount = 0;
-	LastSurfaceVoxelTextureData.VoxelSize = OutVoxelData.VoxelSize;
-
-	UWorld* World = GetWorld();
-	if (!World)
-	{
-		return OutVoxelData;
+		return Output;
 	}
 
 	const FBox QueryBox = GetGeneratorBoundsWorldBox();
 	if (!QueryBox.IsValid)
 	{
-		return OutVoxelData;
+		return Output;
 	}
 
-	// Voxel cell 坐标系原点 — 存入 OutVoxelData 用于后续体素采样
-	OutVoxelData.VoxelOrigin = QueryBox.Min;
-
+	const float SafeVoxelSize = FMath::Max(VoxelSize, UE_KINDA_SMALL_NUMBER);
 	const int32 SafeMaxTriangles = FMath::Max(1, MaxTriangles);
 	const int32 SafeMaxVoxels = FMath::Max(1, MaxVoxels);
 	const int32 SafeSurfaceVoxelBlurIterations = FMath::Max(0, SurfaceVoxelBlurIterations);
 	const int32 SafeSurfaceVoxelBlurRadius = FMath::Max(1, SurfaceVoxelBlurRadius);
+
 	TArray<FCSStaticMeshTriangleRequest> Requests;
 	BuildBoxSceneTriangleRequests(World, QueryBox, Requests);
 
@@ -2407,49 +2349,265 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 	const bool bHasLandscapeTriangles = GetTriangleMeshDataTriangleCount(LandscapeTriangleData) > 0;
 	if (Requests.IsEmpty() && !bHasLandscapeTriangles)
 	{
-		return OutVoxelData;
+		return Output;
 	}
 
 	TArray<FResolvedStaticMeshTriangleRequest> ResolvedRequests;
 	const uint64 TotalStaticMeshTriangleCount = ResolveStaticMeshTriangleRequests(
 		Requests,
 		this,
-		ExcludedActorTag,
+		ExcludedActorTags,
 		true,
 		ResolvedRequests);
 	if (ResolvedRequests.IsEmpty() && !bHasLandscapeTriangles)
 	{
-		return OutVoxelData;
+		return Output;
 	}
 
-	const uint64 MaxVoxelReadbackBytes64 = uint64(SafeMaxVoxels) * sizeof(FVector4f);
-	if (MaxVoxelReadbackBytes64 > uint64(TNumericLimits<uint32>::Max()))
+	const FCSTriangleMeshData* InitialTriangleData = bHasLandscapeTriangles ? &LandscapeTriangleData : nullptr;
+
+	FCSStaticMeshTriangleRDGOutput TriangleOutput = AddResolvedStaticMeshTrianglesToRDGInternal(
+		GraphBuilder,
+		RHICmdList,
+		ResolvedRequests,
+		TotalStaticMeshTriangleCount,
+		EmptyReferencePoints,
+		0.0f,
+		SafeMaxTriangles,
+		InitialTriangleData,
+		TEXT("CS.BoxSceneSurfaceVoxels.Triangles"));
+
+	Output = AddTriangleSurfaceVoxelsToRDGInternal(
+		GraphBuilder,
+		TriangleOutput,
+		QueryBox.Min,
+		SafeVoxelSize,
+		0.0f,
+		SafeMaxVoxels,
+		0,
+		SafeSurfaceVoxelBlurIterations,
+		SafeSurfaceVoxelBlurRadius,
+		DebugName);
+
+	return Output;
+}
+
+FCSStaticMeshTriangleRDGOutput AComputeShaderMeshGenerator::AddBoxSceneTrianglesToRDG(
+	FRDGBuilder& GraphBuilder,
+	FRHICommandListImmediate& RHICmdList,
+	const FBox& QueryBox,
+	int32 InMaxTriangles,
+	const TCHAR* DebugName,
+	const TArray<FVector>& InReferencePoints,
+	float InReferenceFilterDistance)
+{
+	FCSStaticMeshTriangleRDGOutput TriangleOutput;
+
+	UWorld* World = GetWorld();
+	if (!World || !QueryBox.IsValid)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneSurfaceVoxelsFromGPU] Readback request too large. MaxVoxels=%d"), SafeMaxVoxels);
-		return OutVoxelData;
+		return TriangleOutput;
 	}
 
-	const uint32 CounterReadbackBytes = sizeof(uint32) * 2;
+	const int32 SafeMaxTriangles = InMaxTriangles > 0 ? InMaxTriangles : FMath::Max(1, MaxTriangles);
+	const float SafeReferenceFilterDistance = InReferencePoints.IsEmpty() ? 0.0f : FMath::Max(0.0f, InReferenceFilterDistance);
 
-	FRHIGPUBufferReadback* PositionReadback = new FRHIGPUBufferReadback(TEXT("BoxSceneSurfaceVoxels_PositionReadback"));
-	FRHIGPUBufferReadback* NormalReadback = new FRHIGPUBufferReadback(TEXT("BoxSceneSurfaceVoxels_NormalReadback"));
-	FRHIGPUBufferReadback* TargetPositionReadback = new FRHIGPUBufferReadback(TEXT("BoxSceneSurfaceVoxels_TargetPositionReadback"));
-	FRHIGPUBufferReadback* CellReadback = new FRHIGPUBufferReadback(TEXT("BoxSceneSurfaceVoxels_CellReadback"));
-	FRHIGPUBufferReadback* CounterReadback = new FRHIGPUBufferReadback(TEXT("BoxSceneSurfaceVoxels_CounterReadback"));
+	TArray<FCSStaticMeshTriangleRequest> Requests;
+	BuildBoxSceneTriangleRequests(World, QueryBox, Requests);
+
+	FCSTriangleMeshData LandscapeTriangleData;
+	BuildBoxSceneLandscapeTrianglesInternal(
+		World,
+		QueryBox,
+		InReferencePoints,
+		SafeReferenceFilterDistance,
+		SafeMaxTriangles,
+		LandscapeTriangleData);
+
+	const bool bHasLandscapeTriangles = GetTriangleMeshDataTriangleCount(LandscapeTriangleData) > 0;
+	if (Requests.IsEmpty() && !bHasLandscapeTriangles)
+	{
+		return TriangleOutput;
+	}
+
+	TArray<FResolvedStaticMeshTriangleRequest> ResolvedRequests;
+	const uint64 TotalStaticMeshTriangleCount = ResolveStaticMeshTriangleRequests(
+		Requests,
+		this,
+		ExcludedActorTags,
+		true,
+		ResolvedRequests);
+	if (ResolvedRequests.IsEmpty() && !bHasLandscapeTriangles)
+	{
+		return TriangleOutput;
+	}
+
+	const FCSTriangleMeshData* InitialTriangleData = bHasLandscapeTriangles ? &LandscapeTriangleData : nullptr;
+
+	TriangleOutput = AddResolvedStaticMeshTrianglesToRDGInternal(
+		GraphBuilder,
+		RHICmdList,
+		ResolvedRequests,
+		TotalStaticMeshTriangleCount,
+		InReferencePoints,
+		SafeReferenceFilterDistance,
+		SafeMaxTriangles,
+		InitialTriangleData,
+		DebugName);
+
+	return TriangleOutput;
+}
+
+// -----------------------------------------------------------------------------
+// PrepareBoxSceneTriangles / AddPreparedBoxSceneTrianglesToRDG
+// -----------------------------------------------------------------------------
+
+struct FCSBoxScenePreparedDataImpl
+{
+	TArray<FResolvedStaticMeshTriangleRequest> ResolvedRequests;
+	uint64 TotalStaticMeshTriangleCount = 0;
+	FCSTriangleMeshData LandscapeTriangleData;
+	TArray<FVector> ReferencePoints;
+	float ReferenceFilterDistance = 0.0f;
+	int32 SafeMaxTriangles = 1;
+};
+
+bool FCSBoxScenePreparedData::HasAnyTriangles() const
+{
+	if (!Impl) return false;
+	return !Impl->ResolvedRequests.IsEmpty() || GetTriangleMeshDataTriangleCount(Impl->LandscapeTriangleData) > 0;
+}
+
+FCSBoxScenePreparedData AComputeShaderMeshGenerator::PrepareBoxSceneTriangles(
+	UWorld* World,
+	const FBox& QueryBox,
+	int32 InMaxTriangles,
+	const TArray<FVector>& InReferencePoints,
+	float InReferenceFilterDistance,
+	FName RequiredActorTag)
+{
+	FCSBoxScenePreparedData Result;
+	if (!World || !QueryBox.IsValid) return Result;
+
+	auto ImplData = MakeShared<FCSBoxScenePreparedDataImpl, ESPMode::ThreadSafe>();
+
+	const int32 SafeMaxTriangles = InMaxTriangles > 0 ? InMaxTriangles : FMath::Max(1, MaxTriangles);
+	const float SafeRefDist = InReferencePoints.IsEmpty() ? 0.0f : FMath::Max(0.0f, InReferenceFilterDistance);
+
+	TArray<FCSStaticMeshTriangleRequest> Requests;
+	BuildBoxSceneTriangleRequests(World, QueryBox, Requests);
+
+	if (!RequiredActorTag.IsNone())
+	{
+		Requests.RemoveAll([RequiredActorTag](const FCSStaticMeshTriangleRequest& Req)
+		{
+			return Req.SourceActor && !Req.SourceActor->ActorHasTag(RequiredActorTag);
+		});
+	}
+
+	BuildBoxSceneLandscapeTrianglesInternal(
+		World, QueryBox, InReferencePoints, SafeRefDist, SafeMaxTriangles,
+		ImplData->LandscapeTriangleData);
+
+	ImplData->TotalStaticMeshTriangleCount = ResolveStaticMeshTriangleRequests(
+		Requests, this, ExcludedActorTags, true, ImplData->ResolvedRequests);
+
+	ImplData->ReferencePoints = InReferencePoints;
+	ImplData->ReferenceFilterDistance = SafeRefDist;
+	ImplData->SafeMaxTriangles = SafeMaxTriangles;
+
+	Result.Impl = ImplData;
+	return Result;
+}
+
+FCSStaticMeshTriangleRDGOutput AComputeShaderMeshGenerator::AddPreparedBoxSceneTrianglesToRDG(
+	FRDGBuilder& GraphBuilder,
+	FRHICommandListImmediate& RHICmdList,
+	const FCSBoxScenePreparedData& Prepared,
+	const TCHAR* DebugName)
+{
+	FCSStaticMeshTriangleRDGOutput Output;
+	if (!Prepared.IsValid() || !Prepared.HasAnyTriangles()) return Output;
+
+	const auto& D = *Prepared.Impl;
+	const FCSTriangleMeshData* InitialTriangleData =
+		GetTriangleMeshDataTriangleCount(D.LandscapeTriangleData) > 0 ? &D.LandscapeTriangleData : nullptr;
+
+	Output = AddResolvedStaticMeshTrianglesToRDGInternal(
+		GraphBuilder, RHICmdList, D.ResolvedRequests, D.TotalStaticMeshTriangleCount,
+		D.ReferencePoints, D.ReferenceFilterDistance, D.SafeMaxTriangles,
+		InitialTriangleData, DebugName);
+
+	return Output;
+}
+
+FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPUFiltered(float ReferenceFilterDistance)
+{
+	FCSTriangleMeshData ResultTriangleData;
+	ClearTriangleTextureData();
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return ResultTriangleData;
+	}
+
+	const FBox QueryBox = GetGeneratorBoundsWorldBox();
+	if (!QueryBox.IsValid)
+	{
+		return ResultTriangleData;
+	}
+
+	const TArray<FVector> ReferencePointsForRender = ReferencePoints;
+	const float SafeFilterDistance = (ReferencePointsForRender.IsEmpty()) ? 0.0f : FMath::Max(0.0f, ReferenceFilterDistance);
+	const int32 SafeMaxTriangles = FMath::Max(1, MaxTriangles);
+
+	TArray<FCSStaticMeshTriangleRequest> Requests;
+	BuildBoxSceneTriangleRequests(World, QueryBox, Requests);
+
+	FCSTriangleMeshData LandscapeTriangleData;
+	BuildBoxSceneLandscapeTrianglesInternal(
+		World,
+		QueryBox,
+		ReferencePointsForRender,
+		SafeFilterDistance,
+		SafeMaxTriangles,
+		LandscapeTriangleData);
+
+	const bool bHasLandscapeTriangles = GetTriangleMeshDataTriangleCount(LandscapeTriangleData) > 0;
+	if (Requests.IsEmpty() && !bHasLandscapeTriangles)
+	{
+		return ResultTriangleData;
+	}
+
+	TArray<FResolvedStaticMeshTriangleRequest> ResolvedRequests;
+	const uint64 TotalStaticMeshTriangleCount = ResolveStaticMeshTriangleRequests(
+		Requests,
+		this,
+		ExcludedActorTags,
+		true,
+		ResolvedRequests);
+	if (ResolvedRequests.IsEmpty() && !bHasLandscapeTriangles)
+	{
+		return ResultTriangleData;
+	}
+
+	FRHIGPUBufferReadback* VertexReadback = new FRHIGPUBufferReadback(TEXT("BoxSceneTrianglesFiltered_VertexReadback"));
+	FRHIGPUBufferReadback* NormalReadback = new FRHIGPUBufferReadback(TEXT("BoxSceneTrianglesFiltered_NormalReadback"));
+	FRHIGPUBufferReadback* CounterReadback = new FRHIGPUBufferReadback(TEXT("BoxSceneTrianglesFiltered_CounterReadback"));
+	const uint32 CounterReadbackBytes = sizeof(uint32);
 	bool bRenderWorkQueued = false;
 	bool bHasGPUOutput = false;
-	int32 VoxelCapacity = 0;
-	uint32 ActualVoxelReadbackBytes = 0;
-	uint32 ActualVoxelCellReadbackBytes = 0;
+	int32 VertexCapacity = 0;
+	uint32 ActualVertexReadbackBytes = 0;
 
-	ENQUEUE_RENDER_COMMAND(GetBoxSceneSurfaceVoxelsFromGPUGPU)(
-		[ResolvedRequests = MoveTemp(ResolvedRequests), TotalStaticMeshTriangleCount, LandscapeTriangleData = MoveTemp(LandscapeTriangleData), PositionReadback, NormalReadback, TargetPositionReadback, CellReadback, CounterReadback, CounterReadbackBytes,
-		 SafeMaxTriangles, SafeMaxVoxels, VoxelOrigin = QueryBox.Min, SafeVoxelSize = OutVoxelData.VoxelSize,
-		 SafeSurfaceVoxelBlurIterations, SafeSurfaceVoxelBlurRadius,
-		 &bRenderWorkQueued, &bHasGPUOutput, &VoxelCapacity, &ActualVoxelReadbackBytes, &ActualVoxelCellReadbackBytes](FRHICommandListImmediate& RHICmdList)
+	ENQUEUE_RENDER_COMMAND(GetBoxSceneTrianglesFromGPUFilteredGPU)(
+		[ResolvedRequests = MoveTemp(ResolvedRequests), TotalStaticMeshTriangleCount, LandscapeTriangleData = MoveTemp(LandscapeTriangleData),
+		 VertexReadback, NormalReadback, CounterReadback, CounterReadbackBytes,
+		 ReferencePointsForRender, SafeFilterDistance, SafeMaxTriangles,
+		 &bRenderWorkQueued, &bHasGPUOutput, &VertexCapacity, &ActualVertexReadbackBytes](FRHICommandListImmediate& RHICmdList)
 		{
 			FRDGBuilder GraphBuilder(RHICmdList);
-			const TArray<FVector> EmptyReferencePoints;
 			const FCSTriangleMeshData* InitialTriangleData = GetTriangleMeshDataTriangleCount(LandscapeTriangleData) > 0 ? &LandscapeTriangleData : nullptr;
 
 			FCSStaticMeshTriangleRDGOutput TriangleOutput = AddResolvedStaticMeshTrianglesToRDGInternal(
@@ -2457,38 +2615,19 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 				RHICmdList,
 				ResolvedRequests,
 				TotalStaticMeshTriangleCount,
-				EmptyReferencePoints,
-				0.0f,
+				ReferencePointsForRender,
+				SafeFilterDistance,
 				SafeMaxTriangles,
 				InitialTriangleData,
-				TEXT("CS.BoxSceneSurfaceVoxels.Triangles"));
+				TEXT("CS.BoxSceneTrianglesFiltered"));
 
-			FCSSurfaceVoxelRDGOutput VoxelOutput = AddTriangleSurfaceVoxelsToRDGInternal(
-				GraphBuilder,
-				TriangleOutput,
-				VoxelOrigin,
-				SafeVoxelSize,
-				0.0f,
-				SafeMaxVoxels,
-				0,
-				SafeSurfaceVoxelBlurIterations,
-				SafeSurfaceVoxelBlurRadius,
-				TEXT("CS.BoxSceneSurfaceVoxels"));
-
-			if (VoxelOutput.VoxelPositions
-				&& VoxelOutput.VoxelNormals
-				&& VoxelOutput.VoxelTargetPositions
-				&& VoxelOutput.VoxelCells
-				&& VoxelOutput.VoxelCounter)
+			if (TriangleOutput.TriangleVertices && TriangleOutput.TriangleNormals && TriangleOutput.TriangleCounter)
 			{
-				VoxelCapacity = int32(VoxelOutput.MaxVoxels);
-				ActualVoxelReadbackBytes = uint32(uint64(VoxelOutput.MaxVoxels) * sizeof(FVector4f));
-				ActualVoxelCellReadbackBytes = uint32(uint64(VoxelOutput.MaxVoxels) * sizeof(FIntVector4));
-				AddEnqueueCopyPass(GraphBuilder, PositionReadback, VoxelOutput.VoxelPositions, ActualVoxelReadbackBytes);
-				AddEnqueueCopyPass(GraphBuilder, NormalReadback, VoxelOutput.VoxelNormals, ActualVoxelReadbackBytes);
-				AddEnqueueCopyPass(GraphBuilder, TargetPositionReadback, VoxelOutput.VoxelTargetPositions, ActualVoxelReadbackBytes);
-				AddEnqueueCopyPass(GraphBuilder, CellReadback, VoxelOutput.VoxelCells, ActualVoxelCellReadbackBytes);
-				AddEnqueueCopyPass(GraphBuilder, CounterReadback, VoxelOutput.VoxelCounter, CounterReadbackBytes);
+				VertexCapacity = int32(TriangleOutput.MaxVertices);
+				ActualVertexReadbackBytes = uint32(uint64(TriangleOutput.MaxVertices) * sizeof(FVector4f));
+				AddEnqueueCopyPass(GraphBuilder, VertexReadback, TriangleOutput.TriangleVertices, ActualVertexReadbackBytes);
+				AddEnqueueCopyPass(GraphBuilder, NormalReadback, TriangleOutput.TriangleNormals, ActualVertexReadbackBytes);
+				AddEnqueueCopyPass(GraphBuilder, CounterReadback, TriangleOutput.TriangleCounter, CounterReadbackBytes);
 				bHasGPUOutput = true;
 			}
 
@@ -2498,121 +2637,76 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 
 	FlushRenderingCommands();
 
-	if (!bRenderWorkQueued || !bHasGPUOutput)
+	if (!bRenderWorkQueued || !bHasGPUOutput || VertexCapacity <= 0)
 	{
-		delete PositionReadback;
+		delete VertexReadback;
 		delete NormalReadback;
-		delete TargetPositionReadback;
-		delete CellReadback;
 		delete CounterReadback;
-		return OutVoxelData;
+		return ResultTriangleData;
 	}
 
-	TArray<FVector4f> PositionData;
+	TArray<FVector4f> VertexData;
 	TArray<FVector4f> NormalData;
-	TArray<FVector4f> TargetPositionData;
-	TArray<FIntVector4> CellData;
-	PositionData.SetNumZeroed(VoxelCapacity);
-	NormalData.SetNumZeroed(VoxelCapacity);
-	TargetPositionData.SetNumZeroed(VoxelCapacity);
-	CellData.SetNumZeroed(VoxelCapacity);
-	uint32 VoxelCount = 0;
-	uint32 DroppedVoxelCount = 0;
+	VertexData.SetNumZeroed(VertexCapacity);
+	NormalData.SetNumZeroed(VertexCapacity);
+	uint32 TriangleCount = 0;
 	bool bReadbackSucceeded = false;
 
-	ENQUEUE_RENDER_COMMAND(GetBoxSceneSurfaceVoxelsFromGPUReadback)(
-		[PositionReadback, NormalReadback, TargetPositionReadback, CellReadback, CounterReadback, ActualVoxelReadbackBytes, ActualVoxelCellReadbackBytes, CounterReadbackBytes,
-		 &PositionData, &NormalData, &TargetPositionData, &CellData, &VoxelCount, &DroppedVoxelCount, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList)
+	ENQUEUE_RENDER_COMMAND(GetBoxSceneTrianglesFromGPUFilteredReadback)(
+		[VertexReadback, NormalReadback, CounterReadback, ActualVertexReadbackBytes, CounterReadbackBytes,
+		 &VertexData, &NormalData, &TriangleCount, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList)
 		{
-			if (!PositionReadback || !NormalReadback || !TargetPositionReadback || !CellReadback || !CounterReadback)
+			if (!VertexReadback || !NormalReadback || !CounterReadback)
 			{
 				return;
 			}
 
-			if (!PositionReadback->IsReady()
-				|| !NormalReadback->IsReady()
-				|| !TargetPositionReadback->IsReady()
-				|| !CellReadback->IsReady()
-				|| !CounterReadback->IsReady())
+			if (!VertexReadback->IsReady() || !NormalReadback->IsReady() || !CounterReadback->IsReady())
 			{
 				RHICmdList.SubmitAndBlockUntilGPUIdle();
 			}
 
-			if (!PositionReadback->IsReady()
-				|| !NormalReadback->IsReady()
-				|| !TargetPositionReadback->IsReady()
-				|| !CellReadback->IsReady()
-				|| !CounterReadback->IsReady())
+			if (!VertexReadback->IsReady() || !NormalReadback->IsReady() || !CounterReadback->IsReady())
 			{
-				UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneSurfaceVoxelsFromGPU] GPU readback was not ready after flush."));
-				delete PositionReadback;
+				UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneTrianglesFromGPUFiltered] GPU readback was not ready after flush."));
+				delete VertexReadback;
 				delete NormalReadback;
-				delete TargetPositionReadback;
-				delete CellReadback;
 				delete CounterReadback;
 				return;
 			}
 
-			if (PositionReadback->GetGPUSizeBytes() < ActualVoxelReadbackBytes ||
-				NormalReadback->GetGPUSizeBytes() < ActualVoxelReadbackBytes ||
-				TargetPositionReadback->GetGPUSizeBytes() < ActualVoxelReadbackBytes ||
-				CellReadback->GetGPUSizeBytes() < ActualVoxelCellReadbackBytes ||
+			if (VertexReadback->GetGPUSizeBytes() < ActualVertexReadbackBytes ||
+				NormalReadback->GetGPUSizeBytes() < ActualVertexReadbackBytes ||
 				CounterReadback->GetGPUSizeBytes() < CounterReadbackBytes)
 			{
-				UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneSurfaceVoxelsFromGPU] GPU readback size mismatch. Position=%llu/%u Normal=%llu/%u Target=%llu/%u Cell=%llu/%u Counter=%llu/%u"),
-					PositionReadback->GetGPUSizeBytes(),
-					ActualVoxelReadbackBytes,
+				UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneTrianglesFromGPUFiltered] GPU readback size mismatch. Vertex=%llu/%u Normal=%llu/%u Counter=%llu/%u"),
+					VertexReadback->GetGPUSizeBytes(),
+					ActualVertexReadbackBytes,
 					NormalReadback->GetGPUSizeBytes(),
-					ActualVoxelReadbackBytes,
-					TargetPositionReadback->GetGPUSizeBytes(),
-					ActualVoxelReadbackBytes,
-					CellReadback->GetGPUSizeBytes(),
-					ActualVoxelCellReadbackBytes,
+					ActualVertexReadbackBytes,
 					CounterReadback->GetGPUSizeBytes(),
 					CounterReadbackBytes);
-				delete PositionReadback;
+				delete VertexReadback;
 				delete NormalReadback;
-				delete TargetPositionReadback;
-				delete CellReadback;
 				delete CounterReadback;
 				return;
 			}
 
 			bool bLockedAll = true;
-			if (const FVector4f* PositionPtr = static_cast<const FVector4f*>(PositionReadback->Lock(ActualVoxelReadbackBytes)))
+			if (const FVector4f* VertexPtr = static_cast<const FVector4f*>(VertexReadback->Lock(ActualVertexReadbackBytes)))
 			{
-				FMemory::Memcpy(PositionData.GetData(), PositionPtr, ActualVoxelReadbackBytes);
-				PositionReadback->Unlock();
+				FMemory::Memcpy(VertexData.GetData(), VertexPtr, ActualVertexReadbackBytes);
+				VertexReadback->Unlock();
 			}
 			else
 			{
 				bLockedAll = false;
 			}
 
-			if (const FVector4f* NormalPtr = static_cast<const FVector4f*>(NormalReadback->Lock(ActualVoxelReadbackBytes)))
+			if (const FVector4f* NormalPtr = static_cast<const FVector4f*>(NormalReadback->Lock(ActualVertexReadbackBytes)))
 			{
-				FMemory::Memcpy(NormalData.GetData(), NormalPtr, ActualVoxelReadbackBytes);
+				FMemory::Memcpy(NormalData.GetData(), NormalPtr, ActualVertexReadbackBytes);
 				NormalReadback->Unlock();
-			}
-			else
-			{
-				bLockedAll = false;
-			}
-
-			if (const FVector4f* TargetPositionPtr = static_cast<const FVector4f*>(TargetPositionReadback->Lock(ActualVoxelReadbackBytes)))
-			{
-				FMemory::Memcpy(TargetPositionData.GetData(), TargetPositionPtr, ActualVoxelReadbackBytes);
-				TargetPositionReadback->Unlock();
-			}
-			else
-			{
-				bLockedAll = false;
-			}
-
-			if (const FIntVector4* CellPtr = static_cast<const FIntVector4*>(CellReadback->Lock(ActualVoxelCellReadbackBytes)))
-			{
-				FMemory::Memcpy(CellData.GetData(), CellPtr, ActualVoxelCellReadbackBytes);
-				CellReadback->Unlock();
 			}
 			else
 			{
@@ -2621,8 +2715,7 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 
 			if (const uint32* CounterPtr = static_cast<const uint32*>(CounterReadback->Lock(CounterReadbackBytes)))
 			{
-				VoxelCount = CounterPtr[0];
-				DroppedVoxelCount = CounterPtr[1];
+				TriangleCount = *CounterPtr;
 				CounterReadback->Unlock();
 			}
 			else
@@ -2630,10 +2723,8 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 				bLockedAll = false;
 			}
 
-			delete PositionReadback;
+			delete VertexReadback;
 			delete NormalReadback;
-			delete TargetPositionReadback;
-			delete CellReadback;
 			delete CounterReadback;
 			bReadbackSucceeded = bLockedAll;
 		});
@@ -2642,101 +2733,33 @@ FCSSurfaceVoxelData AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsFromGPU
 
 	if (!bReadbackSucceeded)
 	{
-		return OutVoxelData;
+		return ResultTriangleData;
 	}
 
-	if (DroppedVoxelCount > 0)
+	const int32 MaxTriangleCapacity = VertexCapacity / 3;
+	const int32 SafeTriangleCount = FMath::Clamp<int32>(int32(TriangleCount), 0, MaxTriangleCapacity);
+	const int32 EffectiveVertexCount = FMath::Clamp(SafeTriangleCount * 3, 0, VertexData.Num());
+	if (EffectiveVertexCount <= 0)
 	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[GetBoxSceneSurfaceVoxelsFromGPU] Voxel buffer overflow: %u cells dropped (capacity MaxVoxels=%d). Increase MaxVoxels or VoxelSize."),
-			DroppedVoxelCount, SafeMaxVoxels);
+		StoreTriangleTextureData(ResultTriangleData, SafeFilterDistance, QueryBox);
+		return ResultTriangleData;
 	}
 
-	const int32 EffectiveVoxelCount = FMath::Clamp<int32>(int32(VoxelCount), 0, PositionData.Num());
-	if (EffectiveVoxelCount <= 0)
+	ResultTriangleData.Vertices.Reserve(EffectiveVertexCount);
+	ResultTriangleData.VertexNormals.Reserve(EffectiveVertexCount);
+	for (int32 VertexIndex = 0; VertexIndex < EffectiveVertexCount; ++VertexIndex)
 	{
-		OutVoxelData.VoxelCount = 0;
-		return OutVoxelData;
+		const FVector4f& Vertex = VertexData[VertexIndex];
+		ResultTriangleData.Vertices.Add(FVector(Vertex.X, Vertex.Y, Vertex.Z));
+
+		const FVector4f& Normal = NormalData[VertexIndex];
+		ResultTriangleData.VertexNormals.Add(FVector(Normal.X, Normal.Y, Normal.Z));
 	}
+	ResultTriangleData.VertexCount = EffectiveVertexCount;
+	ResultTriangleData.IndexCount = 0;
 
-	OutVoxelData.Positions.Reserve(EffectiveVoxelCount);
-	OutVoxelData.Normals.Reserve(EffectiveVoxelCount);
-	OutVoxelData.TargetPositions.Reserve(EffectiveVoxelCount);
-	OutVoxelData.Cells.Reserve(EffectiveVoxelCount);
-	int32 InvalidPositionCount = 0;
-	int32 InvalidNormalCount = 0;
-	int32 InvalidTargetCount = 0;
-	int32 InvalidTargetVectorCount = 0;
-	int32 InvalidTargetWCount = 0;
-	int32 FarTargetCount = 0;
-	const double MaxTargetDistanceSq = FMath::Square(double(FMath::Max(OutVoxelData.VoxelSize * 2.0f, UE_KINDA_SMALL_NUMBER)));
-	for (int32 VoxelIndex = 0; VoxelIndex < EffectiveVoxelCount; ++VoxelIndex)
-	{
-		const FVector4f& Position = PositionData[VoxelIndex];
-		const FVector4f& Normal = NormalData[VoxelIndex];
-		const FVector4f& TargetPosition = TargetPositionData[VoxelIndex];
-		const FIntVector4& Cell = CellData[VoxelIndex];
-
-		if (!IsFiniteCSVector4(Position) || Position.W <= 0.0f)
-		{
-			++InvalidPositionCount;
-			continue;
-		}
-
-		const FVector VoxelCenter(Position.X, Position.Y, Position.Z);
-		FVector SafeNormal(Normal.X, Normal.Y, Normal.Z);
-		if (!IsFiniteCSVector4(Normal) || !SafeNormal.Normalize())
-		{
-			SafeNormal = FVector::UpVector;
-			++InvalidNormalCount;
-		}
-
-		FVector SafeTarget(TargetPosition.X, TargetPosition.Y, TargetPosition.Z);
-		const bool bFiniteTarget = IsFiniteCSVector4(TargetPosition);
-		const bool bPositiveTargetW = TargetPosition.W > 0.0f;
-		const bool bTargetWithinVoxel = bFiniteTarget
-			&& FVector::DistSquared(SafeTarget, VoxelCenter) <= MaxTargetDistanceSq;
-		const bool bValidTarget = bFiniteTarget && bPositiveTargetW && bTargetWithinVoxel;
-		if (!bValidTarget)
-		{
-			if (!bFiniteTarget)
-			{
-				++InvalidTargetVectorCount;
-			}
-			else if (!bPositiveTargetW)
-			{
-				++InvalidTargetWCount;
-			}
-			else
-			{
-				++FarTargetCount;
-			}
-			SafeTarget = VoxelCenter;
-			++InvalidTargetCount;
-		}
-
-		OutVoxelData.Positions.Add(VoxelCenter);
-		OutVoxelData.Normals.Add(SafeNormal);
-		OutVoxelData.TargetPositions.Add(SafeTarget);
-		OutVoxelData.Cells.Add(FIntVector(Cell.X, Cell.Y, Cell.Z));
-	}
-	OutVoxelData.VoxelCount = OutVoxelData.Positions.Num();
-	if (InvalidPositionCount > 0 || InvalidNormalCount > 0 || InvalidTargetCount > 0)
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[GetBoxSceneSurfaceVoxelsFromGPU] Sanitized surface voxel readback. Input=%d Output=%d InvalidPositions=%d InvalidNormals=%d InvalidTargets=%d InvalidTargetVectors=%d InvalidTargetW=%d FarTargets=%d"),
-			EffectiveVoxelCount,
-			OutVoxelData.VoxelCount,
-			InvalidPositionCount,
-			InvalidNormalCount,
-			InvalidTargetCount,
-			InvalidTargetVectorCount,
-			InvalidTargetWCount,
-			FarTargetCount);
-	}
-	LastSurfaceVoxelData = OutVoxelData;
-	StoreSurfaceVoxelTextureData(OutVoxelData, QueryBox.Min);
-	return OutVoxelData;
+	StoreTriangleTextureData(ResultTriangleData, SafeFilterDistance, QueryBox);
+	return ResultTriangleData;
 }
 
 void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSize,
@@ -2794,7 +2817,7 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 	const uint64 TotalStaticMeshTriangleCount = ResolveStaticMeshTriangleRequests(
 		Requests,
 		this,
-		ExcludedActorTag,
+		ExcludedActorTags,
 		true,
 		ResolvedRequests);
 	if (ResolvedRequests.IsEmpty() && !bHasLandscapeTriangles)
@@ -2829,50 +2852,247 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 		 ReferencePointsForRender, SafeFilterDistance, SafeSurfaceVoxelBlurIterations, SafeSurfaceVoxelBlurRadius,
 		 &bRenderWorkQueued, &bHasGPUOutput, &VoxelCapacity, &ActualVoxelReadbackBytes, &ActualVoxelCellReadbackBytes](FRHICommandListImmediate& RHICmdList)
 		{
-			FRDGBuilder GraphBuilder(RHICmdList);
-			const FCSTriangleMeshData* InitialTriangleData = GetTriangleMeshDataTriangleCount(LandscapeTriangleData) > 0 ? &LandscapeTriangleData : nullptr;
+			const uint32 VoxCap = uint32(FMath::Max(1, SafeMaxVoxels));
+			const uint32 HashSlotCount = GetSurfaceVoxelHashSlotCount(SafeMaxVoxels, 0);
+			const float SafeSurfaceThickness = SafeVoxelSize * 0.5f;
 
-			FCSStaticMeshTriangleRDGOutput TriangleOutput = AddResolvedStaticMeshTrianglesToRDGInternal(
-				GraphBuilder,
-				RHICmdList,
-				ResolvedRequests,
-				TotalStaticMeshTriangleCount,
-				ReferencePointsForRender,
-				SafeFilterDistance,
-				SafeMaxTriangles,
-				InitialTriangleData,
-				TEXT("CS.FilteredSurfaceVoxels.Triangles"));
+			TRefCountPtr<FRDGPooledBuffer> VoxelPositionsBuf = AllocatePooledBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), VoxCap), TEXT("CS.SV.Positions"));
+			TRefCountPtr<FRDGPooledBuffer> VoxelNormalsBuf = AllocatePooledBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), VoxCap), TEXT("CS.SV.Normals"));
+			TRefCountPtr<FRDGPooledBuffer> VoxelCounterBuf = AllocatePooledBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 2), TEXT("CS.SV.Counter"));
+			TRefCountPtr<FRDGPooledBuffer> VoxelHashSlotsBuf = AllocatePooledBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), HashSlotCount), TEXT("CS.SV.HashSlots"));
+			TRefCountPtr<FRDGPooledBuffer> VoxelHashIndicesBuf = AllocatePooledBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), HashSlotCount), TEXT("CS.SV.HashIndices"));
+			TRefCountPtr<FRDGPooledBuffer> VoxelNormalSumsBuf = AllocatePooledBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(int32), VoxCap * 4u), TEXT("CS.SV.NormalSums"));
+			TRefCountPtr<FRDGPooledBuffer> VoxelNormalCountsBuf = AllocatePooledBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), VoxCap), TEXT("CS.SV.NormalCounts"));
+			TRefCountPtr<FRDGPooledBuffer> VoxelTargetPositionsBuf = AllocatePooledBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), VoxCap), TEXT("CS.SV.TargetPositions"));
+			TRefCountPtr<FRDGPooledBuffer> VoxelTargetOffsetSumsBuf = AllocatePooledBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(int32), VoxCap * 4u), TEXT("CS.SV.TargetOffsetSums"));
+			TRefCountPtr<FRDGPooledBuffer> VoxelTargetWeightSumsBuf = AllocatePooledBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), VoxCap), TEXT("CS.SV.TargetWeightSums"));
+			TRefCountPtr<FRDGPooledBuffer> VoxelCellsBuf = AllocatePooledBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(int32) * 4, VoxCap), TEXT("CS.SV.Cells"));
+			TRefCountPtr<FRDGPooledBuffer> BlurredNormalsBuf = AllocatePooledBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), VoxCap), TEXT("CS.SV.BlurredNormals"));
+			TRefCountPtr<FRDGPooledBuffer> BlurredTargetsBuf = AllocatePooledBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), VoxCap), TEXT("CS.SV.BlurredTargets"));
 
-			FCSSurfaceVoxelRDGOutput VoxelOutput = AddTriangleSurfaceVoxelsToRDGInternal(
-				GraphBuilder,
-				TriangleOutput,
-				VoxelOrigin,
-				SafeVoxelSize,
-				0.0f,
-				SafeMaxVoxels,
-				0,
-				SafeSurfaceVoxelBlurIterations,
-				SafeSurfaceVoxelBlurRadius,
-				TEXT("CS.FilteredSurfaceVoxels"));
-
-			if (VoxelOutput.VoxelPositions
-				&& VoxelOutput.VoxelNormals
-				&& VoxelOutput.VoxelTargetPositions
-				&& VoxelOutput.VoxelCells
-				&& VoxelOutput.VoxelCounter)
 			{
-				VoxelCapacity = int32(VoxelOutput.MaxVoxels);
-				ActualVoxelReadbackBytes = uint32(uint64(VoxelOutput.MaxVoxels) * sizeof(FVector4f));
-				ActualVoxelCellReadbackBytes = uint32(uint64(VoxelOutput.MaxVoxels) * sizeof(FIntVector4));
-				AddEnqueueCopyPass(GraphBuilder, PositionReadback, VoxelOutput.VoxelPositions, ActualVoxelReadbackBytes);
-				AddEnqueueCopyPass(GraphBuilder, NormalReadback, VoxelOutput.VoxelNormals, ActualVoxelReadbackBytes);
-				AddEnqueueCopyPass(GraphBuilder, TargetPositionReadback, VoxelOutput.VoxelTargetPositions, ActualVoxelReadbackBytes);
-				AddEnqueueCopyPass(GraphBuilder, CellReadback, VoxelOutput.VoxelCells, ActualVoxelCellReadbackBytes);
-				AddEnqueueCopyPass(GraphBuilder, CounterReadback, VoxelOutput.VoxelCounter, CounterReadbackBytes);
-				bHasGPUOutput = true;
+				FRDGBuilder InitGraph(RHICmdList);
+				FRDGBufferRef RDG_Positions = InitGraph.RegisterExternalBuffer(VoxelPositionsBuf);
+				FRDGBufferRef RDG_Normals = InitGraph.RegisterExternalBuffer(VoxelNormalsBuf);
+				FRDGBufferRef RDG_Counter = InitGraph.RegisterExternalBuffer(VoxelCounterBuf);
+				FRDGBufferRef RDG_HashSlots = InitGraph.RegisterExternalBuffer(VoxelHashSlotsBuf);
+				FRDGBufferRef RDG_HashIndices = InitGraph.RegisterExternalBuffer(VoxelHashIndicesBuf);
+				FRDGBufferRef RDG_NormalSums = InitGraph.RegisterExternalBuffer(VoxelNormalSumsBuf);
+				FRDGBufferRef RDG_NormalCounts = InitGraph.RegisterExternalBuffer(VoxelNormalCountsBuf);
+				FRDGBufferRef RDG_TargetPositions = InitGraph.RegisterExternalBuffer(VoxelTargetPositionsBuf);
+				FRDGBufferRef RDG_TargetOffsetSums = InitGraph.RegisterExternalBuffer(VoxelTargetOffsetSumsBuf);
+				FRDGBufferRef RDG_TargetWeightSums = InitGraph.RegisterExternalBuffer(VoxelTargetWeightSumsBuf);
+				FRDGBufferRef RDG_Cells = InitGraph.RegisterExternalBuffer(VoxelCellsBuf);
+				FRDGBufferRef RDG_BlurredNormals = InitGraph.RegisterExternalBuffer(BlurredNormalsBuf);
+				FRDGBufferRef RDG_BlurredTargets = InitGraph.RegisterExternalBuffer(BlurredTargetsBuf);
+				AddClearUAVPass(InitGraph, InitGraph.CreateUAV(FRDGBufferUAVDesc(RDG_Positions, PF_A32B32G32R32F)), 0.0f);
+				AddClearUAVPass(InitGraph, InitGraph.CreateUAV(FRDGBufferUAVDesc(RDG_Normals, PF_A32B32G32R32F)), 0.0f);
+				AddClearUAVPass(InitGraph, InitGraph.CreateUAV(FRDGBufferUAVDesc(RDG_Counter, PF_R32_UINT)), 0u);
+				AddClearUAVPass(InitGraph, InitGraph.CreateUAV(FRDGBufferUAVDesc(RDG_HashSlots, PF_R32_UINT)), 0u);
+				AddClearUAVPass(InitGraph, InitGraph.CreateUAV(FRDGBufferUAVDesc(RDG_HashIndices, PF_R32_UINT)), 0u);
+				AddClearUAVPass(InitGraph, InitGraph.CreateUAV(FRDGBufferUAVDesc(RDG_NormalSums, PF_R32_SINT)), 0u);
+				AddClearUAVPass(InitGraph, InitGraph.CreateUAV(FRDGBufferUAVDesc(RDG_NormalCounts, PF_R32_UINT)), 0u);
+				AddClearUAVPass(InitGraph, InitGraph.CreateUAV(FRDGBufferUAVDesc(RDG_TargetPositions, PF_A32B32G32R32F)), 0.0f);
+				AddClearUAVPass(InitGraph, InitGraph.CreateUAV(FRDGBufferUAVDesc(RDG_TargetOffsetSums, PF_R32_SINT)), 0u);
+				AddClearUAVPass(InitGraph, InitGraph.CreateUAV(FRDGBufferUAVDesc(RDG_TargetWeightSums, PF_R32_UINT)), 0u);
+				AddClearUAVPass(InitGraph, InitGraph.CreateUAV(FRDGBufferUAVDesc(RDG_Cells, PF_R32G32B32A32_UINT)), 0u);
+				AddClearUAVPass(InitGraph, InitGraph.CreateUAV(FRDGBufferUAVDesc(RDG_BlurredNormals, PF_A32B32G32R32F)), 0.0f);
+				AddClearUAVPass(InitGraph, InitGraph.CreateUAV(FRDGBufferUAVDesc(RDG_BlurredTargets, PF_A32B32G32R32F)), 0.0f);
+				InitGraph.Execute();
 			}
 
-			GraphBuilder.Execute();
+			const int32 BatchTriangleCap = FMath::Min(SafeMaxTriangles, 500000);
+			const FCSTriangleMeshData* InitialTriangleData = GetTriangleMeshDataTriangleCount(LandscapeTriangleData) > 0 ? &LandscapeTriangleData : nullptr;
+
+			TArray<TArray<FResolvedStaticMeshTriangleRequest>> Batches;
+			{
+				TArray<FResolvedStaticMeshTriangleRequest> CurrentBatch;
+				int64 CurrentBatchTriCount = 0;
+				for (int32 i = 0; i < ResolvedRequests.Num(); ++i)
+				{
+					if (CurrentBatchTriCount + ResolvedRequests[i].TriangleCount > int64(BatchTriangleCap) && CurrentBatch.Num() > 0)
+					{
+						Batches.Add(MoveTemp(CurrentBatch));
+						CurrentBatch.Reset();
+						CurrentBatchTriCount = 0;
+					}
+					CurrentBatch.Add(ResolvedRequests[i]);
+					CurrentBatchTriCount += ResolvedRequests[i].TriangleCount;
+				}
+				if (CurrentBatch.Num() > 0)
+				{
+					Batches.Add(MoveTemp(CurrentBatch));
+				}
+			}
+
+			TShaderMapRef<FTriangleSurfaceVoxelsCS> VoxelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+
+			for (int32 BatchIdx = 0; BatchIdx < Batches.Num(); ++BatchIdx)
+			{
+				const TArray<FResolvedStaticMeshTriangleRequest>& Batch = Batches[BatchIdx];
+				uint64 BatchTriCount = 0;
+				for (const auto& Req : Batch) BatchTriCount += Req.TriangleCount;
+
+				FRDGBuilder BatchGraph(RHICmdList);
+
+				const FCSTriangleMeshData* BatchInitData = (BatchIdx == 0) ? InitialTriangleData : nullptr;
+				FCSStaticMeshTriangleRDGOutput TriOut = AddResolvedStaticMeshTrianglesToRDGInternal(
+					BatchGraph, RHICmdList, Batch, BatchTriCount, ReferencePointsForRender, SafeFilterDistance,
+					BatchTriangleCap, BatchInitData, TEXT("CS.FilteredSV.Batch.Tri"));
+
+				if (TriOut.TriangleVertices && TriOut.TriangleNormals && TriOut.TriangleCounter && TriOut.MaxTriangles > 0)
+				{
+					FRDGBufferRef ExtPositions = BatchGraph.RegisterExternalBuffer(VoxelPositionsBuf);
+					FRDGBufferRef ExtNormals = BatchGraph.RegisterExternalBuffer(VoxelNormalsBuf);
+					FRDGBufferRef ExtCounter = BatchGraph.RegisterExternalBuffer(VoxelCounterBuf);
+					FRDGBufferRef ExtHashSlots = BatchGraph.RegisterExternalBuffer(VoxelHashSlotsBuf);
+					FRDGBufferRef ExtHashIndices = BatchGraph.RegisterExternalBuffer(VoxelHashIndicesBuf);
+					FRDGBufferRef ExtNormalSums = BatchGraph.RegisterExternalBuffer(VoxelNormalSumsBuf);
+					FRDGBufferRef ExtNormalCounts = BatchGraph.RegisterExternalBuffer(VoxelNormalCountsBuf);
+					FRDGBufferRef ExtTargetPositions = BatchGraph.RegisterExternalBuffer(VoxelTargetPositionsBuf);
+					FRDGBufferRef ExtTargetOffsetSums = BatchGraph.RegisterExternalBuffer(VoxelTargetOffsetSumsBuf);
+					FRDGBufferRef ExtTargetWeightSums = BatchGraph.RegisterExternalBuffer(VoxelTargetWeightSumsBuf);
+					FRDGBufferRef ExtCells = BatchGraph.RegisterExternalBuffer(VoxelCellsBuf);
+
+					FRDGBufferSRVRef TriVertsSRV = TriOut.TriangleVerticesSRV ? TriOut.TriangleVerticesSRV : BatchGraph.CreateSRV(FRDGBufferSRVDesc(TriOut.TriangleVertices, PF_A32B32G32R32F));
+					FRDGBufferSRVRef TriNormsSRV = TriOut.TriangleNormalsSRV ? TriOut.TriangleNormalsSRV : BatchGraph.CreateSRV(FRDGBufferSRVDesc(TriOut.TriangleNormals, PF_A32B32G32R32F));
+					FRDGBufferSRVRef TriCounterSRV = TriOut.TriangleCounterSRV ? TriOut.TriangleCounterSRV : BatchGraph.CreateSRV(FRDGBufferSRVDesc(TriOut.TriangleCounter, PF_R32_UINT));
+
+					FTriangleSurfaceVoxelsCS::FParameters* VP = BatchGraph.AllocParameters<FTriangleSurfaceVoxelsCS::FParameters>();
+					VP->TriangleVertices = TriVertsSRV;
+					VP->TriangleNormals = TriNormsSRV;
+					VP->SurfaceTriangleCounter = TriCounterSRV;
+					VP->RW_OutVoxelPositions = BatchGraph.CreateUAV(FRDGBufferUAVDesc(ExtPositions, PF_A32B32G32R32F));
+					VP->RW_OutVoxelNormals = BatchGraph.CreateUAV(FRDGBufferUAVDesc(ExtNormals, PF_A32B32G32R32F));
+					VP->RW_SurfaceVoxelCounter = BatchGraph.CreateUAV(FRDGBufferUAVDesc(ExtCounter, PF_R32_UINT));
+					VP->RW_SurfaceVoxelHashSlots = BatchGraph.CreateUAV(FRDGBufferUAVDesc(ExtHashSlots, PF_R32_UINT));
+					VP->RW_SurfaceVoxelHashIndices = BatchGraph.CreateUAV(FRDGBufferUAVDesc(ExtHashIndices, PF_R32_UINT));
+					VP->RW_SurfaceVoxelNormalSums = BatchGraph.CreateUAV(FRDGBufferUAVDesc(ExtNormalSums, PF_R32_SINT));
+					VP->RW_SurfaceVoxelNormalCounts = BatchGraph.CreateUAV(FRDGBufferUAVDesc(ExtNormalCounts, PF_R32_UINT));
+					VP->RW_OutVoxelTargetPositions = BatchGraph.CreateUAV(FRDGBufferUAVDesc(ExtTargetPositions, PF_A32B32G32R32F));
+					VP->RW_SurfaceVoxelTargetOffsetSums = BatchGraph.CreateUAV(FRDGBufferUAVDesc(ExtTargetOffsetSums, PF_R32_SINT));
+					VP->RW_SurfaceVoxelTargetWeightSums = BatchGraph.CreateUAV(FRDGBufferUAVDesc(ExtTargetWeightSums, PF_R32_UINT));
+					VP->RW_OutVoxelCells = BatchGraph.CreateUAV(FRDGBufferUAVDesc(ExtCells, PF_R32G32B32A32_UINT));
+					VP->SurfaceVoxelOrigin = FVector3f(VoxelOrigin);
+					VP->SurfaceVoxelSize = SafeVoxelSize;
+					VP->SurfaceThickness = SafeSurfaceThickness;
+					VP->SurfaceTriangleCount = TriOut.MaxTriangles;
+					VP->SurfaceVoxelCapacity = VoxCap;
+					VP->SurfaceVoxelHashSlotCount = HashSlotCount;
+
+					BatchGraph.AddPass(
+						RDG_EVENT_NAME("CS.FilteredSV.Batch%d.Voxelize", BatchIdx),
+						VP, ERDGPassFlags::Compute,
+						[VP, VoxelShader, TriCap = TriOut.MaxTriangles](FRHIComputeCommandList& Cmd)
+						{
+							FComputeShaderUtils::Dispatch(Cmd, VoxelShader, *VP, FComputeShaderUtils::GetGroupCount(FIntVector(int32(TriCap), 1, 1), 64));
+						});
+				}
+				BatchGraph.Execute();
+			}
+
+			{
+				FRDGBuilder FinalGraph(RHICmdList);
+
+				FRDGBufferRef FPositions = FinalGraph.RegisterExternalBuffer(VoxelPositionsBuf);
+				FRDGBufferRef FNormals = FinalGraph.RegisterExternalBuffer(VoxelNormalsBuf);
+				FRDGBufferRef FCounter = FinalGraph.RegisterExternalBuffer(VoxelCounterBuf);
+				FRDGBufferRef FNormalSums = FinalGraph.RegisterExternalBuffer(VoxelNormalSumsBuf);
+				FRDGBufferRef FNormalCounts = FinalGraph.RegisterExternalBuffer(VoxelNormalCountsBuf);
+				FRDGBufferRef FTargetPositions = FinalGraph.RegisterExternalBuffer(VoxelTargetPositionsBuf);
+				FRDGBufferRef FTargetOffsetSums = FinalGraph.RegisterExternalBuffer(VoxelTargetOffsetSumsBuf);
+				FRDGBufferRef FTargetWeightSums = FinalGraph.RegisterExternalBuffer(VoxelTargetWeightSumsBuf);
+				FRDGBufferRef FCells = FinalGraph.RegisterExternalBuffer(VoxelCellsBuf);
+				FRDGBufferRef FBlurNormals = FinalGraph.RegisterExternalBuffer(BlurredNormalsBuf);
+				FRDGBufferRef FBlurTargets = FinalGraph.RegisterExternalBuffer(BlurredTargetsBuf);
+
+				FRDGBufferUAVRef PositionsUAV = FinalGraph.CreateUAV(FRDGBufferUAVDesc(FPositions, PF_A32B32G32R32F));
+				FRDGBufferUAVRef NormalsUAV = FinalGraph.CreateUAV(FRDGBufferUAVDesc(FNormals, PF_A32B32G32R32F));
+				FRDGBufferUAVRef TargetPositionsUAV = FinalGraph.CreateUAV(FRDGBufferUAVDesc(FTargetPositions, PF_A32B32G32R32F));
+				FRDGBufferSRVRef NormalSumsSRV = FinalGraph.CreateSRV(FRDGBufferSRVDesc(FNormalSums, PF_R32_SINT));
+				FRDGBufferSRVRef NormalCountsSRV = FinalGraph.CreateSRV(FRDGBufferSRVDesc(FNormalCounts, PF_R32_UINT));
+				FRDGBufferUAVRef TargetOffsetSumsUAV = FinalGraph.CreateUAV(FRDGBufferUAVDesc(FTargetOffsetSums, PF_R32_SINT));
+				FRDGBufferUAVRef TargetWeightSumsUAV = FinalGraph.CreateUAV(FRDGBufferUAVDesc(FTargetWeightSums, PF_R32_UINT));
+
+				TShaderMapRef<FFinalizeSurfaceVoxelNormalsCS> FinalizeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				FFinalizeSurfaceVoxelNormalsCS::FParameters* FP = FinalGraph.AllocParameters<FFinalizeSurfaceVoxelNormalsCS::FParameters>();
+				FP->SurfaceVoxelNormalSums = NormalSumsSRV;
+				FP->SurfaceVoxelNormalCounts = NormalCountsSRV;
+				FP->RW_SurfaceVoxelTargetOffsetSums = TargetOffsetSumsUAV;
+				FP->RW_SurfaceVoxelTargetWeightSums = TargetWeightSumsUAV;
+				FP->RW_OutVoxelPositions = PositionsUAV;
+				FP->RW_OutVoxelNormals = NormalsUAV;
+				FP->RW_OutVoxelTargetPositions = TargetPositionsUAV;
+				FP->SurfaceVoxelCapacity = VoxCap;
+				FP->SurfaceVoxelSize = SafeVoxelSize;
+				FinalGraph.AddPass(
+					RDG_EVENT_NAME("CS.FilteredSV.FinalizeNormals"), FP, ERDGPassFlags::Compute,
+					[FP, FinalizeShader, VoxCap](FRHIComputeCommandList& Cmd)
+					{
+						FComputeShaderUtils::Dispatch(Cmd, FinalizeShader, *FP, FComputeShaderUtils::GetGroupCount(FIntVector(int32(VoxCap), 1, 1), 64));
+					});
+
+				const uint32 BlurIters = uint32(FMath::Max(0, SafeSurfaceVoxelBlurIterations));
+				FRDGBufferUAVRef BlurNormalsUAV = FinalGraph.CreateUAV(FRDGBufferUAVDesc(FBlurNormals, PF_A32B32G32R32F));
+				FRDGBufferUAVRef BlurTargetsUAV = FinalGraph.CreateUAV(FRDGBufferUAVDesc(FBlurTargets, PF_A32B32G32R32F));
+				FRDGBufferUAVRef CounterUAV = FinalGraph.CreateUAV(FRDGBufferUAVDesc(FCounter, PF_R32_UINT));
+				FRDGBufferUAVRef CellsUAV = FinalGraph.CreateUAV(FRDGBufferUAVDesc(FCells, PF_R32G32B32A32_UINT));
+				FRDGBufferRef FHashSlots = FinalGraph.RegisterExternalBuffer(VoxelHashSlotsBuf);
+				FRDGBufferRef FHashIndices = FinalGraph.RegisterExternalBuffer(VoxelHashIndicesBuf);
+				FRDGBufferUAVRef HashSlotsUAV = FinalGraph.CreateUAV(FRDGBufferUAVDesc(FHashSlots, PF_R32_UINT));
+				FRDGBufferUAVRef HashIndicesUAV = FinalGraph.CreateUAV(FRDGBufferUAVDesc(FHashIndices, PF_R32_UINT));
+
+				if (BlurIters > 0u)
+				{
+					const uint32 BlurRadius = uint32(FMath::Max(1, SafeSurfaceVoxelBlurRadius));
+					int32 CurrentNormalsIdx = 0;
+					int32 CurrentTargetsIdx = 0;
+					TShaderMapRef<FBlurSurfaceVoxelsCS> BlurShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+					for (uint32 Iter = 0u; Iter < BlurIters; ++Iter)
+					{
+						const bool bReadFromOriginal = (CurrentNormalsIdx == 0);
+						FRDGBufferUAVRef SrcN = bReadFromOriginal ? NormalsUAV : BlurNormalsUAV;
+						FRDGBufferUAVRef SrcT = bReadFromOriginal ? TargetPositionsUAV : BlurTargetsUAV;
+						FRDGBufferUAVRef DstN = bReadFromOriginal ? BlurNormalsUAV : NormalsUAV;
+						FRDGBufferUAVRef DstT = bReadFromOriginal ? BlurTargetsUAV : TargetPositionsUAV;
+						FBlurSurfaceVoxelsCS::FParameters* BP = FinalGraph.AllocParameters<FBlurSurfaceVoxelsCS::FParameters>();
+						BP->RW_SurfaceVoxelCounter = CounterUAV;
+					BP->RW_OutVoxelNormals = SrcN;
+					BP->RW_BlurredVoxelNormals = DstN;
+					BP->RW_OutVoxelTargetPositions = SrcT;
+					BP->RW_BlurredVoxelTargetPositions = DstT;
+					BP->RW_OutVoxelCells = CellsUAV;
+					BP->RW_SurfaceVoxelHashSlots = HashSlotsUAV;
+					BP->RW_SurfaceVoxelHashIndices = HashIndicesUAV;
+					BP->SurfaceVoxelCapacity = VoxCap;
+					BP->SurfaceVoxelHashSlotCount = HashSlotCount;
+					BP->SurfaceVoxelBlurRadius = BlurRadius;
+						FinalGraph.AddPass(
+							RDG_EVENT_NAME("CS.FilteredSV.Blur%d", Iter), BP, ERDGPassFlags::Compute,
+							[BP, BlurShader, VoxCap](FRHIComputeCommandList& Cmd)
+							{
+								FComputeShaderUtils::Dispatch(Cmd, BlurShader, *BP, FComputeShaderUtils::GetGroupCount(FIntVector(int32(VoxCap), 1, 1), 64));
+							});
+						CurrentNormalsIdx = 1 - CurrentNormalsIdx;
+						CurrentTargetsIdx = 1 - CurrentTargetsIdx;
+					}
+					if (CurrentNormalsIdx != 0) { NormalsUAV = BlurNormalsUAV; }
+					if (CurrentTargetsIdx != 0) { TargetPositionsUAV = BlurTargetsUAV; }
+				}
+
+				VoxelCapacity = int32(VoxCap);
+				ActualVoxelReadbackBytes = uint32(uint64(VoxCap) * sizeof(FVector4f));
+				ActualVoxelCellReadbackBytes = uint32(uint64(VoxCap) * sizeof(FIntVector4));
+				AddEnqueueCopyPass(FinalGraph, PositionReadback, FPositions, ActualVoxelReadbackBytes);
+				AddEnqueueCopyPass(FinalGraph, NormalReadback, FNormals, ActualVoxelReadbackBytes);
+				AddEnqueueCopyPass(FinalGraph, TargetPositionReadback, FTargetPositions, ActualVoxelReadbackBytes);
+				AddEnqueueCopyPass(FinalGraph, CellReadback, FCells, ActualVoxelCellReadbackBytes);
+				AddEnqueueCopyPass(FinalGraph, CounterReadback, FCounter, CounterReadbackBytes);
+				bHasGPUOutput = true;
+
+				FinalGraph.Execute();
+			}
+
 			bRenderWorkQueued = true;
 		});
 
@@ -3126,19 +3346,18 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 	StoreSurfaceVoxelTextureData(LastSurfaceVoxelData, QueryBox.Min);
 }
 
+FCSSurfaceVoxelData AComputeShaderMeshGenerator::ReadbackBoxSceneSurfaceVoxelsSync(float VoxelSize, const TCHAR* DebugName)
+{
+	(void)DebugName;
+	TArray<FVector> UnusedPositions;
+	TArray<FVector> UnusedNormals;
+	GetBoxSceneFilteredSurfaceVoxels(VoxelSize, 0.0f, UnusedPositions, UnusedNormals);
+	return LastSurfaceVoxelData;
+}
+
 // -----------------------------------------------------------------------------
 // Core System - Generated Data Cache
 // -----------------------------------------------------------------------------
-
-FCSMeshGeneratorTriangleTextureDataHandle AComputeShaderMeshGenerator::GetLastTriangleTextureData() const
-{
-	return LastTriangleTextureData;
-}
-
-FCSMeshGeneratorSurfaceVoxelTextureDataHandle AComputeShaderMeshGenerator::GetLastSurfaceVoxelTextureData() const
-{
-	return LastSurfaceVoxelTextureData;
-}
 
 FCSMeshGeneratorTriangleTextureDataHandle AComputeShaderMeshGenerator::UpdateBoxSceneTriangleTextureData(float ReferenceFilterDistance)
 {
@@ -3148,7 +3367,7 @@ FCSMeshGeneratorTriangleTextureDataHandle AComputeShaderMeshGenerator::UpdateBox
 
 FCSMeshGeneratorSurfaceVoxelTextureDataHandle AComputeShaderMeshGenerator::UpdateBoxSceneSurfaceVoxelTextureData(float VoxelSize)
 {
-	GetBoxSceneSurfaceVoxelsFromGPU(VoxelSize);
+	ReadbackBoxSceneSurfaceVoxelsSync(VoxelSize);
 	return LastSurfaceVoxelTextureData;
 }
 
@@ -3261,26 +3480,10 @@ int32 AComputeShaderMeshGenerator::DrawDebugLastSurfaceVoxelDirections(
 		Options.MaxDirectionsToDraw);
 }
 
-int32 AComputeShaderMeshGenerator::DrawDebugLastSurfaceVoxelArrows(
-	const FCSDebugLastVoxelArrowOptions& Options) const
-{
-	FCSDebugLastVoxelDirectionOptions DirectionOpts;
-	DirectionOpts.DirectionLength = Options.ArrowLength;
-	DirectionOpts.DirectionColor = Options.ArrowColor;
-	DirectionOpts.Duration = Options.Duration;
-	DirectionOpts.Thickness = Options.Thickness;
-	DirectionOpts.bPersistentLines = Options.bPersistentLines;
-	DirectionOpts.bDrawPoints = Options.bDrawPoints;
-	DirectionOpts.PointColor = Options.PointColor;
-	DirectionOpts.PointSize = Options.PointSize;
-	DirectionOpts.MaxDirectionsToDraw = Options.MaxArrowsToDraw;
-	return DrawDebugLastSurfaceVoxelDirections(DirectionOpts);
-}
-
 int32 AComputeShaderMeshGenerator::DrawDebugBoxSceneSurfaceVoxelDirections(
 	const FCSDebugBoxVoxelDirectionOptions& Options)
 {
-	const FCSSurfaceVoxelData SurfaceVoxels = GetBoxSceneSurfaceVoxelsFromGPU(Options.VoxelSize);
+	const FCSSurfaceVoxelData SurfaceVoxels = ReadbackBoxSceneSurfaceVoxelsSync(Options.VoxelSize);
 	const float EffectiveDirectionLength = Options.DirectionLength > 0.0f
 		? Options.DirectionLength
 		: FMath::Max(SurfaceVoxels.VoxelSize, UE_KINDA_SMALL_NUMBER);
@@ -3296,23 +3499,6 @@ int32 AComputeShaderMeshGenerator::DrawDebugBoxSceneSurfaceVoxelDirections(
 		Options.PointColor,
 		Options.PointSize,
 		Options.MaxDirectionsToDraw);
-}
-
-int32 AComputeShaderMeshGenerator::DrawDebugBoxSceneSurfaceVoxelArrows(
-	const FCSDebugBoxVoxelArrowOptions& Options)
-{
-	FCSDebugBoxVoxelDirectionOptions DirectionOpts;
-	DirectionOpts.VoxelSize = Options.VoxelSize;
-	DirectionOpts.DirectionLength = Options.ArrowLength;
-	DirectionOpts.DirectionColor = Options.ArrowColor;
-	DirectionOpts.Duration = Options.Duration;
-	DirectionOpts.Thickness = Options.Thickness;
-	DirectionOpts.bPersistentLines = Options.bPersistentLines;
-	DirectionOpts.bDrawPoints = Options.bDrawPoints;
-	DirectionOpts.PointColor = Options.PointColor;
-	DirectionOpts.PointSize = Options.PointSize;
-	DirectionOpts.MaxDirectionsToDraw = Options.MaxArrowsToDraw;
-	return DrawDebugBoxSceneSurfaceVoxelDirections(DirectionOpts);
 }
 
 UTextureRenderTarget2D* AComputeShaderMeshGenerator::GetOrCreateGeneratedDataRenderTarget(
@@ -3608,7 +3794,7 @@ void AComputeShaderMeshGenerator::ClearSurfaceVoxelTextureData()
 UDynamicMesh* AComputeShaderMeshGenerator::SurfaceVoxelsToIsolatedQuadsDebug(float VoxelSize,
 	bool bReverseOrientation)
 {
-	const FCSSurfaceVoxelData SurfaceVoxels = GetBoxSceneSurfaceVoxelsFromGPU(VoxelSize);
+	const FCSSurfaceVoxelData SurfaceVoxels = ReadbackBoxSceneSurfaceVoxelsSync(VoxelSize);
 
 	UDynamicMesh* OutMesh = CreateEmptyDynamicMesh();
 	if (!OutMesh)
@@ -3718,7 +3904,7 @@ UDynamicMesh* AComputeShaderMeshGenerator::SurfaceVoxelsToOpenDynamicMesh(float 
 	bool bReverseOrientation,
 	bool bRecomputeNormals)
 {
-	const FCSSurfaceVoxelData SurfaceVoxels = GetBoxSceneSurfaceVoxelsFromGPU(VoxelSize);
+	const FCSSurfaceVoxelData SurfaceVoxels = ReadbackBoxSceneSurfaceVoxelsSync(VoxelSize);
 
 	UDynamicMesh* OutMesh = CreateEmptyDynamicMesh();
 	if (!OutMesh)
@@ -3810,7 +3996,7 @@ UDynamicMesh* AComputeShaderMeshGenerator::SurfaceVoxelsToVDBMesh(float VoxelSiz
 	float RadiusMult,
 	bool bRecomputeNormals)
 {
-	const FCSSurfaceVoxelData SurfaceVoxels = GetBoxSceneSurfaceVoxelsFromGPU(VoxelSize);
+	const FCSSurfaceVoxelData SurfaceVoxels = ReadbackBoxSceneSurfaceVoxelsSync(VoxelSize);
 	UDynamicMesh* OutMesh = CreateEmptyDynamicMesh();
 	if (!OutMesh)
 	{
@@ -3923,7 +4109,7 @@ void AComputeShaderMeshGenerator::SpawnDebugSurfaceTrianglesDynamicMeshActor(flo
 		CachedSurfaceTriangles.VertexNormals,
 		CachedSurfaceTriangles.VertexCount,
 		CachedSurfaceTriangles.IndexCount,
-		false, // bReverseOrientation
+		true,  // bReverseOrientation
 		true,  // bSkipDegenerateTriangles
 		true); // bRecomputeNormals
 
@@ -4360,11 +4546,6 @@ FCSMeshGeneratorTriangleCacheHandle AComputeShaderMeshGenerator::GetTriangleCach
 	return Handle;
 }
 
-FBox AComputeShaderMeshGenerator::GetCachedWorldBounds() const
-{
-	return CacheState.CachedWorldBounds;
-}
-
 // -----------------------------------------------------------------------------
 // Debug System
 // -----------------------------------------------------------------------------
@@ -4526,7 +4707,7 @@ void AComputeShaderMeshGenerator::BuildActiveCellsFromReferencePoints(
 			continue;
 		}
 
-		const FIntVector CenterCell = WorldPositionToCell(Point).ToIntVector();
+		const FIntVector CenterCell = WorldPositionToCell(Point);
 		for (int32 Z = CenterCell.Z - RadiusInCells; Z <= CenterCell.Z + RadiusInCells; ++Z)
 		{
 			if (Z < 0 || Z >= CacheState.GridSize.Z)
@@ -4709,7 +4890,7 @@ void AComputeShaderMeshGenerator::DispatchDirtyVoxelTriangleCacheUpdate()
 	const uint64 TotalStaticMeshTriangleCount = ResolveStaticMeshTriangleRequests(
 		SceneTriangleRequests,
 		this,
-		ExcludedActorTag,
+		ExcludedActorTags,
 		true,
 		ResolvedRequests);
 
@@ -4937,21 +5118,9 @@ FBox AComputeShaderMeshGenerator::GetCellWorldBounds(const FCSMeshGeneratorVoxel
 
 void AComputeShaderMeshGenerator::ReleaseCacheResources()
 {
-	if (VoxelMetaRT)
-	{
-		VoxelMetaRT->ReleaseResource();
-		VoxelMetaRT = nullptr;
-	}
-	if (TriangleVertexRT)
-	{
-		TriangleVertexRT->ReleaseResource();
-		TriangleVertexRT = nullptr;
-	}
-	if (TriangleNormalRT)
-	{
-		TriangleNormalRT->ReleaseResource();
-		TriangleNormalRT = nullptr;
-	}
+	ReleaseRTAndNull(VoxelMetaRT);
+	ReleaseRTAndNull(TriangleVertexRT);
+	ReleaseRTAndNull(TriangleNormalRT);
 }
 
 void AComputeShaderMeshGenerator::ResetCacheRuntime(bool bClearRequests)
@@ -5026,32 +5195,9 @@ void AComputeShaderMeshGenerator::CreateCacheRenderTargets()
 		MakeUniqueObjectName(this, UTextureRenderTarget2D::StaticClass(), TEXT("CSMeshGenerator_TriangleNormalRT")),
 		RF_Transient);
 
-	if (VoxelMetaRT)
-	{
-		VoxelMetaRT->RenderTargetFormat = RTF_RGBA32f;
-		VoxelMetaRT->ClearColor = FLinearColor::Black;
-		VoxelMetaRT->bCanCreateUAV = true;
-		VoxelMetaRT->InitAutoFormat(MetaWidth, MetaHeight);
-		VoxelMetaRT->UpdateResourceImmediate(true);
-	}
-
-	if (TriangleVertexRT)
-	{
-		TriangleVertexRT->RenderTargetFormat = RTF_RGBA32f;
-		TriangleVertexRT->ClearColor = FLinearColor::Black;
-		TriangleVertexRT->bCanCreateUAV = true;
-		TriangleVertexRT->InitAutoFormat(VertexWidth, VertexHeight);
-		TriangleVertexRT->UpdateResourceImmediate(true);
-	}
-
-	if (TriangleNormalRT)
-	{
-		TriangleNormalRT->RenderTargetFormat = RTF_RGBA32f;
-		TriangleNormalRT->ClearColor = FLinearColor::Black;
-		TriangleNormalRT->bCanCreateUAV = true;
-		TriangleNormalRT->InitAutoFormat(NormalWidth, NormalHeight);
-		TriangleNormalRT->UpdateResourceImmediate(true);
-	}
+	InitCacheRT(VoxelMetaRT, MetaWidth, MetaHeight);
+	InitCacheRT(TriangleVertexRT, VertexWidth, VertexHeight);
+	InitCacheRT(TriangleNormalRT, NormalWidth, NormalHeight);
 }
 
 void AComputeShaderMeshGenerator::RebuildRequestActiveCellsFromLastRequests()
@@ -5077,18 +5223,7 @@ void AComputeShaderMeshGenerator::RebuildRequestActiveCellsFromLastRequests()
 
 bool AComputeShaderMeshGenerator::HasValidCacheResources() const
 {
-	return VoxelMetaRT != nullptr
-		&& TriangleVertexRT != nullptr
-		&& TriangleNormalRT != nullptr
-		&& VoxelMetaRT->bCanCreateUAV
-		&& TriangleVertexRT->bCanCreateUAV
-		&& TriangleNormalRT->bCanCreateUAV
-		&& VoxelMetaRT->SizeX > 0
-		&& VoxelMetaRT->SizeY > 0
-		&& TriangleVertexRT->SizeX > 0
-		&& TriangleVertexRT->SizeY > 0
-		&& TriangleNormalRT->SizeX > 0
-		&& TriangleNormalRT->SizeY > 0;
+	return IsValidCacheRT(VoxelMetaRT) && IsValidCacheRT(TriangleVertexRT) && IsValidCacheRT(TriangleNormalRT);
 }
 
 bool AComputeShaderMeshGenerator::AreBoundsCompatible(const FBox& A, const FBox& B) const

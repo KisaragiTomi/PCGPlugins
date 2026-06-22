@@ -209,11 +209,6 @@ void ACSPlaneRangeGenerator::Tick(float DeltaTime)
 
 }
 
-void ACSPlaneRangeGenerator::GenerateInternal()
-{
-	Super::GenerateInternal();
-}
-
 TArray<FTransform> ACSPlaneRangeGenerator::GenerateTransformsInternal()
 {
 	FVector Center = Box->Bounds.Origin;

@@ -31,7 +31,7 @@ enum class EReductionCustomOp : uint8
  * 通用数学工具库，提供模板归约与 Blueprint 归约函数
  */
 UCLASS()
-class GEOMETRYMATH_API UGeneralMath : public UBlueprintFunctionLibrary
+class GEOMETRYSCRIPTEXTRAEDITOR_API UGeneralMath : public UBlueprintFunctionLibrary
 {
 	GENERATED_BODY()
 public:
@@ -141,7 +141,6 @@ public:
 
 	// ==================== 仅限 C++ 的通用 API（含 lambda）====================
 
-	// 统计满足条件的元素数量（仅 C++，支持任意 lambda）
 	template<typename T>
 	static int32 CountIf(TArrayView<const T> Input, TFunctionRef<bool(T)> Predicate)
 	{
@@ -150,7 +149,6 @@ public:
 		}, 0);
 	}
 
-	// 自定义 lambda 归约（仅 C++）
 	template<typename T, typename R>
 	static R Reduce_Custom(TArrayView<const T> Input, TFunctionRef<R(R, T)> Lambda, R Init)
 	{

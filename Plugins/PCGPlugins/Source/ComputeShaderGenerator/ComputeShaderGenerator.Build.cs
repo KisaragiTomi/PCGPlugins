@@ -10,7 +10,6 @@ public class ComputeShaderGenerator : ModuleRules
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 		bUseRTTI = true;
-		PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "..", "PCGPluginsShared"));
 		bool bPCGPluginsDebug = Target.Configuration != UnrealTargetConfiguration.Shipping;
 		string PCGPluginsDebugEnv = Environment.GetEnvironmentVariable("PCGPLUGINS_DEBUG");
 		if (!string.IsNullOrWhiteSpace(PCGPluginsDebugEnv))

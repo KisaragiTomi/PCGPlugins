@@ -33,7 +33,7 @@
 #include "PolyLine.h"
 #include "Curve/CurveUtil.h"
 #include "Selection/GeometrySelector.h"
-#include "GeometryMath/Public/Noise.h"
+#include "Noise.h"
 #include "EngineUtils.h"
 #include "GeometryScript/MeshVertexColorFunctions.h"
 #include "DynamicMesh/DynamicMeshOverlay.h"

@@ -22,6 +22,21 @@ struct FCSSPlinePointData
 	TArray<TArray<FLinearColor>> PointData;
 };
 
+/**
+ * Unified blend mode for all CS landscape edit layers (Temp / Layer / Landscape).
+ * Integer order MUST stay in sync with the TempLayerBlend branch in CSLandscape.usf.
+ */
+UENUM(BlueprintType)
+enum class ECSLandscapeBlendMode : uint8
+{
+	Alpha         UMETA(DisplayName = "Alpha Lerp (Lerp toward generated height)"),
+	Override      UMETA(DisplayName = "Override (Replace within alpha mask)"),
+	Additive      UMETA(DisplayName = "Additive (Height += Delta * Alpha)"),
+	Subtract      UMETA(DisplayName = "Subtract (Height -= Delta * Alpha)"),
+	Multiply      UMETA(DisplayName = "Multiply (Height *= Generated * Alpha + (1-Alpha))"),
+	MaterialDrive UMETA(DisplayName = "Material Driven (Per-pixel blend from material texture)")
+};
+
 USTRUCT()
 struct COMPUTESHADERGENERATOR_API FCSReadLandscapeData
 {
@@ -74,14 +89,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	static void UpPixelsMask(UTextureRenderTarget2D* InTextureTarget, UTextureRenderTarget2D* OutUpTexture, float Threshold = .8, int32 Channel = 0);
 	
-	// UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	// static void UpPixelsMask(UTextureRenderTarget2D* InTextureTarget, UTextureRenderTarget2D* OutUpTexture, float Threshold = .8, int32 Channel = 0);
-	//
 	
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	static void DrawTextureOut(UTextureRenderTarget2D* InTextureTarget, UTextureRenderTarget2D* OutTextureTarget);
-	
-
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	static void ExtentMaskFast(UTextureRenderTarget2D* InTextureTarget, UTextureRenderTarget2D* InDebugView, int32 Channel = 0, int32 NumExtend = 1);
 
@@ -103,10 +111,6 @@ public:
 	static void GenerateMapCliff(TSubclassOf<ACSPlaneRangeGenerator> ManagerClass, TArray<TSubclassOf<ACSCliffGenerateCapture>> GeneratorClass, ACSPlaneRangeGenerator
 	                             *& GeneratorManager);
 	
-	static void RDG_SampleSpline(FRDGBuilder& GraphBuilder, FRDGTextureRef& TmpRDG_DirMinDistRotate, FRDGTextureUAVRef& RDGUAV_GradientHeight, TArray<
-	                             FLinearColor> SplinePoints, FIntPoint TextureSizeXY, FIntVector GroupCount
-	);
-
 	// ─── 通用平滑曲线（三次 B-Spline）：曲线逼近控制点，段间 C2 连续 ───────────
 
 	/** RDG 流程版：在 GPU 上对一组控制点做三次 B-Spline 重采样。
@@ -164,15 +168,10 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	static void CopyTexture(UTextureRenderTarget2D* InOrig, UTextureRenderTarget2D* InCopy);
 	
-	static void DrawCopyTexture(FRDGBuilder& GraphBuilder, FRDGTextureUAVRef RDGUAV_CopySource, UTextureRenderTarget2D* RT_CopyTarget);
-	
 	static void DrawCopyTexture(FRDGBuilder& GraphBuilder, FRDGTextureUAVRef RDGUAV_CopySource, FRDGTextureRef& RDG_CopyTarget);
 
 	static void BuildTextureArray(FRDGBuilder& GraphBuilder, int32& Index, FRDGTextureRef& RDG_CopySource, FRDGTextureUAVRef
 	                              & RDG_CopyTarget, FIntVector& GroupCount);
-
-	// static void GenerateWorldCaptureTransform(FRDGBuilder& GraphBuilder, int32& Index, FRDGTextureRef& RDG_CopySource, FRDGTextureUAVRef
-	// 						  & RDG_CopyTarget, FIntVector& GroupCount);
 
 
 #if WITH_EDITOR

@@ -10,7 +10,6 @@ public class GeometryScriptExtraEditor : ModuleRules
         PCHUsage = ModuleRules.PCHUsageMode.NoPCHs;
         bUseUnity = false;
         bUseRTTI = true;
-        PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "..", "PCGPluginsShared"));
         bool bPCGPluginsDebug = Target.Configuration != UnrealTargetConfiguration.Shipping;
         string PCGPluginsDebugEnv = Environment.GetEnvironmentVariable("PCGPLUGINS_DEBUG");
         if (!string.IsNullOrWhiteSpace(PCGPluginsDebugEnv))
@@ -23,7 +22,6 @@ public class GeometryScriptExtraEditor : ModuleRules
             new string[]
             {
                 "ComputeShaderGenerator",
-                "GeometryMath",
             }
         );
 

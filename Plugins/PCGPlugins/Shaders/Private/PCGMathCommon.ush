@@ -1,0 +1,42 @@
+#ifndef PCG_MATH_COMMON_USH
+#define PCG_MATH_COMMON_USH
+
+float EdgeFunction2D(float2 A, float2 B, float2 P)
+{
+	return (P.x - A.x) * (B.y - A.y) - (P.y - A.y) * (B.x - A.x);
+}
+
+float3 SafeNormalize3(float3 V, float3 Fallback)
+{
+	float LenSq = dot(V, V);
+	if (LenSq <= 1.0e-8f)
+		return Fallback;
+	return V * rsqrt(LenSq);
+}
+
+uint HashUint(uint Value)
+{
+	Value ^= Value >> 16;
+	Value *= 0x7feb352du;
+	Value ^= Value >> 15;
+	Value *= 0x846ca68bu;
+	Value ^= Value >> 16;
+	return Value;
+}
+
+uint PackZSpan16(uint ZStart, uint ZEnd)
+{
+	return (ZStart & 0xFFFFu) | ((ZEnd & 0xFFFFu) << 16u);
+}
+
+uint ZSpanStart16(uint Packed)
+{
+	return Packed & 0xFFFFu;
+}
+
+uint ZSpanEnd16(uint Packed)
+{
+	return (Packed >> 16u) & 0xFFFFu;
+}
+
+#endif // PCG_MATH_COMMON_USH

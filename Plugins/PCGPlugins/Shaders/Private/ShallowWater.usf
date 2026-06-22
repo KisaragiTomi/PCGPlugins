@@ -292,11 +292,18 @@ void CalVelocityHeight_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId, ui
 
 	// Waterfall: blend raw terrain toward smooth terrain
 	float SmoothStress = 1;
+	float SHCRaw = SHC, SHRRaw = SHR, SHTRaw = SHT, SHLRaw = SHL, SHBRaw = SHB;
 	SHC = lerp(SHC, SSHC, SmoothStress);
 	SHR = lerp(SHR, SSHR, SmoothStress);
 	SHT = lerp(SHT, SSHT, SmoothStress);
 	SHL = lerp(SHL, SSHL, SmoothStress);
 	SHB = lerp(SHB, SSHB, SmoothStress);
+	// Smooth from previous frame may lag behind terrain changes; never let it go below raw terrain.
+	SHC = max(SHC, SHCRaw);
+	SHR = max(SHR, SHRRaw);
+	SHT = max(SHT, SHTRaw);
+	SHL = max(SHL, SHLRaw);
+	SHB = max(SHB, SHBRaw);
 
 	// Smooth height convergence (waterfall independent shared memory)
 	half4 CurrentWFData = WaterfallSharedGroup[GroupThreadId.x + WATERFALL_EXTENT][GroupThreadId.y + WATERFALL_EXTENT];
@@ -354,15 +361,22 @@ void CalVelocityHeight_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId, ui
 		SHB = DispatchThreadId.y + 1 >= MaxCell.y - WaterBoundSize - 1 ? 99999 : SHB;
 	}
 
-	// Source injection
+	// Source injection (skip sources buried inside terrain)
 	for (int i = 0; i < BCount_SourceUVRads; i++)
 	{
 		float4 SrcData = RWB_SourceUVRads[i];
 		SrcData.z -= ActorLocationZ;
-		float DistToSource = distance(DispatchThreadId.xy / (MaxCell - 1), SrcData.xy);
+		if (SrcData.w <= 0)
+			continue;
+		int2 SrcPixel = (int2)floor(SrcData.xy * MaxCell);
+		SrcPixel = clamp(SrcPixel, int2(0,0), MaxCellInt - int2(1,1));
+		float SrcTerrainH = HeightMAX - T_SceneDepth[SrcPixel].x;
+		if (SrcData.z <= SrcTerrainH)
+			continue;
+		float DistToSource = distance((DispatchThreadId.xy + 0.5) / MaxCell, SrcData.xy);
 		float Blend = max(1 - DistToSource / SrcData.w, 0);
 		float TarVC = lerp(VC, max(SrcData.z - SHC, 0), Blend);
-		VC = SrcData.w > 0 ? TarVC : VC;
+		VC = TarVC;
 		FC = lerp(FC, 0, Blend);
 	}
 

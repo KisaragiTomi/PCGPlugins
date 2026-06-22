@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "PCGEditorProcess.h"
+#include "ActorTagShortcut.h"
 #include "CSInstanceBrushEdMode.h"
 #include "ComputeShaderMeshGenerator.h"
 #include "ComputeShaderShallowWater.h"
@@ -164,6 +165,8 @@ void FPCGEditorProcessModule::StartupModule()
 
 void FPCGEditorProcessModule::ShutdownModule()
 {
+	FActorTagInputProcessor::Unregister();
+
 	if (PostEngineInitHandle.IsValid())
 	{
 		FCoreDelegates::OnPostEngineInit.Remove(PostEngineInitHandle);
@@ -193,6 +196,8 @@ void FPCGEditorProcessModule::InitializeEditorUI()
 	{
 		return;
 	}
+
+	FActorTagInputProcessor::Register();
 
 	const bool bModeAlreadyRegistered = FEditorModeRegistry::Get().GetFactoryMap().Contains(FCSInstanceBrushEdMode::EM_CSInstanceBrush);
 	if (!bModeAlreadyRegistered)

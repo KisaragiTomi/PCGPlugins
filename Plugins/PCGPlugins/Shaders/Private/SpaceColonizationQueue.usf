@@ -1,4 +1,5 @@
 #include "/Engine/Public/Platform.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/PCGMathCommon.ush"
 
 #ifndef THREADGROUPSIZE_X
 #define THREADGROUPSIZE_X 64
@@ -36,16 +37,6 @@ uint Activetime;
 float RandGrow;
 float Seed;
 float InfluenceRadius;
-
-uint HashUint(uint Value)
-{
-    Value ^= Value >> 16;
-    Value *= 0x7feb352du;
-    Value ^= Value >> 15;
-    Value *= 0x846ca68bu;
-    Value ^= Value >> 16;
-    return Value;
-}
 
 float HashFloat01(uint Value)
 {

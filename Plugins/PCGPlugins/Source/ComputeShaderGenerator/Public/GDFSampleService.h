@@ -3,22 +3,25 @@
 #include "CoreMinimal.h"
 #include "SceneViewExtension.h"
 #include "Containers/Queue.h"
+#include "Containers/Map.h"
 #include "Math/IntVector.h"
 #include "Templates/Function.h"
+#include "Templates/RefCounting.h"
 
 class FRDGBuilder;
 class FSceneView;
 class FGlobalDistanceFieldParameterData;
+class FRDGPooledBuffer;
 
-// GSDF 异步采样服务。
-//
-// 为什么需要它：全局距离场（GDF）的参数数据（FGlobalDistanceFieldParameterData）只存在于
-// 渲染器内部的真 FViewInfo 上，而且只有在渲染管线跑到 base pass 之后才被填充。任何手工构造的
-// FSceneView（bIsViewInfo=false）都拿不到，强取会触发 ensure(View.bIsViewInfo) 崩溃。
-//
-// 因此唯一正确做法：注册一个 SceneViewExtension，在 PostRenderBasePassDeferred_RenderThread
-// 回调里拿到真 FViewInfo（此时 GDF 已就绪），当帧把待处理的采样请求挂到引擎的 GraphBuilder 上，
-// 发起 GPU readback，readback 完成后在游戏线程触发回调。全程异步、零阻塞、不取景、不 Flush。
+//// GSDF 异步采样服务。
+////
+//// 为什么需要它：全局距离场（GDF）的参数数据（FGlobalDistanceFieldParameterData）只存在于
+//// 渲染器内部的真 FViewInfo 上，而且只有在渲染管线跑到 base pass 之后才被填充。任何手工构造的
+//// FSceneView（bIsViewInfo=false）都拿不到，强取会触发 ensure(View.bIsViewInfo) 崩溃。
+////
+//// 因此唯一正确做法：注册一个 SceneViewExtension，在 PostRenderBasePassDeferred_RenderThread
+//// 回调里拿到真 FViewInfo（此时 GDF 已就绪），当帧把待处理的采样请求挂到引擎的 GraphBuilder 上，
+//// 发起 GPU readback，readback 完成后在游戏线程触发回调。全程异步、零阻塞、不取景、不 Flush。
 //
 // GDF 的纹理是裸 FRHITexture*，只在回调那一帧有效，所以请求必须在回调当帧消费，不跨帧缓存。
 
@@ -55,12 +58,36 @@ struct FGDFCavitySpanRequest
 };
 
 // 通用 GDF 作业：在 GDF 就绪那一帧，直接拿到引擎主 GraphBuilder + 真 FViewInfo + GDF 参数数据，
-// 由调用方在 lambda 里自行构图（绑 GDF、跑 compute、QueueBufferUpload、ConvertToExternalBuffer、
-// AddEnqueueCopyPass 等）。service 不关心具体管线，只负责把作业挂到正确时机的图上。
-// 跨帧持有结果请在 lambda 里用 ConvertToExternalBuffer 转出常驻 buffer，并自行用 AsyncTask 回游戏线程。
+// 由调用方在 Build lambda 里自行构图（绑 GDF、跑 compute 等），并把需要跨帧持有的常驻 buffer
+// 通过 FGDFJobOutputs::Add 交给 service。service 负责统一挂 fence 探测 GPU 完成，待该帧 GPU 真正
+// 写完后，在游戏线程触发 OnComplete，把同一批常驻 buffer 交还调用方。
+// 这样调用方只需关心两件事：Build 里挂自己的 pass、OnComplete 里拿结果，不再手写
+// ConvertToExternalBuffer 之外的 AsyncTask / fence / 轮询样板。
+
+// Build 产出的 GPU 常驻 buffer 容器（按名取用）。值即 ConvertToExternalBuffer 的返回。
+struct FGDFJobOutputs
+{
+	TMap<FName, TRefCountPtr<FRDGPooledBuffer>> Buffers;
+
+	void Add(FName Key, TRefCountPtr<FRDGPooledBuffer> Buffer)
+	{
+		Buffers.Add(Key, MoveTemp(Buffer));
+	}
+
+	TRefCountPtr<FRDGPooledBuffer> Find(FName Key) const
+	{
+		const TRefCountPtr<FRDGPooledBuffer>* Found = Buffers.Find(Key);
+		return Found ? *Found : TRefCountPtr<FRDGPooledBuffer>();
+	}
+};
+
 struct FGDFJobRequest
 {
-	TFunction<void(FRDGBuilder& GraphBuilder, const FSceneView& View, const FGlobalDistanceFieldParameterData& GDFData)> Build;
+	// 渲染线程：GDF 就绪那一帧构图。把需要跨帧持有的常驻 buffer 填进 Outputs（用 ConvertToExternalBuffer）。
+	TFunction<void(FRDGBuilder& GraphBuilder, const FSceneView& View, const FGlobalDistanceFieldParameterData& GDFData, FGDFJobOutputs& Outputs)> Build;
+
+	// 游戏线程：该帧 GPU 真正写完后触发，Outputs 即 Build 填入的常驻 buffer。可空（fire-and-forget）。
+	TFunction<void(FGDFJobOutputs& Outputs)> OnComplete;
 };
 
 // 进程级单例：持有 view extension 与请求队列。

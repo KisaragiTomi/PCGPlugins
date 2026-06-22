@@ -32,13 +32,12 @@
 #include "GeometryGeneral.h"
 #include "DynamicMesh/MeshTransforms.h"
 #include "ComputeShaderGenerateHepler.h"
-#include "GeometryMath/Public/Noise.h"
+#include "Noise.h"
 #include "GlobalShader.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
 #include "RHIGPUReadback.h"
 #include "ShaderParameterStruct.h"
-#include "Spatial/MeshAABBTree3.h"
 #include "Misc/PackageName.h"
 
 #define GV_ACTOR_ENABLE_PERF_LOGS 1
@@ -1138,11 +1137,6 @@ static void RebuildVineFrameNormalsForEditedLine(
 	FrameNormals = MoveTemp(NewFrameNormals);
 }
 
-static uint32 BuildVVPointSortKey(const FVector& Point)
-{
-	return BuildVVRandomSeed(FVector::ZeroVector, Point);
-}
-
 static float GetVVTinyZJitter(const FVector& Point, int32 PointIndex)
 {
 	const FVector IndexSeed(double(PointIndex), double(PointIndex) * 0.37, double(PointIndex) * 0.11);
@@ -1155,136 +1149,6 @@ static bool IsFiniteVineVector(const FVector& Vector)
 	return FMath::IsFinite(Vector.X) && FMath::IsFinite(Vector.Y) && FMath::IsFinite(Vector.Z);
 }
 
-static bool AppendVineProjectionTriangle(
-	FDynamicMesh3& Mesh,
-	const FVector& A,
-	const FVector& B,
-	const FVector& C)
-{
-	if (!IsFiniteVineVector(A) || !IsFiniteVineVector(B) || !IsFiniteVineVector(C))
-	{
-		return false;
-	}
-
-	const FVector AB = B - A;
-	const FVector AC = C - A;
-	if (FVector::CrossProduct(AB, AC).SizeSquared() <= 1.0e-8)
-	{
-		return false;
-	}
-
-	const int32 VA = Mesh.AppendVertex(FVector3d(A));
-	const int32 VB = Mesh.AppendVertex(FVector3d(B));
-	const int32 VC = Mesh.AppendVertex(FVector3d(C));
-	return Mesh.AppendTriangle(VA, VB, VC) >= 0;
-}
-
-static bool BuildVineProjectionTriangleMesh(const FCSTriangleMeshData& TriangleData, FDynamicMesh3& OutMesh)
-{
-	OutMesh.Clear();
-
-	const int32 EffectiveVertexCount = TriangleData.VertexCount >= 0
-		? FMath::Clamp(TriangleData.VertexCount, 0, TriangleData.Vertices.Num())
-		: TriangleData.Vertices.Num();
-	const int32 EffectiveIndexCount = TriangleData.IndexCount >= 0
-		? FMath::Clamp(TriangleData.IndexCount, 0, TriangleData.Indices.Num())
-		: TriangleData.Indices.Num();
-	if (EffectiveVertexCount < 3)
-	{
-		return false;
-	}
-
-	int32 AddedTriangles = 0;
-	if (EffectiveIndexCount >= 3)
-	{
-		const int32 TriangleCount = EffectiveIndexCount / 3;
-		for (int32 TriangleIndex = 0; TriangleIndex < TriangleCount; ++TriangleIndex)
-		{
-			const int32 IA = TriangleData.Indices[TriangleIndex * 3 + 0];
-			const int32 IB = TriangleData.Indices[TriangleIndex * 3 + 1];
-			const int32 IC = TriangleData.Indices[TriangleIndex * 3 + 2];
-			if (IA < 0 || IB < 0 || IC < 0 || IA >= EffectiveVertexCount || IB >= EffectiveVertexCount || IC >= EffectiveVertexCount)
-			{
-				continue;
-			}
-
-			if (AppendVineProjectionTriangle(OutMesh, TriangleData.Vertices[IA], TriangleData.Vertices[IB], TriangleData.Vertices[IC]))
-			{
-				++AddedTriangles;
-			}
-		}
-	}
-	else
-	{
-		const int32 TriangleCount = EffectiveVertexCount / 3;
-		for (int32 TriangleIndex = 0; TriangleIndex < TriangleCount; ++TriangleIndex)
-		{
-			if (AppendVineProjectionTriangle(
-				OutMesh,
-				TriangleData.Vertices[TriangleIndex * 3 + 0],
-				TriangleData.Vertices[TriangleIndex * 3 + 1],
-				TriangleData.Vertices[TriangleIndex * 3 + 2]))
-			{
-				++AddedTriangles;
-			}
-		}
-	}
-
-	return AddedTriangles > 0;
-}
-
-struct FVineTriangleBVHProjectionCache
-{
-	FDynamicMesh3 Mesh;
-	TUniquePtr<UE::Geometry::TMeshAABBTree3<FDynamicMesh3>> Spatial;
-};
-
-static TUniquePtr<FVineTriangleBVHProjectionCache> BuildVineTriangleBVHProjectionCache(const FCSTriangleMeshData& TriangleData)
-{
-	TUniquePtr<FVineTriangleBVHProjectionCache> Cache = MakeUnique<FVineTriangleBVHProjectionCache>();
-	if (!BuildVineProjectionTriangleMesh(TriangleData, Cache->Mesh) || Cache->Mesh.TriangleCount() == 0)
-	{
-		return nullptr;
-	}
-
-	Cache->Spatial = MakeUnique<UE::Geometry::TMeshAABBTree3<FDynamicMesh3>>(&Cache->Mesh, true);
-	return Cache;
-}
-
-static bool ProjectVinePathToNearestTriangleBVH(
-	const FVector& QueryPosition,
-	const FVineTriangleBVHProjectionCache& Cache,
-	FVector& OutProjected,
-	FVector& OutNormal)
-{
-	if (!Cache.Spatial || Cache.Mesh.TriangleCount() == 0)
-	{
-		return false;
-	}
-
-	double NearDistSq = TNumericLimits<double>::Max();
-	const int32 NearTri = Cache.Spatial->FindNearestTriangle(FVector3d(QueryPosition), NearDistSq);
-	if (NearTri < 0 || !Cache.Mesh.IsTriangle(NearTri))
-	{
-		return false;
-	}
-
-	const FIndex3i Tri = Cache.Mesh.GetTriangle(NearTri);
-	const FVector3d A = Cache.Mesh.GetVertex(Tri[0]);
-	const FVector3d B = Cache.Mesh.GetVertex(Tri[1]);
-	const FVector3d C = Cache.Mesh.GetVertex(Tri[2]);
-	OutProjected = FMath::ClosestPointOnTriangleToPoint(QueryPosition, FVector(A), FVector(B), FVector(C));
-	// 源三角面绕序已由 NormalizeTriangleMeshDataWinding 对齐到 cross(B-A, C-A)==外法线。
-	// VectorUtil::Normal 在左手坐标系下做了反向叉乘 (C-A)x(B-A)，会指向网格内部，
-	// 导致投影法线反向、vine 沿 VinesOffset 往表面里偏，所以这里改用同一约定的叉乘。
-	FVector Normal = FVector(FVector3d::CrossProduct(B - A, C - A));
-	if (!IsFiniteVineVector(Normal) || !Normal.Normalize())
-	{
-		Normal = FVector::UpVector;
-	}
-	OutNormal = Normal;
-	return true;
-}
 
 static bool PrepareVVLinesProjected(
 	const TArray<FGeometryScriptPolyPath>& Lines,
@@ -1322,7 +1186,7 @@ static bool PrepareVVLinesProjected(
 		return false;
 	}
 
-	const int32 SafeCPUPostProjectionSmoothIterations = FMath::Max(0, VV.VisVineCPUPostProjectionSmoothIterations);
+	const int32 SafeCPUPostProjectionSmoothIterations = FMath::Max(0, 1);
 
 	TArray<FGeometryScriptPolyPath> WorkingLines;
 	WorkingLines.Reserve(Lines.Num());
@@ -1478,8 +1342,8 @@ static bool PrepareVVLinesProjected(
 	const double ReduceSampleStartSeconds = FPlatformTime::Seconds();
 	SampleRangePointsSum.Sort([](const FVector& A, const FVector& B)
 	{
-		const uint32 AKey = BuildVVPointSortKey(A);
-		const uint32 BKey = BuildVVPointSortKey(B);
+		const uint32 AKey = BuildVVRandomSeed(FVector::ZeroVector, A);
+		const uint32 BKey = BuildVVRandomSeed(FVector::ZeroVector, B);
 		if (AKey != BKey)
 		{
 			return AKey < BKey;
@@ -2549,84 +2413,6 @@ namespace VineCPUTail
 			bTube, TubeProfileCount, CircleScale, LineScale, VinesOffset, TinyZJitterStrength, OutVertices, OutUVs, OutIndices);
 	}
 } // namespace VineCPUTail
-
-static TArray<FTransform> BuildVineCPUFrameTransforms(
-	const FGeometryScriptPolyPath& Line,
-	const TArray<FVector>* FrameNormalSeeds,
-	int32 FrameSmoothIterations)
-{
-	TArray<FTransform> Transforms;
-	if (!Line.Path.IsValid()) return Transforms;
-
-	const TArray<FVector>& Points = *Line.Path;
-	const int32 PointCount = Points.Num();
-	if (PointCount < 2) return Transforms;
-
-	TArray<FVector4f> Noised;
-	TArray<FVector4f> SurfaceTargets;
-	TArray<FVector4f> SurfaceNormals;
-	TArray<FIntVector4> Meta;
-	Noised.SetNumUninitialized(PointCount);
-	SurfaceTargets.SetNumUninitialized(PointCount);
-	SurfaceNormals.SetNumUninitialized(PointCount);
-	Meta.SetNumUninitialized(PointCount);
-
-	for (int32 PointIndex = 0; PointIndex < PointCount; ++PointIndex)
-	{
-		const FVector& Point = Points[PointIndex];
-		const FVector4f PackedPoint(float(Point.X), float(Point.Y), float(Point.Z), 1.0f);
-		const FVector SeedNormal = FrameNormalSeeds && FrameNormalSeeds->IsValidIndex(PointIndex)
-			? (*FrameNormalSeeds)[PointIndex]
-			: FVector::UpVector;
-		const FVector SafeNormal = NormalizeVineDirectionOrFallback(SeedNormal, FVector::UpVector);
-
-		Noised[PointIndex] = PackedPoint;
-		SurfaceTargets[PointIndex] = PackedPoint;
-		SurfaceNormals[PointIndex] = FVector4f(float(SafeNormal.X), float(SafeNormal.Y), float(SafeNormal.Z), 0.0f);
-		Meta[PointIndex] = FIntVector4(
-			FMath::Max(PointIndex - 1, 0),
-			FMath::Min(PointIndex + 1, PointCount - 1),
-			0,
-			PointCount);
-	}
-
-	TArray<FVector4f> Tangents;
-	TArray<FVector4f> FrameNormals;
-	VineCPUTail::RunBuildParallelTransportFrame(Noised, Meta, SurfaceTargets, SurfaceNormals, Tangents, FrameNormals);
-
-	const int32 SafeFrameSmoothIterations = FMath::Max(0, FrameSmoothIterations);
-	for (int32 SmoothIndex = 0; SmoothIndex < SafeFrameSmoothIterations; ++SmoothIndex)
-	{
-		TArray<FVector4f> NextTangents;
-		TArray<FVector4f> NextFrameNormals;
-		VineCPUTail::RunSmoothTangentsIteration(Meta, Tangents, FrameNormals, NextTangents, NextFrameNormals);
-		Tangents = MoveTemp(NextTangents);
-		FrameNormals = MoveTemp(NextFrameNormals);
-	}
-
-	Transforms.Reserve(PointCount);
-	for (int32 PointIndex = 0; PointIndex < PointCount; ++PointIndex)
-	{
-		const FVector4f& PackedTangent = Tangents[PointIndex];
-		const FVector4f& PackedFrameNormal = FrameNormals[PointIndex];
-		FVector3f FrameTangent;
-		FVector3f FrameNormal;
-		FVector3f Binormal;
-		VineCPUTail::BuildOrthonormalFrame(
-			FVector3f(PackedTangent.X, PackedTangent.Y, PackedTangent.Z),
-			FVector3f(PackedFrameNormal.X, PackedFrameNormal.Y, PackedFrameNormal.Z),
-			FrameTangent,
-			FrameNormal,
-			Binormal);
-
-		const FVector Tangent(double(FrameTangent.X), double(FrameTangent.Y), double(FrameTangent.Z));
-		const FVector Normal(double(FrameNormal.X), double(FrameNormal.Y), double(FrameNormal.Z));
-		const FQuat Rotation = FRotationMatrix::MakeFromXZ(Tangent, Normal).ToQuat();
-		Transforms.Add(FTransform(Rotation, Points[PointIndex], FVector::OneVector));
-	}
-
-	return Transforms;
-}
 
 // 方式 A 截断函数：GPU 只跑 N→A→P→FP（voxel 依赖段），回读 noised + FP 投影后的
 // surface target/normal，供 CPU 接力执行 RS/B/FT/C。不创建顶点/UV/索引缓冲。
@@ -4674,14 +4460,9 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result)
 	// The cache is refreshed during GenerateVines().
 	{
 		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.GetBoxSceneSurfaceVoxels"));
-		CachedSurfaceVoxels = GetBoxSceneSurfaceVoxelsFromGPU(SC.VoxelSize);
+		CachedSurfaceVoxels = ReadbackBoxSceneSurfaceVoxelsSync(SC.VoxelSize, TEXT("[GenerateVines.SurfaceVoxels]"));
 	}
 	CachedSurfaceTriangles = FCSTriangleMeshData();
-
-	{
-		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.GetBoxSceneTrianglesForCPU"));
-		CachedSurfaceTriangles = GetBoxSceneTrianglesFromGPUFiltered(100.0f);
-	}
 	// Cache generation bounds for subsequent GPU visualization.
 	InstanceBound = Bounds;
 
@@ -4728,7 +4509,7 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result)
 
 	LogVineSCStageTargetTransformMatch(TEXT("Tube"), TubeLines, TargetTransforms);
 
-	if (VV.bUseGPUMode && GPUProjectionDebug.bDrawGPUProjectionVoxelDebugPoints && GPUProjectionDebug.GPUProjectionVoxelDebugDuration > 0.0f)
+	if (GPUProjectionDebug.bDrawGPUProjectionVoxelDebugPoints && GPUProjectionDebug.GPUProjectionVoxelDebugDuration > 0.0f)
 	{
 		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.DrawGPUProjectionVoxelDebugPoints"));
 		DrawVineGPUProjectionVoxelDebugPoints(
@@ -4747,7 +4528,7 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result)
 	// 5. 可视化
 	{
 		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.VisVine"));
-		VisVine(VV.bUseGPUMode);
+		VisVine();
 	}
 
 
@@ -4984,7 +4765,7 @@ int32 AVineContainer::DrawDebugVineSurfaceVoxelArrows()
 		Bounds.GetExtent(),
 		false);
 
-	CachedSurfaceVoxels = GetBoxSceneSurfaceVoxelsFromGPU(SafeVoxelSize);
+	CachedSurfaceVoxels = ReadbackBoxSceneSurfaceVoxelsSync(SafeVoxelSize, TEXT("[VisVineGPU.SurfaceVoxels]"));
 	const FCSSurfaceVoxelData& VoxelData = CachedSurfaceVoxels;
 	const int32 AvailableCount = VoxelData.VoxelCount >= 0
 		? FMath::Min(VoxelData.VoxelCount, VoxelData.Positions.Num())
@@ -7243,42 +7024,6 @@ static void ProjectSCLineResultsToSurface_Voxel(
 	}
 }
 
-// Surface projection via BVH for SpaceColonization output (CPU path).
-// Projects each line point onto the nearest triangle of the target surface mesh.
-static void ProjectSCLineResultsToSurface_BVH(
-	TArray<FSpaceColonizationLineResult>& LineResults,
-	const FCSTriangleMeshData& TriangleData)
-{
-	if (TriangleData.Vertices.Num() < 3)
-	{
-		return;
-	}
-
-	TUniquePtr<FVineTriangleBVHProjectionCache> Cache = BuildVineTriangleBVHProjectionCache(TriangleData);
-	if (!Cache || !Cache->Spatial || Cache->Mesh.TriangleCount() == 0)
-	{
-		return;
-	}
-
-	for (FSpaceColonizationLineResult& LineResult : LineResults)
-	{
-		TArray<FVector>& Path = *LineResult.Path.Path;
-		for (FVector& Point : Path)
-		{
-			if (!IsFiniteVineVector(Point))
-			{
-				continue;
-			}
-
-			FVector Projected, Normal;
-			if (ProjectVinePathToNearestTriangleBVH(Point, *Cache, Projected, Normal))
-			{
-				Point = Projected;
-			}
-		}
-	}
-}
-
 // ---- SpaceColonization member functions (moved from UGenerateVines, params from SC) ----
 
 bool AVineContainer::BuildSpaceColonizationQueue(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms,
@@ -7367,6 +7112,5 @@ TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales
 	}
 
 	TArray<FSpaceColonizationLineResult> Results = BuildSpaceColonizationLineResultsImpl(TargetLocations, SCAttributes, SC.BackGrowCount, SC.ForkTaperForkOrdinal, TargetPointScales, StartSourceScales);
-	ProjectSCLineResultsToSurface_BVH(Results, CachedSurfaceTriangles);
 	return Results;
 }

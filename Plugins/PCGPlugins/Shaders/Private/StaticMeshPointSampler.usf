@@ -1,4 +1,5 @@
 #include "/Engine/Public/Platform.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/PCGMathCommon.ush"
 
 #ifndef THREADGROUPSIZE_X
 #define THREADGROUPSIZE_X 64
@@ -190,16 +191,6 @@ bool PassTriangleReferenceFilter(float3 A, float3 B, float3 C)
 	}
 
 	return BestDistSq <= ReferenceFilterDistanceSq;
-}
-
-uint HashUint(uint Value)
-{
-	Value ^= Value >> 16;
-	Value *= 0x7feb352du;
-	Value ^= Value >> 15;
-	Value *= 0x846ca68bu;
-	Value ^= Value >> 16;
-	return Value;
 }
 
 uint HashCell(int3 Cell)
@@ -917,6 +908,8 @@ void TriangleSurfaceVoxelsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	{
 		return;
 	}
+	// Cap per-thread cell iterations to avoid GPU TDR on large triangles.
+	TotalCells = min(TotalCells, 512u);
 
 	for (uint LinearIndex = 0u; LinearIndex < TotalCells; ++LinearIndex)
 	{

@@ -306,8 +306,6 @@ public:
 	ACSPlaneRangeGenerator();
 
 	virtual void Tick(float DeltaTime) override;
-
-	virtual void GenerateInternal() override;
 	
 	virtual TArray<FTransform> GenerateTransformsInternal() override;
 };

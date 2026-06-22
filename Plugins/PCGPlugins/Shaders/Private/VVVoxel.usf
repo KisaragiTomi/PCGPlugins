@@ -42,6 +42,8 @@ uint bTube;
 float CircleScale;
 float LineScale;
 
+#include "/Plugin/PCGPlugins/Shaders/Private/VineFrameCommon.ush"
+
 float3 VoxelOrigin;
 float VoxelSize;
 uint VoxelCount;
@@ -74,16 +76,6 @@ static const uint VINE_VOXEL_SAMPLE_MODE_FAIL = 0u;
 static const uint VINE_VOXEL_SAMPLE_MODE_NEIGHBOR = 1u;
 static const uint VINE_VOXEL_SAMPLE_MODE_LOCAL = 2u;
 static const uint VINE_VOXEL_SAMPLE_MODE_BUCKET = 3u;
-
-float3 SafeNormalize3(float3 V, float3 Fallback)
-{
-    float LenSq = dot(V, V);
-    if (LenSq <= 1.0e-8f)
-    {
-        return Fallback;
-    }
-    return V * rsqrt(LenSq);
-}
 
 uint HashVoxelCell(int3 Cell)
 {
@@ -551,32 +543,6 @@ bool FindNearestVoxelSample(float3 Query, out float3 OutTarget, out float3 OutNo
     return false;
 }
 
-uint GetLinePointIndex(uint PointIndex, int Offset)
-{
-    int4 Meta = PathPointMeta[PointIndex];
-    int BaseIndex = max(Meta.z, 0);
-    int PointCount = max(Meta.w, 1);
-    int LastIndex = min(BaseIndex + PointCount - 1, int(PathPointCount) - 1);
-    return (uint)min(max(int(PointIndex) + Offset, BaseIndex), LastIndex);
-}
-
-float3 GetFallbackFrameNormal(float3 Tangent)
-{
-    float3 Up = abs(Tangent.z) < 0.9f ? float3(0.0f, 0.0f, 1.0f) : float3(0.0f, 1.0f, 0.0f);
-    return SafeNormalize3(Up - Tangent * dot(Up, Tangent), float3(0.0f, 1.0f, 0.0f));
-}
-
-float3 OrientAxisToReference(float3 Axis, float3 Reference)
-{
-    return dot(Axis, Reference) < 0.0f ? -Axis : Axis;
-}
-
-float3 BuildFrameNormalFromTangent(float3 Tangent, float3 Normal)
-{
-    float3 FallbackNormal = GetFallbackFrameNormal(Tangent);
-    return SafeNormalize3(Normal - Tangent * dot(Normal, Tangent), FallbackNormal);
-}
-
 // Rotate V by the minimal rotation that aligns unit FromDir onto unit ToDir (Rodrigues).
 // Used to parallel-transport the roll axis from one point's tangent to the next, so the
 // cross-section frame follows the curve with the least possible twist.
@@ -593,19 +559,6 @@ float3 RotateVectorByAlign(float3 V, float3 FromDir, float3 ToDir)
     float3 K = Axis / AxisLen;
     float SinA = AxisLen;
     return V * CosA + cross(K, V) * SinA + K * dot(K, V) * (1.0f - CosA);
-}
-
-void BuildOrthonormalFrame(float3 Tangent, float3 Normal, out float3 OutTangent, out float3 OutNormal, out float3 OutBinormal)
-{
-    OutTangent = SafeNormalize3(Tangent, float3(1.0f, 0.0f, 0.0f));
-    OutNormal = BuildFrameNormalFromTangent(OutTangent, Normal);
-    OutBinormal = cross(OutNormal, OutTangent);
-    if (dot(OutBinormal, OutBinormal) <= 1.0e-8f)
-    {
-        OutBinormal = cross(GetFallbackFrameNormal(OutTangent), OutTangent);
-    }
-    OutBinormal = SafeNormalize3(OutBinormal, float3(0.0f, 1.0f, 0.0f));
-    OutNormal = SafeNormalize3(cross(OutTangent, OutBinormal), OutNormal);
 }
 
 void BuildRawVoxelVineFrame(uint PointIndex, out float3 OutTangent, out float3 OutNormal, out float3 OutSurfaceTarget, out float3 OutSurfaceNormal, out bool bOutHasVoxelSample, out uint OutSampleMode)

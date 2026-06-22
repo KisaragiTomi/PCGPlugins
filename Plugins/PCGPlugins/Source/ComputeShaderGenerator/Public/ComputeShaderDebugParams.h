@@ -203,40 +203,6 @@ public:
 	int32 MaxDirectionsToDraw = 0;
 };
 
-/** Debug draw options for DrawDebugLastSurfaceVoxelArrows. */
-USTRUCT(BlueprintType, meta = (DisplayName = "CS Last Voxel Arrow Debug"))
-struct COMPUTESHADERGENERATOR_API FCSDebugLastVoxelArrowOptions
-{
-	GENERATED_BODY()
-public:
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw", meta = (ClampMin = "0.0"))
-	float ArrowLength = 0.0f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw")
-	FLinearColor ArrowColor = FLinearColor::Blue;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw", meta = (ClampMin = "0.0"))
-	float Duration = 5.0f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw", meta = (ClampMin = "0.0"))
-	float Thickness = 2.0f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw")
-	bool bPersistentLines = false;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw")
-	bool bDrawPoints = true;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw")
-	FLinearColor PointColor = FLinearColor::Yellow;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw", meta = (ClampMin = "0.0"))
-	float PointSize = 8.0f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw", meta = (ClampMin = "0"))
-	int32 MaxArrowsToDraw = 0;
-};
-
 /** Debug draw options for DrawDebugBoxSceneSurfaceVoxelDirections. */
 USTRUCT(BlueprintType, meta = (DisplayName = "CS Box Voxel Direction Debug"))
 struct COMPUTESHADERGENERATOR_API FCSDebugBoxVoxelDirectionOptions
@@ -272,43 +238,6 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw", meta = (ClampMin = "0"))
 	int32 MaxDirectionsToDraw = 0;
-};
-
-/** Debug draw options for DrawDebugBoxSceneSurfaceVoxelArrows. */
-USTRUCT(BlueprintType, meta = (DisplayName = "CS Box Voxel Arrow Debug"))
-struct COMPUTESHADERGENERATOR_API FCSDebugBoxVoxelArrowOptions
-{
-	GENERATED_BODY()
-public:
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw", meta = (ClampMin = "0.001"))
-	float VoxelSize = 10.0f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw", meta = (ClampMin = "0.0"))
-	float ArrowLength = 0.0f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw")
-	FLinearColor ArrowColor = FLinearColor::Blue;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw", meta = (ClampMin = "0.0"))
-	float Duration = 5.0f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw", meta = (ClampMin = "0.0"))
-	float Thickness = 2.0f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw")
-	bool bPersistentLines = false;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw")
-	bool bDrawPoints = true;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw")
-	FLinearColor PointColor = FLinearColor::Yellow;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw", meta = (ClampMin = "0.0"))
-	float PointSize = 8.0f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Draw", meta = (ClampMin = "0"))
-	int32 MaxArrowsToDraw = 0;
 };
 
 /** Debug draw options for DrawDebugCachedSurfaceTriangles. */

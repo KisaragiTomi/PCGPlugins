@@ -111,74 +111,72 @@ public:
 
 IMPLEMENT_GLOBAL_SHADER(FDrawCopyTexturePS, "/Plugin/PCGPlugins/Shaders/Private/BasicFunction.usf", "FDrawCopyTexture", SF_Pixel);
 
+namespace CSRTUpload
+{
+template<typename TPixel>
+void UploadPixelsToRT(FTextureRenderTargetResource* TextureTarget, TArray<TPixel> Pixels)
+{
+	if (!TextureTarget) return;
+	const int32 Width = TextureTarget->GetSizeXY().X;
+	const int32 Height = TextureTarget->GetSizeXY().Y;
+	if (Width * Height > Pixels.Num()) return;
+
+	ENQUEUE_RENDER_COMMAND(CSUploadPixelsToRT)(
+		[TextureTarget, Width, Height, Pixels = MoveTemp(Pixels)](FRHICommandListImmediate& RHICmdList)
+	{
+		FTextureRHIRef TextureRHI = TextureTarget->GetRenderTargetTexture();
+		if (!TextureRHI.IsValid()) return;
+
+		uint32 DestStride = 0;
+		void* DestData = RHILockTexture2D(TextureRHI, 0, RLM_WriteOnly, DestStride, false);
+		if (!DestData || DestStride == 0)
+		{
+			if (DestData) RHIUnlockTexture2D(TextureRHI, 0, false);
+			return;
+		}
+
+		constexpr uint32 PixelBytes = sizeof(TPixel);
+		const uint32 RowBytes = uint32(Width) * PixelBytes;
+		const uint8* SourceBytes = reinterpret_cast<const uint8*>(Pixels.GetData());
+		uint8* DestBytes = static_cast<uint8*>(DestData);
+		for (int32 Y = 0; Y < Height; ++Y)
+		{
+			FMemory::Memcpy(DestBytes + uint64(Y) * DestStride, SourceBytes + uint64(Y) * RowBytes, RowBytes);
+		}
+
+		RHIUnlockTexture2D(TextureRHI, 0, false);
+	});
+	FlushRenderingCommands();
+}
+}
+
 void UComputeShaderBasicFunction::DrawLinearColorsToRenderTarget32(UTextureRenderTarget2D* InTextureTarget,
 	TArray<FLinearColor> Colors)
 {
-	int32 TexturePixelCount = InTextureTarget->SizeX * InTextureTarget->SizeY;
-	if (TexturePixelCount > Colors.Num()) return;
-	FTextureRenderTargetResource* TextureTarget = InTextureTarget->GameThread_GetRenderTargetResource();
-	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	[TextureTarget, Colors = MoveTemp(Colors)](FRHICommandListImmediate& RHICmdList)
-	{
-		FTextureRHIRef TextureRHI = TextureTarget->GetRenderTargetTexture();
-		uint32 DestStride;
-		void* DestData = RHILockTexture2D(TextureRHI, 0, RLM_WriteOnly, DestStride, false);
-		 if (!DestStride)	return;
-		FMemory::Memcpy(DestData, Colors.GetData(), TextureTarget->GetSizeXY().X * TextureTarget->GetSizeXY().Y * sizeof(FLinearColor));
-		RHIUnlockTexture2D(TextureRHI, 0 ,false);
-	});
-	FlushRenderingCommands();
+	if (!InTextureTarget) return;
+	CSRTUpload::UploadPixelsToRT(InTextureTarget->GameThread_GetRenderTargetResource(), MoveTemp(Colors));
 }
 
 void UComputeShaderBasicFunction::DrawLinearColorsToRenderTarget16(UTextureRenderTarget2D* InTextureTarget,
 	TArray<FLinearColor> Colors)
 {
-	int32 TexturePixelCount = InTextureTarget->SizeX * InTextureTarget->SizeY;
-	if (TexturePixelCount < Colors.Num()) return;
+	if (!InTextureTarget) return;
+	const int32 TexturePixelCount = InTextureTarget->SizeX * InTextureTarget->SizeY;
+	if (TexturePixelCount > Colors.Num()) return;
 	TArray<FFloat16Color> Colors16;
-	Colors16.Reserve(Colors.Num());
-	for (int32 i = 0; i < TexturePixelCount; i++)
+	Colors16.SetNumZeroed(TexturePixelCount);
+	for (int32 i = 0; i < Colors.Num(); ++i)
 	{
-		if (i < Colors.Num())
-		{
-			Colors16.Add(FFloat16Color(Colors[i]));
-		}
-		else
-		{
-			Colors16.Add(FFloat16Color(FLinearColor::Black));
-		}
+		Colors16[i] = FFloat16Color(Colors[i]);
 	}
-	FTextureRenderTargetResource* TextureTarget = InTextureTarget->GameThread_GetRenderTargetResource();
-	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	[TextureTarget, Colors16 = MoveTemp(Colors16), TexturePixelCount](FRHICommandListImmediate& RHICmdList)
-	{
-		FTextureRHIRef TextureRHI = TextureTarget->GetRenderTargetTexture();
-		uint32 DestStride;
-		void* DestData = RHILockTexture2D(TextureRHI, 0, RLM_WriteOnly, DestStride, false);
-		 if (!DestStride)	return;
-		FMemory::Memcpy(DestData, Colors16.GetData(), TexturePixelCount * sizeof(FFloat16Color));
-		RHIUnlockTexture2D(TextureRHI, 0 ,false);
-	});
-	FlushRenderingCommands();
+	DrawFFloat16ColorsToRenderTarget(InTextureTarget, MoveTemp(Colors16));
 }
 
 void UComputeShaderBasicFunction::DrawFFloat16ColorsToRenderTarget(UTextureRenderTarget2D* InTextureTarget,
 	TArray<FFloat16Color> Colors16)
 {
-	if (InTextureTarget->SizeX * InTextureTarget->SizeY > Colors16.Num()) return;
-	
-	FTextureRenderTargetResource* TextureTarget = InTextureTarget->GameThread_GetRenderTargetResource();
-	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	[TextureTarget, Colors16 = MoveTemp(Colors16)](FRHICommandListImmediate& RHICmdList)
-	{
-		FTextureRHIRef TextureRHI = TextureTarget->GetRenderTargetTexture();
-		uint32 DestStride;
-		void* DestData = RHILockTexture2D(TextureRHI, 0, RLM_WriteOnly, DestStride, false);
-		 if (!DestStride)	return;
-		FMemory::Memcpy(DestData, Colors16.GetData(), TextureTarget->GetSizeXY().X * TextureTarget->GetSizeXY().Y * sizeof(FFloat16Color));
-		RHIUnlockTexture2D(TextureRHI, 0 ,false);
-	});
-	FlushRenderingCommands();
+	if (!InTextureTarget) return;
+	CSRTUpload::UploadPixelsToRT(InTextureTarget->GameThread_GetRenderTargetResource(), MoveTemp(Colors16));
 }
 
 void UComputeShaderBasicFunction::ConnectivityPixel(UTextureRenderTarget2D* InTextureTarget,
@@ -332,54 +330,47 @@ void UComputeShaderBasicFunction::ConnectivityPixel(UTextureRenderTarget2D* InTe
 	
 }
 
+// ─── Blur shared internal helper ──────────────────────────────
+static void BlurTexture_Internal(FRDGBuilder& GraphBuilder, FTextureRenderTargetResource* TextureTarget, FTextureRenderTargetResource* BlurTextureRT, float BlurScale, FBlurTexture::EBlurType BlurType)
+{
+	typename FBlurTexture::FPermutationDomain PermutationVector;
+	PermutationVector.Set<FBlurTexture::FBlurFunctionSet>(BlurType);
+	TShaderMapRef<FBlurTexture> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PermutationVector);
+	if (!ComputeShader.IsValid()) return;
+
+	FBlurTexture::FParameters* PassParameters = GraphBuilder.AllocParameters<FBlurTexture::FParameters>();
+	auto GroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(TextureTarget->GetSizeXY().X, TextureTarget->GetSizeXY().Y, 1), FComputeShaderUtils::kGolden2DGroupSize);
+	FRDGTextureRef TmpTexture_BlurTexture = ConvertToUVATexture(BlurTextureRT, GraphBuilder);
+	FRDGTextureRef TextureTargetTexture = RegisterExternalTexture(GraphBuilder, TextureTarget->GetRenderTargetTexture(), TEXT("Input_RT"));
+	FRDGTextureRef BlurTextureTexture = RegisterExternalTexture(GraphBuilder, BlurTextureRT->GetRenderTargetTexture(), TEXT("Blur_RT"));
+	PassParameters->T_BlurTexture = TextureTargetTexture;
+	PassParameters->RW_BlurTexture = GraphBuilder.CreateUAV(TmpTexture_BlurTexture);
+	PassParameters->Sampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
+	PassParameters->BlurScale = BlurScale;
+	GraphBuilder.AddPass(
+		RDG_EVENT_NAME("Blur"),
+		PassParameters,
+		ERDGPassFlags::AsyncCompute,
+		[&PassParameters, ComputeShader, GroupCount](FRHIComputeCommandList& RHICmdList)
+		{
+			FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader, *PassParameters, GroupCount);
+		});
+	AddCopyTexturePass(GraphBuilder, TmpTexture_BlurTexture, BlurTextureTexture, FRHICopyTextureInfo());
+}
+
 void UComputeShaderBasicFunction::BlurTexture(UTextureRenderTarget2D* InTextureTarget,
 	UTextureRenderTarget2D* OutBlurTexture, float BlurScale)
 {
 	if (InTextureTarget == nullptr || OutBlurTexture == nullptr)	return;
-
 	SCOPE_CYCLE_COUNTER(STAT_CSTest_Execute);
 	FTextureRenderTargetResource* TextureTarget = InTextureTarget->GameThread_GetRenderTargetResource();
-	FTextureRenderTargetResource* BlurTexture = OutBlurTexture->GameThread_GetRenderTargetResource();
+	FTextureRenderTargetResource* BlurTextureRT = OutBlurTexture->GameThread_GetRenderTargetResource();
 	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	[TextureTarget, BlurTexture, BlurScale](FRHICommandListImmediate& RHICmdList)
+	[TextureTarget, BlurTextureRT, BlurScale](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
 		{
-			
-			typename FBlurTexture::FPermutationDomain PermutationVector;
-			PermutationVector.Set<FBlurTexture::FBlurFunctionSet>(FBlurTexture::EBlurType::BT_BLUR3X3);
-			TShaderMapRef<FBlurTexture> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PermutationVector);
-			
-			bool bIsShaderValid = ComputeShader.IsValid();
-		
-			if (bIsShaderValid)
-			{
-				FBlurTexture::FParameters* PassParameters = GraphBuilder.AllocParameters<FBlurTexture::FParameters>();
-				auto GroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(TextureTarget->GetSizeXY().X, TextureTarget->GetSizeXY().Y, 1), FComputeShaderUtils::kGolden2DGroupSize);
-				
-				FRDGTextureRef TmpTexture_BlurTexture = ConvertToUVATexture(BlurTexture, GraphBuilder);
-				FRDGTextureRef TextureTargetTexture = RegisterExternalTexture(GraphBuilder, TextureTarget->GetRenderTargetTexture(), TEXT("Input_RT"));
-				FRDGTextureRef BlurTextureTexture = RegisterExternalTexture(GraphBuilder, BlurTexture->GetRenderTargetTexture(), TEXT("Blur_RT"));
-				
-				PassParameters->T_BlurTexture = TextureTargetTexture;
-				PassParameters->RW_BlurTexture = GraphBuilder.CreateUAV(TmpTexture_BlurTexture);
-				PassParameters->Sampler	= TStaticSamplerState<SF_Bilinear>::GetRHI();
-				PassParameters->BlurScale = BlurScale;
-				
-
-				GraphBuilder.AddPass(
-				RDG_EVENT_NAME("ExecuteExampleComputeShader"),
-				PassParameters,
-				ERDGPassFlags::AsyncCompute,
-				[&PassParameters, ComputeShader, GroupCount](FRHIComputeCommandList& RHICmdList)
-				{
-					FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader, *PassParameters, GroupCount);
-				});
-				
-				
-				
-				AddCopyTexturePass(GraphBuilder, TmpTexture_BlurTexture, BlurTextureTexture, FRHICopyTextureInfo());
-			}
+			BlurTexture_Internal(GraphBuilder, TextureTarget, BlurTextureRT, BlurScale, FBlurTexture::EBlurType::BT_BLUR3X3);
 		}
 		GraphBuilder.Execute();
 	});
@@ -389,7 +380,7 @@ void UComputeShaderBasicFunction::BlurTexture(UTextureRenderTarget2D* InTextureT
 void UComputeShaderBasicFunction::BlurTextureRDG(FRDGBuilder& GraphBuilder, FRDGTextureRef& InTexture, FRDGTextureUAVRef& InTextureUAV, FRDGTextureRef& OutTexture, FIntVector GroupCount, FBlurTexture::EBlurType Type,float BlurScale)
 {
 	typename FBlurTexture::FPermutationDomain PermutationVector;
-	PermutationVector.Set<FBlurTexture::FBlurFunctionSet>(FBlurTexture::EBlurType::BT_BLUR15X15);
+	PermutationVector.Set<FBlurTexture::FBlurFunctionSet>(Type);
 	TShaderMapRef<FBlurTexture> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PermutationVector);
 
 	FBlurTexture::FParameters* PassParameters = GraphBuilder.AllocParameters<FBlurTexture::FParameters>();
@@ -412,52 +403,19 @@ void UComputeShaderBasicFunction::BlurTextureRDG(FRDGBuilder& GraphBuilder, FRDG
 }
 
 void UComputeShaderBasicFunction::BlurNormalTexture(UTextureRenderTarget2D* InTextureTarget,
-                                                    UTextureRenderTarget2D* OutBlurTexture, float BlurScale)
+	UTextureRenderTarget2D* OutBlurTexture, float BlurScale)
 {
-			if (InTextureTarget == nullptr || OutBlurTexture == nullptr)
-		return;
-
+	if (InTextureTarget == nullptr || OutBlurTexture == nullptr) return;
 	FTextureRenderTargetResource* TextureTarget = InTextureTarget->GameThread_GetRenderTargetResource();
-	FTextureRenderTargetResource* BlurTexture = OutBlurTexture->GameThread_GetRenderTargetResource();
+	FTextureRenderTargetResource* BlurTextureRT = OutBlurTexture->GameThread_GetRenderTargetResource();
 	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	[TextureTarget, BlurTexture, BlurScale](FRHICommandListImmediate& RHICmdList)
+	[TextureTarget, BlurTextureRT, BlurScale](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
 		{
-			typename FBlurTexture::FPermutationDomain PermutationVector;
-			PermutationVector.Set<FBlurTexture::FBlurFunctionSet>(FBlurTexture::EBlurType::BT_BLURNORMAL3X3);
-			TShaderMapRef<FBlurTexture> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PermutationVector);
-			
-			bool bIsShaderValid = ComputeShader.IsValid();
-		
-			if (bIsShaderValid)
-			{
-				FBlurTexture::FParameters* PassParameters = GraphBuilder.AllocParameters<FBlurTexture::FParameters>();
-				auto GroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(TextureTarget->GetSizeXY().X, TextureTarget->GetSizeXY().Y, 1), FComputeShaderUtils::kGolden2DGroupSize);
-				
-				FRDGTextureRef TmpTexture_BlurTexture = ConvertToUVATexture(BlurTexture, GraphBuilder);
-				FRDGTextureRef TextureTargetTexture = RegisterExternalTexture(GraphBuilder, TextureTarget->GetRenderTargetTexture(), TEXT("Input_RT"));
-				
-				PassParameters->T_BlurTexture = TextureTargetTexture;
-				PassParameters->RW_BlurTexture = GraphBuilder.CreateUAV(TmpTexture_BlurTexture);
-				PassParameters->Sampler	= TStaticSamplerState<SF_Bilinear>::GetRHI();
-				PassParameters->BlurScale = BlurScale;
-				
-				GraphBuilder.AddPass(
-					RDG_EVENT_NAME("ExecuteExampleComputeShader"),
-					PassParameters,
-					ERDGPassFlags::AsyncCompute,
-					[&PassParameters, ComputeShader, GroupCount](FRHIComputeCommandList& RHICmdList)
-					{
-						FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader, *PassParameters, GroupCount);
-					});
-				
-				FRDGTextureRef BlurTextureTexture = RegisterExternalTexture(GraphBuilder, BlurTexture->GetRenderTargetTexture(), TEXT("Connectivity_RT"));
-				AddCopyTexturePass(GraphBuilder, TmpTexture_BlurTexture, BlurTextureTexture, FRHICopyTextureInfo());
-			}
+			BlurTexture_Internal(GraphBuilder, TextureTarget, BlurTextureRT, BlurScale, FBlurTexture::EBlurType::BT_BLURNORMAL3X3);
 		}
 		GraphBuilder.Execute();
-
 	});
 }
 
@@ -508,33 +466,6 @@ void UComputeShaderBasicFunction::UpPixelsMask(UTextureRenderTarget2D* InTexture
 				
 				AddCopyTexturePass(GraphBuilder, TmpTexture_UpTexture, UpTextureTexture, FRHICopyTextureInfo());
 			}
-		}
-		GraphBuilder.Execute();
-
-	});
-}
-
-void UComputeShaderBasicFunction::DrawTextureOut(UTextureRenderTarget2D* InTextureTarget, UTextureRenderTarget2D* OutTextureTarget)
-{
-	if (InTextureTarget == nullptr || OutTextureTarget == nullptr) return;
-		
-	
-	
-	FTextureRenderTargetResource* TextureTargetIn = InTextureTarget->GameThread_GetRenderTargetResource();
-	FTextureRenderTargetResource* TextureTargetOut = OutTextureTarget->GameThread_GetRenderTargetResource();
-
-	if (TextureTargetIn->GetSizeXY() != TextureTargetOut->GetSizeXY()) return;
-	
-	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	[=](FRHICommandListImmediate& RHICmdList)
-	{
-		FRDGBuilder GraphBuilder(RHICmdList);
-		{
-			FRDGTextureRef TextureTargetInTexture = RegisterExternalTexture(GraphBuilder, TextureTargetIn->GetRenderTargetTexture(), TEXT("Input_RT"));
-			FRDGTextureRef TextureTextureOutTexture = RegisterExternalTexture(GraphBuilder, TextureTargetOut->GetRenderTargetTexture(), TEXT("Output_RT"));
-			
-			AddCopyTexturePass(GraphBuilder, TextureTargetInTexture, TextureTextureOutTexture, FRHICopyTextureInfo());
-		
 		}
 		GraphBuilder.Execute();
 
@@ -927,55 +858,6 @@ void UComputeShaderBasicFunction::GenerateMapCliff(TSubclassOf<ACSPlaneRangeGene
 }
 
 
-void UComputeShaderBasicFunction::RDG_SampleSpline(FRDGBuilder& GraphBuilder,
-                                                   FRDGTextureRef& TmpRDG_DirMinDistRotate, FRDGTextureUAVRef& RDGUAV_GradientHeight,
-                                                   TArray<FLinearColor> SplinePoints,
-                                                   FIntPoint TextureSizeXY, FIntVector GroupCount)
-{
-
-
-	// FIntPoint TextureSizeXY = SampleDistRotate->GetSizeXY();
-	//
-	// TShaderMapRef<FSampleSpline> ComputeShader = FSampleSpline::CreateTempShaderPermutation(FSampleSpline::ESampleStep::SS_SampleSpline);
-	// FSampleSpline::FParameters* PassParameters = GraphBuilder.AllocParameters<FSampleSpline::FParameters>();
-	//
-	// FRDGTextureRef TmpRDG_DirMinDistRotate = ConvertToUVATextureFormat(GraphBuilder, TextureSizeXY, PF_FloatRGBA, TEXT("DirMinDistRotate_RWTexture")); 
-	// FRDGTextureUAVRef RDGUAV_DirMinDistRotate = GraphBuilder.CreateUAV(TmpRDG_DirMinDistRotate);
-	// FRDGTextureRef TmpRDG_GradientHeight = ConvertToUVATextureFormat(GraphBuilder, TextureSizeXY, PF_FloatRGBA, TEXT("GradientHeight_RWTexture")); 
-	// FRDGTextureUAVRef RDGUAV_GradientHeight = GraphBuilder.CreateUAV(TmpRDG_GradientHeight);
-	// FRDGTextureRef TmpRDG_DebugView = ConvertToUVATextureFormat(GraphBuilder, TextureSizeXY, PF_FloatRGBA, TEXT("DebugView_RWTexture")); 
-	// FRDGTextureUAVRef RDGUAV_DebugView = GraphBuilder.CreateUAV(TmpRDG_DebugView);
-	//
-	// FRDGBufferRef Tmp_SplineDataBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(ElementSize, BufferNumElement), TEXT("SplineDataBuffer"));
-	// GraphBuilder.QueueBufferUpload(Tmp_SplineDataBuffer, SplinePoints.GetData(), SplinePoints.Num() * ElementSize);
-	// FRDGBufferUAVRef Tmp_SplineDataBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Tmp_SplineDataBuffer, EPixelFormat::PF_A32B32G32R32F));
-	//
-	// FRDGBufferRef Tmp_SplinePointCountBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(int32), NumSpline), TEXT("SplinePointCountBuffer"));
-	// GraphBuilder.QueueBufferUpload(Tmp_SplinePointCountBuffer, SplinePointCount.GetData(), SplinePointCount.Num() * sizeof(int32));
-	// FRDGBufferUAVRef Tmp_SplinePointCountBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Tmp_SplinePointCountBuffer, EPixelFormat::PF_R32_UINT));
-	//
-	//
-	// PassParameters->RW_SampleResult_DirMinDistRotate = RDGUAV_DirMinDistRotate;
-	// PassParameters->RW_SampleResult_GradientHeight = RDGUAV_GradientHeight;
-	// PassParameters->RW_DebugView = RDGUAV_DebugView;
-	// PassParameters->RW_PointsToSampleBuffer = Tmp_SplineDataBufferUAV;
-	// PassParameters->RW_SplinePointCount = Tmp_SplinePointCountBufferUAV;
-	// PassParameters->NumSpline = NumSpline;
-	// PassParameters->BoundsMin = FVector3f(BoundMin.X, BoundMin.Y, BoundMin.Z);
-	// PassParameters->BoundsSize = FVector3f(BoundSize.X, BoundSize.Y, BoundSize.Z);
-	//
-	// PassParameters->Sampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
-	//
-	// GraphBuilder.AddPass(
-	// 	RDG_EVENT_NAME("SampleSpline"),
-	// 	PassParameters,
-	// 	ERDGPassFlags::AsyncCompute,
-	// 	[&PassParameters, ComputeShader, GroupCount](FRHIComputeCommandList& RHICmdList)
-	// 	{
-	// 		FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader, *PassParameters, GroupCount);
-	// 	});
-}
-
 void UComputeShaderBasicFunction::RDG_SmoothSpline(
 	FRDGBuilder& GraphBuilder,
 	const TArray<FVector4f>& ControlPoints,
@@ -1285,22 +1167,6 @@ void UComputeShaderBasicFunction::CopyTexture(UTextureRenderTarget2D* InOrig, UT
 		GraphBuilder.Execute();
 	});
 	FlushRenderingCommands();
-}
-
-void UComputeShaderBasicFunction::DrawCopyTexture(FRDGBuilder& GraphBuilder, FRDGTextureUAVRef RDGUAV_CopySource, UTextureRenderTarget2D* RT_CopyTarget)
-{
-	FDrawCopyTexturePS::FParameters* PassParameters = GraphBuilder.AllocParameters<FDrawCopyTexturePS::FParameters>();
-	
-	TRefCountPtr<IPooledRenderTarget> pooledRenderTarget = CreateRenderTarget(RT_CopyTarget->GetResource()->GetTexture2DRHI(), TEXT("CopyTarget"));
-	FRDGTextureRef RDG_CopyTarget = GraphBuilder.RegisterExternalTexture(pooledRenderTarget);
-	PassParameters->RenderTargets[0] = FRenderTargetBinding(RDG_CopyTarget, ERenderTargetLoadAction::EClear, 0);
-	PassParameters->RW_CopySource = RDGUAV_CopySource;
-	PassParameters->SourceSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-	FIntRect ViewRect = FIntRect(FIntPoint(0, 0), FIntPoint(RT_CopyTarget->SizeX, RT_CopyTarget->SizeY));
-	const auto GlobalShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
-	TShaderMapRef<FDrawCopyTexturePS> PixelShader = FDrawCopyTexturePS::CreatePermutation(FDrawCopyTexturePS::EDrawCopy::DC_CopyRWTexture);
-
-	FPixelShaderUtils::AddFullscreenPass(GraphBuilder, GlobalShaderMap, RDG_EVENT_NAME("DrawCopyTexture"), PixelShader, PassParameters, ViewRect);
 }
 
 void UComputeShaderBasicFunction::DrawCopyTexture(FRDGBuilder& GraphBuilder, FRDGTextureUAVRef RDGUAV_CopySource, FRDGTextureRef& RDG_CopyTarget)

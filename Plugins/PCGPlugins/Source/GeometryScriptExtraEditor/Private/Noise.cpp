@@ -1,4 +1,4 @@
-﻿#include "Noise.h"
+#include "Noise.h"
 
 
 FVector UNoise::CurlNoise(FVector Pos, FVector& Out_AddedPos, FVector Offset, float Strength, float Frequency)

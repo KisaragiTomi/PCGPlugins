@@ -10,7 +10,7 @@
  * 
  */
 UCLASS()
-class GEOMETRYEDITOR_API UGeometryEditorFunction : public UBlueprintFunctionLibrary
+class PCGEDITORPROCESS_API UGeometryEditorFunction : public UBlueprintFunctionLibrary
 {
 	GENERATED_BODY()
 	UFUNCTION(BlueprintCallable, Category = Generate)

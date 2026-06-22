@@ -1,32 +1,17 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "ComputeShaderLandscape.h"
-#include "LandscapeEditLayerRenderer.h"
-#include "LandscapeEditLayerRendererState.h"
-#include "LandscapeEditLayerTargetTypeState.h"
-#include "LandscapeEditLayerTypes.h"
-#include "LandscapeEditTypes.h"
+#include "CSLandscapeEditLayerBase.h"
+#include "ComputeShaderBasicFunction.h"
+#include "Components/BoxComponent.h"
 #include "ComputeShaderLandscapeLayer.generated.h"
 
 class UMaterialInterface;
-
-UENUM(BlueprintType)
-enum class ELandscapeLayerBlendMode : uint8
-{
-	Alpha         UMETA(DisplayName = "Alpha Lerp (Generated * Alpha + Normal * (1 - Alpha))"),
-	Override      UMETA(DisplayName = "Override (Replace Normal with Generated)"),
-	Additive      UMETA(DisplayName = "Additive (Normal + Generated * Alpha)"),
-	Subtract      UMETA(DisplayName = "Subtract (Normal - Generated * Alpha)"),
-	Multiply      UMETA(DisplayName = "Multiply (Normal * (Generated * Alpha + (1 - Alpha)))"),
-	MaterialDrive UMETA(DisplayName = "Material Driven (Per-pixel blend from material texture)")
-};
+class UTextureRenderTarget2D;
+class UTexture2D;
 
 UCLASS()
-class PCGEDITORPROCESS_API ACSLandscapeLayer : public AActor
-#if CPP && WITH_EDITOR
-	, public ILandscapeEditLayerRenderer
-#endif
+class PCGEDITORPROCESS_API ACSLandscapeLayer : public ACSLandscapeEditLayerBase
 {
 	GENERATED_BODY()
 public:
@@ -36,7 +21,7 @@ public:
 	FName LayerName = TEXT("PCG_TempLayer");
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LayerSettings")
-	ELandscapeLayerBlendMode BlendMode = ELandscapeLayerBlendMode::Alpha;
+	ECSLandscapeBlendMode BlendMode = ECSLandscapeBlendMode::Alpha;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LayerSettings")
 	UMaterialInterface* LayerMaterial;
@@ -81,17 +66,8 @@ public:
 	UPROPERTY(BlueprintReadWrite, Category = "RuntimeData")
 	UTextureRenderTarget2D* RT_DebugView;
 
-	UPROPERTY(BlueprintReadWrite, Category = "RuntimeData")
-	FGuid LayerGuid;
-
-	UPROPERTY(BlueprintReadWrite, Category = "RuntimeData")
-	int32 LayerIndex = -1;
-
-	UPROPERTY(BlueprintReadWrite, Category = "RuntimeData")
-	bool bLayerCreated = false;
-
 	// Not BlueprintType — used internally for data passing
-	FReadLandscapeData Orig_LandscapeData;
+	FCSReadLandscapeData Orig_LandscapeData;
 
 	UPROPERTY(BlueprintReadWrite, Category = "Debug")
 	FVector LandscapeTexMinUV = FVector::ZeroVector;
@@ -111,11 +87,6 @@ public:
 protected:
 	USceneComponent* SceneComponent;
 	UBoxComponent* Box;
-
-	UPROPERTY()
-	FGuid OwnedEditLayerGuid;
-
-	friend class UCSLandscapeEditLayer;
 
 public:
 	virtual void OnConstruction(const FTransform& Transform) override;
@@ -152,33 +123,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "LandscapeLayer")
 	static UTextureRenderTarget2D* CreateBlankAlphaTexture(UObject* WorldContextObject, int32 SizeX, int32 SizeY, FLinearColor ClearColor = FLinearColor::Black);
 
-	UFUNCTION(BlueprintCallable, Category = "LandscapeLayer")
-	void RequestLandscapeUpdate(bool bInUserTriggered = false);
-
 #if WITH_EDITOR
-	// --- ILandscapeEditLayerRenderer interface ---
-	virtual FString GetEditLayerRendererDebugName() const override;
-
-	virtual void GetRendererStateInfo(
-		const UE::Landscape::EditLayers::FMergeContext* InMergeContext,
-		UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutSupportedTargetTypeState,
-		UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutEnabledTargetTypeState,
-		TArray<UE::Landscape::EditLayers::FTargetLayerGroup>& OutTargetLayerGroups) const override;
-
-	virtual TArray<UE::Landscape::EditLayers::FEditLayerRenderItem> GetRenderItems(
-		const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const override;
-
-	virtual UE::Landscape::EditLayers::ERenderFlags GetRenderFlags(
-		const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const override;
-
+	// --- ILandscapeEditLayerRenderer interface (only the per-subclass parts) ---
 	virtual bool RenderLayer(
 		UE::Landscape::EditLayers::FRenderParams& RenderParams,
 		UE::Landscape::FRDGBuilderRecorder& RDGBuilderRecorder) override;
 
 	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
 #endif
-
-private:
-	bool bHasLayerResult = false;
-	ALandscape* FindLandscape() const;
 };

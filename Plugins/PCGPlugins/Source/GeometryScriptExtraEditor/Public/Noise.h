@@ -13,7 +13,7 @@
  * 
  */
 UCLASS()
-class GEOMETRYMATH_API UNoise : public UBlueprintFunctionLibrary
+class GEOMETRYSCRIPTEXTRAEDITOR_API UNoise : public UBlueprintFunctionLibrary
 {
 	GENERATED_BODY()
 public:

@@ -29,6 +29,7 @@
 #if VOXEL_GDF_FILL_OCCUPANCY
 #include "/Engine/Private/DistanceField/GlobalDistanceFieldShared.ush"
 #endif
+#include "/Plugin/PCGPlugins/Shaders/Private/PCGMathCommon.ush"
 
 #ifndef THREADGROUPSIZE_X
 #define THREADGROUPSIZE_X 8
@@ -46,11 +47,6 @@
 
 int3  VoxelGridSize;     // (GridX, GridY, GridZ)
 uint  ColumnCount;       // GridX * GridY
-
-uint PackSpan(uint zStart, uint zEnd)
-{
-	return (zStart & 0xFFFFu) | ((zEnd & 0xFFFFu) << 16u);
-}
 
 // ─── Pass: GDF fill occupancy (sample Global Distance Field per voxel centre) ───
 
@@ -272,7 +268,7 @@ void EmitCavityCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 			if (PrevSolidTop >= 0)
 			{
 				if (WriteOffset < TotalSpanCapacity)
-					RW_Spans[WriteOffset] = PackSpan((uint)PrevSolidTop, (uint)RunStart);
+					RW_Spans[WriteOffset] = PackZSpan16((uint)PrevSolidTop, (uint)RunStart);
 				++WriteOffset;
 			}
 		}

@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "ComputeShaderGenerateHepler.h"
+#include "ComputeShaderMeshGenerator.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Components/BoxComponent.h"
 #include "Kismet/KismetRenderingLibrary.h"
@@ -12,6 +13,7 @@
 #include "RenderGraphResources.h"
 #include "RHIGPUReadback.h"
 #include "TimerManager.h"
+#include "Components/SceneCaptureComponent2D.h"
 
 #define CSSW_VELOCITY_CLAMP 4
 
@@ -31,13 +33,11 @@ enum class EWaterfallExpansion : uint8
 
 
 UCLASS(HideCategories=(Replication), meta=(PrioritizeCategories="SWParameter"))
-class COMPUTESHADERGENERATOR_API ACSShallowWaterCapture : public AActor
+class COMPUTESHADERGENERATOR_API ACSShallowWaterCapture : public AComputeShaderMeshGenerator
 {
 	GENERATED_BODY()
 public:
-	ACSShallowWaterCapture();
-	virtual void Tick(float DeltaTime) override;
-	virtual bool ShouldTickIfViewportsOnly() const override;
+	ACSShallowWaterCapture(const FObjectInitializer& ObjectInitializer);
 
 	UPROPERTY(Transient, NonTransactional, EditAnywhere, BlueprintReadWrite, Category = "Debug")
 	UTextureRenderTarget2D* RT_DebugView;
@@ -59,8 +59,6 @@ public:
 	bool CleanDepthWet = true;
 
 
-	USceneComponent* SceneComponent;
-	UBoxComponent* Box;
 	UPROPERTY(BlueprintReadWrite, Category = "Debug")
 	UStaticMesh* DebugMesh;
 	UPROPERTY(BlueprintReadWrite, Category = "Debug")
@@ -131,13 +129,13 @@ public:
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void Destroyed() override;
 	virtual void BeginDestroy() override;
+	virtual bool ShouldTickIfViewportsOnly() const override;
+	virtual void Tick(float DeltaTime) override;
 
 	virtual void OnConstruction(const FTransform& Transform) override;
 	
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	void ConstructionComponent();
-
-	void ConstructActor();
 
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	bool CheckAndCreateTexture_SWSourcePoint()
@@ -210,13 +208,31 @@ public:
 	void ReleaseTransientRenderResources();
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter|Voxel", Meta=(Priority=1000))
-	int32 VoxelMaxSceneTriangles = 200000;
+	int32 VoxelMaxSceneTriangles = 2000000000;
+
+	// Tiled voxel build: per-column fixed run capacity. The persistent Runs buffer is sized
+	// ColumnCount * VoxelMaxRunsPerColumn (no prefix sum). Columns with more vertical runs than
+	// this are truncated. 16 covers typical terrain (a few solid spans per column); raise it for
+	// highly layered geometry (caves, overhangs) at the cost of more VRAM.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter|Voxel", Meta=(Priority=1000, ClampMin="1", ClampMax="256"))
+	int32 VoxelMaxRunsPerColumn = 16;
+
+	// Tiled voxel build: target VRAM budget (MB) for the transient per-tile occupancy scratch.
+	// The XY tile size is chosen adaptively so one tile's dense bit grid (TileW*TileH*GridZ bits)
+	// fits this budget. Smaller budget -> more, smaller tiles -> lower peak VRAM, more dispatches.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter|Voxel", Meta=(Priority=1000, ClampMin="1", ClampMax="2048"))
+	int32 VoxelTileBudgetMB = 64;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter|Voxel", Meta=(Priority=1000))
 	float MaxWaterRisePerFrame = 40.0f;
 	// When rebuilding the terrain height map, the search starts at the most recent water surface and
 	// expands outward (up and down). Voxels more than this many cm ABOVE the water surface are ignored.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter|Voxel", Meta=(Priority=1000))
 	float VoxelMaxAboveWaterSurface = 50.0f;
+
+	// During initial height map build, voxels more than this many cm BELOW the lowest source point
+	// are rejected. Prevents underground cavities from being selected as terrain surface.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter|Voxel", Meta=(Priority=1000))
+	float VoxelMaxBelowWaterSurface = 500.0f;
 
 	// Terrain voxelization ignores scene triangles whose world Z is higher than the highest source
 	// point plus this margin (cm). Keeps source-overhead geometry (ceilings, overhangs) out of the
@@ -249,6 +265,12 @@ public:
 	// Releases the persistent terrain voxel grid GPU resources.
 	void ReleaseTerrainVoxelGrid();
 
+	UPROPERTY(BlueprintReadWrite, Category = "Capturer")
+	TObjectPtr<USceneCaptureComponent2D> CaptureSceneDepth;
+
+	UPROPERTY(Transient, NonTransactional, BlueprintReadWrite, Category = "Debug")
+	UTextureRenderTarget2D* RT_SceneDepth = nullptr;
+
 	UPROPERTY(Transient, NonTransactional)
 	UTextureRenderTarget2D* RT_TileMask = nullptr;
 
@@ -261,6 +283,15 @@ public:
 	float SimVisTileWorldSize = 0.0f;
 
 	static constexpr int32 ReadbackBufferCount = 2;
+
+	FRHIGPUTextureReadback* TileMaskReadback[ReadbackBufferCount] = {};
+	int32 TileMaskReadbackWriteIdx = 0;
+	int32 TileMaskReadbackCopyWidth[ReadbackBufferCount] = {};
+	int32 TileMaskReadbackCopyHeight[ReadbackBufferCount] = {};
+	int32 TileMaskReadbackGeneration[ReadbackBufferCount] = {};
+	int32 TileMaskReadbackWidth = 0;
+	int32 TileMaskReadbackHeight = 0;
+	TArray<uint8> CachedTileBits;
 
 	FRHIGPUTextureReadback* ResultReadback[ReadbackBufferCount] = {};
 	int32 ResultReadbackWriteIdx = 0;
@@ -301,6 +332,15 @@ public:
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "ComputeShader")
 	void StopSolver();
 
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
+	void RequestRenderDocCapture();
+
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
+	void ShallowWaterSolverSoucePointWithCapture(int32 InIteration);
+
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "ComputeShader")
+	void ToggleSimVisualization(int32 SimIterationsPerFrame = 1);
+
 	DECLARE_DELEGATE_OneParam(FOnBakeResultMesh, ACSShallowWaterCapture*);
 	static FOnBakeResultMesh OnBakeResultMeshDelegate;
 
@@ -317,9 +357,6 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader|Bake")
 	void UseSimulationResultMesh();
 
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader", Meta=(ClampMin="1", ClampMax="32", UIMin="1", UIMax="8"))
-	void ToggleSimVisualization(int32 SimIterationsPerFrame = 1);
-
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "ComputeShader")
 	bool bSimVisActive = false;
 
@@ -334,6 +371,17 @@ public:
 	// must have built it). Duration is the debug line lifetime in seconds.
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "ComputeShader|Debug", Meta=(ClampMin="0", UIMin="0"))
 	void VisualizeVoxelRuns(float Duration = 5.0f);
+
+	// One-shot debug: builds the terrain voxel grid using the solver's GPU pipeline (VoxelFill →
+	// CountRuns → ScanBlocks → ScanBlockSums → AddOffsets → EmitRuns), reads back the sparse
+	// CSR run-length buffers, then draws THICK vertical debug lines per voxel column. Each run
+	// is drawn as a single thick cylinder-like line. Duration controls debug-line lifetime.
+	// Thickness is in world units; defaults to CellSizeXY (the full XY width of each voxel column).
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "ComputeShader|Debug", Meta=(ClampMin="0", UIMin="0"))
+	void DrawDebugVoxelGrid(float Duration = 10.0f, float Thickness = -1.0f);
+
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "ComputeShader|Debug")
+	void DrawDebugHeightMapPoints(float Duration = 10.0f, int32 Stride = 8, float PointSize = 12.0f, bool bUseLiquidSearch = false);
 
 private:
 	void ClearSolverTimer();
@@ -354,6 +402,11 @@ private:
 	int32 ResolveTextureSize() const;
 	void ReleaseShallowWaterTransientResources(const TCHAR* Context);
 
+	void CaptureSceneDepthNow();
+
+	TArray<int32> ISMTileSlots;
+	int32 CachedActiveTileCount = 0;
+
 	TWeakObjectPtr<AActor> DebugViewPlaneActor;
 	FTimerHandle DebugViewPlaneTimerHandle;
 	FTimerHandle SolverTimerHandle;
@@ -361,6 +414,7 @@ private:
 	int32 SolverIterationsPerFrame = 1;
 	bool bSWConstructionGuardActive = false;
 	bool bSWConstructionWorkPending = false;
+	bool bCaptureNextSolverFrame = false;
 };
 
 

@@ -14,7 +14,6 @@
 #endif
 #include "LandscapeComponent.h"
 #include "TextureResource.h"
-#include "DrawPrimtive.h"
 #include "ComputeShaderMeshFill.h"
 #include "ComputeShaderSceneCapture.h"
 #include "ComputeShaderShallowWater.h"

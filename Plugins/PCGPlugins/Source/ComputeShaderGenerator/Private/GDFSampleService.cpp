@@ -163,7 +163,41 @@ void FGDFViewExtension::PostRenderBasePassDeferred_RenderThread(
 		const FGlobalDistanceFieldParameterData* GDFData =
 			GetRendererModule().GetGlobalDistanceFieldParameterData(InView);
 		if (!GDFData) continue;
-		JobReq.Build(GraphBuilder, InView, *GDFData);
+
+		FGDFJobOutputs Outputs;
+		JobReq.Build(GraphBuilder, InView, *GDFData, Outputs);
+
+		// 没有完成回调：纯 fire-and-forget，Build 产出的常驻 buffer 由调用方自行在别处持有/读取。
+		if (!JobReq.OnComplete)
+		{
+			continue;
+		}
+
+		// 挂一个 sentinel readback 作为 GPU 完成 fence：它排在 Build 的所有 pass 之后，
+		// 一旦 readback ready，说明这张图的 GPU 工作已执行完，常驻 buffer 数据已就位。
+		FRDGBufferRef Sentinel = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1), TEXT("GDFJob.Sentinel"));
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Sentinel, PF_R32_UINT)), 0u);
+
+		FRHIGPUBufferReadback* FenceRB = new FRHIGPUBufferReadback(TEXT("GDFJob.FenceRB"));
+		AddEnqueueCopyPass(GraphBuilder, FenceRB, Sentinel, sizeof(uint32));
+
+		TFunction<void(FGDFJobOutputs&)> OnComplete = MoveTemp(JobReq.OnComplete);
+		AddPendingReadback([FenceRB, Outputs = MoveTemp(Outputs), OnComplete = MoveTemp(OnComplete)]() mutable -> bool
+		{
+			if (!FenceRB->IsReady())
+			{
+				return false;
+			}
+			delete FenceRB;
+
+			AsyncTask(ENamedThreads::GameThread,
+				[OnComplete = MoveTemp(OnComplete), Outputs = MoveTemp(Outputs)]() mutable
+				{
+					OnComplete(Outputs);
+				});
+			return true;
+		});
 	}
 }
 

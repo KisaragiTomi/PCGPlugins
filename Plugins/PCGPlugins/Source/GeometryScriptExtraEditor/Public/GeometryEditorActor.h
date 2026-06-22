@@ -3,14 +3,12 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "DynamicMeshActor.h"
 #include "PolyLine.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Curves/CurveLinearColor.h"
 #include "GeometryScript/GeometryScriptTypes.h"
 #include "ComputeShaderMeshGenerator.h"
 #include "ComputeShaderDebugParams.h"
-#include "InstancedFoliage.h"
 #include "InstancedFoliageActor.h"
 #include "FoliageType.h"
 

@@ -52,97 +52,108 @@ static FSafeIndices CalcSafeIndices(FVector2D LocalPoint, int32 Stride)
 	return Result;
 }
 
- 
+// ---------- Shared landscape height reading context ----------
 
-UDynamicMesh* ULandscapeExtra::CreateProjectPlane(UDynamicMesh* Mesh, FVector Center, FVector Extent, int32 ExtentPlus)
+struct FLandscapeHeightReadContext
 {
-	UDynamicMesh* PlaneMesh = NewObject<UDynamicMesh>();
-	FVector Min = Center - Extent;
-	FVector Max = Center + Extent;
-	if (Extent.Length() < .001)
-	{
-		return nullptr;
-	}
 	ALandscape* Landscape = nullptr;
+	FTransform LandscapeTransform;
+	FIntPoint KeyMin = FIntPoint::ZeroValue;
+	FIntPoint KeyMax = FIntPoint::ZeroValue;
+	int32 XNum = 0;
+	int32 YNum = 0;
+	int32 NumVertices = 0;
+	int32 ComponentSizeQuads = 0;
+	TArray<uint16> HeightValues;
+	bool bValid = false;
+};
+
+static FLandscapeHeightReadContext ReadLandscapeHeightInBox(FVector Center, FVector Extent, int32 ExtentPlus)
+{
+	FLandscapeHeightReadContext Ctx;
+	if (Extent.Length() < .001) return Ctx;
+
+	const FVector Min = Center - Extent;
+	const FVector Max = Center + Extent;
+
 	if (UWorld* World = GEngine->GetWorldFromContextObject(GWorld, EGetWorldErrorMode::LogAndReturnNull))
 	{
 		for (TActorIterator<ALandscape> It(World, ALandscape::StaticClass()); It; ++It)
 		{
-			Landscape = *It;
+			Ctx.Landscape = *It;
 			break;
 		}
 	}
-	if (!Landscape)
-	{
-		return nullptr;
-	}
-	const ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo();
-	const FVector MaxLocalPoint = Landscape->GetTransform().InverseTransformPosition(Max);
-	const FVector MinLocalPoint = Landscape->GetTransform().InverseTransformPosition(Min);
-	const FIntPoint KeyMax(FMath::CeilToInt(MaxLocalPoint.X) + ExtentPlus, FMath::CeilToInt(MaxLocalPoint.Y) + ExtentPlus);
-	const FIntPoint KeyMin(FMath::Floor(MinLocalPoint.X) - ExtentPlus, FMath::Floor(MinLocalPoint.Y) - ExtentPlus);
-	int32 ComponentSizeQuads = LandscapeInfo->ComponentSizeQuads;
-	int32 XNum = KeyMax.X - KeyMin.X;
-	int32 YNum = KeyMax.Y - KeyMin.Y;
-	int32 NumVertices = XNum * YNum;
-	
-	
+	if (!Ctx.Landscape) return Ctx;
+
+	Ctx.LandscapeTransform = Ctx.Landscape->GetTransform();
+	const ULandscapeInfo* LandscapeInfo = Ctx.Landscape->GetLandscapeInfo();
+	const FVector MaxLocalPoint = Ctx.LandscapeTransform.InverseTransformPosition(Max);
+	const FVector MinLocalPoint = Ctx.LandscapeTransform.InverseTransformPosition(Min);
+
+	Ctx.KeyMax = FIntPoint(FMath::CeilToInt(MaxLocalPoint.X) + ExtentPlus, FMath::CeilToInt(MaxLocalPoint.Y) + ExtentPlus);
+	Ctx.KeyMin = FIntPoint(FMath::Floor(MinLocalPoint.X) - ExtentPlus, FMath::Floor(MinLocalPoint.Y) - ExtentPlus);
+	Ctx.ComponentSizeQuads = LandscapeInfo->ComponentSizeQuads;
+	Ctx.XNum = Ctx.KeyMax.X - Ctx.KeyMin.X;
+	Ctx.YNum = Ctx.KeyMax.Y - Ctx.KeyMin.Y;
+	Ctx.NumVertices = Ctx.XNum * Ctx.YNum;
+
+	if (Ctx.NumVertices <= 0) return Ctx;
+
+	Ctx.HeightValues.AddZeroed(Ctx.NumVertices);
+	FLandscapeEditDataInterface LandscapeEdit(Ctx.Landscape->GetLandscapeInfo());
+	LandscapeEdit.SetShouldDirtyPackage(false);
+	LandscapeEdit.GetHeightDataFast(Ctx.KeyMin.X, Ctx.KeyMin.Y, Ctx.KeyMax.X - 1, Ctx.KeyMax.Y - 1,
+		(uint16*)Ctx.HeightValues.GetData(), 0);
+
+	Ctx.bValid = true;
+	return Ctx;
+}
+
+ 
+
+UDynamicMesh* ULandscapeExtra::CreateProjectPlane(UDynamicMesh* Mesh, FVector Center, FVector Extent, int32 ExtentPlus)
+{
+	FLandscapeHeightReadContext Ctx = ReadLandscapeHeightInBox(Center, Extent, ExtentPlus);
+	if (!Ctx.bValid) return nullptr;
+
+	UDynamicMesh* PlaneMesh = NewObject<UDynamicMesh>();
 	FRectangleMeshGenerator RectGenerator;
 	RectGenerator.Origin = FVector3d(0, 0, 0);
 	RectGenerator.Normal = FVector3f::UnitZ();
 	RectGenerator.Width = 100;
 	RectGenerator.Height = 100;
-	RectGenerator.WidthVertexCount = FMath::Max(0, XNum);
-	RectGenerator.HeightVertexCount = FMath::Max(0, YNum);
+	RectGenerator.WidthVertexCount = FMath::Max(0, Ctx.XNum);
+	RectGenerator.HeightVertexCount = FMath::Max(0, Ctx.YNum);
 	RectGenerator.bSinglePolyGroup = true;
 	RectGenerator.Generate();
-	
+
 	FGeometryScriptPrimitiveOptions PrimitiveOptions;
 	UGeometryGeneral::AppendPrimitive(PlaneMesh, &RectGenerator, FTransform::Identity, PrimitiveOptions);
-	
-	TArray<uint16> Values;
-	Values.AddZeroed(NumVertices );
-	
-	FScopedSetLandscapeEditingLayer Scope(Landscape, Landscape->GetLayerConst(0)->EditLayer->GetGuid(), [&] {});
-	
-	int32 X1 = KeyMin.X;
-	int32 Y1 = KeyMin.Y;
-	int32 X2 = KeyMax.X - 1;
-	int32 Y2 = KeyMax.Y - 1;
-	FIntPoint MapKey = FIntPoint (X1 / ComponentSizeQuads, Y1 / ComponentSizeQuads );
-	ULandscapeComponent* Comp = LandscapeInfo->XYtoComponentMap.FindRef(MapKey);
-	FLandscapeEditDataInterface LandscapeEdit(Landscape->GetLandscapeInfo());
-	LandscapeEdit.SetShouldDirtyPackage(false);
-	LandscapeEdit.GetHeightDataFast(X1, Y1, X2, Y2, (uint16*)Values.GetData(), 0);
 
-	//
-	int32 FindIndex = 0;
 	TArray<FVector> Vertices;
-	Vertices.Reserve(NumVertices);
-	for (int32 j = KeyMin.Y; j < KeyMax.Y; j++)
+	Vertices.Reserve(Ctx.NumVertices);
+	for (int32 j = Ctx.KeyMin.Y; j < Ctx.KeyMax.Y; j++)
 	{
-		for (int32 i = KeyMin.X; i < KeyMax.X; i++)
+		for (int32 i = Ctx.KeyMin.X; i < Ctx.KeyMax.X; i++)
 		{
-			FVector LandscapePosition = FVector(i , j , LandscapeDataAccess::GetLocalHeight(Values[(j- KeyMin.Y) * XNum + (i - KeyMin.X)]));
-			Vertices.Add(LandscapePosition);
+			FVector Pos = FVector(i, j, LandscapeDataAccess::GetLocalHeight(Ctx.HeightValues[(j - Ctx.KeyMin.Y) * Ctx.XNum + (i - Ctx.KeyMin.X)]));
+			Vertices.Add(Pos);
 		}
 	}
 
 	PlaneMesh->EditMesh([&](FDynamicMesh3& EditMesh)
 	{
-		for (int32 i = 0; i < NumVertices; i++)
+		for (int32 i = 0; i < Ctx.NumVertices; i++)
 		{
-			FVector NewPosition = Vertices[i];
 			if (EditMesh.IsVertex(i))
 			{
-				EditMesh.SetVertex(i, (FVector3d)NewPosition);
-
+				EditMesh.SetVertex(i, (FVector3d)Vertices[i]);
 			}
 		}
-		MeshTransforms::ApplyTransform(EditMesh, (FTransformSRT3d)(Landscape->GetTransform()), true);
+		MeshTransforms::ApplyTransform(EditMesh, (FTransformSRT3d)(Ctx.LandscapeTransform), true);
 	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
 
-	Vertices.Empty();
 	FDynamicMesh3 MeshCopy;
 	PlaneMesh->ProcessMesh([&](const FDynamicMesh3& EditMesh)
 	{
@@ -230,199 +241,122 @@ bool ULandscapeExtra::ProjectPoint(FVector SourceLocation, FVector& OutLocation,
 	return true;
 }
 
-TArray<FLinearColor> ULandscapeExtra::GetLandscapeData( FVector Center, FVector Extent, int32 ExtentPlus)
+TArray<FLinearColor> ULandscapeExtra::GetLandscapeData(FVector Center, FVector Extent, int32 ExtentPlus)
 {
-	TArray<FLinearColor> OutHeightNormals;
-	FVector Min = Center - Extent;
-	FVector Max = Center + Extent;
-	if (Extent.Length() < .001)
-	{
-		return OutHeightNormals;
-	}
-	ALandscape* Landscape = nullptr;
-	if (UWorld* World = GEngine->GetWorldFromContextObject(GWorld, EGetWorldErrorMode::LogAndReturnNull))
-	{
-		for (TActorIterator<ALandscape> It(World, ALandscape::StaticClass()); It; ++It)
-		{
-			Landscape = *It;
-			break;
-		}
-	}
-	if (!Landscape)
-	{
-		return OutHeightNormals;
-	}
-	const ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo();
-	const FVector MaxLocalPoint = Landscape->GetTransform().InverseTransformPosition(Max);
-	const FVector MinLocalPoint = Landscape->GetTransform().InverseTransformPosition(Min);
-	const FIntPoint KeyMax(FMath::CeilToInt(MaxLocalPoint.X) + ExtentPlus, FMath::CeilToInt(MaxLocalPoint.Y) + ExtentPlus);
-	const FIntPoint KeyMin(FMath::Floor(MinLocalPoint.X) - ExtentPlus, FMath::Floor(MinLocalPoint.Y) - ExtentPlus);
-	int32 ComponentSizeQuads = LandscapeInfo->ComponentSizeQuads;
-	int32 XNum = KeyMax.X - KeyMin.X;
-	int32 YNum = KeyMax.Y - KeyMin.Y;
-	int32 NumVertices = XNum * YNum;
-	
-	TArray<uint16> HeightValues;
-	HeightValues.AddZeroed(NumVertices );
-	
-	FScopedSetLandscapeEditingLayer Scope(Landscape, Landscape->GetLayerConst(0)->EditLayer->GetGuid(), [&] {});
-	
-	int32 X1 = KeyMin.X;
-	int32 Y1 = KeyMin.Y;
-	int32 X2 = KeyMax.X - 1;
-	int32 Y2 = KeyMax.Y - 1;
-	FLandscapeEditDataInterface LandscapeEdit(Landscape->GetLandscapeInfo());
-	LandscapeEdit.SetShouldDirtyPackage(false);
-	LandscapeEdit.GetHeightDataFast(X1, Y1, X2, Y2, (uint16*)HeightValues.GetData(), 0);
-	
 	TArray<FLinearColor> HeightNormals;
-	HeightNormals.Reserve(NumVertices);
-	for (int32 j = KeyMin.Y; j < KeyMax.Y; j++)
+	FLandscapeHeightReadContext Ctx = ReadLandscapeHeightInBox(Center, Extent, ExtentPlus);
+	if (!Ctx.bValid) return HeightNormals;
+
+	const int32 X1 = Ctx.KeyMin.X;
+	const int32 Y1 = Ctx.KeyMin.Y;
+	const int32 X2 = Ctx.KeyMax.X - 1;
+	const int32 Y2 = Ctx.KeyMax.Y - 1;
+
+	HeightNormals.Reserve(Ctx.NumVertices);
+	for (int32 j = Ctx.KeyMin.Y; j < Ctx.KeyMax.Y; j++)
 	{
-		for (int32 i = KeyMin.X; i < KeyMax.X; i++)
+		for (int32 i = Ctx.KeyMin.X; i < Ctx.KeyMax.X; i++)
 		{
-			FVector LandscapePosition = FVector(i , j , LandscapeDataAccess::GetLocalHeight(HeightValues[(j- KeyMin.Y) * XNum + (i - KeyMin.X)]));
-			
-			int xPrev = (i == X1) ? KeyMin.X : i - 1;
+			FVector Pos = FVector(i, j, LandscapeDataAccess::GetLocalHeight(Ctx.HeightValues[(j - Ctx.KeyMin.Y) * Ctx.XNum + (i - Ctx.KeyMin.X)]));
+
+			int xPrev = (i == X1) ? Ctx.KeyMin.X : i - 1;
 			int xNext = (i == X2) ? i : i + 1;
-			int yPrev = (j == Y1) ? KeyMin.Y : j - 1;
+			int yPrev = (j == Y1) ? Ctx.KeyMin.Y : j - 1;
 			int yNext = (j == Y2) ? j : j + 1;
-			
-			FVector LandscapePositionXN = FVector(xNext , j , LandscapeDataAccess::GetLocalHeight(HeightValues[(j- KeyMin.Y) * XNum + (xNext - KeyMin.X)]));
-			FVector LandscapePositionXP = FVector(xPrev , j , LandscapeDataAccess::GetLocalHeight(HeightValues[(j- KeyMin.Y) * XNum + (xPrev - KeyMin.X)]));
-			FVector LandscapePositionYN = FVector(i , yNext , LandscapeDataAccess::GetLocalHeight(HeightValues[(yNext- KeyMin.Y) * XNum + (i - KeyMin.X)]));
-			FVector LandscapePositionYP = FVector(i , yPrev , LandscapeDataAccess::GetLocalHeight(HeightValues[(yPrev- KeyMin.Y) * XNum + (i - KeyMin.X)]));
-			FVector DX = (LandscapePositionXN - LandscapePositionXP).GetSafeNormal();
-			FVector DY = (LandscapePositionYN - LandscapePositionYP).GetSafeNormal();
+
+			FVector PosXN = FVector(xNext, j, LandscapeDataAccess::GetLocalHeight(Ctx.HeightValues[(j - Ctx.KeyMin.Y) * Ctx.XNum + (xNext - Ctx.KeyMin.X)]));
+			FVector PosXP = FVector(xPrev, j, LandscapeDataAccess::GetLocalHeight(Ctx.HeightValues[(j - Ctx.KeyMin.Y) * Ctx.XNum + (xPrev - Ctx.KeyMin.X)]));
+			FVector PosYN = FVector(i, yNext, LandscapeDataAccess::GetLocalHeight(Ctx.HeightValues[(yNext - Ctx.KeyMin.Y) * Ctx.XNum + (i - Ctx.KeyMin.X)]));
+			FVector PosYP = FVector(i, yPrev, LandscapeDataAccess::GetLocalHeight(Ctx.HeightValues[(yPrev - Ctx.KeyMin.Y) * Ctx.XNum + (i - Ctx.KeyMin.X)]));
+			FVector DX = (PosXN - PosXP).GetSafeNormal();
+			FVector DY = (PosYN - PosYP).GetSafeNormal();
 			FVector Normal = FVector::CrossProduct(DX, DY).GetSafeNormal();
-			HeightNormals.Add(FLinearColor(Normal.X, Normal.Y, Normal.Z, LandscapePosition.Z));
-			
+			HeightNormals.Add(FLinearColor(Normal.X, Normal.Y, Normal.Z, Pos.Z));
 		}
 	}
-	return  HeightNormals;
-	
+	return HeightNormals;
 }
 
-void ULandscapeExtra::CreateLandscapeTextureData(FReadLandscapeData& LandscapeData, FVector Center, FVector Extent, int32 ExtentPlus)
+void ULandscapeExtra::CreateLandscapeTextureData(FCSReadLandscapeData& LandscapeData, FVector Center, FVector Extent, int32 ExtentPlus)
 {
-	
-	TArray<FLinearColor> OutHeightNormals;
+	FLandscapeHeightReadContext Ctx = ReadLandscapeHeightInBox(Center, Extent, ExtentPlus);
+	if (!Ctx.bValid) return;
+
 	const FVector Min = Center - Extent;
 	const FVector Max = Center + Extent;
-	if (Extent.Length() < .001)
-	{
-		return;
-	}
-	ALandscape* Landscape = nullptr;
-	if (UWorld* World = GEngine->GetWorldFromContextObject(GWorld, EGetWorldErrorMode::LogAndReturnNull))
-	{
-		for (TActorIterator<ALandscape> It(World, ALandscape::StaticClass()); It; ++It)
-		{
-			Landscape = *It;
-			break;
-		}
-	}
-	if (!Landscape)
-	{
-		return;
-	}
-	const ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo();
-	const FVector MaxLocalPoint = Landscape->GetTransform().InverseTransformPosition(Max);
-	const FVector MinLocalPoint = Landscape->GetTransform().InverseTransformPosition(Min);
-	const FIntPoint KeyMax(FMath::CeilToInt(MaxLocalPoint.X) + ExtentPlus, FMath::CeilToInt(MaxLocalPoint.Y) + ExtentPlus);
-	const FIntPoint KeyMin(FMath::Floor(MinLocalPoint.X) - ExtentPlus, FMath::Floor(MinLocalPoint.Y) - ExtentPlus);
-	int32 XMin = FMath::Floor(MinLocalPoint.X) - ExtentPlus;
-	int32 YMin = FMath::Floor(MinLocalPoint.Y) - ExtentPlus;
-	int32 XMax = FMath::CeilToInt(MaxLocalPoint.X) + ExtentPlus;
-	int32 YMax = FMath::CeilToInt(MaxLocalPoint.Y) + ExtentPlus;
-	int32 ComponentSizeQuads = LandscapeInfo->ComponentSizeQuads;
-	int32 XNum = KeyMax.X - KeyMin.X;
-	int32 YNum = KeyMax.Y - KeyMin.Y;
-	int32 NumVertices = XNum * YNum;
-	
-	TArray<uint16> Values;
-	Values.AddZeroed(NumVertices );
-	
-
-	int32 X1 = KeyMin.X;
-	int32 Y1 = KeyMin.Y;
-	int32 X2 = KeyMax.X - 1;
-	int32 Y2 = KeyMax.Y - 1;
-	FLandscapeEditDataInterface LandscapeEdit(Landscape->GetLandscapeInfo());
-	LandscapeEdit.SetShouldDirtyPackage(false);
-	LandscapeEdit.GetHeightDataFast(X1, Y1, X2, Y2, (uint16*)Values.GetData(), 0);
-
+	const int32 XMin = Ctx.KeyMin.X;
+	const int32 YMin = Ctx.KeyMin.Y;
+	const int32 XMax = Ctx.KeyMax.X;
+	const int32 YMax = Ctx.KeyMax.Y;
+	const int32 X1 = XMin;
+	const int32 Y1 = YMin;
+	const int32 X2 = XMax - 1;
+	const int32 Y2 = YMax - 1;
 
 	int32 NumPixelX = 0;
-	for (int i = 5; i < 12; i ++)
+	for (int i = 5; i < 12; i++)
 	{
-		if (1 << i >= XNum)
-		{
-			NumPixelX = 1 << i;
-			break;
-		}
+		if (1 << i >= Ctx.XNum) { NumPixelX = 1 << i; break; }
 	}
 	if (NumPixelX == 0) return;
 
 	int32 NumPixelY = 0;
-	for (int i = 5; i < 12; i ++)
+	for (int i = 5; i < 12; i++)
 	{
-		if (1 << i >= YNum)
-		{
-			NumPixelY = 1 << i;
-			break;
-		}
+		if (1 << i >= Ctx.YNum) { NumPixelY = 1 << i; break; }
 	}
 	if (NumPixelY == 0) return;
 
-	
-	TMap<FIntPoint, FLinearColor> MapHeightNormals;
 	TArray<FLinearColor> HeightNormals;
 	TArray<FLinearColor> ValidHeightNormals;
 	HeightNormals.AddZeroed(NumPixelX * NumPixelY);
-	ValidHeightNormals.Reserve(XNum * YNum);
+	ValidHeightNormals.Reserve(Ctx.XNum * Ctx.YNum);
+
 	for (int32 j = YMin; j < YMax; j++)
 	{
 		for (int32 i = XMin; i < XMax; i++)
 		{
-			FVector LandscapePosition = FVector(i , j , LandscapeDataAccess::GetLocalHeight(Values[(j- YMin) * XNum + (i - XMin)]));
-			LandscapePosition = Landscape->GetTransform().TransformPosition(LandscapePosition);
+			FVector Pos = FVector(i, j, LandscapeDataAccess::GetLocalHeight(Ctx.HeightValues[(j - YMin) * Ctx.XNum + (i - XMin)]));
+			Pos = Ctx.LandscapeTransform.TransformPosition(Pos);
+
 			int xPrev = (i == X1) ? XMin : i - 1;
 			int xNext = (i == X2) ? i : i + 1;
 			int yPrev = (j == Y1) ? YMin : j - 1;
 			int yNext = (j == Y2) ? j : j + 1;
 
-			FVector LandscapePositionXN = FVector(xNext , j , LandscapeDataAccess::GetLocalHeight(Values[(j- YMin) * XNum + (xNext - XMin)]));
-			FVector LandscapePositionXP = FVector(xPrev , j , LandscapeDataAccess::GetLocalHeight(Values[(j- YMin) * XNum + (xPrev - XMin)]));
-			FVector LandscapePositionYN = FVector(i , yNext , LandscapeDataAccess::GetLocalHeight(Values[(yNext- YMin) * XNum + (i - XMin)]));
-			FVector LandscapePositionYP = FVector(i , yPrev , LandscapeDataAccess::GetLocalHeight(Values[(yPrev- YMin) * XNum + (i - XMin)]));
-			FVector DX = (LandscapePositionXN - LandscapePositionXP).GetSafeNormal();
-			FVector DY = (LandscapePositionYN - LandscapePositionYP).GetSafeNormal();
+			FVector PosXN = FVector(xNext, j, LandscapeDataAccess::GetLocalHeight(Ctx.HeightValues[(j - YMin) * Ctx.XNum + (xNext - XMin)]));
+			FVector PosXP = FVector(xPrev, j, LandscapeDataAccess::GetLocalHeight(Ctx.HeightValues[(j - YMin) * Ctx.XNum + (xPrev - XMin)]));
+			FVector PosYN = FVector(i, yNext, LandscapeDataAccess::GetLocalHeight(Ctx.HeightValues[(yNext - YMin) * Ctx.XNum + (i - XMin)]));
+			FVector PosYP = FVector(i, yPrev, LandscapeDataAccess::GetLocalHeight(Ctx.HeightValues[(yPrev - YMin) * Ctx.XNum + (i - XMin)]));
+			FVector DX = (PosXN - PosXP).GetSafeNormal();
+			FVector DY = (PosYN - PosYP).GetSafeNormal();
 			FVector Normal = FVector::CrossProduct(DX, DY).GetSafeNormal();
-			HeightNormals[i - XMin + (j - YMin) * NumPixelX] = FLinearColor(Normal.X, Normal.Y, Normal.Z, LandscapePosition.Z);
-			MapHeightNormals.Add(FIntPoint(i, j), FLinearColor(Normal.X, Normal.Y, Normal.Z, LandscapePosition.Z));
-			ValidHeightNormals.Add(FLinearColor(Normal.X, Normal.Y, Normal.Z, LandscapePosition.Z));
+
+			FLinearColor Color(Normal.X, Normal.Y, Normal.Z, Pos.Z);
+			HeightNormals[i - XMin + (j - YMin) * NumPixelX] = Color;
+			ValidHeightNormals.Add(Color);
 		}
 	}
+
 	TArray<FFloat16Color> HeightNormals16;
 	HeightNormals16.Reserve(HeightNormals.Num());
-	for (int32 i = 0; i < HeightNormals.Num(); i++)
+	for (const FLinearColor& C : HeightNormals)
 	{
-		FFloat16Color Color = HeightNormals[i];
-		HeightNormals16.Add(Color);
+		HeightNormals16.Add(FFloat16Color(C));
 	}
-	LandscapeData.Colors16 = HeightNormals16;
-	LandscapeData.ValidColors = ValidHeightNormals;
-	LandscapeData.Colors = HeightNormals;
-	LandscapeData.MapMin = Landscape->GetTransform().TransformPosition(FVector(XMin - .5, YMin - .5, 0)) + Max * FVector(0, 0, 1);
-	LandscapeData.MapMax = Landscape->GetTransform().TransformPosition(FVector(NumPixelX + XMin -.5, NumPixelY + YMin - .5, 0)) + Min * FVector(0, 0, 1);
-	LandscapeData.ValidMapMin = Landscape->GetTransform().TransformPosition(FVector(XMin - .5, YMin - .5, 0));
-	LandscapeData.ValidMapMax = Landscape->GetTransform().TransformPosition(FVector(XNum + XMin- .5, YNum + YMin - .5, 0));
+
+	LandscapeData.Colors16 = MoveTemp(HeightNormals16);
+	LandscapeData.ValidColors = MoveTemp(ValidHeightNormals);
+	LandscapeData.Colors = MoveTemp(HeightNormals);
+	LandscapeData.MapMin = Ctx.LandscapeTransform.TransformPosition(FVector(XMin - .5, YMin - .5, 0)) + Max * FVector(0, 0, 1);
+	LandscapeData.MapMax = Ctx.LandscapeTransform.TransformPosition(FVector(NumPixelX + XMin - .5, NumPixelY + YMin - .5, 0)) + Min * FVector(0, 0, 1);
+	LandscapeData.ValidMapMin = Ctx.LandscapeTransform.TransformPosition(FVector(XMin - .5, YMin - .5, 0));
+	LandscapeData.ValidMapMax = Ctx.LandscapeTransform.TransformPosition(FVector(Ctx.XNum + XMin - .5, Ctx.YNum + YMin - .5, 0));
 	LandscapeData.TextureSize = FIntVector2(NumPixelX, NumPixelY);
-	LandscapeData.TextureValidSize = FIntVector2(XNum, YNum);
-	LandscapeData.ValidUVRange = FVector2f(XNum / float(NumPixelX), YNum / float(NumPixelY));
+	LandscapeData.TextureValidSize = FIntVector2(Ctx.XNum, Ctx.YNum);
+	LandscapeData.ValidUVRange = FVector2f(Ctx.XNum / float(NumPixelX), Ctx.YNum / float(NumPixelY));
 	LandscapeData.ReadRange = FIntVector4(X1, Y1, X2, Y2);
-	LandscapeData.Transform = Landscape->GetTransform();
+	LandscapeData.Transform = Ctx.LandscapeTransform;
 	LandscapeData.TextureBounds = FBoxSphereBounds(FBox(LandscapeData.MapMin + .5, LandscapeData.MapMax + .5));
 	LandscapeData.ValidTextureBounds = FBoxSphereBounds(FBox(LandscapeData.ValidMapMin + .5, LandscapeData.ValidMapMax + .5));
 }
@@ -431,91 +365,48 @@ TArray<FLinearColor> ULandscapeExtra::CreateLandscapeMeshTextureData(FVector& Ma
 	FVector Extent, int32 TextureSize, int32 ExtentPlus)
 {
 	TArray<FLinearColor> OutHeightNormals;
+	FLandscapeHeightReadContext Ctx = ReadLandscapeHeightInBox(Center, Extent, ExtentPlus);
+	if (!Ctx.bValid) return OutHeightNormals;
+
+	MapMin = Ctx.LandscapeTransform.TransformPosition(FVector(Ctx.KeyMin.X - .5, Ctx.KeyMin.Y - .5, 0));
+	MapMax = Ctx.LandscapeTransform.TransformPosition(FVector(Ctx.KeyMax.X - .5, Ctx.KeyMax.Y - .5, 0));
+
 	UDynamicMesh* PlaneMesh = NewObject<UDynamicMesh>();
-	FVector Min = Center - Extent;
-	FVector Max = Center + Extent;
-	if (Extent.Length() < .001)
-	{
-		return OutHeightNormals;
-	}
-	ALandscape* Landscape = nullptr;
-	if (UWorld* World = GEngine->GetWorldFromContextObject(GWorld, EGetWorldErrorMode::LogAndReturnNull))
-	{
-		for (TActorIterator<ALandscape> It(World, ALandscape::StaticClass()); It; ++It)
-		{
-			Landscape = *It;
-			break;
-		}
-	}
-	if (!Landscape)
-	{
-		return OutHeightNormals;
-	}
-	const ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo();
-	const FVector MaxLocalPoint = Landscape->GetTransform().InverseTransformPosition(Max);
-	const FVector MinLocalPoint = Landscape->GetTransform().InverseTransformPosition(Min);
-	const FIntPoint KeyMax(FMath::CeilToInt(MaxLocalPoint.X) + ExtentPlus, FMath::CeilToInt(MaxLocalPoint.Y) + ExtentPlus);
-	const FIntPoint KeyMin(FMath::Floor(MinLocalPoint.X) - ExtentPlus, FMath::Floor(MinLocalPoint.Y) - ExtentPlus);
-	int32 ComponentSizeQuads = LandscapeInfo->ComponentSizeQuads;
-	int32 XNum = KeyMax.X - KeyMin.X;
-	int32 YNum = KeyMax.Y - KeyMin.Y;
-	int32 NumVertices = XNum * YNum;
-	
-	
 	FRectangleMeshGenerator RectGenerator;
 	RectGenerator.Origin = FVector3d(0, 0, 0);
 	RectGenerator.Normal = FVector3f::UnitZ();
 	RectGenerator.Width = 100;
 	RectGenerator.Height = 100;
-	RectGenerator.WidthVertexCount = FMath::Max(0, XNum);
-	RectGenerator.HeightVertexCount = FMath::Max(0, YNum);
+	RectGenerator.WidthVertexCount = FMath::Max(0, Ctx.XNum);
+	RectGenerator.HeightVertexCount = FMath::Max(0, Ctx.YNum);
 	RectGenerator.bSinglePolyGroup = true;
 	RectGenerator.Generate();
-	
+
 	FGeometryScriptPrimitiveOptions PrimitiveOptions;
 	UGeometryGeneral::AppendPrimitive(PlaneMesh, &RectGenerator, FTransform::Identity, PrimitiveOptions);
-	
-	TArray<uint16> Values;
-	Values.AddZeroed(NumVertices );
-	
-	FScopedSetLandscapeEditingLayer Scope(Landscape, Landscape->GetLayerConst(0)->EditLayer->GetGuid(), [&] {});
-	
-	int32 X1 = KeyMin.X;
-	int32 Y1 = KeyMin.Y;
-	int32 X2 = KeyMax.X - 1;
-	int32 Y2 = KeyMax.Y - 1;
-	FIntPoint MapKey = FIntPoint (X1 / ComponentSizeQuads, Y1 / ComponentSizeQuads );
-	ULandscapeComponent* Comp = LandscapeInfo->XYtoComponentMap.FindRef(MapKey);
-	FLandscapeEditDataInterface LandscapeEdit(Landscape->GetLandscapeInfo());
-	LandscapeEdit.SetShouldDirtyPackage(false);
-	LandscapeEdit.GetHeightDataFast(X1, Y1, X2, Y2, (uint16*)Values.GetData(), 0);
 
-	//
-	int32 FindIndex = 0;
 	TArray<FVector> Vertices;
-	Vertices.Reserve(NumVertices);
-	for (int32 j = KeyMin.Y; j < KeyMax.Y; j++)
+	Vertices.Reserve(Ctx.NumVertices);
+	for (int32 j = Ctx.KeyMin.Y; j < Ctx.KeyMax.Y; j++)
 	{
-		for (int32 i = KeyMin.X; i < KeyMax.X; i++)
+		for (int32 i = Ctx.KeyMin.X; i < Ctx.KeyMax.X; i++)
 		{
-			FVector LandscapePosition = FVector(i , j , LandscapeDataAccess::GetLocalHeight(Values[(j- KeyMin.Y) * XNum + (i - KeyMin.X)]));
-			Vertices.Add(LandscapePosition);
+			FVector Pos = FVector(i, j, LandscapeDataAccess::GetLocalHeight(Ctx.HeightValues[(j - Ctx.KeyMin.Y) * Ctx.XNum + (i - Ctx.KeyMin.X)]));
+			Vertices.Add(Pos);
 		}
 	}
 
 	PlaneMesh->EditMesh([&](FDynamicMesh3& EditMesh)
 	{
-		for (int32 i = 0; i < NumVertices; i++)
+		for (int32 i = 0; i < Ctx.NumVertices; i++)
 		{
-			FVector NewPosition = Vertices[i];
 			if (EditMesh.IsVertex(i))
 			{
-				EditMesh.SetVertex(i, (FVector3d)NewPosition);
+				EditMesh.SetVertex(i, (FVector3d)Vertices[i]);
 			}
 		}
-		MeshTransforms::ApplyTransform(EditMesh, (FTransformSRT3d)(Landscape->GetTransform()), true);
+		MeshTransforms::ApplyTransform(EditMesh, (FTransformSRT3d)(Ctx.LandscapeTransform), true);
 	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
-	return OutHeightNormals;
-	// GetNearestLocationNormal
 
+	return OutHeightNormals;
 }

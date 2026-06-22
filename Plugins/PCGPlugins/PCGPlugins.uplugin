@@ -17,18 +17,6 @@
   "EnabledByDefault": true,
   "Modules": [
     {
-      "Name": "GeometryMath",
-      "Type": "Runtime",
-      "LoadingPhase": "Default",
-      "BlacklistTargets": ["Shipping"]
-    },
-    {
-      "Name": "GeometryEditor",
-      "Type": "Editor",
-      "LoadingPhase": "Default",
-      "BlacklistTargets": ["Shipping"]
-    },
-    {
       "Name": "GeometryScriptExtraEditor",
       "Type": "Editor",
       "LoadingPhase": "Default",

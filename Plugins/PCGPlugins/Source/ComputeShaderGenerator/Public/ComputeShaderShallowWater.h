@@ -61,7 +61,7 @@ public:
 
 	UPROPERTY(BlueprintReadWrite, Category = "Debug")
 	UStaticMesh* DebugMesh;
-	UPROPERTY(BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(VisibleAnywhere, BlueprintReadWrite, Category = "Debug")
 	UStaticMeshComponent* ReusltMesh;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Bake", Meta=(Priority=1000))
 	bool bUseBakedResultMesh = false;
@@ -73,9 +73,9 @@ public:
 	UMaterialInterface* SimulationWaterMaterial = nullptr;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Bake", Meta=(Priority=999))
 	UMaterialInterface* SimulationDecalMaterial = nullptr;
-	UPROPERTY(BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Debug")
 	UHierarchicalInstancedStaticMeshComponent* SimVisHISM;
-	UPROPERTY(BlueprintReadWrite, Category = "Debug")
+	UPROPERTY(VisibleAnywhere, BlueprintReadWrite, Category = "Debug")
 	UDecalComponent* CausticsDecal;
 	
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
@@ -402,7 +402,10 @@ private:
 	int32 ResolveTextureSize() const;
 	void ReleaseShallowWaterTransientResources(const TCHAR* Context);
 
+	UE_DEPRECATED(5.7, "Use CaptureSceneDepthFromTriangles instead")
 	void CaptureSceneDepthNow();
+
+	void CaptureSceneDepthFromTriangles();
 
 	TArray<int32> ISMTileSlots;
 	int32 CachedActiveTileCount = 0;

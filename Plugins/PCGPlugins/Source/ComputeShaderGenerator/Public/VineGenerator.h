@@ -3,7 +3,6 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "PolyLine.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Curves/CurveLinearColor.h"
 #include "GeometryScript/GeometryScriptTypes.h"
@@ -12,12 +11,12 @@
 #include "InstancedFoliageActor.h"
 #include "FoliageType.h"
 
-#include "GeometryEditorActor.generated.h"
+#include "VineGenerator.generated.h"
 
 class AStaticMeshActor;
 
 USTRUCT(BlueprintType, meta = (DisplayName = "SC Options"))
-struct GEOMETRYSCRIPTEXTRAEDITOR_API FSpaceColonizationOptions
+struct COMPUTESHADERGENERATOR_API FSpaceColonizationOptions
 {
 	GENERATED_BODY()
 public:
@@ -51,7 +50,7 @@ public:
 };
 
 USTRUCT(BlueprintType)
-struct GEOMETRYSCRIPTEXTRAEDITOR_API FSpaceColonizationAttribute
+struct COMPUTESHADERGENERATOR_API FSpaceColonizationAttribute
 {
 	GENERATED_BODY()
 public:
@@ -84,7 +83,7 @@ public:
 };
 
 USTRUCT(BlueprintType)
-struct GEOMETRYSCRIPTEXTRAEDITOR_API FSpaceColonizationLineResult
+struct COMPUTESHADERGENERATOR_API FSpaceColonizationLineResult
 {
 	GENERATED_BODY()
 public:
@@ -99,7 +98,7 @@ public:
 };
 
 USTRUCT(BlueprintType, meta = (DisplayName = "VV Options"))
-struct GEOMETRYSCRIPTEXTRAEDITOR_API FVV
+struct COMPUTESHADERGENERATOR_API FVV
 {
 	GENERATED_BODY()
 public:
@@ -201,7 +200,7 @@ struct FVineLinePointAxisData
 // VisVine debug parameter structs moved to ComputeShaderDebugParams.h
 
 UCLASS()
-class GEOMETRYSCRIPTEXTRAEDITOR_API AVineContainer : public AComputeShaderMeshGenerator
+class COMPUTESHADERGENERATOR_API AVineContainer : public AComputeShaderMeshGenerator
 {
 	GENERATED_BODY()
 	
@@ -354,7 +353,7 @@ public:
 
 
 // UCLASS(hidecategories=Object, editinlinenew)
-// class GEOMETRYSCRIPTEXTRAEDITOR_API UMyFoliageType : public UFoliageType_InstancedStaticMesh
+// class COMPUTESHADERGENERATOR_API UMyFoliageType : public UFoliageType_InstancedStaticMesh
 // {
 // 	GENERATED_UCLASS_BODY()
 // 	

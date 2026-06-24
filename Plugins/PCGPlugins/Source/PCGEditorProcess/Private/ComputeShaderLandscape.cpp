@@ -12,6 +12,7 @@
 #include "Kismet/KismetRenderingLibrary.h"
 #include "ComputeShaderGeneral.h"
 #include "ComputeShaderBasicFunction.h"
+#include "ComputeShaderMeshGenerator.h"
 #include "ComputeShaderShallowWater.h"
 #include "LandscapeExtra.h"
 #include "Kismet/GameplayStatics.h"
@@ -193,23 +194,27 @@ void ACSLandscape::EnsureRTs(int32 SizeX, int32 SizeY)
 
 void ACSLandscape::ReadLandscapeDataToTexture()
 {
+	ALandscape* Landscape = FindLandscape();
+	if (!Landscape || !Box) return;
+
 	FVector Center = Box->Bounds.Origin;
 	FVector Extent = Box->Bounds.BoxExtent;
-	FCSReadLandscapeData LandscapeData;
-	ULandscapeExtra::CreateLandscapeTextureData(LandscapeData, Center, Extent);
-	if (LandscapeData.TextureSize.X + LandscapeData.TextureSize.Y < 32) return;
 
-	EnsureRTs(LandscapeData.TextureSize.X, LandscapeData.TextureSize.Y);
-	
-	FVector TextureMin = Center - Extent;
-	FVector TextureMax = Center + Extent;
-	FVector Range = LandscapeData.MapMax - LandscapeData.MapMin + FVector(0, 0, 1);
-	FVector MinUV = (TextureMin - LandscapeData.MapMin) / Range;
-	FVector MaxUV = (TextureMax - LandscapeData.MapMin) / Range;
-	FVector UVRange = MaxUV - MinUV;
-	
-	UComputeShaderBasicFunction::DrawLinearColorsToRenderTarget32(RT_LandscapeData, LandscapeData.Colors);
-	Orig_LandscapeData = LandscapeData;
+	EnsureRTs(RT_LandscapeData ? RT_LandscapeData->SizeX : 256,
+	          RT_LandscapeData ? RT_LandscapeData->SizeY : 256);
+
+	if (!AComputeShaderMeshGenerator::RenderLandscapeToNormalHeightRT(
+		Landscape, Center, Extent, RT_LandscapeData))
+	{
+		return;
+	}
+
+	Orig_LandscapeData.MapMin = Center - Extent;
+	Orig_LandscapeData.MapMax = Center + Extent;
+	Orig_LandscapeData.ValidUVRange = FVector2f(1.0f, 1.0f);
+	Orig_LandscapeData.TextureSize = FIntVector2(RT_LandscapeData->SizeX, RT_LandscapeData->SizeY);
+	Orig_LandscapeData.TextureValidSize = Orig_LandscapeData.TextureSize;
+	Orig_LandscapeData.Transform = Landscape->GetTransform();
 }
 
 
@@ -813,15 +818,15 @@ void ACSLandscapeRiver::SimRiver(TSubclassOf<AActor> ActorClass, int32 SimIterat
 	if (RT_SplineRotateDist == nullptr) return;
 	ACSShallowWaterCapture* SimActor = nullptr;
 	TArray<AActor*> Actors;
-	UGameplayStatics::GetAllActorsOfClass(GWorld, ActorClass, Actors);
+	UGameplayStatics::GetAllActorsOfClass(GetWorld(), ActorClass, Actors);
 	
-	for (TActorIterator<AActor> It(GWorld, ActorClass); It; ++It)
+	for (TActorIterator<AActor> It(GetWorld(), ActorClass); It; ++It)
 	{
 		SimActor = Cast<ACSShallowWaterCapture>(*It);
 	}
 	if (SimActor == nullptr)
 	{
-		SimActor = GWorld->SpawnActor<ACSShallowWaterCapture>(ActorClass);
+		SimActor = GetWorld()->SpawnActor<ACSShallowWaterCapture>(ActorClass);
 	}
 	// UKismetRenderingLibrary::ClearRenderTarget2D(this, SimActor->RT_Result);
 	// UKismetRenderingLibrary::ClearRenderTarget2D(this, SimActor->RT_VelocityHeight);

@@ -12,6 +12,7 @@
 #include "ComputeShaderMeshGenerator.generated.h"
 
 class AActor;
+class ALandscape;
 class UHierarchicalInstancedStaticMeshComponent;
 class UStaticMesh;
 
@@ -543,23 +544,9 @@ public:
 	// Core System - Scene Extraction and Mesh Output
 	// -------------------------------------------------------------------------
 
-	/** Builds static-mesh triangle extraction requests for actors intersecting QueryBox in World.
-	 *  When OptionalActors is non-empty, only those actors are queried; otherwise all registered
-	 *  StaticMeshComponents in World are scanned. BoundsExpand expands the query box symmetrically. */
-	void BuildSceneTriangleRequests(UWorld* World,
-		const FBox& QueryBox,
-		TArray<FCSStaticMeshTriangleRequest>& OutRequests,
-		int32 LODIndex,
-		const TArray<AActor*>& OptionalActors = TArray<AActor*>(),
-		float BoundsExpand = 0.0f);
-
 	void BuildBoxSceneTriangleRequests(UWorld* World,
 		const FBox& QueryBox,
 		TArray<FCSStaticMeshTriangleRequest>& OutRequests);
-
-	void BuildActorSceneTriangleRequests(TArray<AActor*> InActors,
-		TArray<FCSStaticMeshTriangleRequest>& OutRequests,
-		float BoundsExpand = 0.0f);
 
 	/** [game thread] 用 FLandscapeComponentDataInterface 在 CPU 端把 QueryBox 内的 landscape 高度场
 	 *  提取成 triangle-soup（世界坐标，已按上朝向定向），暂存进 OutTriangleData，供后续 RDG 流程作为
@@ -589,31 +576,6 @@ public:
 		FName RequiredActorTag = NAME_None,
 		bool bSortComponentsByDistance = true);
 
-	/** Queues RDG compute passes that extract scene triangles and voxelize them into GPU buffers.
-	 *  The caller is responsible for GraphBuilder.Execute(), flush, and readback. */
-	FCSSurfaceVoxelRDGOutput GetBoxSceneSurfaceVoxelsToRDG(
-		FRDGBuilder& GraphBuilder,
-		FRHICommandListImmediate& RHICmdList,
-		float VoxelSize = 10.0f,
-		const TCHAR* DebugName = TEXT("CS.BoxSceneSurfaceVoxels"));
-
-	/** Adds RDG passes that extract scene triangles (static mesh + landscape) inside QueryBox into a
-	 *  GPU triangle-soup buffer. Runs entirely inside the supplied FRDGBuilder with no GPU readback,
-	 *  so callers can chain their own compute passes off the result on the same graph. Must be called
-	 *  on the render thread (it touches static-mesh render data). InMaxTriangles <= 0 falls back to
-	 *  the MaxTriangles member. Self (this actor) and ExcludedActorTags actors are excluded.
-	 *  When InReferencePoints is non-empty and InReferenceFilterDistance > 0, triangles are filtered
-	 *  on the GPU by distance to the reference points; an empty point set disables the distance filter
-	 *  and keeps all triangles in the box (the default, matching the readback-free callers). */
-	FCSStaticMeshTriangleRDGOutput AddBoxSceneTrianglesToRDG(
-		FRDGBuilder& GraphBuilder,
-		FRHICommandListImmediate& RHICmdList,
-		const FBox& QueryBox,
-		int32 InMaxTriangles = -1,
-		const TCHAR* DebugName = TEXT("CS.BoxSceneTriangles"),
-		const TArray<FVector>& InReferencePoints = TArray<FVector>(),
-		float InReferenceFilterDistance = 0.0f);
-
 	/** [game thread] 枚举 QueryBox 内的 static mesh + landscape，完成 static mesh 渲染资源 resolve
 	 *  与 landscape CPU 三角形提取，返回可安全捕获进 render 线程 lambda 的预备数据。
 	 *  必须在 game thread 调用（触碰 UObject / FLandscapeComponentDataInterface）。
@@ -640,6 +602,87 @@ public:
 	 *  bounds; otherwise triangles are GPU-filtered by distance to this actor's ReferencePoints.
 	 *  Also refreshes LastTriangleTextureData. Blocks via FlushRenderingCommands. */
 	FCSTriangleMeshData GetBoxSceneTrianglesFromGPUFiltered(float ReferenceFilterDistance = 200.0f);
+
+	/** Rasterizes a GPU triangle soup into a 2D heightmap via top-down orthographic projection.
+	 *  Output format matches SceneCapture depth: texel.x = CameraHeight - WorldZ.
+	 *  Runs entirely within the supplied FRDGBuilder; must be called on the render thread. */
+	void RasterizeTriangleSoupToHeightmapRDG(
+		FRDGBuilder& GraphBuilder,
+		const FCSStaticMeshTriangleRDGOutput& TriangleOutput,
+		FRDGTextureRef OutputHeightmap,
+		const FBox& WorldBounds,
+		float CameraHeight);
+
+	/** Converts an ALandscape::RenderHeightmap G16 output into the depth format (CameraHeight - WorldZ)
+	 *  and merges it into an existing OutputHeightmap using min (higher terrain wins).
+	 *  Runs entirely within the supplied FRDGBuilder; must be called on the render thread. */
+	void ConvertLandscapeHeightmapToDepthRDG(
+		FRDGBuilder& GraphBuilder,
+		FRDGTextureRef LandscapeG16Texture,
+		FRDGTextureRef OutputHeightmap,
+		float CameraHeight,
+		float LandscapeScaleZ,
+		float LandscapeOriginZ);
+
+	/** Captures the landscape heightmap using GeneratorBounds as the capture area.
+	 *  bOutputWorldHeight=true  → RGBA16f with RGB=Normal, A=WorldZ (cm)
+	 *  bOutputWorldHeight=false → Depth from CameraHeight (R channel)
+	 *  If OutRT is null, auto-creates a temporary RT and draws DrawDebugPoint.
+	 *  Iterates ALL ALandscape actors; supports multi-landscape merge and World Partition.
+	 *  @param OutRT Output render target (null for debug mode)
+	 *  @param bOutputWorldHeight true=Normal+WorldZ, false=Depth */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Heightmap")
+	bool CaptureLandscapeHeightmap(UTextureRenderTarget2D* OutRT, bool bOutputWorldHeight = true);
+
+	/** Explicit-parameter overload for CaptureLandscapeHeightmap(Depth mode).
+	 *  Iterates ALL ALandscape actors and min-merges (highest terrain wins). */
+	bool CaptureLandscapeHeightmapToDepth(
+		FVector WorldCenter,
+		float CaptureExtent,
+		float CameraHeight,
+		UTextureRenderTarget2D* OutDepthRT);
+
+	/** Converts an ALandscape::RenderHeightmap G16 output into Normal+Height format
+	 *  (RGBA: Normal.XYZ, WorldHeight_cm) via finite-difference normals.
+	 *  When bMergeByMaxZ is true, only overwrites texels where the new worldZ exceeds the
+	 *  existing .w value — used to composite multiple landscapes (output must be pre-cleared
+	 *  with .w = -large for correct results).
+	 *  Runs entirely within the supplied FRDGBuilder; must be called on the render thread. */
+	void ConvertLandscapeHeightmapToNormalHeightRDG(
+		FRDGBuilder& GraphBuilder,
+		FRDGTextureRef LandscapeG16Texture,
+		FRDGTextureRef OutputNormalHeight,
+		float LandscapeScaleZ,
+		float LandscapeOriginZ,
+		FVector2f TexelWorldSize,
+		bool bMergeByMaxZ = false);
+
+	/** Explicit-parameter overload for CaptureLandscapeHeightmap(WorldHeight mode). */
+	bool CaptureLandscapeHeightmapGPU(
+		FVector WorldCenter,
+		float CaptureExtent,
+		UTextureRenderTarget2D* OutNormalHeightRT);
+
+	/** GPU triangle extraction from landscape heightmap.
+	 *  Renders the landscape heightmap in GeneratorBounds, then a compute shader converts
+	 *  each texel into 2 triangles (6 world-space vertices) in a StructuredBuffer.
+	 *  Returns readback vertex data as FCSTriangleMeshData.
+	 *  @param TextureSize Resolution of the intermediate heightmap (default 128) */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Heightmap")
+	FCSTriangleMeshData CaptureLandscapeTrianglesGPU(int32 TextureSize = 128);
+
+	/** Static utility: renders a landscape heightmap via ALandscape::RenderHeightmap (GPU)
+	 *  and converts to Normal+Height (RGB=Normal, A=WorldHeight_cm) in the given RT.
+	 *  Does NOT require an AComputeShaderMeshGenerator instance.
+	 *  @param Landscape The landscape actor to capture
+	 *  @param WorldCenter Center of the capture area
+	 *  @param WorldExtentXY Half-size of the capture area (only XY used)
+	 *  @param OutNormalHeightRT Output render target (RGBA16f/RGBA32f, bCanCreateUAV=true) */
+	static bool RenderLandscapeToNormalHeightRT(
+		ALandscape* Landscape,
+		FVector WorldCenter,
+		FVector WorldExtentXY,
+		UTextureRenderTarget2D* OutNormalHeightRT);
 
 	/** Converts the latest bounded scene surface voxels into an open quad-strip DynamicMesh. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh")

@@ -5,6 +5,7 @@
 #include "ComputeShaderGenerateHepler.h"
 #include "ComputeShaderGeneral.h"
 #include "ComputeShaderBasicFunction.h"
+#include "ComputeShaderMeshGenerator.h"
 #include "LandscapeExtra.h"
 #include "Kismet/KismetRenderingLibrary.h"
 #include "Kismet/GameplayStatics.h"
@@ -118,6 +119,8 @@ void ACSLandscapeLayer::OnConstruction(const FTransform& Transform)
 
 void ACSLandscapeLayer::InitRT()
 {
+	if (RT_OrigLandscapeData == nullptr)
+		RT_OrigLandscapeData = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor::Black, true, false);
 	if (RT_LayerAlpha == nullptr)
 		RT_LayerAlpha = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor::Black, true, false);
 	if (RT_LayerGeneratedHeight == nullptr)
@@ -130,36 +133,40 @@ void ACSLandscapeLayer::InitRT()
 
 void ACSLandscapeLayer::ReadLandscapeDataToTexture()
 {
-	if (!RT_LayerBlendResult) return;
+	if (!RT_LayerBlendResult || !RT_OrigLandscapeData) return;
+
+	ALandscape* Landscape = FindLandscape();
+	if (!Landscape || !Box) return;
 
 	FVector Center = Box->Bounds.Origin;
 	FVector Extent = Box->Bounds.BoxExtent;
-	FCSReadLandscapeData LandscapeData;
-	ULandscapeExtra::CreateLandscapeTextureData(LandscapeData, Center, Extent);
-	if (LandscapeData.TextureSize.X + LandscapeData.TextureSize.Y < 32) return;
 
-	RT_LayerBlendResult->ResizeTarget(LandscapeData.TextureSize.X, LandscapeData.TextureSize.Y);
-	RT_LayerAlpha->ResizeTarget(LandscapeData.TextureSize.X, LandscapeData.TextureSize.Y);
-	RT_LayerGeneratedHeight->ResizeTarget(LandscapeData.TextureSize.X, LandscapeData.TextureSize.Y);
-	RT_DebugView->ResizeTarget(LandscapeData.TextureSize.X, LandscapeData.TextureSize.Y);
+	if (!AComputeShaderMeshGenerator::RenderLandscapeToNormalHeightRT(
+		Landscape, Center, Extent, RT_OrigLandscapeData))
+	{
+		return;
+	}
 
-	FVector TextureMin = Center - Extent;
-	FVector TextureMax = Center + Extent;
-	FVector Range = LandscapeData.MapMax - LandscapeData.MapMin + FVector(0, 0, 1);
-	FVector MinUV = (TextureMin - LandscapeData.MapMin) / Range;
-	FVector MaxUV = (TextureMax - LandscapeData.MapMin) / Range;
+	int32 TexW = RT_OrigLandscapeData->SizeX;
+	int32 TexH = RT_OrigLandscapeData->SizeY;
+	RT_LayerBlendResult->ResizeTarget(TexW, TexH);
+	RT_LayerAlpha->ResizeTarget(TexW, TexH);
+	RT_LayerGeneratedHeight->ResizeTarget(TexW, TexH);
+	RT_DebugView->ResizeTarget(TexW, TexH);
 
-	LandscapeTexMinUV = MinUV;
-	LandscapeTexUVRange = MaxUV - MinUV;
-	MapMin = LandscapeData.MapMin;
-	MapMax = LandscapeData.MapMax;
-	Orig_LandscapeData = LandscapeData;
+	LandscapeTexMinUV = FVector::ZeroVector;
+	LandscapeTexUVRange = FVector(1, 1, 0);
+	MapMin = Center - Extent;
+	MapMax = Center + Extent;
 }
 
 void ACSLandscapeLayer::GenerateLayerAlphaAndHeight()
 {
+	if (!RT_LayerAlpha || !RT_LayerGeneratedHeight || !RT_OrigLandscapeData) return;
+
 	FTextureRenderTargetResource* R_Alpha = RT_LayerAlpha->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_Height = RT_LayerGeneratedHeight->GameThread_GetRenderTargetResource();
+	FTextureRenderTargetResource* R_OrigData = RT_OrigLandscapeData->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_Debug = RT_DebugView->GameThread_GetRenderTargetResource();
 
 	FVector Center = Box->Bounds.Origin;
@@ -174,15 +181,13 @@ void ACSLandscapeLayer::GenerateLayerAlphaAndHeight()
 	const float CapturedNoiseAmplitude = NoiseAmplitude;
 
 	ENQUEUE_RENDER_COMMAND(GenerateLayerAlphaHeight)(
-	[R_Alpha, R_Height, R_Debug, Center, Extent, CapturedLandscapeTexMinUV, CapturedLandscapeTexUVRange,
+	[R_Alpha, R_Height, R_OrigData, R_Debug, Center, Extent, CapturedLandscapeTexMinUV, CapturedLandscapeTexUVRange,
 	 CapturedGlobalAlpha, CapturedHeightModStrength, CapturedNormalStrength, CapturedFalloffWidth,
 	 CapturedNoiseFrequency, CapturedNoiseAmplitude](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
 		{
 			FIntPoint TextureSize = R_Alpha->GetSizeXY();
-
-			FCSLandscapeLayer::FParameters* PassParameters = GraphBuilder.AllocParameters<FCSLandscapeLayer::FParameters>();
 			FIntVector GroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(TextureSize.X, TextureSize.Y, 1), 32);
 
 			FRDGTextureRef TmpRDG_Alpha = nullptr;
@@ -197,53 +202,57 @@ void ACSLandscapeLayer::GenerateLayerAlphaAndHeight()
 			FRDGTextureUAVRef RDGUAV_Debug = nullptr;
 			ConvertToUVATextureFormat(GraphBuilder, TmpRDG_Debug, RDGUAV_Debug, TextureSize, PF_FloatRGBA, TEXT("UAV_Debug"));
 
-			PassParameters->RW_LayerAlpha = RDGUAV_Alpha;
-			PassParameters->RW_LayerGeneratedHeight = RDGUAV_Height;
-			PassParameters->RW_DebugView = RDGUAV_Debug;
+			FRDGTextureRef RDG_OrigData = RegisterExternalTexture(GraphBuilder, R_OrigData->GetRenderTargetTexture(), TEXT("R_OrigLandscapeData"));
+
+			auto FillCommonParams = [&](FCSLandscapeLayer::FParameters* Params)
 			{
 				auto UVEnd = CapturedLandscapeTexMinUV + CapturedLandscapeTexUVRange;
-				PassParameters->ValidUVRange = FVector4f(
+				Params->ValidUVRange = FVector4f(
 					static_cast<float>(CapturedLandscapeTexMinUV.X), static_cast<float>(CapturedLandscapeTexMinUV.Y),
 					static_cast<float>(UVEnd.X), static_cast<float>(UVEnd.Y));
-			}
-			PassParameters->GlobalAlpha = CapturedGlobalAlpha;
-			PassParameters->HeightModStrength = CapturedHeightModStrength;
-			PassParameters->NormalStrength = CapturedNormalStrength;
-			PassParameters->FalloffWidth = CapturedFalloffWidth;
-			PassParameters->NoiseFrequency = CapturedNoiseFrequency;
-			PassParameters->NoiseAmplitude = CapturedNoiseAmplitude;
-			PassParameters->BoxOrigin = FVector3f(Center);
-			PassParameters->BoxExtent = FVector3f(Extent);
-			PassParameters->Sampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
+				Params->GlobalAlpha = CapturedGlobalAlpha;
+				Params->HeightModStrength = CapturedHeightModStrength;
+				Params->NormalStrength = CapturedNormalStrength;
+				Params->FalloffWidth = CapturedFalloffWidth;
+				Params->NoiseFrequency = CapturedNoiseFrequency;
+				Params->NoiseAmplitude = CapturedNoiseAmplitude;
+				Params->BoxOrigin = FVector3f(Center);
+				Params->BoxExtent = FVector3f(Extent);
+				Params->Sampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
+			};
 
 			{
-				TShaderMapRef<FCSLandscapeLayer> ComputeShader_GenAlpha(FCSLandscapeLayer::CreatePermutation(FCSLandscapeLayer::ELandscapeLayerFunction::L_GenerateLayerAlpha));
-				PassParameters->RW_LayerAlpha = RDGUAV_Alpha;
-				PassParameters->RW_LayerGeneratedHeight = nullptr;
-				PassParameters->RW_DebugView = nullptr;
+				FCSLandscapeLayer::FParameters* AlphaParams = GraphBuilder.AllocParameters<FCSLandscapeLayer::FParameters>();
+				FillCommonParams(AlphaParams);
+				AlphaParams->RW_LayerAlpha = RDGUAV_Alpha;
+
+				TShaderMapRef<FCSLandscapeLayer> CS_GenAlpha(FCSLandscapeLayer::CreatePermutation(FCSLandscapeLayer::ELandscapeLayerFunction::L_GenerateLayerAlpha));
 				GraphBuilder.AddPass(
 					RDG_EVENT_NAME("GenerateLayerAlpha"),
-					PassParameters,
+					AlphaParams,
 					ERDGPassFlags::AsyncCompute,
-					[PassParameters, ComputeShader_GenAlpha, GroupCount](FRHIComputeCommandList& RHICmdList)
+					[AlphaParams, CS_GenAlpha, GroupCount](FRHIComputeCommandList& RHICmdList)
 					{
-						FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_GenAlpha, *PassParameters, GroupCount);
+						FComputeShaderUtils::Dispatch(RHICmdList, CS_GenAlpha, *AlphaParams, GroupCount);
 					});
 				AddCopyTexturePass(GraphBuilder, TmpRDG_Alpha, RegisterExternalTexture(GraphBuilder, R_Alpha->GetRenderTargetTexture(), TEXT("R_Alpha")), FRHICopyTextureInfo());
 			}
 
 			{
-				TShaderMapRef<FCSLandscapeLayer> ComputeShader_GenHeight(FCSLandscapeLayer::CreatePermutation(FCSLandscapeLayer::ELandscapeLayerFunction::L_GenerateLayerHeight));
-				PassParameters->RW_LayerAlpha = nullptr;
-				PassParameters->RW_LayerGeneratedHeight = RDGUAV_Height;
-				PassParameters->RW_DebugView = RDGUAV_Debug;
+				FCSLandscapeLayer::FParameters* HeightParams = GraphBuilder.AllocParameters<FCSLandscapeLayer::FParameters>();
+				FillCommonParams(HeightParams);
+				HeightParams->T_OrigLandscapeData = RDG_OrigData;
+				HeightParams->RW_LayerGeneratedHeight = RDGUAV_Height;
+				HeightParams->RW_DebugView = RDGUAV_Debug;
+
+				TShaderMapRef<FCSLandscapeLayer> CS_GenHeight(FCSLandscapeLayer::CreatePermutation(FCSLandscapeLayer::ELandscapeLayerFunction::L_GenerateLayerHeight));
 				GraphBuilder.AddPass(
 					RDG_EVENT_NAME("GenerateLayerHeight"),
-					PassParameters,
+					HeightParams,
 					ERDGPassFlags::AsyncCompute,
-					[PassParameters, ComputeShader_GenHeight, GroupCount](FRHIComputeCommandList& RHICmdList)
+					[HeightParams, CS_GenHeight, GroupCount](FRHIComputeCommandList& RHICmdList)
 					{
-						FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_GenHeight, *PassParameters, GroupCount);
+						FComputeShaderUtils::Dispatch(RHICmdList, CS_GenHeight, *HeightParams, GroupCount);
 					});
 				AddCopyTexturePass(GraphBuilder, TmpRDG_Height, RegisterExternalTexture(GraphBuilder, R_Height->GetRenderTargetTexture(), TEXT("R_Height")), FRHICopyTextureInfo());
 				AddCopyTexturePass(GraphBuilder, TmpRDG_Debug, RegisterExternalTexture(GraphBuilder, R_Debug->GetRenderTargetTexture(), TEXT("R_Debug")), FRHICopyTextureInfo());
@@ -256,31 +265,34 @@ void ACSLandscapeLayer::GenerateLayerAlphaAndHeight()
 
 void ACSLandscapeLayer::BlendLayerWithAlpha()
 {
-	FTextureRenderTargetResource* R_Orig = RT_LayerBlendResult->GameThread_GetRenderTargetResource();
-	FTextureRenderTargetResource* R_Alpha = RT_LayerAlpha->GameThread_GetRenderTargetResource();
+	if (!RT_LayerBlendResult || !RT_OrigLandscapeData || !RT_LayerGeneratedHeight) return;
+
+	FTextureRenderTargetResource* R_BlendResult = RT_LayerBlendResult->GameThread_GetRenderTargetResource();
+	FTextureRenderTargetResource* R_OrigData = RT_OrigLandscapeData->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_Height = RT_LayerGeneratedHeight->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_Debug = RT_DebugView->GameThread_GetRenderTargetResource();
 
-	FCSReadLandscapeData LandscapeData;
-	FVector Center = Box->Bounds.Origin;
-	FVector Extent = Box->Bounds.BoxExtent;
-	ULandscapeExtra::CreateLandscapeTextureData(LandscapeData, Center, Extent);
-	if (LandscapeData.TextureSize.X + LandscapeData.TextureSize.Y < 32) return;
-	Orig_LandscapeData = LandscapeData;
 	const FVector CapturedLandscapeTexMinUV = LandscapeTexMinUV;
 	const FVector CapturedLandscapeTexUVRange = LandscapeTexUVRange;
 	const float CapturedGlobalAlpha = GlobalAlpha;
 	const float CapturedHeightModStrength = HeightModStrength;
 	const float CapturedNormalStrength = NormalStrength;
 	const ECSLandscapeBlendMode CapturedBlendMode = BlendMode;
+	FTextureRHIRef CapturedMaterialBlendRHI = nullptr;
+	if (MaterialBlendTexture)
+	{
+		if (FTextureResource* MatRes = MaterialBlendTexture->GetResource())
+			CapturedMaterialBlendRHI = MatRes->GetTextureRHI();
+	}
 
 	ENQUEUE_RENDER_COMMAND(BlendLayerAlpha)(
-	[R_Orig, R_Alpha, R_Height, R_Debug, CapturedLandscapeTexMinUV, CapturedLandscapeTexUVRange,
-	 CapturedGlobalAlpha, CapturedHeightModStrength, CapturedNormalStrength, CapturedBlendMode](FRHICommandListImmediate& RHICmdList)
+	[R_BlendResult, R_OrigData, R_Height, R_Debug, CapturedLandscapeTexMinUV, CapturedLandscapeTexUVRange,
+	 CapturedGlobalAlpha, CapturedHeightModStrength, CapturedNormalStrength, CapturedBlendMode,
+	 CapturedMaterialBlendRHI](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
 		{
-			FIntPoint TextureSize = R_Orig->GetSizeXY();
+			FIntPoint TextureSize = R_BlendResult->GetSizeXY();
 
 			FCSLandscapeLayer::FParameters* PassParameters = GraphBuilder.AllocParameters<FCSLandscapeLayer::FParameters>();
 			FIntVector GroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(TextureSize.X, TextureSize.Y, 1), 32);
@@ -293,12 +305,11 @@ void ACSLandscapeLayer::BlendLayerWithAlpha()
 			FRDGTextureUAVRef RDGUAV_Debug = nullptr;
 			ConvertToUVATextureFormat(GraphBuilder, TmpRDG_Debug, RDGUAV_Debug, TextureSize, PF_FloatRGBA, TEXT("UAV_Debug"));
 
-			FRDGTextureRef RDG_Orig = RegisterExternalTexture(GraphBuilder, R_Orig->GetRenderTargetTexture(), TEXT("R_Orig"));
-			FRDGTextureRef RDG_Alpha = RegisterExternalTexture(GraphBuilder, R_Alpha->GetRenderTargetTexture(), TEXT("R_Alpha"));
+			FRDGTextureRef RDG_OrigData = RegisterExternalTexture(GraphBuilder, R_OrigData->GetRenderTargetTexture(), TEXT("R_OrigLandscapeData"));
 			FRDGTextureRef RDG_Height = RegisterExternalTexture(GraphBuilder, R_Height->GetRenderTargetTexture(), TEXT("R_Height"));
 
-			PassParameters->T_OrigLandscapeData = RDG_Orig;
-			PassParameters->T_MaterialBlendTexture = RDG_Alpha;
+			PassParameters->T_OrigLandscapeData = RDG_OrigData;
+			PassParameters->T_AlphaTexture = RDG_Height;
 			PassParameters->RW_LayerBlendResult = RDGUAV_Result;
 			PassParameters->RW_DebugView = RDGUAV_Debug;
 			{
@@ -310,7 +321,14 @@ void ACSLandscapeLayer::BlendLayerWithAlpha()
 			PassParameters->GlobalAlpha = CapturedGlobalAlpha;
 			PassParameters->HeightModStrength = CapturedHeightModStrength;
 			PassParameters->NormalStrength = CapturedNormalStrength;
+			PassParameters->FalloffWidth = 500.0f;
 			PassParameters->Sampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
+
+			if (CapturedBlendMode == ECSLandscapeBlendMode::MaterialDrive && CapturedMaterialBlendRHI.IsValid())
+			{
+				PassParameters->T_MaterialBlendTexture = RegisterExternalTexture(GraphBuilder,
+					CapturedMaterialBlendRHI, TEXT("R_MaterialBlend"), ERDGTextureFlags::None);
+			}
 
 			TShaderMapRef<FCSLandscapeLayer> ComputeShader_Blend = FCSLandscapeLayer::CreatePermutation(
 				CapturedBlendMode == ECSLandscapeBlendMode::MaterialDrive
@@ -325,7 +343,7 @@ void ACSLandscapeLayer::BlendLayerWithAlpha()
 				{
 					FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_Blend, *PassParameters, GroupCount);
 				});
-			AddCopyTexturePass(GraphBuilder, TmpRDG_Result, RegisterExternalTexture(GraphBuilder, R_Orig->GetRenderTargetTexture(), TEXT("R_Result")), FRHICopyTextureInfo());
+			AddCopyTexturePass(GraphBuilder, TmpRDG_Result, RegisterExternalTexture(GraphBuilder, R_BlendResult->GetRenderTargetTexture(), TEXT("R_BlendResult")), FRHICopyTextureInfo());
 			AddCopyTexturePass(GraphBuilder, TmpRDG_Debug, RegisterExternalTexture(GraphBuilder, R_Debug->GetRenderTargetTexture(), TEXT("R_Debug")), FRHICopyTextureInfo());
 		}
 		GraphBuilder.Execute();

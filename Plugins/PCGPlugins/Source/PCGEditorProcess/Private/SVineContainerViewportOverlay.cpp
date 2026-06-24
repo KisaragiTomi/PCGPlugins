@@ -1,6 +1,6 @@
 #include "SVineContainerViewportOverlay.h"
 
-#include "GeometryEditorActor.h"
+#include "VineGenerator.h"
 #include "Styling/AppStyle.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Layout/SBorder.h"

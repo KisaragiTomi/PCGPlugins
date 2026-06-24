@@ -21,6 +21,7 @@
 #include "GeometryScript/MeshNormalsFunctions.h"
 #include "GlobalShader.h"
 #include "HAL/IConsoleManager.h"
+#include "EngineUtils.h"
 #include "Landscape.h"
 #include "LandscapeComponent.h"
 #include "LandscapeProxy.h"
@@ -534,6 +535,125 @@ class FScatterTrianglesToVoxelCacheCS : public FGlobalShader
 };
 
 IMPLEMENT_GLOBAL_SHADER(FScatterTrianglesToVoxelCacheCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "ScatterTrianglesToVoxelCacheCS", SF_Compute);
+
+// -----------------------------------------------------------------------------
+// Triangle Soup → Heightmap rasterization
+// -----------------------------------------------------------------------------
+
+class FTriangleSoupToHeightmapCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FTriangleSoupToHeightmapCS);
+	SHADER_USE_PARAMETER_STRUCT(FTriangleSoupToHeightmapCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleVertices)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_TriangleCounter)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint>, RW_HeightmapUint)
+		SHADER_PARAMETER(FVector2f, HM_BoundsMin)
+		SHADER_PARAMETER(FVector2f, HM_BoundsInvSize)
+		SHADER_PARAMETER(float, HM_CameraHeight)
+		SHADER_PARAMETER(FIntPoint, HM_TextureSize)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FTriangleSoupToHeightmapCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "TriangleSoupToHeightmapCS", SF_Compute);
+
+class FConvertHeightmapUintToFloatCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FConvertHeightmapUintToFloatCS);
+	SHADER_USE_PARAMETER_STRUCT(FConvertHeightmapUintToFloatCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<uint>, T_HeightmapUint)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_HeightmapFloat)
+		SHADER_PARAMETER(FIntPoint, HM_TextureSize)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FConvertHeightmapUintToFloatCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "ConvertHeightmapUintToFloatCS", SF_Compute);
+
+class FLandscapeG16ToDepthCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FLandscapeG16ToDepthCS);
+	SHADER_USE_PARAMETER_STRUCT(FLandscapeG16ToDepthCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float4>, T_LandscapeRGBA)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_HeightmapFloat)
+		SHADER_PARAMETER(float, LHM_CameraHeight)
+		SHADER_PARAMETER(float, LHM_LandscapeScaleZ)
+		SHADER_PARAMETER(float, LHM_LandscapeOriginZ)
+		SHADER_PARAMETER(FIntPoint, LHM_TextureSize)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FLandscapeG16ToDepthCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "LandscapeG16ToDepthCS", SF_Compute);
+
+class FLandscapeG16ToNormalHeightCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FLandscapeG16ToNormalHeightCS);
+	SHADER_USE_PARAMETER_STRUCT(FLandscapeG16ToNormalHeightCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float4>, T_LandscapeRGBA)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_HeightmapFloat)
+		SHADER_PARAMETER(float, LHM_LandscapeScaleZ)
+		SHADER_PARAMETER(float, LHM_LandscapeOriginZ)
+		SHADER_PARAMETER(FIntPoint, LHM_TextureSize)
+		SHADER_PARAMETER(FVector2f, LHM_TexelWorldSize)
+		SHADER_PARAMETER(uint32, LHM_MergeByMaxZ)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FLandscapeG16ToNormalHeightCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "LandscapeG16ToNormalHeightCS", SF_Compute);
+
+class FLandscapeHeightmapToTrianglesCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FLandscapeHeightmapToTrianglesCS);
+	SHADER_USE_PARAMETER_STRUCT(FLandscapeHeightmapToTrianglesCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float4>, T_LandscapeRGBA)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FVector4f>, RW_TriangleVerts)
+		SHADER_PARAMETER(float, LHM_LandscapeScaleZ)
+		SHADER_PARAMETER(float, LHM_LandscapeOriginZ)
+		SHADER_PARAMETER(FIntPoint, LHM_TextureSize)
+		SHADER_PARAMETER(FVector2f, LHM_WorldOriginXY)
+		SHADER_PARAMETER(FVector2f, LHM_TexelWorldSize)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FLandscapeHeightmapToTrianglesCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "LandscapeHeightmapToTrianglesCS", SF_Compute);
 
 // -----------------------------------------------------------------------------
 // Core System - Internal Helpers
@@ -1501,99 +1621,6 @@ void AComputeShaderMeshGenerator::BuildBoxSceneTriangleRequests(UWorld* World,
 	BuildBoxSceneTriangleRequestsInternal(World, QueryBox, VoxelGridSettings.LODIndex, OutRequests);
 }
 
-void AComputeShaderMeshGenerator::BuildActorSceneTriangleRequests(TArray<AActor*> InActors,
-	TArray<FCSStaticMeshTriangleRequest>& OutRequests,
-	float BoundsExpand)
-{
-	OutRequests.Reset();
-
-	FBox ReferenceBounds(ForceInit);
-	for (const FVector& ReferencePoint : ReferencePoints)
-	{
-		ReferenceBounds += ReferencePoint;
-	}
-	if (ReferenceBounds.IsValid && BoundsExpand > 0.0f)
-	{
-		ReferenceBounds = ReferenceBounds.ExpandBy(BoundsExpand);
-	}
-
-	for (AActor* Actor : InActors)
-	{
-		if (!Actor)
-		{
-			continue;
-		}
-
-		{
-			bool bExcluded = false;
-			for (const FName& Tag : ExcludedActorTags)
-			{
-				if (!Tag.IsNone() && Actor->ActorHasTag(Tag))
-				{
-					bExcluded = true;
-					break;
-				}
-			}
-			if (bExcluded)
-			{
-				continue;
-			}
-		}
-
-		TArray<UStaticMeshComponent*> StaticMeshComponents;
-		Actor->GetComponents<UStaticMeshComponent>(StaticMeshComponents);
-		for (UStaticMeshComponent* StaticMeshComponent : StaticMeshComponents)
-		{
-			if (!StaticMeshComponent || !StaticMeshComponent->GetStaticMesh())
-			{
-				continue;
-			}
-
-			if (UInstancedStaticMeshComponent* InstancedComponent = Cast<UInstancedStaticMeshComponent>(StaticMeshComponent))
-			{
-				UStaticMesh* InstanceMesh = InstancedComponent->GetStaticMesh();
-				if (!InstanceMesh)
-				{
-					continue;
-				}
-
-				const FBox LocalMeshBounds = InstanceMesh->GetBoundingBox();
-				for (int32 InstanceIndex = 0; InstanceIndex < InstancedComponent->GetInstanceCount(); ++InstanceIndex)
-				{
-					FTransform InstanceTransform = FTransform::Identity;
-					InstancedComponent->GetInstanceTransform(InstanceIndex, InstanceTransform, true);
-					const FBox InstanceWorldBounds = LocalMeshBounds.TransformBy(InstanceTransform);
-					if (ReferenceBounds.IsValid && !InstanceWorldBounds.Intersect(ReferenceBounds))
-					{
-						continue;
-					}
-
-					FCSStaticMeshTriangleRequest& Request = OutRequests.AddDefaulted_GetRef();
-					Request.StaticMesh = InstanceMesh;
-					Request.LODIndex = VoxelGridSettings.LODIndex;
-					Request.LocalToWorld = InstanceTransform;
-					Request.WorldBounds = ReferenceBounds.IsValid ? ReferenceBounds : FBox(ForceInit);
-					Request.SourceActor = Actor;
-				}
-				continue;
-			}
-
-			const FBox ComponentWorldBounds = StaticMeshComponent->Bounds.GetBox();
-			if (ReferenceBounds.IsValid && !ComponentWorldBounds.Intersect(ReferenceBounds))
-			{
-				continue;
-			}
-
-			FCSStaticMeshTriangleRequest& Request = OutRequests.AddDefaulted_GetRef();
-			Request.StaticMesh = StaticMeshComponent->GetStaticMesh();
-			Request.LODIndex = VoxelGridSettings.LODIndex;
-			Request.LocalToWorld = StaticMeshComponent->GetComponentTransform();
-			Request.WorldBounds = ReferenceBounds.IsValid ? ReferenceBounds : FBox(ForceInit);
-			Request.SourceActor = Actor;
-		}
-	}
-}
-
 // -----------------------------------------------------------------------------
 // Core System - RDG Extraction
 // -----------------------------------------------------------------------------
@@ -2306,157 +2333,6 @@ FCSSurfaceVoxelRDGOutput AddTriangleSurfaceVoxelsToRDGInternal(
 // -----------------------------------------------------------------------------
 
 
-
-FCSSurfaceVoxelRDGOutput AComputeShaderMeshGenerator::GetBoxSceneSurfaceVoxelsToRDG(
-	FRDGBuilder& GraphBuilder,
-	FRHICommandListImmediate& RHICmdList,
-	float VoxelSize,
-	const TCHAR* DebugName)
-{
-	FCSSurfaceVoxelRDGOutput Output;
-
-	UWorld* World = GetWorld();
-	if (!World)
-	{
-		return Output;
-	}
-
-	const FBox QueryBox = GetGeneratorBoundsWorldBox();
-	if (!QueryBox.IsValid)
-	{
-		return Output;
-	}
-
-	const float SafeVoxelSize = FMath::Max(VoxelSize, UE_KINDA_SMALL_NUMBER);
-	const int32 SafeMaxTriangles = FMath::Max(1, MaxTriangles);
-	const int32 SafeMaxVoxels = FMath::Max(1, MaxVoxels);
-	const int32 SafeSurfaceVoxelBlurIterations = FMath::Max(0, SurfaceVoxelBlurIterations);
-	const int32 SafeSurfaceVoxelBlurRadius = FMath::Max(1, SurfaceVoxelBlurRadius);
-
-	TArray<FCSStaticMeshTriangleRequest> Requests;
-	BuildBoxSceneTriangleRequests(World, QueryBox, Requests);
-
-	FCSTriangleMeshData LandscapeTriangleData;
-	const TArray<FVector> EmptyReferencePoints;
-	BuildBoxSceneLandscapeTrianglesInternal(
-		World,
-		QueryBox,
-		EmptyReferencePoints,
-		0.0f,
-		SafeMaxTriangles,
-		LandscapeTriangleData);
-
-	const bool bHasLandscapeTriangles = GetTriangleMeshDataTriangleCount(LandscapeTriangleData) > 0;
-	if (Requests.IsEmpty() && !bHasLandscapeTriangles)
-	{
-		return Output;
-	}
-
-	TArray<FResolvedStaticMeshTriangleRequest> ResolvedRequests;
-	const uint64 TotalStaticMeshTriangleCount = ResolveStaticMeshTriangleRequests(
-		Requests,
-		this,
-		ExcludedActorTags,
-		true,
-		ResolvedRequests);
-	if (ResolvedRequests.IsEmpty() && !bHasLandscapeTriangles)
-	{
-		return Output;
-	}
-
-	const FCSTriangleMeshData* InitialTriangleData = bHasLandscapeTriangles ? &LandscapeTriangleData : nullptr;
-
-	FCSStaticMeshTriangleRDGOutput TriangleOutput = AddResolvedStaticMeshTrianglesToRDGInternal(
-		GraphBuilder,
-		RHICmdList,
-		ResolvedRequests,
-		TotalStaticMeshTriangleCount,
-		EmptyReferencePoints,
-		0.0f,
-		SafeMaxTriangles,
-		InitialTriangleData,
-		TEXT("CS.BoxSceneSurfaceVoxels.Triangles"));
-
-	Output = AddTriangleSurfaceVoxelsToRDGInternal(
-		GraphBuilder,
-		TriangleOutput,
-		QueryBox.Min,
-		SafeVoxelSize,
-		0.0f,
-		SafeMaxVoxels,
-		0,
-		SafeSurfaceVoxelBlurIterations,
-		SafeSurfaceVoxelBlurRadius,
-		DebugName);
-
-	return Output;
-}
-
-FCSStaticMeshTriangleRDGOutput AComputeShaderMeshGenerator::AddBoxSceneTrianglesToRDG(
-	FRDGBuilder& GraphBuilder,
-	FRHICommandListImmediate& RHICmdList,
-	const FBox& QueryBox,
-	int32 InMaxTriangles,
-	const TCHAR* DebugName,
-	const TArray<FVector>& InReferencePoints,
-	float InReferenceFilterDistance)
-{
-	FCSStaticMeshTriangleRDGOutput TriangleOutput;
-
-	UWorld* World = GetWorld();
-	if (!World || !QueryBox.IsValid)
-	{
-		return TriangleOutput;
-	}
-
-	const int32 SafeMaxTriangles = InMaxTriangles > 0 ? InMaxTriangles : FMath::Max(1, MaxTriangles);
-	const float SafeReferenceFilterDistance = InReferencePoints.IsEmpty() ? 0.0f : FMath::Max(0.0f, InReferenceFilterDistance);
-
-	TArray<FCSStaticMeshTriangleRequest> Requests;
-	BuildBoxSceneTriangleRequests(World, QueryBox, Requests);
-
-	FCSTriangleMeshData LandscapeTriangleData;
-	BuildBoxSceneLandscapeTrianglesInternal(
-		World,
-		QueryBox,
-		InReferencePoints,
-		SafeReferenceFilterDistance,
-		SafeMaxTriangles,
-		LandscapeTriangleData);
-
-	const bool bHasLandscapeTriangles = GetTriangleMeshDataTriangleCount(LandscapeTriangleData) > 0;
-	if (Requests.IsEmpty() && !bHasLandscapeTriangles)
-	{
-		return TriangleOutput;
-	}
-
-	TArray<FResolvedStaticMeshTriangleRequest> ResolvedRequests;
-	const uint64 TotalStaticMeshTriangleCount = ResolveStaticMeshTriangleRequests(
-		Requests,
-		this,
-		ExcludedActorTags,
-		true,
-		ResolvedRequests);
-	if (ResolvedRequests.IsEmpty() && !bHasLandscapeTriangles)
-	{
-		return TriangleOutput;
-	}
-
-	const FCSTriangleMeshData* InitialTriangleData = bHasLandscapeTriangles ? &LandscapeTriangleData : nullptr;
-
-	TriangleOutput = AddResolvedStaticMeshTrianglesToRDGInternal(
-		GraphBuilder,
-		RHICmdList,
-		ResolvedRequests,
-		TotalStaticMeshTriangleCount,
-		InReferencePoints,
-		SafeReferenceFilterDistance,
-		SafeMaxTriangles,
-		InitialTriangleData,
-		DebugName);
-
-	return TriangleOutput;
-}
 
 // -----------------------------------------------------------------------------
 // PrepareBoxSceneTriangles / AddPreparedBoxSceneTrianglesToRDG
@@ -5242,4 +5118,615 @@ bool AComputeShaderMeshGenerator::AreBoundsCompatible(const FBox& A, const FBox&
 FName AComputeShaderMeshGenerator::NormalizeRequestId(FName RequestId) const
 {
 	return RequestId.IsNone() ? CSGeneratorDefaultRequestId : RequestId;
+}
+
+// -----------------------------------------------------------------------------
+// Triangle Soup → Heightmap RDG pass
+// -----------------------------------------------------------------------------
+
+void AComputeShaderMeshGenerator::RasterizeTriangleSoupToHeightmapRDG(
+	FRDGBuilder& GraphBuilder,
+	const FCSStaticMeshTriangleRDGOutput& TriangleOutput,
+	FRDGTextureRef OutputHeightmap,
+	const FBox& WorldBounds,
+	float CameraHeight)
+{
+	if (!TriangleOutput.TriangleVertices || !TriangleOutput.TriangleCounter || TriangleOutput.MaxTriangles == 0)
+	{
+		return;
+	}
+
+	FIntPoint TexSize;
+	{
+		FRDGTextureDesc Desc = OutputHeightmap->Desc;
+		TexSize = FIntPoint(Desc.Extent.X, Desc.Extent.Y);
+	}
+
+	FVector2f BoundsMin(WorldBounds.Min.X, WorldBounds.Min.Y);
+	FVector2f BoundsSize(WorldBounds.Max.X - WorldBounds.Min.X, WorldBounds.Max.Y - WorldBounds.Min.Y);
+	FVector2f BoundsInvSize(
+		BoundsSize.X > 0.01f ? 1.0f / BoundsSize.X : 0.0f,
+		BoundsSize.Y > 0.01f ? 1.0f / BoundsSize.Y : 0.0f);
+
+	FRDGTextureDesc UintDesc = FRDGTextureDesc::Create2D(
+		FIntPoint(TexSize.X, TexSize.Y),
+		PF_R32_UINT,
+		FClearValueBinding::None,
+		TexCreate_ShaderResource | TexCreate_UAV);
+	FRDGTextureRef HeightmapUint = GraphBuilder.CreateTexture(UintDesc, TEXT("CS.HeightmapUint"));
+	FRDGTextureUAVRef HeightmapUintUAV = GraphBuilder.CreateUAV(HeightmapUint);
+
+	AddClearUAVPass(GraphBuilder, HeightmapUintUAV, 0xFFFFFFFFu);
+
+	{
+		TShaderMapRef<FTriangleSoupToHeightmapCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		auto* PassParams = GraphBuilder.AllocParameters<FTriangleSoupToHeightmapCS::FParameters>();
+		PassParams->RW_OutTriangleVertices = TriangleOutput.TriangleVerticesUAV;
+		PassParams->RW_TriangleCounter = TriangleOutput.TriangleCounterUAV;
+		PassParams->RW_HeightmapUint = HeightmapUintUAV;
+		PassParams->HM_BoundsMin = BoundsMin;
+		PassParams->HM_BoundsInvSize = BoundsInvSize;
+		PassParams->HM_CameraHeight = CameraHeight;
+		PassParams->HM_TextureSize = TexSize;
+
+		FIntVector GroupCount(FMath::DivideAndRoundUp(int32(TriangleOutput.MaxTriangles), 64), 1, 1);
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("TriangleSoupToHeightmap"),
+			ERDGPassFlags::Compute,
+			CS,
+			PassParams,
+			GroupCount);
+	}
+
+	{
+		TShaderMapRef<FConvertHeightmapUintToFloatCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		auto* ConvertParams = GraphBuilder.AllocParameters<FConvertHeightmapUintToFloatCS::FParameters>();
+		ConvertParams->T_HeightmapUint = GraphBuilder.CreateSRV(FRDGTextureSRVDesc(HeightmapUint));
+		ConvertParams->RW_HeightmapFloat = GraphBuilder.CreateUAV(OutputHeightmap);
+		ConvertParams->HM_TextureSize = TexSize;
+
+		FIntVector GroupCount(
+			FMath::DivideAndRoundUp(TexSize.X, 8),
+			FMath::DivideAndRoundUp(TexSize.Y, 8),
+			1);
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("ConvertHeightmapUintToFloat"),
+			ERDGPassFlags::Compute,
+			CS,
+			ConvertParams,
+			GroupCount);
+	}
+}
+
+void AComputeShaderMeshGenerator::ConvertLandscapeHeightmapToDepthRDG(
+	FRDGBuilder& GraphBuilder,
+	FRDGTextureRef LandscapeG16Texture,
+	FRDGTextureRef OutputHeightmap,
+	float CameraHeight,
+	float LandscapeScaleZ,
+	float LandscapeOriginZ)
+{
+	if (!LandscapeG16Texture || !OutputHeightmap) return;
+
+	FIntPoint TexSize(OutputHeightmap->Desc.Extent.X, OutputHeightmap->Desc.Extent.Y);
+
+	TShaderMapRef<FLandscapeG16ToDepthCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	auto* PassParams = GraphBuilder.AllocParameters<FLandscapeG16ToDepthCS::FParameters>();
+	PassParams->T_LandscapeRGBA = GraphBuilder.CreateSRV(FRDGTextureSRVDesc(LandscapeG16Texture));
+	PassParams->RW_HeightmapFloat = GraphBuilder.CreateUAV(OutputHeightmap);
+	PassParams->LHM_CameraHeight = CameraHeight;
+	PassParams->LHM_LandscapeScaleZ = LandscapeScaleZ;
+	PassParams->LHM_LandscapeOriginZ = LandscapeOriginZ;
+	PassParams->LHM_TextureSize = TexSize;
+
+	FIntVector GroupCount(
+		FMath::DivideAndRoundUp(TexSize.X, 8),
+		FMath::DivideAndRoundUp(TexSize.Y, 8),
+		1);
+	FComputeShaderUtils::AddPass(
+		GraphBuilder,
+		RDG_EVENT_NAME("LandscapeG16ToDepth"),
+		ERDGPassFlags::Compute,
+		CS,
+		PassParams,
+		GroupCount);
+}
+
+bool AComputeShaderMeshGenerator::CaptureLandscapeHeightmap(UTextureRenderTarget2D* OutRT, bool bOutputWorldHeight)
+{
+	const FBox Box = GetGeneratorBoundsWorldBox();
+	if (!Box.IsValid) return false;
+	const FVector Center = Box.GetCenter();
+	const FVector Extent = Box.GetExtent();
+	const float CaptureExtent = FMath::Max(Extent.X, Extent.Y);
+	const float CameraHeight = Center.Z + Extent.Z;
+
+	if (OutRT == nullptr)
+	{
+		UWorld* World = GetWorld();
+		if (!World) return false;
+
+		constexpr int32 GridSize = 32;
+		const float WorldSize = CaptureExtent * 2.0f;
+		const float StepSize = WorldSize / GridSize;
+
+		const float TraceTop    = CameraHeight + 100000.0f;
+		const float TraceBottom = Center.Z - Extent.Z - 100000.0f;
+
+		FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(LandscapeHeightDD), false);
+		QueryParams.AddIgnoredActor(this);
+
+		int32 HitCount = 0;
+		const double TraceStart = FPlatformTime::Seconds();
+		for (int32 Y = 0; Y < GridSize; ++Y)
+		{
+			for (int32 X = 0; X < GridSize; ++X)
+			{
+				const float WorldX = Center.X - CaptureExtent + (X + 0.5f) * StepSize;
+				const float WorldY = Center.Y - CaptureExtent + (Y + 0.5f) * StepSize;
+
+				FHitResult Hit;
+				if (World->LineTraceSingleByChannel(Hit,
+					FVector(WorldX, WorldY, TraceTop),
+					FVector(WorldX, WorldY, TraceBottom),
+					ECC_WorldStatic, QueryParams)
+					&& Hit.GetActor() && Hit.GetActor()->IsA<ALandscapeProxy>())
+				{
+					DrawDebugPoint(World, Hit.ImpactPoint + FVector(0,0,10), 8.0f, FColor::Green, false, 15.0f);
+					++HitCount;
+				}
+			}
+		}
+		const double TraceMs = (FPlatformTime::Seconds() - TraceStart) * 1000.0;
+		UE_LOG(LogTemp, Log, TEXT("[CaptureLandscapeHeightmap] DD mode: %d/%d landscape hits, %.2f ms, Center=(%.0f,%.0f,%.0f) Extent=%.0f"),
+			HitCount, GridSize * GridSize, TraceMs, Center.X, Center.Y, Center.Z, CaptureExtent);
+		return HitCount > 0;
+	}
+
+	const bool bResult = bOutputWorldHeight
+		? CaptureLandscapeHeightmapGPU(Center, CaptureExtent, OutRT)
+		: CaptureLandscapeHeightmapToDepth(Center, CaptureExtent, CameraHeight, OutRT);
+
+	return bResult;
+}
+
+bool AComputeShaderMeshGenerator::CaptureLandscapeHeightmapToDepth(
+	FVector WorldCenter,
+	float CaptureExtent,
+	float CameraHeight,
+	UTextureRenderTarget2D* OutDepthRT)
+{
+	if (!OutDepthRT) return false;
+
+	UWorld* World = GetWorld();
+	if (!World) return false;
+
+	TArray<ALandscape*> Landscapes;
+	for (TActorIterator<ALandscape> It(World); It; ++It)
+	{
+		if (IsValid(*It))
+		{
+			Landscapes.Add(*It);
+		}
+	}
+	if (Landscapes.IsEmpty()) return false;
+
+	const int32 TexSize = OutDepthRT->SizeX;
+
+	// Pre-clear output to very large depth so min-merge works across multiple landscapes.
+	// The shader writes min(existing, newDepth), so existing must start high.
+	FTextureRenderTargetResource* R_Depth = OutDepthRT->GameThread_GetRenderTargetResource();
+	ENQUEUE_RENDER_COMMAND(ClearDepthToMax)(
+	[R_Depth](FRHICommandListImmediate& RHICmdList)
+	{
+		FRDGBuilder GraphBuilder(RHICmdList);
+		FRDGTextureRef RDG = RegisterExternalTexture(
+			GraphBuilder, R_Depth->GetRenderTargetTexture(), TEXT("DepthClear"));
+		AddClearRenderTargetPass(GraphBuilder, RDG, FLinearColor(1e10f, 0, 0, 1));
+		GraphBuilder.Execute();
+	});
+
+	FTransform AreaTransform(FQuat::Identity, WorldCenter, FVector::OneVector);
+	FBox2D Extents(FVector2D(-CaptureExtent, -CaptureExtent), FVector2D(CaptureExtent, CaptureExtent));
+
+	TArray<UTextureRenderTarget2D*> TempRTs;
+	bool bAnySuccess = false;
+
+	for (ALandscape* Landscape : Landscapes)
+	{
+		UTextureRenderTarget2D* TempRT = NewObject<UTextureRenderTarget2D>(GetTransientPackage());
+		TempRT->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
+		TempRT->bCanCreateUAV = false;
+		TempRT->ClearColor = FLinearColor(0.5f, 0, 0, 0);
+		TempRT->InitAutoFormat(TexSize, TexSize);
+		TempRT->UpdateResourceImmediate(true);
+
+		if (!Landscape->RenderHeightmap(AreaTransform, Extents, TempRT))
+		{
+			TempRT->MarkAsGarbage();
+			continue;
+		}
+
+		const float LandscapeScaleZ = Landscape->GetActorScale3D().Z;
+		const float LandscapeOriginZ = Landscape->GetActorLocation().Z;
+
+		FTextureRenderTargetResource* R_RGBA = TempRT->GameThread_GetRenderTargetResource();
+
+		ENQUEUE_RENDER_COMMAND(LandscapeRGBAToDepth)(
+		[this, R_RGBA, R_Depth, CameraHeight, LandscapeScaleZ, LandscapeOriginZ, TexSize](FRHICommandListImmediate& RHICmdList)
+		{
+			FRDGBuilder GraphBuilder(RHICmdList);
+
+			FRDGTextureRef RDG_RGBA = RegisterExternalTexture(GraphBuilder, R_RGBA->GetRenderTargetTexture(), TEXT("LandscapeRGBA_RT"));
+			FRDGTextureRef RDG_Depth = RegisterExternalTexture(GraphBuilder, R_Depth->GetRenderTargetTexture(), TEXT("DepthOutput_RT"));
+
+			ConvertLandscapeHeightmapToDepthRDG(
+				GraphBuilder, RDG_RGBA, RDG_Depth,
+				CameraHeight, LandscapeScaleZ, LandscapeOriginZ);
+
+			GraphBuilder.Execute();
+		});
+
+		TempRTs.Add(TempRT);
+		bAnySuccess = true;
+	}
+
+	FlushRenderingCommands();
+
+	for (UTextureRenderTarget2D* TempRT : TempRTs)
+	{
+		TempRT->MarkAsGarbage();
+	}
+
+	return bAnySuccess;
+}
+
+void AComputeShaderMeshGenerator::ConvertLandscapeHeightmapToNormalHeightRDG(
+	FRDGBuilder& GraphBuilder,
+	FRDGTextureRef LandscapeG16Texture,
+	FRDGTextureRef OutputNormalHeight,
+	float LandscapeScaleZ,
+	float LandscapeOriginZ,
+	FVector2f TexelWorldSize,
+	bool bMergeByMaxZ)
+{
+	if (!LandscapeG16Texture || !OutputNormalHeight) return;
+
+	FIntPoint TexSize(OutputNormalHeight->Desc.Extent.X, OutputNormalHeight->Desc.Extent.Y);
+
+	TShaderMapRef<FLandscapeG16ToNormalHeightCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	auto* PassParams = GraphBuilder.AllocParameters<FLandscapeG16ToNormalHeightCS::FParameters>();
+	PassParams->T_LandscapeRGBA = GraphBuilder.CreateSRV(FRDGTextureSRVDesc(LandscapeG16Texture));
+	PassParams->RW_HeightmapFloat = GraphBuilder.CreateUAV(OutputNormalHeight);
+	PassParams->LHM_LandscapeScaleZ = LandscapeScaleZ;
+	PassParams->LHM_LandscapeOriginZ = LandscapeOriginZ;
+	PassParams->LHM_TextureSize = TexSize;
+	PassParams->LHM_TexelWorldSize = TexelWorldSize;
+	PassParams->LHM_MergeByMaxZ = bMergeByMaxZ ? 1u : 0u;
+
+	FIntVector GroupCount(
+		FMath::DivideAndRoundUp(TexSize.X, 8),
+		FMath::DivideAndRoundUp(TexSize.Y, 8),
+		1);
+	FComputeShaderUtils::AddPass(
+		GraphBuilder,
+		RDG_EVENT_NAME("LandscapeG16ToNormalHeight"),
+		ERDGPassFlags::Compute,
+		CS,
+		PassParams,
+		GroupCount);
+}
+
+bool AComputeShaderMeshGenerator::CaptureLandscapeHeightmapGPU(
+	FVector WorldCenter,
+	float CaptureExtent,
+	UTextureRenderTarget2D* OutNormalHeightRT)
+{
+	if (!OutNormalHeightRT) return false;
+
+	UWorld* World = GetWorld();
+	if (!World) return false;
+
+	TArray<ALandscape*> Landscapes;
+	for (TActorIterator<ALandscape> It(World); It; ++It)
+	{
+		if (IsValid(*It))
+		{
+			Landscapes.Add(*It);
+		}
+	}
+	if (Landscapes.IsEmpty()) return false;
+
+	const int32 TexSize = OutNormalHeightRT->SizeX;
+	const bool bMultipleLandscapes = Landscapes.Num() > 1;
+
+	// Pre-clear output: Normal=(0,0,1) up, Height=-1e10 (very low → any real terrain wins merge)
+	FTextureRenderTargetResource* R_Out = OutNormalHeightRT->GameThread_GetRenderTargetResource();
+	if (bMultipleLandscapes)
+	{
+		ENQUEUE_RENDER_COMMAND(ClearNormalHeightToMin)(
+		[R_Out](FRHICommandListImmediate& RHICmdList)
+		{
+			FRDGBuilder GraphBuilder(RHICmdList);
+			FRDGTextureRef RDG = RegisterExternalTexture(
+				GraphBuilder, R_Out->GetRenderTargetTexture(), TEXT("NHClear"));
+			AddClearRenderTargetPass(GraphBuilder, RDG, FLinearColor(0, 0, 1, -1e10f));
+			GraphBuilder.Execute();
+		});
+	}
+
+	FTransform AreaTransform(FQuat::Identity, WorldCenter, FVector::OneVector);
+	FBox2D Extents(FVector2D(-CaptureExtent, -CaptureExtent), FVector2D(CaptureExtent, CaptureExtent));
+	const FVector2f CapturedTexelWorldSize(
+		(CaptureExtent * 2.0f) / TexSize,
+		(CaptureExtent * 2.0f) / TexSize);
+
+	TArray<UTextureRenderTarget2D*> TempRTs;
+	bool bAnySuccess = false;
+
+	for (ALandscape* Landscape : Landscapes)
+	{
+		UTextureRenderTarget2D* TempRT = NewObject<UTextureRenderTarget2D>(GetTransientPackage());
+		TempRT->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
+		TempRT->bCanCreateUAV = false;
+		TempRT->ClearColor = FLinearColor(0.5f, 0, 0, 0);
+		TempRT->InitAutoFormat(TexSize, TexSize);
+		TempRT->UpdateResourceImmediate(true);
+
+		if (!Landscape->RenderHeightmap(AreaTransform, Extents, TempRT))
+		{
+			TempRT->MarkAsGarbage();
+			continue;
+		}
+
+		const float LandscapeScaleZ = Landscape->GetActorScale3D().Z;
+		const float LandscapeOriginZ = Landscape->GetActorLocation().Z;
+		const bool bMerge = bMultipleLandscapes;
+
+		FTextureRenderTargetResource* R_RGBA = TempRT->GameThread_GetRenderTargetResource();
+
+		ENQUEUE_RENDER_COMMAND(LandscapeRGBAToNormalHeight)(
+		[this, R_RGBA, R_Out, LandscapeScaleZ, LandscapeOriginZ, CapturedTexelWorldSize, TexSize, bMerge](FRHICommandListImmediate& RHICmdList)
+		{
+			FRDGBuilder GraphBuilder(RHICmdList);
+
+			FRDGTextureRef RDG_RGBA = RegisterExternalTexture(GraphBuilder, R_RGBA->GetRenderTargetTexture(), TEXT("LandscapeRGBA_RT"));
+			FRDGTextureRef RDG_Out = RegisterExternalTexture(GraphBuilder, R_Out->GetRenderTargetTexture(), TEXT("NormalHeightOutput_RT"));
+
+			ConvertLandscapeHeightmapToNormalHeightRDG(
+				GraphBuilder, RDG_RGBA, RDG_Out,
+				LandscapeScaleZ, LandscapeOriginZ, CapturedTexelWorldSize, bMerge);
+
+			GraphBuilder.Execute();
+		});
+
+		TempRTs.Add(TempRT);
+		bAnySuccess = true;
+	}
+
+	FlushRenderingCommands();
+
+	for (UTextureRenderTarget2D* TempRT : TempRTs)
+	{
+		TempRT->MarkAsGarbage();
+	}
+
+	return bAnySuccess;
+}
+
+bool AComputeShaderMeshGenerator::RenderLandscapeToNormalHeightRT(
+	ALandscape* Landscape,
+	FVector WorldCenter,
+	FVector WorldExtentXY,
+	UTextureRenderTarget2D* OutNormalHeightRT)
+{
+	if (!Landscape || !OutNormalHeightRT) return false;
+
+	const int32 TexSizeX = OutNormalHeightRT->SizeX;
+	const int32 TexSizeY = OutNormalHeightRT->SizeY;
+	if (TexSizeX < 4 || TexSizeY < 4) return false;
+
+	const float ExtX = FMath::Abs(WorldExtentXY.X);
+	const float ExtY = FMath::Abs(WorldExtentXY.Y);
+	if (ExtX < 1.0f || ExtY < 1.0f) return false;
+
+	UTextureRenderTarget2D* TempRT = NewObject<UTextureRenderTarget2D>(GetTransientPackage());
+	TempRT->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
+	TempRT->bCanCreateUAV = false;
+	TempRT->ClearColor = FLinearColor(0.5f, 0, 0, 0);
+	TempRT->InitAutoFormat(TexSizeX, TexSizeY);
+	TempRT->UpdateResourceImmediate(true);
+
+	FTransform AreaTransform(FQuat::Identity, WorldCenter, FVector::OneVector);
+	FBox2D Extents(FVector2D(-ExtX, -ExtY), FVector2D(ExtX, ExtY));
+
+	if (!Landscape->RenderHeightmap(AreaTransform, Extents, TempRT))
+	{
+		TempRT->MarkAsGarbage();
+		return false;
+	}
+
+	const float LandscapeScaleZ = Landscape->GetActorScale3D().Z;
+	const float LandscapeOriginZ = Landscape->GetActorLocation().Z;
+	const FVector2f TexelWorldSize(
+		(ExtX * 2.0f) / TexSizeX,
+		(ExtY * 2.0f) / TexSizeY);
+
+	FTextureRenderTargetResource* R_RGBA = TempRT->GameThread_GetRenderTargetResource();
+	FTextureRenderTargetResource* R_Out = OutNormalHeightRT->GameThread_GetRenderTargetResource();
+
+	ENQUEUE_RENDER_COMMAND(LandscapeRGBAToNormalHeight_Static)(
+	[R_RGBA, R_Out, LandscapeScaleZ, LandscapeOriginZ, TexelWorldSize, TexSizeX, TexSizeY](FRHICommandListImmediate& RHICmdList)
+	{
+		FRDGBuilder GraphBuilder(RHICmdList);
+
+		FRDGTextureRef RDG_RGBA = RegisterExternalTexture(GraphBuilder, R_RGBA->GetRenderTargetTexture(), TEXT("LandscapeRGBA_RT"));
+		FRDGTextureRef RDG_Out = RegisterExternalTexture(GraphBuilder, R_Out->GetRenderTargetTexture(), TEXT("NormalHeight_RT"));
+
+		FIntPoint TexSize(TexSizeX, TexSizeY);
+		TShaderMapRef<FLandscapeG16ToNormalHeightCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		auto* PassParams = GraphBuilder.AllocParameters<FLandscapeG16ToNormalHeightCS::FParameters>();
+		PassParams->T_LandscapeRGBA = GraphBuilder.CreateSRV(FRDGTextureSRVDesc(RDG_RGBA));
+		PassParams->RW_HeightmapFloat = GraphBuilder.CreateUAV(RDG_Out);
+		PassParams->LHM_LandscapeScaleZ = LandscapeScaleZ;
+		PassParams->LHM_LandscapeOriginZ = LandscapeOriginZ;
+		PassParams->LHM_TextureSize = TexSize;
+		PassParams->LHM_TexelWorldSize = TexelWorldSize;
+		PassParams->LHM_MergeByMaxZ = 0u;
+
+		FIntVector GroupCount(
+			FMath::DivideAndRoundUp(TexSize.X, 8),
+			FMath::DivideAndRoundUp(TexSize.Y, 8),
+			1);
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("LandscapeG16ToNormalHeight"),
+			ERDGPassFlags::Compute,
+			CS,
+			PassParams,
+			GroupCount);
+
+		GraphBuilder.Execute();
+	});
+
+	FlushRenderingCommands();
+
+	TempRT->MarkAsGarbage();
+	return true;
+}
+
+FCSTriangleMeshData AComputeShaderMeshGenerator::CaptureLandscapeTrianglesGPU(int32 TextureSize)
+{
+	FCSTriangleMeshData Result;
+
+	const FBox Box = GetGeneratorBoundsWorldBox();
+	if (!Box.IsValid) return Result;
+
+	UWorld* World = GetWorld();
+	if (!World) return Result;
+
+	const FVector Center = Box.GetCenter();
+	const FVector Extent = Box.GetExtent();
+	const float CaptureExtent = FMath::Max(Extent.X, Extent.Y);
+	TextureSize = FMath::Clamp(TextureSize, 4, 2048);
+
+	TArray<ALandscape*> Landscapes;
+	for (TActorIterator<ALandscape> It(World); It; ++It)
+	{
+		if (IsValid(*It))
+			Landscapes.Add(*It);
+	}
+	if (Landscapes.IsEmpty()) return Result;
+
+	ALandscape* Landscape = Landscapes[0];
+
+	UTextureRenderTarget2D* TempRT = NewObject<UTextureRenderTarget2D>(GetTransientPackage());
+	TempRT->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
+	TempRT->bCanCreateUAV = false;
+	TempRT->ClearColor = FLinearColor(0.5f, 0, 0, 0);
+	TempRT->InitAutoFormat(TextureSize, TextureSize);
+	TempRT->UpdateResourceImmediate(true);
+
+	FTransform AreaTransform(FQuat::Identity, Center, FVector::OneVector);
+	FBox2D AreaExtents(FVector2D(-CaptureExtent, -CaptureExtent), FVector2D(CaptureExtent, CaptureExtent));
+
+	if (!Landscape->RenderHeightmap(AreaTransform, AreaExtents, TempRT))
+	{
+		TempRT->MarkAsGarbage();
+		return Result;
+	}
+
+	const float LandscapeScaleZ = Landscape->GetActorScale3D().Z;
+	const float LandscapeOriginZ = Landscape->GetActorLocation().Z;
+	const FVector2f TexelWorldSize(
+		(CaptureExtent * 2.0f) / TextureSize,
+		(CaptureExtent * 2.0f) / TextureSize);
+	const FVector2f WorldOriginXY(
+		float(Center.X - CaptureExtent),
+		float(Center.Y - CaptureExtent));
+
+	const int32 GridCells = TextureSize - 1;
+	const int32 TotalVerts = GridCells * GridCells * 6;
+	const uint32 ReadbackBytes = uint32(int64(TotalVerts) * sizeof(FVector4f));
+
+	FTextureRenderTargetResource* R_RGBA = TempRT->GameThread_GetRenderTargetResource();
+
+	FRHIGPUBufferReadback* VertReadback = new FRHIGPUBufferReadback(TEXT("LandscapeTriangles_VertReadback"));
+	bool bRenderWorkQueued = false;
+
+	ENQUEUE_RENDER_COMMAND(LandscapeToTriangles)(
+	[R_RGBA, LandscapeScaleZ, LandscapeOriginZ, TexelWorldSize, WorldOriginXY,
+	 TextureSize, GridCells, TotalVerts, ReadbackBytes, VertReadback,
+	 &bRenderWorkQueued](FRHICommandListImmediate& RHICmdList)
+	{
+		FRDGBuilder GraphBuilder(RHICmdList);
+
+		FRDGTextureRef RDG_RGBA = RegisterExternalTexture(
+			GraphBuilder, R_RGBA->GetRenderTargetTexture(), TEXT("LandscapeRGBA_Tri"));
+
+		FRDGBufferRef TriBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), TotalVerts),
+			TEXT("LandscapeTriVerts"));
+
+		TShaderMapRef<FLandscapeHeightmapToTrianglesCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		auto* Params = GraphBuilder.AllocParameters<FLandscapeHeightmapToTrianglesCS::FParameters>();
+		Params->T_LandscapeRGBA = GraphBuilder.CreateSRV(FRDGTextureSRVDesc(RDG_RGBA));
+		Params->RW_TriangleVerts = GraphBuilder.CreateUAV(TriBuffer);
+		Params->LHM_LandscapeScaleZ = LandscapeScaleZ;
+		Params->LHM_LandscapeOriginZ = LandscapeOriginZ;
+		Params->LHM_TextureSize = FIntPoint(TextureSize, TextureSize);
+		Params->LHM_WorldOriginXY = WorldOriginXY;
+		Params->LHM_TexelWorldSize = TexelWorldSize;
+
+		FIntVector GroupCount(
+			FMath::DivideAndRoundUp(GridCells, 8),
+			FMath::DivideAndRoundUp(GridCells, 8),
+			1);
+		FComputeShaderUtils::AddPass(
+			GraphBuilder, RDG_EVENT_NAME("LandscapeHeightmapToTriangles"),
+			ERDGPassFlags::Compute, CS, Params, GroupCount);
+
+		AddEnqueueCopyPass(GraphBuilder, VertReadback, TriBuffer, ReadbackBytes);
+
+		GraphBuilder.Execute();
+		bRenderWorkQueued = true;
+	});
+
+	FlushRenderingCommands();
+
+	if (bRenderWorkQueued)
+	{
+		ENQUEUE_RENDER_COMMAND(LandscapeTrianglesReadback)(
+		[VertReadback, ReadbackBytes, TotalVerts, &Result](FRHICommandListImmediate& RHICmdList)
+		{
+			if (!VertReadback->IsReady())
+				RHICmdList.SubmitAndBlockUntilGPUIdle();
+
+			if (VertReadback->IsReady() && VertReadback->GetGPUSizeBytes() >= ReadbackBytes)
+			{
+				if (const FVector4f* SrcData = static_cast<const FVector4f*>(VertReadback->Lock(ReadbackBytes)))
+				{
+					Result.Vertices.SetNumUninitialized(TotalVerts);
+					for (int32 i = 0; i < TotalVerts; ++i)
+						Result.Vertices[i] = FVector(SrcData[i].X, SrcData[i].Y, SrcData[i].Z);
+					Result.VertexCount = TotalVerts;
+					VertReadback->Unlock();
+				}
+			}
+			delete VertReadback;
+		});
+		FlushRenderingCommands();
+	}
+	else
+	{
+		delete VertReadback;
+	}
+
+	TempRT->MarkAsGarbage();
+
+	UE_LOG(LogTemp, Log, TEXT("[CaptureLandscapeTrianglesGPU] %d verts (%d tris), TexSize=%d, Center=(%.0f,%.0f) Extent=%.0f"),
+		Result.VertexCount, Result.VertexCount / 3, TextureSize, Center.X, Center.Y, CaptureExtent);
+	return Result;
 }

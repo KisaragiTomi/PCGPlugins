@@ -274,10 +274,10 @@ bool ACSLandscapeTempLayer::RenderLayer(
 	EnsureRTs(Size);
 	RunBlendCS(ReadRT2D, RT_InternalResult, Size);
 
-	// Copy blended result to the write scratch RT
-	WriteRT->CopyFrom(
-		ULandscapeScratchRenderTarget::FCopyFromScratchRenderTargetParams(ReadRT),
-		RDGBuilderRecorder);
+	WriteRT->TransitionTo(ERHIAccess::RTV, RDGBuilderRecorder);
+	ULandscapeScratchRenderTarget::FCopyFromTextureParams CopyParams(RT_InternalResult);
+	CopyParams.CopySize = Size;
+	WriteRT->CopyFrom(CopyParams, RDGBuilderRecorder);
 
 	bHasResult = true;
 	return true;

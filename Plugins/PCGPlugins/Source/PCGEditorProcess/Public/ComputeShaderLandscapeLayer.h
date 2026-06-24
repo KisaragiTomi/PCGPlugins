@@ -54,6 +54,10 @@ public:
 		meta = (DisplayName = "Noise Amplitude (max height displacement)"))
 	float NoiseAmplitude = 500.0f;
 
+	UPROPERTY(BlueprintReadWrite, Category = "RuntimeData",
+		meta = (DisplayName = "Original Landscape Data (immutable)"))
+	UTextureRenderTarget2D* RT_OrigLandscapeData;
+
 	UPROPERTY(BlueprintReadWrite, Category = "RuntimeData")
 	UTextureRenderTarget2D* RT_LayerAlpha;
 

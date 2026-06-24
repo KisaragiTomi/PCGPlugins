@@ -4,7 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
-#include "GeometryEditorActor.h"
+#include "VineGenerator.h"
 #include "FoliageConverter.generated.h"
 
 class UHierarchicalInstancedStaticMeshComponent;

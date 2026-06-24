@@ -79,6 +79,10 @@ public:
 	FRuntimeLayerSettings LayerSettings;
 
 	UPROPERTY(BlueprintReadWrite, Category = "RuntimeData",
+		meta = (DisplayName = "Original Landscape Data (read-only after ReadLandscapeData)"))
+	UTextureRenderTarget2D* RT_OrigLandscapeData;
+
+	UPROPERTY(BlueprintReadWrite, Category = "RuntimeData",
 		meta = (DisplayName = "Generated Layer Alpha (R) + Height (A) RT"))
 	UTextureRenderTarget2D* RT_LayerAlphaHeight;
 

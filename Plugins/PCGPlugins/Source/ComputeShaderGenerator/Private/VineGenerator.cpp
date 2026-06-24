@@ -1,19 +1,16 @@
 // Fill out your copyright notice in the Description page of Project Settings.
-#include "GeometryEditorActor.h"
+#include "VineGenerator.h"
 
 #include "EngineUtils.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshActor.h"
 #include "Landscape.h"
 #include "ObjectTools.h"
-#include "PointFunction.h"
 #include "PCGPluginDebug.h"
 #include "PackageTools.h"
 
-// SpaceColonization GPU shader includes (moved from GenerateVines.cpp)
 #include "GlobalShader.h"
 #include "GeometryAsync.h"
-#include "GeometryGenerate.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
 #include "RHIGPUReadback.h"
@@ -29,16 +26,210 @@
 #include "GeometryScript/MeshBasicEditFunctions.h"
 #include "GeometryScript/MeshNormalsFunctions.h"
 #include "GeometryScript/MeshPrimitiveFunctions.h"
-#include "GeometryGeneral.h"
 #include "DynamicMesh/MeshTransforms.h"
-#include "ComputeShaderGenerateHepler.h"
-#include "Noise.h"
-#include "GlobalShader.h"
-#include "RenderGraphBuilder.h"
-#include "RenderGraphUtils.h"
-#include "RHIGPUReadback.h"
-#include "ShaderParameterStruct.h"
 #include "Misc/PackageName.h"
+#include "Curve/CurveUtil.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "EditorAssetLibrary.h"
+#include "AssetUtils/CreateStaticMeshUtil.h"
+
+DECLARE_STATS_GROUP(TEXT("TestTime"), STATGROUP_TestTime, STATCAT_Advanced);
+DECLARE_CYCLE_STAT(TEXT("SCTime"), STAT_SpaceColonization, STATGROUP_TestTime);
+DECLARE_CYCLE_STAT(TEXT("SCTimeMultThread"), STAT_SpaceColonizationMultThread, STATGROUP_TestTime);
+
+// ---------------------------------------------------------------------------
+// Local helpers – inlined from GeometryScriptExtraEditor to break the
+// circular module dependency (ComputeShaderGenerator ↔ GeometryScriptExtraEditor).
+// ---------------------------------------------------------------------------
+namespace VineGeneratorLocal
+{
+
+static int32 FindNearPointIteration(const TArray<FVector>& TarLocations, const FVector& SourceLocation)
+{
+	int32 Index = -1;
+	float Dist = TNumericLimits<float>::Max();
+	for (int32 i = 0; i < TarLocations.Num(); i++)
+	{
+		float TarDist = FVector::Dist(TarLocations[i], SourceLocation);
+		if (TarDist < Dist)
+		{
+			Dist = TarDist;
+			Index = i;
+		}
+	}
+	return Index;
+}
+
+static FVector CurlNoise(const FVector& Pos, FVector& Out_AddedPos, const FVector& Offset = FVector::ZeroVector, float Strength = 1.f, float Frequency = 1.f)
+{
+	FVector curl(0, 0, 0);
+	const float h = 0.001f;
+	float n, n1, a, b;
+	const float Freq = Frequency / 100.f;
+	const FVector NoisePos = (Pos + Offset) * Freq;
+	n = FMath::PerlinNoise3D(NoisePos);
+
+	n1 = FMath::PerlinNoise3D(NoisePos - FVector(0, h, 0));
+	a = (n - n1) / h;
+	n1 = FMath::PerlinNoise3D(NoisePos - FVector(0, 0, h));
+	b = (n - n1) / h;
+	curl.X = a - b;
+
+	a = (n - n1) / h;
+	n1 = FMath::PerlinNoise3D(NoisePos - FVector(h, 0, 0));
+	b = (n - n1) / h;
+	curl.Y = a - b;
+
+	a = (n - n1) / h;
+	n1 = FMath::PerlinNoise3D(NoisePos - FVector(0, h, 0));
+	b = (n - n1) / h;
+	curl.Z = a - b;
+
+	Out_AddedPos = Pos + curl * Strength;
+	return curl;
+}
+
+static UStaticMesh* SaveDynamicMeshToStaticMesh(
+	UDynamicMesh* TargetMesh,
+	const FString& AssetPathAndName,
+	UMeshComponent* MaterialSource = nullptr,
+	bool bReplaceExistingAsset = true,
+	bool bSaveAsset = false,
+	bool bMarkPackageDirty = true)
+{
+	if (!TargetMesh || TargetMesh->GetTriangleCount() == 0 || AssetPathAndName.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	const FString SanitizedAssetPathAndName = UPackageTools::SanitizePackageName(AssetPathAndName);
+	const FString AssetFolderPath = FPackageName::GetLongPackagePath(SanitizedAssetPathAndName);
+	if (!AssetFolderPath.IsEmpty())
+	{
+		UEditorAssetLibrary::MakeDirectory(AssetFolderPath);
+	}
+
+	if (bReplaceExistingAsset && UEditorAssetLibrary::DoesAssetExist(SanitizedAssetPathAndName))
+	{
+		UEditorAssetLibrary::DeleteAsset(SanitizedAssetPathAndName);
+	}
+
+	FDynamicMesh3 CopyMesh;
+	int32 NumMaterialSlots = 1;
+	TargetMesh->ProcessMesh([&](const FDynamicMesh3& ReadMesh)
+	{
+		CopyMesh = ReadMesh;
+		if (ReadMesh.HasAttributes() && ReadMesh.Attributes()->HasMaterialID())
+		{
+			const UE::Geometry::FDynamicMeshMaterialAttribute* MaterialIDs = ReadMesh.Attributes()->GetMaterialID();
+			for (const int32 TriangleID : ReadMesh.TriangleIndicesItr())
+			{
+				NumMaterialSlots = FMath::Max(NumMaterialSlots, MaterialIDs->GetValue(TriangleID) + 1);
+			}
+		}
+	});
+
+	TArray<UMaterialInterface*> Materials;
+	Materials.Reserve(NumMaterialSlots);
+	for (int32 MaterialIndex = 0; MaterialIndex < NumMaterialSlots; ++MaterialIndex)
+	{
+		Materials.Add(MaterialSource ? MaterialSource->GetMaterial(MaterialIndex) : nullptr);
+	}
+
+	UE::AssetUtils::FStaticMeshAssetOptions AssetOptions;
+	AssetOptions.NewAssetPath = SanitizedAssetPathAndName;
+	AssetOptions.NumSourceModels = 1;
+	AssetOptions.NumMaterialSlots = NumMaterialSlots;
+	AssetOptions.AssetMaterials = Materials;
+	AssetOptions.bEnableRecomputeNormals = false;
+	AssetOptions.bEnableRecomputeTangents = true;
+	AssetOptions.CollisionType = ECollisionTraceFlag::CTF_UseComplexAsSimple;
+	AssetOptions.SourceMeshes.DynamicMeshes.Add(&CopyMesh);
+
+	UE::AssetUtils::FStaticMeshResults ResultData;
+	const UE::AssetUtils::ECreateStaticMeshResult AssetResult = UE::AssetUtils::CreateStaticMeshAsset(AssetOptions, ResultData);
+	UStaticMesh* NewStaticMesh = AssetResult == UE::AssetUtils::ECreateStaticMeshResult::Ok ? ResultData.StaticMesh : nullptr;
+	if (!NewStaticMesh)
+	{
+		return nullptr;
+	}
+
+	NewStaticMesh->PostEditChange();
+	NewStaticMesh->Modify();
+	if (bMarkPackageDirty)
+	{
+		NewStaticMesh->MarkPackageDirty();
+		if (UPackage* StaticMeshPackage = NewStaticMesh->GetOutermost())
+		{
+			StaticMeshPackage->SetDirtyFlag(true);
+		}
+	}
+	FAssetRegistryModule::AssetCreated(NewStaticMesh);
+	if (bSaveAsset)
+	{
+		UEditorAssetLibrary::SaveLoadedAsset(NewStaticMesh, false);
+	}
+	return NewStaticMesh;
+}
+
+static FGeometryScriptPolyPath SmoothLine(FGeometryScriptPolyPath PolyPath, int NumIterations)
+{
+	int32 EndIdx = (PolyPath.Path.IsValid()) ? FMath::Max(PolyPath.Path->Num() - 1, 0) : 0;
+	if (PolyPath.Path.IsValid())
+	{
+		UE::Geometry::CurveUtil::IterativeSmooth<double, FVector>(*PolyPath.Path, 0, EndIdx, 1, NumIterations, false);
+	}
+	return PolyPath;
+}
+
+static FGeometryScriptPolyPath ResampleByLength(FGeometryScriptPolyPath PolyPath, float IntervalExp)
+{
+	float Sum = 0;
+	float CurrentLength = 0;
+	FGeometryScriptPolyPath ToReturn;
+	ToReturn.Reset();
+
+	float ArcLength = UE::Geometry::CurveUtil::ArcLength<float, FVector>(*PolyPath.Path, false);
+	int32 NumIterations = int32(ArcLength / IntervalExp);
+	if (NumIterations < 2)
+		return ToReturn;
+
+	float Interval = ArcLength / NumIterations;
+
+	TArray<FVector> Vertices = *PolyPath.Path;
+	TArray<FVector> PathVertices;
+	PathVertices.SetNum(NumIterations);
+	int32 PointCount = 1;
+	int32 iterat = NumIterations - 2;
+
+	if (Vertices.Num() < 1)
+	{
+		return ToReturn;
+	}
+
+	PathVertices[0] = Vertices[0];
+	Sum += FVector::Distance(Vertices[0], Vertices[1]);
+
+	FVector Dir = (Vertices[1] - Vertices[0]).GetSafeNormal(.001);
+	for (int i = 0; i < iterat; i++)
+	{
+		CurrentLength += Interval;
+		while (CurrentLength > Sum)
+		{
+			PointCount += 1;
+			Sum += FVector::Distance(Vertices[PointCount], Vertices[PointCount - 1]);
+			Dir = (Vertices[PointCount] - Vertices[PointCount - 1]).GetSafeNormal(.001);
+		}
+		FVector SamplePos = Vertices[PointCount] - Dir * (Sum - CurrentLength);
+		PathVertices[i + 1] = SamplePos;
+	}
+	PathVertices[NumIterations - 1] = Vertices[Vertices.Num() - 1];
+
+	ToReturn.Path->Append(PathVertices);
+	return ToReturn;
+}
+
+} // namespace VineGeneratorLocal
 
 #define GV_ACTOR_ENABLE_PERF_LOGS 1
 #if GV_ACTOR_ENABLE_PERF_LOGS
@@ -1273,10 +1464,10 @@ static bool PrepareVVLinesProjected(
 		}
 
 		FGeometryScriptPolyPath PreviousLine = ClonePolyPath(Line);
-		Line = UPolyLine::SmoothLine(Line, 3);
+		Line = VineGeneratorLocal::SmoothLine(Line, 3);
 		RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
 		PreviousLine = ClonePolyPath(Line);
-		Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
+		Line = VineGeneratorLocal::ResampleByLength(Line, VV.ResampleLength);
 		RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
 		if (!Line.Path.IsValid() || Line.Path->Num() < 3)
 		{
@@ -1296,14 +1487,14 @@ static bool PrepareVVLinesProjected(
 					VertexLocation = ProjectedPos;
 				}
 
-				UNoise::CurlNoise(VertexLocation, VertexLocation, FVector::ZeroVector, VV.CurlNoiseScale / 10.0f, VV.CurlNoiseFre);
+				VineGeneratorLocal::CurlNoise(VertexLocation, VertexLocation, FVector::ZeroVector, VV.CurlNoiseScale / 10.0f, VV.CurlNoiseFre);
 				const FVector NoisePos = (VV.PerlinNoiseFre / 100.0f) * VertexLocation;
 				const float OffsetNoise = VV.PerlinNoiseScale * FMath::PerlinNoise3D(NoisePos);
 				const float PerlinOffset = VV.CurveControl ? VV.CurveControl->GetUnadjustedLinearColorValue(PointIndex / double(VertexCount - 1)).R : 0.0f;
 			}
 
 			PreviousLine = ClonePolyPath(Line);
-			Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
+			Line = VineGeneratorLocal::ResampleByLength(Line, VV.ResampleLength);
 			RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
 			if (!Line.Path.IsValid() || Line.Path->Num() < 3)
 			{
@@ -1318,7 +1509,7 @@ static bool PrepareVVLinesProjected(
 
 		for (FVector& VertexLocation : *Line.Path)
 		{
-			UNoise::CurlNoise(VertexLocation, VertexLocation, FVector::ZeroVector, VV.CurlNoiseScale / 10.0f, VV.CurlNoiseFre);
+			VineGeneratorLocal::CurlNoise(VertexLocation, VertexLocation, FVector::ZeroVector, VV.CurlNoiseScale / 10.0f, VV.CurlNoiseFre);
 		}
 
 		const int32 SampleCount = FMath::Clamp(FMath::FloorToInt(float(Line.Path->Num()) * 0.8f), 0, Line.Path->Num());
@@ -1394,10 +1585,10 @@ static bool PrepareVVLinesProjected(
 		}
 
 		FGeometryScriptPolyPath PreviousLine = ClonePolyPath(Line);
-		Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
+		Line = VineGeneratorLocal::ResampleByLength(Line, VV.ResampleLength);
 		RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
 		PreviousLine = ClonePolyPath(Line);
-		Line = UPolyLine::SmoothLine(Line, 1);
+		Line = VineGeneratorLocal::SmoothLine(Line, 1);
 		RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
 
 		if (!Line.Path.IsValid() || Line.Path->Num() < 3)
@@ -1428,7 +1619,7 @@ static bool PrepareVVLinesProjected(
 		}
 
 		PreviousLine = ClonePolyPath(Line);
-		Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
+		Line = VineGeneratorLocal::ResampleByLength(Line, VV.ResampleLength);
 		RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
 		RebuildVineFrameNormalsForEditedLine(PreviousLine, Line, CurrentFrameNormals);
 		if (!Line.Path.IsValid() || Line.Path->Num() < 3)
@@ -1438,7 +1629,7 @@ static bool PrepareVVLinesProjected(
 
 		if (SafeCPUPostProjectionSmoothIterations > 0)
 		{
-			Line = UPolyLine::SmoothLine(Line, SafeCPUPostProjectionSmoothIterations);
+			Line = VineGeneratorLocal::SmoothLine(Line, SafeCPUPostProjectionSmoothIterations);
 			if (!Line.Path.IsValid() || Line.Path->Num() < 3)
 			{
 				continue;
@@ -3949,10 +4140,10 @@ bool AVineContainer::VisVineGPUInternal()
 		}
 
 		FGeometryScriptPolyPath PreviousLine = ClonePolyPath(Line);
-		Line = UPolyLine::SmoothLine(Line, 3);
+		Line = VineGeneratorLocal::SmoothLine(Line, 3);
 		RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
 		PreviousLine = ClonePolyPath(Line);
-		Line = UPolyLine::ResamppleByLength(Line, VV.ResampleLength);
+		Line = VineGeneratorLocal::ResampleByLength(Line, VV.ResampleLength);
 		RebuildVinePointScalesForEditedLine(PreviousLine, Line, FallbackScale, CurrentPointScales);
 		if (!Line.Path.IsValid() || Line.Path->Num() < 3)
 		{
@@ -4487,7 +4678,7 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result)
 			TArray<FTransform> SCSourceTransform;
 			SCSourceTransform.Add(TubeSourceTransforms[i]);
 				TArray<FSpaceColonizationLineResult> LinesFromSource = SpaceColonizationWithScales(
-					SCSourceTransform, TargetTransforms);
+					SCSourceTransform, TargetTransforms, VV.bUseGPUMode);
 			const float SourceScale = GetVineTransformScale(TubeSourceTransforms[i]);
 			for (FSpaceColonizationLineResult& LineResult : LinesFromSource)
 			{
@@ -5134,7 +5325,7 @@ void AVineContainer::SaveStaticmesh()
 	}
 	const FString AssetPathAndName = UPackageTools::SanitizePackageName(AssetFolderPath / AssetName);
 
-	UStaticMesh* NewStaticMesh = UGeometryGeneral::SaveDynamicMeshToStaticMesh(
+	UStaticMesh* NewStaticMesh = VineGeneratorLocal::SaveDynamicMeshToStaticMesh(
 		TargetMesh,
 		AssetPathAndName,
 		MeshComponent,
@@ -5243,7 +5434,7 @@ static void BuildSpaceColonizationScaleLookups(
 
 	for (const FTransform& SourceTransform : SourceTransforms)
 	{
-		const int32 NearPointIndex = UPointFunction::FindNearPointIteration(TargetLocations, SourceTransform.GetLocation());
+		const int32 NearPointIndex = VineGeneratorLocal::FindNearPointIteration(TargetLocations, SourceTransform.GetLocation());
 		if (NearPointIndex != -1)
 		{
 			OutStartSourceScales[NearPointIndex] = GetSpaceColonizationTransformScale(SourceTransform);
@@ -6514,7 +6705,7 @@ static void BuildSpaceColonizationQueueImpl(
 
 		for (const FVector& SourceLocation : SourceLocations)
 		{
-			const int32 Nearpt = UPointFunction::FindNearPointIteration(OutTargetLocations, SourceLocation);
+			const int32 Nearpt = VineGeneratorLocal::FindNearPointIteration(OutTargetLocations, SourceLocation);
 			if (Nearpt == -1)
 			{
 				continue;

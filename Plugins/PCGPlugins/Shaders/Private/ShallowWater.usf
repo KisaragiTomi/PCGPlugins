@@ -511,22 +511,12 @@ void CalShallowWaterResult_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId
 	CurrentWet = max(CurrentWet, CurrentSceneHeight + ActorLocationZ - 100);
 
 	float ResultHeight  = CurrentWater + CurrentSceneHeight;
-	float CurrentHeight = CurrentWater + CurrentSceneHeight;
 	float ResultForm    = CurrentForm;
 	float ChangeHeight  = CurrentSceneHeight - 100;
-	float SumHeight     = 0;
 	float ValidCount    = 0;
 	float HeightMin     =  999999;
-	float HeightMax     = -999999;
-	float WaterMin      = CurrentWater;
 	float WaterMax      = CurrentWater;
-	float WaterAvg      = 0;
-	float GroundMin     = CurrentSceneHeight;
-	float GroundMax     = CurrentSceneHeight;
-	float GroundAvg     = 0;
-	float FormMin       = CurrentForm;
 	float FormMax       = CurrentForm;
-	float FormAvg       = 0;
 	float WetAvg        = 0;
 	float Count         = 0;
 
@@ -536,44 +526,26 @@ void CalShallowWaterResult_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId
 		{
 			Count += 1;
 			int2 Offset = GroupThreadId.xy + int2(X, Y) + int2(GENERAL_SHAREGROUP_EXTENT, GENERAL_SHAREGROUP_EXTENT);
-			float WaterHeight = GENERAL_SHAREGROUP_NAME[Offset.x][Offset.y].x;
-			float SceneHeight = GENERAL_SHAREGROUP_NAME[Offset.x][Offset.y].y;
-			float Form        = GENERAL_SHAREGROUP_NAME[Offset.x][Offset.y].z;
-			float NeighbourHeight = WaterHeight + SceneHeight;
+			half4 SharedData = GENERAL_SHAREGROUP_NAME[Offset.x][Offset.y];
+			float WaterHeight = SharedData.x;
 
 			if (WaterHeight > 0)
 			{
-				SumHeight  += NeighbourHeight;
+				float NeighbourHeight = WaterHeight + SharedData.y;
 				ValidCount += 1;
 				HeightMin   = min(NeighbourHeight, HeightMin);
-				HeightMax   = max(NeighbourHeight, HeightMax);
-				WaterMin    = min(WaterMin, WaterHeight);
 				WaterMax    = max(WaterMax, WaterHeight);
-				WaterAvg   += WaterHeight;
-				GroundMin   = min(GroundMin, SceneHeight);
-				GroundMax   = max(GroundMax, SceneHeight);
-				GroundAvg  += SceneHeight;
-				FormMin     = min(FormMin, Form);
-				FormMax     = max(FormMax, Form);
-				FormAvg    += Form;
+				FormMax     = max(FormMax, SharedData.z);
 			}
 
-			float Wet = GENERAL_SHAREGROUP_NAME[Offset.x][Offset.y].w;
-			float MaxLerpDist = 50;
-			Wet = clamp(Wet, CurrentWet - MaxLerpDist, CurrentWet + MaxLerpDist);
+			float Wet = SharedData.w;
+			Wet = clamp(Wet, CurrentWet - 50, CurrentWet + 50);
 			Wet -= CurrentSceneHeight + ActorLocationZ;
 			WetAvg += Wet;
 		}
 	}
 
 	WetAvg /= Count;
-
-	if (ValidCount > 0)
-	{
-		WaterAvg  /= ValidCount;
-		GroundAvg /= ValidCount;
-		FormAvg   /= ValidCount;
-	}
 
 	if (CurrentWater <= 0)
 	{

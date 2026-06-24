@@ -27,7 +27,7 @@ public class ComputeShaderGenerator : ModuleRules
 		
 		PrivateIncludePaths.AddRange(
 			new string[] {
-				// ... add other private include paths required here ...
+				// ... add private include paths required here ...
 			}
 			);
 			
@@ -62,7 +62,12 @@ public class ComputeShaderGenerator : ModuleRules
 				"Foliage",
 				"MeshDescription",
 				"StaticMeshDescription",
-				// ... add private dependencies that you statically link with here ...	
+				"UnrealEd",
+				"GeometryAlgorithms",
+				"ModelingComponents",
+				"ModelingComponentsEditorOnly",
+				"AssetRegistry",
+				"EditorScriptingUtilities",
 			}
 			);
 

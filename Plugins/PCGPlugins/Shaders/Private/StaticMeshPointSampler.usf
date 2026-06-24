@@ -1172,3 +1172,194 @@ void BlurSurfaceVoxelsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	RW_BlurredVoxelTargetPositions[VoxelIndex] = float4(BlurredTarget, 1.0f);
 	RW_BlurredVoxelNormals[VoxelIndex] = float4(normalize(BlurredDir), 0.0f);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// TriangleSoupToHeightmapCS
+// Top-down orthographic rasterization of triangle soup into a depth/height
+// texture compatible with ShallowWater's T_SceneDepth convention:
+//   texel.x = CameraHeight - WorldZ
+// Uses InterlockedMin on uint-reinterpreted floats for correct max-Z.
+// ─────────────────────────────────────────────────────────────────────────
+
+RWTexture2D<uint> RW_HeightmapUint;
+
+float2 HM_BoundsMin;
+float2 HM_BoundsInvSize;
+float  HM_CameraHeight;
+int2   HM_TextureSize;
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void TriangleSoupToHeightmapCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint TriCount = RW_TriangleCounter[0];
+	uint TriIdx = DTid.x;
+	if (TriIdx >= TriCount)
+		return;
+
+	float3 V0 = RW_OutTriangleVertices[TriIdx * 3 + 0].xyz;
+	float3 V1 = RW_OutTriangleVertices[TriIdx * 3 + 1].xyz;
+	float3 V2 = RW_OutTriangleVertices[TriIdx * 3 + 2].xyz;
+
+	float2 UV0 = (V0.xy - HM_BoundsMin) * HM_BoundsInvSize;
+	float2 UV1 = (V1.xy - HM_BoundsMin) * HM_BoundsInvSize;
+	float2 UV2 = (V2.xy - HM_BoundsMin) * HM_BoundsInvSize;
+
+	int2 PxMin = max(int2(floor(min(min(UV0, UV1), UV2) * HM_TextureSize)), int2(0, 0));
+	int2 PxMax = min(int2(ceil (max(max(UV0, UV1), UV2) * HM_TextureSize)), HM_TextureSize - int2(1, 1));
+
+	float2 e0 = V1.xy - V0.xy;
+	float2 e1 = V2.xy - V0.xy;
+	float  det = e0.x * e1.y - e0.y * e1.x;
+	if (abs(det) < 1e-10f)
+		return;
+	float invDet = 1.0f / det;
+
+	for (int py = PxMin.y; py <= PxMax.y; ++py)
+	{
+		for (int px = PxMin.x; px <= PxMax.x; ++px)
+		{
+			float2 pWorld = HM_BoundsMin + (float2(px, py) + 0.5f) / float2(HM_TextureSize) / HM_BoundsInvSize;
+			float2 d = pWorld - V0.xy;
+
+			float u = (d.x * e1.y - d.y * e1.x) * invDet;
+			float v = (e0.x * d.y - e0.y * d.x) * invDet;
+			if (u < 0.0f || v < 0.0f || (u + v) > 1.0f)
+				continue;
+
+			float z = V0.z + u * (V1.z - V0.z) + v * (V2.z - V0.z);
+			float depth = HM_CameraHeight - z;
+			uint depthBits = asuint(max(depth, 0.0f));
+			InterlockedMin(RW_HeightmapUint[int2(px, py)], depthBits);
+		}
+	}
+}
+
+RWTexture2D<float4> RW_HeightmapFloat;
+Texture2D<uint> T_HeightmapUint;
+
+[numthreads(8, 8, 1)]
+void ConvertHeightmapUintToFloatCS(uint3 DTid : SV_DispatchThreadID)
+{
+	if (any(DTid.xy >= (uint2)HM_TextureSize))
+		return;
+	float depth = asfloat(T_HeightmapUint[DTid.xy]);
+	RW_HeightmapFloat[DTid.xy] = float4(depth, 0, 0, 1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Landscape RGBA8 heightmap helpers
+// RenderHeightmap outputs PF_B8G8R8A8.  Height is uint16 split: R=high, G=low.
+// ─────────────────────────────────────────────────────────────────────────
+
+Texture2D<float4> T_LandscapeRGBA;
+float LHM_CameraHeight;
+float LHM_LandscapeScaleZ;
+float LHM_LandscapeOriginZ;
+int2  LHM_TextureSize;
+
+float LHM_DecodeWorldZ(float4 rgba)
+{
+	float rawHeight = rgba.r * 255.0 * 256.0 + rgba.g * 255.0;
+	float localHeight = (rawHeight - 32768.0) / 128.0;
+	return localHeight * LHM_LandscapeScaleZ + LHM_LandscapeOriginZ;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// LandscapeG16ToDepthCS
+// ─────────────────────────────────────────────────────────────────────────
+
+[numthreads(8, 8, 1)]
+void LandscapeG16ToDepthCS(uint3 DTid : SV_DispatchThreadID)
+{
+	if (any(DTid.xy >= (uint2)LHM_TextureSize))
+		return;
+
+	float worldZ = LHM_DecodeWorldZ(T_LandscapeRGBA[DTid.xy]);
+	float depth = LHM_CameraHeight - worldZ;
+
+	float existing = RW_HeightmapFloat[DTid.xy].r;
+	RW_HeightmapFloat[DTid.xy] = float4(min(existing, depth), 0, 0, 1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// LandscapeG16ToNormalHeightCS
+// RGBA = (Normal.XYZ, WorldHeight_cm) via finite-difference normals.
+// ─────────────────────────────────────────────────────────────────────────
+
+float2 LHM_TexelWorldSize;
+uint   LHM_MergeByMaxZ;
+
+[numthreads(8, 8, 1)]
+void LandscapeG16ToNormalHeightCS(uint3 DTid : SV_DispatchThreadID)
+{
+	if (any(DTid.xy >= (uint2)LHM_TextureSize))
+		return;
+
+	int2 coord = int2(DTid.xy);
+	int2 maxCoord = LHM_TextureSize - 1;
+
+	float zC = LHM_DecodeWorldZ(T_LandscapeRGBA[coord]);
+	float zL = LHM_DecodeWorldZ(T_LandscapeRGBA[int2(max(coord.x - 1, 0), coord.y)]);
+	float zR = LHM_DecodeWorldZ(T_LandscapeRGBA[int2(min(coord.x + 1, maxCoord.x), coord.y)]);
+	float zU = LHM_DecodeWorldZ(T_LandscapeRGBA[int2(coord.x, max(coord.y - 1, 0))]);
+	float zD = LHM_DecodeWorldZ(T_LandscapeRGBA[int2(coord.x, min(coord.y + 1, maxCoord.y))]);
+
+	float dzdx = (zR - zL) / (2.0 * LHM_TexelWorldSize.x);
+	float dzdy = (zD - zU) / (2.0 * LHM_TexelWorldSize.y);
+	float3 normal = normalize(float3(-dzdx, -dzdy, 1.0));
+
+	if (LHM_MergeByMaxZ)
+	{
+		float existingZ = RW_HeightmapFloat[DTid.xy].w;
+		if (existingZ >= zC)
+			return;
+	}
+	RW_HeightmapFloat[DTid.xy] = float4(normal, zC);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// LandscapeHeightmapToTrianglesCS
+// Reads the RGBA8 landscape heightmap and emits 2 triangles (6 verts) per
+// interior texel into RW_TriangleVerts.  Each float4 = (WorldX, WorldY, WorldZ, 0).
+// Grid cell (X,Y) uses corners at (X,Y), (X+1,Y), (X,Y+1), (X+1,Y+1).
+// Dispatch with (TextureSize-1) x (TextureSize-1) threads.
+// ─────────────────────────────────────────────────────────────────────────
+
+float2 LHM_WorldOriginXY;
+RWStructuredBuffer<float4> RW_TriangleVerts;
+
+[numthreads(8, 8, 1)]
+void LandscapeHeightmapToTrianglesCS(uint3 DTid : SV_DispatchThreadID)
+{
+	int2 gridSize = LHM_TextureSize - 1;
+	if (any(DTid.xy >= (uint2)gridSize))
+		return;
+
+	int2 c00 = int2(DTid.xy);
+	int2 c10 = c00 + int2(1, 0);
+	int2 c01 = c00 + int2(0, 1);
+	int2 c11 = c00 + int2(1, 1);
+
+	float z00 = LHM_DecodeWorldZ(T_LandscapeRGBA[c00]);
+	float z10 = LHM_DecodeWorldZ(T_LandscapeRGBA[c10]);
+	float z01 = LHM_DecodeWorldZ(T_LandscapeRGBA[c01]);
+	float z11 = LHM_DecodeWorldZ(T_LandscapeRGBA[c11]);
+
+	float wx00 = LHM_WorldOriginXY.x + c00.x * LHM_TexelWorldSize.x;
+	float wy00 = LHM_WorldOriginXY.y + c00.y * LHM_TexelWorldSize.y;
+	float wx10 = wx00 + LHM_TexelWorldSize.x;
+	float wy01 = wy00 + LHM_TexelWorldSize.y;
+
+	float4 v00 = float4(wx00, wy00, z00, 0);
+	float4 v10 = float4(wx10, wy00, z10, 0);
+	float4 v01 = float4(wx00, wy01, z01, 0);
+	float4 v11 = float4(wx10, wy01, z11, 0);
+
+	uint baseIdx = (DTid.y * (uint)gridSize.x + DTid.x) * 6;
+	RW_TriangleVerts[baseIdx + 0] = v00;
+	RW_TriangleVerts[baseIdx + 1] = v10;
+	RW_TriangleVerts[baseIdx + 2] = v01;
+	RW_TriangleVerts[baseIdx + 3] = v10;
+	RW_TriangleVerts[baseIdx + 4] = v11;
+	RW_TriangleVerts[baseIdx + 5] = v01;
+}

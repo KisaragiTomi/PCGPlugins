@@ -39,9 +39,6 @@ namespace ProcessAsync
 				//FPlatformProcess::Sleep(10);
 				return ResultsPerTask;
 			}));
-			
-			float Time = FPlatformTime::Seconds();
-			UE_LOG(LogTemp, Log, TEXT("The float value is: %f"), Time);
 		}
 
 		for (const TFuture<TArray<T>>& ThreadResult : Threads)

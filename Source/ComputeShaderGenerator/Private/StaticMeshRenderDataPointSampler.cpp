@@ -188,12 +188,6 @@ uint32 GetPointHashSlotCount(int32 PointCount)
 }
 }
 
-bool FStaticMeshRenderDataPointSampler::SamplePointsSync(const TArray<FStaticMeshRenderDataPointSampleRequest>& Requests, TArray<FVector>& OutPoints)
-{
-	TArray<int32> PointsPerRequest;
-	return SamplePointsSync(Requests, OutPoints, PointsPerRequest);
-}
-
 bool FStaticMeshRenderDataPointSampler::SamplePointsSync(const TArray<FStaticMeshRenderDataPointSampleRequest>& Requests, TArray<FVector>& OutPoints, TArray<int32>& OutPointsPerRequest)
 {
 	TArray<FResolvedStaticMeshPointSampleRequest> ResolvedRequests;

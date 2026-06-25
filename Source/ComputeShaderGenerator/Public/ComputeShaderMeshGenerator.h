@@ -1,15 +1,18 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "DynamicMeshActor.h"
+#include "GameFramework/Actor.h"
 #include "Components/BoxComponent.h"
+#include "Components/DynamicMeshComponent.h"
 #include "Components/SceneComponent.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "RenderGraphBuilder.h"
 #include "UDynamicMesh.h"
+#include "ComputeShaderDebugParams.h"
 #include "ComputeShaderMeshGenerator.generated.h"
 
 class AActor;
+class ALandscape;
 class UHierarchicalInstancedStaticMeshComponent;
 class UStaticMesh;
 
@@ -91,6 +94,32 @@ public:
 	// 生成 voxel 时使用的 cell size，后续转 mesh 时可作为默认面片大小。
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	float VoxelSize = 0.0f;
+
+	// 体素整数网格坐标，与 Positions 一一对应（-1 索引为无效）。
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
+	TArray<FIntVector> Cells;
+
+	// 面积加权质心（target position），与 Positions 一一对应。用于更精确的表面匹配。
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
+	TArray<FVector> TargetPositions;
+
+	// 体素网格的世界空间原点（与 Cells 坐标系对应）。
+	// Cell (cx, cy, cz) 的世界空间中心 = VoxelOrigin + (Cell + 0.5) * VoxelSize。
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
+	FVector VoxelOrigin = FVector::ZeroVector;
+};
+
+// game-thread 预备好的盒内场景三角形数据：static mesh 已 resolve 出渲染资源引用，
+// landscape 已在 game thread 完成 CPU 提取。可安全捕获进 render 线程 lambda，再交给
+// AddPreparedBoxSceneTrianglesToRDG 消费。内部用 PImpl 隐藏 .cpp-only 的 resolved 类型。
+struct FCSBoxScenePreparedDataImpl;
+
+struct COMPUTESHADERGENERATOR_API FCSBoxScenePreparedData
+{
+	TSharedPtr<FCSBoxScenePreparedDataImpl, ESPMode::ThreadSafe> Impl;
+
+	bool IsValid() const { return Impl.IsValid(); }
+	bool HasAnyTriangles() const;
 };
 
 struct COMPUTESHADERGENERATOR_API FCSStaticMeshTriangleRDGOutput
@@ -148,6 +177,30 @@ struct COMPUTESHADERGENERATOR_API FCSSurfaceVoxelRDGOutput
 	FRDGBufferRef VoxelNormalCounts = nullptr;
 	FRDGBufferUAVRef VoxelNormalCountsUAV = nullptr;
 	FRDGBufferSRVRef VoxelNormalCountsSRV = nullptr;
+
+	// Ported from ResinRattan: target-position accumulation (clipped centroid)
+	FRDGBufferRef VoxelTargetPositions = nullptr;
+	FRDGBufferUAVRef VoxelTargetPositionsUAV = nullptr;
+	FRDGBufferSRVRef VoxelTargetPositionsSRV = nullptr;
+
+	FRDGBufferRef VoxelTargetOffsetSums = nullptr;
+	FRDGBufferUAVRef VoxelTargetOffsetSumsUAV = nullptr;
+
+	FRDGBufferRef VoxelTargetWeightSums = nullptr;
+	FRDGBufferUAVRef VoxelTargetWeightSumsUAV = nullptr;
+
+	// Integer grid cell per voxel, required for spatial blur neighbour lookup.
+	FRDGBufferRef VoxelCells = nullptr;
+	FRDGBufferUAVRef VoxelCellsUAV = nullptr;
+
+	// Blur output buffers (read when blur is enabled).
+	FRDGBufferRef BlurredVoxelNormals = nullptr;
+	FRDGBufferUAVRef BlurredVoxelNormalsUAV = nullptr;
+	FRDGBufferSRVRef BlurredVoxelNormalsSRV = nullptr;
+
+	FRDGBufferRef BlurredVoxelTargetPositions = nullptr;
+	FRDGBufferUAVRef BlurredVoxelTargetPositionsUAV = nullptr;
+	FRDGBufferSRVRef BlurredVoxelTargetPositionsSRV = nullptr;
 
 	uint32 MaxVoxels = 0;
 	uint32 HashSlotCount = 0;
@@ -223,7 +276,15 @@ struct COMPUTESHADERGENERATOR_API FCSMeshGeneratorSurfaceVoxelTextureDataHandle
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data")
 	TObjectPtr<UTextureRenderTarget2D> VoxelNormalRT = nullptr;
 
-	// Small metadata texture. Pixel 0 = counts/size, pixels 1-3 = origin/bounds/dimensions.
+	// One RGBA32f texel per sampled surface voxel. xyz = weighted surface target, w = 1.
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data")
+	TObjectPtr<UTextureRenderTarget2D> VoxelTargetRT = nullptr;
+
+	// One RGBA32f texel per sampled surface voxel. xyz = integer voxel cell encoded as floats, w = 0.
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data")
+	TObjectPtr<UTextureRenderTarget2D> VoxelCellRT = nullptr;
+
+	// Small metadata texture. Pixel 0 = counts/size, pixels 1-4 = origin/bounds/dimensions.
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data")
 	TObjectPtr<UTextureRenderTarget2D> VoxelMetaRT = nullptr;
 };
@@ -233,70 +294,22 @@ struct COMPUTESHADERGENERATOR_API FCSMeshGeneratorSurfaceVoxelTextureDataHandle
 // -----------------------------------------------------------------------------
 
 USTRUCT(BlueprintType)
-struct COMPUTESHADERGENERATOR_API FCSMeshGeneratorVoxelKey
-{
-	GENERATED_BODY()
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Voxel")
-	int32 X = 0;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Voxel")
-	int32 Y = 0;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Voxel")
-	int32 Z = 0;
-
-	FCSMeshGeneratorVoxelKey() = default;
-	FCSMeshGeneratorVoxelKey(int32 InX, int32 InY, int32 InZ)
-		: X(InX), Y(InY), Z(InZ)
-	{
-	}
-
-	explicit FCSMeshGeneratorVoxelKey(const FIntVector& InCell)
-		: X(InCell.X), Y(InCell.Y), Z(InCell.Z)
-	{
-	}
-
-	FIntVector ToIntVector() const
-	{
-		return FIntVector(X, Y, Z);
-	}
-
-	bool operator==(const FCSMeshGeneratorVoxelKey& Other) const
-	{
-		return X == Other.X && Y == Other.Y && Z == Other.Z;
-	}
-};
-
-FORCEINLINE uint32 GetTypeHash(const FCSMeshGeneratorVoxelKey& Key)
-{
-	return HashCombine(HashCombine(::GetTypeHash(Key.X), ::GetTypeHash(Key.Y)), ::GetTypeHash(Key.Z));
-}
-
-USTRUCT(BlueprintType)
 struct COMPUTESHADERGENERATOR_API FCSMeshGeneratorVoxelGridSettings
 {
 	GENERATED_BODY()
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Voxel")
 	float VoxelSize = 100.0f;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Voxel")
 	float ActivationRadius = 200.0f;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Voxel")
 	int32 MaxActiveVoxels = 4096;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	int32 MaxTrianglesPerVoxel = 256;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	int32 LODIndex = 0;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	float BoundsTolerance = 1.0f;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	int32 MaxCacheTextureDimension = 4096;
 };
 
@@ -305,16 +318,12 @@ struct COMPUTESHADERGENERATOR_API FCSMeshGeneratorTriangleCacheRequest
 {
 	GENERATED_BODY()
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Triangle Cache")
 	FName RequestId = NAME_None;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Triangle Cache")
 	bool bForceFullRebuild = false;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Triangle Cache")
 	float ActivationRadiusOverride = 0.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Triangle Cache")
 	bool bPersistentInterest = true;
 
 	TArray<FVector> CachedReferencePoints;
@@ -325,34 +334,24 @@ struct COMPUTESHADERGENERATOR_API FCSMeshGeneratorTriangleCacheHandle
 {
 	GENERATED_BODY()
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	bool bValid = false;
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	int32 CacheGeneration = 0;
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	FBox CachedWorldBounds = FBox(ForceInit);
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	FIntVector GridSize = FIntVector::ZeroValue;
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	float VoxelSize = 0.0f;
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	int32 ActiveVoxelCount = 0;
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	int32 DirtyVoxelCount = 0;
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	TObjectPtr<UTextureRenderTarget2D> VoxelMetaRT = nullptr;
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	TObjectPtr<UTextureRenderTarget2D> TriangleVertexRT = nullptr;
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	TObjectPtr<UTextureRenderTarget2D> TriangleNormalRT = nullptr;
 };
 
@@ -370,11 +369,11 @@ struct COMPUTESHADERGENERATOR_API FCSMeshGeneratorVoxelCacheState
 	int32 CachedMaxTextureDimension = 0;
 	uint32 CacheGeneration = 0;
 
-	TSet<FCSMeshGeneratorVoxelKey> ActiveCells;
-	TSet<FCSMeshGeneratorVoxelKey> CellsToActivate;
-	TSet<FCSMeshGeneratorVoxelKey> CellsToDeactivate;
-	TSet<FCSMeshGeneratorVoxelKey> DirtyCells;
-	TMap<FCSMeshGeneratorVoxelKey, int32> CellToPage;
+	TSet<FIntVector> ActiveCells;
+	TSet<FIntVector> CellsToActivate;
+	TSet<FIntVector> CellsToDeactivate;
+	TSet<FIntVector> DirtyCells;
+	TMap<FIntVector, int32> CellToPage;
 	TArray<int32> FreePages;
 };
 
@@ -387,15 +386,13 @@ struct COMPUTESHADERGENERATOR_API FCSInstancePaintComponentSlot
 {
 	GENERATED_BODY()
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Instance Brush")
 	TObjectPtr<UStaticMesh> Mesh = nullptr;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Instance Brush")
 	TObjectPtr<UHierarchicalInstancedStaticMeshComponent> Component = nullptr;
 };
 
 UCLASS(Blueprintable)
-class COMPUTESHADERGENERATOR_API AComputeShaderMeshGenerator : public ADynamicMeshActor
+class COMPUTESHADERGENERATOR_API AComputeShaderMeshGenerator : public AActor
 {
 	GENERATED_BODY()
 
@@ -403,12 +400,18 @@ public:
 	/** Creates the generator actor, scene root, bounds component, and DynamicMesh rendering defaults. */
 	AComputeShaderMeshGenerator(const FObjectInitializer& ObjectInitializer);
 
+	/** Returns the DynamicMeshComponent owned by this actor. */
+	UDynamicMeshComponent* GetDynamicMeshComponent() const { return DynamicMeshComponent; }
+
 	// -------------------------------------------------------------------------
 	// Core System
 	// -------------------------------------------------------------------------
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator")
 	TObjectPtr<USceneComponent> SceneRoot;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator")
+	TObjectPtr<UDynamicMeshComponent> DynamicMeshComponent;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator")
 	TObjectPtr<UBoxComponent> GeneratorBounds;
@@ -421,20 +424,14 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Reference Filter")
 	TArray<FVector> ReferencePoints;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Scene Filter")
-	FName ExcludedActorTag = TEXT("UA");
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Scene Filter")
+	TArray<FName> ExcludedActorTags = { TEXT("UA"), TEXT("UN") };
 
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
 	int32 MaxTriangles = 20000000;
 
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
 	int32 MaxVoxels = 2000000;
-
-	// Per-triangle surface voxelization budget. This is intended to limit how many
-	// voxel cells one large triangle may scan when VoxelSize is small; MaxVoxels is
-	// the separate total output capacity.
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
-	int32 MaxVoxelCellsPerTriangle = 4096;
 
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "0.001"))
 	float QuadScale = 1.0f;
@@ -446,16 +443,25 @@ public:
 	float DynamicMeshCullBoundsScale = 10.0f;
 
 	// -------------------------------------------------------------------------
+	// Surface Voxel Blur — ResinRattan port
+	// -------------------------------------------------------------------------
+
+	/** Number of 3D mean-filter iterations applied after voxelization. 0 = disabled. */
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "0"))
+	int32 SurfaceVoxelBlurIterations = 0;
+
+	/** Neighbourhood radius for the 3D mean filter. 1 = 3x3x3 Moore neighbourhood. */
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
+	int32 SurfaceVoxelBlurRadius = 1;
+
+	// -------------------------------------------------------------------------
 	// Dirty Cache System
 	// -------------------------------------------------------------------------
 
-	UPROPERTY(Transient, BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	TObjectPtr<UTextureRenderTarget2D> VoxelMetaRT;
 
-	UPROPERTY(Transient, BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	TObjectPtr<UTextureRenderTarget2D> TriangleVertexRT;
 
-	UPROPERTY(Transient, BlueprintReadOnly, Category = "CS Mesh Generator|Triangle Cache")
 	TObjectPtr<UTextureRenderTarget2D> TriangleNormalRT;
 
 	// -------------------------------------------------------------------------
@@ -474,7 +480,11 @@ public:
 
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data|Debug")
 	FCSSurfaceVoxelData LastSurfaceVoxelData;
-	
+
+	/** Triangle surface data used by the CPU/BVH vine visualization path.
+	 *  Filled by GenerateVines(). */
+	FCSTriangleMeshData CachedSurfaceTriangles;
+
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Mesh|Debug")
 	int64 GeneratorTimeCode = -1;
 
@@ -484,43 +494,30 @@ public:
 
 	static FCSInstanceBrushEditorRequest OnInstanceBrushEditorRequest;
 
-	UPROPERTY( BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush")
 	TObjectPtr<UStaticMesh> InstanceBrushMesh = nullptr;
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "1.0", UIMin = "1.0"))
 	float InstanceBrushRadius = 500.0f;
 
-	UPROPERTY( BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "1"))
 	int32 InstanceBrushSamplesPerMouseMove = 16;
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float InstanceBrushMinSpacing = 100.0f;
 
-	UPROPERTY( BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float InstanceBrushTraceRadius = 0.0f;
 
-	UPROPERTY( BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.1", UIMin = "0.1"))
 	float InstanceBrushPreviewPointSize = 8.0f;
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.01", UIMin = "0.01"))
 	float InstanceBrushPreviewLifetime = 0.1f;
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush")
 	bool bInstanceBrushAlignToNormal = true;
 
-	UPROPERTY( BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush")
 	bool bInstanceBrushUseGeneratorBounds = true;
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush")
 	bool bInstanceBrushExitAfterCommit = false;
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.001", UIMin = "0.001"))
 	FVector2D InstanceBrushUniformScaleRange = FVector2D(1.0f, 1.0f);
 
-	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float InstanceBrushRandomYawDegrees = 360.0f;
 
-	UPROPERTY( BlueprintReadOnly, Category = "CS Mesh Generator|Instance Brush")
 	TArray<FCSInstancePaintComponentSlot> PaintedInstanceComponents;
 
 	/** Opens the editor-side instance brush tool for this generator. */
@@ -547,43 +544,145 @@ public:
 	// Core System - Scene Extraction and Mesh Output
 	// -------------------------------------------------------------------------
 
-	/** Builds static-mesh triangle extraction requests from explicit actors, optionally culling by expanded reference bounds. */
-	void BuildActorSceneTriangleRequests(TArray<AActor*> InActors,
-		TArray<FCSStaticMeshTriangleRequest>& OutRequests,
-		float BoundsExpand = 0.0f);
-
-	/** Builds static-mesh triangle extraction requests for actors intersecting QueryBox in World. */
 	void BuildBoxSceneTriangleRequests(UWorld* World,
 		const FBox& QueryBox,
 		TArray<FCSStaticMeshTriangleRequest>& OutRequests);
 
-	/** Adds RDG compute passes that extract scene static-mesh triangles into GPU buffers. */
-	FCSStaticMeshTriangleRDGOutput AddStaticMeshTrianglesToRDG(
+	/** [game thread] 用 FLandscapeComponentDataInterface 在 CPU 端把 QueryBox 内的 landscape 高度场
+	 *  提取成 triangle-soup（世界坐标，已按上朝向定向），暂存进 OutTriangleData，供后续 RDG 流程作为
+	 *  initial triangle 上传。必须在 game thread 调用（CDI 构造强制 game thread）。普通 static mesh 不走
+	 *  这里，仍用本 class 的 GPU resolve 流程。InReferencePoints 非空且 InReferenceFilterDistance > 0 时，
+	 *  按到参考点的距离做 CPU 粗筛；否则保留盒内全部三角形。MaxTriangles == 0 时直接返回空。 */
+	static void BuildBoxSceneLandscapeTriangles(UWorld* World,
+		const FBox& QueryBox,
+		const TArray<FVector>& InReferencePoints,
+		float InReferenceFilterDistance,
+		int32 MaxTriangles,
+		FCSTriangleMeshData& OutTriangleData);
+
+	/** Extended overload with OBB filtering and actor-tag culling. When WorldToLocalBoxTransform
+	 *  is non-null each triangle is additionally tested against the OBB defined by
+	 *  (*WorldToLocalBoxTransform, *LocalBoxExtent). RequiredActorTag != NAME_None restricts to
+	 *  landscape proxies that carry that tag. bSortComponentsByDistance sorts components closest
+	 *  to the box center first (useful when MaxTriangles may truncate results). */
+	static void BuildBoxSceneLandscapeTriangles(UWorld* World,
+		const FBox& QueryBox,
+		const TArray<FVector>& InReferencePoints,
+		float InReferenceFilterDistance,
+		int32 MaxTriangles,
+		FCSTriangleMeshData& OutTriangleData,
+		const FTransform* WorldToLocalBoxTransform,
+		const FVector* LocalBoxExtent,
+		FName RequiredActorTag = NAME_None,
+		bool bSortComponentsByDistance = true);
+
+	/** [game thread] 枚举 QueryBox 内的 static mesh + landscape，完成 static mesh 渲染资源 resolve
+	 *  与 landscape CPU 三角形提取，返回可安全捕获进 render 线程 lambda 的预备数据。
+	 *  必须在 game thread 调用（触碰 UObject / FLandscapeComponentDataInterface）。
+	 *  RequiredActorTag != NAME_None 时，仅保留带该 Tag 的 Actor 的 static mesh（landscape 始终包含）。 */
+	FCSBoxScenePreparedData PrepareBoxSceneTriangles(
+		UWorld* World,
+		const FBox& QueryBox,
+		int32 InMaxTriangles = -1,
+		const TArray<FVector>& InReferencePoints = TArray<FVector>(),
+		float InReferenceFilterDistance = 0.0f,
+		FName RequiredActorTag = NAME_None);
+
+	/** [render thread] 消费 PrepareBoxSceneTriangles 的预备数据，在 GraphBuilder 上建出 triangle-soup
+	 *  buffer。只做 RHI/RDG 操作，不触碰 UObject，可安全在 ENQUEUE_RENDER_COMMAND lambda 内调用。 */
+	FCSStaticMeshTriangleRDGOutput AddPreparedBoxSceneTrianglesToRDG(
 		FRDGBuilder& GraphBuilder,
 		FRHICommandListImmediate& RHICmdList,
-		const TArray<FCSStaticMeshTriangleRequest>& Requests,
-		float ReferenceFilterDistance = 200.0f,
-		const TCHAR* DebugName = TEXT("CS.StaticMeshTriangles"),
-		bool bNaniteOnlyFallbackMesh = true);
+		const FCSBoxScenePreparedData& Prepared,
+		const TCHAR* DebugName = TEXT("CS.BoxSceneTriangles"));
 
-	/** Adds RDG compute passes that voxelize extracted triangle surfaces into GPU voxel buffers. */
-	FCSSurfaceVoxelRDGOutput AddTriangleSurfaceVoxelsToRDG(
-		FRDGBuilder& GraphBuilder,
-		const FCSStaticMeshTriangleRDGOutput& TriangleOutput,
-		FVector VoxelOrigin,
-		float VoxelSize = 10.0f,
-		int32 HashSlotCount = 0,
-		const TCHAR* DebugName = TEXT("CS.SurfaceVoxels"));
-
-
-	/** Reads all scene triangles inside the generator bounds back from the GPU without reference-point filtering. */
-	FCSTriangleMeshData GetBoxSceneTrianglesFromGPU();
-
-	/** Reads scene triangles inside the generator bounds back from the GPU, optionally filtering near ReferencePoints. */
+	/** Reads back box-scene triangles into a CPU FCSTriangleMeshData by dispatching
+	 *  AddBoxSceneTrianglesToRDG on the render thread and copying the GPU triangle-soup buffer back.
+	 *  ReferenceFilterDistance <= 0 (or empty ReferencePoints) keeps all triangles in the generator
+	 *  bounds; otherwise triangles are GPU-filtered by distance to this actor's ReferencePoints.
+	 *  Also refreshes LastTriangleTextureData. Blocks via FlushRenderingCommands. */
 	FCSTriangleMeshData GetBoxSceneTrianglesFromGPUFiltered(float ReferenceFilterDistance = 200.0f);
 
-	/** Voxelizes all scene triangles inside the generator bounds and reads positions/normals back from the GPU. */
-	FCSSurfaceVoxelData GetBoxSceneSurfaceVoxelsFromGPU(float VoxelSize = 10.0f);
+	/** Rasterizes a GPU triangle soup into a 2D heightmap via top-down orthographic projection.
+	 *  Output format matches SceneCapture depth: texel.x = CameraHeight - WorldZ.
+	 *  Runs entirely within the supplied FRDGBuilder; must be called on the render thread. */
+	void RasterizeTriangleSoupToHeightmapRDG(
+		FRDGBuilder& GraphBuilder,
+		const FCSStaticMeshTriangleRDGOutput& TriangleOutput,
+		FRDGTextureRef OutputHeightmap,
+		const FBox& WorldBounds,
+		float CameraHeight);
+
+	/** Converts an ALandscape::RenderHeightmap G16 output into the depth format (CameraHeight - WorldZ)
+	 *  and merges it into an existing OutputHeightmap using min (higher terrain wins).
+	 *  Runs entirely within the supplied FRDGBuilder; must be called on the render thread. */
+	void ConvertLandscapeHeightmapToDepthRDG(
+		FRDGBuilder& GraphBuilder,
+		FRDGTextureRef LandscapeG16Texture,
+		FRDGTextureRef OutputHeightmap,
+		float CameraHeight,
+		float LandscapeScaleZ,
+		float LandscapeOriginZ);
+
+	/** Captures the landscape heightmap using GeneratorBounds as the capture area.
+	 *  bOutputWorldHeight=true  → RGBA16f with RGB=Normal, A=WorldZ (cm)
+	 *  bOutputWorldHeight=false → Depth from CameraHeight (R channel)
+	 *  If OutRT is null, auto-creates a temporary RT and draws DrawDebugPoint.
+	 *  Iterates ALL ALandscape actors; supports multi-landscape merge and World Partition.
+	 *  @param OutRT Output render target (null for debug mode)
+	 *  @param bOutputWorldHeight true=Normal+WorldZ, false=Depth */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Heightmap")
+	bool CaptureLandscapeHeightmap(UTextureRenderTarget2D* OutRT, bool bOutputWorldHeight = true);
+
+	/** Explicit-parameter overload for CaptureLandscapeHeightmap(Depth mode).
+	 *  Iterates ALL ALandscape actors and min-merges (highest terrain wins). */
+	bool CaptureLandscapeHeightmapToDepth(
+		FVector WorldCenter,
+		float CaptureExtent,
+		float CameraHeight,
+		UTextureRenderTarget2D* OutDepthRT);
+
+	/** Converts an ALandscape::RenderHeightmap G16 output into Normal+Height format
+	 *  (RGBA: Normal.XYZ, WorldHeight_cm) via finite-difference normals.
+	 *  When bMergeByMaxZ is true, only overwrites texels where the new worldZ exceeds the
+	 *  existing .w value — used to composite multiple landscapes (output must be pre-cleared
+	 *  with .w = -large for correct results).
+	 *  Runs entirely within the supplied FRDGBuilder; must be called on the render thread. */
+	void ConvertLandscapeHeightmapToNormalHeightRDG(
+		FRDGBuilder& GraphBuilder,
+		FRDGTextureRef LandscapeG16Texture,
+		FRDGTextureRef OutputNormalHeight,
+		float LandscapeScaleZ,
+		float LandscapeOriginZ,
+		FVector2f TexelWorldSize,
+		bool bMergeByMaxZ = false);
+
+	/** Explicit-parameter overload for CaptureLandscapeHeightmap(WorldHeight mode). */
+	bool CaptureLandscapeHeightmapGPU(
+		FVector WorldCenter,
+		float CaptureExtent,
+		UTextureRenderTarget2D* OutNormalHeightRT);
+
+	/** GPU triangle extraction from landscape heightmap.
+	 *  Renders the landscape heightmap in GeneratorBounds, then a compute shader converts
+	 *  each texel into 2 triangles (6 world-space vertices) in a StructuredBuffer.
+	 *  Returns readback vertex data as FCSTriangleMeshData.
+	 *  @param TextureSize Resolution of the intermediate heightmap (default 128) */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Heightmap")
+	FCSTriangleMeshData CaptureLandscapeTrianglesGPU(int32 TextureSize = 128);
+
+	/** Static utility: renders a landscape heightmap via ALandscape::RenderHeightmap (GPU)
+	 *  and converts to Normal+Height (RGB=Normal, A=WorldHeight_cm) in the given RT.
+	 *  Does NOT require an AComputeShaderMeshGenerator instance.
+	 *  @param Landscape The landscape actor to capture
+	 *  @param WorldCenter Center of the capture area
+	 *  @param WorldExtentXY Half-size of the capture area (only XY used)
+	 *  @param OutNormalHeightRT Output render target (RGBA16f/RGBA32f, bCanCreateUAV=true) */
+	static bool RenderLandscapeToNormalHeightRT(
+		ALandscape* Landscape,
+		FVector WorldCenter,
+		FVector WorldExtentXY,
+		UTextureRenderTarget2D* OutNormalHeightRT);
 
 	/** Converts the latest bounded scene surface voxels into an open quad-strip DynamicMesh. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh")
@@ -617,13 +716,19 @@ public:
 		TArray<FVector>& OutPositions,
 		TArray<FVector>& OutNormals);
 
+	/** Synchronously voxelizes the bounded scene surface and reads the voxels back to the CPU by
+	 *  running the RDG surface-voxel pass on the render thread and blocking via FlushRenderingCommands.
+	 *  Keeps all triangles within the generator bounds (no reference-point filtering). Refreshes the
+	 *  cached LastSurfaceVoxelData / LastSurfaceVoxelTextureData and returns the sanitized voxel data. */
+	FCSSurfaceVoxelData ReadbackBoxSceneSurfaceVoxelsSync(float VoxelSize, const TCHAR* DebugName = nullptr);
+
 	/** Returns the handle for the most recently stored triangle texture data. */
 	UFUNCTION(BlueprintPure, Category = "CS Mesh Generator|Generated Data")
-	FCSMeshGeneratorTriangleTextureDataHandle GetLastTriangleTextureData() const;
+	FCSMeshGeneratorTriangleTextureDataHandle GetLastTriangleTextureData() const { return LastTriangleTextureData; }
 
 	/** Returns the handle for the most recently stored surface-voxel texture data. */
 	UFUNCTION(BlueprintPure, Category = "CS Mesh Generator|Generated Data")
-	FCSMeshGeneratorSurfaceVoxelTextureDataHandle GetLastSurfaceVoxelTextureData() const;
+	FCSMeshGeneratorSurfaceVoxelTextureDataHandle GetLastSurfaceVoxelTextureData() const { return LastSurfaceVoxelTextureData; }
 
 	/** Rebuilds triangle data for the generator bounds and stores it in transient render targets. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data")
@@ -649,67 +754,23 @@ public:
 	/** Draws debug direction lines and optional points from the last cached surface-voxel data. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug", meta = (DevelopmentOnly))
 	int32 DrawDebugLastSurfaceVoxelDirections(
-		float DirectionLength = 0.0f,
-		FLinearColor DirectionColor = FLinearColor::Blue,
-		float Duration = 5.0f,
-		float Thickness = 2.0f,
-		bool bPersistentLines = false,
-		bool bDrawPoints = true,
-		FLinearColor PointColor = FLinearColor::Yellow,
-		float PointSize = 8.0f,
-		int32 MaxDirectionsToDraw = 0) const;
-
-	/** Draws debug arrows and optional points from the last cached surface-voxel data. */
-	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug", meta = (DevelopmentOnly, DisplayName = "Draw Debug Last Surface Voxel Arrows"))
-	int32 DrawDebugLastSurfaceVoxelArrows(
-		float ArrowLength = 0.0f,
-		FLinearColor ArrowColor = FLinearColor::Blue,
-		float Duration = 5.0f,
-		float Thickness = 2.0f,
-		bool bPersistentLines = false,
-		bool bDrawPoints = true,
-		FLinearColor PointColor = FLinearColor::Yellow,
-		float PointSize = 8.0f,
-		int32 MaxArrowsToDraw = 0) const;
+		const FCSDebugLastVoxelDirectionOptions& Options = FCSDebugLastVoxelDirectionOptions()) const;
 
 	/** Regenerates bounded scene surface voxels and draws their normals as debug direction lines. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug", meta = (DevelopmentOnly))
 	int32 DrawDebugBoxSceneSurfaceVoxelDirections(
-		float VoxelSize = 10.0f,
-		float DirectionLength = 0.0f,
-		FLinearColor DirectionColor = FLinearColor::Blue,
-		float Duration = 5.0f,
-		float Thickness = 2.0f,
-		bool bPersistentLines = false,
-		bool bDrawPoints = true,
-		FLinearColor PointColor = FLinearColor::Yellow,
-		float PointSize = 8.0f,
-		int32 MaxDirectionsToDraw = 0);
-
-	/** Regenerates bounded scene surface voxels and draws their normals as debug arrows. */
-	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug", meta = (DevelopmentOnly, DisplayName = "Draw Debug Box Scene Surface Voxel Arrows"))
-	int32 DrawDebugBoxSceneSurfaceVoxelArrows(
-		float VoxelSize = 10.0f,
-		float ArrowLength = 0.0f,
-		FLinearColor ArrowColor = FLinearColor::Blue,
-		float Duration = 5.0f,
-		float Thickness = 2.0f,
-		bool bPersistentLines = false,
-		bool bDrawPoints = true,
-		FLinearColor PointColor = FLinearColor::Yellow,
-		float PointSize = 8.0f,
-		int32 MaxArrowsToDraw = 0);
+		const FCSDebugBoxVoxelDirectionOptions& Options);
 
 	/** Draws active cache voxel cells, optionally limited to one request and including the cache bounds. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Triangle Cache|Debug", meta = (DevelopmentOnly))
 	int32 DrawDebugActiveVoxels(
-		FName RequestId = NAME_None,
-		FLinearColor DebugColor = FLinearColor::Green,
-		float Duration = 5.0f,
-		float Thickness = 2.0f,
-		bool bPersistentLines = false,
-		bool bDrawCacheBounds = true,
-		int32 MaxVoxelsToDraw = 0) const;
+		const FCSDebugActiveVoxelOptions& Options = FCSDebugActiveVoxelOptions()) const;
+
+	/** Spawns a temporary ADynamicMeshActor at this actor's location,
+	 *  converts CachedSurfaceTriangles into a DynamicMesh,
+	 *  and destroys the actor after LifetimeSeconds. */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Debug", meta = (DevelopmentOnly, DisplayName = "Spawn Debug Surface Triangles DynamicMesh Actor"))
+	void SpawnDebugSurfaceTrianglesDynamicMeshActor(float LifetimeSeconds = 10.0f);
 
 	// -------------------------------------------------------------------------
 	// Core System - Dynamic Mesh Helpers
@@ -766,7 +827,7 @@ public:
 
 	/** Returns the world-space bounds currently covered by the triangle cache. */
 	UFUNCTION(BlueprintPure, Category = "CS Mesh Generator|Triangle Cache")
-	FBox GetCachedWorldBounds() const;
+	FBox GetCachedWorldBounds() const { return CacheState.CachedWorldBounds; }
 
 protected:
 	// -------------------------------------------------------------------------
@@ -803,17 +864,17 @@ protected:
 	/** Reinitializes cache state, render targets, and page mappings for the supplied world bounds. */
 	virtual void RebuildCacheResources(const FBox& InputWorldBounds);
 	/** Builds active cache cells around this actor's ReferencePoints using ActivationRadius. */
-	virtual void BuildActiveCellsFromReferencePoints(float ActivationRadius, TSet<FCSMeshGeneratorVoxelKey>& OutCells) const;
+	virtual void BuildActiveCellsFromReferencePoints(float ActivationRadius, TSet<FIntVector>& OutCells) const;
 	/** Builds active cache cells around the supplied reference points using ActivationRadius. */
-	virtual void BuildActiveCellsFromReferencePoints(const TArray<FVector>& InReferencePoints, float ActivationRadius, TSet<FCSMeshGeneratorVoxelKey>& OutCells) const;
+	virtual void BuildActiveCellsFromReferencePoints(const TArray<FVector>& InReferencePoints, float ActivationRadius, TSet<FIntVector>& OutCells) const;
 	/** Combines all persistent request cell sets into one active-cell set. */
-	virtual void BuildUnionActiveCells(TSet<FCSMeshGeneratorVoxelKey>& OutCells) const;
+	virtual void BuildUnionActiveCells(TSet<FIntVector>& OutCells) const;
 	/** Computes cells to activate/deactivate by comparing NewActiveCells against the current cache state. */
-	virtual void DiffActiveCells(const TSet<FCSMeshGeneratorVoxelKey>& NewActiveCells);
+	virtual void DiffActiveCells(const TSet<FIntVector>& NewActiveCells);
 	/** Assigns free cache texture pages to newly active cells. */
-	virtual void AllocatePagesForCells(const TSet<FCSMeshGeneratorVoxelKey>& Cells);
+	virtual void AllocatePagesForCells(const TSet<FIntVector>& Cells);
 	/** Frees cache texture pages for cells that are no longer active. */
-	virtual void ReleasePagesForCells(const TSet<FCSMeshGeneratorVoxelKey>& Cells);
+	virtual void ReleasePagesForCells(const TSet<FIntVector>& Cells);
 	/** Queues render-thread compute work to rewrite triangle-cache pages marked dirty. */
 	virtual void DispatchDirtyVoxelTriangleCacheUpdate();
 
@@ -822,9 +883,9 @@ protected:
 	/** Computes the integer voxel-grid dimensions needed to cover InputWorldBounds. */
 	FIntVector ComputeGridSize(const FBox& InputWorldBounds) const;
 	/** Converts a world position into a clamped cache voxel key. */
-	FCSMeshGeneratorVoxelKey WorldPositionToCell(FVector WorldPosition) const;
+	FIntVector WorldPositionToCell(FVector WorldPosition) const;
 	/** Returns the world-space bounds for a single cache voxel cell. */
-	FBox GetCellWorldBounds(const FCSMeshGeneratorVoxelKey& Cell) const;
+	FBox GetCellWorldBounds(const FIntVector& Cell) const;
 	/** Releases transient render targets used by the triangle cache. */
 	void ReleaseCacheResources();
 	/** Clears runtime cache state and optionally removes persistent cache requests. */
@@ -834,7 +895,7 @@ protected:
 	/** Allocates UAV-capable render targets sized for cache metadata, triangle vertices, and triangle normals. */
 	void CreateCacheRenderTargets();
 	/** Stores CPU triangle data into generated-data texture targets and updates LastTriangleTextureData. */
-	void StoreTriangleTextureData(const FCSTriangleMeshData& TriangleData, float ReferenceFilterDistance);
+	void StoreTriangleTextureData(const FCSTriangleMeshData& TriangleData, float ReferenceFilterDistance, FBox SourceWorldBounds = FBox(ForceInit));
 	/** Stores CPU surface-voxel data into generated-data texture targets and updates LastSurfaceVoxelTextureData. */
 	void StoreSurfaceVoxelTextureData(const FCSSurfaceVoxelData& SurfaceVoxelData, FVector VoxelOrigin);
 	/** Releases triangle generated-data textures and invalidates the triangle data handle. */
@@ -852,9 +913,8 @@ protected:
 	/** Converts NAME_None into the class default cache request id. */
 	FName NormalizeRequestId(FName RequestId) const;
 
-	UPROPERTY(Transient)
 	FCSMeshGeneratorVoxelCacheState CacheState;
 
-	TMap<FName, TSet<FCSMeshGeneratorVoxelKey>> RequestActiveCells;
+	TMap<FName, TSet<FIntVector>> RequestActiveCells;
 	TMap<FName, FCSMeshGeneratorTriangleCacheRequest> LastRequests;
 };

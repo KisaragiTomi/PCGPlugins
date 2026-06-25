@@ -1,0 +1,43 @@
+#ifndef VINE_FRAME_COMMON_USH
+#define VINE_FRAME_COMMON_USH
+
+#include "/Plugin/PCGPlugins/Shaders/Private/PCGMathCommon.ush"
+
+uint GetLinePointIndex(uint PointIndex, int Offset)
+{
+	int4 Meta = PathPointMeta[PointIndex];
+	int BaseIndex = max(Meta.z, 0);
+	int PointCount = max(Meta.w, 1);
+	int LastIndex = min(BaseIndex + PointCount - 1, int(PathPointCount) - 1);
+	return (uint)min(max(int(PointIndex) + Offset, BaseIndex), LastIndex);
+}
+
+float3 GetFallbackFrameNormal(float3 Tangent)
+{
+	float3 Up = abs(Tangent.z) < 0.9f ? float3(0.0f, 0.0f, 1.0f) : float3(0.0f, 1.0f, 0.0f);
+	return SafeNormalize3(Up - Tangent * dot(Up, Tangent), float3(0.0f, 1.0f, 0.0f));
+}
+
+float3 OrientAxisToReference(float3 Axis, float3 Reference)
+{
+	return dot(Axis, Reference) < 0.0f ? -Axis : Axis;
+}
+
+float3 BuildFrameNormalFromTangent(float3 Tangent, float3 Normal)
+{
+	float3 FallbackNormal = GetFallbackFrameNormal(Tangent);
+	return SafeNormalize3(Normal - Tangent * dot(Normal, Tangent), FallbackNormal);
+}
+
+void BuildOrthonormalFrame(float3 Tangent, float3 Normal, out float3 OutTangent, out float3 OutNormal, out float3 OutBinormal)
+{
+	OutTangent = SafeNormalize3(Tangent, float3(1.0f, 0.0f, 0.0f));
+	OutNormal = BuildFrameNormalFromTangent(OutTangent, Normal);
+	OutBinormal = cross(OutNormal, OutTangent);
+	if (dot(OutBinormal, OutBinormal) <= 1.0e-8f)
+		OutBinormal = cross(GetFallbackFrameNormal(OutTangent), OutTangent);
+	OutBinormal = SafeNormalize3(OutBinormal, float3(0.0f, 1.0f, 0.0f));
+	OutNormal = SafeNormalize3(cross(OutTangent, OutBinormal), OutNormal);
+}
+
+#endif // VINE_FRAME_COMMON_USH

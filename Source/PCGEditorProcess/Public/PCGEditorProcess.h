@@ -5,8 +5,10 @@
 #include "CoreMinimal.h"
 #include "Delegates/Delegate.h"
 #include "Modules/ModuleManager.h"
+#include "ComputeShaderDebugParams.h"
 
 class AComputeShaderMeshGenerator;
+class AGPUSkeletalTree;
 class FVineContainerViewportOverlay;
 
 class FPCGEditorProcessModule : public IModuleInterface
@@ -20,6 +22,7 @@ public:
 private:
 	void InitializeEditorUI();
 	void StartInstanceBrush(AComputeShaderMeshGenerator* TargetActor);
+	void GenerateGPUSkeletalTree(AGPUSkeletalTree* TargetActor);
 
 	FDelegateHandle PostEngineInitHandle;
 	TUniquePtr<FVineContainerViewportOverlay> VineContainerViewportOverlay;

@@ -1081,7 +1081,7 @@ void UGeometryGeneral::WeldVertices(FDynamicMesh3& EditMesh, float Tolerance)
 		
 		 			FailedCount++;
 		 		}
-		 		else 
+		 		else
 		 		{
 		 			// ok we merged, other edge is no longer free
 		 			bMerged = true;
@@ -1115,7 +1115,7 @@ void UGeometryGeneral::WeldVertices(FDynamicMesh3& EditMesh, float Tolerance)
 			 EquivalenceSets[eid] = nullptr;
 			 RemainingEdges.Remove(eid);
 		}
-		else 
+		else
 		{
 			// should we do something else here? doesn't make sense to put
 			// back into Q, as it should be at the top, right?
@@ -1385,7 +1385,7 @@ template<typename ReduceDatatype, typename  ComponentType>
 TMap<int, ReduceDatatype> UGeometryGeneral::FindNearestComponents(FDynamicMesh3& EditMesh, FGeometryScriptDynamicMeshBVH BVH, TMap<int, ComponentType> ComponentDatas)
 {
 	TMap<int, ReduceDatatype> ReduceComponentMap;
-	if(!EditMesh.Attributes()->HasAttachedAttribute(FName("TI_Class"))) return ReduceComponentMap;
+	if (!EditMesh.Attributes()->HasAttachedAttribute(FName("TI_Class"))) return ReduceComponentMap;
 		
 	for (TPair<int, ComponentType> ComponentData :  ComponentDatas)
 	{

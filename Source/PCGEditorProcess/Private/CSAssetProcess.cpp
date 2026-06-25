@@ -10,6 +10,7 @@
 #include "RenderGraphResources.h"
 #include "RenderGraphUtils.h"
 #include "RenderGraphBuilder.h"
+#include "RHIGPUReadback.h"
 #include "RenderTargetPool.h"
 #include "ComputeShaderGenerateHepler.h"
 #include "EngineUtils.h"
@@ -43,6 +44,8 @@
 #include "Runtime/Experimental/Voronoi/Private/voro++/src/container.hh"
 #include "Subsystems/EditorAssetSubsystem.h"
 #include "MeshDescription.h"
+#include "DrawDebugHelpers.h"
+#include "Engine/World.h"
 #include "StaticMeshAttributes.h"
 
 
@@ -402,46 +405,34 @@ UMaterialInstance* UCSAssetProcess::FindOrDuplicateMaterialInstanceAsset(FString
 	return OutMaterialInstance;
 }
 
-//This function has a bug
 UMaterialInstance* UCSAssetProcess::FindOrCreateMaterialInstanceAsset(FString AssetName, FString AssetFolderPath, UMaterialInterface* Parent)
 {
-	FString AssetPath = AssetFolderPath + "/" + AssetName;
-	UMaterialInstance* OutMaterialInstance = FindOrCreateAsset<UMaterialInstance>(AssetName, AssetFolderPath,[&]()
+	if (!Parent) return nullptr;
+
+	FString AssetPath = AssetFolderPath / AssetName;
+
+	if (UEditorAssetLibrary::DoesAssetExist(AssetPath))
 	{
-		IAssetTools &AssetTools = FModuleManager::GetModuleChecked<FAssetToolsModule>("AssetTools").Get();
-		UObject* NewObject = AssetTools.CreateAsset(AssetName, AssetFolderPath, UMaterialInstance::StaticClass(), nullptr);
-		UMaterialInstance* NewMaterialInstance = Cast<UMaterialInstance>(NewObject);
-		// UMaterialInstanceConstant* NewMaterialInstance = FMaterialUtilities::CreateInstancedMaterial(Parent, CreatePackage( *AssetPath), AssetName, RF_Public | RF_Standalone);
-		NewMaterialInstance->InitStaticPermutation();
+		UObject* Existing = UEditorAssetLibrary::LoadAsset(AssetPath);
+		UMaterialInstanceConstant* ExistingMIC = Cast<UMaterialInstanceConstant>(Existing);
+		if (ExistingMIC)
+		{
+			UMaterialEditingLibrary::SetMaterialInstanceParent(ExistingMIC, Parent);
+			return ExistingMIC;
+		}
+		UEditorAssetLibrary::DeleteAsset(AssetPath);
+	}
 
-		NewMaterialInstance->PostEditChange();
+	UPackage* Package = CreatePackage(*AssetPath);
+	UMaterialInstanceConstant* NewMIC = NewObject<UMaterialInstanceConstant>(
+		Package, *AssetName, RF_Public | RF_Standalone);
+	NewMIC->SetParentEditorOnly(Parent);
+	NewMIC->PostEditChange();
 
-		return NewMaterialInstance;
-	});
-	UMaterialInterface* NewInterface =  OutMaterialInstance;
-	
-	UMaterialInstanceConstant* Constant = Cast<UMaterialInstanceConstant>(OutMaterialInstance);
-	UMaterialEditingLibrary::SetMaterialInstanceParent(Constant, Parent);
-	
-	return OutMaterialInstance;;
-}
+	FAssetRegistryModule::AssetCreated(NewMIC);
+	NewMIC->MarkPackageDirty();
 
-void UCSAssetProcess::GetDistanceToNearestSurface(UTextureRenderTarget2D* InDebugView)
-{
-	FEditorViewportClient* EditorViewportClient = StaticCast<FEditorViewportClient*>(GEditor->GetActiveViewport()->GetClient());
-	FViewport* Viewport = EditorViewportClient->Viewport;
-	FSceneViewFamilyContext ViewFamily(FSceneViewFamily::ConstructionValues(Viewport, EditorViewportClient->GetScene(), EditorViewportClient->EngineShowFlags));
-	// ViewFamily.viewinf
-	// FSceneRenderer
-	FSceneView* SceneView = EditorViewportClient->CalcSceneView(&ViewFamily);
-	SceneView->Family->GetSceneRenderer()->GetSceneUniforms();
-	// FScene* Scene;
-	// // FDistanceFieldSceneData& DFData = Scene->DistanceFieldSceneData;
-	// Scene->GetRenderScene();
-	
-	// SceneView
-	// SceneView->bIsViewInfo
-	UComputeShaderBasicFunction::CalDistanceToNearestSurface(SceneView, InDebugView);
+	return NewMIC;
 }
 
 void UCSAssetProcess::CreateDebugTexture(AActor* TargetActor, UTextureRenderTarget2D* InDebugView, FString DebugName)
@@ -565,31 +556,4 @@ void UCSAssetProcess::DisplaceMeshByRTBlueChannel(
 
 	UE_LOG(LogTemp, Log, TEXT("DisplaceMeshByRTBlueChannel: Displaced %d verts, wrote vertex colors on '%s'."),
 		NumVertexInstances, *InStaticMesh->GetName());
-}
-
-void UCSAssetProcess::SampleGlobalDistanceField(
-	UObject* WorldContextObject,
-	const TArray<FVector>& WorldPositions,
-	TArray<float>& OutDistances,
-	TArray<FVector>& OutGradients)
-{
-	OutDistances.Reset();
-	OutGradients.Reset();
-	if (!WorldContextObject || WorldPositions.IsEmpty()) return;
-
-#if WITH_EDITOR
-	FEditorViewportClient* EditorViewportClient = StaticCast<FEditorViewportClient*>(
-		GEditor->GetActiveViewport()->GetClient());
-	if (!EditorViewportClient) return;
-
-	FViewport* Viewport = EditorViewportClient->Viewport;
-	FSceneViewFamilyContext ViewFamily(
-		FSceneViewFamily::ConstructionValues(
-			Viewport, EditorViewportClient->GetScene(), EditorViewportClient->EngineShowFlags));
-	FSceneView* SceneView = EditorViewportClient->CalcSceneView(&ViewFamily);
-	if (!SceneView) return;
-
-	UComputeShaderBasicFunction::SampleGlobalDistanceFieldAtPositions(
-		SceneView, WorldPositions, OutDistances, OutGradients);
-#endif
 }

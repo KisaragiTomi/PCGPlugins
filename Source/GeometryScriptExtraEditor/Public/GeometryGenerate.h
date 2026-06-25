@@ -3,15 +3,10 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "DynamicMeshActor.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "GeometryScript/GeometryScriptTypes.h"
-#include "LandscapeComponent.h"
 #include "UDynamicMesh.h"
-#include "Components/InstancedStaticMeshComponent.h"
 #include "ComputeShaderMeshGenerator.h"
-#include "GeometryEditorActor.h"
-#include "Curves/CurveLinearColor.h"
 
 #include "GeometryGenerate.generated.h"
 

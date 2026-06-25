@@ -5,6 +5,7 @@
 #include "ComputeShaderGenerateHepler.h"
 #include "ComputeShaderGeneral.h"
 #include "ComputeShaderBasicFunction.h"
+#include "ComputeShaderMeshGenerator.h"
 #include "LandscapeExtra.h"
 #include "Kismet/KismetRenderingLibrary.h"
 #include "Kismet/GameplayStatics.h"
@@ -118,6 +119,8 @@ void ACSLandscapeLayer::OnConstruction(const FTransform& Transform)
 
 void ACSLandscapeLayer::InitRT()
 {
+	if (RT_OrigLandscapeData == nullptr)
+		RT_OrigLandscapeData = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor::Black, true, false);
 	if (RT_LayerAlpha == nullptr)
 		RT_LayerAlpha = UKismetRenderingLibrary::CreateRenderTarget2D(this, 256, 256, ETextureRenderTargetFormat::RTF_RGBA32f, FLinearColor::Black, true, false);
 	if (RT_LayerGeneratedHeight == nullptr)
@@ -130,36 +133,40 @@ void ACSLandscapeLayer::InitRT()
 
 void ACSLandscapeLayer::ReadLandscapeDataToTexture()
 {
-	if (!RT_LayerBlendResult) return;
+	if (!RT_LayerBlendResult || !RT_OrigLandscapeData) return;
+
+	ALandscape* Landscape = FindLandscape();
+	if (!Landscape || !Box) return;
 
 	FVector Center = Box->Bounds.Origin;
 	FVector Extent = Box->Bounds.BoxExtent;
-	FReadLandscapeData LandscapeData;
-	ULandscapeExtra::CreateLandscapeTextureData(LandscapeData, Center, Extent);
-	if (LandscapeData.TextureSize.X + LandscapeData.TextureSize.Y < 32) return;
 
-	RT_LayerBlendResult->ResizeTarget(LandscapeData.TextureSize.X, LandscapeData.TextureSize.Y);
-	RT_LayerAlpha->ResizeTarget(LandscapeData.TextureSize.X, LandscapeData.TextureSize.Y);
-	RT_LayerGeneratedHeight->ResizeTarget(LandscapeData.TextureSize.X, LandscapeData.TextureSize.Y);
-	RT_DebugView->ResizeTarget(LandscapeData.TextureSize.X, LandscapeData.TextureSize.Y);
+	if (!AComputeShaderMeshGenerator::RenderLandscapeToNormalHeightRT(
+		Landscape, Center, Extent, RT_OrigLandscapeData))
+	{
+		return;
+	}
 
-	FVector TextureMin = Center - Extent;
-	FVector TextureMax = Center + Extent;
-	FVector Range = LandscapeData.MapMax - LandscapeData.MapMin + FVector(0, 0, 1);
-	FVector MinUV = (TextureMin - LandscapeData.MapMin) / Range;
-	FVector MaxUV = (TextureMax - LandscapeData.MapMin) / Range;
+	int32 TexW = RT_OrigLandscapeData->SizeX;
+	int32 TexH = RT_OrigLandscapeData->SizeY;
+	RT_LayerBlendResult->ResizeTarget(TexW, TexH);
+	RT_LayerAlpha->ResizeTarget(TexW, TexH);
+	RT_LayerGeneratedHeight->ResizeTarget(TexW, TexH);
+	RT_DebugView->ResizeTarget(TexW, TexH);
 
-	LandscapeTexMinUV = MinUV;
-	LandscapeTexUVRange = MaxUV - MinUV;
-	MapMin = LandscapeData.MapMin;
-	MapMax = LandscapeData.MapMax;
-	Orig_LandscapeData = LandscapeData;
+	LandscapeTexMinUV = FVector::ZeroVector;
+	LandscapeTexUVRange = FVector(1, 1, 0);
+	MapMin = Center - Extent;
+	MapMax = Center + Extent;
 }
 
 void ACSLandscapeLayer::GenerateLayerAlphaAndHeight()
 {
+	if (!RT_LayerAlpha || !RT_LayerGeneratedHeight || !RT_OrigLandscapeData) return;
+
 	FTextureRenderTargetResource* R_Alpha = RT_LayerAlpha->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_Height = RT_LayerGeneratedHeight->GameThread_GetRenderTargetResource();
+	FTextureRenderTargetResource* R_OrigData = RT_OrigLandscapeData->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_Debug = RT_DebugView->GameThread_GetRenderTargetResource();
 
 	FVector Center = Box->Bounds.Origin;
@@ -174,15 +181,13 @@ void ACSLandscapeLayer::GenerateLayerAlphaAndHeight()
 	const float CapturedNoiseAmplitude = NoiseAmplitude;
 
 	ENQUEUE_RENDER_COMMAND(GenerateLayerAlphaHeight)(
-	[R_Alpha, R_Height, R_Debug, Center, Extent, CapturedLandscapeTexMinUV, CapturedLandscapeTexUVRange,
+	[R_Alpha, R_Height, R_OrigData, R_Debug, Center, Extent, CapturedLandscapeTexMinUV, CapturedLandscapeTexUVRange,
 	 CapturedGlobalAlpha, CapturedHeightModStrength, CapturedNormalStrength, CapturedFalloffWidth,
 	 CapturedNoiseFrequency, CapturedNoiseAmplitude](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
 		{
 			FIntPoint TextureSize = R_Alpha->GetSizeXY();
-
-			FCSLandscapeLayer::FParameters* PassParameters = GraphBuilder.AllocParameters<FCSLandscapeLayer::FParameters>();
 			FIntVector GroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(TextureSize.X, TextureSize.Y, 1), 32);
 
 			FRDGTextureRef TmpRDG_Alpha = nullptr;
@@ -197,53 +202,57 @@ void ACSLandscapeLayer::GenerateLayerAlphaAndHeight()
 			FRDGTextureUAVRef RDGUAV_Debug = nullptr;
 			ConvertToUVATextureFormat(GraphBuilder, TmpRDG_Debug, RDGUAV_Debug, TextureSize, PF_FloatRGBA, TEXT("UAV_Debug"));
 
-			PassParameters->RW_LayerAlpha = RDGUAV_Alpha;
-			PassParameters->RW_LayerGeneratedHeight = RDGUAV_Height;
-			PassParameters->RW_DebugView = RDGUAV_Debug;
+			FRDGTextureRef RDG_OrigData = RegisterExternalTexture(GraphBuilder, R_OrigData->GetRenderTargetTexture(), TEXT("R_OrigLandscapeData"));
+
+			auto FillCommonParams = [&](FCSLandscapeLayer::FParameters* Params)
 			{
 				auto UVEnd = CapturedLandscapeTexMinUV + CapturedLandscapeTexUVRange;
-				PassParameters->ValidUVRange = FVector4f(
+				Params->ValidUVRange = FVector4f(
 					static_cast<float>(CapturedLandscapeTexMinUV.X), static_cast<float>(CapturedLandscapeTexMinUV.Y),
 					static_cast<float>(UVEnd.X), static_cast<float>(UVEnd.Y));
-			}
-			PassParameters->GlobalAlpha = CapturedGlobalAlpha;
-			PassParameters->HeightModStrength = CapturedHeightModStrength;
-			PassParameters->NormalStrength = CapturedNormalStrength;
-			PassParameters->FalloffWidth = CapturedFalloffWidth;
-			PassParameters->NoiseFrequency = CapturedNoiseFrequency;
-			PassParameters->NoiseAmplitude = CapturedNoiseAmplitude;
-			PassParameters->BoxOrigin = FVector3f(Center);
-			PassParameters->BoxExtent = FVector3f(Extent);
-			PassParameters->Sampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
+				Params->GlobalAlpha = CapturedGlobalAlpha;
+				Params->HeightModStrength = CapturedHeightModStrength;
+				Params->NormalStrength = CapturedNormalStrength;
+				Params->FalloffWidth = CapturedFalloffWidth;
+				Params->NoiseFrequency = CapturedNoiseFrequency;
+				Params->NoiseAmplitude = CapturedNoiseAmplitude;
+				Params->BoxOrigin = FVector3f(Center);
+				Params->BoxExtent = FVector3f(Extent);
+				Params->Sampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
+			};
 
 			{
-				TShaderMapRef<FCSLandscapeLayer> ComputeShader_GenAlpha(FCSLandscapeLayer::CreatePermutation(FCSLandscapeLayer::ELandscapeLayerFunction::L_GenerateLayerAlpha));
-				PassParameters->RW_LayerAlpha = RDGUAV_Alpha;
-				PassParameters->RW_LayerGeneratedHeight = nullptr;
-				PassParameters->RW_DebugView = nullptr;
+				FCSLandscapeLayer::FParameters* AlphaParams = GraphBuilder.AllocParameters<FCSLandscapeLayer::FParameters>();
+				FillCommonParams(AlphaParams);
+				AlphaParams->RW_LayerAlpha = RDGUAV_Alpha;
+
+				TShaderMapRef<FCSLandscapeLayer> CS_GenAlpha(FCSLandscapeLayer::CreatePermutation(FCSLandscapeLayer::ELandscapeLayerFunction::L_GenerateLayerAlpha));
 				GraphBuilder.AddPass(
 					RDG_EVENT_NAME("GenerateLayerAlpha"),
-					PassParameters,
+					AlphaParams,
 					ERDGPassFlags::AsyncCompute,
-					[PassParameters, ComputeShader_GenAlpha, GroupCount](FRHIComputeCommandList& RHICmdList)
+					[AlphaParams, CS_GenAlpha, GroupCount](FRHIComputeCommandList& RHICmdList)
 					{
-						FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_GenAlpha, *PassParameters, GroupCount);
+						FComputeShaderUtils::Dispatch(RHICmdList, CS_GenAlpha, *AlphaParams, GroupCount);
 					});
 				AddCopyTexturePass(GraphBuilder, TmpRDG_Alpha, RegisterExternalTexture(GraphBuilder, R_Alpha->GetRenderTargetTexture(), TEXT("R_Alpha")), FRHICopyTextureInfo());
 			}
 
 			{
-				TShaderMapRef<FCSLandscapeLayer> ComputeShader_GenHeight(FCSLandscapeLayer::CreatePermutation(FCSLandscapeLayer::ELandscapeLayerFunction::L_GenerateLayerHeight));
-				PassParameters->RW_LayerAlpha = nullptr;
-				PassParameters->RW_LayerGeneratedHeight = RDGUAV_Height;
-				PassParameters->RW_DebugView = RDGUAV_Debug;
+				FCSLandscapeLayer::FParameters* HeightParams = GraphBuilder.AllocParameters<FCSLandscapeLayer::FParameters>();
+				FillCommonParams(HeightParams);
+				HeightParams->T_OrigLandscapeData = RDG_OrigData;
+				HeightParams->RW_LayerGeneratedHeight = RDGUAV_Height;
+				HeightParams->RW_DebugView = RDGUAV_Debug;
+
+				TShaderMapRef<FCSLandscapeLayer> CS_GenHeight(FCSLandscapeLayer::CreatePermutation(FCSLandscapeLayer::ELandscapeLayerFunction::L_GenerateLayerHeight));
 				GraphBuilder.AddPass(
 					RDG_EVENT_NAME("GenerateLayerHeight"),
-					PassParameters,
+					HeightParams,
 					ERDGPassFlags::AsyncCompute,
-					[PassParameters, ComputeShader_GenHeight, GroupCount](FRHIComputeCommandList& RHICmdList)
+					[HeightParams, CS_GenHeight, GroupCount](FRHIComputeCommandList& RHICmdList)
 					{
-						FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_GenHeight, *PassParameters, GroupCount);
+						FComputeShaderUtils::Dispatch(RHICmdList, CS_GenHeight, *HeightParams, GroupCount);
 					});
 				AddCopyTexturePass(GraphBuilder, TmpRDG_Height, RegisterExternalTexture(GraphBuilder, R_Height->GetRenderTargetTexture(), TEXT("R_Height")), FRHICopyTextureInfo());
 				AddCopyTexturePass(GraphBuilder, TmpRDG_Debug, RegisterExternalTexture(GraphBuilder, R_Debug->GetRenderTargetTexture(), TEXT("R_Debug")), FRHICopyTextureInfo());
@@ -256,31 +265,34 @@ void ACSLandscapeLayer::GenerateLayerAlphaAndHeight()
 
 void ACSLandscapeLayer::BlendLayerWithAlpha()
 {
-	FTextureRenderTargetResource* R_Orig = RT_LayerBlendResult->GameThread_GetRenderTargetResource();
-	FTextureRenderTargetResource* R_Alpha = RT_LayerAlpha->GameThread_GetRenderTargetResource();
+	if (!RT_LayerBlendResult || !RT_OrigLandscapeData || !RT_LayerGeneratedHeight) return;
+
+	FTextureRenderTargetResource* R_BlendResult = RT_LayerBlendResult->GameThread_GetRenderTargetResource();
+	FTextureRenderTargetResource* R_OrigData = RT_OrigLandscapeData->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_Height = RT_LayerGeneratedHeight->GameThread_GetRenderTargetResource();
 	FTextureRenderTargetResource* R_Debug = RT_DebugView->GameThread_GetRenderTargetResource();
 
-	FReadLandscapeData LandscapeData;
-	FVector Center = Box->Bounds.Origin;
-	FVector Extent = Box->Bounds.BoxExtent;
-	ULandscapeExtra::CreateLandscapeTextureData(LandscapeData, Center, Extent);
-	if (LandscapeData.TextureSize.X + LandscapeData.TextureSize.Y < 32) return;
-	Orig_LandscapeData = LandscapeData;
 	const FVector CapturedLandscapeTexMinUV = LandscapeTexMinUV;
 	const FVector CapturedLandscapeTexUVRange = LandscapeTexUVRange;
 	const float CapturedGlobalAlpha = GlobalAlpha;
 	const float CapturedHeightModStrength = HeightModStrength;
 	const float CapturedNormalStrength = NormalStrength;
-	const ELandscapeLayerBlendMode CapturedBlendMode = BlendMode;
+	const ECSLandscapeBlendMode CapturedBlendMode = BlendMode;
+	FTextureRHIRef CapturedMaterialBlendRHI = nullptr;
+	if (MaterialBlendTexture)
+	{
+		if (FTextureResource* MatRes = MaterialBlendTexture->GetResource())
+			CapturedMaterialBlendRHI = MatRes->GetTextureRHI();
+	}
 
 	ENQUEUE_RENDER_COMMAND(BlendLayerAlpha)(
-	[R_Orig, R_Alpha, R_Height, R_Debug, CapturedLandscapeTexMinUV, CapturedLandscapeTexUVRange,
-	 CapturedGlobalAlpha, CapturedHeightModStrength, CapturedNormalStrength, CapturedBlendMode](FRHICommandListImmediate& RHICmdList)
+	[R_BlendResult, R_OrigData, R_Height, R_Debug, CapturedLandscapeTexMinUV, CapturedLandscapeTexUVRange,
+	 CapturedGlobalAlpha, CapturedHeightModStrength, CapturedNormalStrength, CapturedBlendMode,
+	 CapturedMaterialBlendRHI](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
 		{
-			FIntPoint TextureSize = R_Orig->GetSizeXY();
+			FIntPoint TextureSize = R_BlendResult->GetSizeXY();
 
 			FCSLandscapeLayer::FParameters* PassParameters = GraphBuilder.AllocParameters<FCSLandscapeLayer::FParameters>();
 			FIntVector GroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(TextureSize.X, TextureSize.Y, 1), 32);
@@ -293,12 +305,11 @@ void ACSLandscapeLayer::BlendLayerWithAlpha()
 			FRDGTextureUAVRef RDGUAV_Debug = nullptr;
 			ConvertToUVATextureFormat(GraphBuilder, TmpRDG_Debug, RDGUAV_Debug, TextureSize, PF_FloatRGBA, TEXT("UAV_Debug"));
 
-			FRDGTextureRef RDG_Orig = RegisterExternalTexture(GraphBuilder, R_Orig->GetRenderTargetTexture(), TEXT("R_Orig"));
-			FRDGTextureRef RDG_Alpha = RegisterExternalTexture(GraphBuilder, R_Alpha->GetRenderTargetTexture(), TEXT("R_Alpha"));
+			FRDGTextureRef RDG_OrigData = RegisterExternalTexture(GraphBuilder, R_OrigData->GetRenderTargetTexture(), TEXT("R_OrigLandscapeData"));
 			FRDGTextureRef RDG_Height = RegisterExternalTexture(GraphBuilder, R_Height->GetRenderTargetTexture(), TEXT("R_Height"));
 
-			PassParameters->T_OrigLandscapeData = RDG_Orig;
-			PassParameters->T_MaterialBlendTexture = RDG_Alpha;
+			PassParameters->T_OrigLandscapeData = RDG_OrigData;
+			PassParameters->T_AlphaTexture = RDG_Height;
 			PassParameters->RW_LayerBlendResult = RDGUAV_Result;
 			PassParameters->RW_DebugView = RDGUAV_Debug;
 			{
@@ -310,10 +321,17 @@ void ACSLandscapeLayer::BlendLayerWithAlpha()
 			PassParameters->GlobalAlpha = CapturedGlobalAlpha;
 			PassParameters->HeightModStrength = CapturedHeightModStrength;
 			PassParameters->NormalStrength = CapturedNormalStrength;
+			PassParameters->FalloffWidth = 500.0f;
 			PassParameters->Sampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
 
+			if (CapturedBlendMode == ECSLandscapeBlendMode::MaterialDrive && CapturedMaterialBlendRHI.IsValid())
+			{
+				PassParameters->T_MaterialBlendTexture = RegisterExternalTexture(GraphBuilder,
+					CapturedMaterialBlendRHI, TEXT("R_MaterialBlend"), ERDGTextureFlags::None);
+			}
+
 			TShaderMapRef<FCSLandscapeLayer> ComputeShader_Blend = FCSLandscapeLayer::CreatePermutation(
-				CapturedBlendMode == ELandscapeLayerBlendMode::MaterialDrive
+				CapturedBlendMode == ECSLandscapeBlendMode::MaterialDrive
 					? FCSLandscapeLayer::ELandscapeLayerFunction::L_BlendMaterialDrive
 					: FCSLandscapeLayer::ELandscapeLayerFunction::L_BlendAlpha);
 
@@ -325,7 +343,7 @@ void ACSLandscapeLayer::BlendLayerWithAlpha()
 				{
 					FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader_Blend, *PassParameters, GroupCount);
 				});
-			AddCopyTexturePass(GraphBuilder, TmpRDG_Result, RegisterExternalTexture(GraphBuilder, R_Orig->GetRenderTargetTexture(), TEXT("R_Result")), FRHICopyTextureInfo());
+			AddCopyTexturePass(GraphBuilder, TmpRDG_Result, RegisterExternalTexture(GraphBuilder, R_BlendResult->GetRenderTargetTexture(), TEXT("R_BlendResult")), FRHICopyTextureInfo());
 			AddCopyTexturePass(GraphBuilder, TmpRDG_Debug, RegisterExternalTexture(GraphBuilder, R_Debug->GetRenderTargetTexture(), TEXT("R_Debug")), FRHICopyTextureInfo());
 		}
 		GraphBuilder.Execute();
@@ -335,192 +353,44 @@ void ACSLandscapeLayer::BlendLayerWithAlpha()
 
 void ACSLandscapeLayer::CreateLandscapeLayer()
 {
-	ALandscape* Landscape = FindLandscape();
-	if (!Landscape)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("ACSLandscapeLayer: No Landscape found in world."));
-		return;
-	}
-
-	if (!LayerMaterial)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("ACSLandscapeLayer: LayerMaterial is not set."));
-		return;
-	}
-
-	if (bLayerCreated)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("ACSLandscapeLayer: Layer already created. Call RemoveLandscapeLayer first."));
-		return;
-	}
-
-	FName UsedLayerName = LayerName;
-	if (UsedLayerName.IsNone())
-	{
-		int32 ExistingCount = Landscape->GetLayersConst().Num();
-		UsedLayerName = FName(*FString::Printf(TEXT("PCG_TempLayer_%d"), ExistingCount));
-	}
-
-	int32 NewLayerIndex = Landscape->CreateLayer(UsedLayerName);
-	if (NewLayerIndex != INDEX_NONE)
-	{
-		const FLandscapeLayer* NewLayer = Landscape->GetLayerConst(NewLayerIndex);
-		if (NewLayer && NewLayer->EditLayer)
-		{
-			LayerGuid = NewLayer->EditLayer->GetGuid();
-		}
-		LayerIndex = NewLayerIndex;
-		bLayerCreated = true;
-
-		UE_LOG(LogTemp, Log, TEXT("ACSLandscapeLayer: Created layer '%s' at index %d, Guid: %s"),
-			*UsedLayerName.ToString(), LayerIndex, *LayerGuid.ToString());
-	}
+	EnsureEditLayer();
 }
 
 void ACSLandscapeLayer::RemoveLandscapeLayer()
 {
-	if (!bLayerCreated) return;
-
-	ALandscape* Landscape = FindLandscape();
-	if (!Landscape) return;
-
-	Landscape->DeleteLayer(LayerIndex);
-	bLayerCreated = false;
-	LayerGuid = FGuid();
-	LayerIndex = -1;
-
-	UE_LOG(LogTemp, Log, TEXT("ACSLandscapeLayer: Removed layer at index %d"), LayerIndex + 1);
+	RemoveEditLayer();
 }
 
 void ACSLandscapeLayer::ApplyBlendedLayerToLandscape()
 {
 	if (RT_LayerBlendResult == nullptr) return;
-	bHasLayerResult = true;
+	bHasResult = true;
 	RequestLandscapeUpdate(true);
 }
 
 void ACSLandscapeLayer::CommitToLandscape()
 {
 #if WITH_EDITOR
-	if (RT_LayerBlendResult == nullptr || !bHasLayerResult) return;
+	if (RT_LayerBlendResult == nullptr || !bHasResult) return;
 
-	ALandscape* Landscape = FindLandscape();
-	if (!Landscape) return;
-
-	if (!bLayerCreated)
-	{
-		CreateLandscapeLayer();
-	}
-
-	FLandscapeEditDataInterface LandscapeEdit(Landscape->GetLandscapeInfo());
-	LandscapeEdit.SetShouldDirtyPackage(true);
-
-	FReadLandscapeData LandscapeData;
+	FCSReadLandscapeData LandscapeData;
 	FVector Center = Box->Bounds.Origin;
 	FVector Extent = Box->Bounds.BoxExtent;
 	ULandscapeExtra::CreateLandscapeTextureData(LandscapeData, Center, Extent);
-	if (LandscapeData.TextureSize.X + LandscapeData.TextureSize.Y < 32) return;
 
-	int32 XNum = RT_LayerBlendResult->SizeX;
-	TArray<FLinearColor> ResultColors;
-	UKismetRenderingLibrary::ReadRenderTargetRaw(this, RT_LayerBlendResult, ResultColors, false);
+	BakeResultToLandscape(RT_LayerBlendResult, LandscapeData, /*bClearLayerFirst*/ true, /*bWriteAlphaBlendAndFlags*/ true);
 
-	TArray<uint16> HeightData;
-	TArray<uint16> HeightAlphaBlendData;
-	TArray<uint8> HeightFlagsData;
-	HeightData.Reserve(LandscapeData.TextureValidSize.X * LandscapeData.TextureValidSize.Y);
-	HeightAlphaBlendData.Reserve(LandscapeData.TextureValidSize.X * LandscapeData.TextureValidSize.Y);
-	HeightFlagsData.Reserve(LandscapeData.TextureValidSize.X * LandscapeData.TextureValidSize.Y);
-
-	float LandscapeScaleZ = Landscape->GetActorScale3D().Z;
-	for (int32 Y = 0; Y < LandscapeData.TextureValidSize.Y; Y++)
-	{
-		for (int32 X = 0; X < LandscapeData.TextureValidSize.X; X++)
-		{
-			float ResultHeight = ResultColors[X + Y * XNum].A / LandscapeScaleZ;
-			HeightAlphaBlendData.Add(0);
-			HeightFlagsData.Add(0);
-			HeightData.Add(LandscapeDataAccess::GetTexHeight(ResultHeight));
-		}
-	}
-
-	const FLandscapeLayer* Layer = Landscape->GetLayerConst(LayerIndex >= 0 ? LayerIndex : 0);
-	FGuid TargetLayerGuid = Layer ? Layer->EditLayer->GetGuid() : FGuid();
-
-	Landscape->ClearEditLayer(LayerIndex >= 0 ? LayerIndex : 0, nullptr, ELandscapeToolTargetTypeFlags::Heightmap);
-	FScopedSetLandscapeEditingLayer Scope(Landscape, TargetLayerGuid,
-		[=] { Landscape->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_All); });
-
-	LandscapeEdit.SetHeightData(
-		LandscapeData.ReadRange.X, LandscapeData.ReadRange.Y,
-		LandscapeData.ReadRange.Z, LandscapeData.ReadRange.W,
-		(uint16*)HeightData.GetData(), 0, true, nullptr,
-		(uint16*)HeightAlphaBlendData.GetData(), (uint8*)HeightFlagsData.GetData());
-
-	bHasLayerResult = false;
-#endif
-}
-
-ALandscape* ACSLandscapeLayer::FindLandscape() const
-{
-	if (!GetWorld()) return nullptr;
-	for (TActorIterator<ALandscape> It(GetWorld()); It; ++It)
-	{
-		return *It;
-	}
-	return nullptr;
-}
-
-void ACSLandscapeLayer::RequestLandscapeUpdate(bool bInUserTriggered)
-{
-#if WITH_EDITOR
-	ALandscape* Landscape = FindLandscape();
-	if (Landscape)
-	{
-		Landscape->RequestLayersContentUpdateForceAll(ELandscapeLayerUpdateMode::Update_All, bInUserTriggered);
-	}
+	bHasResult = false;
 #endif
 }
 
 #if WITH_EDITOR
-
-FString ACSLandscapeLayer::GetEditLayerRendererDebugName() const
-{
-	return FString::Printf(TEXT("ACSLandscapeLayer_%s"), *GetName());
-}
-
-void ACSLandscapeLayer::GetRendererStateInfo(
-	const UE::Landscape::EditLayers::FMergeContext* InMergeContext,
-	UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutSupportedTargetTypeState,
-	UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutEnabledTargetTypeState,
-	TArray<UE::Landscape::EditLayers::FTargetLayerGroup>& OutTargetLayerGroups) const
-{
-	OutSupportedTargetTypeState.AddTargetTypeMask(ELandscapeToolTargetTypeFlags::Heightmap);
-	if (bHasLayerResult)
-	{
-		OutEnabledTargetTypeState.AddTargetTypeMask(ELandscapeToolTargetTypeFlags::Heightmap);
-	}
-}
-
-TArray<UE::Landscape::EditLayers::FEditLayerRenderItem> ACSLandscapeLayer::GetRenderItems(
-	const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const
-{
-	using namespace UE::Landscape::EditLayers;
-	FEditLayerTargetTypeState EnabledState(InMergeContext, ELandscapeToolTargetTypeFlags::Heightmap);
-	return { FEditLayerRenderItem(EnabledState, FInputWorldArea::CreateInfinite(), FOutputWorldArea::CreateLocalComponent(), false) };
-}
-
-UE::Landscape::EditLayers::ERenderFlags ACSLandscapeLayer::GetRenderFlags(
-	const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const
-{
-	return UE::Landscape::EditLayers::ERenderFlags::RenderMode_Immediate;
-}
 
 bool ACSLandscapeLayer::RenderLayer(
 	UE::Landscape::EditLayers::FRenderParams& RenderParams,
 	UE::Landscape::FRDGBuilderRecorder& RDGBuilderRecorder)
 {
-	if (!bHasLayerResult || !RT_LayerBlendResult) return false;
+	if (!bHasResult || !RT_LayerBlendResult) return false;
 	if (!RenderParams.MergeRenderContext->IsHeightmapMerge()) return false;
 
 	RenderParams.MergeRenderContext->CycleBlendRenderTargets(RDGBuilderRecorder);
@@ -539,7 +409,7 @@ bool ACSLandscapeLayer::RenderLayer(
 void ACSLandscapeLayer::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
 	Super::PostEditChangeProperty(PropertyChangedEvent);
-	if (bHasLayerResult)
+	if (bHasResult)
 	{
 		RequestLandscapeUpdate(true);
 	}

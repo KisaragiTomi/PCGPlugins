@@ -17,4 +17,9 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "General|Timer", meta = (WorldContext = "WorldContextObject"))
 	static void StopSolverTimer(UObject* WorldContextObject, UPARAM(ref) FTimerHandle& Handle);
+
+	/** Move the editor viewport camera to Location and load nearby Data Layers within RadiusCm.
+	 *  Returns the number of Data Layers made visible. Editor-only. */
+	UFUNCTION(BlueprintCallable, Category = "General|Editor", meta = (CallInEditor = "true"))
+	static int32 GoToLocationAndLoadDataLayers(FVector Location, float RadiusCm = 50000.0f);
 };

@@ -10,7 +10,6 @@ public class ComputeShaderGenerator : ModuleRules
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 		bUseRTTI = true;
-		PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "..", "PCGPluginsShared"));
 		bool bPCGPluginsDebug = Target.Configuration != UnrealTargetConfiguration.Shipping;
 		string PCGPluginsDebugEnv = Environment.GetEnvironmentVariable("PCGPLUGINS_DEBUG");
 		if (!string.IsNullOrWhiteSpace(PCGPluginsDebugEnv))
@@ -28,7 +27,7 @@ public class ComputeShaderGenerator : ModuleRules
 		
 		PrivateIncludePaths.AddRange(
 			new string[] {
-				// ... add other private include paths required here ...
+				// ... add private include paths required here ...
 			}
 			);
 			
@@ -63,8 +62,12 @@ public class ComputeShaderGenerator : ModuleRules
 				"Foliage",
 				"MeshDescription",
 				"StaticMeshDescription",
-				"ProxyLODMeshReduction",
-				// ... add private dependencies that you statically link with here ...	
+				"UnrealEd",
+				"GeometryAlgorithms",
+				"ModelingComponents",
+				"ModelingComponentsEditorOnly",
+				"AssetRegistry",
+				"EditorScriptingUtilities",
 			}
 			);
 
@@ -75,18 +78,6 @@ public class ComputeShaderGenerator : ModuleRules
 			"zlib"
 		);
 
-		if (Target.bBuildEditor)
-		{
-			PrivateDependencyModuleNames.AddRange(
-				new string[]
-				{
-					"AnimationCore",
-					"SkeletalMeshDescription",
-				}
-				);
-		}
-		
-		
 		DynamicallyLoadedModuleNames.AddRange(
 			new string[]
 			{

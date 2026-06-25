@@ -10,7 +10,6 @@ public class GeometryScriptExtraEditor : ModuleRules
         PCHUsage = ModuleRules.PCHUsageMode.NoPCHs;
         bUseUnity = false;
         bUseRTTI = true;
-        PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "..", "PCGPluginsShared"));
         bool bPCGPluginsDebug = Target.Configuration != UnrealTargetConfiguration.Shipping;
         string PCGPluginsDebugEnv = Environment.GetEnvironmentVariable("PCGPLUGINS_DEBUG");
         if (!string.IsNullOrWhiteSpace(PCGPluginsDebugEnv))
@@ -19,14 +18,16 @@ public class GeometryScriptExtraEditor : ModuleRules
         }
         PublicDefinitions.Add("PCGPLUGINS_DEBUG=" + (bPCGPluginsDebug ? "1" : "0"));
 
+        // Ensure our own Public headers are found before engine headers with
+        // colliding names (e.g. PolyLine.h vs GeometryCore's Polyline.h).
+        PrivateIncludePaths.Add(Path.Combine(ModuleDirectory, "Public"));
+
         PublicDependencyModuleNames.AddRange(
             new string[]
             {
                 "ComputeShaderGenerator",
-                "GeometryMath",
             }
         );
-
 
         PrivateDependencyModuleNames.AddRange(
             new string[]

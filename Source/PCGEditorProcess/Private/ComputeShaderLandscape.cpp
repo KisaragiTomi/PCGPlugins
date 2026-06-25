@@ -12,6 +12,7 @@
 #include "Kismet/KismetRenderingLibrary.h"
 #include "ComputeShaderGeneral.h"
 #include "ComputeShaderBasicFunction.h"
+#include "ComputeShaderMeshGenerator.h"
 #include "ComputeShaderShallowWater.h"
 #include "LandscapeExtra.h"
 #include "Kismet/GameplayStatics.h"
@@ -193,23 +194,27 @@ void ACSLandscape::EnsureRTs(int32 SizeX, int32 SizeY)
 
 void ACSLandscape::ReadLandscapeDataToTexture()
 {
+	ALandscape* Landscape = FindLandscape();
+	if (!Landscape || !Box) return;
+
 	FVector Center = Box->Bounds.Origin;
 	FVector Extent = Box->Bounds.BoxExtent;
-	FReadLandscapeData LandscapeData;
-	ULandscapeExtra::CreateLandscapeTextureData(LandscapeData, Center, Extent);
-	if (LandscapeData.TextureSize.X + LandscapeData.TextureSize.Y < 32) return;
 
-	EnsureRTs(LandscapeData.TextureSize.X, LandscapeData.TextureSize.Y);
-	
-	FVector TextureMin = Center - Extent;
-	FVector TextureMax = Center + Extent;
-	FVector Range = LandscapeData.MapMax - LandscapeData.MapMin + FVector(0, 0, 1);
-	FVector MinUV = (TextureMin - LandscapeData.MapMin) / Range;
-	FVector MaxUV = (TextureMax - LandscapeData.MapMin) / Range;
-	FVector UVRange = MaxUV - MinUV;
-	
-	UComputeShaderBasicFunction::DrawLinearColorsToRenderTarget32(RT_LandscapeData, LandscapeData.Colors);
-	Orig_LandscapeData = LandscapeData;
+	EnsureRTs(RT_LandscapeData ? RT_LandscapeData->SizeX : 256,
+	          RT_LandscapeData ? RT_LandscapeData->SizeY : 256);
+
+	if (!AComputeShaderMeshGenerator::RenderLandscapeToNormalHeightRT(
+		Landscape, Center, Extent, RT_LandscapeData))
+	{
+		return;
+	}
+
+	Orig_LandscapeData.MapMin = Center - Extent;
+	Orig_LandscapeData.MapMax = Center + Extent;
+	Orig_LandscapeData.ValidUVRange = FVector2f(1.0f, 1.0f);
+	Orig_LandscapeData.TextureSize = FIntVector2(RT_LandscapeData->SizeX, RT_LandscapeData->SizeY);
+	Orig_LandscapeData.TextureValidSize = Orig_LandscapeData.TextureSize;
+	Orig_LandscapeData.Transform = Landscape->GetTransform();
 }
 
 
@@ -363,79 +368,6 @@ void ACSLandscape::PasteLandscapeData()
 	RequestLandscapeUpdate(true);
 }
 
-ALandscape* ACSLandscape::FindLandscape() const
-{
-	if (!GetWorld()) return nullptr;
-	for (TActorIterator<ALandscape> It(GetWorld()); It; ++It)
-	{
-		return *It;
-	}
-	return nullptr;
-}
-
-void ACSLandscape::RequestLandscapeUpdate(bool bInUserTriggered)
-{
-#if WITH_EDITOR
-	EnsureEditLayer();
-
-	ALandscape* Landscape = FindLandscape();
-	if (Landscape)
-	{
-		Landscape->RequestLayersContentUpdateForceAll(ELandscapeLayerUpdateMode::Update_All, bInUserTriggered);
-	}
-#endif
-}
-
-void ACSLandscape::EnsureEditLayer()
-{
-#if WITH_EDITOR
-	ALandscape* Landscape = FindLandscape();
-	if (!Landscape) return;
-
-	// Already exists?
-	if (OwnedEditLayerGuid.IsValid())
-	{
-		int32 Idx = Landscape->GetLayerIndex(OwnedEditLayerGuid);
-		if (Idx != INDEX_NONE) return; // still alive
-		OwnedEditLayerGuid.Invalidate(); // stale, recreate
-	}
-
-	// Each Actor gets its own layer
-	FName LayerName = FName(*FString::Printf(TEXT("CS_%s"), *GetName()));
-	int32 NewIdx = Landscape->CreateLayer(LayerName, UCSLandscapeEditLayer::StaticClass());
-	if (NewIdx != INDEX_NONE)
-	{
-		const FLandscapeLayer* NewLayer = Landscape->GetLayerConst(NewIdx);
-		if (NewLayer && NewLayer->EditLayer)
-		{
-			OwnedEditLayerGuid = NewLayer->EditLayer->GetGuid();
-		}
-	}
-
-	UE_LOG(LogTemp, Log, TEXT("ACSLandscape::EnsureEditLayer: %s → layer %s"),
-		*GetName(), *OwnedEditLayerGuid.ToString());
-#endif
-}
-
-void ACSLandscape::RemoveEditLayer()
-{
-#if WITH_EDITOR
-	if (!OwnedEditLayerGuid.IsValid()) return;
-
-	ALandscape* Landscape = FindLandscape();
-	if (!Landscape) return;
-
-	int32 Idx = Landscape->GetLayerIndex(OwnedEditLayerGuid);
-	if (Idx != INDEX_NONE)
-	{
-		Landscape->DeleteLayer(Idx);
-		UE_LOG(LogTemp, Log, TEXT("ACSLandscape::RemoveEditLayer: deleted layer %s"), *OwnedEditLayerGuid.ToString());
-	}
-
-	OwnedEditLayerGuid.Invalidate();
-#endif
-}
-
 void ACSLandscape::SaveResultToPersistent()
 {
 #if WITH_EDITOR
@@ -501,112 +433,18 @@ void ACSLandscape::PostLoad()
 	RestoreResultFromPersistent();
 }
 
-void ACSLandscape::BeginPlay()
-{
-	Super::BeginPlay();
-}
-
-void ACSLandscape::EndPlay(const EEndPlayReason::Type EndPlayReason)
-{
-	// Only remove the Edit Layer if the actor is explicitly destroyed (e.g. user deletes it).
-	// Do NOT remove on level unload / editor shutdown / PIE end — the layer should persist with the level.
-	if (EndPlayReason == EEndPlayReason::Destroyed)
-	{
-		RemoveEditLayer();
-	}
-	Super::EndPlay(EndPlayReason);
-}
-
-void ACSLandscape::Destroyed()
-{
-	RemoveEditLayer();
-	Super::Destroyed();
-}
-
 void ACSLandscape::CommitToLandscape()
 {
 #if WITH_EDITOR
 	if (!RT_Result || !bHasResult) return;
 
-	ALandscape* Landscape = FindLandscape();
-	if (!Landscape) return;
-
-	FLandscapeEditDataInterface LandscapeEdit(Landscape->GetLandscapeInfo());
-	LandscapeEdit.SetShouldDirtyPackage(true);
-
-	int32 XNum = RT_Result->SizeX;
-	TArray<FLinearColor> ResultColors;
-	UKismetRenderingLibrary::ReadRenderTargetRaw(this, RT_Result, ResultColors, false);
-
-	TArray<uint16> HeightData;
-	TArray<uint16> HeightAlphaBlendData;
-	TArray<uint8> HeightFlagsData;
-	HeightData.Reserve(Orig_LandscapeData.TextureValidSize.X * Orig_LandscapeData.TextureValidSize.Y);
-	HeightAlphaBlendData.Reserve(Orig_LandscapeData.TextureValidSize.X * Orig_LandscapeData.TextureValidSize.Y);
-	HeightFlagsData.Reserve(Orig_LandscapeData.TextureValidSize.X * Orig_LandscapeData.TextureValidSize.Y);
-	for (int32 Y = 0; Y < Orig_LandscapeData.TextureValidSize.Y; Y++)
-	{
-		for (int32 X = 0; X < Orig_LandscapeData.TextureValidSize.X; X++)
-		{
-			float ResultHeight = ResultColors[X + Y * XNum].A / Landscape->GetActorScale3D().Z;
-			HeightAlphaBlendData.Add(0);
-			HeightFlagsData.Add(0);
-			HeightData.Add(LandscapeDataAccess::GetTexHeight(ResultHeight));
-		}
-	}
-
-	const FLandscapeLayer* Layer = Landscape->GetLayerConst(0);
-	FGuid LayerGuid = Layer ? Layer->EditLayer->GetGuid() : FGuid();
-	Landscape->ClearEditLayer(0, nullptr, ELandscapeToolTargetTypeFlags::Heightmap);
-	FScopedSetLandscapeEditingLayer Scope(Landscape, LayerGuid, [=] { Landscape->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_All); });
-	LandscapeEdit.SetHeightData(Orig_LandscapeData.ReadRange.X, Orig_LandscapeData.ReadRange.Y, Orig_LandscapeData.ReadRange.Z, Orig_LandscapeData.ReadRange.W, (uint16*)HeightData.GetData(), 0, true, nullptr, (uint16*)HeightAlphaBlendData.GetData(), (uint8*)HeightFlagsData.GetData());
+	BakeResultToLandscape(RT_Result, Orig_LandscapeData, /*bClearLayerFirst*/ true, /*bWriteAlphaBlendAndFlags*/ true);
 
 	bHasResult = false;
 #endif
 }
 
 #if WITH_EDITOR
-
-FString ACSLandscape::GetEditLayerRendererDebugName() const
-{
-	return FString::Printf(TEXT("ACSLandscape_%s"), *GetName());
-}
-
-void ACSLandscape::GetRendererStateInfo(
-	const UE::Landscape::EditLayers::FMergeContext* InMergeContext,
-	UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutSupportedTargetTypeState,
-	UE::Landscape::EditLayers::FEditLayerTargetTypeState& OutEnabledTargetTypeState,
-	TArray<UE::Landscape::EditLayers::FTargetLayerGroup>& OutTargetLayerGroups) const
-{
-	using namespace UE::Landscape::EditLayers;
-	if (bAffectHeightmap)
-	{
-		OutSupportedTargetTypeState.AddTargetTypeMask(ELandscapeToolTargetTypeFlags::Heightmap);
-		if (bHasResult)
-		{
-			OutEnabledTargetTypeState.AddTargetTypeMask(ELandscapeToolTargetTypeFlags::Heightmap);
-		}
-	}
-}
-
-TArray<UE::Landscape::EditLayers::FEditLayerRenderItem> ACSLandscape::GetRenderItems(
-	const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const
-{
-	using namespace UE::Landscape::EditLayers;
-
-	FEditLayerTargetTypeState EnabledState(InMergeContext, bAffectHeightmap ? ELandscapeToolTargetTypeFlags::Heightmap : ELandscapeToolTargetTypeFlags::None);
-
-	FInputWorldArea InputArea = FInputWorldArea::CreateInfinite();
-	FOutputWorldArea OutputArea = FOutputWorldArea::CreateLocalComponent();
-
-	return { FEditLayerRenderItem(EnabledState, InputArea, OutputArea, false) };
-}
-
-UE::Landscape::EditLayers::ERenderFlags ACSLandscape::GetRenderFlags(
-	const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const
-{
-	return UE::Landscape::EditLayers::ERenderFlags::RenderMode_Immediate;
-}
 
 bool ACSLandscape::RenderLayer(
 	UE::Landscape::EditLayers::FRenderParams& RenderParams,
@@ -980,15 +818,15 @@ void ACSLandscapeRiver::SimRiver(TSubclassOf<AActor> ActorClass, int32 SimIterat
 	if (RT_SplineRotateDist == nullptr) return;
 	ACSShallowWaterCapture* SimActor = nullptr;
 	TArray<AActor*> Actors;
-	UGameplayStatics::GetAllActorsOfClass(GWorld, ActorClass, Actors);
+	UGameplayStatics::GetAllActorsOfClass(GetWorld(), ActorClass, Actors);
 	
-	for (TActorIterator<AActor> It(GWorld, ActorClass); It; ++It)
+	for (TActorIterator<AActor> It(GetWorld(), ActorClass); It; ++It)
 	{
 		SimActor = Cast<ACSShallowWaterCapture>(*It);
 	}
 	if (SimActor == nullptr)
 	{
-		SimActor = GWorld->SpawnActor<ACSShallowWaterCapture>(ActorClass);
+		SimActor = GetWorld()->SpawnActor<ACSShallowWaterCapture>(ActorClass);
 	}
 	// UKismetRenderingLibrary::ClearRenderTarget2D(this, SimActor->RT_Result);
 	// UKismetRenderingLibrary::ClearRenderTarget2D(this, SimActor->RT_VelocityHeight);

@@ -1,4 +1,4 @@
-﻿// Copyright Epic Games, Inc. All Rights Reserved.
+// Copyright Epic Games, Inc. All Rights Reserved.
 
 using System;
 using System.IO;
@@ -9,7 +9,6 @@ public class PCGEditorProcess : ModuleRules
 	public PCGEditorProcess(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
-		PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "..", "PCGPluginsShared"));
 		bool bPCGPluginsDebug = Target.Configuration != UnrealTargetConfiguration.Shipping;
 		string PCGPluginsDebugEnv = Environment.GetEnvironmentVariable("PCGPLUGINS_DEBUG");
 		if (!string.IsNullOrWhiteSpace(PCGPluginsDebugEnv))
@@ -34,6 +33,7 @@ public class PCGEditorProcess : ModuleRules
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
+				"DeveloperSettings",
 				"EditorFramework",
 				"Engine",
 				"Foliage",
@@ -63,8 +63,12 @@ public class PCGEditorProcess : ModuleRules
 				"MaterialUtilities",
 				"Blutility",
 				"LandscapeEditorUtilities",
-				"MeshDescription",
-				"StaticMeshDescription",
+				"DataLayerEditor",
+			"AnimationCore",
+			"MeshDescription",
+			"SkeletalMeshDescription",
+			"StaticMeshDescription",
+			"ModelingComponentsEditorOnly",
 			}
 			);
 		

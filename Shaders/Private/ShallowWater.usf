@@ -27,7 +27,6 @@
 // ─── Resource Bindings ──────────────────────────────────────────────
 
 Texture2D T_SceneDepth;
-Texture2D T_Source;
 Texture2D T_VelocityHeight;
 Texture2D T_SplineScaleDist;
 Texture2D T_CopyLandscape;
@@ -65,6 +64,8 @@ float  SeaLevel;
 float  ActorLocationZ;
 float  AdvectFoam;
 float  FoamFadeSpeed;
+float  MaxWaterRisePerFrame;
+float  SpikeClampHeight;
 float2 CopyValidUV;
 SamplerState Sampler;
 
@@ -291,11 +292,18 @@ void CalVelocityHeight_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId, ui
 
 	// Waterfall: blend raw terrain toward smooth terrain
 	float SmoothStress = 1;
+	float SHCRaw = SHC, SHRRaw = SHR, SHTRaw = SHT, SHLRaw = SHL, SHBRaw = SHB;
 	SHC = lerp(SHC, SSHC, SmoothStress);
 	SHR = lerp(SHR, SSHR, SmoothStress);
 	SHT = lerp(SHT, SSHT, SmoothStress);
 	SHL = lerp(SHL, SSHL, SmoothStress);
 	SHB = lerp(SHB, SSHB, SmoothStress);
+	// Smooth from previous frame may lag behind terrain changes; never let it go below raw terrain.
+	SHC = max(SHC, SHCRaw);
+	SHR = max(SHR, SHRRaw);
+	SHT = max(SHT, SHTRaw);
+	SHL = max(SHL, SHLRaw);
+	SHB = max(SHB, SHBRaw);
 
 	// Smooth height convergence (waterfall independent shared memory)
 	half4 CurrentWFData = WaterfallSharedGroup[GroupThreadId.x + WATERFALL_EXTENT][GroupThreadId.y + WATERFALL_EXTENT];
@@ -353,15 +361,22 @@ void CalVelocityHeight_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId, ui
 		SHB = DispatchThreadId.y + 1 >= MaxCell.y - WaterBoundSize - 1 ? 99999 : SHB;
 	}
 
-	// Source injection
+	// Source injection (skip sources buried inside terrain)
 	for (int i = 0; i < BCount_SourceUVRads; i++)
 	{
 		float4 SrcData = RWB_SourceUVRads[i];
 		SrcData.z -= ActorLocationZ;
-		float DistToSource = distance(DispatchThreadId.xy / (MaxCell - 1), SrcData.xy);
+		if (SrcData.w <= 0)
+			continue;
+		int2 SrcPixel = (int2)floor(SrcData.xy * MaxCell);
+		SrcPixel = clamp(SrcPixel, int2(0,0), MaxCellInt - int2(1,1));
+		float SrcTerrainH = max(HeightMAX - T_SceneDepth[SrcPixel].x, RW_SmoothHeightA[SrcPixel].y);
+		if (SrcData.z <= SrcTerrainH)
+			continue;
+		float DistToSource = distance((DispatchThreadId.xy + 0.5) / MaxCell, SrcData.xy);
 		float Blend = max(1 - DistToSource / SrcData.w, 0);
 		float TarVC = lerp(VC, max(SrcData.z - SHC, 0), Blend);
-		VC = SrcData.w > 0 ? TarVC : VC;
+		VC = TarVC;
 		FC = lerp(FC, 0, Blend);
 	}
 
@@ -496,24 +511,15 @@ void CalShallowWaterResult_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId
 	CurrentWet = max(CurrentWet, CurrentSceneHeight + ActorLocationZ - 100);
 
 	float ResultHeight  = CurrentWater + CurrentSceneHeight;
-	float CurrentHeight = CurrentWater + CurrentSceneHeight;
 	float ResultForm    = CurrentForm;
 	float ChangeHeight  = CurrentSceneHeight - 100;
-	float SumHeight     = 0;
 	float ValidCount    = 0;
 	float HeightMin     =  999999;
-	float HeightMax     = -999999;
-	float WaterMin      = CurrentWater;
 	float WaterMax      = CurrentWater;
-	float WaterAvg      = 0;
-	float GroundMin     = CurrentSceneHeight;
-	float GroundMax     = CurrentSceneHeight;
-	float GroundAvg     = 0;
-	float FormMin       = CurrentForm;
 	float FormMax       = CurrentForm;
-	float FormAvg       = 0;
 	float WetAvg        = 0;
 	float Count         = 0;
+	float SpikeMaxNeighbour = -999999;
 
 	for (int Y = -GENERAL_SHAREGROUP_EXTENT; Y <= GENERAL_SHAREGROUP_EXTENT; Y++)
 	{
@@ -521,44 +527,32 @@ void CalShallowWaterResult_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId
 		{
 			Count += 1;
 			int2 Offset = GroupThreadId.xy + int2(X, Y) + int2(GENERAL_SHAREGROUP_EXTENT, GENERAL_SHAREGROUP_EXTENT);
-			float WaterHeight = GENERAL_SHAREGROUP_NAME[Offset.x][Offset.y].x;
-			float SceneHeight = GENERAL_SHAREGROUP_NAME[Offset.x][Offset.y].y;
-			float Form        = GENERAL_SHAREGROUP_NAME[Offset.x][Offset.y].z;
-			float NeighbourHeight = WaterHeight + SceneHeight;
+			half4 SharedData = GENERAL_SHAREGROUP_NAME[Offset.x][Offset.y];
+			float WaterHeight = SharedData.x;
 
 			if (WaterHeight > 0)
 			{
-				SumHeight  += NeighbourHeight;
+				float NeighbourHeight = WaterHeight + SharedData.y;
 				ValidCount += 1;
 				HeightMin   = min(NeighbourHeight, HeightMin);
-				HeightMax   = max(NeighbourHeight, HeightMax);
-				WaterMin    = min(WaterMin, WaterHeight);
 				WaterMax    = max(WaterMax, WaterHeight);
-				WaterAvg   += WaterHeight;
-				GroundMin   = min(GroundMin, SceneHeight);
-				GroundMax   = max(GroundMax, SceneHeight);
-				GroundAvg  += SceneHeight;
-				FormMin     = min(FormMin, Form);
-				FormMax     = max(FormMax, Form);
-				FormAvg    += Form;
+				FormMax     = max(FormMax, SharedData.z);
+
+				bool bImmediate = abs(X) <= 1 && abs(Y) <= 1 && (X | Y) != 0;
+				if (bImmediate)
+				{
+					SpikeMaxNeighbour = max(SpikeMaxNeighbour, NeighbourHeight);
+				}
 			}
 
-			float Wet = GENERAL_SHAREGROUP_NAME[Offset.x][Offset.y].w;
-			float MaxLerpDist = 50;
-			Wet = clamp(Wet, CurrentWet - MaxLerpDist, CurrentWet + MaxLerpDist);
+			float Wet = SharedData.w;
+			Wet = clamp(Wet, CurrentWet - 50, CurrentWet + 50);
 			Wet -= CurrentSceneHeight + ActorLocationZ;
 			WetAvg += Wet;
 		}
 	}
 
 	WetAvg /= Count;
-
-	if (ValidCount > 0)
-	{
-		WaterAvg  /= ValidCount;
-		GroundAvg /= ValidCount;
-		FormAvg   /= ValidCount;
-	}
 
 	if (CurrentWater <= 0)
 	{
@@ -584,16 +578,31 @@ void CalShallowWaterResult_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId
 	DepthWet.x = WaterMax;
 	DepthWet.w = (ValidCount / Count - .49) * 2;
 
+	if (SpikeClampHeight > 0 && CurrentWater > 0 && SpikeMaxNeighbour > -999999)
+	{
+		float Excess = ResultHeight - (SpikeMaxNeighbour + SpikeClampHeight);
+		if (Excess > 0)
+		{
+			float LerpFactor = saturate(Excess / SpikeClampHeight);
+			ResultHeight = lerp(ResultHeight, SpikeMaxNeighbour, LerpFactor);
+		}
+	}
+
+	// ResultHeight += ActorLocationZ;
+
+	float4 ResultSmoothHeight = RW_SmoothHeightA[DispatchThreadId.xy];
+	// Persist the computed waterfall scene height for the next simulation step.
+	ResultSmoothHeight.y = CurrentSceneHeight;
 	RW_ResultDepthWet[DispatchThreadId.xy]     = DepthWet;
 	RW_ResultVelHeight[DispatchThreadId.xy]    = float4(VelHeightFoam.xy, ResultHeight, ResultForm);
-	RW_ResultSmoothHeight[DispatchThreadId.xy] = RW_SmoothHeightA[DispatchThreadId.xy];
+	RW_ResultSmoothHeight[DispatchThreadId.xy] = ResultSmoothHeight;
 
 	// Debug visualization
-	float RawSceneHeight = MAX_HEIGHT - T_SceneDepth[DispatchThreadId.xy].x;
+	float RawSceneH = MAX_HEIGHT - T_SceneDepth[DispatchThreadId.xy].x;
 	float4 SmoothData = RW_SmoothHeightA[DispatchThreadId.xy];
 	float SmoothH = SmoothData.y;
-	float WaterfallExpansion = saturate((SmoothH - RawSceneHeight) / 200.0);
-	float HeightDiff = SmoothH - RawSceneHeight;
+	float WaterfallExpansion = saturate((SmoothH - RawSceneH) / 200.0);
+	float HeightDiff = SmoothH - RawSceneH;
 	float NormDiff = clamp(HeightDiff / 500.0, -1.0, 1.0) * 0.5 + 0.5;
 
 	RW_DebugView[DispatchThreadId.xy] = float4(WaterfallExpansion, NormDiff, 0, CurrentSceneHeight);

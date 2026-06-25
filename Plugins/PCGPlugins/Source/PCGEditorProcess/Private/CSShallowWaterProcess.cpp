@@ -48,8 +48,6 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 
 	if (!SourceMesh) return;
 
-	FName CSSWTag = InCSSWActor->SWTag;
-
 	ULevel* CurrentLevel = InCSSWActor->GetLevel();
 	FString LevelPathName = GetPathNameSafe(CurrentLevel);
 	FString FileName;
@@ -64,76 +62,25 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 		InCSSWActor->SWUniqueID = Time.GetDay() * 1e6 + Time.GetHour() * 1e4 + Time.GetMinute() * 1e2 + Time.GetSecond();
 	}
 	int32 ActorId = InCSSWActor->SWUniqueID;
-	FString ResultVelHeightName = FString::Printf(TEXT("T_CSSW_VelHeight_%d"), ActorId);
-	FString ResultDepthWetName = FString::Printf(TEXT("T_CSSW_DepthWet_%d"), ActorId);
-	FString ResultWaterMaterialName = FString::Printf(TEXT("MI_CSSW_Water_%d"), ActorId);
-	FString ResultDecalMaterialName = FString::Printf(TEXT("MI_CSSW_Decal_%d"), ActorId);
-	FString ResultWaterMaterialPathFull = AssetFolderPath + "/" + ResultWaterMaterialName + "." + ResultWaterMaterialName;
-	FString ResultDecalMaterialPathFull = AssetFolderPath + "/" + ResultDecalMaterialName + "." + ResultDecalMaterialName;
 
-	UTexture2D* VelHeightTexture = UCSAssetProcess::ConveretAndSaveRTAsset(ResultVelHeightName, AssetFolderPath, InCSSWActor->RT_ResultVelHeight);
-	UTexture2D* DepthWetTexture = UCSAssetProcess::ConveretAndSaveRTAsset(ResultDepthWetName, AssetFolderPath, InCSSWActor->RT_ResultDepthWet);
-
-	auto FindOrCreateChildMIC = [&](UMaterialInterface* ParentMat, const FString& MIName) -> UMaterialInstanceConstant*
+	TArray<FFloat16Color> Pixels;
+	int32 RTWidth = 0, RTHeight = 0;
+	if (InCSSWActor->RT_ResultVelHeight)
 	{
-		if (!ParentMat) return nullptr;
-		FString MIPath = AssetFolderPath / MIName;
-		UMaterialInstanceConstant* MIC = nullptr;
-		if (UEditorAssetLibrary::DoesAssetExist(MIPath))
+		FTextureRenderTargetResource* VHResource = InCSSWActor->RT_ResultVelHeight->GameThread_GetRenderTargetResource();
+		if (VHResource)
 		{
-			MIC = Cast<UMaterialInstanceConstant>(UEditorAssetLibrary::LoadAsset(MIPath));
+			FIntPoint VHSize = VHResource->GetSizeXY();
+			RTWidth = VHSize.X;
+			RTHeight = VHSize.Y;
+			VHResource->ReadFloat16Pixels(Pixels);
 		}
-		if (!MIC)
-		{
-			UPackage* Pkg = CreatePackage(*(MIPath));
-			Pkg->FullyLoad();
-			MIC = NewObject<UMaterialInstanceConstant>(Pkg, *MIName, RF_Public | RF_Standalone);
-			FAssetRegistryModule::AssetCreated(MIC);
-		}
-		UMaterialEditingLibrary::SetMaterialInstanceParent(MIC, ParentMat);
-		return MIC;
-	};
-
-	UMaterialInstanceConstant* WaterMIC = FindOrCreateChildMIC(InCSSWActor->WaterMaterial, ResultWaterMaterialName);
-	UMaterialInstanceConstant* DecalMIC = FindOrCreateChildMIC(InCSSWActor->DecalMaterial, ResultDecalMaterialName);
-
-	if (WaterMIC)
-	{
-		if (VelHeightTexture)
-			UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(WaterMIC, TEXT("CSSW_VelHeight"), VelHeightTexture);
-		if (DepthWetTexture)
-			UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(WaterMIC, TEXT("CSSW_DepthWet"), DepthWetTexture);
-		UMaterialEditingLibrary::SetMaterialInstanceVectorParameterValue(WaterMIC, TEXT("CSSW_SimCenter"),
-			FLinearColor(InCSSWActor->SimUVCenter.X, InCSSWActor->SimUVCenter.Y, 0.f, 0.f));
-		UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(WaterMIC, TEXT("CSSW_SimInvSize"), InCSSWActor->SimUVInvSize);
-		UMaterialEditingLibrary::SetMaterialInstanceStaticSwitchParameterValue(WaterMIC, TEXT("SwithSim"), true);
-		UEditorAssetLibrary::SaveLoadedAsset(WaterMIC, false);
-		WaterMIC->MarkPackageDirty();
 	}
-	if (DecalMIC)
+	if (RTWidth <= 0 || RTHeight <= 0 || Pixels.Num() != RTWidth * RTHeight)
 	{
-		if (VelHeightTexture)
-			UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(DecalMIC, TEXT("CSSW_VelHeight"), VelHeightTexture);
-		if (DepthWetTexture)
-			UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(DecalMIC, TEXT("CSSW_DepthWet"), DepthWetTexture);
-		UMaterialEditingLibrary::SetMaterialInstanceVectorParameterValue(DecalMIC, TEXT("CSSW_SimCenter"),
-			FLinearColor(InCSSWActor->SimUVCenter.X, InCSSWActor->SimUVCenter.Y, 0.f, 0.f));
-		UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(DecalMIC, TEXT("CSSW_SimInvSize"), InCSSWActor->SimUVInvSize);
-		UMaterialEditingLibrary::SetMaterialInstanceStaticSwitchParameterValue(DecalMIC, TEXT("SwithSim"), true);
-		UEditorAssetLibrary::SaveLoadedAsset(DecalMIC, false);
-		DecalMIC->MarkPackageDirty();
-	}
-	if (VelHeightTexture) { UEditorAssetLibrary::SaveLoadedAsset(VelHeightTexture, false); VelHeightTexture->MarkPackageDirty(); }
-	if (DepthWetTexture) { UEditorAssetLibrary::SaveLoadedAsset(DepthWetTexture, false); DepthWetTexture->MarkPackageDirty(); }
-
-	const int32 RTWidth  = InCSSWActor->CachedResultWidth;
-	const int32 RTHeight = InCSSWActor->CachedResultHeight;
-	if (RTWidth <= 0 || RTHeight <= 0 || InCSSWActor->CachedResultPixels.Num() != RTWidth * RTHeight)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSSW] No cached result data available for bake. Run simulation first."));
+		UE_LOG(LogTemp, Warning, TEXT("[CSSW] RT_ResultVelHeight not available for bake. Run simulation first."));
 		return;
 	}
-	const TArray<FFloat16Color>& Pixels = InCSSWActor->CachedResultPixels;
 
 	TArray<FFloat16Color> DepthWetPixels;
 	int32 DWWidth = 0, DWHeight = 0;
@@ -207,6 +154,7 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 
 	const float HalfCapture = InCSSWActor->CaptureSize * 0.5f;
 	const float InvCapture = InCSSWActor->CaptureSize > 0.f ? 1.f / InCSSWActor->CaptureSize : 0.f;
+	const float ActorLocationZ = InCSSWActor->GetActorLocation().Z;
 	constexpr float DryThreshold = -9000.0f;
 	constexpr float VelocityMax = (float)CSSW_VELOCITY_CLAMP;
 
@@ -221,25 +169,35 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 	constexpr float WeldThreshold = 0.01f;
 	TMap<FIntVector, FVertexID> WeldMap;
 
-	auto GetOrCreateWeldedVertex = [&](const FVector3f& WorldPos3f) -> FVertexID
+	auto TrySampleBakedLocalHeight = [&](const FVector3f& LocalPos3f, float& OutLocalHeight) -> bool
+	{
+		float U = (LocalPos3f.X + HalfCapture) * InvCapture;
+		float V = (LocalPos3f.Y + HalfCapture) * InvCapture;
+		int32 PX = FMath::Clamp(FMath::FloorToInt32(U * RTWidth), 0, RTWidth - 1);
+		int32 PY = FMath::Clamp(FMath::FloorToInt32(V * RTHeight), 0, RTHeight - 1);
+		float ResultWorldHeight = Pixels[PY * RTWidth + PX].B.GetFloat();
+		if (ResultWorldHeight <= DryThreshold)
+		{
+			return false;
+		}
+
+		OutLocalHeight = ResultWorldHeight;
+		return true;
+	};
+
+	auto GetOrCreateWeldedVertex = [&](const FVector3f& LocalPos3f, float LocalHeight) -> FVertexID
 	{
 		FIntVector Key(
-			FMath::RoundToInt32(WorldPos3f.X / WeldThreshold),
-			FMath::RoundToInt32(WorldPos3f.Y / WeldThreshold),
+			FMath::RoundToInt32(LocalPos3f.X / WeldThreshold),
+			FMath::RoundToInt32(LocalPos3f.Y / WeldThreshold),
 			0);
 		if (FVertexID* Found = WeldMap.Find(Key))
 		{
 			return *Found;
 		}
 
-		float U = (WorldPos3f.X + HalfCapture) * InvCapture;
-		float V = (WorldPos3f.Y + HalfCapture) * InvCapture;
-		int32 PX = FMath::Clamp(FMath::FloorToInt32(U * RTWidth), 0, RTWidth - 1);
-		int32 PY = FMath::Clamp(FMath::FloorToInt32(V * RTHeight), 0, RTHeight - 1);
-		float HeightOffset = Pixels[PY * RTWidth + PX].B.GetFloat();
-
 		FVertexID NewVID = MergedDesc.CreateVertex();
-		MergedPositions[NewVID] = FVector3f(WorldPos3f.X, WorldPos3f.Y, WorldPos3f.Z + HeightOffset);
+		MergedPositions[NewVID] = FVector3f(LocalPos3f.X, LocalPos3f.Y, LocalHeight);
 		WeldMap.Add(Key, NewVID);
 		return NewVID;
 	};
@@ -302,18 +260,58 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 			FVector3f WP1 = FVector3f(InstT.TransformPosition(FVector(SrcPositions[I1])));
 			FVector3f WP2 = FVector3f(InstT.TransformPosition(FVector(SrcPositions[I2])));
 
-			bool bAllDry = true;
 			FVector3f WorldVerts[3] = { WP0, WP1, WP2 };
+			float LocalHeights[3] = {};
+			bool bWetVerts[3] = {};
+			int32 WetVertCount = 0;
+			float WetHeightSum = 0.0f;
 			for (int32 v = 0; v < 3; v++)
 			{
-				float U = (WorldVerts[v].X + HalfCapture) * InvCapture;
-				float V = (WorldVerts[v].Y + HalfCapture) * InvCapture;
-				int32 PX = FMath::Clamp(FMath::FloorToInt32(U * RTWidth), 0, RTWidth - 1);
-				int32 PY = FMath::Clamp(FMath::FloorToInt32(V * RTHeight), 0, RTHeight - 1);
-				float H = Pixels[PY * RTWidth + PX].B.GetFloat();
-				if (H > DryThreshold) { bAllDry = false; break; }
+				if (TrySampleBakedLocalHeight(WorldVerts[v], LocalHeights[v]))
+				{
+					bWetVerts[v] = true;
+					WetVertCount++;
+					WetHeightSum += LocalHeights[v];
+				}
 			}
-			if (bAllDry) { DbgDrySkipped++; continue; }
+
+			const FVector3f TriCenter = (WorldVerts[0] + WorldVerts[1] + WorldVerts[2]) / 3.0f;
+			float CenterLocalHeight = 0.0f;
+			const bool bCenterWet = TrySampleBakedLocalHeight(TriCenter, CenterLocalHeight);
+			if (WetVertCount == 0 && !bCenterWet)
+			{
+				DbgDrySkipped++;
+				continue;
+			}
+
+			const float FallbackLocalHeight = bCenterWet ? CenterLocalHeight : WetHeightSum / FMath::Max(WetVertCount, 1);
+			for (int32 v = 0; v < 3; v++)
+			{
+				if (!bWetVerts[v])
+					LocalHeights[v] = FallbackLocalHeight;
+			}
+
+			if (DepthWetPixels.Num() > 0 && DWWidth > 0 && DWHeight > 0)
+			{
+				bool bAllTransparent = true;
+				for (int32 v = 0; v < 3; v++)
+				{
+					float U = (WorldVerts[v].X + HalfCapture) * InvCapture;
+					float V = (WorldVerts[v].Y + HalfCapture) * InvCapture;
+					int32 DPX = FMath::Clamp(FMath::FloorToInt32(U * DWWidth), 0, DWWidth - 1);
+					int32 DPY = FMath::Clamp(FMath::FloorToInt32(V * DWHeight), 0, DWHeight - 1);
+					if (DepthWetPixels[DPY * DWWidth + DPX].A.GetFloat() > 0.f)
+					{
+						bAllTransparent = false;
+						break;
+					}
+				}
+				if (bAllTransparent)
+				{
+					DbgDrySkipped++;
+					continue;
+				}
+			}
 
 			uint32 SrcIdx[3] = { I0, I1, I2 };
 			FVertexID NewVIDs[3];
@@ -323,7 +321,7 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 
 			for (int32 v = 0; v < 3; v++)
 			{
-				FVertexID NewVID = GetOrCreateWeldedVertex(WorldVerts[v]);
+				FVertexID NewVID = GetOrCreateWeldedVertex(WorldVerts[v], LocalHeights[v]);
 				NewVIDs[v] = NewVID;
 				UniqueVerts.Add(NewVID);
 
@@ -395,13 +393,40 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 
 	NewMesh->CommitMeshDescription(0);
 
-	if (WaterMIC)
+	UMaterialInterface* BakeMaterial = InCSSWActor->WaterMaterial;
+	if (BakeMaterial)
 	{
+		FString VelHeightTexName = FString::Printf(TEXT("T_CSSW_VelHeight_%d"), ActorId);
+		UTexture2D* VelHeightTex = InCSSWActor->RT_ResultVelHeight
+			? UCSAssetProcess::ConveretAndSaveRTAsset(VelHeightTexName, AssetFolderPath, InCSSWActor->RT_ResultVelHeight)
+			: nullptr;
+
+		FString DepthWetTexName = FString::Printf(TEXT("T_CSSW_DepthWet_%d"), ActorId);
+		UTexture2D* DepthWetTex = InCSSWActor->RT_ResultDepthWet
+			? UCSAssetProcess::ConveretAndSaveRTAsset(DepthWetTexName, AssetFolderPath, InCSSWActor->RT_ResultDepthWet)
+			: nullptr;
+
+		FString WaterMIName = FString::Printf(TEXT("MI_CSSW_Water_%d"), ActorId);
+		UMaterialInstance* WaterMI = UCSAssetProcess::FindOrCreateMaterialInstanceAsset(WaterMIName, AssetFolderPath, BakeMaterial);
+		UMaterialInstanceConstant* WaterMIC = Cast<UMaterialInstanceConstant>(WaterMI);
+		if (WaterMIC)
+		{
+			if (VelHeightTex) UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(WaterMIC, FName("CSSW_VelHeight"), VelHeightTex);
+			if (DepthWetTex) UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(WaterMIC, FName("CSSW_DepthWet"), DepthWetTex);
+			UMaterialEditingLibrary::SetMaterialInstanceVectorParameterValue(WaterMIC, FName("CSSW_SimCenter"),
+				FLinearColor(InCSSWActor->SimUVCenter.X, InCSSWActor->SimUVCenter.Y, 0, 0));
+			UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(WaterMIC, FName("CSSW_SimInvSize"), InCSSWActor->SimUVInvSize);
+			UMaterialEditingLibrary::SetMaterialInstanceStaticSwitchParameterValue(WaterMIC, FName("SwithSim"), true);
+			WaterMIC->PostEditChange();
+			UEditorAssetLibrary::SaveLoadedAsset(WaterMIC, false);
+			BakeMaterial = WaterMIC;
+		}
+
 		TArray<FStaticMaterial>& Materials = NewMesh->GetStaticMaterials();
 		if (Materials.Num() > 0)
-			Materials[0].MaterialInterface = WaterMIC;
+			Materials[0].MaterialInterface = BakeMaterial;
 		else
-			Materials.Add(FStaticMaterial(WaterMIC, TEXT("Water")));
+			Materials.Add(FStaticMaterial(BakeMaterial, TEXT("Water")));
 	}
 
 	NewMesh->Build(false);
@@ -409,52 +434,21 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 	UEditorAssetLibrary::SaveLoadedAsset(NewMesh, false);
 	NewMesh->MarkPackageDirty();
 
-	InCSSWActor->Modify();
 	if (InCSSWActor->ReusltMesh)
 	{
+		InCSSWActor->Modify();
 		InCSSWActor->ReusltMesh->Modify();
+
 		if (!InCSSWActor->SimulationPreviewMesh)
-		{
 			InCSSWActor->SimulationPreviewMesh = InCSSWActor->ReusltMesh->GetStaticMesh();
-		}
+
+		InCSSWActor->BakedResultMesh = NewMesh;
+		InCSSWActor->bUseBakedResultMesh = true;
+
 		InCSSWActor->ReusltMesh->SetStaticMesh(NewMesh);
 		InCSSWActor->ReusltMesh->SetRelativeScale3D(FVector::OneVector);
-		if (WaterMIC)
-		{
-			InCSSWActor->ReusltMesh->SetMaterial(0, WaterMIC);
-		}
-		InCSSWActor->ReusltMesh->SetVisibility(true);
-		InCSSWActor->ReusltMesh->MarkRenderStateDirty();
-	}
-	if (!InCSSWActor->SimulationWaterMaterial)
-	{
-		InCSSWActor->SimulationWaterMaterial = InCSSWActor->WaterMaterial;
-	}
-	if (!InCSSWActor->SimulationDecalMaterial)
-	{
-		InCSSWActor->SimulationDecalMaterial = InCSSWActor->DecalMaterial;
-	}
-	InCSSWActor->BakedResultMesh = NewMesh;
-	InCSSWActor->bUseBakedResultMesh = true;
-	InCSSWActor->WaterMaterial = WaterMIC ? WaterMIC : InCSSWActor->WaterMaterial;
-	InCSSWActor->DecalMaterial = DecalMIC ? DecalMIC : InCSSWActor->DecalMaterial;
-	InCSSWActor->StopSolver();
-	InCSSWActor->bSimVisActive = false;
-	if (InCSSWActor->CausticsDecal && InCSSWActor->DecalMaterial)
-	{
-		InCSSWActor->CausticsDecal->Modify();
-		InCSSWActor->CausticsDecal->SetDecalMaterial(InCSSWActor->DecalMaterial);
-		InCSSWActor->CausticsDecal->SetVisibility(true);
-		InCSSWActor->CausticsDecal->MarkRenderStateDirty();
-	}
-	if (InCSSWActor->SimVisHISM)
-	{
-		InCSSWActor->SimVisHISM->ClearInstances();
-		InCSSWActor->SimVisHISM->SetVisibility(false);
-	}
-	InCSSWActor->MarkPackageDirty();
-	if (InCSSWActor->ReusltMesh)
-	{
+		if (BakeMaterial)
+			InCSSWActor->ReusltMesh->SetMaterial(0, BakeMaterial);
 		InCSSWActor->ReusltMesh->MarkRenderStateDirty();
 	}
 }
@@ -553,7 +547,6 @@ void UCSShallowWaterProcess::DebugDumpSWPassResults(ACSShallowWaterCapture* InCS
 	};
 
 	TArray<FRTEntry> RTsToSave = {
-		{ InCSSWActor->RT_VoxelTerrain,     TEXT("Debug_VoxelTerrain") },
 		{ InCSSWActor->RT_VelocityHeight,   TEXT("Debug_VelocityHeight") },
 		{ InCSSWActor->RT_ResultVelHeight,   TEXT("Debug_ResultVelHeight") },
 		{ InCSSWActor->RT_ResultDepthWet,    TEXT("Debug_ResultDepthWet") },

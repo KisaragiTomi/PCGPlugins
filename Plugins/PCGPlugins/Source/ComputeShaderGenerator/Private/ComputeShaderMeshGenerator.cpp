@@ -4097,6 +4097,7 @@ AComputeShaderMeshGenerator::AComputeShaderMeshGenerator(const FObjectInitialize
 
 	USceneComponent* ExistingRoot = GetRootComponent();
 	SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
+	SceneRoot->bEditableWhenInherited = false;
 	SetRootComponent(SceneRoot);
 	if (ExistingRoot && ExistingRoot != SceneRoot)
 	{
@@ -4112,6 +4113,8 @@ AComputeShaderMeshGenerator::AComputeShaderMeshGenerator(const FObjectInitialize
 	DynamicMeshComponent->SetBoundsScale(DynamicMeshCullBoundsScale);
 
 	GeneratorBounds = CreateDefaultSubobject<UBoxComponent>(TEXT("GeneratorBounds"));
+	GeneratorBounds->SetIsVisualizationComponent(true);
+	GeneratorBounds->bEditableWhenInherited = false;
 	GeneratorBounds->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
 	GeneratorBounds->SetCollisionObjectType(ECollisionChannel::ECC_WorldDynamic);
 	GeneratorBounds->SetCollisionResponseToAllChannels(ECR_Overlap);

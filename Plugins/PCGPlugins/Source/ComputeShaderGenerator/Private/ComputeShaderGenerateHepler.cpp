@@ -4,6 +4,7 @@
 #include "Landscape.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshActor.h"
+#include "Engine/World.h"
 #include "Kismet/KismetSystemLibrary.h"
 
 

@@ -1,6 +1,6 @@
 #include "VineContainerViewportOverlay.h"
 
-#include "VineGenerator.h"
+#include "GeometryEditorActor.h"
 #include "SVineContainerViewportOverlay.h"
 
 bool FVineContainerViewportOverlay::SupportsActor(const AActor* Actor) const

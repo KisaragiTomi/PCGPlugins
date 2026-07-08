@@ -15,8 +15,15 @@ public class AIToolModule : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
-			"Json",
-			"Projects",
+			"Projects",           // IPluginManager (weights path resolution)
+			"GeometryCore",       // FDynamicMesh3
+			"GeometryFramework",  // UDynamicMesh
 		});
+
+		// Dense float32 math for the NKSR C++ port (GEMM etc.)
+		AddEngineThirdPartyPrivateStaticDependencies(Target, "Eigen");
+
+		// Ship the converted NKSR network weights with packaged builds.
+		RuntimeDependencies.Add("$(PluginDir)/Resources/nksr_ks.nkw");
 	}
 }

@@ -7,6 +7,7 @@
 #include "RenderGraphUtils.h"
 #include "RenderGraphBuilder.h"
 #include "EngineUtils.h"
+#include "Engine/StaticMesh.h"
 #include "Kismet/KismetRenderingLibrary.h"
 #include "ComputeShaderGeneral.h"
 #include "Engine/Texture2DArray.h"

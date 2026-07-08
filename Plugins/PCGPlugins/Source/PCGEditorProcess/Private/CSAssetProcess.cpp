@@ -405,28 +405,34 @@ UMaterialInstance* UCSAssetProcess::FindOrDuplicateMaterialInstanceAsset(FString
 	return OutMaterialInstance;
 }
 
-//This function has a bug
 UMaterialInstance* UCSAssetProcess::FindOrCreateMaterialInstanceAsset(FString AssetName, FString AssetFolderPath, UMaterialInterface* Parent)
 {
-	FString AssetPath = AssetFolderPath + "/" + AssetName;
-	UMaterialInstance* OutMaterialInstance = FindOrCreateAsset<UMaterialInstance>(AssetName, AssetFolderPath,[&]()
+	if (!Parent) return nullptr;
+
+	FString AssetPath = AssetFolderPath / AssetName;
+
+	if (UEditorAssetLibrary::DoesAssetExist(AssetPath))
 	{
-		IAssetTools &AssetTools = FModuleManager::GetModuleChecked<FAssetToolsModule>("AssetTools").Get();
-		UObject* NewObject = AssetTools.CreateAsset(AssetName, AssetFolderPath, UMaterialInstance::StaticClass(), nullptr);
-		UMaterialInstance* NewMaterialInstance = Cast<UMaterialInstance>(NewObject);
-		// UMaterialInstanceConstant* NewMaterialInstance = FMaterialUtilities::CreateInstancedMaterial(Parent, CreatePackage( *AssetPath), AssetName, RF_Public | RF_Standalone);
-		NewMaterialInstance->InitStaticPermutation();
+		UObject* Existing = UEditorAssetLibrary::LoadAsset(AssetPath);
+		UMaterialInstanceConstant* ExistingMIC = Cast<UMaterialInstanceConstant>(Existing);
+		if (ExistingMIC)
+		{
+			UMaterialEditingLibrary::SetMaterialInstanceParent(ExistingMIC, Parent);
+			return ExistingMIC;
+		}
+		UEditorAssetLibrary::DeleteAsset(AssetPath);
+	}
 
-		NewMaterialInstance->PostEditChange();
+	UPackage* Package = CreatePackage(*AssetPath);
+	UMaterialInstanceConstant* NewMIC = NewObject<UMaterialInstanceConstant>(
+		Package, *AssetName, RF_Public | RF_Standalone);
+	NewMIC->SetParentEditorOnly(Parent);
+	NewMIC->PostEditChange();
 
-		return NewMaterialInstance;
-	});
-	UMaterialInterface* NewInterface =  OutMaterialInstance;
-	
-	UMaterialInstanceConstant* Constant = Cast<UMaterialInstanceConstant>(OutMaterialInstance);
-	UMaterialEditingLibrary::SetMaterialInstanceParent(Constant, Parent);
-	
-	return OutMaterialInstance;;
+	FAssetRegistryModule::AssetCreated(NewMIC);
+	NewMIC->MarkPackageDirty();
+
+	return NewMIC;
 }
 
 void UCSAssetProcess::CreateDebugTexture(AActor* TargetActor, UTextureRenderTarget2D* InDebugView, FString DebugName)

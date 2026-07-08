@@ -1,0 +1,302 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1400" font-family="Consolas, monospace" font-size="12">
+  <defs>
+    <linearGradient id="headerGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2d3748"/>
+      <stop offset="100%" stop-color="#1a202c"/>
+    </linearGradient>
+    <linearGradient id="rtGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#2b6cb0"/>
+      <stop offset="100%" stop-color="#2c5282"/>
+    </linearGradient>
+    <linearGradient id="passGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#38a169"/>
+      <stop offset="100%" stop-color="#276749"/>
+    </linearGradient>
+    <linearGradient id="blendGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#d69e2e"/>
+      <stop offset="100%" stop-color="#b7791f"/>
+    </linearGradient>
+    <linearGradient id="commitGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#e53e3e"/>
+      <stop offset="100%" stop-color="#c53030"/>
+    </linearGradient>
+    <filter id="shadow" x="-2%" y="-2%" width="104%" height="104%">
+      <feDropShadow dx="2" dy="2" stdDeviation="3" flood-opacity="0.3"/>
+    </filter>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#718096"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#63b3ed"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#68d391"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#f6ad55"/>
+    </marker>
+    <marker id="arrowRed" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#fc8181"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="1400" fill="#0d1117" rx="8"/>
+
+  <!-- Title -->
+  <text x="600" y="35" text-anchor="middle" fill="#e2e8f0" font-size="20" font-weight="bold">ComputeShaderLandscapeLayerRuntime.cpp  Architecture Diagram</text>
+  <text x="600" y="55" text-anchor="middle" fill="#718096" font-size="11">ACSRuntimeLandscapeLayer Pipeline &amp; Data Flow</text>
+
+  <!-- ========== CLASS SECTION ========== -->
+  <rect x="30" y="75" width="550" height="140" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1.5" filter="url(#shadow)"/>
+  <rect x="30" y="75" width="550" height="28" rx="6" fill="url(#headerGrad)"/>
+  <text x="45" y="94" fill="#e2e8f0" font-size="13" font-weight="bold">ACSRuntimeLandscapeLayer : ACSRangeGenerator</text>
+
+  <text x="45" y="118" fill="#63b3ed" font-size="11">UPROPERTY</text>
+  <text x="120" y="118" fill="#a0aec0" font-size="11">FRuntimeLayerSettings LayerSettings</text>
+  <text x="45" y="134" fill="#63b3ed" font-size="11">UPROPERTY</text>
+  <text x="120" y="134" fill="#a0aec0" font-size="11">RT_OrigLandscapeData  (RGBA32f, immutable copy)</text>
+  <text x="45" y="150" fill="#63b3ed" font-size="11">UPROPERTY</text>
+  <text x="120" y="150" fill="#a0aec0" font-size="11">RT_LayerAlphaHeight   (RGBA32f, generated)</text>
+  <text x="45" y="166" fill="#63b3ed" font-size="11">UPROPERTY</text>
+  <text x="120" y="166" fill="#a0aec0" font-size="11">RT_BlendResult / RT_DebugView  (RGBA16f)</text>
+  <text x="45" y="182" fill="#63b3ed" font-size="11">UPROPERTY</text>
+  <text x="120" y="182" fill="#a0aec0" font-size="11">ALandscape* TargetLandscape, Box*, UV ranges</text>
+  <text x="45" y="198" fill="#f6ad55" font-size="11">UFUNCTION</text>
+  <text x="120" y="198" fill="#a0aec0" font-size="11">InitRuntimeRT / ReadLandscapeData / GenerateLayerData / BlendLayer / Apply / Commit</text>
+
+  <!-- ========== SHADER CLASS ========== -->
+  <rect x="610" y="75" width="560" height="140" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1.5" filter="url(#shadow)"/>
+  <rect x="610" y="75" width="560" height="28" rx="6" fill="#2d3748"/>
+  <text x="625" y="94" fill="#e2e8f0" font-size="13" font-weight="bold">FCSRuntimeLandscapeLayer : FGlobalShader</text>
+
+  <text x="625" y="118" fill="#d69e2e" font-size="11">Permutations (ERuntimeLayerFunction)</text>
+  <text x="625" y="136" fill="#68d391" font-size="10">0: RL_GENERATENOISEALPHA</text>
+  <text x="820" y="136" fill="#a0aec0" font-size="10">-&gt; writes RW_LayerAlpha</text>
+  <text x="625" y="151" fill="#68d391" font-size="10">1: RL_GENERATENOISEHEIGHT</text>
+  <text x="820" y="151" fill="#a0aec0" font-size="10">-&gt; writes RW_LayerGeneratedHeight</text>
+  <text x="625" y="166" fill="#68d391" font-size="10">2: RL_BLENDALPHA</text>
+  <text x="820" y="166" fill="#a0aec0" font-size="10">-&gt; reads T_Orig + T_Alpha -&gt; RW_BlendResult</text>
+  <text x="625" y="181" fill="#68d391" font-size="10">3: RL_BLENDMATERIALDRIVE</text>
+  <text x="820" y="181" fill="#a0aec0" font-size="10">-&gt; reads T_Orig + T_Alpha + T_Material</text>
+  <text x="625" y="196" fill="#68d391" font-size="10">4: RL_THERMALEROSION</text>
+  <text x="820" y="196" fill="#a0aec0" font-size="10">-&gt; reads T_Orig -&gt; RW_BlendResult</text>
+
+  <!-- ========== PIPELINE HEADER ========== -->
+  <text x="600" y="250" text-anchor="middle" fill="#e2e8f0" font-size="16" font-weight="bold">FullRuntimePipeline()  Execution Flow</text>
+  <line x1="350" y1="258" x2="850" y2="258" stroke="#30363d" stroke-width="1"/>
+
+  <!-- ========== STEP 1: InitRuntimeRT ========== -->
+  <rect x="80" y="280" width="1040" height="90" rx="6" fill="#161b22" stroke="#2b6cb0" stroke-width="1.5" filter="url(#shadow)"/>
+  <rect x="80" y="280" width="1040" height="26" rx="6" fill="url(#rtGrad)"/>
+  <text x="95" y="298" fill="#fff" font-size="13" font-weight="bold">Step 1: InitRuntimeRT()</text>
+  <text x="600" y="298" fill="#bee3f8" font-size="11" text-anchor="middle">Creates 4 Render Targets if null</text>
+
+  <!-- RT boxes -->
+  <rect x="100" y="316" width="220" height="40" rx="4" fill="#1a365d" stroke="#2b6cb0" stroke-width="1"/>
+  <text x="210" y="333" text-anchor="middle" fill="#90cdf4" font-size="11" font-weight="bold">RT_OrigLandscapeData</text>
+  <text x="210" y="348" text-anchor="middle" fill="#718096" font-size="10">256x256 RGBA32f (immutable)</text>
+
+  <rect x="340" y="316" width="220" height="40" rx="4" fill="#1a365d" stroke="#2b6cb0" stroke-width="1"/>
+  <text x="450" y="333" text-anchor="middle" fill="#90cdf4" font-size="11" font-weight="bold">RT_LayerAlphaHeight</text>
+  <text x="450" y="348" text-anchor="middle" fill="#718096" font-size="10">256x256 RGBA32f (generated)</text>
+
+  <rect x="580" y="316" width="220" height="40" rx="4" fill="#1a365d" stroke="#2b6cb0" stroke-width="1"/>
+  <text x="690" y="333" text-anchor="middle" fill="#90cdf4" font-size="11" font-weight="bold">RT_BlendResult</text>
+  <text x="690" y="348" text-anchor="middle" fill="#718096" font-size="10">256x256 RGBA16f</text>
+
+  <rect x="820" y="316" width="220" height="40" rx="4" fill="#1a365d" stroke="#2b6cb0" stroke-width="1"/>
+  <text x="930" y="333" text-anchor="middle" fill="#90cdf4" font-size="11" font-weight="bold">RT_DebugView</text>
+  <text x="930" y="348" text-anchor="middle" fill="#718096" font-size="10">256x256 RGBA16f</text>
+
+  <!-- Arrow 1 to 2 -->
+  <line x1="600" y1="375" x2="600" y2="400" stroke="#718096" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- ========== STEP 2: ReadLandscapeData ========== -->
+  <rect x="80" y="405" width="1040" height="165" rx="6" fill="#161b22" stroke="#805ad5" stroke-width="1.5" filter="url(#shadow)"/>
+  <rect x="80" y="405" width="1040" height="26" rx="6" fill="#553c9a"/>
+  <text x="95" y="423" fill="#fff" font-size="13" font-weight="bold">Step 2: ReadLandscapeData()</text>
+  <text x="600" y="423" fill="#d6bcfa" font-size="11" text-anchor="middle">Reads heightmap from ALandscape via FLandscapeEditDataInterface (#if WITH_EDITOR)</text>
+
+  <!-- Sub-flow inside ReadLandscapeData -->
+  <rect x="100" y="440" width="180" height="50" rx="4" fill="#44337a" stroke="#805ad5" stroke-width="1"/>
+  <text x="190" y="460" text-anchor="middle" fill="#e9d8fd" font-size="10" font-weight="bold">FindLandscape()</text>
+  <text x="190" y="475" text-anchor="middle" fill="#a0aec0" font-size="9">GetWorld() iterator</text>
+
+  <line x1="280" y1="465" x2="310" y2="465" stroke="#805ad5" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="310" y="440" width="220" height="50" rx="4" fill="#44337a" stroke="#805ad5" stroke-width="1"/>
+  <text x="420" y="460" text-anchor="middle" fill="#e9d8fd" font-size="10" font-weight="bold">GetHeightDataFast()</text>
+  <text x="420" y="475" text-anchor="middle" fill="#a0aec0" font-size="9">uint16 -&gt; FLinearColor(Normal, Height)</text>
+
+  <line x1="530" y1="465" x2="560" y2="465" stroke="#805ad5" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="560" y="440" width="240" height="50" rx="4" fill="#44337a" stroke="#805ad5" stroke-width="1"/>
+  <text x="680" y="455" text-anchor="middle" fill="#e9d8fd" font-size="10" font-weight="bold">ResizeTarget() x4</text>
+  <text x="680" y="470" text-anchor="middle" fill="#a0aec0" font-size="9">Resize all RTs to landscape texel size</text>
+  <text x="680" y="483" text-anchor="middle" fill="#a0aec0" font-size="9">(pow-of-2 snapped)</text>
+
+  <line x1="800" y1="465" x2="830" y2="465" stroke="#805ad5" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="830" y="440" width="270" height="50" rx="4" fill="#44337a" stroke="#805ad5" stroke-width="1"/>
+  <text x="965" y="455" text-anchor="middle" fill="#e9d8fd" font-size="10" font-weight="bold">DrawFFloat16ColorsToRenderTarget()</text>
+  <text x="965" y="470" text-anchor="middle" fill="#f6ad55" font-size="9">-&gt; RT_OrigLandscapeData (immutable)</text>
+  <text x="965" y="483" text-anchor="middle" fill="#f6ad55" font-size="9">-&gt; RT_LayerAlphaHeight (initial copy)</text>
+
+  <!-- Data format note -->
+  <rect x="100" y="500" width="1000" height="60" rx="4" fill="#1a202c" stroke="#4a5568" stroke-width="1" stroke-dasharray="4"/>
+  <text x="115" y="516" fill="#d69e2e" font-size="11" font-weight="bold">Texture Data Format (per pixel):</text>
+  <text x="115" y="534" fill="#a0aec0" font-size="10">R = Normal.X    G = Normal.Y    B = Normal.Z    A = WorldHeight (cm)</text>
+  <text x="115" y="550" fill="#718096" font-size="10">UV Range: LandscapeTexMinUV / LandscapeTexUVRange  maps texture UV to landscape world coords</text>
+
+  <!-- Arrow 2 to 3 -->
+  <line x1="600" y1="575" x2="600" y2="600" stroke="#718096" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- ========== STEP 3: GenerateLayerData ========== -->
+  <rect x="80" y="605" width="1040" height="220" rx="6" fill="#161b22" stroke="#38a169" stroke-width="1.5" filter="url(#shadow)"/>
+  <rect x="80" y="605" width="1040" height="26" rx="6" fill="url(#passGrad)"/>
+  <text x="95" y="623" fill="#fff" font-size="13" font-weight="bold">Step 3: GenerateLayerData()</text>
+  <text x="600" y="623" fill="#c6f6d5" font-size="11" text-anchor="middle">GPU Compute: Single pass via RDG (RL_GenerateNoiseAlpha permutation)</text>
+
+  <!-- Input textures -->
+  <rect x="100" y="645" width="200" height="55" rx="4" fill="#22543d" stroke="#38a169" stroke-width="1"/>
+  <text x="200" y="665" text-anchor="middle" fill="#c6f6d5" font-size="10" font-weight="bold">SRV Input</text>
+  <text x="200" y="680" text-anchor="middle" fill="#9ae6b4" font-size="10">T_OrigLandscapeData</text>
+  <text x="200" y="693" text-anchor="middle" fill="#718096" font-size="9">from RT_OrigLandscapeData</text>
+
+  <line x1="300" y1="672" x2="360" y2="672" stroke="#68d391" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+
+  <!-- Shader box -->
+  <rect x="365" y="640" width="470" height="80" rx="4" fill="#1c4532" stroke="#48bb78" stroke-width="2"/>
+  <text x="600" y="660" text-anchor="middle" fill="#68d391" font-size="12" font-weight="bold">GPU: CSRuntimeLandscapeLayerFunction</text>
+  <text x="600" y="678" text-anchor="middle" fill="#c6f6d5" font-size="10">#if RL_GENERATENOISEALPHA</text>
+  <text x="600" y="694" text-anchor="middle" fill="#a0aec0" font-size="9">NoiseAlpha = FBM2D(UV * Freq) * GlobalAlpha * BoxFalloff</text>
+  <text x="600" y="708" text-anchor="middle" fill="#a0aec0" font-size="9">-&gt; RW_LayerAlpha = float4(FinalAlpha, BoxFalloff, Combined, 1.0)</text>
+
+  <!-- Output UAV -->
+  <line x1="835" y1="672" x2="870" y2="672" stroke="#68d391" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+
+  <rect x="875" y="645" width="220" height="55" rx="4" fill="#22543d" stroke="#38a169" stroke-width="1"/>
+  <text x="985" y="665" text-anchor="middle" fill="#c6f6d5" font-size="10" font-weight="bold">UAV Output</text>
+  <text x="985" y="680" text-anchor="middle" fill="#9ae6b4" font-size="10">RW_LayerAlpha</text>
+  <text x="985" y="693" text-anchor="middle" fill="#718096" font-size="9">-&gt; copy to RT_LayerAlphaHeight</text>
+
+  <!-- Parameters -->
+  <rect x="100" y="730" width="995" height="50" rx="4" fill="#1a202c" stroke="#4a5568" stroke-width="1"/>
+  <text x="115" y="748" fill="#d69e2e" font-size="10" font-weight="bold">Shader Parameters:</text>
+  <text x="260" y="748" fill="#a0aec0" font-size="10">ValidUVRange, GlobalAlpha, NoiseFrequency, NoiseAmplitude, FalloffWidth, BoxOrigin, BoxExtent, Sampler</text>
+  <text x="115" y="768" fill="#718096" font-size="9">Dispatched as: FComputeShaderUtils::GetGroupCount(TextureSize, 32)  ThreadGroup [32, 32, 1]</text>
+
+  <!-- RDG note -->
+  <rect x="100" y="790" width="995" height="25" rx="4" fill="#1a202c" stroke="#276749" stroke-width="1" stroke-dasharray="3"/>
+  <text x="600" y="807" text-anchor="middle" fill="#68d391" font-size="10">AddCopyTexturePass: TmpRDG_AlphaHeight -&gt; RT_LayerAlphaHeight  |  TmpRDG_Debug -&gt; RT_DebugView  |  FlushRenderingCommands()</text>
+
+  <!-- Arrow 3 to 4 -->
+  <line x1="600" y1="830" x2="600" y2="855" stroke="#718096" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- ========== STEP 4: BlendLayer ========== -->
+  <rect x="80" y="860" width="1040" height="215" rx="6" fill="#161b22" stroke="#d69e2e" stroke-width="1.5" filter="url(#shadow)"/>
+  <rect x="80" y="860" width="1040" height="26" rx="6" fill="url(#blendGrad)"/>
+  <text x="95" y="878" fill="#fff" font-size="13" font-weight="bold">Step 4: BlendLayer()</text>
+  <text x="600" y="878" fill="#fefcbf" font-size="11" text-anchor="middle">GPU Compute: Blend original landscape with generated layer (RL_BlendAlpha or RL_BlendMaterialDrive)</text>
+
+  <!-- Two input textures -->
+  <rect x="100" y="900" width="200" height="55" rx="4" fill="#744210" stroke="#d69e2e" stroke-width="1"/>
+  <text x="200" y="920" text-anchor="middle" fill="#fefcbf" font-size="10" font-weight="bold">SRV: T_OrigLandscapeData</text>
+  <text x="200" y="935" text-anchor="middle" fill="#f6e05e" font-size="10">from RT_OrigLandscapeData</text>
+  <text x="200" y="948" text-anchor="middle" fill="#718096" font-size="9">(unmodified original)</text>
+
+  <rect x="100" y="960" width="200" height="55" rx="4" fill="#744210" stroke="#d69e2e" stroke-width="1"/>
+  <text x="200" y="980" text-anchor="middle" fill="#fefcbf" font-size="10" font-weight="bold">SRV: T_AlphaTexture</text>
+  <text x="200" y="995" text-anchor="middle" fill="#f6e05e" font-size="10">from RT_LayerAlphaHeight</text>
+  <text x="200" y="1008" text-anchor="middle" fill="#718096" font-size="9">(generated alpha+height)</text>
+
+  <line x1="300" y1="927" x2="360" y2="940" stroke="#f6ad55" stroke-width="1.5" marker-end="url(#arrowOrange)"/>
+  <line x1="300" y1="987" x2="360" y2="960" stroke="#f6ad55" stroke-width="1.5" marker-end="url(#arrowOrange)"/>
+
+  <!-- Blend Shader -->
+  <rect x="365" y="895" width="470" height="85" rx="4" fill="#5a3a00" stroke="#ecc94b" stroke-width="2"/>
+  <text x="600" y="916" text-anchor="middle" fill="#f6e05e" font-size="12" font-weight="bold">GPU: CSRuntimeLandscapeLayerFunction</text>
+  <text x="600" y="934" text-anchor="middle" fill="#fefcbf" font-size="10">#if RL_BLENDALPHA / RL_BLENDMATERIALDRIVE</text>
+  <text x="600" y="950" text-anchor="middle" fill="#a0aec0" font-size="9">Alpha = LayerData.r * GlobalAlpha * BoxFalloff</text>
+  <text x="600" y="964" text-anchor="middle" fill="#a0aec0" font-size="9">BlendedHeight = Orig.a*(1-a) + Generated.a*a    BlendedNormal = lerp(OrigN, GenN, a)</text>
+
+  <!-- Output -->
+  <line x1="835" y1="937" x2="870" y2="937" stroke="#f6ad55" stroke-width="1.5" marker-end="url(#arrowOrange)"/>
+
+  <rect x="875" y="910" width="220" height="55" rx="4" fill="#744210" stroke="#d69e2e" stroke-width="1"/>
+  <text x="985" y="930" text-anchor="middle" fill="#fefcbf" font-size="10" font-weight="bold">UAV Output</text>
+  <text x="985" y="945" text-anchor="middle" fill="#f6e05e" font-size="10">RW_BlendResult</text>
+  <text x="985" y="958" text-anchor="middle" fill="#718096" font-size="9">-&gt; copy to RT_BlendResult</text>
+
+  <!-- MaterialDrive note -->
+  <rect x="100" y="1020" width="995" height="40" rx="4" fill="#1a202c" stroke="#4a5568" stroke-width="1"/>
+  <text x="115" y="1037" fill="#d69e2e" font-size="10" font-weight="bold">MaterialDrive Mode:</text>
+  <text x="270" y="1037" fill="#a0aec0" font-size="10">T_AlphaTexture overridden by MaterialBlendTexture (R=alpha, G=heightMod, B=normalStr)</text>
+  <text x="115" y="1052" fill="#718096" font-size="9">Output: float4(BlendedNormal * 0.5 + 0.5, BlendedHeight) -&gt; RW_BlendResult -&gt; RT_BlendResult  |  Debug -&gt; RT_DebugView</text>
+
+  <!-- Arrow 4 to 5 -->
+  <line x1="600" y1="1080" x2="600" y2="1105" stroke="#718096" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- ========== STEP 5: ApplyToLandscape ========== -->
+  <rect x="80" y="1110" width="500" height="85" rx="6" fill="#161b22" stroke="#e53e3e" stroke-width="1.5" filter="url(#shadow)"/>
+  <rect x="80" y="1110" width="500" height="26" rx="6" fill="url(#commitGrad)"/>
+  <text x="95" y="1128" fill="#fff" font-size="13" font-weight="bold">Step 5: ApplyToLandscape()</text>
+
+  <text x="95" y="1152" fill="#a0aec0" font-size="10">bHasRuntimeResult = true</text>
+  <text x="95" y="1168" fill="#fc8181" font-size="10" font-weight="bold">if (bAutoCommit) -&gt; CommitToLandscape()</text>
+  <text x="95" y="1184" fill="#718096" font-size="9">ReadRenderTargetRaw -&gt; GetTexHeight -&gt; SetHeightData -&gt; RequestLayersContentUpdate</text>
+
+  <!-- Manager box -->
+  <rect x="620" y="1110" width="500" height="85" rx="6" fill="#161b22" stroke="#4a5568" stroke-width="1.5" filter="url(#shadow)"/>
+  <rect x="620" y="1110" width="500" height="26" rx="6" fill="#2d3748"/>
+  <text x="635" y="1128" fill="#e2e8f0" font-size="13" font-weight="bold">ACSRuntimeLandscapeLayerManager</text>
+
+  <text x="635" y="1152" fill="#a0aec0" font-size="10">TArray&lt;ACSRuntimeLandscapeLayer*&gt; ActiveLayers</text>
+  <text x="635" y="1168" fill="#a0aec0" font-size="10">RunAllLayers(): foreach Layer -&gt; FullRuntimePipeline()</text>
+  <text x="635" y="1184" fill="#718096" font-size="9">bAutoFindLandscape, bAutoRunOnBeginPlay</text>
+
+  <!-- ========== DATA FLOW LEGEND ========== -->
+  <rect x="80" y="1220" width="1040" height="155" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="95" y="1242" fill="#e2e8f0" font-size="13" font-weight="bold">Render Target Data Flow Summary</text>
+
+  <!-- RT flow diagram -->
+  <rect x="100" y="1258" width="140" height="30" rx="3" fill="#1a365d" stroke="#2b6cb0"/>
+  <text x="170" y="1278" text-anchor="middle" fill="#90cdf4" font-size="10">RT_OrigLandscape</text>
+
+  <line x1="240" y1="1273" x2="280" y2="1273" stroke="#63b3ed" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+  <text x="260" y="1266" text-anchor="middle" fill="#718096" font-size="8">ReadOnly</text>
+
+  <rect x="285" y="1258" width="100" height="30" rx="3" fill="#22543d" stroke="#38a169"/>
+  <text x="335" y="1278" text-anchor="middle" fill="#9ae6b4" font-size="10">Generate</text>
+
+  <rect x="100" y="1298" width="140" height="30" rx="3" fill="#1a365d" stroke="#2b6cb0"/>
+  <text x="170" y="1318" text-anchor="middle" fill="#90cdf4" font-size="10">RT_LayerAlpha</text>
+
+  <line x1="240" y1="1313" x2="280" y2="1313" stroke="#63b3ed" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+  <text x="260" y="1306" text-anchor="middle" fill="#718096" font-size="8">Overwrite</text>
+
+  <line x1="385" y1="1273" x2="430" y2="1273" stroke="#68d391" stroke-width="1.5"/>
+  <line x1="430" y1="1273" x2="430" y2="1295" stroke="#68d391" stroke-width="1.5"/>
+  <line x1="430" y1="1295" x2="460" y2="1295" stroke="#68d391" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+  <line x1="240" y1="1313" x2="460" y2="1295" stroke="#63b3ed" stroke-width="1.5" marker-end="url(#arrowBlue)" stroke-dasharray="4"/>
+
+  <rect x="465" y="1278" width="80" height="30" rx="3" fill="#5a3a00" stroke="#d69e2e"/>
+  <text x="505" y="1298" text-anchor="middle" fill="#f6e05e" font-size="10">Blend</text>
+
+  <line x1="545" y1="1293" x2="590" y2="1293" stroke="#f6ad55" stroke-width="1.5" marker-end="url(#arrowOrange)"/>
+
+  <rect x="595" y="1278" width="140" height="30" rx="3" fill="#1a365d" stroke="#2b6cb0"/>
+  <text x="665" y="1298" text-anchor="middle" fill="#90cdf4" font-size="10">RT_BlendResult</text>
+
+  <line x1="735" y1="1293" x2="780" y2="1293" stroke="#fc8181" stroke-width="1.5" marker-end="url(#arrowRed)"/>
+
+  <rect x="785" y="1278" width="140" height="30" rx="3" fill="#742a2a" stroke="#e53e3e"/>
+  <text x="855" y="1298" text-anchor="middle" fill="#feb2b2" font-size="10">Landscape HM</text>
+  <text x="855" y="1340" text-anchor="middle" fill="#718096" font-size="9">(CommitToLandscape)</text>
+
+  <!-- Key insight -->
+  <rect x="100" y="1340" width="600" height="25" rx="3" fill="#1a202c" stroke="#4a5568" stroke-width="1" stroke-dasharray="3"/>
+  <text x="115" y="1357" fill="#68d391" font-size="10">Key Fix: RT_OrigLandscapeData preserves original data; BlendLayer reads it separately from generated RT_LayerAlphaHeight</text>
+</svg>

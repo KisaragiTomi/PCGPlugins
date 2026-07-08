@@ -203,7 +203,9 @@ ACSShallowWaterCapture::ACSShallowWaterCapture(const FObjectInitializer& ObjectI
 	ReusltMesh->SetupAttachment(SceneRoot, TEXT("VisualizationMesh"));
 	SimVisHISM = CreateDefaultSubobject<UHierarchicalInstancedStaticMeshComponent>(TEXT("SimVisHISM"));
 	SimVisHISM->SetupAttachment(SceneRoot, TEXT("SimVisHISM"));
+#if WITH_EDITOR
 	SimVisHISM->SetIsVisualizationComponent(true);
+#endif
 	SimVisHISM->SetVisibility(false);
 	SimVisHISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	SimVisHISM->SetCastShadow(false);

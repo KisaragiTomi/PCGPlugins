@@ -62,14 +62,23 @@ public class ComputeShaderGenerator : ModuleRules
 				"Foliage",
 				"MeshDescription",
 				"StaticMeshDescription",
-				"UnrealEd",
 				"GeometryAlgorithms",
 				"ModelingComponents",
-				"ModelingComponentsEditorOnly",
 				"AssetRegistry",
-				"EditorScriptingUtilities",
 			}
 			);
+
+		if (Target.Type == TargetType.Editor)
+		{
+			PrivateDependencyModuleNames.AddRange(
+				new string[]
+				{
+					"UnrealEd",
+					"ModelingComponentsEditorOnly",
+					"EditorScriptingUtilities",
+				}
+			);
+		}
 
 		AddEngineThirdPartyPrivateStaticDependencies(Target,
 			"IntelTBB",

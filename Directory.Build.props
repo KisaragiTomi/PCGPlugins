@@ -1,0 +1,5 @@
+<Project>
+  <PropertyGroup>
+    <VCTargetsPath Condition="!Exists('$(VCTargetsPath)\Microsoft.Cpp.Default.props')">C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\VC\v170\</VCTargetsPath>
+  </PropertyGroup>
+</Project>

@@ -455,16 +455,6 @@ public:
 	int32 SurfaceVoxelBlurRadius = 1;
 
 	// -------------------------------------------------------------------------
-	// Dirty Cache System
-	// -------------------------------------------------------------------------
-
-	TObjectPtr<UTextureRenderTarget2D> VoxelMetaRT;
-
-	TObjectPtr<UTextureRenderTarget2D> TriangleVertexRT;
-
-	TObjectPtr<UTextureRenderTarget2D> TriangleNormalRT;
-
-	// -------------------------------------------------------------------------
 	// Core System - Generated Data Cache
 	// -------------------------------------------------------------------------
 
@@ -487,58 +477,6 @@ public:
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Mesh|Debug")
 	int64 GeneratorTimeCode = -1;
-
-	// -------------------------------------------------------------------------
-	// Brush System
-	// -------------------------------------------------------------------------
-
-	static FCSInstanceBrushEditorRequest OnInstanceBrushEditorRequest;
-
-	TObjectPtr<UStaticMesh> InstanceBrushMesh = nullptr;
-
-	float InstanceBrushRadius = 500.0f;
-
-	int32 InstanceBrushSamplesPerMouseMove = 16;
-
-	float InstanceBrushMinSpacing = 100.0f;
-
-	float InstanceBrushTraceRadius = 0.0f;
-
-	float InstanceBrushPreviewPointSize = 8.0f;
-
-	float InstanceBrushPreviewLifetime = 0.1f;
-
-	bool bInstanceBrushAlignToNormal = true;
-
-	bool bInstanceBrushUseGeneratorBounds = true;
-
-	bool bInstanceBrushExitAfterCommit = false;
-
-	FVector2D InstanceBrushUniformScaleRange = FVector2D(1.0f, 1.0f);
-
-	float InstanceBrushRandomYawDegrees = 360.0f;
-
-	TArray<FCSInstancePaintComponentSlot> PaintedInstanceComponents;
-
-	/** Opens the editor-side instance brush tool for this generator. */
-	UFUNCTION(BlueprintCallable, CallInEditor, Category = "CS Mesh Generator|Instance Brush", meta = (DevelopmentOnly))
-	void StartInstanceBrush();
-
-	/** Finds or creates the HISM component used to store painted instances for the given mesh. */
-	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Instance Brush")
-	UHierarchicalInstancedStaticMeshComponent* GetOrCreatePaintComponent(UStaticMesh* Mesh);
-
-	/** Returns the existing painted-instance component for a mesh, or nullptr if none exists. */
-	UFUNCTION(BlueprintPure, Category = "CS Mesh Generator|Instance Brush")
-	UHierarchicalInstancedStaticMeshComponent* FindPaintComponent(UStaticMesh* Mesh) const;
-
-	/** Appends world-space instance transforms to the paint component for Mesh and returns the added count. */
-	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Instance Brush")
-	int32 CommitPaintInstances(const TArray<FTransform>& WorldTransforms, UStaticMesh* Mesh);
-
-	/** Tests whether a brush placement point is inside the generator bounds when bounds filtering is enabled. */
-	UFUNCTION(BlueprintPure, Category = "CS Mesh Generator|Instance Brush")
-	bool IsInstanceBrushPointAllowed(const FVector& WorldPosition) const;
 
 	// -------------------------------------------------------------------------
 	// Core System - Scene Extraction and Mesh Output
@@ -761,11 +699,6 @@ public:
 	int32 DrawDebugBoxSceneSurfaceVoxelDirections(
 		const FCSDebugBoxVoxelDirectionOptions& Options);
 
-	/** Draws active cache voxel cells, optionally limited to one request and including the cache bounds. */
-	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Triangle Cache|Debug", meta = (DevelopmentOnly))
-	int32 DrawDebugActiveVoxels(
-		const FCSDebugActiveVoxelOptions& Options = FCSDebugActiveVoxelOptions()) const;
-
 	/** Spawns a temporary ADynamicMeshActor at this actor's location,
 	 *  converts CachedSurfaceTriangles into a DynamicMesh,
 	 *  and destroys the actor after LifetimeSeconds. */
@@ -783,51 +716,6 @@ public:
 	/** Updates DynamicMeshComponent culling settings after geometry or bounds-scale changes. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh")
 	void RefreshDynamicMeshComponentCullingBounds(float BoundsScale = -1.0f);
-
-	// -------------------------------------------------------------------------
-	// Dirty Cache System
-	// -------------------------------------------------------------------------
-
-	/** Ensures the triangle cache covers the request's active cells and refreshes dirty pages as needed. */
-	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Triangle Cache")
-	virtual FCSMeshGeneratorTriangleCacheHandle EnsureTriangleCache(const FCSMeshGeneratorTriangleCacheRequest& Request);
-
-	/** Ensures a default bounds-based cache request using the current GeneratorBounds. */
-	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Triangle Cache")
-	virtual FCSMeshGeneratorTriangleCacheHandle EnsureTriangleCacheByBox(
-		FName RequestId,
-		bool bForceFullRebuild = false);
-
-	/** Ensures a bounds-based cache request using an explicit box center and extent. */
-	virtual FCSMeshGeneratorTriangleCacheHandle EnsureTriangleCacheByBox(
-		FName RequestId,
-		const FVector& BoxCenter,
-		const FVector& BoxExtent,
-		bool bForceFullRebuild = false);
-
-	/** Refreshes the default GeneratorBounds-based cache request. */
-	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Triangle Cache")
-	virtual void UpdateMeshGeneratorCacheByBox(bool bForceFullRebuild = false);
-
-	/** Removes a persistent cache interest request and frees cells no longer needed by any request. */
-	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Triangle Cache")
-	virtual void ReleaseTriangleCacheRequest(FName RequestId);
-
-	/** Clears all cache requests, active cells, dirty state, and GPU cache render targets. */
-	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Triangle Cache")
-	virtual void ClearMeshGeneratorCache();
-
-	/** Marks every currently active voxel page dirty so the next update rewrites cached triangle data. */
-	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Triangle Cache")
-	virtual void MarkAllActiveVoxelsDirty();
-
-	/** Returns a lightweight summary of the current triangle-cache state. */
-	UFUNCTION(BlueprintPure, Category = "CS Mesh Generator|Triangle Cache")
-	FCSMeshGeneratorTriangleCacheHandle GetTriangleCacheHandle() const;
-
-	/** Returns the world-space bounds currently covered by the triangle cache. */
-	UFUNCTION(BlueprintPure, Category = "CS Mesh Generator|Triangle Cache")
-	FBox GetCachedWorldBounds() const { return CacheState.CachedWorldBounds; }
 
 protected:
 	// -------------------------------------------------------------------------
@@ -855,45 +743,8 @@ protected:
 	/** Releases transient GPU resources when the actor leaves play. */
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
-	// -------------------------------------------------------------------------
-	// Dirty Cache System - Internals
-	// -------------------------------------------------------------------------
-
-	/** Returns true when cache settings or bounds changed enough to require recreating all cache resources. */
-	virtual bool DoesInputRequireFullRebuild(const FBox& InputWorldBounds) const;
-	/** Reinitializes cache state, render targets, and page mappings for the supplied world bounds. */
-	virtual void RebuildCacheResources(const FBox& InputWorldBounds);
-	/** Builds active cache cells around this actor's ReferencePoints using ActivationRadius. */
-	virtual void BuildActiveCellsFromReferencePoints(float ActivationRadius, TSet<FIntVector>& OutCells) const;
-	/** Builds active cache cells around the supplied reference points using ActivationRadius. */
-	virtual void BuildActiveCellsFromReferencePoints(const TArray<FVector>& InReferencePoints, float ActivationRadius, TSet<FIntVector>& OutCells) const;
-	/** Combines all persistent request cell sets into one active-cell set. */
-	virtual void BuildUnionActiveCells(TSet<FIntVector>& OutCells) const;
-	/** Computes cells to activate/deactivate by comparing NewActiveCells against the current cache state. */
-	virtual void DiffActiveCells(const TSet<FIntVector>& NewActiveCells);
-	/** Assigns free cache texture pages to newly active cells. */
-	virtual void AllocatePagesForCells(const TSet<FIntVector>& Cells);
-	/** Frees cache texture pages for cells that are no longer active. */
-	virtual void ReleasePagesForCells(const TSet<FIntVector>& Cells);
-	/** Queues render-thread compute work to rewrite triangle-cache pages marked dirty. */
-	virtual void DispatchDirtyVoxelTriangleCacheUpdate();
-
 	/** Returns the current GeneratorBounds component as a valid world-space box when possible. */
 	FBox GetGeneratorBoundsWorldBox() const;
-	/** Computes the integer voxel-grid dimensions needed to cover InputWorldBounds. */
-	FIntVector ComputeGridSize(const FBox& InputWorldBounds) const;
-	/** Converts a world position into a clamped cache voxel key. */
-	FIntVector WorldPositionToCell(FVector WorldPosition) const;
-	/** Returns the world-space bounds for a single cache voxel cell. */
-	FBox GetCellWorldBounds(const FIntVector& Cell) const;
-	/** Releases transient render targets used by the triangle cache. */
-	void ReleaseCacheResources();
-	/** Clears runtime cache state and optionally removes persistent cache requests. */
-	void ResetCacheRuntime(bool bClearRequests);
-	/** Populates the free-page stack for all available cache pages. */
-	void InitializeFreePages();
-	/** Allocates UAV-capable render targets sized for cache metadata, triangle vertices, and triangle normals. */
-	void CreateCacheRenderTargets();
 	/** Stores CPU triangle data into generated-data texture targets and updates LastTriangleTextureData. */
 	void StoreTriangleTextureData(const FCSTriangleMeshData& TriangleData, float ReferenceFilterDistance, FBox SourceWorldBounds = FBox(ForceInit));
 	/** Stores CPU surface-voxel data into generated-data texture targets and updates LastSurfaceVoxelTextureData. */
@@ -904,17 +755,4 @@ protected:
 	void ClearSurfaceVoxelTextureData();
 	/** Gets or allocates a transient generated-data render target with the requested size. */
 	UTextureRenderTarget2D* GetOrCreateGeneratedDataRenderTarget(TObjectPtr<UTextureRenderTarget2D>& RenderTarget, const TCHAR* BaseName, int32 Width, int32 Height);
-	/** Rebuilds per-request active-cell sets from LastRequests after a cache resource rebuild. */
-	void RebuildRequestActiveCellsFromLastRequests();
-	/** Checks whether triangle-cache render targets exist and can be written by compute shaders. */
-	bool HasValidCacheResources() const;
-	/** Compares two bounds using VoxelGridSettings.BoundsTolerance for cache reuse decisions. */
-	bool AreBoundsCompatible(const FBox& A, const FBox& B) const;
-	/** Converts NAME_None into the class default cache request id. */
-	FName NormalizeRequestId(FName RequestId) const;
-
-	FCSMeshGeneratorVoxelCacheState CacheState;
-
-	TMap<FName, TSet<FIntVector>> RequestActiveCells;
-	TMap<FName, FCSMeshGeneratorTriangleCacheRequest> LastRequests;
 };

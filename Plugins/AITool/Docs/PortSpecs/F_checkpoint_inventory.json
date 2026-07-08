@@ -1,0 +1,1793 @@
+{
+  "checkpoint": "C:/Users/KLW/.cache/torch/hub/checkpoints/ks.pth",
+  "zip_pickle_prefix": "archive/",
+  "top_level_structure": {
+    "state_dict": "dict(len=213)"
+  },
+  "num_state_dict_keys": 213,
+  "total_float_params": 14383065,
+  "total_elements": 14383065,
+  "dtype_counts": {
+    "float32": 213
+  },
+  "prefix_groups": {
+    "encoder.blocks": {
+      "count": 15,
+      "numel": 15552,
+      "example_keys": [
+        "encoder.blocks.0.fc_0.bias float32 [32]",
+        "encoder.blocks.0.fc_0.weight float32 [32, 64]",
+        "encoder.blocks.0.fc_1.bias float32 [32]",
+        "encoder.blocks.0.fc_1.weight float32 [32, 32]"
+      ]
+    },
+    "encoder.fc_c": {
+      "count": 2,
+      "numel": 1056,
+      "example_keys": [
+        "encoder.fc_c.bias float32 [32]",
+        "encoder.fc_c.weight float32 [32, 32]"
+      ]
+    },
+    "encoder.fc_pos": {
+      "count": 2,
+      "numel": 448,
+      "example_keys": [
+        "encoder.fc_pos.bias float32 [64]",
+        "encoder.fc_pos.weight float32 [64, 6]"
+      ]
+    },
+    "interpolators.0": {
+      "count": 8,
+      "numel": 692,
+      "example_keys": [
+        "interpolators.0.mlp.layers.0.bias float32 [16]",
+        "interpolators.0.mlp.layers.0.weight float32 [16, 4]",
+        "interpolators.0.mlp.layers.2.bias float32 [16]",
+        "interpolators.0.mlp.layers.2.weight float32 [16, 16]"
+      ]
+    },
+    "interpolators.1": {
+      "count": 8,
+      "numel": 692,
+      "example_keys": [
+        "interpolators.1.mlp.layers.0.bias float32 [16]",
+        "interpolators.1.mlp.layers.0.weight float32 [16, 4]",
+        "interpolators.1.mlp.layers.2.bias float32 [16]",
+        "interpolators.1.mlp.layers.2.weight float32 [16, 16]"
+      ]
+    },
+    "interpolators.2": {
+      "count": 8,
+      "numel": 692,
+      "example_keys": [
+        "interpolators.2.mlp.layers.0.bias float32 [16]",
+        "interpolators.2.mlp.layers.0.weight float32 [16, 4]",
+        "interpolators.2.mlp.layers.2.bias float32 [16]",
+        "interpolators.2.mlp.layers.2.weight float32 [16, 16]"
+      ]
+    },
+    "interpolators.3": {
+      "count": 8,
+      "numel": 692,
+      "example_keys": [
+        "interpolators.3.mlp.layers.0.bias float32 [16]",
+        "interpolators.3.mlp.layers.0.weight float32 [16, 4]",
+        "interpolators.3.mlp.layers.2.bias float32 [16]",
+        "interpolators.3.mlp.layers.2.weight float32 [16, 16]"
+      ]
+    },
+    "udf_decoder.blocks": {
+      "count": 8,
+      "numel": 4224,
+      "example_keys": [
+        "udf_decoder.blocks.0.fc_0.bias float32 [32]",
+        "udf_decoder.blocks.0.fc_0.weight float32 [32, 32]",
+        "udf_decoder.blocks.0.fc_1.bias float32 [32]",
+        "udf_decoder.blocks.0.fc_1.weight float32 [32, 32]"
+      ]
+    },
+    "udf_decoder.fc_c": {
+      "count": 4,
+      "numel": 4160,
+      "example_keys": [
+        "udf_decoder.fc_c.0.bias float32 [32]",
+        "udf_decoder.fc_c.0.weight float32 [32, 64]",
+        "udf_decoder.fc_c.1.bias float32 [32]",
+        "udf_decoder.fc_c.1.weight float32 [32, 64]"
+      ]
+    },
+    "udf_decoder.fc_out": {
+      "count": 2,
+      "numel": 33,
+      "example_keys": [
+        "udf_decoder.fc_out.bias float32 [1]",
+        "udf_decoder.fc_out.weight float32 [1, 32]"
+      ]
+    },
+    "udf_decoder.fc_p": {
+      "count": 2,
+      "numel": 224,
+      "example_keys": [
+        "udf_decoder.fc_p.bias float32 [32]",
+        "udf_decoder.fc_p.weight float32 [32, 6]"
+      ]
+    },
+    "unet.basis_heads": {
+      "count": 44,
+      "numel": 3168464,
+      "example_keys": [
+        "unet.basis_heads.Basis-1.OneConv0.Conv.kernel float32 [64, 64]",
+        "unet.basis_heads.Basis-1.OneConv0.GroupNorm.bias float32 [64]",
+        "unet.basis_heads.Basis-1.OneConv0.GroupNorm.weight float32 [64]",
+        "unet.basis_heads.Basis-1.OutConv.bias float32 [4]"
+      ]
+    },
+    "unet.decoders": {
+      "count": 18,
+      "numel": 2324224,
+      "example_keys": [
+        "unet.decoders.Dec-2.SingleConv1.Conv.kernel float32 [27, 384, 128]",
+        "unet.decoders.Dec-2.SingleConv1.GroupNorm.bias float32 [384]",
+        "unet.decoders.Dec-2.SingleConv1.GroupNorm.weight float32 [384]",
+        "unet.decoders.Dec-2.SingleConv2.Conv.kernel float32 [27, 128, 128]"
+      ]
+    },
+    "unet.encoders": {
+      "count": 24,
+      "numel": 1798144,
+      "example_keys": [
+        "unet.encoders.Enc0.SingleConv1.Conv.kernel float32 [27, 32, 32]",
+        "unet.encoders.Enc0.SingleConv1.GroupNorm.bias float32 [32]",
+        "unet.encoders.Enc0.SingleConv1.GroupNorm.weight float32 [32]",
+        "unet.encoders.Enc0.SingleConv2.Conv.kernel float32 [27, 32, 32]"
+      ]
+    },
+    "unet.udf_heads": {
+      "count": 20,
+      "numel": 2358784,
+      "example_keys": [
+        "unet.udf_heads.UDF-1.OutConv.bias float32 [16]",
+        "unet.udf_heads.UDF-1.OutConv.kernel float32 [256, 16]",
+        "unet.udf_heads.UDF-1.SingleConv.Conv.kernel float32 [27, 256, 256]",
+        "unet.udf_heads.UDF-1.SingleConv.GroupNorm.bias float32 [256]"
+      ]
+    },
+    "unet.normal_heads": {
+      "count": 20,
+      "numel": 2352492,
+      "example_keys": [
+        "unet.normal_heads.Normal-1.OutConv.bias float32 [3]",
+        "unet.normal_heads.Normal-1.OutConv.kernel float32 [256, 3]",
+        "unet.normal_heads.Normal-1.SingleConv.Conv.kernel float32 [27, 256, 256]",
+        "unet.normal_heads.Normal-1.SingleConv.GroupNorm.bias float32 [256]"
+      ]
+    },
+    "unet.struct_heads": {
+      "count": 20,
+      "numel": 2352492,
+      "example_keys": [
+        "unet.struct_heads.Struct-1.OutConv.bias float32 [3]",
+        "unet.struct_heads.Struct-1.OutConv.kernel float32 [256, 3]",
+        "unet.struct_heads.Struct-1.SingleConv.Conv.kernel float32 [27, 256, 256]",
+        "unet.struct_heads.Struct-1.SingleConv.GroupNorm.bias float32 [256]"
+      ]
+    }
+  },
+  "state_dict": {
+    "encoder.blocks.0.fc_0.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "encoder.blocks.0.fc_0.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        64
+      ],
+      "numel": 2048
+    },
+    "encoder.blocks.0.fc_1.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "encoder.blocks.0.fc_1.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        32
+      ],
+      "numel": 1024
+    },
+    "encoder.blocks.0.shortcut.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        64
+      ],
+      "numel": 2048
+    },
+    "encoder.blocks.1.fc_0.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "encoder.blocks.1.fc_0.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        64
+      ],
+      "numel": 2048
+    },
+    "encoder.blocks.1.fc_1.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "encoder.blocks.1.fc_1.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        32
+      ],
+      "numel": 1024
+    },
+    "encoder.blocks.1.shortcut.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        64
+      ],
+      "numel": 2048
+    },
+    "encoder.blocks.2.fc_0.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "encoder.blocks.2.fc_0.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        64
+      ],
+      "numel": 2048
+    },
+    "encoder.blocks.2.fc_1.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "encoder.blocks.2.fc_1.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        32
+      ],
+      "numel": 1024
+    },
+    "encoder.blocks.2.shortcut.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        64
+      ],
+      "numel": 2048
+    },
+    "encoder.fc_c.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "encoder.fc_c.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        32
+      ],
+      "numel": 1024
+    },
+    "encoder.fc_pos.bias": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "encoder.fc_pos.weight": {
+      "dtype": "float32",
+      "shape": [
+        64,
+        6
+      ],
+      "numel": 384
+    },
+    "interpolators.0.mlp.layers.0.bias": {
+      "dtype": "float32",
+      "shape": [
+        16
+      ],
+      "numel": 16
+    },
+    "interpolators.0.mlp.layers.0.weight": {
+      "dtype": "float32",
+      "shape": [
+        16,
+        4
+      ],
+      "numel": 64
+    },
+    "interpolators.0.mlp.layers.2.bias": {
+      "dtype": "float32",
+      "shape": [
+        16
+      ],
+      "numel": 16
+    },
+    "interpolators.0.mlp.layers.2.weight": {
+      "dtype": "float32",
+      "shape": [
+        16,
+        16
+      ],
+      "numel": 256
+    },
+    "interpolators.0.mlp.layers.4.bias": {
+      "dtype": "float32",
+      "shape": [
+        16
+      ],
+      "numel": 16
+    },
+    "interpolators.0.mlp.layers.4.weight": {
+      "dtype": "float32",
+      "shape": [
+        16,
+        16
+      ],
+      "numel": 256
+    },
+    "interpolators.0.mlp.layers.6.bias": {
+      "dtype": "float32",
+      "shape": [
+        4
+      ],
+      "numel": 4
+    },
+    "interpolators.0.mlp.layers.6.weight": {
+      "dtype": "float32",
+      "shape": [
+        4,
+        16
+      ],
+      "numel": 64
+    },
+    "interpolators.1.mlp.layers.0.bias": {
+      "dtype": "float32",
+      "shape": [
+        16
+      ],
+      "numel": 16
+    },
+    "interpolators.1.mlp.layers.0.weight": {
+      "dtype": "float32",
+      "shape": [
+        16,
+        4
+      ],
+      "numel": 64
+    },
+    "interpolators.1.mlp.layers.2.bias": {
+      "dtype": "float32",
+      "shape": [
+        16
+      ],
+      "numel": 16
+    },
+    "interpolators.1.mlp.layers.2.weight": {
+      "dtype": "float32",
+      "shape": [
+        16,
+        16
+      ],
+      "numel": 256
+    },
+    "interpolators.1.mlp.layers.4.bias": {
+      "dtype": "float32",
+      "shape": [
+        16
+      ],
+      "numel": 16
+    },
+    "interpolators.1.mlp.layers.4.weight": {
+      "dtype": "float32",
+      "shape": [
+        16,
+        16
+      ],
+      "numel": 256
+    },
+    "interpolators.1.mlp.layers.6.bias": {
+      "dtype": "float32",
+      "shape": [
+        4
+      ],
+      "numel": 4
+    },
+    "interpolators.1.mlp.layers.6.weight": {
+      "dtype": "float32",
+      "shape": [
+        4,
+        16
+      ],
+      "numel": 64
+    },
+    "interpolators.2.mlp.layers.0.bias": {
+      "dtype": "float32",
+      "shape": [
+        16
+      ],
+      "numel": 16
+    },
+    "interpolators.2.mlp.layers.0.weight": {
+      "dtype": "float32",
+      "shape": [
+        16,
+        4
+      ],
+      "numel": 64
+    },
+    "interpolators.2.mlp.layers.2.bias": {
+      "dtype": "float32",
+      "shape": [
+        16
+      ],
+      "numel": 16
+    },
+    "interpolators.2.mlp.layers.2.weight": {
+      "dtype": "float32",
+      "shape": [
+        16,
+        16
+      ],
+      "numel": 256
+    },
+    "interpolators.2.mlp.layers.4.bias": {
+      "dtype": "float32",
+      "shape": [
+        16
+      ],
+      "numel": 16
+    },
+    "interpolators.2.mlp.layers.4.weight": {
+      "dtype": "float32",
+      "shape": [
+        16,
+        16
+      ],
+      "numel": 256
+    },
+    "interpolators.2.mlp.layers.6.bias": {
+      "dtype": "float32",
+      "shape": [
+        4
+      ],
+      "numel": 4
+    },
+    "interpolators.2.mlp.layers.6.weight": {
+      "dtype": "float32",
+      "shape": [
+        4,
+        16
+      ],
+      "numel": 64
+    },
+    "interpolators.3.mlp.layers.0.bias": {
+      "dtype": "float32",
+      "shape": [
+        16
+      ],
+      "numel": 16
+    },
+    "interpolators.3.mlp.layers.0.weight": {
+      "dtype": "float32",
+      "shape": [
+        16,
+        4
+      ],
+      "numel": 64
+    },
+    "interpolators.3.mlp.layers.2.bias": {
+      "dtype": "float32",
+      "shape": [
+        16
+      ],
+      "numel": 16
+    },
+    "interpolators.3.mlp.layers.2.weight": {
+      "dtype": "float32",
+      "shape": [
+        16,
+        16
+      ],
+      "numel": 256
+    },
+    "interpolators.3.mlp.layers.4.bias": {
+      "dtype": "float32",
+      "shape": [
+        16
+      ],
+      "numel": 16
+    },
+    "interpolators.3.mlp.layers.4.weight": {
+      "dtype": "float32",
+      "shape": [
+        16,
+        16
+      ],
+      "numel": 256
+    },
+    "interpolators.3.mlp.layers.6.bias": {
+      "dtype": "float32",
+      "shape": [
+        4
+      ],
+      "numel": 4
+    },
+    "interpolators.3.mlp.layers.6.weight": {
+      "dtype": "float32",
+      "shape": [
+        4,
+        16
+      ],
+      "numel": 64
+    },
+    "udf_decoder.blocks.0.fc_0.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "udf_decoder.blocks.0.fc_0.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        32
+      ],
+      "numel": 1024
+    },
+    "udf_decoder.blocks.0.fc_1.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "udf_decoder.blocks.0.fc_1.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        32
+      ],
+      "numel": 1024
+    },
+    "udf_decoder.blocks.1.fc_0.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "udf_decoder.blocks.1.fc_0.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        32
+      ],
+      "numel": 1024
+    },
+    "udf_decoder.blocks.1.fc_1.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "udf_decoder.blocks.1.fc_1.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        32
+      ],
+      "numel": 1024
+    },
+    "udf_decoder.fc_c.0.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "udf_decoder.fc_c.0.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        64
+      ],
+      "numel": 2048
+    },
+    "udf_decoder.fc_c.1.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "udf_decoder.fc_c.1.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        64
+      ],
+      "numel": 2048
+    },
+    "udf_decoder.fc_out.bias": {
+      "dtype": "float32",
+      "shape": [
+        1
+      ],
+      "numel": 1
+    },
+    "udf_decoder.fc_out.weight": {
+      "dtype": "float32",
+      "shape": [
+        1,
+        32
+      ],
+      "numel": 32
+    },
+    "udf_decoder.fc_p.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "udf_decoder.fc_p.weight": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        6
+      ],
+      "numel": 192
+    },
+    "unet.basis_heads.Basis-1.OneConv0.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        64,
+        64
+      ],
+      "numel": 4096
+    },
+    "unet.basis_heads.Basis-1.OneConv0.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.basis_heads.Basis-1.OneConv0.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.basis_heads.Basis-1.OutConv.bias": {
+      "dtype": "float32",
+      "shape": [
+        4
+      ],
+      "numel": 4
+    },
+    "unet.basis_heads.Basis-1.OutConv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        64,
+        4
+      ],
+      "numel": 256
+    },
+    "unet.basis_heads.Basis-1.SingleConv.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        256,
+        256
+      ],
+      "numel": 1769472
+    },
+    "unet.basis_heads.Basis-1.SingleConv.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        256
+      ],
+      "numel": 256
+    },
+    "unet.basis_heads.Basis-1.SingleConv.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        256
+      ],
+      "numel": 256
+    },
+    "unet.basis_heads.Basis-1.SingleConv2.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        256,
+        64
+      ],
+      "numel": 442368
+    },
+    "unet.basis_heads.Basis-1.SingleConv2.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        256
+      ],
+      "numel": 256
+    },
+    "unet.basis_heads.Basis-1.SingleConv2.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        256
+      ],
+      "numel": 256
+    },
+    "unet.basis_heads.Basis-2.OneConv0.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        64,
+        64
+      ],
+      "numel": 4096
+    },
+    "unet.basis_heads.Basis-2.OneConv0.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.basis_heads.Basis-2.OneConv0.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.basis_heads.Basis-2.OutConv.bias": {
+      "dtype": "float32",
+      "shape": [
+        4
+      ],
+      "numel": 4
+    },
+    "unet.basis_heads.Basis-2.OutConv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        64,
+        4
+      ],
+      "numel": 256
+    },
+    "unet.basis_heads.Basis-2.SingleConv.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        128,
+        128
+      ],
+      "numel": 442368
+    },
+    "unet.basis_heads.Basis-2.SingleConv.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        128
+      ],
+      "numel": 128
+    },
+    "unet.basis_heads.Basis-2.SingleConv.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        128
+      ],
+      "numel": 128
+    },
+    "unet.basis_heads.Basis-2.SingleConv2.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        128,
+        64
+      ],
+      "numel": 221184
+    },
+    "unet.basis_heads.Basis-2.SingleConv2.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        128
+      ],
+      "numel": 128
+    },
+    "unet.basis_heads.Basis-2.SingleConv2.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        128
+      ],
+      "numel": 128
+    },
+    "unet.basis_heads.Basis-3.OneConv0.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        64,
+        64
+      ],
+      "numel": 4096
+    },
+    "unet.basis_heads.Basis-3.OneConv0.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.basis_heads.Basis-3.OneConv0.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.basis_heads.Basis-3.OutConv.bias": {
+      "dtype": "float32",
+      "shape": [
+        4
+      ],
+      "numel": 4
+    },
+    "unet.basis_heads.Basis-3.OutConv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        64,
+        4
+      ],
+      "numel": 256
+    },
+    "unet.basis_heads.Basis-3.SingleConv.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        64,
+        64
+      ],
+      "numel": 110592
+    },
+    "unet.basis_heads.Basis-3.SingleConv.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.basis_heads.Basis-3.SingleConv.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.basis_heads.Basis-3.SingleConv2.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        64,
+        64
+      ],
+      "numel": 110592
+    },
+    "unet.basis_heads.Basis-3.SingleConv2.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.basis_heads.Basis-3.SingleConv2.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.basis_heads.Basis-4.OneConv0.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        32
+      ],
+      "numel": 1024
+    },
+    "unet.basis_heads.Basis-4.OneConv0.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.basis_heads.Basis-4.OneConv0.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.basis_heads.Basis-4.OutConv.bias": {
+      "dtype": "float32",
+      "shape": [
+        4
+      ],
+      "numel": 4
+    },
+    "unet.basis_heads.Basis-4.OutConv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        4
+      ],
+      "numel": 128
+    },
+    "unet.basis_heads.Basis-4.SingleConv.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        32,
+        32
+      ],
+      "numel": 27648
+    },
+    "unet.basis_heads.Basis-4.SingleConv.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.basis_heads.Basis-4.SingleConv.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.basis_heads.Basis-4.SingleConv2.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        32,
+        32
+      ],
+      "numel": 27648
+    },
+    "unet.basis_heads.Basis-4.SingleConv2.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.basis_heads.Basis-4.SingleConv2.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.decoders.Dec-2.SingleConv1.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        384,
+        128
+      ],
+      "numel": 1327104
+    },
+    "unet.decoders.Dec-2.SingleConv1.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        384
+      ],
+      "numel": 384
+    },
+    "unet.decoders.Dec-2.SingleConv1.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        384
+      ],
+      "numel": 384
+    },
+    "unet.decoders.Dec-2.SingleConv2.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        128,
+        128
+      ],
+      "numel": 442368
+    },
+    "unet.decoders.Dec-2.SingleConv2.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        128
+      ],
+      "numel": 128
+    },
+    "unet.decoders.Dec-2.SingleConv2.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        128
+      ],
+      "numel": 128
+    },
+    "unet.decoders.Dec-3.SingleConv1.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        192,
+        64
+      ],
+      "numel": 331776
+    },
+    "unet.decoders.Dec-3.SingleConv1.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        192
+      ],
+      "numel": 192
+    },
+    "unet.decoders.Dec-3.SingleConv1.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        192
+      ],
+      "numel": 192
+    },
+    "unet.decoders.Dec-3.SingleConv2.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        64,
+        64
+      ],
+      "numel": 110592
+    },
+    "unet.decoders.Dec-3.SingleConv2.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.decoders.Dec-3.SingleConv2.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.decoders.Dec-4.SingleConv1.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        96,
+        32
+      ],
+      "numel": 82944
+    },
+    "unet.decoders.Dec-4.SingleConv1.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        96
+      ],
+      "numel": 96
+    },
+    "unet.decoders.Dec-4.SingleConv1.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        96
+      ],
+      "numel": 96
+    },
+    "unet.decoders.Dec-4.SingleConv2.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        32,
+        32
+      ],
+      "numel": 27648
+    },
+    "unet.decoders.Dec-4.SingleConv2.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.decoders.Dec-4.SingleConv2.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.encoders.Enc0.SingleConv1.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        32,
+        32
+      ],
+      "numel": 27648
+    },
+    "unet.encoders.Enc0.SingleConv1.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.encoders.Enc0.SingleConv1.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.encoders.Enc0.SingleConv2.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        32,
+        32
+      ],
+      "numel": 27648
+    },
+    "unet.encoders.Enc0.SingleConv2.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.encoders.Enc0.SingleConv2.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.encoders.Enc1.SingleConv1.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        32,
+        32
+      ],
+      "numel": 27648
+    },
+    "unet.encoders.Enc1.SingleConv1.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.encoders.Enc1.SingleConv1.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.encoders.Enc1.SingleConv2.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        32,
+        64
+      ],
+      "numel": 55296
+    },
+    "unet.encoders.Enc1.SingleConv2.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.encoders.Enc1.SingleConv2.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.encoders.Enc2.SingleConv1.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        64,
+        64
+      ],
+      "numel": 110592
+    },
+    "unet.encoders.Enc2.SingleConv1.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.encoders.Enc2.SingleConv1.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.encoders.Enc2.SingleConv2.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        64,
+        128
+      ],
+      "numel": 221184
+    },
+    "unet.encoders.Enc2.SingleConv2.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.encoders.Enc2.SingleConv2.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.encoders.Enc3.SingleConv1.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        128,
+        128
+      ],
+      "numel": 442368
+    },
+    "unet.encoders.Enc3.SingleConv1.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        128
+      ],
+      "numel": 128
+    },
+    "unet.encoders.Enc3.SingleConv1.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        128
+      ],
+      "numel": 128
+    },
+    "unet.encoders.Enc3.SingleConv2.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        128,
+        256
+      ],
+      "numel": 884736
+    },
+    "unet.encoders.Enc3.SingleConv2.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        128
+      ],
+      "numel": 128
+    },
+    "unet.encoders.Enc3.SingleConv2.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        128
+      ],
+      "numel": 128
+    },
+    "unet.udf_heads.UDF-1.OutConv.bias": {
+      "dtype": "float32",
+      "shape": [
+        16
+      ],
+      "numel": 16
+    },
+    "unet.udf_heads.UDF-1.OutConv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        256,
+        16
+      ],
+      "numel": 4096
+    },
+    "unet.udf_heads.UDF-1.SingleConv.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        256,
+        256
+      ],
+      "numel": 1769472
+    },
+    "unet.udf_heads.UDF-1.SingleConv.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        256
+      ],
+      "numel": 256
+    },
+    "unet.udf_heads.UDF-1.SingleConv.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        256
+      ],
+      "numel": 256
+    },
+    "unet.udf_heads.UDF-2.OutConv.bias": {
+      "dtype": "float32",
+      "shape": [
+        16
+      ],
+      "numel": 16
+    },
+    "unet.udf_heads.UDF-2.OutConv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        128,
+        16
+      ],
+      "numel": 2048
+    },
+    "unet.udf_heads.UDF-2.SingleConv.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        128,
+        128
+      ],
+      "numel": 442368
+    },
+    "unet.udf_heads.UDF-2.SingleConv.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        128
+      ],
+      "numel": 128
+    },
+    "unet.udf_heads.UDF-2.SingleConv.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        128
+      ],
+      "numel": 128
+    },
+    "unet.udf_heads.UDF-3.OutConv.bias": {
+      "dtype": "float32",
+      "shape": [
+        16
+      ],
+      "numel": 16
+    },
+    "unet.udf_heads.UDF-3.OutConv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        64,
+        16
+      ],
+      "numel": 1024
+    },
+    "unet.udf_heads.UDF-3.SingleConv.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        64,
+        64
+      ],
+      "numel": 110592
+    },
+    "unet.udf_heads.UDF-3.SingleConv.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.udf_heads.UDF-3.SingleConv.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.udf_heads.UDF-4.OutConv.bias": {
+      "dtype": "float32",
+      "shape": [
+        16
+      ],
+      "numel": 16
+    },
+    "unet.udf_heads.UDF-4.OutConv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        16
+      ],
+      "numel": 512
+    },
+    "unet.udf_heads.UDF-4.SingleConv.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        32,
+        32
+      ],
+      "numel": 27648
+    },
+    "unet.udf_heads.UDF-4.SingleConv.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.udf_heads.UDF-4.SingleConv.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.normal_heads.Normal-1.OutConv.bias": {
+      "dtype": "float32",
+      "shape": [
+        3
+      ],
+      "numel": 3
+    },
+    "unet.normal_heads.Normal-1.OutConv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        256,
+        3
+      ],
+      "numel": 768
+    },
+    "unet.normal_heads.Normal-1.SingleConv.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        256,
+        256
+      ],
+      "numel": 1769472
+    },
+    "unet.normal_heads.Normal-1.SingleConv.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        256
+      ],
+      "numel": 256
+    },
+    "unet.normal_heads.Normal-1.SingleConv.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        256
+      ],
+      "numel": 256
+    },
+    "unet.normal_heads.Normal-2.OutConv.bias": {
+      "dtype": "float32",
+      "shape": [
+        3
+      ],
+      "numel": 3
+    },
+    "unet.normal_heads.Normal-2.OutConv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        128,
+        3
+      ],
+      "numel": 384
+    },
+    "unet.normal_heads.Normal-2.SingleConv.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        128,
+        128
+      ],
+      "numel": 442368
+    },
+    "unet.normal_heads.Normal-2.SingleConv.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        128
+      ],
+      "numel": 128
+    },
+    "unet.normal_heads.Normal-2.SingleConv.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        128
+      ],
+      "numel": 128
+    },
+    "unet.normal_heads.Normal-3.OutConv.bias": {
+      "dtype": "float32",
+      "shape": [
+        3
+      ],
+      "numel": 3
+    },
+    "unet.normal_heads.Normal-3.OutConv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        64,
+        3
+      ],
+      "numel": 192
+    },
+    "unet.normal_heads.Normal-3.SingleConv.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        64,
+        64
+      ],
+      "numel": 110592
+    },
+    "unet.normal_heads.Normal-3.SingleConv.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.normal_heads.Normal-3.SingleConv.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.normal_heads.Normal-4.OutConv.bias": {
+      "dtype": "float32",
+      "shape": [
+        3
+      ],
+      "numel": 3
+    },
+    "unet.normal_heads.Normal-4.OutConv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        3
+      ],
+      "numel": 96
+    },
+    "unet.normal_heads.Normal-4.SingleConv.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        32,
+        32
+      ],
+      "numel": 27648
+    },
+    "unet.normal_heads.Normal-4.SingleConv.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.normal_heads.Normal-4.SingleConv.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.struct_heads.Struct-1.OutConv.bias": {
+      "dtype": "float32",
+      "shape": [
+        3
+      ],
+      "numel": 3
+    },
+    "unet.struct_heads.Struct-1.OutConv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        256,
+        3
+      ],
+      "numel": 768
+    },
+    "unet.struct_heads.Struct-1.SingleConv.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        256,
+        256
+      ],
+      "numel": 1769472
+    },
+    "unet.struct_heads.Struct-1.SingleConv.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        256
+      ],
+      "numel": 256
+    },
+    "unet.struct_heads.Struct-1.SingleConv.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        256
+      ],
+      "numel": 256
+    },
+    "unet.struct_heads.Struct-2.OutConv.bias": {
+      "dtype": "float32",
+      "shape": [
+        3
+      ],
+      "numel": 3
+    },
+    "unet.struct_heads.Struct-2.OutConv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        128,
+        3
+      ],
+      "numel": 384
+    },
+    "unet.struct_heads.Struct-2.SingleConv.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        128,
+        128
+      ],
+      "numel": 442368
+    },
+    "unet.struct_heads.Struct-2.SingleConv.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        128
+      ],
+      "numel": 128
+    },
+    "unet.struct_heads.Struct-2.SingleConv.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        128
+      ],
+      "numel": 128
+    },
+    "unet.struct_heads.Struct-3.OutConv.bias": {
+      "dtype": "float32",
+      "shape": [
+        3
+      ],
+      "numel": 3
+    },
+    "unet.struct_heads.Struct-3.OutConv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        64,
+        3
+      ],
+      "numel": 192
+    },
+    "unet.struct_heads.Struct-3.SingleConv.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        64,
+        64
+      ],
+      "numel": 110592
+    },
+    "unet.struct_heads.Struct-3.SingleConv.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.struct_heads.Struct-3.SingleConv.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        64
+      ],
+      "numel": 64
+    },
+    "unet.struct_heads.Struct-4.OutConv.bias": {
+      "dtype": "float32",
+      "shape": [
+        3
+      ],
+      "numel": 3
+    },
+    "unet.struct_heads.Struct-4.OutConv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        3
+      ],
+      "numel": 96
+    },
+    "unet.struct_heads.Struct-4.SingleConv.Conv.kernel": {
+      "dtype": "float32",
+      "shape": [
+        27,
+        32,
+        32
+      ],
+      "numel": 27648
+    },
+    "unet.struct_heads.Struct-4.SingleConv.GroupNorm.bias": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    },
+    "unet.struct_heads.Struct-4.SingleConv.GroupNorm.weight": {
+      "dtype": "float32",
+      "shape": [
+        32
+      ],
+      "numel": 32
+    }
+  }
+}

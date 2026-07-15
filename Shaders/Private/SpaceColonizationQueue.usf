@@ -733,3 +733,337 @@ void EmitSpaceColonizationLinesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
         }
     }
 }
+
+// Pre-projection smooth (Increment B, Stage B3). One iteration of the Jacobi Laplacian
+// UPolyLine::SmoothLine uses (Alpha=1): interior point -> (prev_old + next_old)*0.5, both
+// endpoints anchored. Run this pass 3 times ping-ponging the position buffers to match
+// SmoothLine(Line, 3). Only xyz is smoothed; w (per-point scale) passes through.
+StructuredBuffer<float4> SmoothInPoints;
+StructuredBuffer<int4> SmoothMeta;
+StructuredBuffer<uint> SmoothCounts; // [1] = totalPoints
+RWStructuredBuffer<float4> RW_SmoothOutPoints;
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void SmoothSpaceColonizationLinesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint Index = DispatchThreadId.x;
+    if (Index >= SmoothCounts[1])
+    {
+        return;
+    }
+    int4 Meta = SmoothMeta[Index];
+    int Base = Meta.z;
+    int Count = Meta.w;
+    float4 Self = SmoothInPoints[Index];
+    if (Count <= 2 || (int)Index == Base || (int)Index == Base + Count - 1)
+    {
+        RW_SmoothOutPoints[Index] = Self; // endpoints (and degenerate lines) are anchored
+        return;
+    }
+    float3 Prev = SmoothInPoints[Meta.x].xyz; // Meta.x = clamped-in-line prev index
+    float3 Next = SmoothInPoints[Meta.y].xyz; // Meta.y = clamped-in-line next index
+    RW_SmoothOutPoints[Index] = float4((Prev + Next) * 0.5f, Self.w);
+}
+
+// Pre-projection ResamppleByLength (Increment B, Stage B3) — count-CHANGING, so a second
+// compaction (CountResample -> PrefixResample -> EmitResample) mirroring the emit triad.
+// Reproduces UPolyLine::ResamppleByLength (GeometryMathUtils.cpp:161-207) bit-faithfully:
+// NumIterations = int(ArcLen/ResampleLength), Interval = ArcLen/NumIterations, forward
+// serial walk with GetSafeNormal(.001), and the doubled final gap. Reads the smoothed
+// points (emit layout via LineOffset/LineLength); writes a new compact layout.
+StructuredBuffer<float4> ResampleInPoints; // smoothed points, emit layout
+StructuredBuffer<uint> ResampleLineOffset; // emit per-line base
+StructuredBuffer<uint> ResampleLineLength; // emit per-line count
+StructuredBuffer<uint> ResampleLineCount;  // [0] = number of lines
+RWStructuredBuffer<uint> RW_NewLineLength;
+RWStructuredBuffer<uint> RW_NewSegLength;
+StructuredBuffer<uint> NewLineLength;
+StructuredBuffer<uint> NewSegLength;
+RWStructuredBuffer<uint> RW_NewLineOffset;
+RWStructuredBuffer<uint> RW_NewSegOffset;
+RWStructuredBuffer<uint> RW_NewCounts;      // overwrites LineCountsOut [1]=points [2]=segs (keep [0])
+StructuredBuffer<uint> NewLineOffset;
+StructuredBuffer<uint> NewSegOffset;
+RWStructuredBuffer<float4> RW_PathPoints2;
+RWStructuredBuffer<int4> RW_PathPointMeta2;
+RWStructuredBuffer<int4> RW_SegmentMeta2;
+float ResampleLength;
+uint PathPoint2Capacity;
+uint Segment2Capacity;
+
+float3 SafeNormalSC(float3 V) // FVector::GetSafeNormal(0.001)
+{
+    float SquareSum = dot(V, V);
+    return (SquareSum < 0.001f) ? float3(0.0f, 0.0f, 0.0f) : V * rsqrt(SquareSum);
+}
+
+float ResampleLineArcLength(uint Base, uint Count) // CurveUtil::ArcLength (float)
+{
+    float Arc = 0.0f;
+    for (uint k = 0; k + 1u < Count; ++k)
+    {
+        Arc += distance(ResampleInPoints[Base + k].xyz, ResampleInPoints[Base + k + 1u].xyz);
+    }
+    return Arc;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void CountResampleSpaceColonizationCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint LineIdx = DispatchThreadId.x;
+    if (LineIdx >= ResampleLineCount[0])
+    {
+        return;
+    }
+    uint Base = ResampleLineOffset[LineIdx];
+    uint Count = ResampleLineLength[LineIdx];
+    if (Count < 2u)
+    {
+        RW_NewLineLength[LineIdx] = 0u;
+        RW_NewSegLength[LineIdx] = 0u;
+        return;
+    }
+    float Arc = ResampleLineArcLength(Base, Count);
+    int NumIterations = (int)(Arc / ResampleLength);
+    uint NewCount = (NumIterations >= 2) ? (uint)NumIterations : 0u; // < 2 -> ResamppleByLength drops
+    RW_NewLineLength[LineIdx] = NewCount;
+    RW_NewSegLength[LineIdx] = (NewCount >= 1u) ? (NewCount - 1u) : 0u;
+}
+
+[numthreads(1, 1, 1)]
+void PrefixResampleSpaceColonizationCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (DispatchThreadId.x != 0)
+    {
+        return;
+    }
+    uint LineCount = ResampleLineCount[0];
+    if (LineCount > TargetCount)
+    {
+        LineCount = TargetCount;
+    }
+    uint PointAcc = 0u;
+    uint SegAcc = 0u;
+    for (uint i = 0; i < LineCount; ++i)
+    {
+        RW_NewLineOffset[i] = PointAcc;
+        RW_NewSegOffset[i] = SegAcc;
+        PointAcc += NewLineLength[i];
+        SegAcc += NewSegLength[i];
+    }
+    RW_NewCounts[0] = LineCount;
+    RW_NewCounts[1] = PointAcc; // newTotalPoints
+    RW_NewCounts[2] = SegAcc;   // newTotalSegments
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void EmitResampleSpaceColonizationCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint LineIdx = DispatchThreadId.x;
+    if (LineIdx >= ResampleLineCount[0])
+    {
+        return;
+    }
+    uint SrcBase = ResampleLineOffset[LineIdx];
+    uint SrcCount = ResampleLineLength[LineIdx];
+    if (SrcCount < 2u)
+    {
+        return;
+    }
+    float Arc = ResampleLineArcLength(SrcBase, SrcCount);
+    int NumIterations = (int)(Arc / ResampleLength);
+    if (NumIterations < 2)
+    {
+        return;
+    }
+    float Interval = Arc / (float)NumIterations;
+    uint OutBase = NewLineOffset[LineIdx];
+    uint OutSegBase = NewSegOffset[LineIdx];
+    uint NewCount = (uint)NumIterations;
+
+    // Positions: replicate the CPU forward serial walk (incl. the doubled final gap).
+    if (OutBase < PathPoint2Capacity)
+    {
+        RW_PathPoints2[OutBase] = ResampleInPoints[SrcBase]; // P[0] = V[0]
+    }
+    float Sum = distance(ResampleInPoints[SrcBase].xyz, ResampleInPoints[SrcBase + 1u].xyz);
+    float3 Dir = SafeNormalSC(ResampleInPoints[SrcBase + 1u].xyz - ResampleInPoints[SrcBase].xyz);
+    uint PointCount = 1u;
+    float CurrentLength = 0.0f;
+    int Iterat = NumIterations - 2;
+    for (int i = 0; i < Iterat; ++i)
+    {
+        CurrentLength += Interval;
+        [loop]
+        while (CurrentLength > Sum && PointCount + 1u < SrcCount)
+        {
+            PointCount += 1u;
+            Sum += distance(ResampleInPoints[SrcBase + PointCount].xyz, ResampleInPoints[SrcBase + PointCount - 1u].xyz);
+            Dir = SafeNormalSC(ResampleInPoints[SrcBase + PointCount].xyz - ResampleInPoints[SrcBase + PointCount - 1u].xyz);
+        }
+        float3 SamplePos = ResampleInPoints[SrcBase + PointCount].xyz - Dir * (Sum - CurrentLength);
+        uint gi = OutBase + (uint)(i + 1);
+        if (gi < PathPoint2Capacity)
+        {
+            RW_PathPoints2[gi] = float4(SamplePos, ResampleInPoints[SrcBase + PointCount].w);
+        }
+    }
+    uint LastGi = OutBase + NewCount - 1u;
+    if (LastGi < PathPoint2Capacity)
+    {
+        RW_PathPoints2[LastGi] = ResampleInPoints[SrcBase + SrcCount - 1u]; // P[last] = V[last]
+    }
+
+    // Per-point scale remap (BuildPreparedLinePointScales GeometryEditorActor.cpp:1221):
+    // arc-length uniform-alpha resample of the source line's scales, monotonic segment pointer.
+    {
+        uint SegIdx = 0u;
+        float CumAtSeg = 0.0f;
+        for (uint o = 0; o < NewCount; ++o)
+        {
+            uint gi = OutBase + o;
+            if (gi >= PathPoint2Capacity)
+            {
+                break;
+            }
+            float ScaleOut;
+            if (Arc <= 1.0e-8f)
+            {
+                ScaleOut = ResampleInPoints[SrcBase].w;
+            }
+            else
+            {
+                float Alpha = (NewCount > 1u) ? ((float)o / (float)(NewCount - 1u)) : 0.0f;
+                float Target = Alpha * Arc;
+                [loop]
+                while (SegIdx + 1u < SrcCount)
+                {
+                    float NextCum = CumAtSeg + distance(ResampleInPoints[SrcBase + SegIdx].xyz, ResampleInPoints[SrcBase + SegIdx + 1u].xyz);
+                    if (NextCum < Target)
+                    {
+                        CumAtSeg = NextCum;
+                        SegIdx += 1u;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                if (SegIdx + 1u >= SrcCount)
+                {
+                    ScaleOut = ResampleInPoints[SrcBase + SrcCount - 1u].w;
+                }
+                else
+                {
+                    float SegLen = distance(ResampleInPoints[SrcBase + SegIdx].xyz, ResampleInPoints[SrcBase + SegIdx + 1u].xyz);
+                    float SegAlpha = (SegLen > 1.0e-8f) ? ((Target - CumAtSeg) / SegLen) : 0.0f;
+                    ScaleOut = lerp(ResampleInPoints[SrcBase + SegIdx].w, ResampleInPoints[SrcBase + SegIdx + 1u].w, SegAlpha);
+                }
+            }
+            float4 P = RW_PathPoints2[gi];
+            P.w = ScaleOut;
+            RW_PathPoints2[gi] = P;
+        }
+    }
+
+    // Meta + segments for the new compact line.
+    for (uint o = 0; o < NewCount; ++o)
+    {
+        uint gi = OutBase + o;
+        if (gi >= PathPoint2Capacity)
+        {
+            break;
+        }
+        int PrevIdx = (int)(OutBase + max(int(o) - 1, 0));
+        int NextIdx = (int)(OutBase + min(o + 1u, NewCount - 1u));
+        RW_PathPointMeta2[gi] = int4(PrevIdx, NextIdx, (int)OutBase, (int)NewCount);
+        if (o + 1u < NewCount)
+        {
+            uint si = OutSegBase + o;
+            if (si < Segment2Capacity)
+            {
+                RW_SegmentMeta2[si] = int4((int)gi, (int)(gi + 1u), 0, 0);
+            }
+        }
+    }
+}
+
+// CurveScale + scale-weighted CurveU (Increment B, Stage B3), post-resample, 1 thread/line.
+// Reproduces BuildVVGPUInput's PathPoints.w = EvaluateVineScale(CurveControl,k,N)*max(scale,0)
+// (GeometryEditorActor.cpp:1857-1859) and BuildVineScaleWeightedCurveUFromSegmentLengths (:895).
+// CurveControl.G is sampled from a baked LUT. Operates in place on PathPoints2.w and writes CurveU2.
+StructuredBuffer<float> CurveLUT;
+uint CurveLUTSize;
+float UVScaleInfluence;
+float UVScaleFloor;
+float UVScalePower;
+float UVLengthScale;
+StructuredBuffer<uint> CurveLineOffset;
+StructuredBuffer<uint> CurveLineLength;
+StructuredBuffer<uint> CurveLineCount;
+RWStructuredBuffer<float4> RW_CurvePoints;
+RWStructuredBuffer<float> RW_PathPointCurveU2;
+
+float SanUVScale(float S) // GetSanitizedVineUVScale
+{
+    return isfinite(S) ? max(S, 0.0f) : 0.0f;
+}
+
+float SampleCurveLUT(float T) // CurveControl->GetUnadjustedLinearColorValue(T).G
+{
+    if (CurveLUTSize == 0u)
+    {
+        return 1.0f;
+    }
+    float F = saturate(T) * (float)(CurveLUTSize - 1u);
+    uint I0 = (uint)floor(F);
+    uint I1 = min(I0 + 1u, CurveLUTSize - 1u);
+    return lerp(CurveLUT[I0], CurveLUT[I1], frac(F));
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void CurveSpaceColonizationCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint LineIdx = DispatchThreadId.x;
+    if (LineIdx >= CurveLineCount[0])
+    {
+        return;
+    }
+    uint Base = CurveLineOffset[LineIdx];
+    uint N = CurveLineLength[LineIdx];
+    if (N == 0u)
+    {
+        return;
+    }
+
+    // Pass 1: final profile scale (CurveScale * remapped scale) + MaxScale.
+    float MaxScale = 1.0e-8f;
+    [loop]
+    for (uint l = 0; l < N; ++l)
+    {
+        float CurveScale = (N <= 1u) ? 1.0f : SampleCurveLUT((float)l / (float)(N - 1u));
+        float4 P = RW_CurvePoints[Base + l];
+        float FinalScale = CurveScale * max(P.w, 0.0f);
+        P.w = FinalScale;
+        RW_CurvePoints[Base + l] = P;
+        MaxScale = max(MaxScale, SanUVScale(FinalScale));
+    }
+
+    // Pass 2: scale-weighted CurveU.
+    float Influence = clamp(UVScaleInfluence, 0.0f, 1.0f);
+    float ScaleFloor = clamp(UVScaleFloor, 0.001f, 1.0f);
+    float ScalePower = clamp(UVScalePower, 0.0f, 4.0f);
+    float LengthScale = max(UVLengthScale, 1.0e-8f);
+    RW_PathPointCurveU2[Base] = 0.0f;
+    [loop]
+    for (uint m = 1; m < N; ++m)
+    {
+        float SegLen = max(distance(RW_CurvePoints[Base + m - 1u].xyz, RW_CurvePoints[Base + m].xyz), 0.0f);
+        float PrevScale = max(SanUVScale(RW_CurvePoints[Base + m - 1u].w) / MaxScale, ScaleFloor);
+        float CurrScale = max(SanUVScale(RW_CurvePoints[Base + m].w) / MaxScale, ScaleFloor);
+        float AvgScale = max((PrevScale + CurrScale) * 0.5f, 1.0e-8f);
+        float InverseScale = 1.0f / pow(AvgScale, ScalePower);
+        float Weight = (1.0f - Influence) + Influence * InverseScale;
+        RW_PathPointCurveU2[Base + m] = RW_PathPointCurveU2[Base + m - 1u] + SegLen * max(Weight, 1.0e-8f) * LengthScale;
+    }
+}

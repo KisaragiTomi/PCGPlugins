@@ -710,6 +710,147 @@ class FSpaceColonizationEmitLinesCS : public FGlobalShader
 	}
 };
 
+class FSpaceColonizationSmoothLinesCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSpaceColonizationSmoothLinesCS);
+	SHADER_USE_PARAMETER_STRUCT(FSpaceColonizationSmoothLinesCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, SmoothInPoints)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, SmoothMeta)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, SmoothCounts)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_SmoothOutPoints)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
+class FSpaceColonizationCountResampleCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSpaceColonizationCountResampleCS);
+	SHADER_USE_PARAMETER_STRUCT(FSpaceColonizationCountResampleCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, ResampleInPoints)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ResampleLineOffset)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ResampleLineLength)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ResampleLineCount)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_NewLineLength)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_NewSegLength)
+		SHADER_PARAMETER(float, ResampleLength)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
+class FSpaceColonizationPrefixResampleCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSpaceColonizationPrefixResampleCS);
+	SHADER_USE_PARAMETER_STRUCT(FSpaceColonizationPrefixResampleCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ResampleLineCount)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, NewLineLength)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, NewSegLength)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_NewLineOffset)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_NewSegOffset)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_NewCounts)
+		SHADER_PARAMETER(uint32, TargetCount)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
+class FSpaceColonizationEmitResampleCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSpaceColonizationEmitResampleCS);
+	SHADER_USE_PARAMETER_STRUCT(FSpaceColonizationEmitResampleCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, ResampleInPoints)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ResampleLineOffset)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ResampleLineLength)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ResampleLineCount)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, NewLineOffset)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, NewSegOffset)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_PathPoints2)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<int4>, RW_PathPointMeta2)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<int4>, RW_SegmentMeta2)
+		SHADER_PARAMETER(float, ResampleLength)
+		SHADER_PARAMETER(uint32, PathPoint2Capacity)
+		SHADER_PARAMETER(uint32, Segment2Capacity)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
+class FSpaceColonizationCurveCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSpaceColonizationCurveCS);
+	SHADER_USE_PARAMETER_STRUCT(FSpaceColonizationCurveCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, CurveLUT)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, CurveLineOffset)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, CurveLineLength)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, CurveLineCount)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_CurvePoints)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, RW_PathPointCurveU2)
+		SHADER_PARAMETER(uint32, CurveLUTSize)
+		SHADER_PARAMETER(float, UVScaleInfluence)
+		SHADER_PARAMETER(float, UVScaleFloor)
+		SHADER_PARAMETER(float, UVScalePower)
+		SHADER_PARAMETER(float, UVLengthScale)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueInitCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "InitializeSpaceColonizationQueueCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueMarkSourcesCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "MarkSpaceColonizationSourcesCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueBuildNeighborsCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "BuildSpaceColonizationNeighborsCS", SF_Compute);
@@ -722,6 +863,11 @@ IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationBranchOrderCS, "/Plugin/PCGPlugins/Sha
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationCountLinesCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "CountSpaceColonizationLinesCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationPrefixSumLinesCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "PrefixSumSpaceColonizationLinesCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationEmitLinesCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "EmitSpaceColonizationLinesCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationSmoothLinesCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "SmoothSpaceColonizationLinesCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationCountResampleCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "CountResampleSpaceColonizationCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationPrefixResampleCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "PrefixResampleSpaceColonizationCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationEmitResampleCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "EmitResampleSpaceColonizationCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationCurveCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "CurveSpaceColonizationCS", SF_Compute);
 
 
 namespace
@@ -6274,6 +6420,12 @@ static bool BuildSpaceColonizationQueueCSImpl(
 	float InfluenceRadius,
 	int32 BackGrowCount,
 	int32 ForkTaperForkOrdinal,
+	float ResampleLength,
+	const TArray<float>& CurveLUT,
+	float UVScaleInfluence,
+	float UVScaleFloor,
+	float UVScalePower,
+	float UVLengthScale,
 	const TArray<float>& TargetPointScales,
 	const TArray<float>& StartSourceScales,
 	TArray<FVector4f>& OutGPUPathPoints,
@@ -6349,12 +6501,17 @@ static bool BuildSpaceColonizationQueueCSImpl(
 		constexpr int32 SpaceColonizationMaxBacktrack = 100;
 		const uint32 PathPointCapacity = uint32(FMath::Min<int64>(int64(TargetCount) * int64(SpaceColonizationMaxBacktrack + 1), 4000000));
 		const uint32 SegmentCapacity = PathPointCapacity;
+		// Resample can grow lines; keep a generous compact capacity for the post-resample set.
+		const uint32 PathPoint2Capacity = PathPointCapacity;
+		const uint32 Segment2Capacity = PathPointCapacity;
 		const uint32 PathPointsReadbackCount = FMath::Min<uint32>(PathPointCapacity, 65536u);
 		const uint32 PathPointsReadbackBytes = uint32(sizeof(FVector4f) * uint64(PathPointsReadbackCount));
 		FRHIGPUBufferReadback* PathPointsReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_PathPoints"));
 		TArray<FVector4f> PathPointsData;
 		TArray<float> EmitTargetPointScales = TargetPointScales;
 		TArray<float> EmitStartSourceScales = StartSourceScales;
+		TArray<float> EmitCurveLUT = CurveLUT;
+		const uint32 CurveLUTSize = uint32(CurveLUT.Num());
 		// Debug readbacks exist solely to feed the [SpaceColonizationStep] validation logs.
 		// In production (bSpaceColonizationStepLogs == false) they stay null and every
 		// debug copy-pass / lock below is compiled out, so the GPU path only pays for the
@@ -6405,6 +6562,9 @@ static bool BuildSpaceColonizationQueueCSImpl(
 				 LineCountsReadback, LineCountsReadbackBytes,
 				 EmitTargetPointScales = MoveTemp(EmitTargetPointScales), EmitStartSourceScales = MoveTemp(EmitStartSourceScales),
 				 PathPointsReadback, PathPointsReadbackBytes, PathPointCapacity, SegmentCapacity,
+				 ResampleLength, PathPoint2Capacity, Segment2Capacity,
+				 EmitCurveLUT = MoveTemp(EmitCurveLUT), CurveLUTSize,
+				 UVScaleInfluence, UVScaleFloor, UVScalePower, UVLengthScale,
 				 &bRenderWorkQueued](FRHICommandListImmediate& RHICmdList)
 				{
 					FRDGBuilder GraphBuilder(RHICmdList);
@@ -6665,7 +6825,7 @@ static bool BuildSpaceColonizationQueueCSImpl(
 						{
 							FComputeShaderUtils::Dispatch(InRHICmdList, PrefixSumShader, *PrefixSumParameters, FIntVector(1, 1, 1));
 						});
-					AddEnqueueCopyPass(GraphBuilder, LineCountsReadback, LineCountsOutBuffer, LineCountsReadbackBytes);
+					// (LineCounts readback moved to after the resample; see the NewCounts copy below.)
 
 					// ---- Stage B2: emit the flat PathPoints/Meta/Segment layout ----
 					CREATE_RDG_STRUCTURED_UPLOAD_SRV(TargetPointScales, float, EmitTargetPointScales, TEXT("SpaceColonizationQueue_TargetPointScales"))
@@ -6700,7 +6860,111 @@ static bool BuildSpaceColonizationQueueCSImpl(
 						{
 							FComputeShaderUtils::Dispatch(InRHICmdList, EmitLinesShader, *EmitLinesParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
 						});
-					AddEnqueueCopyPass(GraphBuilder, PathPointsReadback, PathPointsBuffer, PathPointsReadbackBytes);
+					// ---- Stage B3 (prep port): pre-projection SmoothLine(3) as 3 ping-pong Jacobi passes ----
+					CREATE_RDG_STRUCTURED_UAV_SRV(SmoothA, FVector4f, PathPointCapacity, TEXT("SpaceColonizationQueue_SmoothA"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(SmoothB, FVector4f, PathPointCapacity, TEXT("SpaceColonizationQueue_SmoothB"))
+					TShaderMapRef<FSpaceColonizationSmoothLinesCS> SmoothShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+					auto AddSmoothPass = [&](FRDGBufferSRVRef InPoints, FRDGBufferUAVRef OutPoints)
+					{
+						FSpaceColonizationSmoothLinesCS::FParameters* SmoothParameters = GraphBuilder.AllocParameters<FSpaceColonizationSmoothLinesCS::FParameters>();
+						SmoothParameters->SmoothInPoints = InPoints;
+						SmoothParameters->SmoothMeta = PathPointMetaSRV;
+						SmoothParameters->SmoothCounts = LineCountsOutSRV;
+						SmoothParameters->RW_SmoothOutPoints = OutPoints;
+						GraphBuilder.AddPass(
+							RDG_EVENT_NAME("SpaceColonizationQueue.SmoothLines"),
+							SmoothParameters,
+							ERDGPassFlags::Compute,
+							[SmoothParameters, SmoothShader, PathPointCapacity](FRHIComputeCommandList& InRHICmdList)
+							{
+								FComputeShaderUtils::Dispatch(InRHICmdList, SmoothShader, *SmoothParameters, FComputeShaderUtils::GetGroupCount(FIntVector(int32(PathPointCapacity), 1, 1), 64));
+							});
+					};
+					AddSmoothPass(PathPointsSRV, SmoothAUAV); // iter 1: raw emit -> A
+					AddSmoothPass(SmoothASRV, SmoothBUAV);    // iter 2: A -> B
+					AddSmoothPass(SmoothBSRV, SmoothAUAV);    // iter 3: B -> A (result)
+
+					// ---- Stage B3 (prep port): pre-projection ResamppleByLength (count-changing) ----
+					CREATE_RDG_STRUCTURED_UAV_SRV(NewLineLength, uint32, TargetCount, TEXT("SpaceColonizationQueue_NewLineLength"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(NewSegLength, uint32, TargetCount, TEXT("SpaceColonizationQueue_NewSegLength"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(NewLineOffset, uint32, TargetCount, TEXT("SpaceColonizationQueue_NewLineOffset"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(NewSegOffset, uint32, TargetCount, TEXT("SpaceColonizationQueue_NewSegOffset"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(NewCounts, uint32, 4, TEXT("SpaceColonizationQueue_NewCounts"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(PathPoints2, FVector4f, PathPoint2Capacity, TEXT("SpaceColonizationQueue_PathPoints2"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(PathPointMeta2, FIntVector4, PathPoint2Capacity, TEXT("SpaceColonizationQueue_PathPointMeta2"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(SegmentMeta2, FIntVector4, Segment2Capacity, TEXT("SpaceColonizationQueue_SegmentMeta2"))
+					{
+						TShaderMapRef<FSpaceColonizationCountResampleCS> CountResampleShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+						FSpaceColonizationCountResampleCS::FParameters* P = GraphBuilder.AllocParameters<FSpaceColonizationCountResampleCS::FParameters>();
+						P->ResampleInPoints = SmoothASRV;
+						P->ResampleLineOffset = LineOffsetSRV;
+						P->ResampleLineLength = LineLengthSRV;
+						P->ResampleLineCount = LineCountsOutSRV;
+						P->RW_NewLineLength = NewLineLengthUAV;
+						P->RW_NewSegLength = NewSegLengthUAV;
+						P->ResampleLength = ResampleLength;
+						GraphBuilder.AddPass(RDG_EVENT_NAME("SpaceColonizationQueue.CountResample"), P, ERDGPassFlags::Compute,
+							[P, CountResampleShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
+							{ FComputeShaderUtils::Dispatch(InRHICmdList, CountResampleShader, *P, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64)); });
+					}
+					{
+						TShaderMapRef<FSpaceColonizationPrefixResampleCS> PrefixResampleShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+						FSpaceColonizationPrefixResampleCS::FParameters* P = GraphBuilder.AllocParameters<FSpaceColonizationPrefixResampleCS::FParameters>();
+						P->ResampleLineCount = LineCountsOutSRV;
+						P->NewLineLength = NewLineLengthSRV;
+						P->NewSegLength = NewSegLengthSRV;
+						P->RW_NewLineOffset = NewLineOffsetUAV;
+						P->RW_NewSegOffset = NewSegOffsetUAV;
+						P->RW_NewCounts = NewCountsUAV;
+						P->TargetCount = uint32(TargetCount);
+						GraphBuilder.AddPass(RDG_EVENT_NAME("SpaceColonizationQueue.PrefixResample"), P, ERDGPassFlags::Compute,
+							[P, PrefixResampleShader](FRHIComputeCommandList& InRHICmdList)
+							{ FComputeShaderUtils::Dispatch(InRHICmdList, PrefixResampleShader, *P, FIntVector(1, 1, 1)); });
+					}
+					{
+						TShaderMapRef<FSpaceColonizationEmitResampleCS> EmitResampleShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+						FSpaceColonizationEmitResampleCS::FParameters* P = GraphBuilder.AllocParameters<FSpaceColonizationEmitResampleCS::FParameters>();
+						P->ResampleInPoints = SmoothASRV;
+						P->ResampleLineOffset = LineOffsetSRV;
+						P->ResampleLineLength = LineLengthSRV;
+						P->ResampleLineCount = LineCountsOutSRV;
+						P->NewLineOffset = NewLineOffsetSRV;
+						P->NewSegOffset = NewSegOffsetSRV;
+						P->RW_PathPoints2 = PathPoints2UAV;
+						P->RW_PathPointMeta2 = PathPointMeta2UAV;
+						P->RW_SegmentMeta2 = SegmentMeta2UAV;
+						P->ResampleLength = ResampleLength;
+						P->PathPoint2Capacity = PathPoint2Capacity;
+						P->Segment2Capacity = Segment2Capacity;
+						GraphBuilder.AddPass(RDG_EVENT_NAME("SpaceColonizationQueue.EmitResample"), P, ERDGPassFlags::Compute,
+							[P, EmitResampleShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
+							{ FComputeShaderUtils::Dispatch(InRHICmdList, EmitResampleShader, *P, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64)); });
+					}
+					// ---- Stage B3 (prep port): CurveScale (thickness .w) + scale-weighted CurveU ----
+					CREATE_RDG_STRUCTURED_UPLOAD_SRV(CurveLUT, float, EmitCurveLUT, TEXT("SpaceColonizationQueue_CurveLUT"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(PathPointCurveU2, float, PathPoint2Capacity, TEXT("SpaceColonizationQueue_PathPointCurveU2"))
+					{
+						TShaderMapRef<FSpaceColonizationCurveCS> CurveShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+						FSpaceColonizationCurveCS::FParameters* P = GraphBuilder.AllocParameters<FSpaceColonizationCurveCS::FParameters>();
+						P->CurveLUT = CurveLUTSRV;
+						P->CurveLineOffset = NewLineOffsetSRV;
+						P->CurveLineLength = NewLineLengthSRV;
+						P->CurveLineCount = NewCountsSRV;
+						P->RW_CurvePoints = PathPoints2UAV;
+						P->RW_PathPointCurveU2 = PathPointCurveU2UAV;
+						P->CurveLUTSize = CurveLUTSize;
+						P->UVScaleInfluence = UVScaleInfluence;
+						P->UVScaleFloor = UVScaleFloor;
+						P->UVScalePower = UVScalePower;
+						P->UVLengthScale = UVLengthScale;
+						GraphBuilder.AddPass(RDG_EVENT_NAME("SpaceColonizationQueue.CurveScaleU"), P, ERDGPassFlags::Compute,
+							[P, CurveShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
+							{ FComputeShaderUtils::Dispatch(InRHICmdList, CurveShader, *P, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64)); });
+					}
+
+					// The resampled counts (post-resample) drive the readback slice.
+					AddEnqueueCopyPass(GraphBuilder, LineCountsReadback, NewCountsBuffer, LineCountsReadbackBytes);
+					AddEnqueueCopyPass(GraphBuilder, PathPointsReadback, PathPoints2Buffer, PathPointsReadbackBytes);
 
 					AddEnqueueCopyPass(GraphBuilder, TargetReadback, TargetBuffer, TargetReadbackBytes);
 					AddEnqueueCopyPass(GraphBuilder, State0Readback, State0Buffer, StateReadbackBytes);
@@ -7367,6 +7631,16 @@ TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales
 		TArray<float> TargetPointScales;
 		TArray<float> StartSourceScales;
 		BuildSpaceColonizationScaleLookups(SourceTransforms, TargetTransforms, TargetPointScales, StartSourceScales);
+		// Bake CurveControl.G into a LUT so the GPU CurveScale matches EvaluateVineScale.
+		TArray<float> CurveLUT;
+		{
+			const int32 LUTSize = 256;
+			CurveLUT.SetNumUninitialized(LUTSize);
+			for (int32 LUTIndex = 0; LUTIndex < LUTSize; ++LUTIndex)
+			{
+				CurveLUT[LUTIndex] = EvaluateVineScale(VV.CurveControl, LUTIndex, LUTSize);
+			}
+		}
 		TArray<FVector4f> GPUPathPoints;
 		if (!BuildSpaceColonizationQueueCSImpl(
 			SourceTransforms,
@@ -7378,6 +7652,12 @@ TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales
 			SC.InfluenceRadius,
 			SC.BackGrowCount,
 			SC.ForkTaperForkOrdinal,
+			FMath::Max(VV.ResampleLength, 0.01f),
+			CurveLUT,
+			VV.UVScaleInfluence,
+			VV.UVScaleFloor,
+			VV.UVScalePower,
+			VV.UVLengthScale,
 			TargetPointScales,
 			StartSourceScales,
 			GPUPathPoints,
@@ -7389,23 +7669,40 @@ TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales
 
 		TArray<FSpaceColonizationLineResult> Results = BuildSpaceColonizationLineResultsImpl(TargetLocations, SCAttributes, SC.BackGrowCount, SC.ForkTaperForkOrdinal, TargetPointScales, StartSourceScales);
 
-		// Stage B2 validation: the GPU emit kernel (GPUPathPoints: xyz=pos, w=tracer scale)
-		// must match the CPU tracer's flattened lines. Compare order-independent aggregates.
+		// Stage B3 validation: GPUPathPoints now holds the full prep — SmoothLine(3),
+		// ResamppleByLength, per-point scale remap, and CurveScale (in .w). It must match
+		// the CPU tracer lines put through the same chain (BuildPreparedLinePointScales +
+		// EvaluateVineScale). Compare order-independent position + final-scale sums.
+		// (Note: the CPU also re-maps scales during smooth; the GPU treats smooth as an
+		// identity for scales, a documented sub-visual approximation.)
 		{
+			const float SafeResampleLength = FMath::Max(VV.ResampleLength, 0.01f);
 			FVector CPUPosSum = FVector::ZeroVector;
 			double CPUScaleSum = 0.0;
 			int32 CPUPointCount = 0;
+			int32 CPULineCount = 0;
 			for (const FSpaceColonizationLineResult& Line : Results)
 			{
-				const TArray<FVector>* Path = Line.Path.Path.IsValid() ? Line.Path.Path.Get() : nullptr;
-				if (!Path)
+				if (!Line.Path.Path.IsValid() || Line.Path.Path->Num() < 2)
 				{
 					continue;
 				}
-				for (int32 PointIndex = 0; PointIndex < Path->Num(); ++PointIndex)
+				const FGeometryScriptPolyPath Smoothed = UPolyLine::SmoothLine(Line.Path, 3);
+				const FGeometryScriptPolyPath Resampled = UPolyLine::ResamppleByLength(Smoothed, SafeResampleLength);
+				if (!Resampled.Path.IsValid() || Resampled.Path->Num() < 2)
 				{
-					CPUPosSum += (*Path)[PointIndex];
-					CPUScaleSum += double(Line.PointScales.IsValidIndex(PointIndex) ? Line.PointScales[PointIndex] : 0.0f);
+					continue;
+				}
+				const int32 N = Resampled.Path->Num();
+				TArray<float> ResampledScales;
+				BuildPreparedLinePointScales(Smoothed, &Line.PointScales, N, 1.0f, ResampledScales);
+				++CPULineCount;
+				for (int32 PointIndex = 0; PointIndex < N; ++PointIndex)
+				{
+					CPUPosSum += (*Resampled.Path)[PointIndex];
+					const float ResScale = ResampledScales.IsValidIndex(PointIndex) ? ResampledScales[PointIndex] : 0.0f;
+					const float FinalScale = EvaluateVineScale(VV.CurveControl, PointIndex, N) * FMath::Max(ResScale, 0.0f);
+					CPUScaleSum += double(FinalScale);
 					++CPUPointCount;
 				}
 			}
@@ -7421,9 +7718,8 @@ TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales
 			const double PosDiff = (CPUPosSum - GPUPosSum).Size();
 			const double ScaleDiff = FMath::Abs(CPUScaleSum - GPUScaleSum);
 			UE_LOG(LogTemp, Display,
-				TEXT("[SpaceColonizationEmitCS] points CPU=%d GPU=%d | posSumDiff=%.4f scaleSumDiff=%.5f | CPUpos=(%.1f,%.1f,%.1f) GPUpos=(%.1f,%.1f,%.1f) CPUscale=%.3f GPUscale=%.3f"),
-				CPUPointCount, GPUPathPoints.Num(), PosDiff, ScaleDiff,
-				CPUPosSum.X, CPUPosSum.Y, CPUPosSum.Z, GPUPosSum.X, GPUPosSum.Y, GPUPosSum.Z, CPUScaleSum, GPUScaleSum);
+				TEXT("[SpaceColonizationPrepCS] lines CPU=%d | points CPU=%d GPU=%d | posSumDiff=%.4f scaleSumDiff=%.4f | CPUscale=%.3f GPUscale=%.3f"),
+				CPULineCount, CPUPointCount, GPUPathPoints.Num(), PosDiff, ScaleDiff, CPUScaleSum, GPUScaleSum);
 		}
 
 		return Results;

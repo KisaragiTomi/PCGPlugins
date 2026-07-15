@@ -3,7 +3,7 @@
 #include "PCGEditorProcess.h"
 #include "ActorTagShortcut.h"
 #include "CSInstanceBrushEdMode.h"
-#include "ComputeShaderMeshGenerator.h"
+#include "MeshGeneratorBrushCache.h"
 #include "ComputeShaderShallowWater.h"
 #include "CSShallowWaterProcess.h"
 #include "GPUSkeletalTree.h"
@@ -147,7 +147,7 @@ void FPCGEditorProcessModule::StartupModule()
 {
 	// Bind delegates that don't require Slate/LevelEditor
 	ACSShallowWaterCapture::OnBakeResultMeshDelegate.BindStatic(&UCSShallowWaterProcess::SaveSWData);
-	AComputeShaderMeshGenerator::OnInstanceBrushEditorRequest.AddRaw(this, &FPCGEditorProcessModule::StartInstanceBrush);
+	AMeshGeneratorBrushCache::OnInstanceBrushEditorRequest.AddRaw(this, &FPCGEditorProcessModule::StartInstanceBrush);
 	AGPUSkeletalTree::OnGenerateTreeEditorRequest.BindRaw(this, &FPCGEditorProcessModule::GenerateGPUSkeletalTree);
 
 	// Defer editor UI initialization until the engine is fully loaded.
@@ -174,7 +174,7 @@ void FPCGEditorProcessModule::ShutdownModule()
 	}
 
 	VineContainerViewportOverlay.Reset();
-	AComputeShaderMeshGenerator::OnInstanceBrushEditorRequest.RemoveAll(this);
+	AMeshGeneratorBrushCache::OnInstanceBrushEditorRequest.RemoveAll(this);
 	AGPUSkeletalTree::OnGenerateTreeEditorRequest.Unbind();
 	if (bEditorModeRegistered && !IsEngineExitRequested() && GEditor)
 	{
@@ -216,7 +216,8 @@ void FPCGEditorProcessModule::InitializeEditorUI()
 
 void FPCGEditorProcessModule::StartInstanceBrush(AComputeShaderMeshGenerator* TargetActor)
 {
-	if (!TargetActor || !GEditor)
+	AMeshGeneratorBrushCache* BrushCacheActor = Cast<AMeshGeneratorBrushCache>(TargetActor);
+	if (!BrushCacheActor || !GEditor)
 	{
 		return;
 	}
@@ -225,7 +226,7 @@ void FPCGEditorProcessModule::StartInstanceBrush(AComputeShaderMeshGenerator* Ta
 	ModeTools.ActivateMode(FCSInstanceBrushEdMode::EM_CSInstanceBrush);
 	if (FCSInstanceBrushEdMode* BrushMode = ModeTools.GetActiveModeTyped<FCSInstanceBrushEdMode>(FCSInstanceBrushEdMode::EM_CSInstanceBrush))
 	{
-		BrushMode->SetTargetActor(TargetActor);
+		BrushMode->SetTargetActor(BrushCacheActor);
 	}
 }
 

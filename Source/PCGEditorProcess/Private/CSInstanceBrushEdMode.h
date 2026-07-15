@@ -3,7 +3,7 @@
 #include "CoreMinimal.h"
 #include "EdMode.h"
 
-class AComputeShaderMeshGenerator;
+class AMeshGeneratorBrushCache;
 class FEditorViewportClient;
 class FPrimitiveDrawInterface;
 class FSceneView;
@@ -26,7 +26,7 @@ public:
 	FCSInstanceBrushEdMode();
 	virtual ~FCSInstanceBrushEdMode() override;
 
-	void SetTargetActor(AComputeShaderMeshGenerator* InTargetActor);
+	void SetTargetActor(AMeshGeneratorBrushCache* InTargetActor);
 
 	virtual void Enter() override;
 	virtual void Exit() override;
@@ -61,7 +61,7 @@ private:
 	void GetRandomVectorInBrush(FVector& OutStart, FVector& OutEnd) const;
 	void DrawPendingPreviewPoints() const;
 
-	TWeakObjectPtr<AComputeShaderMeshGenerator> TargetActor;
+	TWeakObjectPtr<AMeshGeneratorBrushCache> TargetActor;
 	TObjectPtr<UStaticMeshComponent> SphereBrushComponent;
 	TObjectPtr<UMaterialInstanceDynamic> BrushMID;
 

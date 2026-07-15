@@ -1,4 +1,5 @@
 #include "ComputeShaderMeshGenerator.h"
+#include "MeshGeneratorBrushCache.h"
 
 #include "ComputeShaderBasicFunction.h"
 #include "DynamicMeshActor.h"
@@ -17,6 +18,7 @@
 #include "Engine/Engine.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
+#include "TimerManager.h"
 #include "GameFramework/Actor.h"
 #include "GeometryScript/MeshNormalsFunctions.h"
 #include "GlobalShader.h"
@@ -4113,7 +4115,9 @@ AComputeShaderMeshGenerator::AComputeShaderMeshGenerator(const FObjectInitialize
 	DynamicMeshComponent->SetBoundsScale(DynamicMeshCullBoundsScale);
 
 	GeneratorBounds = CreateDefaultSubobject<UBoxComponent>(TEXT("GeneratorBounds"));
+#if WITH_EDITOR
 	GeneratorBounds->SetIsVisualizationComponent(true);
+#endif
 	GeneratorBounds->bEditableWhenInherited = false;
 	GeneratorBounds->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
 	GeneratorBounds->SetCollisionObjectType(ECollisionChannel::ECC_WorldDynamic);
@@ -4137,8 +4141,13 @@ void AComputeShaderMeshGenerator::PostRegisterAllComponents()
 
 void AComputeShaderMeshGenerator::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	ClearMeshGeneratorCache();
 	ClearGeneratedDataTextureCache();
+	Super::EndPlay(EndPlayReason);
+}
+
+void AMeshGeneratorBrushCache::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	ClearMeshGeneratorCache();
 	Super::EndPlay(EndPlayReason);
 }
 
@@ -4146,9 +4155,7 @@ void AComputeShaderMeshGenerator::EndPlay(const EEndPlayReason::Type EndPlayReas
 // Brush System
 // -----------------------------------------------------------------------------
 
-FCSInstanceBrushEditorRequest AComputeShaderMeshGenerator::OnInstanceBrushEditorRequest;
-
-void AComputeShaderMeshGenerator::StartInstanceBrush()
+void AMeshGeneratorBrushCache::StartInstanceBrush()
 {
 #if WITH_EDITOR
 	if (!InstanceBrushMesh)
@@ -4169,7 +4176,7 @@ void AComputeShaderMeshGenerator::StartInstanceBrush()
 #endif
 }
 
-UHierarchicalInstancedStaticMeshComponent* AComputeShaderMeshGenerator::FindPaintComponent(UStaticMesh* Mesh) const
+UHierarchicalInstancedStaticMeshComponent* AMeshGeneratorBrushCache::FindPaintComponent(UStaticMesh* Mesh) const
 {
 	if (!Mesh)
 	{
@@ -4187,7 +4194,7 @@ UHierarchicalInstancedStaticMeshComponent* AComputeShaderMeshGenerator::FindPain
 	return nullptr;
 }
 
-UHierarchicalInstancedStaticMeshComponent* AComputeShaderMeshGenerator::GetOrCreatePaintComponent(UStaticMesh* Mesh)
+UHierarchicalInstancedStaticMeshComponent* AMeshGeneratorBrushCache::GetOrCreatePaintComponent(UStaticMesh* Mesh)
 {
 	if (!Mesh)
 	{
@@ -4224,7 +4231,7 @@ UHierarchicalInstancedStaticMeshComponent* AComputeShaderMeshGenerator::GetOrCre
 	return NewComponent;
 }
 
-int32 AComputeShaderMeshGenerator::CommitPaintInstances(const TArray<FTransform>& WorldTransforms, UStaticMesh* Mesh)
+int32 AMeshGeneratorBrushCache::CommitPaintInstances(const TArray<FTransform>& WorldTransforms, UStaticMesh* Mesh)
 {
 	if (!Mesh || WorldTransforms.IsEmpty())
 	{
@@ -4248,7 +4255,7 @@ int32 AComputeShaderMeshGenerator::CommitPaintInstances(const TArray<FTransform>
 	return PaintComponent->GetInstanceCount() - PreviousInstanceCount;
 }
 
-bool AComputeShaderMeshGenerator::IsInstanceBrushPointAllowed(const FVector& WorldPosition) const
+bool AMeshGeneratorBrushCache::IsInstanceBrushPointAllowed(const FVector& WorldPosition) const
 {
 	if (!bInstanceBrushUseGeneratorBounds)
 	{
@@ -4263,7 +4270,7 @@ bool AComputeShaderMeshGenerator::IsInstanceBrushPointAllowed(const FVector& Wor
 // Dirty Cache System - Public API
 // -----------------------------------------------------------------------------
 
-FCSMeshGeneratorTriangleCacheHandle AComputeShaderMeshGenerator::EnsureTriangleCache(const FCSMeshGeneratorTriangleCacheRequest& Request)
+FCSMeshGeneratorTriangleCacheHandle AMeshGeneratorBrushCache::EnsureTriangleCache(const FCSMeshGeneratorTriangleCacheRequest& Request)
 {
 	FCSMeshGeneratorTriangleCacheRequest NormalizedRequest = Request;
 	NormalizedRequest.RequestId = NormalizeRequestId(Request.RequestId);
@@ -4333,7 +4340,7 @@ FCSMeshGeneratorTriangleCacheHandle AComputeShaderMeshGenerator::EnsureTriangleC
 	return GetTriangleCacheHandle();
 }
 
-FCSMeshGeneratorTriangleCacheHandle AComputeShaderMeshGenerator::EnsureTriangleCacheByBox(
+FCSMeshGeneratorTriangleCacheHandle AMeshGeneratorBrushCache::EnsureTriangleCacheByBox(
 	FName RequestId,
 	bool bForceFullRebuild)
 {
@@ -4343,7 +4350,7 @@ FCSMeshGeneratorTriangleCacheHandle AComputeShaderMeshGenerator::EnsureTriangleC
 	return EnsureTriangleCache(Request);
 }
 
-FCSMeshGeneratorTriangleCacheHandle AComputeShaderMeshGenerator::EnsureTriangleCacheByBox(
+FCSMeshGeneratorTriangleCacheHandle AMeshGeneratorBrushCache::EnsureTriangleCacheByBox(
 	FName RequestId,
 	const FVector& BoxCenter,
 	const FVector& BoxExtent,
@@ -4373,13 +4380,13 @@ FCSMeshGeneratorTriangleCacheHandle AComputeShaderMeshGenerator::EnsureTriangleC
 	return EnsureTriangleCacheByBox(RequestId, bForceFullRebuild);
 }
 
-void AComputeShaderMeshGenerator::UpdateMeshGeneratorCacheByBox(
+void AMeshGeneratorBrushCache::UpdateMeshGeneratorCacheByBox(
 	bool bForceFullRebuild)
 {
 	EnsureTriangleCacheByBox(CSGeneratorDefaultRequestId, bForceFullRebuild);
 }
 
-void AComputeShaderMeshGenerator::ReleaseTriangleCacheRequest(FName RequestId)
+void AMeshGeneratorBrushCache::ReleaseTriangleCacheRequest(FName RequestId)
 {
 	const FName SafeRequestId = NormalizeRequestId(RequestId);
 	if (!RequestActiveCells.Contains(SafeRequestId) && !LastRequests.Contains(SafeRequestId))
@@ -4398,18 +4405,18 @@ void AComputeShaderMeshGenerator::ReleaseTriangleCacheRequest(FName RequestId)
 	CacheState.ActiveCells = MoveTemp(NewUnionActiveCells);
 }
 
-void AComputeShaderMeshGenerator::ClearMeshGeneratorCache()
+void AMeshGeneratorBrushCache::ClearMeshGeneratorCache()
 {
 	ResetCacheRuntime(true);
 	++CacheState.CacheGeneration;
 }
 
-void AComputeShaderMeshGenerator::MarkAllActiveVoxelsDirty()
+void AMeshGeneratorBrushCache::MarkAllActiveVoxelsDirty()
 {
 	CacheState.DirtyCells.Append(CacheState.ActiveCells);
 }
 
-FCSMeshGeneratorTriangleCacheHandle AComputeShaderMeshGenerator::GetTriangleCacheHandle() const
+FCSMeshGeneratorTriangleCacheHandle AMeshGeneratorBrushCache::GetTriangleCacheHandle() const
 {
 	FCSMeshGeneratorTriangleCacheHandle Handle;
 	Handle.bValid = HasValidCacheResources() && CacheState.CachedWorldBounds.IsValid;
@@ -4429,7 +4436,7 @@ FCSMeshGeneratorTriangleCacheHandle AComputeShaderMeshGenerator::GetTriangleCach
 // Debug System
 // -----------------------------------------------------------------------------
 
-int32 AComputeShaderMeshGenerator::DrawDebugActiveVoxels(
+int32 AMeshGeneratorBrushCache::DrawDebugActiveVoxels(
 	const FCSDebugActiveVoxelOptions& Options) const
 {
 	UWorld* World = GetWorld();
@@ -4504,7 +4511,7 @@ int32 AComputeShaderMeshGenerator::DrawDebugActiveVoxels(
 // Dirty Cache System - Internals
 // -----------------------------------------------------------------------------
 
-bool AComputeShaderMeshGenerator::DoesInputRequireFullRebuild(const FBox& InputWorldBounds) const
+bool AMeshGeneratorBrushCache::DoesInputRequireFullRebuild(const FBox& InputWorldBounds) const
 {
 	const float SafeVoxelSize = FMath::Max(VoxelGridSettings.VoxelSize, CSGeneratorMinVoxelSize);
 	const int32 SafeMaxActiveVoxels = FMath::Max(1, VoxelGridSettings.MaxActiveVoxels);
@@ -4542,7 +4549,7 @@ bool AComputeShaderMeshGenerator::DoesInputRequireFullRebuild(const FBox& InputW
 	return false;
 }
 
-void AComputeShaderMeshGenerator::RebuildCacheResources(const FBox& InputWorldBounds)
+void AMeshGeneratorBrushCache::RebuildCacheResources(const FBox& InputWorldBounds)
 {
 	CacheState.CachedWorldBounds = InputWorldBounds;
 	CacheState.CachedVoxelSize = FMath::Max(VoxelGridSettings.VoxelSize, CSGeneratorMinVoxelSize);
@@ -4556,14 +4563,14 @@ void AComputeShaderMeshGenerator::RebuildCacheResources(const FBox& InputWorldBo
 	CreateCacheRenderTargets();
 }
 
-void AComputeShaderMeshGenerator::BuildActiveCellsFromReferencePoints(
+void AMeshGeneratorBrushCache::BuildActiveCellsFromReferencePoints(
 	float ActivationRadius,
 	TSet<FCSMeshGeneratorVoxelKey>& OutCells) const
 {
 	BuildActiveCellsFromReferencePoints(ReferencePoints, ActivationRadius, OutCells);
 }
 
-void AComputeShaderMeshGenerator::BuildActiveCellsFromReferencePoints(
+void AMeshGeneratorBrushCache::BuildActiveCellsFromReferencePoints(
 	const TArray<FVector>& InReferencePoints,
 	float ActivationRadius,
 	TSet<FCSMeshGeneratorVoxelKey>& OutCells) const
@@ -4626,7 +4633,7 @@ void AComputeShaderMeshGenerator::BuildActiveCellsFromReferencePoints(
 	}
 }
 
-void AComputeShaderMeshGenerator::BuildUnionActiveCells(TSet<FCSMeshGeneratorVoxelKey>& OutCells) const
+void AMeshGeneratorBrushCache::BuildUnionActiveCells(TSet<FCSMeshGeneratorVoxelKey>& OutCells) const
 {
 	OutCells.Reset();
 	const int32 MaxActiveVoxels = FMath::Max(1, VoxelGridSettings.MaxActiveVoxels);
@@ -4643,7 +4650,7 @@ void AComputeShaderMeshGenerator::BuildUnionActiveCells(TSet<FCSMeshGeneratorVox
 	}
 }
 
-void AComputeShaderMeshGenerator::DiffActiveCells(const TSet<FCSMeshGeneratorVoxelKey>& NewActiveCells)
+void AMeshGeneratorBrushCache::DiffActiveCells(const TSet<FCSMeshGeneratorVoxelKey>& NewActiveCells)
 {
 	CacheState.CellsToActivate.Reset();
 	CacheState.CellsToDeactivate.Reset();
@@ -4666,7 +4673,7 @@ void AComputeShaderMeshGenerator::DiffActiveCells(const TSet<FCSMeshGeneratorVox
 	}
 }
 
-void AComputeShaderMeshGenerator::AllocatePagesForCells(const TSet<FCSMeshGeneratorVoxelKey>& Cells)
+void AMeshGeneratorBrushCache::AllocatePagesForCells(const TSet<FCSMeshGeneratorVoxelKey>& Cells)
 {
 	for (const FCSMeshGeneratorVoxelKey& Cell : Cells)
 	{
@@ -4688,7 +4695,7 @@ void AComputeShaderMeshGenerator::AllocatePagesForCells(const TSet<FCSMeshGenera
 	}
 }
 
-void AComputeShaderMeshGenerator::ReleasePagesForCells(const TSet<FCSMeshGeneratorVoxelKey>& Cells)
+void AMeshGeneratorBrushCache::ReleasePagesForCells(const TSet<FCSMeshGeneratorVoxelKey>& Cells)
 {
 	for (const FCSMeshGeneratorVoxelKey& Cell : Cells)
 	{
@@ -4703,7 +4710,7 @@ void AComputeShaderMeshGenerator::ReleasePagesForCells(const TSet<FCSMeshGenerat
 	}
 }
 
-void AComputeShaderMeshGenerator::DispatchDirtyVoxelTriangleCacheUpdate()
+void AMeshGeneratorBrushCache::DispatchDirtyVoxelTriangleCacheUpdate()
 {
 	if (CacheState.DirtyCells.IsEmpty())
 	{
@@ -4958,7 +4965,7 @@ FBox AComputeShaderMeshGenerator::GetGeneratorBoundsWorldBox() const
 	return FBox(GeneratorBounds->GetComponentLocation() - SafeExtent, GeneratorBounds->GetComponentLocation() + SafeExtent);
 }
 
-FIntVector AComputeShaderMeshGenerator::ComputeGridSize(const FBox& InputWorldBounds) const
+FIntVector AMeshGeneratorBrushCache::ComputeGridSize(const FBox& InputWorldBounds) const
 {
 	if (!InputWorldBounds.IsValid)
 	{
@@ -4973,7 +4980,7 @@ FIntVector AComputeShaderMeshGenerator::ComputeGridSize(const FBox& InputWorldBo
 		FMath::Max(1, FMath::CeilToInt(BoundsSize.Z / SafeVoxelSize)));
 }
 
-FCSMeshGeneratorVoxelKey AComputeShaderMeshGenerator::WorldPositionToCell(FVector WorldPosition) const
+FCSMeshGeneratorVoxelKey AMeshGeneratorBrushCache::WorldPositionToCell(FVector WorldPosition) const
 {
 	const float SafeVoxelSize = FMath::Max(CacheState.CachedVoxelSize, CSGeneratorMinVoxelSize);
 	const FVector Local = (WorldPosition - CacheState.CachedWorldBounds.Min) / SafeVoxelSize;
@@ -4988,21 +4995,21 @@ FCSMeshGeneratorVoxelKey AComputeShaderMeshGenerator::WorldPositionToCell(FVecto
 		FMath::Clamp(RawCell.Z, 0, FMath::Max(0, CacheState.GridSize.Z - 1)));
 }
 
-FBox AComputeShaderMeshGenerator::GetCellWorldBounds(const FCSMeshGeneratorVoxelKey& Cell) const
+FBox AMeshGeneratorBrushCache::GetCellWorldBounds(const FCSMeshGeneratorVoxelKey& Cell) const
 {
 	const float SafeVoxelSize = FMath::Max(CacheState.CachedVoxelSize, CSGeneratorMinVoxelSize);
 	const FVector Min = CacheState.CachedWorldBounds.Min + FVector(Cell.X, Cell.Y, Cell.Z) * SafeVoxelSize;
 	return FBox(Min, Min + FVector(SafeVoxelSize));
 }
 
-void AComputeShaderMeshGenerator::ReleaseCacheResources()
+void AMeshGeneratorBrushCache::ReleaseCacheResources()
 {
 	ReleaseRTAndNull(VoxelMetaRT);
 	ReleaseRTAndNull(TriangleVertexRT);
 	ReleaseRTAndNull(TriangleNormalRT);
 }
 
-void AComputeShaderMeshGenerator::ResetCacheRuntime(bool bClearRequests)
+void AMeshGeneratorBrushCache::ResetCacheRuntime(bool bClearRequests)
 {
 	ReleaseCacheResources();
 
@@ -5031,7 +5038,7 @@ void AComputeShaderMeshGenerator::ResetCacheRuntime(bool bClearRequests)
 	}
 }
 
-void AComputeShaderMeshGenerator::InitializeFreePages()
+void AMeshGeneratorBrushCache::InitializeFreePages()
 {
 	CacheState.FreePages.Reset();
 	CacheState.FreePages.Reserve(CacheState.CachedMaxActiveVoxels);
@@ -5041,7 +5048,7 @@ void AComputeShaderMeshGenerator::InitializeFreePages()
 	}
 }
 
-void AComputeShaderMeshGenerator::CreateCacheRenderTargets()
+void AMeshGeneratorBrushCache::CreateCacheRenderTargets()
 {
 	ReleaseCacheResources();
 
@@ -5079,7 +5086,7 @@ void AComputeShaderMeshGenerator::CreateCacheRenderTargets()
 	InitCacheRT(TriangleNormalRT, NormalWidth, NormalHeight);
 }
 
-void AComputeShaderMeshGenerator::RebuildRequestActiveCellsFromLastRequests()
+void AMeshGeneratorBrushCache::RebuildRequestActiveCellsFromLastRequests()
 {
 	RequestActiveCells.Empty();
 	for (const TPair<FName, FCSMeshGeneratorTriangleCacheRequest>& Pair : LastRequests)
@@ -5100,12 +5107,12 @@ void AComputeShaderMeshGenerator::RebuildRequestActiveCellsFromLastRequests()
 	}
 }
 
-bool AComputeShaderMeshGenerator::HasValidCacheResources() const
+bool AMeshGeneratorBrushCache::HasValidCacheResources() const
 {
 	return IsValidCacheRT(VoxelMetaRT) && IsValidCacheRT(TriangleVertexRT) && IsValidCacheRT(TriangleNormalRT);
 }
 
-bool AComputeShaderMeshGenerator::AreBoundsCompatible(const FBox& A, const FBox& B) const
+bool AMeshGeneratorBrushCache::AreBoundsCompatible(const FBox& A, const FBox& B) const
 {
 	if (!A.IsValid || !B.IsValid)
 	{
@@ -5118,7 +5125,7 @@ bool AComputeShaderMeshGenerator::AreBoundsCompatible(const FBox& A, const FBox&
 		&& FVector::DistSquared(A.GetExtent(), B.GetExtent()) <= ToleranceSq;
 }
 
-FName AComputeShaderMeshGenerator::NormalizeRequestId(FName RequestId) const
+FName AMeshGeneratorBrushCache::NormalizeRequestId(FName RequestId) const
 {
 	return RequestId.IsNone() ? CSGeneratorDefaultRequestId : RequestId;
 }

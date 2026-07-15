@@ -99,11 +99,6 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 	FString MeshAssetName = FString::Printf(TEXT("SM_CSSW_Water_%d"), ActorId);
 	FString DuplicateMeshPath = AssetFolderPath / MeshAssetName;
 
-	if (UEditorAssetLibrary::DoesAssetExist(DuplicateMeshPath))
-	{
-		UEditorAssetLibrary::DeleteAsset(DuplicateMeshPath);
-	}
-
 	const FStaticMeshRenderData* RenderData = SourceMesh->GetRenderData();
 	if (!RenderData || RenderData->LODResources.Num() == 0)
 	{
@@ -138,9 +133,17 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 	UE_LOG(LogTemp, Log, TEXT("[CSSW] SrcMesh RenderData: Verts=%d, Tris=%d, Instances=%d"),
 		SrcNumVerts, SrcNumTris, InstanceTransforms.Num());
 
-	FString OriginalMeshPath = GetPathNameSafe(SourceMesh);
-	UObject* DupObj = UEditorAssetLibrary::DuplicateAsset(OriginalMeshPath, DuplicateMeshPath);
-	UStaticMesh* NewMesh = Cast<UStaticMesh>(DupObj);
+	UStaticMesh* NewMesh = nullptr;
+	if (UEditorAssetLibrary::DoesAssetExist(DuplicateMeshPath))
+	{
+		NewMesh = Cast<UStaticMesh>(UEditorAssetLibrary::LoadAsset(DuplicateMeshPath));
+	}
+	if (!NewMesh)
+	{
+		FString OriginalMeshPath = GetPathNameSafe(SourceMesh);
+		UObject* DupObj = UEditorAssetLibrary::DuplicateAsset(OriginalMeshPath, DuplicateMeshPath);
+		NewMesh = Cast<UStaticMesh>(DupObj);
+	}
 	if (!NewMesh) return;
 
 	FMeshDescription MergedDesc;
@@ -400,11 +403,19 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 		UTexture2D* VelHeightTex = InCSSWActor->RT_ResultVelHeight
 			? UCSAssetProcess::ConveretAndSaveRTAsset(VelHeightTexName, AssetFolderPath, InCSSWActor->RT_ResultVelHeight)
 			: nullptr;
+		if (VelHeightTex)
+		{
+			VelHeightTex->MarkPackageDirty();
+		}
 
 		FString DepthWetTexName = FString::Printf(TEXT("T_CSSW_DepthWet_%d"), ActorId);
 		UTexture2D* DepthWetTex = InCSSWActor->RT_ResultDepthWet
 			? UCSAssetProcess::ConveretAndSaveRTAsset(DepthWetTexName, AssetFolderPath, InCSSWActor->RT_ResultDepthWet)
 			: nullptr;
+		if (DepthWetTex)
+		{
+			DepthWetTex->MarkPackageDirty();
+		}
 
 		FString WaterMIName = FString::Printf(TEXT("MI_CSSW_Water_%d"), ActorId);
 		UMaterialInstance* WaterMI = UCSAssetProcess::FindOrCreateMaterialInstanceAsset(WaterMIName, AssetFolderPath, BakeMaterial);
@@ -419,6 +430,7 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 			UMaterialEditingLibrary::SetMaterialInstanceStaticSwitchParameterValue(WaterMIC, FName("SwithSim"), true);
 			WaterMIC->PostEditChange();
 			UEditorAssetLibrary::SaveLoadedAsset(WaterMIC, false);
+			WaterMIC->MarkPackageDirty();
 			BakeMaterial = WaterMIC;
 		}
 

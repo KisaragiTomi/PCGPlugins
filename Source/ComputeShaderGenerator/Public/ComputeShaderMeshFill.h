@@ -3,8 +3,10 @@
 #include "CoreMinimal.h"
 #include "GenericPlatform/GenericPlatformMisc.h"
 #include "Kismet/BlueprintAsyncActionBase.h"
+#include "Kismet/BlueprintFunctionLibrary.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Components/BoxComponent.h"
+#include "GlobalShader.h"
 #include "ComputeShaderSceneCapture.h"
 #include "ShaderParameterStruct.h"
 

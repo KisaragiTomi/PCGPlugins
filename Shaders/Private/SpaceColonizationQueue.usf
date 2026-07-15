@@ -5,12 +5,25 @@
 #define THREADGROUPSIZE_X 64
 #endif
 
-struct FTargetState
-{
-	float4 Position;
-	int4 State0;
-	int4 State1;
-};
+// Upper bound for the per-thread nearest-neighbor selection arrays in
+// BuildSpaceColonizationNeighborsCS. Must stay >= the host-side
+// SpaceColonizationMaxNeighborsPerTarget constant (128).
+#ifndef SC_MAX_NEIGHBORS_CAP
+#define SC_MAX_NEIGHBORS_CAP 128
+#endif
+
+// The kernels below mirror the CPU reference implementation in
+// GeometryEditorActor.cpp (BuildSpaceColonizationQueueImpl and helpers).
+// Per iteration: Reset -> Claim -> Propose -> CommitParents -> CommitChildren.
+// - Claim replicates PopulateSpaceColonizationAssociatesFromNeighbors: each
+//   attractor claims its single nearest non-attractor node (runtime positions,
+//   1.1 slack radius gate).
+// - Propose replicates the CPU growth loop: eligibility gates, nearest
+//   attractor from the node's own neighbor list, direction from claimed
+//   attractors only.
+// - CommitParents/CommitChildren replicate the CPU sequential commit loop:
+//   every proposer commits its parent-side effects, and when several proposers
+//   contest one child the highest proposer index wins (last writer on CPU).
 
 StructuredBuffer<float4> SourcePositions;
 StructuredBuffer<float4> InitialTargetPositions;
@@ -19,19 +32,25 @@ StructuredBuffer<int4> State0;
 StructuredBuffer<int4> State1;
 StructuredBuffer<uint> NeighborCounts;
 StructuredBuffer<uint> NeighborIndices;
+StructuredBuffer<uint> Claims;
+StructuredBuffer<uint> ClaimCounts;
 StructuredBuffer<uint> ProposalOwners;
+StructuredBuffer<uint> ProposalTargets;
 StructuredBuffer<float4> ProposalPositions;
 RWStructuredBuffer<float4> RW_TargetPositions;
 RWStructuredBuffer<int4> RW_State0;
 RWStructuredBuffer<int4> RW_State1;
 RWStructuredBuffer<uint> RW_NeighborCounts;
 RWStructuredBuffer<uint> RW_NeighborIndices;
+RWStructuredBuffer<uint> RW_Claims;
+RWStructuredBuffer<uint> RW_ClaimCounts;
 RWStructuredBuffer<uint> RW_ProposalOwners;
+RWStructuredBuffer<uint> RW_ProposalTargets;
 RWStructuredBuffer<float4> RW_ProposalPositions;
 
 uint TargetCount;
 uint SourceCount;
-    uint MaxNeighbors;
+uint MaxNeighbors;
 uint Iteration;
 uint Activetime;
 float RandGrow;
@@ -74,18 +93,25 @@ void MarkSpaceColonizationSourcesCS(uint3 DispatchThreadId : SV_DispatchThreadID
         return;
     }
 
+    // Mirrors UPointFunction::FindNearPointIteration: linear float distance,
+    // 999999999 cutoff, and no marking at all when nothing beats the cutoff.
     float3 Source = SourcePositions[SourceIndex].xyz;
-    uint BestIndex = 0;
-    float BestDistSq = 3.402823466e+38f;
+    uint BestIndex = 0xffffffffu;
+    float BestDist = 999999999.0f;
 
     for (uint i = 0; i < TargetCount; ++i)
     {
-        float D = DistSq(InitialTargetPositions[i].xyz, Source);
-        if (D < BestDistSq)
+        float D = sqrt(DistSq(InitialTargetPositions[i].xyz, Source));
+        if (D < BestDist)
         {
-            BestDistSq = D;
+            BestDist = D;
             BestIndex = i;
         }
+    }
+
+    if (BestIndex == 0xffffffffu)
+    {
+        return;
     }
 
     float4 BestPosition = InitialTargetPositions[BestIndex];
@@ -112,6 +138,14 @@ void BuildSpaceColonizationNeighborsCS(uint3 DispatchThreadId : SV_DispatchThrea
     float Radius = max(InfluenceRadius, 1.0f);
     float RadiusSq = Radius * Radius;
     float3 Center = InitialTargetPositions[Index].xyz;
+    uint EffectiveMax = min(MaxNeighbors, (uint)SC_MAX_NEIGHBORS_CAP);
+
+    // Keep the NEAREST EffectiveMax candidates (replace-farthest selection) so
+    // the neighbor set membership matches the CPU's distance-sorted truncation.
+    // Slot order differs from the CPU's sorted list, which is fine: every
+    // consumer does a strict min-scan over the list.
+    float BestDistSq[SC_MAX_NEIGHBORS_CAP];
+    uint BestIndex[SC_MAX_NEIGHBORS_CAP];
     uint Count = 0u;
 
     for (uint Candidate = 0; Candidate < TargetCount; ++Candidate)
@@ -121,18 +155,43 @@ void BuildSpaceColonizationNeighborsCS(uint3 DispatchThreadId : SV_DispatchThrea
             continue;
         }
 
-        if (DistSq(InitialTargetPositions[Candidate].xyz, Center) > RadiusSq)
+        float D = DistSq(InitialTargetPositions[Candidate].xyz, Center);
+        if (D > RadiusSq)
         {
             continue;
         }
 
-        if (Count < MaxNeighbors)
+        if (Count < EffectiveMax)
         {
-            RW_NeighborIndices[Index * MaxNeighbors + Count] = Candidate;
+            BestDistSq[Count] = D;
+            BestIndex[Count] = Candidate;
             Count += 1u;
+        }
+        else
+        {
+            uint WorstSlot = 0u;
+            float WorstDistSq = BestDistSq[0];
+            for (uint Slot = 1u; Slot < EffectiveMax; ++Slot)
+            {
+                if (BestDistSq[Slot] > WorstDistSq)
+                {
+                    WorstDistSq = BestDistSq[Slot];
+                    WorstSlot = Slot;
+                }
+            }
+
+            if (D < WorstDistSq)
+            {
+                BestDistSq[WorstSlot] = D;
+                BestIndex[WorstSlot] = Candidate;
+            }
         }
     }
 
+    for (uint Out = 0u; Out < Count; ++Out)
+    {
+        RW_NeighborIndices[Index * MaxNeighbors + Out] = BestIndex[Out];
+    }
     RW_NeighborCounts[Index] = Count;
 }
 
@@ -145,8 +204,70 @@ void ResetSpaceColonizationProposalsCS(uint3 DispatchThreadId : SV_DispatchThrea
         return;
     }
 
-    RW_ProposalOwners[Index] = 0xffffffffu;
+    // Owners are encoded as ProposerIndex + 1 so 0 means "no proposal"; this
+    // lets CommitChildren pick the HIGHEST proposer via InterlockedMax.
+    RW_ProposalOwners[Index] = 0u;
     RW_ProposalPositions[Index] = float4(0.0f, 0.0f, 0.0f, -1.0f);
+    RW_Claims[Index] = 0xffffffffu;
+    RW_ClaimCounts[Index] = 0u;
+    RW_ProposalTargets[Index] = 0xffffffffu;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void ClaimSpaceColonizationAssociatesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint AttractorIndex = DispatchThreadId.x;
+    if (AttractorIndex >= TargetCount || MaxNeighbors == 0u)
+    {
+        return;
+    }
+
+    // Mirrors PopulateSpaceColonizationAssociatesFromNeighbors: only attractors
+    // claim, each claims the single nearest non-attractor node from its own
+    // neighbor list at RUNTIME positions.
+    if (State0[AttractorIndex].x == 0)
+    {
+        return;
+    }
+
+    float3 AttractorPosition = TargetPositions[AttractorIndex].xyz;
+    uint NeighborCount = min(NeighborCounts[AttractorIndex], MaxNeighbors);
+    uint NeighborBase = AttractorIndex * MaxNeighbors;
+    uint NearestNode = 0xffffffffu;
+    float NearestDistSq = 3.402823466e+38f;
+
+    for (uint NeighborOffset = 0; NeighborOffset < NeighborCount; ++NeighborOffset)
+    {
+        uint NodeIndex = NeighborIndices[NeighborBase + NeighborOffset];
+        if (NodeIndex >= TargetCount)
+        {
+            continue;
+        }
+        if (State0[NodeIndex].x != 0)
+        {
+            continue;
+        }
+
+        float D = DistSq(TargetPositions[NodeIndex].xyz, AttractorPosition);
+        if (D < NearestDistSq)
+        {
+            NearestDistSq = D;
+            NearestNode = NodeIndex;
+        }
+    }
+
+    if (NearestNode == 0xffffffffu)
+    {
+        return;
+    }
+    // CPU associate gate: runtime distance with 1.1 slack must stay inside the radius.
+    if (!(sqrt(NearestDistSq) * 1.1f < InfluenceRadius))
+    {
+        return;
+    }
+
+    RW_Claims[AttractorIndex] = NearestNode;
+    InterlockedAdd(RW_ClaimCounts[NearestNode], 1u);
 }
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
@@ -171,23 +292,24 @@ void ProposeSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThread
         return;
     }
 
+    // Same hash gate as the CPU path (SpaceColonizationGrowRand); keep the two
+    // formulas in sync or per-node growth decisions stop matching.
     float Grow = HashFloat01((uint)(P * 1664525u + Iteration * 1013904223u + (uint)(Seed * 100000.0f)));
     if (Grow < RandGrow && Iteration > 10u)
     {
         return;
     }
 
-    float3 OriginalCurrent = InitialTargetPositions[P].xyz;
-    float3 RuntimeCurrent = TargetPositions[P].xyz;
-    float SourceScale = 1.0f;
-    int StartId = State1[P].x;
-    if (StartId >= 0 && StartId < (int)TargetCount)
+    uint ClaimCount = ClaimCounts[P];
+    if (ClaimCount == 0u)
     {
-        float StartTargetScale = max(abs(InitialTargetPositions[StartId].w), 1.0e-6f);
-        SourceScale = TargetPositions[StartId].w / StartTargetScale;
+        return;
     }
-    float3 DirSum = float3(0.0f, 0.0f, 0.0f);
-    uint AssociateCount = 0u;
+
+    float3 RuntimeCurrent = TargetPositions[P].xyz;
+
+    // Growth target: nearest attractor among P's OWN neighbors (any attractor,
+    // not only claimed ones) — mirrors FindSpaceColonizationNearestAttractorFromNeighbors.
     uint NearAttractor = 0xffffffffu;
     float NearAttractorDistSq = 3.402823466e+38f;
     uint NeighborCount = min(NeighborCounts[P], MaxNeighbors);
@@ -200,17 +322,12 @@ void ProposeSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThread
         {
             continue;
         }
-
         if (State0[AttractorIndex].x == 0)
         {
             continue;
         }
 
-        float3 OriginalAttractor = InitialTargetPositions[AttractorIndex].xyz;
-        float D = DistSq(OriginalAttractor, OriginalCurrent);
-        DirSum += OriginalAttractor - OriginalCurrent;
-        AssociateCount += 1u;
-
+        float D = DistSq(TargetPositions[AttractorIndex].xyz, RuntimeCurrent);
         if (D < NearAttractorDistSq)
         {
             NearAttractorDistSq = D;
@@ -218,27 +335,81 @@ void ProposeSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThread
         }
     }
 
-    if (AssociateCount == 0u || NearAttractor == 0xffffffffu)
+    if (NearAttractor == 0xffffffffu)
     {
         return;
     }
 
-    float DirLenSq = dot(DirSum, DirSum);
-    if (DirLenSq <= 1.0e-8f)
+    // Growth direction: only the attractors that claimed P this iteration, in
+    // ascending index order to match the CPU associate ordering. The scan stops
+    // once all ClaimCount claims are found.
+    float3 DirSum = float3(0.0f, 0.0f, 0.0f);
+    uint Remaining = ClaimCount;
+    for (uint ClaimIndex = 0; ClaimIndex < TargetCount && Remaining > 0u; ++ClaimIndex)
     {
-        return;
+        if (Claims[ClaimIndex] != P)
+        {
+            continue;
+        }
+        DirSum += TargetPositions[ClaimIndex].xyz - RuntimeCurrent;
+        Remaining -= 1u;
+    }
+
+    // FVector::Normalize semantics: leave the vector unchanged when its squared
+    // length is within the 1e-8 tolerance, and still commit the degenerate step.
+    float DirLenSq = dot(DirSum, DirSum);
+    if (DirLenSq > 1.0e-8f)
+    {
+        DirSum *= rsqrt(DirLenSq);
+    }
+
+    float SourceScale = 1.0f;
+    int StartId = State1[P].x;
+    if (StartId >= 0 && StartId < (int)TargetCount)
+    {
+        float StartTargetScale = max(abs(InitialTargetPositions[StartId].w), 1.0e-6f);
+        SourceScale = TargetPositions[StartId].w / StartTargetScale;
     }
 
     float NearestDist = sqrt(NearAttractorDistSq);
-    // [DEBUG] DirSum directional influence temporarily zeroed — branch stays at current position
-    // TODO: revert to: float3 NewPosition = RuntimeCurrent + DirSum * rsqrt(DirLenSq) * NearestDist;
-    float3 NewPosition = RuntimeCurrent;
+    float3 NewPosition = RuntimeCurrent + DirSum * NearestDist;
     RW_ProposalPositions[P] = float4(NewPosition, SourceScale);
-    InterlockedMin(RW_ProposalOwners[NearAttractor], P);
+    RW_ProposalTargets[P] = NearAttractor;
+    // CPU conflict resolution: sequential commits mean the HIGHEST proposer
+    // index overwrites the contested child, hence InterlockedMax on P + 1.
+    InterlockedMax(RW_ProposalOwners[NearAttractor], P + 1u);
 }
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
-void CommitSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+void CommitSpaceColonizationParentsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint P = DispatchThreadId.x;
+    if (P >= TargetCount)
+    {
+        return;
+    }
+
+    uint TargetIndex = ProposalTargets[P];
+    if (TargetIndex >= TargetCount)
+    {
+        return;
+    }
+
+    // Every proposer commits its parent-side effects, matching the CPU loop
+    // where losing proposals still increment SpawnCount/BranchCount and leave
+    // NextPt pointing at the contested child. No re-validation, as on CPU.
+    int4 ParentState0 = RW_State0[P];
+    int4 ParentState1 = RW_State1[P];
+    ParentState0.w += 1;
+    ParentState0.y = 0;
+    ParentState1.z = (int)TargetIndex;
+    ParentState1.w += 1;
+    RW_State0[P] = ParentState0;
+    RW_State1[P] = ParentState1;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void CommitSpaceColonizationChildrenCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
     uint TargetIndex = DispatchThreadId.x;
     if (TargetIndex >= TargetCount)
@@ -246,39 +417,25 @@ void CommitSpaceColonizationGrowthCS(uint3 DispatchThreadId : SV_DispatchThreadI
         return;
     }
 
-    uint SourceIndex = ProposalOwners[TargetIndex];
-    if (SourceIndex == 0xffffffffu || SourceIndex >= TargetCount)
+    uint Owner = ProposalOwners[TargetIndex];
+    if (Owner == 0u)
+    {
+        return;
+    }
+    uint SourceIndex = Owner - 1u;
+    if (SourceIndex >= TargetCount)
     {
         return;
     }
 
+    // Parent state was already updated by CommitSpaceColonizationParentsCS, so
+    // SpawnCount below matches the CPU child's post-increment inheritance.
     float4 ProposedPosition = ProposalPositions[SourceIndex];
-    if (ProposedPosition.w < 0.0f)
-    {
-        return;
-    }
-
-    float4 ParentPosition = RW_TargetPositions[SourceIndex];
     int4 ParentState0 = RW_State0[SourceIndex];
     int4 ParentState1 = RW_State1[SourceIndex];
-    int4 CurrentState0 = RW_State0[TargetIndex];
-
-    if (ParentState0.x != 0 || ParentState1.w > 2 || CurrentState0.x == 0)
-    {
-        return;
-    }
-
-    int ParentStartId = ParentState1.x;
-    ParentState0.w += 1;
-    ParentState0.y = 0;
-    ParentState1.z = (int)TargetIndex;
-    ParentState1.w += 1;
-    RW_TargetPositions[SourceIndex] = ParentPosition;
-    RW_State0[SourceIndex] = ParentState0;
-    RW_State1[SourceIndex] = ParentState1;
 
     float TargetPointScale = InitialTargetPositions[TargetIndex].w;
     RW_TargetPositions[TargetIndex] = float4(ProposedPosition.xyz, TargetPointScale * ProposedPosition.w);
     RW_State0[TargetIndex] = int4(0, 1, 0, ParentState0.w);
-    RW_State1[TargetIndex] = int4(ParentStartId, (int)SourceIndex, -1, 1);
+    RW_State1[TargetIndex] = int4(ParentState1.x, (int)SourceIndex, -1, 1);
 }

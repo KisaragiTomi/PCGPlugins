@@ -2,7 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "ComputeShaderGenerateHepler.h"
-#include "ComputeShaderMeshGenerator.h"
+#include "MeshGeneratorBrushCache.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Components/BoxComponent.h"
 #include "Kismet/KismetRenderingLibrary.h"
@@ -31,7 +31,7 @@ enum class EWaterfallExpansion : uint8
 
 
 UCLASS(HideCategories=(Replication), meta=(PrioritizeCategories="SWParameter"))
-class COMPUTESHADERGENERATOR_API ACSShallowWaterCapture : public AComputeShaderMeshGenerator
+class COMPUTESHADERGENERATOR_API ACSShallowWaterCapture : public AMeshGeneratorBrushCache
 {
 	GENERATED_BODY()
 public:
@@ -44,7 +44,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug")
 	UStaticMeshComponent* ReusltMesh;
 
-	UPROPERTY(Transient, BlueprintReadWrite, DuplicateTransient)
+	UPROPERTY(Transient, BlueprintReadWrite, DuplicateTransient, Category = "Debug")
 	UHierarchicalInstancedStaticMeshComponent* SimVisHISM;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug")

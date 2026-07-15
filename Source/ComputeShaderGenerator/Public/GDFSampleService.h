@@ -7,11 +7,11 @@
 #include "Math/IntVector.h"
 #include "Templates/Function.h"
 #include "Templates/RefCounting.h"
+#include "RenderGraphResources.h"
 
 class FRDGBuilder;
 class FSceneView;
 class FGlobalDistanceFieldParameterData;
-class FRDGPooledBuffer;
 
 //// GSDF 异步采样服务。
 ////

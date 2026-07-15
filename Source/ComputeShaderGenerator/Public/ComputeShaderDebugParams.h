@@ -21,7 +21,7 @@ public:
 	int32 GPUProjectionVoxelDebugPointLimit = 0;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "0.0"))
-	float GPUProjectionVoxelDebugDuration = 10.0f;
+	float GPUProjectionVoxelDebugDuration = 5.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
 	bool bGPUProjectionVoxelDebugPointsPersistent = false;
@@ -48,7 +48,7 @@ public:
 	bool bSCStageDrawTube = true;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "0.0"))
-	float SCStageDebugPointDuration = 10.0f;
+	float SCStageDebugPointDuration = 5.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "0.0"))
 	float SCStageDebugPointSize = 8.0f;
@@ -158,7 +158,7 @@ public:
 
 	// How long (seconds) the debug lines persist. Ignored when bPersistentLines is true.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "0.0"))
-	float DebugDuration = 10.0f;
+	float DebugDuration = 5.0f;
 
 	// Keep debug lines until explicitly flushed instead of expiring after DebugDuration.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
@@ -250,7 +250,7 @@ public:
 	bool bDrawTriangles = true;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "0.0"))
-	float TriangleDebugDuration = 10.0f;
+	float TriangleDebugDuration = 5.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
 	bool bTriangleDebugPersistent = false;

@@ -1,6 +1,6 @@
 #include "CSInstanceBrushEdMode.h"
 
-#include "ComputeShaderMeshGenerator.h"
+#include "MeshGeneratorBrushCache.h"
 
 #include "Components/BrushComponent.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
@@ -67,7 +67,7 @@ struct FCSInstanceBrushGeometryFilter
 	}
 };
 
-FCSInstanceBrushGeometryFilter MakeBrushGeometryFilter(AComputeShaderMeshGenerator* TargetActor)
+FCSInstanceBrushGeometryFilter MakeBrushGeometryFilter(AMeshGeneratorBrushCache* TargetActor)
 {
 	FCSInstanceBrushGeometryFilter Filter;
 	Filter.TargetActor = TargetActor;
@@ -85,7 +85,7 @@ FCSInstanceBrushEdMode::~FCSInstanceBrushEdMode()
 	DestroyBrushComponent();
 }
 
-void FCSInstanceBrushEdMode::SetTargetActor(AComputeShaderMeshGenerator* InTargetActor)
+void FCSInstanceBrushEdMode::SetTargetActor(AMeshGeneratorBrushCache* InTargetActor)
 {
 	TargetActor = InTargetActor;
 	CancelStroke();
@@ -228,7 +228,7 @@ void FCSInstanceBrushEdMode::UpdateBrushComponent(FEditorViewportClient* Viewpor
 		CreateBrushComponent();
 	}
 
-	AComputeShaderMeshGenerator* Target = TargetActor.Get();
+	AMeshGeneratorBrushCache* Target = TargetActor.Get();
 	UWorld* World = Target ? Target->GetWorld() : nullptr;
 	if (!SphereBrushComponent || !World || !ViewportClient || !bBrushTraceValid)
 	{
@@ -278,7 +278,7 @@ bool FCSInstanceBrushEdMode::UpdateBrushTraceFromMouse(FEditorViewportClient* Vi
 bool FCSInstanceBrushEdMode::TraceBrushRay(FEditorViewportClient* ViewportClient, const FVector& RayOrigin, const FVector& RayDirection)
 {
 	bBrushTraceValid = false;
-	AComputeShaderMeshGenerator* Target = TargetActor.Get();
+	AMeshGeneratorBrushCache* Target = TargetActor.Get();
 	UWorld* World = Target ? Target->GetWorld() : nullptr;
 	if (!World || !ViewportClient || ViewportClient->IsMovingCamera() || !ViewportClient->IsVisible())
 	{
@@ -301,7 +301,7 @@ bool FCSInstanceBrushEdMode::TraceBrushRay(FEditorViewportClient* ViewportClient
 
 bool FCSInstanceBrushEdMode::TraceCandidatePoint(const FVector& Start, const FVector& End, FHitResult& OutHit) const
 {
-	AComputeShaderMeshGenerator* Target = TargetActor.Get();
+	AMeshGeneratorBrushCache* Target = TargetActor.Get();
 	UWorld* World = Target ? Target->GetWorld() : nullptr;
 	if (!World)
 	{
@@ -342,7 +342,7 @@ void FCSInstanceBrushEdMode::UpdateStroke()
 
 void FCSInstanceBrushEdMode::CommitStroke()
 {
-	AComputeShaderMeshGenerator* Target = TargetActor.Get();
+	AMeshGeneratorBrushCache* Target = TargetActor.Get();
 	if (Target && Target->InstanceBrushMesh && !PendingTransforms.IsEmpty())
 	{
 		const int32 AddedCount = Target->CommitPaintInstances(PendingTransforms, Target->InstanceBrushMesh);
@@ -374,7 +374,7 @@ void FCSInstanceBrushEdMode::ExitTemporaryMode()
 
 void FCSInstanceBrushEdMode::SamplePreviewPoints()
 {
-	AComputeShaderMeshGenerator* Target = TargetActor.Get();
+	AMeshGeneratorBrushCache* Target = TargetActor.Get();
 	if (!Target || !Target->InstanceBrushMesh || !bBrushTraceValid)
 	{
 		return;
@@ -408,7 +408,7 @@ void FCSInstanceBrushEdMode::SamplePreviewPoints()
 
 bool FCSInstanceBrushEdMode::IsCandidatePointAllowed(const FVector& Location) const
 {
-	AComputeShaderMeshGenerator* Target = TargetActor.Get();
+	AMeshGeneratorBrushCache* Target = TargetActor.Get();
 	if (!Target || !Target->IsInstanceBrushPointAllowed(Location))
 	{
 		return false;
@@ -438,7 +438,7 @@ bool FCSInstanceBrushEdMode::IsTooCloseToPendingPoint(const FVector& Location, f
 
 bool FCSInstanceBrushEdMode::IsTooCloseToExistingInstance(const FVector& Location, float MinSpacingSq) const
 {
-	const AComputeShaderMeshGenerator* Target = TargetActor.Get();
+	const AMeshGeneratorBrushCache* Target = TargetActor.Get();
 	if (!Target || !Target->InstanceBrushMesh)
 	{
 		return false;
@@ -465,7 +465,7 @@ bool FCSInstanceBrushEdMode::IsTooCloseToExistingInstance(const FVector& Locatio
 
 FTransform FCSInstanceBrushEdMode::BuildInstanceTransform(const FHitResult& Hit) const
 {
-	const AComputeShaderMeshGenerator* Target = TargetActor.Get();
+	const AMeshGeneratorBrushCache* Target = TargetActor.Get();
 	if (!Target)
 	{
 		return FTransform::Identity;
@@ -488,7 +488,7 @@ FTransform FCSInstanceBrushEdMode::BuildInstanceTransform(const FHitResult& Hit)
 
 void FCSInstanceBrushEdMode::GetRandomVectorInBrush(FVector& OutStart, FVector& OutEnd) const
 {
-	const AComputeShaderMeshGenerator* Target = TargetActor.Get();
+	const AMeshGeneratorBrushCache* Target = TargetActor.Get();
 	const float BrushRadius = Target ? FMath::Max(1.0f, Target->InstanceBrushRadius) : 1.0f;
 
 	const float Ru = (2.0f * FMath::FRand()) - 1.0f;
@@ -506,7 +506,7 @@ void FCSInstanceBrushEdMode::GetRandomVectorInBrush(FVector& OutStart, FVector& 
 
 void FCSInstanceBrushEdMode::DrawPendingPreviewPoints() const
 {
-	const AComputeShaderMeshGenerator* Target = TargetActor.Get();
+	const AMeshGeneratorBrushCache* Target = TargetActor.Get();
 	UWorld* World = Target ? Target->GetWorld() : nullptr;
 	if (!World || PendingPreviewPoints.IsEmpty())
 	{

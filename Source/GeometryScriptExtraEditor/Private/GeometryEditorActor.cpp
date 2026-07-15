@@ -595,6 +595,121 @@ class FSpaceColonizationQueueCommitChildrenCS : public FGlobalShader
 	}
 };
 
+// GPU vine line-building (Increment B): BranchOrder -> CountLines -> PrefixSum.
+class FSpaceColonizationBranchOrderCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSpaceColonizationBranchOrderCS);
+	SHADER_USE_PARAMETER_STRUCT(FSpaceColonizationBranchOrderCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, State0)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, State1)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_BranchOrder)
+		SHADER_PARAMETER(uint32, TargetCount)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
+class FSpaceColonizationCountLinesCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSpaceColonizationCountLinesCS);
+	SHADER_USE_PARAMETER_STRUCT(FSpaceColonizationCountLinesCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, State0)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, State1)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, BranchOrder)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_LineCounter)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_LineLength)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_NodeLineIndex)
+		SHADER_PARAMETER(uint32, TargetCount)
+		SHADER_PARAMETER(int32, BackGrowCount)
+		SHADER_PARAMETER(int32, ForkTaperForkOrdinal)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
+class FSpaceColonizationPrefixSumLinesCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSpaceColonizationPrefixSumLinesCS);
+	SHADER_USE_PARAMETER_STRUCT(FSpaceColonizationPrefixSumLinesCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, LineCounter)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, LineLength)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_LineOffset)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_LineCountsOut)
+		SHADER_PARAMETER(uint32, TargetCount)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
+class FSpaceColonizationEmitLinesCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSpaceColonizationEmitLinesCS);
+	SHADER_USE_PARAMETER_STRUCT(FSpaceColonizationEmitLinesCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, TargetPositions)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, State0)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, State1)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, BranchOrder)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, TargetPointScales)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, StartSourceScales)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, NodeLineIndex)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, LineOffset)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_PathPoints)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<int4>, RW_PathPointMeta)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<int4>, RW_SegmentMeta)
+		SHADER_PARAMETER(uint32, TargetCount)
+		SHADER_PARAMETER(int32, BackGrowCount)
+		SHADER_PARAMETER(int32, ForkTaperForkOrdinal)
+		SHADER_PARAMETER(uint32, PathPointCapacity)
+		SHADER_PARAMETER(uint32, SegmentCapacity)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueInitCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "InitializeSpaceColonizationQueueCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueMarkSourcesCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "MarkSpaceColonizationSourcesCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueBuildNeighborsCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "BuildSpaceColonizationNeighborsCS", SF_Compute);
@@ -603,6 +718,10 @@ IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueClaimCS, "/Plugin/PCGPlugins/Shad
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueProposeCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "ProposeSpaceColonizationGrowthCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueCommitParentsCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "CommitSpaceColonizationParentsCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueCommitChildrenCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "CommitSpaceColonizationChildrenCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationBranchOrderCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "BuildSpaceColonizationBranchOrderCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationCountLinesCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "CountSpaceColonizationLinesCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationPrefixSumLinesCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "PrefixSumSpaceColonizationLinesCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationEmitLinesCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "EmitSpaceColonizationLinesCS", SF_Compute);
 
 
 namespace
@@ -6153,10 +6272,16 @@ static bool BuildSpaceColonizationQueueCSImpl(
 	float RandGrow,
 	float Seed,
 	float InfluenceRadius,
+	int32 BackGrowCount,
+	int32 ForkTaperForkOrdinal,
+	const TArray<float>& TargetPointScales,
+	const TArray<float>& StartSourceScales,
+	TArray<FVector4f>& OutGPUPathPoints,
 	TArray<FVector>& OutTargetLocations,
 	TArray<FSpaceColonizationAttribute>& OutSCAttributes)
 {
 	GV_TIME_SCOPE(TEXT("SpaceColonizationCS.Queue.Total"));
+	OutGPUPathPoints.Reset();
 	OutTargetLocations.Reset();
 	OutSCAttributes.Reset();
 
@@ -6213,6 +6338,23 @@ static bool BuildSpaceColonizationQueueCSImpl(
 		FRHIGPUBufferReadback* TargetReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_TargetReadback"));
 		FRHIGPUBufferReadback* State0Readback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_State0Readback"));
 		FRHIGPUBufferReadback* State1Readback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_State1Readback"));
+		// GPU line-building (Increment B) validation counters: [lineCount, totalPoints, totalSegments, 0].
+		FRHIGPUBufferReadback* LineCountsReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_LineCounts"));
+		TArray<uint32> LineCountsData;
+		LineCountsData.SetNumZeroed(4);
+		const uint32 LineCountsReadbackBytes = uint32(sizeof(uint32) * 4);
+		// Stage B2 emit-kernel output. Buffer is over-allocated to the worst-case bound
+		// (each of <=TargetCount lines has <= SC_MAX_BACKTRACK+1 points); only [0,totalPoints)
+		// is written compactly. Readback is capped to keep the validation copy small.
+		constexpr int32 SpaceColonizationMaxBacktrack = 100;
+		const uint32 PathPointCapacity = uint32(FMath::Min<int64>(int64(TargetCount) * int64(SpaceColonizationMaxBacktrack + 1), 4000000));
+		const uint32 SegmentCapacity = PathPointCapacity;
+		const uint32 PathPointsReadbackCount = FMath::Min<uint32>(PathPointCapacity, 65536u);
+		const uint32 PathPointsReadbackBytes = uint32(sizeof(FVector4f) * uint64(PathPointsReadbackCount));
+		FRHIGPUBufferReadback* PathPointsReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_PathPoints"));
+		TArray<FVector4f> PathPointsData;
+		TArray<float> EmitTargetPointScales = TargetPointScales;
+		TArray<float> EmitStartSourceScales = StartSourceScales;
 		// Debug readbacks exist solely to feed the [SpaceColonizationStep] validation logs.
 		// In production (bSpaceColonizationStepLogs == false) they stay null and every
 		// debug copy-pass / lock below is compiled out, so the GPU path only pays for the
@@ -6259,7 +6401,11 @@ static bool BuildSpaceColonizationQueueCSImpl(
 				 NeighborCountsDebugReadback, ResetProposalOwnerDebugReadbacks, ProposalOwnerDebugReadbacks,
 				 IterationTargetDebugReadbacks, IterationState0DebugReadbacks, IterationState1DebugReadbacks,
 				 TargetCount, SourceCount, IterationCount, Activetime, RandGrow, Seed, InfluenceRadius,
-				 MaxNeighborsPerTarget, NeighborIndexCount, &bRenderWorkQueued](FRHICommandListImmediate& RHICmdList)
+				 MaxNeighborsPerTarget, NeighborIndexCount, BackGrowCount, ForkTaperForkOrdinal,
+				 LineCountsReadback, LineCountsReadbackBytes,
+				 EmitTargetPointScales = MoveTemp(EmitTargetPointScales), EmitStartSourceScales = MoveTemp(EmitStartSourceScales),
+				 PathPointsReadback, PathPointsReadbackBytes, PathPointCapacity, SegmentCapacity,
+				 &bRenderWorkQueued](FRHICommandListImmediate& RHICmdList)
 				{
 					FRDGBuilder GraphBuilder(RHICmdList);
 
@@ -6456,6 +6602,106 @@ static bool BuildSpaceColonizationQueueCSImpl(
 						}
 					}
 
+					// ---- GPU vine line-building (Increment B, Stage B1: count + validate) ----
+					// Mirrors the CPU tracer: BranchOrder -> CountLines (End-gated, anti-web)
+					// -> PrefixSum. Emits only a validation counter for now; the CPU tracer
+					// still produces the actual lines downstream.
+					CREATE_RDG_STRUCTURED_UAV_SRV(BranchOrder, uint32, TargetCount, TEXT("SpaceColonizationQueue_BranchOrder"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(LineCounter, uint32, 1, TEXT("SpaceColonizationQueue_LineCounter"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(LineLength, uint32, TargetCount, TEXT("SpaceColonizationQueue_LineLength"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(NodeLineIndex, uint32, TargetCount, TEXT("SpaceColonizationQueue_NodeLineIndex"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(LineOffset, uint32, TargetCount, TEXT("SpaceColonizationQueue_LineOffset"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(LineCountsOut, uint32, 4, TEXT("SpaceColonizationQueue_LineCountsOut"))
+
+					AddClearUAVPass(GraphBuilder, LineCounterUAV, 0u);
+
+					TShaderMapRef<FSpaceColonizationBranchOrderCS> BranchOrderShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+					FSpaceColonizationBranchOrderCS::FParameters* BranchOrderParameters = GraphBuilder.AllocParameters<FSpaceColonizationBranchOrderCS::FParameters>();
+					BranchOrderParameters->State0 = State0SRV;
+					BranchOrderParameters->State1 = State1SRV;
+					BranchOrderParameters->RW_BranchOrder = BranchOrderUAV;
+					BranchOrderParameters->TargetCount = uint32(TargetCount);
+					GraphBuilder.AddPass(
+						RDG_EVENT_NAME("SpaceColonizationQueue.BranchOrder"),
+						BranchOrderParameters,
+						ERDGPassFlags::Compute,
+						[BranchOrderParameters, BranchOrderShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
+						{
+							FComputeShaderUtils::Dispatch(InRHICmdList, BranchOrderShader, *BranchOrderParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
+						});
+
+					TShaderMapRef<FSpaceColonizationCountLinesCS> CountLinesShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+					FSpaceColonizationCountLinesCS::FParameters* CountLinesParameters = GraphBuilder.AllocParameters<FSpaceColonizationCountLinesCS::FParameters>();
+					CountLinesParameters->State0 = State0SRV;
+					CountLinesParameters->State1 = State1SRV;
+					CountLinesParameters->BranchOrder = BranchOrderSRV;
+					CountLinesParameters->RW_LineCounter = LineCounterUAV;
+					CountLinesParameters->RW_LineLength = LineLengthUAV;
+					CountLinesParameters->RW_NodeLineIndex = NodeLineIndexUAV;
+					CountLinesParameters->TargetCount = uint32(TargetCount);
+					CountLinesParameters->BackGrowCount = BackGrowCount;
+					CountLinesParameters->ForkTaperForkOrdinal = ForkTaperForkOrdinal;
+					GraphBuilder.AddPass(
+						RDG_EVENT_NAME("SpaceColonizationQueue.CountLines"),
+						CountLinesParameters,
+						ERDGPassFlags::Compute,
+						[CountLinesParameters, CountLinesShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
+						{
+							FComputeShaderUtils::Dispatch(InRHICmdList, CountLinesShader, *CountLinesParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
+						});
+
+					TShaderMapRef<FSpaceColonizationPrefixSumLinesCS> PrefixSumShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+					FSpaceColonizationPrefixSumLinesCS::FParameters* PrefixSumParameters = GraphBuilder.AllocParameters<FSpaceColonizationPrefixSumLinesCS::FParameters>();
+					PrefixSumParameters->LineCounter = LineCounterSRV;
+					PrefixSumParameters->LineLength = LineLengthSRV;
+					PrefixSumParameters->RW_LineOffset = LineOffsetUAV;
+					PrefixSumParameters->RW_LineCountsOut = LineCountsOutUAV;
+					PrefixSumParameters->TargetCount = uint32(TargetCount);
+					GraphBuilder.AddPass(
+						RDG_EVENT_NAME("SpaceColonizationQueue.PrefixSumLines"),
+						PrefixSumParameters,
+						ERDGPassFlags::Compute,
+						[PrefixSumParameters, PrefixSumShader](FRHIComputeCommandList& InRHICmdList)
+						{
+							FComputeShaderUtils::Dispatch(InRHICmdList, PrefixSumShader, *PrefixSumParameters, FIntVector(1, 1, 1));
+						});
+					AddEnqueueCopyPass(GraphBuilder, LineCountsReadback, LineCountsOutBuffer, LineCountsReadbackBytes);
+
+					// ---- Stage B2: emit the flat PathPoints/Meta/Segment layout ----
+					CREATE_RDG_STRUCTURED_UPLOAD_SRV(TargetPointScales, float, EmitTargetPointScales, TEXT("SpaceColonizationQueue_TargetPointScales"))
+					CREATE_RDG_STRUCTURED_UPLOAD_SRV(StartSourceScales, float, EmitStartSourceScales, TEXT("SpaceColonizationQueue_StartSourceScales"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(PathPoints, FVector4f, PathPointCapacity, TEXT("SpaceColonizationQueue_PathPoints"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(PathPointMeta, FIntVector4, PathPointCapacity, TEXT("SpaceColonizationQueue_PathPointMeta"))
+					CREATE_RDG_STRUCTURED_UAV_SRV(SegmentMeta, FIntVector4, SegmentCapacity, TEXT("SpaceColonizationQueue_SegmentMeta"))
+
+					TShaderMapRef<FSpaceColonizationEmitLinesCS> EmitLinesShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+					FSpaceColonizationEmitLinesCS::FParameters* EmitLinesParameters = GraphBuilder.AllocParameters<FSpaceColonizationEmitLinesCS::FParameters>();
+					EmitLinesParameters->TargetPositions = TargetSRV;
+					EmitLinesParameters->State0 = State0SRV;
+					EmitLinesParameters->State1 = State1SRV;
+					EmitLinesParameters->BranchOrder = BranchOrderSRV;
+					EmitLinesParameters->TargetPointScales = TargetPointScalesSRV;
+					EmitLinesParameters->StartSourceScales = StartSourceScalesSRV;
+					EmitLinesParameters->NodeLineIndex = NodeLineIndexSRV;
+					EmitLinesParameters->LineOffset = LineOffsetSRV;
+					EmitLinesParameters->RW_PathPoints = PathPointsUAV;
+					EmitLinesParameters->RW_PathPointMeta = PathPointMetaUAV;
+					EmitLinesParameters->RW_SegmentMeta = SegmentMetaUAV;
+					EmitLinesParameters->TargetCount = uint32(TargetCount);
+					EmitLinesParameters->BackGrowCount = BackGrowCount;
+					EmitLinesParameters->ForkTaperForkOrdinal = ForkTaperForkOrdinal;
+					EmitLinesParameters->PathPointCapacity = PathPointCapacity;
+					EmitLinesParameters->SegmentCapacity = SegmentCapacity;
+					GraphBuilder.AddPass(
+						RDG_EVENT_NAME("SpaceColonizationQueue.EmitLines"),
+						EmitLinesParameters,
+						ERDGPassFlags::Compute,
+						[EmitLinesParameters, EmitLinesShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
+						{
+							FComputeShaderUtils::Dispatch(InRHICmdList, EmitLinesShader, *EmitLinesParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
+						});
+					AddEnqueueCopyPass(GraphBuilder, PathPointsReadback, PathPointsBuffer, PathPointsReadbackBytes);
+
 					AddEnqueueCopyPass(GraphBuilder, TargetReadback, TargetBuffer, TargetReadbackBytes);
 					AddEnqueueCopyPass(GraphBuilder, State0Readback, State0Buffer, StateReadbackBytes);
 					AddEnqueueCopyPass(GraphBuilder, State1Readback, State1Buffer, StateReadbackBytes);
@@ -6482,6 +6728,10 @@ static bool BuildSpaceColonizationQueueCSImpl(
 				IterationTargetDebugReadbacks,
 				IterationState0DebugReadbacks,
 				IterationState1DebugReadbacks);
+			delete LineCountsReadback;
+			LineCountsReadback = nullptr;
+			delete PathPointsReadback;
+			PathPointsReadback = nullptr;
 			return false;
 		}
 
@@ -6498,7 +6748,7 @@ static bool BuildSpaceColonizationQueueCSImpl(
 			ENQUEUE_RENDER_COMMAND(SpaceColonizationQueueCSReadback)(
 				[TargetReadback, State0Readback, State1Readback, InitialTargetDebugReadback, InitialState0DebugReadback, InitialState1DebugReadback,
 				 NeighborCountsDebugReadback, ResetProposalOwnerDebugReadbacks, ProposalOwnerDebugReadbacks, IterationTargetDebugReadbacks,
-				 IterationState0DebugReadbacks, IterationState1DebugReadbacks, TargetReadbackBytes, StateReadbackBytes, UIntReadbackBytes,
+				 IterationState0DebugReadbacks, IterationState1DebugReadbacks, TargetReadbackBytes, StateReadbackBytes, UIntReadbackBytes, LineCountsReadback, LineCountsReadbackBytes, &LineCountsData, PathPointsReadback, PathPointsReadbackBytes, &PathPointsData,
 				 TargetCount, &TargetPositionData, &State0Data, &State1Data, &CSDebugData, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList) mutable
 				{
 					if (!TargetReadback || !State0Readback || !State1Readback)
@@ -6559,6 +6809,9 @@ static bool BuildSpaceColonizationQueueCSImpl(
 						LockSpaceColonizationReadbackToArray(State0Readback, StateReadbackBytes, TargetCount, State0Data) &&
 						LockSpaceColonizationReadbackToArray(State1Readback, StateReadbackBytes, TargetCount, State1Data);
 
+					LockSpaceColonizationReadbackToArray(LineCountsReadback, LineCountsReadbackBytes, 4, LineCountsData);
+					LockSpaceColonizationReadbackToArray(PathPointsReadback, PathPointsReadbackBytes, int32(PathPointsReadbackBytes / sizeof(FVector4f)), PathPointsData);
+
 					CSDebugData.bInitialReadbackSucceeded =
 						LockSpaceColonizationReadbackToArray(InitialTargetDebugReadback, TargetReadbackBytes, TargetCount, CSDebugData.InitialTargetPositions) &&
 						LockSpaceColonizationReadbackToArray(InitialState0DebugReadback, StateReadbackBytes, TargetCount, CSDebugData.InitialState0) &&
@@ -6616,6 +6869,30 @@ static bool BuildSpaceColonizationQueueCSImpl(
 
 			FlushRenderingCommands();
 		}
+
+		// GPU line-building (Increment B, Stage B1) validation: the GPU tree walk
+		// must produce the SAME line/point counts as the CPU tracer (anti-web check).
+		UE_LOG(LogTemp, Display, TEXT("[SpaceColonizationLinesCS] GPU lineCount=%u totalPoints=%u totalSegments=%u (Targets=%d)"),
+			LineCountsData.IsValidIndex(0) ? LineCountsData[0] : 0u,
+			LineCountsData.IsValidIndex(1) ? LineCountsData[1] : 0u,
+			LineCountsData.IsValidIndex(2) ? LineCountsData[2] : 0u,
+			TargetCount);
+		delete LineCountsReadback;
+		LineCountsReadback = nullptr;
+
+		// Slice the emit readback to the compact [0, totalPoints) range for validation.
+		{
+			const uint32 GPUTotalPoints = LineCountsData.IsValidIndex(1) ? LineCountsData[1] : 0u;
+			const int32 CopyCount = FMath::Min<int32>(int32(GPUTotalPoints), PathPointsData.Num());
+			OutGPUPathPoints.Reset();
+			OutGPUPathPoints.Append(PathPointsData.GetData(), FMath::Max(CopyCount, 0));
+			if (int32(GPUTotalPoints) > PathPointsData.Num())
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[SpaceColonizationEmitCS] totalPoints=%u exceeds readback cap=%d; checksum is partial."), GPUTotalPoints, PathPointsData.Num());
+			}
+		}
+		delete PathPointsReadback;
+		PathPointsReadback = nullptr;
 
 		if (!bReadbackSucceeded)
 		{
@@ -7090,6 +7367,7 @@ TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales
 		TArray<float> TargetPointScales;
 		TArray<float> StartSourceScales;
 		BuildSpaceColonizationScaleLookups(SourceTransforms, TargetTransforms, TargetPointScales, StartSourceScales);
+		TArray<FVector4f> GPUPathPoints;
 		if (!BuildSpaceColonizationQueueCSImpl(
 			SourceTransforms,
 			TargetTransforms,
@@ -7098,6 +7376,11 @@ TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales
 			SC.RandGrow,
 			SC.Seed,
 			SC.InfluenceRadius,
+			SC.BackGrowCount,
+			SC.ForkTaperForkOrdinal,
+			TargetPointScales,
+			StartSourceScales,
+			GPUPathPoints,
 			TargetLocations,
 			SCAttributes))
 		{
@@ -7105,6 +7388,44 @@ TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales
 		}
 
 		TArray<FSpaceColonizationLineResult> Results = BuildSpaceColonizationLineResultsImpl(TargetLocations, SCAttributes, SC.BackGrowCount, SC.ForkTaperForkOrdinal, TargetPointScales, StartSourceScales);
+
+		// Stage B2 validation: the GPU emit kernel (GPUPathPoints: xyz=pos, w=tracer scale)
+		// must match the CPU tracer's flattened lines. Compare order-independent aggregates.
+		{
+			FVector CPUPosSum = FVector::ZeroVector;
+			double CPUScaleSum = 0.0;
+			int32 CPUPointCount = 0;
+			for (const FSpaceColonizationLineResult& Line : Results)
+			{
+				const TArray<FVector>* Path = Line.Path.Path.IsValid() ? Line.Path.Path.Get() : nullptr;
+				if (!Path)
+				{
+					continue;
+				}
+				for (int32 PointIndex = 0; PointIndex < Path->Num(); ++PointIndex)
+				{
+					CPUPosSum += (*Path)[PointIndex];
+					CPUScaleSum += double(Line.PointScales.IsValidIndex(PointIndex) ? Line.PointScales[PointIndex] : 0.0f);
+					++CPUPointCount;
+				}
+			}
+
+			FVector GPUPosSum = FVector::ZeroVector;
+			double GPUScaleSum = 0.0;
+			for (const FVector4f& Point : GPUPathPoints)
+			{
+				GPUPosSum += FVector(Point.X, Point.Y, Point.Z);
+				GPUScaleSum += double(Point.W);
+			}
+
+			const double PosDiff = (CPUPosSum - GPUPosSum).Size();
+			const double ScaleDiff = FMath::Abs(CPUScaleSum - GPUScaleSum);
+			UE_LOG(LogTemp, Display,
+				TEXT("[SpaceColonizationEmitCS] points CPU=%d GPU=%d | posSumDiff=%.4f scaleSumDiff=%.5f | CPUpos=(%.1f,%.1f,%.1f) GPUpos=(%.1f,%.1f,%.1f) CPUscale=%.3f GPUscale=%.3f"),
+				CPUPointCount, GPUPathPoints.Num(), PosDiff, ScaleDiff,
+				CPUPosSum.X, CPUPosSum.Y, CPUPosSum.Z, GPUPosSum.X, GPUPosSum.Y, GPUPosSum.Z, CPUScaleSum, GPUScaleSum);
+		}
+
 		return Results;
 	}
 

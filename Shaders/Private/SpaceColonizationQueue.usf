@@ -439,3 +439,297 @@ void CommitSpaceColonizationChildrenCS(uint3 DispatchThreadId : SV_DispatchThrea
     RW_State0[TargetIndex] = int4(0, 1, 0, ParentState0.w);
     RW_State1[TargetIndex] = int4(ParentState1.x, (int)SourceIndex, -1, 1);
 }
+
+// ============================================================================
+// GPU vine line-building (Increment B). Mirrors the CPU tracer
+// BuildSpaceColonizationLineResultsImpl in GeometryEditorActor.cpp:
+//   - a line is emitted ONLY for End tips (State0.y != 0) — the anti-web guard;
+//   - backtrack PrePt (State1.y) from the tip to the start point (PrePt < 0),
+//     capped at SC_MAX_BACKTRACK, applying the same fork-taper early-stop.
+// BranchOrder ranks each child among its PrePt-siblings by (SpawnCount asc,
+// index asc): order 1 = primary branch, order >= 2 = non-primary (arms taper).
+// ============================================================================
+
+RWStructuredBuffer<uint> RW_BranchOrder;
+StructuredBuffer<uint> BranchOrder;
+RWStructuredBuffer<uint> RW_LineCounter;    // [0] = number of emitted lines (atomic)
+RWStructuredBuffer<uint> RW_LineLength;     // per compact line: point count
+RWStructuredBuffer<uint> RW_NodeLineIndex;  // End node -> compact line index
+StructuredBuffer<uint> LineCounter;
+StructuredBuffer<uint> LineLength;
+RWStructuredBuffer<uint> RW_LineOffset;     // exclusive prefix sum over LineLength
+RWStructuredBuffer<uint> RW_LineCountsOut;  // [0]=lineCount [1]=totalPoints [2]=totalSegments
+
+int BackGrowCount;
+int ForkTaperForkOrdinal;
+
+#ifndef SC_MAX_BACKTRACK
+#define SC_MAX_BACKTRACK 100
+#endif
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void BuildSpaceColonizationBranchOrderCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint Child = DispatchThreadId.x;
+    if (Child >= TargetCount)
+    {
+        return;
+    }
+
+    int Parent = State1[Child].y; // PrePt
+    if (Parent < 0 || Parent >= (int)TargetCount)
+    {
+        RW_BranchOrder[Child] = 0u; // start points keep order 0 (CPU: continue)
+        return;
+    }
+
+    int ChildSpawn = State0[Child].w;
+    uint Order = 1u;
+    for (uint s = 0; s < TargetCount; ++s)
+    {
+        if (s == Child)
+        {
+            continue;
+        }
+        if (State1[s].y != Parent) // must share the same parent
+        {
+            continue;
+        }
+        int SibSpawn = State0[s].w;
+        if (SibSpawn < ChildSpawn || (SibSpawn == ChildSpawn && s < Child))
+        {
+            Order += 1u;
+        }
+    }
+    RW_BranchOrder[Child] = Order;
+}
+
+// Point count for the line seeded at End node Tip. This MUST stay byte-identical
+// to the backtrack in EmitLines, or the flat buffers desync.
+uint SpaceColonizationBacktrackCount(uint Tip)
+{
+    int PreForkAncestor = clamp(BackGrowCount - 1, 0, SC_MAX_BACKTRACK);
+    int TaperForkOrdinal = max(ForkTaperForkOrdinal, 1);
+
+    uint Count = 1u; // tip appended first
+    int Current = (int)Tip;
+    int NonPrimaryFork = 0;
+    bool Armed = false;
+    int TaperedAncestors = 0;
+
+    [loop]
+    for (int step = 0; step < SC_MAX_BACKTRACK; ++step)
+    {
+        int Childx = Current;
+        int Pre = State1[Current].y; // PrePt
+        if (Pre < 0 || Pre >= (int)TargetCount)
+        {
+            break; // reached the start point
+        }
+        Count += 1u;
+
+        if (!Armed && BranchOrder[Childx] > 1u)
+        {
+            NonPrimaryFork += 1;
+            if (NonPrimaryFork >= TaperForkOrdinal)
+            {
+                Armed = true;
+            }
+        }
+        if (Armed)
+        {
+            TaperedAncestors += 1;
+        }
+
+        Current = Pre;
+        if (Armed && TaperedAncestors >= PreForkAncestor)
+        {
+            break; // retained-ancestor budget spent
+        }
+    }
+    return Count;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void CountSpaceColonizationLinesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint Node = DispatchThreadId.x;
+    if (Node >= TargetCount)
+    {
+        return;
+    }
+    if (State0[Node].y == 0) // End gate — emit only from grown-tree tips (anti-web)
+    {
+        return;
+    }
+
+    uint Count = SpaceColonizationBacktrackCount(Node);
+    if (Count < 2u) // matches BuildVVGPUInput's < 2 skip
+    {
+        return;
+    }
+
+    uint LineIndex;
+    InterlockedAdd(RW_LineCounter[0], 1u, LineIndex);
+    if (LineIndex >= TargetCount)
+    {
+        return; // defensive capacity guard (lines <= targets)
+    }
+    RW_LineLength[LineIndex] = Count;
+    RW_NodeLineIndex[Node] = LineIndex;
+}
+
+[numthreads(1, 1, 1)]
+void PrefixSumSpaceColonizationLinesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (DispatchThreadId.x != 0)
+    {
+        return;
+    }
+    uint LineCount = LineCounter[0];
+    if (LineCount > TargetCount)
+    {
+        LineCount = TargetCount;
+    }
+    uint Acc = 0u;
+    for (uint i = 0; i < LineCount; ++i)
+    {
+        RW_LineOffset[i] = Acc;
+        Acc += LineLength[i];
+    }
+    RW_LineCountsOut[0] = LineCount;
+    RW_LineCountsOut[1] = Acc; // totalPoints
+    RW_LineCountsOut[2] = (Acc >= LineCount) ? (Acc - LineCount) : 0u; // totalSegments
+}
+
+// Emit the flat PathPoints/Meta/Segment layout (Increment B, Stage B2). One thread
+// per End tip; reuses the exact backtrack from CountLines. PathPoints.w carries the
+// CPU-tracer per-point scale (Resolve * taper); the VisVine-side CurveScale/CurveU
+// are folded in later (B3 fusion). Positions/scales here must match the CPU tracer.
+StructuredBuffer<float> TargetPointScales;
+StructuredBuffer<float> StartSourceScales;
+StructuredBuffer<uint> NodeLineIndex;
+StructuredBuffer<uint> LineOffset;
+RWStructuredBuffer<float4> RW_PathPoints;   // xyz = position, w = tracer per-point scale
+RWStructuredBuffer<int4> RW_PathPointMeta;  // (Prev, Next, Base, Count)
+RWStructuredBuffer<int4> RW_SegmentMeta;    // (A, B, 0, 0)
+uint PathPointCapacity;
+uint SegmentCapacity;
+
+float SpaceColonizationResolveScale(int Idx)
+{
+    float TargetScale = TargetPointScales[Idx];
+    int Start = State1[Idx].x; // Startid
+    float SourceScale = (Start >= 0 && Start < (int)TargetCount) ? StartSourceScales[Start] : 1.0f;
+    return TargetScale * SourceScale;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void EmitSpaceColonizationLinesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint Node = DispatchThreadId.x;
+    if (Node >= TargetCount)
+    {
+        return;
+    }
+    if (State0[Node].y == 0) // End gate — emit only from grown-tree tips (anti-web)
+    {
+        return;
+    }
+
+    uint Count = SpaceColonizationBacktrackCount(Node);
+    if (Count < 2u)
+    {
+        return;
+    }
+    uint LineIndex = NodeLineIndex[Node];
+    if (LineIndex >= TargetCount)
+    {
+        return;
+    }
+    uint Base = LineOffset[LineIndex];
+    uint SegBase = Base - LineIndex; // SegmentOffset[LineIndex] = LineOffset[i] - i
+
+    int PreForkAncestor = clamp(BackGrowCount - 1, 0, SC_MAX_BACKTRACK);
+    int TaperForkOrdinal = max(ForkTaperForkOrdinal, 1);
+
+    // Tip (k = 0): full resolved scale, never tapered.
+    float TipScale = SpaceColonizationResolveScale((int)Node);
+    if (Base < PathPointCapacity)
+    {
+        int NextIdx = (Count > 1u) ? (int)(Base + 1u) : (int)Base;
+        RW_PathPoints[Base] = float4(TargetPositions[Node].xyz, max(TipScale, 0.0f));
+        RW_PathPointMeta[Base] = int4((int)Base, NextIdx, (int)Base, (int)Count);
+        if (Count > 1u && SegBase < SegmentCapacity)
+        {
+            RW_SegmentMeta[SegBase] = int4((int)Base, (int)(Base + 1u), 0, 0);
+        }
+    }
+
+    int Current = (int)Node;
+    int k = 0;
+    int NonPrimaryFork = 0;
+    bool Armed = false;
+    int TaperedAncestors = 0;
+    float ForkScale = 1.0f;
+    float PrevTaper = TipScale;
+
+    [loop]
+    for (int step = 0; step < SC_MAX_BACKTRACK && (uint)(k + 1) < Count; ++step)
+    {
+        int Childx = Current;
+        int Pre = State1[Current].y; // PrePt
+        if (Pre < 0 || Pre >= (int)TargetCount)
+        {
+            break;
+        }
+        k += 1;
+        uint gi = Base + (uint)k;
+        if (gi >= PathPointCapacity)
+        {
+            break;
+        }
+
+        if (!Armed && BranchOrder[Childx] > 1u)
+        {
+            NonPrimaryFork += 1;
+            if (NonPrimaryFork >= TaperForkOrdinal)
+            {
+                Armed = true;
+                ForkScale = PrevTaper; // scale of the point just below the fork
+            }
+        }
+
+        float Taper;
+        if (!Armed)
+        {
+            Taper = SpaceColonizationResolveScale(Pre);
+        }
+        else
+        {
+            TaperedAncestors += 1;
+            float Alpha = (PreForkAncestor > 1) ? ((float)TaperedAncestors / (float)PreForkAncestor) : 1.0f;
+            Taper = ForkScale * lerp(1.0f, 0.1f, Alpha); // ForkTaperEndScale = 0.1
+        }
+
+        int PrevIdx = (int)(gi - 1u);
+        int NextIdx = (int)min(gi + 1u, Base + Count - 1u);
+        RW_PathPoints[gi] = float4(TargetPositions[Pre].xyz, max(Taper, 0.0f));
+        RW_PathPointMeta[gi] = int4(PrevIdx, NextIdx, (int)Base, (int)Count);
+        if ((uint)k < Count - 1u)
+        {
+            uint SegIndex = SegBase + (uint)k;
+            if (SegIndex < SegmentCapacity)
+            {
+                RW_SegmentMeta[SegIndex] = int4((int)gi, (int)(gi + 1u), 0, 0);
+            }
+        }
+
+        PrevTaper = Taper;
+        Current = Pre;
+        if (Armed && TaperedAncestors >= PreForkAncestor)
+        {
+            break;
+        }
+    }
+}

@@ -101,12 +101,12 @@ using namespace CSHepler;
 
 ACSLandscapeLayer::ACSLandscapeLayer()
 {
-	SceneComponent = CreateDefaultSubobject<USceneComponent>(TEXT("CaptureRoot"));
-	SetRootComponent(SceneComponent);
+	// Reuse the inherited AComputeShaderMeshGenerator components instead of creating duplicates.
+	SceneComponent = SceneRoot;
+	Box = GeneratorBounds;
 
-	Box = CreateDefaultSubobject<UBoxComponent>(TEXT("Box"));
-	Box->SetupAttachment(SceneComponent, TEXT("Box"));
 	Box->SetBoxExtent(FVector(50, 50, 50));
+	Box->bEditableWhenInherited = true;
 }
 
 void ACSLandscapeLayer::OnConstruction(const FTransform& Transform)
@@ -393,17 +393,17 @@ bool ACSLandscapeLayer::RenderLayer(
 	if (!bHasResult || !RT_LayerBlendResult) return false;
 	if (!RenderParams.MergeRenderContext->IsHeightmapMerge()) return false;
 
-	RenderParams.MergeRenderContext->CycleBlendRenderTargets(RDGBuilderRecorder);
-	ULandscapeScratchRenderTarget* WriteRT = RenderParams.MergeRenderContext->GetBlendRenderTargetWrite();
-
-	WriteRT->TransitionTo(ERHIAccess::RTV, RDGBuilderRecorder);
-
-	FIntPoint Size = RenderParams.RenderAreaSectionRect.Size();
-	ULandscapeScratchRenderTarget::FCopyFromTextureParams CopyParams(RT_LayerBlendResult);
-	CopyParams.CopySize = Size;
-	WriteRT->CopyFrom(CopyParams, RDGBuilderRecorder);
-
-	return true;
+	// [Step 1 - stop the crash] The previous implementation blitted RT_LayerBlendResult into the
+	// heightmap blend render target with ULandscapeScratchRenderTarget::CopyFrom(). That is a raw
+	// CopyTextureRegion with NO format/encoding conversion, so copying RGBA16f (RT_LayerBlendResult)
+	// into the landscape's packed BGRA8 heightmap target is format-incompatible and crashes the RHI
+	// thread (D3D12 E_INVALIDARG at CopyTextureRegion, confirmed via -d3ddebug).
+	// TODO [Step 2 - correct write]: replace this with a shader pass that samples RT_LayerBlendResult,
+	// encodes world-space height the landscape way (LandscapeDataAccess::GetTexHeight) and writes it
+	// packed (LandscapeCommon.ush PackHeight -> RG) into WriteRT at the batch's DestPosition sub-rect.
+	// Until then this layer simply contributes nothing to the live merge; CommitToLandscape() still
+	// bakes the result into the landscape via the CPU SetHeightData path.
+	return false;
 }
 
 void ACSLandscapeLayer::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)

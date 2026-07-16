@@ -23,10 +23,16 @@ float TempNoiseFrequency;
 float TempNoiseAmplitude;
 int TempNoiseOctaves;
 float TempFalloffWidth;
+float TempLandscapeScaleZ;
 int TempBlendMode;
 int TempSourceMode;
 float3 TempBoxOrigin;
 float3 TempBoxExtent;
+float3 TempBoxAxisX;
+float3 TempBoxAxisY;
+float3 TempRenderAreaOrigin;
+float3 TempRenderAreaAxisX;
+float3 TempRenderAreaAxisY;
 float LandscapeZScale;
 float LandscapeZOffset;
 
@@ -78,48 +84,30 @@ void CreateRiverBed(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupId, 
 }
 
 
+float ComputeRectangularCaptureMask(float2 UV, float2 ValidRange)
+{
+	float2 SafeRange = max(ValidRange, float2(0.0001, 0.0001));
+	if (any(UV < 0.0) || any(UV > ValidRange)) return 0.0;
+
+	float2 BoxUV = UV / SafeRange;
+	float EdgeDistance = 2.0 * min(min(BoxUV.x, 1.0 - BoxUV.x), min(BoxUV.y, 1.0 - BoxUV.y));
+	if (BlurRange <= 0.0001) return 1.0;
+	return smoothstep(0.0, BlurRange, saturate(EdgeDistance));
+}
+
 void LandscapeBrushTexture(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupId, uint GroupIndex)
 {
 	float2 MaxCell;
 	RW_Result.GetDimensions(MaxCell.x, MaxCell.y);
+	if (any(DispatchThreadId.xy >= (uint2)MaxCell)) return;
 
 	float2 UV = (DispatchThreadId.xy + .5) / MaxCell;
 	float4 O_NormalHeight = T_OrigLandscapeData.Sample(Sampler, UV);
 
 	bool IsValidData = length(O_NormalHeight) > .9;
+	float BlurMask = IsValidData ? ComputeRectangularCaptureMask(UV, ValidUVRange.xy) : 0.0;
 
-	// float Mask = T_OrigLandscapeData[DispatchThreadId.xy].x;
-	float ValidDist = distance(UV, float2(ValidUVRange.x, ValidUVRange.y) / 2);
-	float MinRange = min(ValidUVRange.x, ValidUVRange.y) / 2 * .9;
-	float BlurMask = smoothstep(0, BlurRange, (MinRange - ValidDist) / MinRange);
-
-	float2 PackedHeightData = IsValidData? PackRG8Height(O_NormalHeight.w) : float2(.5, .5);
-	RW_Result[DispatchThreadId.xy].w = BlurMask;
-	RW_Result[DispatchThreadId.xy].x = O_NormalHeight.w;
-	// RW_Result[DispatchThreadId.xy].x = 100;
-	// RW_Result[DispatchThreadId.xy].w = 1000;
-}
-
-void LandscapePaste(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupId, uint GroupIndex)
-{
-	float2 MaxCell;
-	RW_Result.GetDimensions(MaxCell.x, MaxCell.y);
-
-	float2 UV = (DispatchThreadId.xy + .5) / MaxCell;
-	float4 O_NormalHeight = T_OrigLandscapeData.Sample(Sampler, UV);
-	float4 C_NormalHeight = T_CopyLandscapeData.Sample(Sampler, UV);
-	
-	if (length(O_NormalHeight) < .9 || length(C_NormalHeight) < .9) return;
-
-	// float Mask = T_OrigLandscapeData[DispatchThreadId.xy].x;
-	float ValidDist = distance(UV, float2(ValidUVRange.x, ValidUVRange.y) / 2);
-	float MinRange = min(ValidUVRange.x, ValidUVRange.y) / 2;
-	float BlurMask = smoothstep(0, BlurRange, (MinRange - ValidDist) / MinRange);
-	O_NormalHeight.w = 0;
-	float4 ResultData = lerp(O_NormalHeight, C_NormalHeight, BlurMask);
-	RW_Result[DispatchThreadId.xy].w = BlurMask;
-	RW_Result[DispatchThreadId.xy].x = ResultData.w;
-	// RW_Result[DispatchThreadId.xy].w = 1000;
+	RW_Result[DispatchThreadId.xy] = float4(O_NormalHeight.w, 0, 0, BlurMask);
 	RW_DebugView[DispatchThreadId.xy] = O_NormalHeight;
 }
 
@@ -154,14 +142,21 @@ float TempFBM(float2 P, int Octaves)
 	return Value;
 }
 
-float TempComputeBoxFalloff(float2 UV)
+float2 TempWorldToBoxUV(float2 WorldPosition)
 {
-	float2 Center = float2(0.5, 0.5);
-	float2 Dist = abs(UV - Center);
-	float MaxDist = max(Dist.x, Dist.y) * 2.0;
-	float NormFalloff = TempFalloffWidth / max(max(TempBoxExtent.x, TempBoxExtent.y), 1.0);
-	float EdgeDist = 1.0 - MaxDist;
-	return smoothstep(0.0, max(NormFalloff, 0.001), EdgeDist);
+	float2 Delta = WorldPosition - TempBoxOrigin.xy;
+	float2 LocalPosition = float2(dot(Delta, TempBoxAxisX.xy), dot(Delta, TempBoxAxisY.xy));
+	return LocalPosition / max(TempBoxExtent.xy * 2.0, float2(0.001, 0.001)) + 0.5;
+}
+
+float TempComputeBoxFalloff(float2 WorldPosition)
+{
+	float2 BoxUV = TempWorldToBoxUV(WorldPosition);
+	float2 LocalPosition = (BoxUV - 0.5) * TempBoxExtent.xy * 2.0;
+	float2 EdgeDistance = TempBoxExtent.xy - abs(LocalPosition);
+	float InsideDistance = min(EdgeDistance.x, EdgeDistance.y);
+	if (TempFalloffWidth <= 0.001) return step(0.0, InsideDistance);
+	return smoothstep(0.0, TempFalloffWidth, InsideDistance);
 }
 
 // T_OrigLandscapeData = CombinedResult (scratch RT, B8G8R8A8: height packed in RG)
@@ -173,10 +168,17 @@ void BrushApplyResult(uint3 DispatchThreadId)
 {
 	float2 MaxCell;
 	RW_Result.GetDimensions(MaxCell.x, MaxCell.y);
+	if (any(DispatchThreadId.xy >= (uint2)MaxCell)) return;
+
 	float2 UV = (DispatchThreadId.xy + 0.5) / MaxCell;
 
-	float4 Combined = T_OrigLandscapeData.SampleLevel(Sampler, UV, 0);
-	float4 LocalResult = T_CopyLandscapeData.SampleLevel(Sampler, UV, 0);
+	float4 Combined = T_OrigLandscapeData.Load(int3(DispatchThreadId.xy, 0));
+	float3 WorldPosition = TempRenderAreaOrigin
+		+ TempRenderAreaAxisX * (DispatchThreadId.x + 0.5)
+		+ TempRenderAreaAxisY * (DispatchThreadId.y + 0.5);
+	float2 BoxUV = TempWorldToBoxUV(WorldPosition.xy);
+	bool IsInsideBox = all(BoxUV >= 0.0) && all(BoxUV <= 1.0);
+	float4 LocalResult = T_CopyLandscapeData.SampleLevel(Sampler, saturate(BoxUV), 0);
 
 	// Decode height from RG (R=high byte, G=low byte) → uint16
 	float CombinedU16 = float(((int)round(Combined.r * 255.0) << 8) | (int)round(Combined.g * 255.0));
@@ -185,7 +187,7 @@ void BrushApplyResult(uint3 DispatchThreadId)
 	float CSWorldZ = LocalResult.x;
 	float CSU16 = (CSWorldZ - LandscapeZOffset) / max(LandscapeZScale, 0.0001) * 128.0 + 32768.0;
 
-	float CSAlpha = LocalResult.w;
+	float CSAlpha = IsInsideBox ? saturate(LocalResult.w) : 0.0;
 	float FinalU16 = lerp(CombinedU16, CSU16, CSAlpha);
 
 	// Pack back to RG
@@ -202,10 +204,14 @@ void TempLayerBlend(uint3 DispatchThreadId)
 	RW_Result.GetDimensions(MaxCell.x, MaxCell.y);
 	float2 UV = (DispatchThreadId.xy + 0.5) / MaxCell;
 
-	float4 Combined = T_OrigLandscapeData.SampleLevel(Sampler, UV, 0);
-	float CombinedHeight = Combined.a;
+	float4 Combined = T_OrigLandscapeData.Load(int3(DispatchThreadId.xy, 0));
+	float CombinedU16 = (Combined.r * 256.0 + Combined.g) * 255.0;
+	float CombinedHeight = (CombinedU16 - 32768.0) / 128.0;
+	float3 WorldPosition = TempRenderAreaOrigin
+		+ TempRenderAreaAxisX * (DispatchThreadId.x + 0.5)
+		+ TempRenderAreaAxisY * (DispatchThreadId.y + 0.5);
 
-	float Falloff = TempComputeBoxFalloff(UV);
+	float Falloff = TempComputeBoxFalloff(WorldPosition.xy);
 	float Alpha = TempLayerAlpha * Falloff;
 
 	float HeightDelta = 0.0;
@@ -213,7 +219,8 @@ void TempLayerBlend(uint3 DispatchThreadId)
 	// SourceMode: 0=ExternalRT, 1=FlatOffset, 2=ProceduralNoise
 	if (TempSourceMode == 0)
 	{
-		HeightDelta = T_ExternalHeight.SampleLevel(Sampler, UV, 0).r;
+		float2 BoxUV = TempWorldToBoxUV(WorldPosition.xy);
+		HeightDelta = T_ExternalHeight.SampleLevel(Sampler, saturate(BoxUV), 0).r;
 	}
 	else if (TempSourceMode == 1)
 	{
@@ -221,9 +228,9 @@ void TempLayerBlend(uint3 DispatchThreadId)
 	}
 	else
 	{
-		float2 WorldUV = UV * float2(TempBoxExtent.x, TempBoxExtent.y) * 2.0 + TempBoxOrigin.xy;
-		HeightDelta = TempFBM(WorldUV * TempNoiseFrequency, TempNoiseOctaves) * TempNoiseAmplitude;
+		HeightDelta = TempFBM(WorldPosition.xy * TempNoiseFrequency, TempNoiseOctaves) * TempNoiseAmplitude;
 	}
+	HeightDelta /= max(abs(TempLandscapeScaleZ), 0.0001);
 
 	float FinalHeight = CombinedHeight;
 
@@ -249,7 +256,11 @@ void TempLayerBlend(uint3 DispatchThreadId)
 		FinalHeight = CombinedHeight * lerp(1.0, HeightDelta, Alpha);
 	}
 
-	RW_Result[DispatchThreadId.xy] = float4(Combined.rgb, FinalHeight);
+	float FinalU16 = FinalHeight * 128.0 + 32768.0;
+	int PackedHeight = clamp((int)round(FinalU16), 0, 65535);
+	float PackedR = float((PackedHeight >> 8) & 0xFF) / 255.0;
+	float PackedG = float(PackedHeight & 0xFF) / 255.0;
+	RW_Result[DispatchThreadId.xy] = float4(PackedR, PackedG, Combined.b, Combined.a);
 
 #if L_TEMPLAYERDEBUG
 	RW_DebugView[DispatchThreadId.xy] = float4(Alpha, HeightDelta / max(TempNoiseAmplitude, 1.0), Falloff, 1.0);
@@ -268,8 +279,6 @@ void CSLandscapeFunction(
 	CreateRiverBed(DispatchThreadId, GroupThreadId, GroupId, GroupIndex);
 #elif L_LANDSCAPEBRUSHTEXTURE
 	LandscapeBrushTexture(DispatchThreadId, GroupThreadId, GroupId, GroupIndex);
-#elif L_LANDSCAPEPASTE
-	LandscapePaste(DispatchThreadId, GroupThreadId, GroupId, GroupIndex);
 #elif L_BRUSHAPPLYRESULT
 	BrushApplyResult(DispatchThreadId);
 #elif L_TEMPLAYERBLEND

@@ -16,6 +16,14 @@
 class USplineComponent;
 class ALandscape;
 
+UENUM(BlueprintType)
+enum class ETempLayerSourceMode : uint8
+{
+	ExternalRT UMETA(DisplayName = "External RT (Set from code/BP)"),
+	FlatOffset UMETA(DisplayName = "Flat Height Offset"),
+	ProceduralNoise UMETA(DisplayName = "Procedural Noise Generation")
+};
+
 UCLASS()
 class PCGEDITORPROCESS_API ACSLandscape : public ACSLandscapeEditLayerBase
 {
@@ -31,16 +39,14 @@ public:
 	UTextureRenderTarget2D* RT_Result = nullptr;
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "LandscapeData")
 	UTextureRenderTarget2D* RT_LandscapeData = nullptr;
-	UPROPERTY(Transient, BlueprintReadOnly, Category = "LandscapeData")
-	UTextureRenderTarget2D* RT_CopyLandscapeData = nullptr;
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "LandscapeData|Realtime")
+	UTextureRenderTarget2D* RT_RealtimeResult = nullptr;
 
 	USceneComponent* SceneComponent;
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LandscapeData")
 	UBoxComponent* Box;
 
 	FCSReadLandscapeData Orig_LandscapeData;
-
-	FCSReadLandscapeData Copy_LandscapeData;
 
 	FVector BoxMin = FVector::ZeroVector;
 	FVector BoxMax = FVector::ZeroVector;
@@ -57,6 +63,46 @@ public:
 	FVector MapMax = FVector::ZeroVector;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LandscapeData")
 	float BlurRange = .25;
+
+	// --- Realtime procedural layer ---
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LandscapeData|Realtime")
+	bool bRealtimeUpdate = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LandscapeData|Realtime|Source")
+	ETempLayerSourceMode SourceMode = ETempLayerSourceMode::FlatOffset;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LandscapeData|Realtime|Source",
+		meta = (DisplayName = "Height Offset (cm)", EditCondition = "SourceMode == ETempLayerSourceMode::FlatOffset"))
+	float HeightOffset = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LandscapeData|Realtime|Source",
+		meta = (EditCondition = "SourceMode == ETempLayerSourceMode::ProceduralNoise"))
+	float NoiseFrequency = 0.005f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LandscapeData|Realtime|Source",
+		meta = (EditCondition = "SourceMode == ETempLayerSourceMode::ProceduralNoise"))
+	float NoiseAmplitude = 200.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LandscapeData|Realtime|Source",
+		meta = (EditCondition = "SourceMode == ETempLayerSourceMode::ProceduralNoise"))
+	int32 NoiseOctaves = 6;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LandscapeData|Realtime|Source",
+		meta = (EditCondition = "SourceMode == ETempLayerSourceMode::ExternalRT"))
+	UTextureRenderTarget2D* ExternalHeightRT = nullptr;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LandscapeData|Realtime|Blend")
+	ECSLandscapeBlendMode BlendMode = ECSLandscapeBlendMode::Additive;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LandscapeData|Realtime|Blend", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float LayerAlpha = 1.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LandscapeData|Realtime|Blend", meta = (DisplayName = "Falloff Width (cm)"))
+	float FalloffWidth = 500.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LandscapeData|Realtime|Debug")
+	bool bShowDebugView = false;
 
 	UPROPERTY( BlueprintReadWrite, Category = "LandscapeData")
 	UDynamicMeshComponent* VisMesh;
@@ -78,16 +124,26 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	void ReadLandscapeDataToTexture();
 
+	/** Capture the Landscape under the box and immediately publish it to this actor's Edit Layer. */
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	void CopyLandscapeData();
 
-	/** Non-destructive preview: computes the paste blend into RT_Result without writing to landscape. */
+	/** Bake the current RT_Result permanently into the Landscape base heightmap (box region only, surrounding
+	 *  terrain preserved), then delete this actor's Edit Layer. Replaces the old Paste action. */
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	void PasteLandscapeData();
+	void BakeLandscape();
 
-	/** Permanently bake the current RT_Result into the Landscape heightmap. */
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader|Realtime")
+	void SetExternalHeightRT(UTextureRenderTarget2D* InRT);
+
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader|Realtime")
+	void RefreshLayer();
+
+	/** Generic "an input height RT deforms the terrain": routes HeightRT through this actor's
+	 *  realtime external-RT blend so the landscape edit layer picks it up. Subclasses that produce
+	 *  a height RT (e.g. the road) call this to affect the terrain. */
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	void CommitToLandscape();
+	void ApplyHeightmapRTToLandscape(UTextureRenderTarget2D* HeightRT);
 
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	void BP_InitRT();
@@ -108,6 +164,7 @@ public:
 		UE::Landscape::FRDGBuilderRecorder& RDGBuilderRecorder) override;
 
 	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+	virtual void PostEditMove(bool bFinished) override;
 #endif
 
 protected:
@@ -117,15 +174,27 @@ protected:
 
 	/** Only contribute to heightmap merge when enabled by the user. */
 	virtual bool ShouldSupportHeightmap() const override { return bAffectHeightmap; }
+	virtual bool IsLayerEnabledForMerge() const override { return bRealtimeUpdate || bHasResult; }
 
-	/** Blend CS result into the Merge pipeline's scratch RT (called from RenderLayer). */
-	void ApplyResultToCombined(UTextureRenderTarget2D* InCombinedResult, UTextureRenderTarget2D* OutResult, const FIntPoint& Size);
+	/** Record Copy and realtime blends into the Landscape merge graph in dependency order. */
+	void EnqueueLayerMerge(
+		UTextureRenderTarget2D* InCombinedResult,
+		UTextureRenderTarget2D* OutResult,
+		const FIntPoint& Size,
+		const FTransform& RenderAreaWorldTransform,
+		bool bApplyCachedResult,
+		bool bApplyRealtime,
+		UE::Landscape::FRDGBuilderRecorder& RDGBuilderRecorder);
 
 	/** Save RT_Result contents into PersistentResult (UTexture2D, serialized with level). */
 	void SaveResultToPersistent();
 
 	/** Restore RT_Result from PersistentResult on level load. */
 	void RestoreResultFromPersistent();
+
+	FIntRect LastRenderAreaSectionRect;
+
+	void EnsureRealtimeRTs(const FIntPoint& InSize);
 
 public:
 	virtual void PostLoad() override;

@@ -400,6 +400,9 @@ public:
 	/** Creates the generator actor, scene root, bounds component, and DynamicMesh rendering defaults. */
 	AComputeShaderMeshGenerator(const FObjectInitializer& ObjectInitializer);
 
+	/** Delegating default constructor so subclasses can keep plain default constructors. */
+	AComputeShaderMeshGenerator();
+
 	/** Returns the DynamicMeshComponent owned by this actor. */
 	UDynamicMeshComponent* GetDynamicMeshComponent() const { return DynamicMeshComponent; }
 
@@ -608,6 +611,26 @@ public:
 	 *  @param TextureSize Resolution of the intermediate heightmap (default 128) */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Heightmap")
 	FCSTriangleMeshData CaptureLandscapeTrianglesGPU(int32 TextureSize = 128);
+
+	/** Generic: rasterize an indexed GPU triangle mesh into OutHeightmap via top-down orthographic
+	 *  projection (texel.x = CameraHeight - WorldZ). Extracts a triangle soup from the position/index
+	 *  buffers (FExtractStaticMeshTrianglesCS) then runs RasterizeTriangleSoupToHeightmapRDG. Adds
+	 *  passes to GraphBuilder; the caller executes. Must be called on the render thread.
+	 *  @param PositionSRV      Buffer<float> SRV, xyz per vertex (stride 3 floats).
+	 *  @param IndexSRV         Buffer<uint>  SRV, triangle-list indices.
+	 *  @param TriangleCapacity Number of triangles to process (index_count / 3); extra degenerate
+	 *                          triangles from unused capacity rasterize to nothing.
+	 *  @param LocalToWorld     Transforms the (local-space) positions to world.
+	 *  @param OutHeightmap     UAV-capable float heightmap (RDG-registered). */
+	void RasterizeIndexedMeshToHeightmapRDG(
+		FRDGBuilder& GraphBuilder,
+		FRHIShaderResourceView* PositionSRV,
+		FRHIShaderResourceView* IndexSRV,
+		uint32 TriangleCapacity,
+		const FMatrix44f& LocalToWorld,
+		FRDGTextureRef OutHeightmap,
+		const FBox& WorldBounds,
+		float CameraHeight);
 
 	/** Static utility: renders a landscape heightmap via ALandscape::RenderHeightmap (GPU)
 	 *  and converts to Normal+Height (RGB=Normal, A=WorldHeight_cm) in the given RT.

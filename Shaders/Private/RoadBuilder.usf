@@ -1,0 +1,931 @@
+// RoadBuilder.usf
+// GPU translation of the Houdini RoadGenerator.hip road network
+// (see Plugins/RoadGenerator/Docs/HipToComputeShader.md for the node mapping).
+//
+// Pass order:
+//   ClearCS -> IntersectCS -> ClusterCS -> CornerSolveCS
+//     -> EmitRoadCS -> EmitCornerCS -> FinalizeCS
+//
+// All geometry is produced into GPU vertex/index buffers and drawn with
+// DrawIndexedIndirect. Nothing is ever read back to the CPU.
+
+#include "/Engine/Public/Platform.ush"
+
+#define MAX_LEGS 12
+#define ROAD_PI 3.14159265f
+
+// ---------------------------------------------------------------- structs
+
+struct FSplineInfo
+{
+	uint  FirstPoint;
+	uint  NumPoints;
+	float Length;
+	float HalfWidth;
+};
+
+// One raw crossing found between two splines (Houdini: intersectionanalysis).
+struct FCrossRec
+{
+	float3 Pos;
+	uint   SplineA;
+	float  DistA;
+	uint   SplineB;
+	float  DistB;
+	uint   Pad;
+};
+
+// One road arm leaving a junction (Houdini: the prims produced by polycut4).
+struct FLegData
+{
+	uint  Spline;
+	float CrossDist;   // distance along spline at the junction
+	float EndDist;     // distance along spline where the leg ends (mid-cut / spline end)
+	float Dir;         // +1: leg goes to increasing distance, -1: decreasing
+	float Angle;       // outgoing azimuth, used for CCW sorting
+	float2 OutDir;     // outgoing 2D direction at the junction
+	float Pad;
+};
+
+struct FJunctionData
+{
+	float3 Center;     // running average of the merged crossing records
+	uint   NumLegs;
+	uint   RecCount;
+	uint   Pad0;
+	uint   Pad1;
+	uint   Pad2;
+};
+
+// Solved corner between leg i and leg (i+1)%NumLegs of a junction
+// (Houdini: road_corner_tangent_arc_preview + intersectionstitch on offsets).
+#define CORNER_MITER 0   // sharp: edge = offset -> M -> offset
+#define CORNER_ARC   1   // tangent arc between the offset lines
+#define CORNER_BLEND 2   // near-straight pass-through: plain offsets joined at M
+#define CORNER_WRAP  3   // reflex wedge: arc around the junction centre
+struct FCornerData
+{
+	float2 M;          // miter / join point of the two offset lines
+	float2 ArcCenter;
+	float  Radius0;    // arc radius at the leg-i end (WRAP: leg-i half width)
+	float  Radius1;    // arc radius at the leg-i+1 end (ARC: same as Radius0)
+	float  Ang0;       // arc start angle (at tangent point of leg i)
+	float  AngSpan;    // signed arc sweep to tangent point of leg i+1
+	float  Keep0;      // arc-length distance of tangent point from junction, leg i
+	float  Keep1;      // same for leg i+1
+	uint   Mode;
+	float  Pad;
+};
+
+// ---------------------------------------------------------------- resources
+
+StructuredBuffer<float4>      SplinePoints;   // xyz = local pos, w = dist along spline
+StructuredBuffer<FSplineInfo> Splines;
+StructuredBuffer<uint>        SegPrefix;      // per spline: first global segment index (NumSplines+1)
+
+RWStructuredBuffer<FCrossRec>     RWCrossRecs;
+RWStructuredBuffer<FJunctionData> RWJunctions;
+StructuredBuffer<FJunctionData>   Junctions;
+RWStructuredBuffer<FLegData>      RWLegs;
+StructuredBuffer<FLegData>        Legs;
+RWStructuredBuffer<FCornerData>   RWCorners;
+StructuredBuffer<FCornerData>     Corners;
+
+// [0]=vertexCount [1]=indexCount [2]=numCrossRecs [3]=numJunctions
+RWBuffer<uint> RWCounters;
+Buffer<uint>   Counters;
+RWBuffer<uint> RWSplineFlags;   // 1 = spline participates in a junction
+Buffer<uint>   SplineFlags;
+
+RWBuffer<float> RWPositions;    // 3 floats / vertex
+RWBuffer<uint>  RWTangents;     // 2 packed 8888 SNORM / vertex (TangentX, TangentZ)
+RWBuffer<float> RWTexCoords;    // 2 floats / vertex
+RWBuffer<uint>  RWColors;       // packed BGRA / vertex
+RWBuffer<uint>  RWIndices;
+RWBuffer<uint>  RWIndirectArgs; // DrawIndexedIndirect: 5 uints
+
+// ---------------------------------------------------------------- params
+
+uint  NumSplines;
+uint  NumSegments;
+float SampleStep;
+float HalfWidth;            // default half width (Splines[].HalfWidth overrides per spline)
+float CornerDist;
+float MergeRadius;
+float EndSnapRadius;
+float MiterDotThreshold;
+float UVInvTile;
+uint  MaxCrossRecs;
+uint  MaxJunctions;
+uint  MaxVertices;
+uint  MaxIndices;
+uint  MaxCornerSamples;
+
+// ---------------------------------------------------------------- helpers
+
+float3 SplinePosAt(uint SplineIdx, float Dist)
+{
+	FSplineInfo S = Splines[SplineIdx];
+	float Step = S.Length / float(S.NumPoints - 1);
+	float F = clamp(Dist / Step, 0.0, float(S.NumPoints - 1));
+	uint I0 = min(uint(F), S.NumPoints - 2);
+	float T = saturate(F - float(I0));
+	return lerp(SplinePoints[S.FirstPoint + I0].xyz, SplinePoints[S.FirstPoint + I0 + 1].xyz, T);
+}
+
+// 2D direction of the spline at Dist (XY plane; the hip solves with @P.y=0).
+float2 SplineDirAt(uint SplineIdx, float Dist)
+{
+	FSplineInfo S = Splines[SplineIdx];
+	float Step = S.Length / float(S.NumPoints - 1);
+	uint I0 = min(uint(clamp(Dist / Step, 0.0, float(S.NumPoints - 1))), S.NumPoints - 2);
+	float2 D = SplinePoints[S.FirstPoint + I0 + 1].xy - SplinePoints[S.FirstPoint + I0].xy;
+	float L = length(D);
+	if (L < 1e-4) return float2(1, 0);
+	return D / L;
+}
+
+float2 Rot90CCW(float2 V) { return float2(-V.y, V.x); }
+float2 Rot90CW(float2 V)  { return float2(V.y, -V.x); }
+
+float Cross2D(float2 A, float2 B) { return A.x * B.y - A.y * B.x; }
+
+// normalize(N0+N1) with a fallback for opposite normals (parallel same-way legs).
+float2 SafeAvgDir(float2 N0, float2 N1, float2 Fallback)
+{
+	float2 Sum = N0 + N1;
+	float L2 = dot(Sum, Sum);
+	if (L2 < 1e-6) return Fallback;
+	return Sum * rsqrt(L2);
+}
+
+float WrapPositive(float Ang)
+{
+	while (Ang < 0.0) Ang += 2.0 * ROAD_PI;
+	while (Ang >= 2.0 * ROAD_PI) Ang -= 2.0 * ROAD_PI;
+	return Ang;
+}
+
+uint PackSnorm8888(float4 V)
+{
+	int4 I = int4(round(clamp(V, -1.0, 1.0) * 127.0));
+	return (uint(I.x) & 0xFF) | ((uint(I.y) & 0xFF) << 8) | ((uint(I.z) & 0xFF) << 16) | ((uint(I.w) & 0xFF) << 24);
+}
+
+void WriteVertex(uint V, float3 Pos, float2 Dir2D, float2 UV, uint Color)
+{
+	RWPositions[V * 3 + 0] = Pos.x;
+	RWPositions[V * 3 + 1] = Pos.y;
+	RWPositions[V * 3 + 2] = Pos.z;
+	RWTangents[V * 2 + 0] = PackSnorm8888(float4(Dir2D.x, Dir2D.y, 0, 0));       // TangentX
+	RWTangents[V * 2 + 1] = PackSnorm8888(float4(0, 0, 1, 1));                    // TangentZ (+w sign)
+	RWTexCoords[V * 2 + 0] = UV.x;
+	RWTexCoords[V * 2 + 1] = UV.y;
+	RWColors[V] = Color;
+}
+
+// ---------------------------------------------------------------- ClearCS
+
+[numthreads(64, 1, 1)]
+void ClearCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x < 8) RWCounters[Id.x] = 0;
+	if (Id.x < 5) RWIndirectArgs[Id.x] = (Id.x == 1) ? 1 : 0; // InstanceCount = 1
+	if (Id.x < NumSplines) RWSplineFlags[Id.x] = 0;
+	if (Id.x < MaxJunctions)
+	{
+		FJunctionData J = (FJunctionData)0;
+		RWJunctions[Id.x] = J;
+	}
+	// Index buffer starts all-zero so any strip that fails its capacity check
+	// leaves degenerate (0,0,0) triangles instead of stale pool garbage.
+	if (Id.x < MaxIndices) RWIndices[Id.x] = 0;
+}
+
+// ---------------------------------------------------------------- IntersectCS
+// Houdini: fuse4 + intersectionanalysis/intersectionstitch (curve-curve
+// crossings) and the polypath end-point snapping (T junctions).
+
+void SegOfGlobal(uint G, out uint SplineIdx, out uint LocalSeg)
+{
+	uint Lo = 0, Hi = NumSplines;
+	while (Lo + 1 < Hi)
+	{
+		uint Mid = (Lo + Hi) >> 1;
+		if (SegPrefix[Mid] <= G) Lo = Mid; else Hi = Mid;
+	}
+	SplineIdx = Lo;
+	LocalSeg = G - SegPrefix[Lo];
+}
+
+void AppendCross(float3 Pos, uint SA, float DA, uint SB, float DB)
+{
+	uint Slot;
+	InterlockedAdd(RWCounters[2], 1, Slot);
+	if (Slot >= MaxCrossRecs) return;
+	FCrossRec R;
+	R.Pos = Pos; R.SplineA = SA; R.DistA = DA; R.SplineB = SB; R.DistB = DB; R.Pad = 0;
+	RWCrossRecs[Slot] = R;
+}
+
+[numthreads(64, 1, 1)]
+void IntersectCS(uint3 Id : SV_DispatchThreadID)
+{
+	// Threads [0, NumSegments): segment-vs-segment crossings.
+	if (Id.x < NumSegments)
+	{
+		uint SA, IA;
+		SegOfGlobal(Id.x, SA, IA);
+		FSplineInfo A = Splines[SA];
+		float StepA = A.Length / float(A.NumPoints - 1);
+		float2 A0 = SplinePoints[A.FirstPoint + IA].xy;
+		float2 A1 = SplinePoints[A.FirstPoint + IA + 1].xy;
+		float ZA0 = SplinePoints[A.FirstPoint + IA].z;
+		float ZA1 = SplinePoints[A.FirstPoint + IA + 1].z;
+
+		for (uint G = Id.x + 1; G < NumSegments; ++G)
+		{
+			uint SB, IB;
+			SegOfGlobal(G, SB, IB);
+			if (SB == SA && IB <= IA + 1) continue; // skip self and adjacent segments
+
+			FSplineInfo B = Splines[SB];
+			float StepB = B.Length / float(B.NumPoints - 1);
+			float2 B0 = SplinePoints[B.FirstPoint + IB].xy;
+			float2 B1 = SplinePoints[B.FirstPoint + IB + 1].xy;
+
+			float2 R = A1 - A0;
+			float2 U = B1 - B0;
+			float Den = Cross2D(R, U);
+			if (abs(Den) < 1e-6) continue;
+			float2 W = B0 - A0;
+			float T = Cross2D(W, U) / Den;
+			float S = Cross2D(W, R) / Den;
+			if (T < 0.0 || T > 1.0 || S < 0.0 || S > 1.0) continue;
+
+			float2 P = A0 + R * T;
+			float Z = lerp(ZA0, ZA1, T);
+			AppendCross(float3(P, Z), SA, (float(IA) + T) * StepA, SB, (float(IB) + S) * StepB);
+		}
+		return;
+	}
+
+	// Threads [NumSegments, NumSegments + NumSplines*2): endpoint-vs-curve
+	// T-junction snapping (Houdini: polypath connect_end_points / xyzdist snap).
+	uint EndIdx = Id.x - NumSegments;
+	if (EndIdx >= NumSplines * 2) return;
+	uint SA = EndIdx >> 1;
+	bool bStart = (EndIdx & 1) == 0;
+	FSplineInfo A = Splines[SA];
+	float3 E = SplinePoints[A.FirstPoint + (bStart ? 0 : A.NumPoints - 1)].xyz;
+	float DistA = bStart ? 0.0 : A.Length;
+
+	float BestD2 = EndSnapRadius * EndSnapRadius;
+	uint BestSpline = 0xFFFFFFFF;
+	float BestDist = 0;
+	float3 BestPos = 0;
+
+	for (uint G = 0; G < NumSegments; ++G)
+	{
+		uint SB, IB;
+		SegOfGlobal(G, SB, IB);
+		if (SB == SA) continue;
+		FSplineInfo B = Splines[SB];
+		float StepB = B.Length / float(B.NumPoints - 1);
+		float2 B0 = SplinePoints[B.FirstPoint + IB].xy;
+		float2 B1 = SplinePoints[B.FirstPoint + IB + 1].xy;
+		float2 U = B1 - B0;
+		float Len2 = dot(U, U);
+		if (Len2 < 1e-8) continue;
+		float S = saturate(dot(E.xy - B0, U) / Len2);
+		float2 P = B0 + U * S;
+		float D2 = dot(E.xy - P, E.xy - P);
+		if (D2 < BestD2)
+		{
+			BestD2 = D2;
+			BestSpline = SB;
+			BestDist = (float(IB) + S) * StepB;
+			float Z0 = SplinePoints[B.FirstPoint + IB].z;
+			float Z1 = SplinePoints[B.FirstPoint + IB + 1].z;
+			BestPos = float3(P, lerp(Z0, Z1, S));
+		}
+	}
+	if (BestSpline != 0xFFFFFFFF) AppendCross(BestPos, SA, DistA, BestSpline, BestDist);
+}
+
+// ---------------------------------------------------------------- ClusterCS
+// Houdini: fuse of crossing points -> crosspt marking (attribwrangle5),
+// mid-cut between junctions (attribwrangle6 + polycut2), leg splitting at
+// junctions (polycut4), angular sort (attribwrangle10 + sort by angle).
+// Junction counts are tiny, so a single serial thread mirrors the SOP
+// semantics exactly without any CPU involvement.
+
+void AddLeg(uint J, uint SplineIdx, float CrossDist, float Dir)
+{
+	FJunctionData Jd = RWJunctions[J];
+
+	FSplineInfo S = Splines[SplineIdx];
+	float LegSpan = (Dir > 0) ? (S.Length - CrossDist) : CrossDist;
+	if (LegSpan < max(SampleStep, S.HalfWidth * 0.25)) return; // degenerate stub
+
+	// One leg per (spline, direction) per junction. When a spline crosses a
+	// merged cluster several times, keep only the OUTERMOST crossing in each
+	// direction — the span between merged crossings is junction interior
+	// (Houdini fuses those points into one), otherwise the duplicated legs
+	// overlap and z-fight.
+	for (uint I = 0; I < Jd.NumLegs; ++I)
+	{
+		FLegData L = RWLegs[J * MAX_LEGS + I];
+		if (L.Spline != SplineIdx || L.Dir != Dir) continue;
+		if ((CrossDist - L.CrossDist) * Dir > 0.0)
+		{
+			L.CrossDist = CrossDist;
+			L.EndDist = (Dir > 0) ? S.Length : 0.0;
+			float2 D2 = SplineDirAt(SplineIdx, CrossDist + Dir * SampleStep * 0.5) * Dir;
+			L.OutDir = D2;
+			L.Angle = atan2(D2.y, D2.x);
+			RWLegs[J * MAX_LEGS + I] = L;
+		}
+		return;
+	}
+
+	if (Jd.NumLegs >= MAX_LEGS) return;
+
+	FLegData Leg = (FLegData)0;
+	Leg.Spline = SplineIdx;
+	Leg.CrossDist = CrossDist;
+	Leg.EndDist = (Dir > 0) ? S.Length : 0.0;   // refined below in the mid-cut pass
+	Leg.Dir = Dir;
+	float2 D = SplineDirAt(SplineIdx, CrossDist + Dir * SampleStep * 0.5) * Dir;
+	Leg.OutDir = D;
+	Leg.Angle = atan2(D.y, D.x);
+	RWLegs[J * MAX_LEGS + Jd.NumLegs] = Leg;
+	Jd.NumLegs++;
+	RWJunctions[J] = Jd;
+	RWSplineFlags[SplineIdx] = 1;
+}
+
+[numthreads(1, 1, 1)]
+void ClusterCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x != 0) return;
+
+	uint NumRecs = min(RWCounters[2], MaxCrossRecs);
+	uint NumJ = 0;
+
+	// 1. cluster crossing records into junctions (Houdini: fuse). The centre
+	//    is the running average of all merged records.
+	for (uint R = 0; R < NumRecs; ++R)
+	{
+		FCrossRec Rec = RWCrossRecs[R];
+		uint Found = 0xFFFFFFFF;
+		for (uint J = 0; J < NumJ; ++J)
+		{
+			if (distance(RWJunctions[J].Center.xy, Rec.Pos.xy) < MergeRadius) { Found = J; break; }
+		}
+		if (Found == 0xFFFFFFFF)
+		{
+			if (NumJ >= MaxJunctions) continue;
+			Found = NumJ++;
+			FJunctionData Jd = (FJunctionData)0;
+			Jd.Center = Rec.Pos;
+			Jd.RecCount = 1;
+			RWJunctions[Found] = Jd;
+		}
+		else
+		{
+			FJunctionData Jd = RWJunctions[Found];
+			Jd.Center = (Jd.Center * float(Jd.RecCount) + Rec.Pos) / float(Jd.RecCount + 1);
+			Jd.RecCount++;
+			RWJunctions[Found] = Jd;
+		}
+
+		// 2. two legs per spline per crossing (polycut4 splits the road here).
+		AddLeg(Found, Rec.SplineA, Rec.DistA, 1.0);
+		AddLeg(Found, Rec.SplineA, Rec.DistA, -1.0);
+		AddLeg(Found, Rec.SplineB, Rec.DistB, 1.0);
+		AddLeg(Found, Rec.SplineB, Rec.DistB, -1.0);
+	}
+
+	// 3. mid-cut: a leg running toward another junction on the same spline
+	//    stops halfway (attribwrangle6 cutcenter + polycut2).
+	for (uint J0 = 0; J0 < NumJ; ++J0)
+	{
+		uint N0 = RWJunctions[J0].NumLegs;
+		for (uint I0 = 0; I0 < N0; ++I0)
+		{
+			FLegData L0 = RWLegs[J0 * MAX_LEGS + I0];
+			float BestEnd = L0.EndDist;
+			for (uint J1 = 0; J1 < NumJ; ++J1)
+			{
+				if (J1 == J0) continue;
+				uint N1 = RWJunctions[J1].NumLegs;
+				for (uint I1 = 0; I1 < N1; ++I1)
+				{
+					FLegData L1 = RWLegs[J1 * MAX_LEGS + I1];
+					if (L1.Spline != L0.Spline) continue;
+					float Delta = (L1.CrossDist - L0.CrossDist) * L0.Dir;
+					if (Delta <= 0.0) continue;
+					float Mid = L0.CrossDist + L0.Dir * Delta * 0.5;
+					if ((Mid - BestEnd) * L0.Dir < 0.0) BestEnd = Mid;
+				}
+			}
+			L0.EndDist = BestEnd;
+			RWLegs[J0 * MAX_LEGS + I0] = L0;
+		}
+
+		// 4. CCW angular sort of the legs (sort primsort=angle + corner_id).
+		for (uint A = 1; A < N0; ++A)
+		{
+			FLegData Key = RWLegs[J0 * MAX_LEGS + A];
+			int B = int(A) - 1;
+			while (B >= 0 && RWLegs[J0 * MAX_LEGS + B].Angle > Key.Angle)
+			{
+				RWLegs[J0 * MAX_LEGS + B + 1] = RWLegs[J0 * MAX_LEGS + B];
+				--B;
+			}
+			RWLegs[J0 * MAX_LEGS + B + 1] = Key;
+		}
+	}
+
+	RWCounters[3] = NumJ;
+}
+
+// ---------------------------------------------------------------- CornerSolveCS
+// Houdini: offset both arms by pscale (attribwrangle7/9), intersect the offset
+// lines (intersectionstitch1), clamp the keep distance (attribwrangle25:
+// pscale = min(len-1, pscale)), then solve the exact tangent circle
+// (road_corner_tangent_arc_preview_sop.py) gated by the normal-dot threshold
+// (attribwrangle23: carc = dot < 0.75).
+
+float LegLen(FLegData L) { return abs(L.EndDist - L.CrossDist); }
+float LegWidth(FLegData L) { return Splines[L.Spline].HalfWidth; }
+
+float2 LegOffsetPoint(FLegData L, float S, float2 SideN)
+{
+	float3 P = SplinePosAt(L.Spline, L.CrossDist + L.Dir * S);
+	return P.xy + SideN * LegWidth(L);
+}
+
+[numthreads(64, 1, 1)]
+void CornerSolveCS(uint3 Id : SV_DispatchThreadID)
+{
+	uint J = Id.x / MAX_LEGS;
+	uint C = Id.x % MAX_LEGS;
+	if (J >= Counters[3]) return;
+	FJunctionData Jd = Junctions[J];
+	if (Jd.NumLegs < 2 || C >= Jd.NumLegs) return;
+
+	FLegData L0 = Legs[J * MAX_LEGS + C];
+	FLegData L1 = Legs[J * MAX_LEGS + ((C + 1) % Jd.NumLegs)];
+
+	float Len0 = LegLen(L0);
+	float Len1 = LegLen(L1);
+	float H0 = LegWidth(L0);
+	float H1 = LegWidth(L1);
+
+	// Wedge-side offset normals at the junction: CCW perp on leg i,
+	// CW perp on leg i+1 (legs are CCW sorted).
+	float2 N0 = Rot90CCW(L0.OutDir);
+	float2 N1 = Rot90CW(L1.OutDir);
+
+	FCornerData Corner = (FCornerData)0;
+
+	// Reflex wedge (outer side of an L / Y junction): the tangent-circle
+	// construction is invalid, wrap an arc around the junction centre instead
+	// (radius blends between the two half widths).
+	if (Cross2D(L0.OutDir, L1.OutDir) < -1e-4)
+	{
+		float Ang0 = atan2(N0.y, N0.x);
+		float Span = WrapPositive(atan2(N1.y, N1.x) - Ang0);
+		Corner.Mode = CORNER_WRAP;
+		Corner.ArcCenter = Jd.Center.xy;
+		Corner.Radius0 = H0;
+		Corner.Radius1 = H1;
+		Corner.Ang0 = Ang0;
+		Corner.AngSpan = Span;
+		Corner.M = Jd.Center.xy;
+		RWCorners[J * MAX_LEGS + C] = Corner;
+		return;
+	}
+
+	// Convex wedges always attempt the tangent arc. (The hip gates arcs by
+	// carc = dot < 0.75 and leaves wide corners as plain stitched offsets;
+	// per user request we round those too. Exactly-straight pass-throughs
+	// still fall out below via the parallel-offset-line check.)
+
+	// Keep distance, clamped by both arm lengths (attribwrangle25).
+	float Keep = min(CornerDist, min(Len0, Len1) - SampleStep);
+	Keep = max(Keep, SampleStep);
+
+	// Local straight-arm approximation at the keep points.
+	float2 D0 = SplineDirAt(L0.Spline, L0.CrossDist + L0.Dir * Keep) * L0.Dir;
+	float2 D1 = SplineDirAt(L1.Spline, L1.CrossDist + L1.Dir * Keep) * L1.Dir;
+	float2 A0 = LegOffsetPoint(L0, Keep, Rot90CCW(D0));
+	float2 A1 = LegOffsetPoint(L1, Keep, Rot90CW(D1));
+
+	// Intersect the two offset lines: A0 - t*D0  vs  A1 - u*D1.
+	float Den = Cross2D(D0, D1);
+	if (abs(Den) < 1e-4)
+	{
+		float2 NAvg = SafeAvgDir(N0, N1, Rot90CCW(L0.OutDir));
+		Corner.Mode = CORNER_BLEND;
+		Corner.M = Jd.Center.xy + NAvg * (0.5 * (H0 + H1));
+		RWCorners[J * MAX_LEGS + C] = Corner;
+		return;
+	}
+	float2 W = A1 - A0;
+	float T = Cross2D(W, -D1) / Cross2D(-D0, -D1);
+	float2 M = A0 - D0 * T;
+
+	// Outward unit dirs along the offset lines, from M toward the keep points.
+	float2 E0 = A0 - M;
+	float2 E1 = A1 - M;
+	float Q0 = length(E0);
+	float Q1 = length(E1);
+
+	// If a short leg clamped Keep to the near side of M, the arm points the
+	// wrong way and the tangent solve would flip inside the road: fall back
+	// to the plain blended join.
+	if (Q0 < 1e-3 || Q1 < 1e-3 || dot(E0, D0) <= 0.0 || dot(E1, D1) <= 0.0)
+	{
+		float2 NAvg = SafeAvgDir(N0, N1, Rot90CCW(L0.OutDir));
+		Corner.Mode = CORNER_BLEND;
+		Corner.M = Jd.Center.xy + NAvg * (0.5 * (H0 + H1));
+		RWCorners[J * MAX_LEGS + C] = Corner;
+		return;
+	}
+	E0 /= Q0; E1 /= Q1;
+
+	// Equal tangent length on both lines (symmetric solve; the hip script
+	// scores candidates by |d - target| on both arms, which the symmetric
+	// solution minimises).
+	float Q = min(Q0, Q1);
+	float2 T0 = M + E0 * Q;
+	float2 T1 = M + E1 * Q;
+
+	float CosPhi = clamp(dot(E0, E1), -1.0, 1.0);
+	float Phi = acos(CosPhi);
+	float Half = Phi * 0.5;
+	if (Half < 1e-3 || Half > 1.55)
+	{
+		Corner.Mode = CORNER_MITER;
+		Corner.M = M;
+	}
+	else
+	{
+		float R = Q * tan(Half);
+		float2 Bis = normalize(E0 + E1);
+		float2 Cn = M + Bis * (Q / cos(Half));
+		float AngA = atan2(T0.y - Cn.y, T0.x - Cn.x);
+		float AngB = atan2(T1.y - Cn.y, T1.x - Cn.x);
+		float Span = AngB - AngA;
+		if (Span > ROAD_PI)  Span -= 2.0 * ROAD_PI;
+		if (Span < -ROAD_PI) Span += 2.0 * ROAD_PI;
+
+		Corner.Mode = CORNER_ARC;
+		Corner.M = M;
+		Corner.ArcCenter = Cn;
+		Corner.Radius0 = R;
+		Corner.Radius1 = R;
+		Corner.Ang0 = AngA;
+		Corner.AngSpan = Span;
+	}
+
+	// Arc-length distance of the tangent points from the junction along the
+	// arms: the straight-arm approximation puts T at Keep - (Qi - Q).
+	Corner.Keep0 = clamp(Keep + (Q - Q0), 0.0, Len0);
+	Corner.Keep1 = clamp(Keep + (Q - Q1), 0.0, Len1);
+	RWCorners[J * MAX_LEGS + C] = Corner;
+}
+
+// ---------------------------------------------------------------- emission
+
+uint2 AllocStrip(uint NumVerts, uint NumIdx)
+{
+	uint VBase, IBase;
+	InterlockedAdd(RWCounters[0], NumVerts, VBase);
+	InterlockedAdd(RWCounters[1], NumIdx, IBase);
+	if (VBase + NumVerts > MaxVertices || IBase + NumIdx > MaxIndices) return uint2(0xFFFFFFFF, 0xFFFFFFFF);
+	return uint2(VBase, IBase);
+}
+
+// EmitRoadCS -- crossing-free splines become plain ribbons
+// (Houdini: skin2 over the +-offset rails).
+[numthreads(64, 1, 1)]
+void EmitRoadCS(uint3 Id : SV_DispatchThreadID)
+{
+	uint SplineIdx = Id.x;
+	if (SplineIdx >= NumSplines) return;
+	if (SplineFlags[SplineIdx] != 0) return;
+
+	FSplineInfo S = Splines[SplineIdx];
+	uint K = clamp(uint(ceil(S.Length / SampleStep)) + 1, 2u, 4096u);
+	uint2 Base = AllocStrip(K * 2, (K - 1) * 6);
+	if (Base.x == 0xFFFFFFFF) return;
+
+	for (uint I = 0; I < K; ++I)
+	{
+		float Dist = S.Length * float(I) / float(K - 1);
+		float3 P = SplinePosAt(SplineIdx, Dist);
+		float2 D = SplineDirAt(SplineIdx, Dist);
+		float2 NL = Rot90CCW(D);
+		float U = Dist * UVInvTile;
+		uint V = Base.x + I * 2;
+		WriteVertex(V + 0, float3(P.xy + NL * S.HalfWidth, P.z), D, float2(U, 0.0), 0xFFFFFFFF);
+		WriteVertex(V + 1, float3(P.xy - NL * S.HalfWidth, P.z), D, float2(U, 1.0), 0xFFFFFFFF);
+
+		if (I + 1 < K)
+		{
+			uint L0 = V, R0 = V + 1, L1 = V + 2, R1 = V + 3;
+			uint Idx = Base.y + I * 6;
+			RWIndices[Idx + 0] = L0; RWIndices[Idx + 1] = L1; RWIndices[Idx + 2] = R0;
+			RWIndices[Idx + 3] = R0; RWIndices[Idx + 4] = L1; RWIndices[Idx + 5] = R1;
+		}
+	}
+}
+
+// EmitCornerCS -- one strip per corner: skin between the centre polyline
+// (leg i inward through the junction, leg i+1 outward) and the composite
+// edge polyline (offset + tangent arc / miter / wrap). Houdini: merge4 +
+// skin1 inside the corner_id foreach block.
+//
+// Sampling grid: each leg is sampled at positions that depend only on its own
+// (length, SampleStep), so the two corners sharing a leg place identical
+// centre-line vertices -> no hairline cracks along the leg centre.
+[numthreads(64, 1, 1)]
+void EmitCornerCS(uint3 Id : SV_DispatchThreadID)
+{
+	uint J = Id.x / MAX_LEGS;
+	uint C = Id.x % MAX_LEGS;
+	uint NumJ = RWCounters[3]; // UAV read: this pass also bumps [0]/[1] in AllocStrip
+	if (J >= NumJ) return;
+	FJunctionData Jd = Junctions[J];
+	if (Jd.NumLegs < 2 || C >= Jd.NumLegs) return;
+
+	FLegData L0 = Legs[J * MAX_LEGS + C];
+	FLegData L1 = Legs[J * MAX_LEGS + ((C + 1) % Jd.NumLegs)];
+	FCornerData Corner = Corners[J * MAX_LEGS + C];
+
+	float Len0 = LegLen(L0);
+	float Len1 = LegLen(L1);
+	if (Len0 + Len1 < SampleStep) return;
+
+	uint HalfCap = (MaxCornerSamples - 1) / 2;
+	uint K0 = clamp(uint(ceil(Len0 / SampleStep)), 1u, HalfCap);
+	uint K1 = clamp(uint(ceil(Len1 / SampleStep)), 1u, HalfCap);
+	uint K = K0 + K1 + 1;
+	uint2 Base = AllocStrip(K * 2, (K - 1) * 6);
+	if (Base.x == 0xFFFFFFFF) return;
+
+	// Composite edge polyline: leg0 offset (far -> Keep0), middle join
+	// (arc / miter chords / point), leg1 offset (Keep1 -> far).
+	float Keep0 = (Corner.Mode == CORNER_ARC || Corner.Mode == CORNER_MITER) ? Corner.Keep0 : 0.0;
+	float Keep1 = (Corner.Mode == CORNER_ARC || Corner.Mode == CORNER_MITER) ? Corner.Keep1 : 0.0;
+	float E0Len = max(Len0 - Keep0, 0.0);
+	float E1Len = max(Len1 - Keep1, 0.0);
+
+	float MidLen = 0.0;
+	float2 T0 = 0, T1 = 0;
+	if (Corner.Mode == CORNER_ARC || Corner.Mode == CORNER_WRAP)
+	{
+		MidLen = abs(Corner.AngSpan) * (0.5 * (Corner.Radius0 + Corner.Radius1));
+	}
+	else if (Corner.Mode == CORNER_MITER)
+	{
+		float2 DK0 = SplineDirAt(L0.Spline, L0.CrossDist + L0.Dir * Keep0) * L0.Dir;
+		float2 DK1 = SplineDirAt(L1.Spline, L1.CrossDist + L1.Dir * Keep1) * L1.Dir;
+		T0 = LegOffsetPoint(L0, Keep0, Rot90CCW(DK0));
+		T1 = LegOffsetPoint(L1, Keep1, Rot90CW(DK1));
+		MidLen = distance(T0, Corner.M) + distance(Corner.M, T1);
+	}
+	float MidHalf = MidLen * 0.5;
+
+	for (uint I = 0; I < K; ++I)
+	{
+		bool bOnLeg0 = I <= K0;
+		FLegData Leg = L0;
+		if (!bOnLeg0) Leg = L1;
+		float LegL = bOnLeg0 ? Len0 : Len1;
+		// distance from the junction along the current leg
+		float SLeg = bOnLeg0 ? LegL * (1.0 - float(I) / float(K0)) : LegL * float(I - K0) / float(K1);
+
+		// --- centre polyline sample. It snaps to the junction centre inside
+		// the blend radius so end-snapped T junctions and merged crossings
+		// converge to one point. The radius depends only on the current leg,
+		// keeping the two corners that share this leg crack-free.
+		float3 CP = SplinePosAt(Leg.Spline, Leg.CrossDist + Leg.Dir * SLeg);
+		float Blend = saturate(SLeg / (LegWidth(Leg) * 2.0));
+		CP = lerp(Jd.Center, CP, Blend);
+		float2 Travel = SplineDirAt(Leg.Spline, Leg.CrossDist + Leg.Dir * SLeg) * Leg.Dir * (bOnLeg0 ? -1.0 : 1.0);
+
+		// --- edge polyline sample: piecewise mapping keeps the junction
+		// crossing (I == K0) on the middle of the arc/miter join.
+		float SEdge = bOnLeg0
+			? (float(I) / float(K0)) * (E0Len + MidHalf)
+			: E0Len + MidHalf + (float(I - K0) / float(K1)) * (MidHalf + E1Len);
+
+		float2 EP;
+		if (SEdge < E0Len)
+		{
+			float SE = Len0 - SEdge;
+			float2 D = SplineDirAt(L0.Spline, L0.CrossDist + L0.Dir * SE) * L0.Dir;
+			EP = LegOffsetPoint(L0, SE, Rot90CCW(D));
+		}
+		else if (SEdge <= E0Len + MidLen && MidLen > 0.0)
+		{
+			float F = saturate((SEdge - E0Len) / MidLen);
+			if (Corner.Mode == CORNER_MITER)
+			{
+				float DM0 = distance(T0, Corner.M);
+				float SM = F * MidLen;
+				EP = (SM < DM0)
+					? lerp(T0, Corner.M, SM / max(DM0, 1e-3))
+					: lerp(Corner.M, T1, (SM - DM0) / max(MidLen - DM0, 1e-3));
+			}
+			else
+			{
+				float Ang = Corner.Ang0 + Corner.AngSpan * F;
+				float R = lerp(Corner.Radius0, Corner.Radius1, F);
+				EP = Corner.ArcCenter + float2(cos(Ang), sin(Ang)) * R;
+			}
+		}
+		else if (Corner.Mode == CORNER_BLEND && I == K0)
+		{
+			EP = Corner.M; // join the two plain offsets across the junction
+		}
+		else
+		{
+			float SE = min(Keep1 + max(SEdge - E0Len - MidLen, 0.0), Len1);
+			float2 D = SplineDirAt(L1.Spline, L1.CrossDist + L1.Dir * SE) * L1.Dir;
+			EP = LegOffsetPoint(L1, SE, Rot90CW(D));
+		}
+
+		// --- UVs: U is absolute spline distance (continuous with ribbons),
+		// V spans the full road width: centre = 0.5, edge = 0 (left of the
+		// spline direction) or 1 (right).
+		float SplineDist = Leg.CrossDist + Leg.Dir * SLeg;
+		float U = SplineDist * UVInvTile;
+		bool bWedgeIsLeftOfSpline = bOnLeg0 ? (Leg.Dir > 0.0) : (Leg.Dir < 0.0);
+		float EdgeV = bWedgeIsLeftOfSpline ? 0.0 : 1.0;
+
+		uint V = Base.x + I * 2;
+		WriteVertex(V + 0, CP, Travel, float2(U, 0.5), 0xFFFFFFFF);
+		WriteVertex(V + 1, float3(EP, CP.z), Travel, float2(U, EdgeV), 0xFFCCCCCC);
+
+		// edge lies on the RIGHT of the travel direction -> CW winding faces up
+		if (I + 1 < K)
+		{
+			uint C0 = V, E0i = V + 1, C1 = V + 2, E1i = V + 3;
+			uint Idx = Base.y + I * 6;
+			RWIndices[Idx + 0] = C0; RWIndices[Idx + 1] = C1; RWIndices[Idx + 2] = E0i;
+			RWIndices[Idx + 3] = E0i; RWIndices[Idx + 4] = C1; RWIndices[Idx + 5] = E1i;
+		}
+	}
+}
+
+// ---------------------------------------------------------------- FinalizeCS
+
+[numthreads(1, 1, 1)]
+void FinalizeCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x != 0) return;
+	RWIndirectArgs[0] = min(RWCounters[1], MaxIndices); // IndexCountPerInstance
+	RWIndirectArgs[1] = 1;                              // InstanceCount
+	RWIndirectArgs[2] = 0;                              // StartIndexLocation
+	RWIndirectArgs[3] = 0;                              // BaseVertexLocation
+	RWIndirectArgs[4] = 0;                              // StartInstanceLocation
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// RoadDepthToResultCS
+// Converts the road heightmap (depth = CameraHeight - WorldZ, NaN where no
+// road) into the CS-landscape edit-layer merge format:
+//   RW_RoadResult = float4(WorldZ, 0, 0, Coverage)
+// so the proven BrushApplyResult merge does lerp(existingTerrain, WorldZ, Coverage).
+// ─────────────────────────────────────────────────────────────────────────
+Texture2D<float4>   T_RoadDepth;
+RWTexture2D<float4> RW_RoadResult;
+float RoadCameraHeight;
+float RoadInfluence;      // 0..1 blend strength (how strongly the terrain conforms to the road)
+float RoadHeightOffset;   // cm added to the road world Z (raise/lower the road)
+int2  RoadResultSize;
+
+[numthreads(8, 8, 1)]
+void RoadDepthToResultCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (any(Id.xy >= (uint2)RoadResultSize)) return;
+
+	float Depth = T_RoadDepth[Id.xy].r;
+	// Off-road texels are 0xFFFFFFFF -> NaN. MUST guard WorldZ to a finite value there:
+	// NaN * 0 == NaN, so an unguarded premultiply would poison the feather blur (deep spikes).
+	bool  bRoad  = isfinite(Depth);
+	float Weight = bRoad ? saturate(RoadInfluence) : 0.0f;
+	float WorldZ = bRoad ? (RoadCameraHeight - Depth + RoadHeightOffset) : 0.0f;
+	// Diffusion state: (WorldZ*Weight [premultiplied], Weight, isSource, _).
+	// Road texels are fixed Dirichlet sources; gaps diffuse toward the surrounding roads.
+	RW_RoadResult[Id.xy] = float4(WorldZ * Weight, Weight, bRoad ? 1.0f : 0.0f, 0.0f);
+}
+
+// -------------------------------------------------------------------------
+// RoadDiffuseCS  (height diffusion, temporal-blocking / groupshared)
+// State: .r = WorldZ*Weight (premult), .g = Weight, .b = isSource.
+// Road texels (.b==1) are fixed Dirichlet sources; gaps relax to a coverage-
+// weighted neighbour average, so the band between two roads of different
+// heights blends both sides. Each dispatch runs up to ROAD_DIFF_LOCAL Jacobi
+// iterations inside groupshared (one halo ring consumed per iteration), so the
+// global ping-pong happens once per ROAD_DIFF_LOCAL iterations, not every one.
+// -------------------------------------------------------------------------
+#define ROAD_DIFF_TILE  16
+#define ROAD_DIFF_LOCAL 4
+#define ROAD_DIFF_LDS   (ROAD_DIFF_TILE + 2 * ROAD_DIFF_LOCAL)   // 24
+
+Texture2D<float4>   T_RoadDiffuseIn;
+RWTexture2D<float4> RW_RoadDiffuseOut;
+int  RoadDiffuseIterations;   // iterations to apply this dispatch (<= ROAD_DIFF_LOCAL)
+int2 RoadDiffuseSize;
+
+groupshared float2 gsRoadState[2][ROAD_DIFF_LDS][ROAD_DIFF_LDS]; // ping-pong (premultZ, weight)
+groupshared float  gsRoadSrc[ROAD_DIFF_LDS][ROAD_DIFF_LDS];      // isSource (invariant)
+
+[numthreads(ROAD_DIFF_LDS, ROAD_DIFF_LDS, 1)]
+void RoadDiffuseCS(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
+{
+	const int2 TileOrigin = int2(Gid.xy) * ROAD_DIFF_TILE - ROAD_DIFF_LOCAL;
+	const int2 L = int2(GTid.xy);          // 0..ROAD_DIFF_LDS-1
+	const int2 G = TileOrigin + L;         // global texel
+
+	// Load tile + halo; out-of-bounds -> zero-weight background.
+	float2 st = float2(0.0f, 0.0f);
+	float  sr = 0.0f;
+	if (all(G >= int2(0, 0)) && all(G < RoadDiffuseSize))
+	{
+		float4 v = T_RoadDiffuseIn[G];
+		st = v.xy;
+		sr = v.z;
+	}
+	gsRoadState[0][L.y][L.x] = st;
+	gsRoadSrc[L.y][L.x] = sr;
+	GroupMemoryBarrierWithGroupSync();
+
+	int cur = 0;
+	const int Iters = clamp(RoadDiffuseIterations, 0, ROAD_DIFF_LOCAL);
+	for (int it = 0; it < Iters; ++it)
+	{
+		const int nxt = 1 - cur;
+		// The correct region shrinks one halo ring per iteration: [it+1, LDS-2-it]. After
+		// ROAD_DIFF_LOCAL iterations that is exactly the centre TILE, so no boundary error
+		// reaches the output. Texels outside the shrinking region just carry forward.
+		const int lo = it + 1;
+		const int hi = ROAD_DIFF_LDS - 2 - it;
+		if (L.x >= lo && L.x <= hi && L.y >= lo && L.y <= hi)
+		{
+			if (gsRoadSrc[L.y][L.x] > 0.5f)
+			{
+				gsRoadState[nxt][L.y][L.x] = gsRoadState[cur][L.y][L.x]; // fixed source
+			}
+			else
+			{
+				float2 c = gsRoadState[cur][L.y][L.x];
+				float2 l = gsRoadState[cur][L.y][L.x - 1];
+				float2 r = gsRoadState[cur][L.y][L.x + 1];
+				float2 u = gsRoadState[cur][L.y - 1][L.x];
+				float2 d = gsRoadState[cur][L.y + 1][L.x];
+				gsRoadState[nxt][L.y][L.x] = (c + l + r + u + d) * 0.2f;
+			}
+		}
+		else
+		{
+			gsRoadState[nxt][L.y][L.x] = gsRoadState[cur][L.y][L.x];
+		}
+		GroupMemoryBarrierWithGroupSync();
+		cur = nxt;
+	}
+
+	// Write the centre TILE back to global.
+	if (L.x >= ROAD_DIFF_LOCAL && L.x < ROAD_DIFF_LOCAL + ROAD_DIFF_TILE &&
+	    L.y >= ROAD_DIFF_LOCAL && L.y < ROAD_DIFF_LOCAL + ROAD_DIFF_TILE &&
+	    all(G >= int2(0, 0)) && all(G < RoadDiffuseSize))
+	{
+		float2 s = gsRoadState[cur][L.y][L.x];
+		RW_RoadDiffuseOut[G] = float4(s.x, s.y, gsRoadSrc[L.y][L.x], 0.0f);
+	}
+}
+
+// -------------------------------------------------------------------------
+// RoadUnpremultCS: (WorldZ*Weight, Weight, isSource, _) -> (WorldZ, 0, 0, Weight)
+// for the edit-layer merge lerp(terrain, WorldZ, Weight).
+// -------------------------------------------------------------------------
+Texture2D<float4>   T_RoadUnpremult;
+RWTexture2D<float4> RW_RoadUnpremult;
+int2 RoadUnpremultSize;
+
+[numthreads(8, 8, 1)]
+void RoadUnpremultCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (any(Id.xy >= (uint2)RoadUnpremultSize)) return;
+	float4 S = T_RoadUnpremult[Id.xy];
+	float  W = S.g;
+	float  WorldZ = (W > 1e-4f) ? (S.r / W) : 0.0f;
+	RW_RoadUnpremult[Id.xy] = float4(WorldZ, 0.0f, 0.0f, W);
+}

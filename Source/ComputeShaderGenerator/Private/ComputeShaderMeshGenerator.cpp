@@ -4081,6 +4081,11 @@ void AComputeShaderMeshGenerator::RefreshDynamicMeshComponentCullingBounds(float
 // Core System - Lifecycle
 // -----------------------------------------------------------------------------
 
+AComputeShaderMeshGenerator::AComputeShaderMeshGenerator()
+	: AComputeShaderMeshGenerator(FObjectInitializer::Get())
+{
+}
+
 AComputeShaderMeshGenerator::AComputeShaderMeshGenerator(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
@@ -5208,6 +5213,79 @@ void AComputeShaderMeshGenerator::RasterizeTriangleSoupToHeightmapRDG(
 			ConvertParams,
 			GroupCount);
 	}
+}
+
+void AComputeShaderMeshGenerator::RasterizeIndexedMeshToHeightmapRDG(
+	FRDGBuilder& GraphBuilder,
+	FRHIShaderResourceView* PositionSRV,
+	FRHIShaderResourceView* IndexSRV,
+	uint32 TriangleCapacity,
+	const FMatrix44f& LocalToWorld,
+	FRDGTextureRef OutHeightmap,
+	const FBox& WorldBounds,
+	float CameraHeight)
+{
+	if (!PositionSRV || !IndexSRV || TriangleCapacity == 0 || !OutHeightmap)
+	{
+		return;
+	}
+
+	FCSStaticMeshTriangleRDGOutput Soup;
+	Soup.MaxTriangles = TriangleCapacity;
+	Soup.MaxVertices = TriangleCapacity * 3u;
+	Soup.TriangleVertices = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), TriangleCapacity * 3u), TEXT("IdxMeshHM.Soup.Verts"));
+	Soup.TriangleVerticesUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Soup.TriangleVertices, PF_A32B32G32R32F));
+	Soup.TriangleVerticesSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Soup.TriangleVertices, PF_A32B32G32R32F));
+	AddClearUAVPass(GraphBuilder, Soup.TriangleVerticesUAV, 0.0f);
+
+	Soup.TriangleNormals = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), TriangleCapacity * 3u), TEXT("IdxMeshHM.Soup.Normals"));
+	Soup.TriangleNormalsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Soup.TriangleNormals, PF_A32B32G32R32F));
+	AddClearUAVPass(GraphBuilder, Soup.TriangleNormalsUAV, 0.0f);
+
+	Soup.TriangleCounter = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1), TEXT("IdxMeshHM.Soup.Counter"));
+	Soup.TriangleCounterUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Soup.TriangleCounter, PF_R32_UINT));
+	Soup.TriangleCounterSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Soup.TriangleCounter, PF_R32_UINT));
+	AddClearUAVPass(GraphBuilder, Soup.TriangleCounterUAV, 0u);
+
+	// Dummy reference-point buffer (filter disabled).
+	FRDGBufferRef RefBuf = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), 1), TEXT("IdxMeshHM.Soup.Ref"));
+	FVector4f* RefData = GraphBuilder.AllocPODArray<FVector4f>(1);
+	RefData[0] = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+	GraphBuilder.QueueBufferUpload(RefBuf, RefData, sizeof(FVector4f));
+	FRDGBufferSRVRef RefSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(RefBuf, PF_A32B32G32R32F));
+
+	TShaderMapRef<FExtractStaticMeshTrianglesCS> ExtractCS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	auto* EP = GraphBuilder.AllocParameters<FExtractStaticMeshTrianglesCS::FParameters>();
+	EP->IndexBuffer = IndexSRV;
+	EP->PositionBuffer = PositionSRV;
+	EP->ReferencePoints = RefSRV;
+	EP->RW_OutTriangleVertices = Soup.TriangleVerticesUAV;
+	EP->RW_OutTriangleNormals = Soup.TriangleNormalsUAV;
+	EP->RW_TriangleCounter = Soup.TriangleCounterUAV;
+	EP->LocalToWorld = LocalToWorld;
+	EP->BoundsMin = FVector3f(-TNumericLimits<float>::Max());
+	EP->BoundsMax = FVector3f(TNumericLimits<float>::Max());
+	// Unused indices are zero -> degenerate (0,0,0) triangles that rasterize to nothing.
+	EP->TriangleCount = TriangleCapacity;
+	EP->PositionStrideFloat = 3u;
+	EP->ReferenceCount = 0u;
+	EP->TriangleCapacity = TriangleCapacity;
+	EP->bUseBounds = 0u;
+	EP->bUseReferenceFilter = 0u;
+	EP->ReferenceFilterDistanceSq = TNumericLimits<float>::Max();
+
+	GraphBuilder.AddPass(RDG_EVENT_NAME("IdxMeshHM.Extract"), EP, ERDGPassFlags::Compute,
+		[EP, ExtractCS, TriangleCapacity](FRHIComputeCommandList& CmdList)
+		{
+			FComputeShaderUtils::Dispatch(CmdList, ExtractCS, *EP,
+				FComputeShaderUtils::GetGroupCount(FIntVector(int32(TriangleCapacity), 1, 1), 64));
+		});
+
+	RasterizeTriangleSoupToHeightmapRDG(GraphBuilder, Soup, OutHeightmap, WorldBounds, CameraHeight);
 }
 
 void AComputeShaderMeshGenerator::ConvertLandscapeHeightmapToDepthRDG(

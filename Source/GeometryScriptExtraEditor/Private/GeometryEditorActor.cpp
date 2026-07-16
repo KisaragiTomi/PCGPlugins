@@ -4451,11 +4451,8 @@ static TAutoConsoleVariable<int32> CVarVineSCFusedPath(
 bool AVineContainer::VisVineGPUInternal()
 {
 	const TArray<FGeometryScriptPolyPath>& Lines = TubeLines;
-	if (Lines.Num() == 0)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] No tube lines to visualize."));
-		return false;
-	}
+	// Empty-Lines check is deferred: when the fused GPU path is taken the CPU TubeLines
+	// are intentionally not built, so emptiness only matters for the CPU fallback below.
 
 	if (VV.ResampleLength <= KINDA_SMALL_NUMBER)
 	{
@@ -4488,6 +4485,33 @@ bool AVineContainer::VisVineGPUInternal()
 		return false;
 	}
 
+	// Trip A: decide the fused GPU hand-off up front so the whole CPU line prep
+	// (smooth/resample/scale + BuildVVGPUInput; the CPU trace is skipped upstream) is
+	// bypassed. r.Vine.SC.FusedPath=0 forces the CPU fallback below.
+	FVineSCGPUBuffers ConcatenatedGPULines;
+	const bool bFusedGPULines = (CVarVineSCFusedPath.GetValueOnGameThread() != 0)
+		&& !VV.bVisVineGPUUseCPUForPostPasses
+		&& TubeLineGPUBuffers.Num() > 0
+		&& ConcatenateVineSCGPUBuffers(TubeLineGPUBuffers, ConcatenatedGPULines);
+
+	if (!bFusedGPULines && Lines.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] No tube lines to visualize (CPU fallback path)."));
+		return false;
+	}
+
+	// Path geometry for the voxel dispatch: filled by the CPU prep on the fallback path,
+	// left empty on the fused path (DispatchVVGPU_Voxel reads ConcatenatedGPULines instead).
+	TArray<FVector4f> PathPoints;
+	TArray<FVector4f> PathPointAxes;
+	TArray<FIntVector4> PathPointMeta;
+	TArray<float> PathPointCurveU;
+	TArray<FIntVector4> SegmentMeta;
+	double PrepareLinesMs = 0.0;
+	double BuildGPUInputMs = 0.0;
+
+	if (!bFusedGPULines)
+	{
 	const TArray<float>& LineSourceScales = TubeLineSourceScales;
 	const TArray<FVector>& LineSourceLocations = TubeLineSourceLocations;
 	const TArray<FVineLinePointScaleData>& LinePointScales = TubeLinePointScales;
@@ -4609,7 +4633,7 @@ bool AVineContainer::VisVineGPUInternal()
 			ScaleSampleCount);
 	}
 
-	const double PrepareLinesMs = (FPlatformTime::Seconds() - PrepareLinesStartSeconds) * 1000.0;
+	PrepareLinesMs = (FPlatformTime::Seconds() - PrepareLinesStartSeconds) * 1000.0;
 
 	if (PreparedLines.Num() == 0)
 	{
@@ -4619,11 +4643,6 @@ bool AVineContainer::VisVineGPUInternal()
 
 	const TArray<FVineLinePointAxisData> PreparedLinePointAxes;
 
-	TArray<FVector4f> PathPoints;
-	TArray<FVector4f> PathPointAxes;
-	TArray<FIntVector4> PathPointMeta;
-	TArray<float> PathPointCurveU;
-	TArray<FIntVector4> SegmentMeta;
 	const double BuildGPUInputStartSeconds = FPlatformTime::Seconds();
 	if (!BuildVVGPUInput(
 		PreparedLines,
@@ -4640,20 +4659,13 @@ bool AVineContainer::VisVineGPUInternal()
 		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] Failed to build GPU input buffers."));
 		return false;
 	}
-	const double BuildGPUInputMs = (FPlatformTime::Seconds() - BuildGPUInputStartSeconds) * 1000.0;
+	BuildGPUInputMs = (FPlatformTime::Seconds() - BuildGPUInputStartSeconds) * 1000.0;
+	} // end if (!bFusedGPULines): CPU line prep skipped entirely on the fused path
 
-	// Trip A: concatenate the GPU-resident prepped SC buffers so the voxel dispatch can
-	// consume them directly (no CPU upload). Gated by r.Vine.SC.FusedPath; the CPU arrays
-	// above still act as the fallback and drive the CPU-tail path (方式A).
-	FVineSCGPUBuffers ConcatenatedGPULines;
-	const bool bFusedGPULines = (CVarVineSCFusedPath.GetValueOnGameThread() != 0)
-		&& !VV.bVisVineGPUUseCPUForPostPasses
-		&& TubeLineGPUBuffers.Num() > 0
-		&& ConcatenateVineSCGPUBuffers(TubeLineGPUBuffers, ConcatenatedGPULines);
 	if (bFusedGPULines)
 	{
-		UE_LOG(LogTemp, Display, TEXT("[VineSCFused] GPU-resident lines: points=%d segments=%d (CPU path points=%d segments=%d)"),
-			ConcatenatedGPULines.PointCount, ConcatenatedGPULines.SegmentCount, PathPoints.Num(), SegmentMeta.Num());
+		UE_LOG(LogTemp, Display, TEXT("[VineSCFused] GPU-resident lines: points=%d segments=%d (CPU prep skipped)"),
+			ConcatenatedGPULines.PointCount, ConcatenatedGPULines.SegmentCount);
 	}
 
 	TArray<FVector4f> OutVertices;
@@ -8030,6 +8042,17 @@ TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales
 			TargetLocations,
 			SCAttributes,
 			OutGPUBuffers))
+		{
+			return {};
+		}
+
+		// Trip A (4c): when this call produces GPU buffers for the fused VisVine path, the CPU
+		// tree re-trace + downstream prep are redundant (the GPU PathPoints2 already carry the
+		// full smoothed/resampled/scaled geometry). Skip them — TubeLines stays empty and the
+		// fused path drives the mesh from the GPU buffers. r.Vine.SC.FusedPath=0 restores this.
+		if (OutGPUBuffers != nullptr
+			&& CVarVineSCFusedPath.GetValueOnGameThread() != 0
+			&& !VV.bVisVineGPUUseCPUForPostPasses)
 		{
 			return {};
 		}

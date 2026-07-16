@@ -8,7 +8,7 @@
 StructuredBuffer<float4> PathPoints;
 StructuredBuffer<float4> PathPointAxes;
 StructuredBuffer<int4> PathPointMeta;
-StructuredBuffer<float> PathPointCurveU;
+StructuredBuffer<float4> PathPointCurveU; // CurveU in .x (16-byte: 4-byte float SRVs read as 0 in this pass on the GPU-resident path)
 StructuredBuffer<float4> PathPointTangents;
 StructuredBuffer<float4> PathPointNormals;
 StructuredBuffer<float4> PathPointFrameNormals;
@@ -1089,7 +1089,7 @@ void BuildVVVoxelCS(uint3 DispatchThreadId : SV_DispatchThreadID)
             PrevIndex = min(PrevIndex, PathPointCount - 1u);
             NextIndex = min(NextIndex, PathPointCount - 1u);
 
-            float V = PathPointCurveU[PointIndex];
+            float V = PathPointCurveU[PointIndex].x;
 
             float U;
             if (bTube != 0u)

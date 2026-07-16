@@ -58,7 +58,7 @@ class FVVVoxelCS : public FGlobalShader
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPoints)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, PathPointMeta)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, PathPointCurveU)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPointCurveU)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPointTangents)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPointNormals)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPointFrameNormals)
@@ -905,6 +905,32 @@ class FConcatOffsetInt4CS : public FGlobalShader
 	}
 };
 
+// Trip A concat: verbatim copy of a float structured buffer (PathPointCurveU) into the
+// concatenated slice, via compute (the byte-level AddCopyBufferPass zeroed the 4-byte float).
+class FConcatCopyFloatCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FConcatCopyFloatCS);
+	SHADER_USE_PARAMETER_STRUCT(FConcatCopyFloatCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, ConcatSrcFloat)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, RW_ConcatDstFloat)
+		SHADER_PARAMETER(uint32, ConcatFloatCount)
+		SHADER_PARAMETER(uint32, ConcatFloatDstBase)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueInitCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "InitializeSpaceColonizationQueueCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueMarkSourcesCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "MarkSpaceColonizationSourcesCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationQueueBuildNeighborsCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "BuildSpaceColonizationNeighborsCS", SF_Compute);
@@ -924,6 +950,7 @@ IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationEmitResampleCS, "/Plugin/PCGPlugins/Sh
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationCurveCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "CurveSpaceColonizationCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationScatterCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "ScatterSpaceColonizationCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FConcatOffsetInt4CS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "ConcatOffsetInt4CS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FConcatCopyFloatCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "ConcatCopyFloatCS", SF_Compute);
 
 
 // Trip A: the SC solve's fully-prepped output kept GPU-resident (pooled), so the
@@ -945,6 +972,11 @@ struct FVineSCGPUBuffers
 	TRefCountPtr<FRDGPooledBuffer> PathPointMeta;
 	TRefCountPtr<FRDGPooledBuffer> PathPointCurveU;
 	TRefCountPtr<FRDGPooledBuffer> SegmentMeta;
+	// CurveU carried as a CPU array (read back from the solve). A GPU-resident 4-byte float
+	// structured buffer read back as zero through the extract->register->SRV pooled path
+	// (the 16-byte float4/int4 buffers work), so CurveU takes the small readback + upload
+	// route instead. Aligned 1:1 with the concatenated points.
+	TArray<float> CurveUCPU;
 	int32 PointCount = 0;
 	int32 SegmentCount = 0;
 	int32 LineCount = 0;
@@ -3132,6 +3164,8 @@ static bool ConcatenateVineSCGPUBuffers(const TArray<TSharedPtr<FVineSCGPUBuffer
 		SrcMeta.Add(S->PathPointMeta);
 		SrcCurveU.Add(S->PathPointCurveU);
 		SrcSeg.Add(S->SegmentMeta);
+		// CurveU is concatenated on the CPU in the same source order as the points.
+		OutConcat.CurveUCPU.Append(S->CurveUCPU);
 		SrcPointCounts.Add(uint32(S->PointCount));
 		SrcSegCounts.Add(uint32(S->SegmentCount));
 		DstPointBases.Add(TotalPoints);
@@ -3166,6 +3200,7 @@ static bool ConcatenateVineSCGPUBuffers(const TArray<TSharedPtr<FVineSCGPUBuffer
 			CSHepler::FRDGStructuredBufferRefs DstSeg = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FIntVector4), TotalSegments, TEXT("VineConcat.SegmentMeta"), true, true);
 
 			TShaderMapRef<FConcatOffsetInt4CS> ConcatShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			TShaderMapRef<FConcatCopyFloatCS> ConcatCopyFloatShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 
 			for (int32 s = 0; s < NumSrc; ++s)
 			{
@@ -3182,9 +3217,19 @@ static bool ConcatenateVineSCGPUBuffers(const TArray<TSharedPtr<FVineSCGPUBuffer
 				FRDGBufferRef SrcCuBuf = GraphBuilder.RegisterExternalBuffer(SrcCurveU[s], TEXT("VineConcat.SrcCurveU"));
 				FRDGBufferRef SrcMtBuf = GraphBuilder.RegisterExternalBuffer(SrcMeta[s], TEXT("VineConcat.SrcMeta"));
 
-				// Positions + CurveU carry no indices: verbatim byte copy into the slice.
+				// Positions: 16-byte float4, verbatim byte copy works.
 				AddCopyBufferPass(GraphBuilder, DstPoints.Buffer, uint64(DstPtBase) * sizeof(FVector4f), SrcPtBuf, 0, uint64(PtCount) * sizeof(FVector4f));
-				AddCopyBufferPass(GraphBuilder, DstCurveU.Buffer, uint64(DstPtBase) * sizeof(float), SrcCuBuf, 0, uint64(PtCount) * sizeof(float));
+				// CurveU: 4-byte float — byte copy silently zeroed it, so copy via compute.
+				{
+					FConcatCopyFloatCS::FParameters* P = GraphBuilder.AllocParameters<FConcatCopyFloatCS::FParameters>();
+					P->ConcatSrcFloat = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SrcCuBuf));
+					P->RW_ConcatDstFloat = DstCurveU.UAV;
+					P->ConcatFloatCount = PtCount;
+					P->ConcatFloatDstBase = DstPtBase;
+					GraphBuilder.AddPass(RDG_EVENT_NAME("VineConcat.CurveU"), P, ERDGPassFlags::Compute,
+						[P, ConcatCopyFloatShader, PtCount](FRHIComputeCommandList& InRHICmdList)
+						{ FComputeShaderUtils::Dispatch(InRHICmdList, ConcatCopyFloatShader, *P, FComputeShaderUtils::GetGroupCount(FIntVector(PtCount, 1, 1), 64)); });
+				}
 
 				// Meta: offset Prev/Next/Base by the point base, keep Count.
 				{
@@ -3434,13 +3479,20 @@ static bool DispatchVVGPU_Voxel(
 	// Trip A: the concatenated GPU-resident line buffers (null when taking the CPU path).
 	TRefCountPtr<FRDGPooledBuffer> GPULinePoints = bUseGPULines ? GPULines->PathPoints : nullptr;
 	TRefCountPtr<FRDGPooledBuffer> GPULineMeta = bUseGPULines ? GPULines->PathPointMeta : nullptr;
-	TRefCountPtr<FRDGPooledBuffer> GPULineCurveU = bUseGPULines ? GPULines->PathPointCurveU : nullptr;
 	TRefCountPtr<FRDGPooledBuffer> GPULineSeg = bUseGPULines ? GPULines->SegmentMeta : nullptr;
+	// CurveU rides as a CPU array (uploaded fresh below) rather than a pooled float buffer.
+	TArray<float> GPULineCurveUCPU = bUseGPULines ? GPULines->CurveUCPU : TArray<float>();
+	{
+		float CuMx = 0.0f;
+		for (float V : GPULineCurveUCPU) CuMx = FMath::Max(CuMx, V);
+		UE_LOG(LogTemp, Warning, TEXT("[VineConsumeCurveU] bUseGPULines=%d GPULineCurveUCPU.Num=%d max=%.3f PathPointCount=%u"),
+			bUseGPULines ? 1 : 0, GPULineCurveUCPU.Num(), CuMx, PathPointCount);
+	}
 
 	const double EnqueueAndFlushStartSeconds = FPlatformTime::Seconds();
 	ENQUEUE_RENDER_COMMAND(VVVoxelGPU)(
 		[PathPoints, PathPointAxes, PathPointMeta, PathPointCurveU, SegmentMeta,
-		 bUseGPULines, GPULinePoints, GPULineMeta, GPULineCurveU, GPULineSeg,
+		 bUseGPULines, GPULinePoints, GPULineMeta, GPULineCurveUCPU = MoveTemp(GPULineCurveUCPU), GPULineSeg,
 		 GPUVoxelCells, GPUVoxelHashSlots, GPUVoxelNormals, GPUVoxelTargetPositions,
 		 TargetBuckets, TargetBucketOrigin,
 		 VertexReadback, UVReadback, IndexReadback, SurfaceTargetReadback, StageCenterReadback, VertexReadbackBytes, UVReadbackBytes, IndexReadbackBytes, SurfaceTargetReadbackBytes,
@@ -3471,7 +3523,13 @@ static bool DispatchVVGPU_Voxel(
 				};
 				PathPointBuffer = RegisterSRVOnly(GPULinePoints, TEXT("VVVoxel.PathPoints.GPU"));
 				PathPointMetaBuffer = RegisterSRVOnly(GPULineMeta, TEXT("VVVoxel.PathPointMeta.GPU"));
-				PathPointCurveUBuffer = RegisterSRVOnly(GPULineCurveU, TEXT("VVVoxel.PathPointCurveU.GPU"));
+				// CurveU as float4 (.x), uploaded fresh from the concatenated CPU array.
+				// KNOWN ISSUE: this reads as 0 in FVVVoxelCS on the fused path (registered-external
+				// siblings) — under investigation; r.Vine.SC.FusedPath defaults to 0 until fixed.
+				TArray<FVector4f> CurveU4;
+				CurveU4.SetNumUninitialized(GPULineCurveUCPU.Num());
+				for (int32 i = 0; i < GPULineCurveUCPU.Num(); ++i) CurveU4[i] = FVector4f(GPULineCurveUCPU[i], 0.0f, 0.0f, 0.0f);
+				PathPointCurveUBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, CurveU4, TEXT("VVVoxel.PathPointCurveU.GPU"));
 				SegmentMetaBuffer = RegisterSRVOnly(GPULineSeg, TEXT("VVVoxel.SegmentMeta.GPU"));
 				// The GPU SC path carries no per-point axis; zero-fill (matches BuildVVGPUInput's empty axes).
 				PathPointAxisBuffer = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointAxes.Zero"), true, true);
@@ -3482,7 +3540,10 @@ static bool DispatchVVGPU_Voxel(
 				PathPointBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, PathPoints, TEXT("VVVoxel.PathPoints"));
 				PathPointAxisBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, PathPointAxes, TEXT("VVVoxel.PathPointAxes"));
 				PathPointMetaBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, PathPointMeta, TEXT("VVVoxel.PathPointMeta"));
-				PathPointCurveUBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, PathPointCurveU, TEXT("VVVoxel.PathPointCurveU"));
+				TArray<FVector4f> CurveU4;
+				CurveU4.SetNumUninitialized(PathPointCurveU.Num());
+				for (int32 i = 0; i < PathPointCurveU.Num(); ++i) CurveU4[i] = FVector4f(PathPointCurveU[i], 0.0f, 0.0f, 0.0f);
+				PathPointCurveUBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, CurveU4, TEXT("VVVoxel.PathPointCurveU"));
 				SegmentMetaBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, SegmentMeta, TEXT("VVVoxel.SegmentMeta"));
 			}
 			const CSHepler::FRDGStructuredBufferRefs VoxelCellsBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, GPUVoxelCells, TEXT("VVVoxel.VoxelCells"));
@@ -4444,8 +4505,8 @@ bool AVineContainer::VisVine()
 // (legacy CPU-upload path) for A/B parity verification.
 static TAutoConsoleVariable<int32> CVarVineSCFusedPath(
 	TEXT("r.Vine.SC.FusedPath"),
-	1,
-	TEXT("Vine VisVine line hand-off: 1=feed GPU-resident SC buffers directly (Trip A), 0=upload CPU arrays."),
+	0,
+	TEXT("Vine VisVine line hand-off: 1=feed GPU-resident SC buffers directly (Trip A; UV/CurveU still broken), 0=upload CPU arrays (correct)."),
 	ECVF_Default);
 
 bool AVineContainer::VisVineGPUInternal()
@@ -6818,6 +6879,10 @@ static bool BuildSpaceColonizationQueueCSImpl(
 		const uint32 PathPointsReadbackBytes = uint32(sizeof(FVector4f) * uint64(PathPointsReadbackCount));
 		FRHIGPUBufferReadback* PathPointsReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_PathPoints"));
 		TArray<FVector4f> PathPointsData;
+		// TEMP DIAGNOSTIC: read back CurveU2 to localize the fused UV (V=CurveU) all-zero bug.
+		const uint32 CurveUReadbackBytes = uint32(sizeof(float) * uint64(PathPointsReadbackCount));
+		FRHIGPUBufferReadback* CurveUReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_CurveU"));
+		TArray<float> CurveUData;
 		// Trip A: when requested, extract the prepped output buffers as pooled (external)
 		// RDG buffers inside the render command below so they outlive the graph and can be
 		// handed to VisVine. Assigned on the render thread; valid after FlushRenderingCommands.
@@ -6879,7 +6944,7 @@ static bool BuildSpaceColonizationQueueCSImpl(
 				 MaxNeighborsPerTarget, NeighborIndexCount, BackGrowCount, ForkTaperForkOrdinal,
 				 LineCountsReadback, LineCountsReadbackBytes,
 				 EmitTargetPointScales = MoveTemp(EmitTargetPointScales), EmitStartSourceScales = MoveTemp(EmitStartSourceScales),
-				 PathPointsReadback, PathPointsReadbackBytes, PathPointCapacity, SegmentCapacity,
+				 PathPointsReadback, PathPointsReadbackBytes, CurveUReadback, CurveUReadbackBytes, PathPointCapacity, SegmentCapacity,
 				 ResampleLength, PathPoint2Capacity, Segment2Capacity,
 				 EmitCurveLUT = MoveTemp(EmitCurveLUT), CurveLUTSize,
 				 UVScaleInfluence, UVScaleFloor, UVScalePower, UVLengthScale, ScatterDistance,
@@ -7317,6 +7382,7 @@ static bool BuildSpaceColonizationQueueCSImpl(
 					// The resampled counts (post-resample) drive the readback slice.
 					AddEnqueueCopyPass(GraphBuilder, LineCountsReadback, NewCountsBuffer, LineCountsReadbackBytes);
 					AddEnqueueCopyPass(GraphBuilder, PathPointsReadback, PathPoints2Buffer, PathPointsReadbackBytes);
+					AddEnqueueCopyPass(GraphBuilder, CurveUReadback, PathPointCurveU2Buffer, CurveUReadbackBytes);
 
 					AddEnqueueCopyPass(GraphBuilder, TargetReadback, TargetBuffer, TargetReadbackBytes);
 					AddEnqueueCopyPass(GraphBuilder, State0Readback, State0Buffer, StateReadbackBytes);
@@ -7348,6 +7414,8 @@ static bool BuildSpaceColonizationQueueCSImpl(
 			LineCountsReadback = nullptr;
 			delete PathPointsReadback;
 			PathPointsReadback = nullptr;
+			delete CurveUReadback;
+			CurveUReadback = nullptr;
 			return false;
 		}
 
@@ -7364,7 +7432,7 @@ static bool BuildSpaceColonizationQueueCSImpl(
 			ENQUEUE_RENDER_COMMAND(SpaceColonizationQueueCSReadback)(
 				[TargetReadback, State0Readback, State1Readback, InitialTargetDebugReadback, InitialState0DebugReadback, InitialState1DebugReadback,
 				 NeighborCountsDebugReadback, ResetProposalOwnerDebugReadbacks, ProposalOwnerDebugReadbacks, IterationTargetDebugReadbacks,
-				 IterationState0DebugReadbacks, IterationState1DebugReadbacks, TargetReadbackBytes, StateReadbackBytes, UIntReadbackBytes, LineCountsReadback, LineCountsReadbackBytes, &LineCountsData, PathPointsReadback, PathPointsReadbackBytes, &PathPointsData,
+				 IterationState0DebugReadbacks, IterationState1DebugReadbacks, TargetReadbackBytes, StateReadbackBytes, UIntReadbackBytes, LineCountsReadback, LineCountsReadbackBytes, &LineCountsData, PathPointsReadback, PathPointsReadbackBytes, &PathPointsData, CurveUReadback, CurveUReadbackBytes, &CurveUData,
 				 TargetCount, &TargetPositionData, &State0Data, &State1Data, &CSDebugData, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList) mutable
 				{
 					if (!TargetReadback || !State0Readback || !State1Readback)
@@ -7427,6 +7495,7 @@ static bool BuildSpaceColonizationQueueCSImpl(
 
 					LockSpaceColonizationReadbackToArray(LineCountsReadback, LineCountsReadbackBytes, 4, LineCountsData);
 					LockSpaceColonizationReadbackToArray(PathPointsReadback, PathPointsReadbackBytes, int32(PathPointsReadbackBytes / sizeof(FVector4f)), PathPointsData);
+					LockSpaceColonizationReadbackToArray(CurveUReadback, CurveUReadbackBytes, int32(CurveUReadbackBytes / sizeof(float)), CurveUData);
 
 					CSDebugData.bInitialReadbackSucceeded =
 						LockSpaceColonizationReadbackToArray(InitialTargetDebugReadback, TargetReadbackBytes, TargetCount, CSDebugData.InitialTargetPositions) &&
@@ -7510,6 +7579,24 @@ static bool BuildSpaceColonizationQueueCSImpl(
 		delete PathPointsReadback;
 		PathPointsReadback = nullptr;
 
+		// TEMP DIAGNOSTIC: SC-solve CurveU2 range. If [0,0] the CurveScaleU pass output is dead;
+		// if non-zero, the loss is downstream in the concat/consume.
+		{
+			float CuMin = TNumericLimits<float>::Max();
+			float CuMax = -TNumericLimits<float>::Max();
+			const uint32 GPUTotalPoints = LineCountsData.IsValidIndex(1) ? LineCountsData[1] : 0u;
+			const int32 CuCount = FMath::Min<int32>(int32(GPUTotalPoints), CurveUData.Num());
+			for (int32 i = 0; i < CuCount; ++i)
+			{
+				CuMin = FMath::Min(CuMin, CurveUData[i]);
+				CuMax = FMath::Max(CuMax, CurveUData[i]);
+			}
+			UE_LOG(LogTemp, Warning, TEXT("[VineCurveUCheck] SC-solve CurveU2[min=%.4f max=%.4f] n=%d"),
+				CuCount > 0 ? CuMin : 0.0f, CuCount > 0 ? CuMax : 0.0f, CuCount);
+		}
+		delete CurveUReadback;
+		CurveUReadback = nullptr;
+
 		if (!bReadbackSucceeded)
 		{
 			return false;
@@ -7530,6 +7617,17 @@ static bool BuildSpaceColonizationQueueCSImpl(
 			OutGPUBuffers->LineCount = LineCountsData.IsValidIndex(0) ? int32(LineCountsData[0]) : 0;
 			OutGPUBuffers->PointCount = LineCountsData.IsValidIndex(1) ? int32(LineCountsData[1]) : 0;
 			OutGPUBuffers->SegmentCount = LineCountsData.IsValidIndex(2) ? int32(LineCountsData[2]) : 0;
+			// CurveU as a CPU array (see FVineSCGPUBuffers::CurveUCPU note). Sliced to the
+			// compact [0, PointCount) range from the readback.
+			{
+				const int32 CuCount = FMath::Min<int32>(OutGPUBuffers->PointCount, CurveUData.Num());
+				OutGPUBuffers->CurveUCPU.Reset();
+				OutGPUBuffers->CurveUCPU.Append(CurveUData.GetData(), FMath::Max(CuCount, 0));
+				float FillMx = 0.0f;
+				for (float V : OutGPUBuffers->CurveUCPU) FillMx = FMath::Max(FillMx, V);
+				UE_LOG(LogTemp, Warning, TEXT("[VineFillCurveU] CuCount=%d CurveUData.Num=%d CurveUCPU.Num=%d max=%.3f"),
+					CuCount, CurveUData.Num(), OutGPUBuffers->CurveUCPU.Num(), FillMx);
+			}
 		}
 
 		LogSpaceColonizationCSDebugData(CSDebugData);
@@ -8008,6 +8106,15 @@ TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales
 		TArray<float> TargetPointScales;
 		TArray<float> StartSourceScales;
 		BuildSpaceColonizationScaleLookups(SourceTransforms, TargetTransforms, TargetPointScales, StartSourceScales);
+		// Ensure the profile curve exists BEFORE baking the LUT. VisVineGPUInternal lazily
+		// creates this default identity ramp, but it runs after the SC prep — so on a first
+		// generate (CurveControl still null) the LUT baked flat (EvaluateVineScale(null)=1.0)
+		// and the fused path lost all thickness variation until the next generate rebuilt it.
+		// Create the same default here so the very first generate already has the ramp.
+		if (VV.CurveControl == nullptr)
+		{
+			VV.CurveControl = NewObject<UCurveLinearColor>(this);
+		}
 		// Bake CurveControl.G into a LUT so the GPU CurveScale matches EvaluateVineScale.
 		TArray<float> CurveLUT;
 		{
@@ -8044,6 +8151,24 @@ TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales
 			OutGPUBuffers))
 		{
 			return {};
+		}
+
+		// Thickness check: FinalScale (PathPoints2.w) range. min << max => taper present
+		// (CurveControl ramp baked correctly); min ~= max => flat (the CurveControl-null-at-bake
+		// bug). Runs before the fused early-out so it covers the first generate too.
+		{
+			float WMin = TNumericLimits<float>::Max();
+			float WMax = -TNumericLimits<float>::Max();
+			for (const FVector4f& P : GPUPathPoints)
+			{
+				WMin = FMath::Min(WMin, P.W);
+				WMax = FMath::Max(WMax, P.W);
+			}
+			UE_LOG(LogTemp, Warning, TEXT("[VineThickCheck] CurveControl=%p FinalScale[min=%.4f max=%.4f] n=%d"),
+				VV.CurveControl,
+				GPUPathPoints.Num() ? WMin : 0.0f,
+				GPUPathPoints.Num() ? WMax : 0.0f,
+				GPUPathPoints.Num());
 		}
 
 		// Trip A (4c): when this call produces GPU buffers for the fused VisVine path, the CPU

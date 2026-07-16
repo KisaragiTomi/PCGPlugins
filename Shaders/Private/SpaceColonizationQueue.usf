@@ -1093,6 +1093,22 @@ void ConcatOffsetInt4CS(uint3 DispatchThreadId : SV_DispatchThreadID)
     RW_ConcatDstInt4[ConcatDstBase + i] = V;
 }
 
+// Verbatim per-element copy of a float structured buffer into the concatenated slice.
+// Used for PathPointCurveU: a byte-level AddCopyBufferPass on the 4-byte float buffer
+// silently produced zeros (unlike the 16-byte float4 copy), so use a compute copy.
+StructuredBuffer<float> ConcatSrcFloat;
+RWStructuredBuffer<float> RW_ConcatDstFloat;
+uint ConcatFloatCount;
+uint ConcatFloatDstBase;
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void ConcatCopyFloatCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint i = DispatchThreadId.x;
+    if (i >= ConcatFloatCount) return;
+    RW_ConcatDstFloat[ConcatFloatDstBase + i] = ConcatSrcFloat[i];
+}
+
 // ---- Scatter (Trip A parity port of ApplyVVSCPointOffset, GeometryEditorActor.cpp:1078) ----
 // Per-point deterministic +/-ScatterDistance offset applied BEFORE the smooth pass, so the
 // arc-length change flows into the resample exactly like the CPU path. Seeded from the

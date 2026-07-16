@@ -204,6 +204,12 @@ struct FVineLinePointAxisData
 
 // VisVine debug parameter structs moved to ComputeShaderDebugParams.h
 
+// Trip A (GPU line hand-off): the space-colonization solve's fully-prepped output
+// buffers, kept GPU-resident (pooled) so VisVine can consume them directly instead
+// of the CPU round-trip (readback -> re-trace -> BuildVVGPUInput re-derive).
+// Defined in GeometryEditorActor.cpp (holds RDG pooled-buffer refs).
+struct FVineSCGPUBuffers;
+
 UCLASS()
 class GEOMETRYSCRIPTEXTRAEDITOR_API AVineContainer : public AMeshGeneratorBrushCache
 {
@@ -277,6 +283,11 @@ public:
 	UPROPERTY(Transient)
 	TArray<FVineLinePointAxisData> TubeLinePointAxes;
 
+	// Trip A: per-source GPU-resident SC output buffers, parallel to TubeLines.
+	// Populated by the tube SC loop, consumed by the VisVine GPU path to skip the
+	// line-data CPU round-trip. Not a UPROPERTY (holds render resources, transient).
+	TArray<TSharedPtr<FVineSCGPUBuffers>> TubeLineGPUBuffers;
+
 	// ---- Core Operations ----
 
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
@@ -320,6 +331,11 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "SpaceColonization")
 	TArray<FSpaceColonizationLineResult> SpaceColonizationWithScales(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, bool bUseComputeShader = false);
+
+	// Non-reflected worker: same as SpaceColonizationWithScales but can also export the
+	// GPU-resident prepped buffers (Trip A). FVineSCGPUBuffers isn't a USTRUCT, so this
+	// cannot be a UFUNCTION. The BlueprintCallable version above forwards here with nullptr.
+	TArray<FSpaceColonizationLineResult> SpaceColonizationWithScalesInternal(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, bool bUseComputeShader, FVineSCGPUBuffers* OutGPUBuffers);
 
 	// ---- Debug ----
 

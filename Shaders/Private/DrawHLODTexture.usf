@@ -1,0 +1,15 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/General.usf"
+
+Texture2D ColorRT;
+RWTexture2D<float3> DrawRT;
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void MainComputeShader(
+                       uint3 DispatchThreadId : SV_DispatchThreadID,
+	                   uint GroupIndex : SV_GroupIndex) 
+{
+    float3 gradient = float3(0, 0, 0);
+	gradient.xy = CalculateGrayGradientT(ColorRT, DispatchThreadId);
+    DrawRT[DispatchThreadId.xy] = gradient;
+}

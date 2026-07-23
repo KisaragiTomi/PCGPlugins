@@ -1,0 +1,3 @@
+#include "MeshGeneratorBrushCache.h"
+
+FCSInstanceBrushEditorRequest AMeshGeneratorBrushCache::OnInstanceBrushEditorRequest;

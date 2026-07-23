@@ -1,0 +1,65 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "1.0",
+  "FriendlyName": "PCGPlugins",
+  "Description": "",
+  "Category": "Other",
+  "CreatedBy": "",
+  "CreatedByURL": "",
+  "DocsURL": "",
+  "MarketplaceURL": "",
+  "SupportURL": "",
+  "CanContainContent": true,
+  "IsBetaVersion": false,
+  "IsExperimentalVersion": false,
+  "Installed": true,
+  "EnabledByDefault": true,
+  "Modules": [
+    {
+      "Name": "GeometryScriptExtraEditor",
+      "Type": "Editor",
+      "LoadingPhase": "Default",
+      "BlacklistTargets": ["Shipping"]
+    },
+    {
+      "Name": "ComputeShaderGenerator",
+      "Type": "Runtime",
+      "LoadingPhase": "PostConfigInit",
+      "PlatformAllowList": ["Win64"]
+    },
+    {
+      "Name": "PCGEditorProcess",
+      "Type": "Editor",
+      "LoadingPhase": "PostConfigInit",
+      "PlatformAllowList": ["Win64"],
+      "BlacklistTargets": ["Shipping"]
+    }
+  ],
+  "ShaderArchive": "PCGPlugins",
+  "Plugins": [
+    {
+      "Name": "GeometryProcessing",
+      "Enabled": true,
+      "TargetAllowList": [
+        "Editor"
+      ]
+    },
+    {
+      "Name": "ModelingToolsEditorMode",
+      "Enabled": true
+    },
+    {
+      "Name": "GeometryScripting",
+      "Enabled": true
+    },
+    {
+      "Name": "EditorScriptingUtilities",
+      "Enabled": true
+    },
+    {
+      "Name": "Landmass",
+      "Enabled": true
+    }
+  ]
+}

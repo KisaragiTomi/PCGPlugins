@@ -1,0 +1,293 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1680" height="1360" viewBox="0 0 1680 1360" role="img" aria-labelledby="title desc">
+  <title id="title">VDBMeshFromActorPoints GPU-first 加速流程</title>
+  <desc id="desc">VDBMeshFromActorPoints 从 Actor/BBox 输入，到 GameThread 快照、GPU RenderData 采样、fallback 补点、OpenVDB 栅格化和 UDynamicMesh 输出的数据流与线程边界。</desc>
+
+  <defs>
+    <marker id="arrow-blue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 1 1 L 11 6 L 1 11 Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-indigo" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 1 1 L 11 6 L 1 11 Z" fill="#4f46e5"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 1 1 L 11 6 L 1 11 Z" fill="#059669"/>
+    </marker>
+    <marker id="arrow-amber" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 1 1 L 11 6 L 1 11 Z" fill="#b45309"/>
+    </marker>
+    <marker id="arrow-slate" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 1 1 L 11 6 L 1 11 Z" fill="#475569"/>
+    </marker>
+    <filter id="shadow" x="-8%" y="-10%" width="116%" height="122%">
+      <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+    <style>
+      .bg { fill: #f8fafc; }
+      .lane { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; filter: url(#shadow); }
+      .lane-title { font: 700 23px "Microsoft YaHei", "Segoe UI", Arial, sans-serif; fill: #0f172a; }
+      .title { font: 800 36px "Microsoft YaHei", "Segoe UI", Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 17px "Microsoft YaHei", "Segoe UI", Arial, sans-serif; fill: #475569; }
+      .card-title { font: 700 18px "Microsoft YaHei", "Segoe UI", Arial, sans-serif; fill: #0f172a; }
+      .card-text { font: 400 14px "Microsoft YaHei", "Segoe UI", Arial, sans-serif; fill: #334155; }
+      .small { font: 400 12.5px "Microsoft YaHei", "Segoe UI", Arial, sans-serif; fill: #475569; }
+      .code { font: 600 13px Consolas, "Microsoft YaHei", monospace; fill: #1e293b; }
+      .tag { font: 700 12px "Microsoft YaHei", "Segoe UI", Arial, sans-serif; fill: #0f172a; }
+      .card { stroke-width: 2; rx: 8; }
+      .entry { fill: #eff6ff; stroke: #60a5fa; }
+      .snapshot { fill: #f0fdfa; stroke: #14b8a6; }
+      .gpu { fill: #eef2ff; stroke: #818cf8; }
+      .compute { fill: #f5f3ff; stroke: #a78bfa; }
+      .fallback { fill: #fffbeb; stroke: #f59e0b; }
+      .worker { fill: #ecfdf5; stroke: #10b981; }
+      .guard { fill: #fff1f2; stroke: #fb7185; }
+      .neutral { fill: #f8fafc; stroke: #94a3b8; }
+      .output { fill: #f0fdf4; stroke: #22c55e; }
+      .line-blue { fill: none; stroke: #2563eb; stroke-width: 3; marker-end: url(#arrow-blue); }
+      .line-indigo { fill: none; stroke: #4f46e5; stroke-width: 3; marker-end: url(#arrow-indigo); }
+      .line-green { fill: none; stroke: #059669; stroke-width: 3; marker-end: url(#arrow-green); }
+      .line-amber { fill: none; stroke: #b45309; stroke-width: 3; marker-end: url(#arrow-amber); }
+      .line-slate { fill: none; stroke: #475569; stroke-width: 2.5; marker-end: url(#arrow-slate); }
+      .line-dash { fill: none; stroke: #64748b; stroke-width: 2.5; stroke-dasharray: 8 8; marker-end: url(#arrow-slate); }
+      .line-dash-amber { fill: none; stroke: #b45309; stroke-width: 2.5; stroke-dasharray: 8 8; marker-end: url(#arrow-amber); }
+      .label-blue { fill: #dbeafe; stroke: #60a5fa; stroke-width: 1.4; rx: 8; }
+      .label-indigo { fill: #e0e7ff; stroke: #818cf8; stroke-width: 1.4; rx: 8; }
+      .label-green { fill: #dcfce7; stroke: #34d399; stroke-width: 1.4; rx: 8; }
+      .label-amber { fill: #fef3c7; stroke: #f59e0b; stroke-width: 1.4; rx: 8; }
+      .label-slate { fill: #f1f5f9; stroke: #94a3b8; stroke-width: 1.4; rx: 8; }
+      .note { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 8; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1680" height="1360"/>
+
+  <text class="title" x="64" y="64">VDBMeshFromActorPoints GPU-first 加速流程</text>
+  <text class="subtitle" x="64" y="96">主目标：避免 CPU 全量读取/展开 StaticMesh，用 GPU 生成压缩表面点，再交给 OpenVDB 构建动态网格</text>
+
+  <rect class="lane" x="48" y="126" width="1584" height="180" rx="14"/>
+  <text class="lane-title" x="78" y="164">1. GameThread 入口与快照：只收集必要对象和纯数据</text>
+
+  <rect class="card entry" x="78" y="188" width="236" height="88"/>
+  <text class="card-title" x="102" y="216">Blueprint 入口</text>
+  <text class="card-text" x="102" y="242">
+    <tspan x="102" dy="0">In_Actors / BBoxVertors</tspan>
+    <tspan x="102" dy="20">VoxelSize / PointSpacing</tspan>
+  </text>
+
+  <rect class="card entry" x="354" y="188" width="248" height="88"/>
+  <text class="card-title" x="378" y="216">Actor / Component 收集</text>
+  <text class="card-text" x="378" y="242">
+    <tspan x="378" dy="0">BoxOverlapActors</tspan>
+    <tspan x="378" dy="20">SMC / ISM / HISM 遍历</tspan>
+  </text>
+
+  <rect class="card snapshot" x="642" y="188" width="280" height="88"/>
+  <text class="card-title" x="666" y="216">采样请求快照</text>
+  <text class="card-text" x="666" y="242">
+    <tspan x="666" dy="0">StaticMesh + LOD + Transform</tspan>
+    <tspan x="666" dy="20">目标 Bounds 与点数上限</tspan>
+  </text>
+
+  <rect class="card guard" x="962" y="188" width="260" height="88"/>
+  <text class="card-title" x="986" y="216">逐 Mesh 决策</text>
+  <text class="card-text" x="986" y="242">
+    <tspan x="986" dy="0">优先 CanSample GPU</tspan>
+    <tspan x="986" dy="20">否则选择缓存或补点</tspan>
+  </text>
+
+  <rect class="card neutral" x="1262" y="188" width="320" height="88"/>
+  <text class="card-title" x="1286" y="216">禁止长期跨线程持有</text>
+  <text class="card-text" x="1286" y="242">
+    <tspan x="1286" dy="0">UObject / RHI 引用不进 worker</tspan>
+    <tspan x="1286" dy="20">后台只处理快照后的数组</tspan>
+  </text>
+
+  <path class="line-blue" d="M314 232 H342"/>
+  <path class="line-blue" d="M602 232 H630"/>
+  <path class="line-blue" d="M922 232 H950"/>
+  <path class="line-slate" d="M1222 232 H1250"/>
+
+  <rect class="lane" x="48" y="330" width="1584" height="260" rx="14"/>
+  <text class="lane-title" x="78" y="368">2. 当前主路径：GPU RenderData 采样 + BBox 过滤 + 体素 hash compact</text>
+
+  <rect class="card gpu" x="78" y="394" width="236" height="96"/>
+  <text class="card-title" x="102" y="422">GPU 可采样</text>
+  <text class="card-text" x="102" y="448">
+    <tspan x="102" dy="0">RenderData / RHI 可用</tspan>
+    <tspan x="102" dy="20">Nanite 不匹配则 fallback</tspan>
+  </text>
+
+  <rect class="card gpu" x="354" y="394" width="248" height="96"/>
+  <text class="card-title" x="378" y="422">RDG 绑定 SRV</text>
+  <text class="code" x="378" y="448">
+    <tspan x="378" dy="0">PositionVertexBuffer.GetSRV()</tspan>
+    <tspan x="378" dy="19">IndexBuffer.GetSRV()</tspan>
+  </text>
+
+  <rect class="card compute" x="642" y="394" width="280" height="96"/>
+  <text class="card-title" x="666" y="422">Compute Shader 采样</text>
+  <text class="card-text" x="666" y="448">
+    <tspan x="666" dy="0">三角中心点 stride/hash</tspan>
+    <tspan x="666" dy="20">LocalToWorld 输出 world points</tspan>
+  </text>
+
+  <rect class="card compute" x="962" y="394" width="260" height="96"/>
+  <text class="card-title" x="986" y="422">GPU 端压缩</text>
+  <text class="card-text" x="986" y="448">
+    <tspan x="986" dy="0">目标 BBox 过滤</tspan>
+    <tspan x="986" dy="20">Voxel hash slot 抢占去重</tspan>
+  </text>
+
+  <rect class="card gpu" x="1262" y="394" width="320" height="96"/>
+  <text class="card-title" x="1286" y="422">Readback compact points</text>
+  <text class="card-text" x="1286" y="448">
+    <tspan x="1286" dy="0">读回点与 per-request counts</tspan>
+    <tspan x="1286" dy="20">当前同步入口仍会等待结果</tspan>
+  </text>
+
+  <path class="line-indigo" d="M314 442 H342"/>
+  <path class="line-indigo" d="M602 442 H630"/>
+  <path class="line-indigo" d="M922 442 H950"/>
+  <path class="line-indigo" d="M1222 442 H1250"/>
+  <path class="line-indigo" d="M1052 276 V316"/>
+  <text class="small" x="1010" y="322">GPU 主路径</text>
+  <path class="line-dash-amber" d="M1142 276 V316"/>
+  <text class="small" x="1156" y="322">失败降级</text>
+
+  <rect class="note" x="78" y="516" width="458" height="46"/>
+  <text class="small" x="102" y="544">当前已做：采样 pass 输出 raw points，compact pass 写代表点和计数。</text>
+
+  <rect class="note" x="582" y="516" width="472" height="46"/>
+  <text class="small" x="606" y="544">下一步优化：先异步读 counter，再按 CompactCount 变长读回点。</text>
+
+  <rect class="note" x="1100" y="516" width="482" height="46"/>
+  <text class="small" x="1124" y="544">GPU 解决 Mesh 读取/展开卡点，OpenVDB CPU 成本仍需单独评估。</text>
+
+  <rect class="lane" x="48" y="614" width="1584" height="264" rx="14"/>
+  <text class="lane-title" x="78" y="652">3. 备用路径：GPU 不适合时按成本逐级降级</text>
+
+  <rect class="card fallback" x="78" y="678" width="270" height="106"/>
+  <text class="card-title" x="102" y="706">CPU RenderData 降级</text>
+  <text class="card-text" x="102" y="732">
+    <tspan x="102" dy="0">不进入 UDynamicMesh</tspan>
+    <tspan x="102" dy="20">适合调试或小范围资产</tspan>
+  </text>
+
+  <rect class="card fallback" x="392" y="678" width="290" height="106"/>
+  <text class="card-title" x="416" y="706">PointCache / Dirty Bake</text>
+  <text class="card-text" x="416" y="732">
+    <tspan x="416" dy="0">Ready 直接变换 LocalPoints</tspan>
+    <tspan x="416" dy="20">Stale/Missing 排队重采样</tspan>
+  </text>
+
+  <rect class="card fallback" x="726" y="678" width="294" height="106"/>
+  <text class="card-title" x="750" y="706">Async LineTrace 补点</text>
+  <text class="card-text" x="750" y="732">
+    <tspan x="750" dy="0">X/Y/Z 方向监测网格</tspan>
+    <tspan x="750" dy="20">collision 更可靠时启用</tspan>
+  </text>
+
+  <rect class="card fallback" x="1064" y="678" width="240" height="106"/>
+  <text class="card-title" x="1088" y="706">Bounds 表面点</text>
+  <text class="card-text" x="1088" y="732">
+    <tspan x="1088" dy="0">最低成本兜底</tspan>
+    <tspan x="1088" dy="20">可能让 VDB 过厚</tspan>
+  </text>
+
+  <rect class="card guard" x="1348" y="678" width="234" height="106"/>
+  <text class="card-title" x="1372" y="706">旧完整 Mesh 路径</text>
+  <text class="card-text" x="1372" y="732">
+    <tspan x="1372" dy="0">仅小范围/离线使用</tspan>
+    <tspan x="1372" dy="20">仍会读取并展开 Mesh</tspan>
+  </text>
+
+  <path class="line-amber" d="M348 731 H380"/>
+  <path class="line-amber" d="M682 731 H714"/>
+  <path class="line-amber" d="M1020 731 H1052"/>
+  <path class="line-amber" d="M1304 731 H1336"/>
+
+  <rect class="label-amber" x="78" y="810" width="310" height="36"/>
+  <text class="tag" x="98" y="833">GPU 不可用 / 点数过少 / Nanite 不匹配</text>
+
+  <rect class="label-amber" x="432" y="810" width="300" height="36"/>
+  <text class="tag" x="452" y="833">缓存 Ready / Stale / Missing / Building</text>
+
+  <rect class="label-amber" x="776" y="810" width="300" height="36"/>
+  <text class="tag" x="796" y="833">需要 collision 修正或场景贴附真实表面</text>
+
+  <rect class="label-amber" x="1120" y="810" width="330" height="36"/>
+  <text class="tag" x="1140" y="833">所有表面点不足时，再加粗体积保护</text>
+
+  <rect class="lane" x="48" y="902" width="1584" height="280" rx="14"/>
+  <text class="lane-title" x="78" y="940">4. 汇合、OpenVDB 与输出：点云合并后再回到动态网格</text>
+
+  <rect class="card worker" x="78" y="966" width="254" height="100"/>
+  <text class="card-title" x="102" y="994">World Points 汇合</text>
+  <text class="card-text" x="102" y="1020">
+    <tspan x="102" dy="0">GPU / Cache / Ray / Bounds</tspan>
+    <tspan x="102" dy="20">统一到目标 BBox 空间</tspan>
+  </text>
+
+  <rect class="card worker" x="376" y="966" width="250" height="100"/>
+  <text class="card-title" x="400" y="994">CPU 去重保护</text>
+  <text class="card-text" x="400" y="1020">
+    <tspan x="400" dy="0">最终 bounds / voxel key</tspan>
+    <tspan x="400" dy="20">避免重复点进入 VDB</tspan>
+  </text>
+
+  <rect class="card worker" x="670" y="966" width="300" height="100"/>
+  <text class="card-title" x="694" y="994">OpenVDB 栅格化</text>
+  <text class="code" x="694" y="1020">
+    <tspan x="694" dy="0">ParticlesToVDBMeshUniform</tspan>
+    <tspan x="694" dy="19">PointRadiusMult 控制连续性</tspan>
+  </text>
+
+  <rect class="card output" x="1014" y="966" width="268" height="100"/>
+  <text class="card-title" x="1038" y="994">边界与结果网格</text>
+  <text class="card-text" x="1038" y="1020">
+    <tspan x="1038" dy="0">追加 Landscape 上下平面</tspan>
+    <tspan x="1038" dy="20">Result=true 走 VoxelMergeMeshs</tspan>
+  </text>
+
+  <rect class="card output" x="1326" y="966" width="256" height="100"/>
+  <text class="card-title" x="1350" y="994">UDynamicMesh 输出</text>
+  <text class="card-text" x="1350" y="1020">
+    <tspan x="1350" dy="0">GameThread 创建 / SetMesh</tspan>
+    <tspan x="1350" dy="20">供藤蔓/空间殖民查询</tspan>
+  </text>
+
+  <path class="line-green" d="M332 1016 H364"/>
+  <path class="line-green" d="M626 1016 H658"/>
+  <path class="line-green" d="M970 1016 H1002"/>
+  <path class="line-green" d="M1282 1016 H1314"/>
+
+  <rect class="note" x="78" y="1100" width="360" height="48"/>
+  <text class="small" x="102" y="1128">断裂优先调参：增大 PointRadiusMult，或减小 PointSpacing。</text>
+
+  <rect class="note" x="474" y="1100" width="380" height="48"/>
+  <text class="small" x="498" y="1128">Dirty 回调只排队，不在资产编辑/导入/保存时做重活。</text>
+
+  <rect class="note" x="890" y="1100" width="330" height="48"/>
+  <text class="small" x="914" y="1128">射线监测点适合 fallback，不适合每帧持续扫描。</text>
+
+  <rect class="note" x="1256" y="1100" width="326" height="48"/>
+  <text class="small" x="1280" y="1128">Bounds 速度快但形状粗，作为最后兜底使用。</text>
+
+  <rect class="lane" x="48" y="1206" width="1584" height="104" rx="14"/>
+  <text class="lane-title" x="78" y="1242">线程边界速记</text>
+
+  <rect class="label-blue" x="78" y="1262" width="270" height="34"/>
+  <text class="tag" x="98" y="1284">GameThread：UObject / 组件快照</text>
+
+  <rect class="label-indigo" x="384" y="1262" width="284" height="34"/>
+  <text class="tag" x="404" y="1284">RenderThread / RDG：SRV 与 dispatch</text>
+
+  <rect class="label-green" x="704" y="1262" width="250" height="34"/>
+  <text class="tag" x="724" y="1284">Worker：纯点数组 / OpenVDB</text>
+
+  <rect class="label-slate" x="990" y="1262" width="280" height="34"/>
+  <text class="tag" x="1010" y="1284">GameThread：UDynamicMesh 创建更新</text>
+
+  <rect class="label-amber" x="1306" y="1262" width="276" height="34"/>
+  <text class="tag" x="1326" y="1284">风险：同步 readback 仍可能卡顿</text>
+</svg>

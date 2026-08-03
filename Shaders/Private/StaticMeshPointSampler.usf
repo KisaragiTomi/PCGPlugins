@@ -1,5 +1,6 @@
 #include "/Engine/Public/Platform.ush"
 #include "/Plugin/PCGPlugins/Shaders/Private/PCGMathCommon.ush"
+#include "/Engine/Private/ComputeShaderUtils.ush"   // GetUnWrappedDispatchThreadId：>65535 组时 2D 包裹 dispatch 线性化（大网格 5.67M 三角提取）
 
 #ifndef THREADGROUPSIZE_X
 #define THREADGROUPSIZE_X 64
@@ -16,6 +17,29 @@ Buffer<float4> ReferencePoints;
 RWBuffer<float4> RW_OutTriangleVertices;
 RWBuffer<float4> RW_OutTriangleNormals;
 RWBuffer<uint> RW_TriangleCounter;
+// 每个源三角一个材质 id（长度 == request 三角数），CS_NO_MATERIAL_ID 表示无材质。
+Buffer<uint> TriToMaterial;
+// 与输出 triangle soup 平行（按 triangle 索引），在与顶点相同的 atomic slot 上写材质 id。
+RWBuffer<uint> RW_OutTriangleMaterialIds;
+// 源 mesh 的逐顶点 UV（typed float2，交错存 NumTexCoords 组/顶点）。NumTexCoords==0 表示无 UV。
+Buffer<float2> SourceTexCoordBuffer;
+// 与输出 triangle soup 顶点平行（3 per triangle），在与顶点相同的 atomic slot 上写 UV0。
+RWBuffer<float2> RW_OutTriangleUVs;
+
+// --- Nanite 全细节源三角追加（AppendSourceTrianglesCS 专用）---
+// 已在 game thread 从 editor MeshDescription 变换到世界空间的源三角，扁平存储 3 顶点/三角。
+// 绕序与 render index buffer 一致，故与 ExtractStaticMeshTrianglesCS 采用完全相同的反绕 + 法线逻辑，
+// 保证 Nanite 与非 Nanite 网格输出朝向一致。
+Buffer<float4> SourceTriangleVertices;   // 世界空间位置，w=1，3 per triangle
+Buffer<float4> SourceTriangleNormals;    // 世界空间源顶点实例法线，3 per triangle
+Buffer<float4> SourceTriangleColors;
+Buffer<float4> SourceTriangleTangents;
+Buffer<float4> SourceTriangleBiTangents;
+RWBuffer<float4> RW_OutTriangleColors;
+RWBuffer<float4> RW_OutTriangleTangents;
+RWBuffer<float4> RW_OutTriangleBiTangents;
+Buffer<float2> SourceTriangleUVs;        // UV0，3 per triangle（与 SourceTriangleVertices 平行）
+Buffer<uint>   SourceTriangleMaterialIds;// 材质 registry id，1 per triangle
 Buffer<float4> TriangleVertices;
 Buffer<float4> TriangleNormals;
 Buffer<uint> SurfaceTriangleCounter;
@@ -61,6 +85,8 @@ uint CompactCapacity;
 uint HashSlotCount;
 uint ReferenceCount;
 uint TriangleCapacity;
+// 源 mesh 每顶点的 UV 组数（交错步长）。0 表示无 UV，输出 UV 退化为 (0,0)。
+uint NumTexCoords;
 uint bUseBounds;
 uint bUseReferenceFilter;
 uint SurfaceVoxelCapacity;
@@ -311,9 +337,10 @@ void CompactStaticMeshPointsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 }
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
-void ExtractStaticMeshTrianglesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+void ExtractStaticMeshTrianglesCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 {
-	uint TriIndex = DispatchThreadId.x;
+	// 包裹 dispatch：>65535 组时 C++ 用 GetGroupCountWrapped 拆成 2D，这里线性化还原（5.67M 三角 = 88677 组 > 65535）
+	uint TriIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
 	if (TriIndex >= TriangleCount || TriangleCapacity == 0u)
 	{
 		return;
@@ -346,6 +373,20 @@ void ExtractStaticMeshTrianglesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		return;
 	}
 
+	// 源三角材质 id：写进与顶点相同的 atomic slot，故 readback 后可按 soup 三角序号取回。
+	uint MaterialId = TriToMaterial[TriIndex];
+
+	// 源顶点 UV0（交错步长 = NumTexCoords）。NumTexCoords==0（无 UV / dummy 绑定）时退化为 (0,0)。
+	float2 UV0 = float2(0.0f, 0.0f);
+	float2 UV1 = float2(0.0f, 0.0f);
+	float2 UV2 = float2(0.0f, 0.0f);
+	if (NumTexCoords > 0u)
+	{
+		UV0 = SourceTexCoordBuffer[I0 * NumTexCoords];
+		UV1 = SourceTexCoordBuffer[I1 * NumTexCoords];
+		UV2 = SourceTexCoordBuffer[I2 * NumTexCoords];
+	}
+
 	uint OutTriangleIndex = 0u;
 	for (;;)
 	{
@@ -371,6 +412,107 @@ void ExtractStaticMeshTrianglesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	RW_OutTriangleNormals[OutVertexBase + 0u] = float4(N, 0.0f);
 	RW_OutTriangleNormals[OutVertexBase + 1u] = float4(N, 0.0f);
 	RW_OutTriangleNormals[OutVertexBase + 2u] = float4(N, 0.0f);
+	// UV 必须跟随上面的顶点重排（slot0=P0/I0, slot1=P2/I2, slot2=P1/I1）。
+	RW_OutTriangleUVs[OutVertexBase + 0u] = UV0;
+	RW_OutTriangleUVs[OutVertexBase + 1u] = UV2;
+	RW_OutTriangleUVs[OutVertexBase + 2u] = UV1;
+	RW_OutTriangleMaterialIds[OutTriangleIndex] = MaterialId;
+}
+
+// Nanite 网格全细节源三角追加：把 game thread 从 editor MeshDescription 提取并已变换到世界空间的
+// 源三角原子追加进与 ExtractStaticMeshTrianglesCS 完全相同的 triangle soup（共享 RW_TriangleCounter）。
+// 逻辑逐字镜像 ExtractStaticMeshTrianglesCS（反绕 + N=cross(P2-P0,P1-P0) + 顶点/UV 重排），
+// 因源三角绕序与 render index buffer 一致，Nanite 与非 Nanite 输出朝向完全一致。
+// 位置已在 CPU 端按 request bounds 粗筛，故这里默认 bUseBounds=0；参考点过滤仍在 GPU 端执行以对齐 render 路径。
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void AppendSourceTrianglesCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	// 与 extract 相同的包裹 dispatch 线性化（源三角可达数百万）。
+	uint TriIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (TriIndex >= TriangleCount || TriangleCapacity == 0u)
+	{
+		return;
+	}
+
+	uint SrcBase = TriIndex * 3u;
+	float3 P0 = SourceTriangleVertices[SrcBase + 0u].xyz;
+	float3 P1 = SourceTriangleVertices[SrcBase + 1u].xyz;
+	float3 P2 = SourceTriangleVertices[SrcBase + 2u].xyz;
+
+	if (bUseBounds != 0u && !TriangleIntersectsBounds(P0, P1, P2))
+	{
+		return;
+	}
+
+	if (!PassTriangleReferenceFilter(P0, P1, P2))
+	{
+		return;
+	}
+
+	float3 N0 = normalize(SourceTriangleNormals[SrcBase + 0u].xyz);
+	float3 N1 = normalize(SourceTriangleNormals[SrcBase + 1u].xyz);
+	float3 N2 = normalize(SourceTriangleNormals[SrcBase + 2u].xyz);
+
+	// Facing comes from the source topology, never from the vertex normals. Normals are
+	// authored shading data: smoothed shells, foliage cards, baked-from-highpoly props and
+	// hard creases routinely produce normals that oppose the geometric face or sit
+	// near-perpendicular to it, so voting per triangle flips isolated triangles and leaves
+	// the soup inconsistent with its own connectivity. Mirrored instances are already
+	// compensated on the CPU (ExtractNaniteSourceTrianglesForRequest swaps two corners for
+	// negative-determinant transforms), so reverse unconditionally here, exactly like
+	// ExtractStaticMeshTrianglesCS, and keep both extraction paths on one convention.
+	const uint Corner1 = 2u;
+	const uint Corner2 = 1u;
+	float3 N = normalize(cross(P2 - P0, P1 - P0));
+	if (any(isnan(N)) || dot(N, N) <= 1.0e-8f)
+	{
+		return;
+	}
+
+	uint MaterialId = SourceTriangleMaterialIds[TriIndex];
+	float2 UV0 = SourceTriangleUVs[SrcBase + 0u];
+	float2 UV1 = SourceTriangleUVs[SrcBase + 1u];
+	float2 UV2 = SourceTriangleUVs[SrcBase + 2u];
+	uint OutTriangleIndex = 0u;
+	for (;;)
+	{
+		uint CurrentTriangleCount = RW_TriangleCounter[0];
+		if (CurrentTriangleCount >= TriangleCapacity)
+		{
+			return;
+		}
+
+		uint OriginalTriangleCount = 0u;
+		InterlockedCompareExchange(RW_TriangleCounter[0], CurrentTriangleCount, CurrentTriangleCount + 1u, OriginalTriangleCount);
+		if (OriginalTriangleCount == CurrentTriangleCount)
+		{
+			OutTriangleIndex = CurrentTriangleCount;
+			break;
+		}
+	}
+
+	uint OutVertexBase = OutTriangleIndex * 3u;
+	RW_OutTriangleVertices[OutVertexBase + 0u] = float4(P0, 1.0f);
+	RW_OutTriangleVertices[OutVertexBase + 1u] = SourceTriangleVertices[SrcBase + Corner1];
+	RW_OutTriangleVertices[OutVertexBase + 2u] = SourceTriangleVertices[SrcBase + Corner2];
+	// Normals ride along with the emitted corner order and stay exactly as authored.
+	RW_OutTriangleNormals[OutVertexBase + 0u] = float4(N0, 0.0f);
+	RW_OutTriangleNormals[OutVertexBase + 1u] = float4(N2, 0.0f);
+	RW_OutTriangleNormals[OutVertexBase + 2u] = float4(N1, 0.0f);
+	// All vertex-instance attributes follow the selected source corner order.
+	RW_OutTriangleUVs[OutVertexBase + 0u] = UV0;
+	RW_OutTriangleUVs[OutVertexBase + 1u] = SourceTriangleUVs[SrcBase + Corner1];
+	RW_OutTriangleUVs[OutVertexBase + 2u] = SourceTriangleUVs[SrcBase + Corner2];
+	RW_OutTriangleColors[OutVertexBase + 0u] = SourceTriangleColors[SrcBase + 0u];
+	RW_OutTriangleColors[OutVertexBase + 1u] = SourceTriangleColors[SrcBase + Corner1];
+	RW_OutTriangleColors[OutVertexBase + 2u] = SourceTriangleColors[SrcBase + Corner2];
+	RW_OutTriangleTangents[OutVertexBase + 0u] = SourceTriangleTangents[SrcBase + 0u];
+	RW_OutTriangleTangents[OutVertexBase + 1u] = SourceTriangleTangents[SrcBase + Corner1];
+	RW_OutTriangleTangents[OutVertexBase + 2u] = SourceTriangleTangents[SrcBase + Corner2];
+	RW_OutTriangleBiTangents[OutVertexBase + 0u] = SourceTriangleBiTangents[SrcBase + 0u];
+	RW_OutTriangleBiTangents[OutVertexBase + 1u] = SourceTriangleBiTangents[SrcBase + Corner1];
+	RW_OutTriangleBiTangents[OutVertexBase + 2u] = SourceTriangleBiTangents[SrcBase + Corner2];
+	RW_OutTriangleMaterialIds[OutTriangleIndex] = MaterialId;
 }
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]

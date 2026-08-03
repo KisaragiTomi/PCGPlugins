@@ -135,12 +135,11 @@ struct COMPUTESHADERGENERATOR_API FVisVineSplineDebugOptions
 {
 	GENERATED_BODY()
 public:
-	// When enabled, VisVineGPU draws each vine's selected-stage center line with DrawDebugLine.
+	// When enabled, VisVineGPU submits the selected-stage GPU center-line buffer to the renderer.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
 	bool bDrawDebugLines = true;
 
-	// Which intermediate pipeline stage to read back and draw. Only this stage is copied
-	// back from the GPU.
+	// Which intermediate pipeline stage to draw directly from its GPU buffer.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
 	EVisVineGPUDebugStage DebugStage = EVisVineGPUDebugStage::Smooth;
 

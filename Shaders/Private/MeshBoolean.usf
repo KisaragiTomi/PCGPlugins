@@ -1,0 +1,1077 @@
+// GPU 场景三角形穿插切分 / 布尔 —— narrow-phase（Stage A）+ Stage B 缠绕数。
+// 设计见 Docs/SceneTriangleBooleanSplit.md。tri-tri LBVH 仅遍历 AABB 重叠候选，
+// 共面对沿彼此的边互相切割、穿插对求交线段，写进全局 append 列表，再由 GPU BSP 重三角化。
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/ComputeShaderUtils.ush"   // GetUnWrappedDispatchThreadId：>65535 组的 2D 包裹 dispatch 线性化
+
+#ifndef THREADGROUPSIZE_X
+#define THREADGROUPSIZE_X 64
+#endif
+
+// LBVH, fast-winding, and position-weld kernels are shared geometry facilities.
+// Keep their implementation in one include so Boolean consumes them without owning
+// or duplicating their math; only classification/output policy remains in this file.
+#include "/Plugin/PCGPlugins/Shaders/Private/CSGpuTriangleUtilities.ush"
+
+// RW_Stats 槽位
+#define STAT_COPLANAR       0
+#define STAT_DEGENERATE     1
+#define STAT_CELL_OVERFLOW  2
+#define STAT_SEG_OVERFLOW   3
+#define STAT_CELLITER_CLAMP 4
+
+// ---- 输入 ----
+Buffer<float4> TriangleVertices;   // triangle soup：每三角 3 个 float4，.w=1
+Buffer<uint>   TriangleCounter;    // [0] = 实际三角数
+uint   TriangleCapacity;           // dispatch 容量（soup 顶点容量/3）
+
+float3 LoadTriVert(uint Tri, uint K)
+{
+	return TriangleVertices[Tri * 3u + K].xyz;
+}
+
+// -----------------------------------------------------------------------------
+// TriTriIntersectCS —— LBVH 候选求交（每对由较小三角形序号处理一次）
+//   共面对沿彼此的边互相切割；穿插对交线段 append 进全局列表
+// -----------------------------------------------------------------------------
+RWBuffer<float4> RW_CutP0;   // .xyz=交线起点，.w=asfloat(TriA)
+RWBuffer<float4> RW_CutP1;   // .xyz=交线终点，.w=asfloat(TriB)
+RWBuffer<uint>   RW_CutCounter; // [0]=count，[1]=overflow
+RWBuffer<uint>   RW_Stats;      // 统计：coplanar/degenerate/segOverflow
+uint MaxCutSegments;
+float SideEps;               // 判定“全在一侧”的带宽
+float ParallelEps;          // |cross(nA,nB)|^2 阈值（判共面/平行，未归一化，仅作 fallback）
+float MinSegLenSq;          // 交线段最短长度平方（滤退化/共享边）
+float SinCoplanarSq;        // sin²(共面二面角阈值)——归一化，与三角尺寸无关
+float CoplanarOffsetEps;    // 共面判定的平面偏移带宽（世界单位 cm，真实距离）
+
+// 三角形边与平面求交：给定三顶点及其到平面的有符号距离（已知穿过），求两个交点
+void EdgeCrossings(float3 V0, float3 V1, float3 V2, float D0, float D1, float D2,
+	out float3 PA, out float3 PB, out bool bOk)
+{
+	float3 Pts[3];
+	uint N = 0u;
+	if (D0 * D1 < 0.0f) Pts[N++] = lerp(V0, V1, D0 / (D0 - D1));
+	if (D1 * D2 < 0.0f) Pts[N++] = lerp(V1, V2, D1 / (D1 - D2));
+	if (D2 * D0 < 0.0f) Pts[N++] = lerp(V2, V0, D2 / (D2 - D0));
+	PA = Pts[0];
+	PB = (N >= 2u) ? Pts[1] : Pts[0];
+	bOk = (N >= 2u);
+}
+
+// 三角形-三角形三维求交。返回 0=无，1=线段(填 P,Q)，2=共面/平行
+int TriTriSegment(uint TriA, uint TriB, out float3 P, out float3 Q)
+{
+	float3 A0 = LoadTriVert(TriA, 0), A1 = LoadTriVert(TriA, 1), A2 = LoadTriVert(TriA, 2);
+	float3 B0 = LoadTriVert(TriB, 0), B1 = LoadTriVert(TriB, 1), B2 = LoadTriVert(TriB, 2);
+
+	float3 NA = cross(A1 - A0, A2 - A0);
+	float3 NB = cross(B1 - B0, B2 - B0);
+	if (dot(NA, NA) < 1e-12f || dot(NB, NB) < 1e-12f) return 0; // 退化三角
+
+	// B 顶点到平面 A 的有符号距离
+	float OA = dot(NA, A0);
+	float da0 = dot(NA, B0) - OA, da1 = dot(NA, B1) - OA, da2 = dot(NA, B2) - OA;
+	float aMin = min(da0, min(da1, da2)), aMax = max(da0, max(da1, da2));
+	if (aMin > SideEps || aMax < -SideEps) return 0; // B 整体在 A 一侧
+
+	// A 顶点到平面 B 的有符号距离
+	float OB = dot(NB, B0);
+	float db0 = dot(NB, A0) - OB, db1 = dot(NB, A1) - OB, db2 = dot(NB, A2) - OB;
+	float bMin = min(db0, min(db1, db2)), bMax = max(db0, max(db1, db2));
+	if (bMin > SideEps || bMax < -SideEps) return 0; // A 整体在 B 一侧
+
+	float3 L = cross(NA, NB);
+	float LL = dot(L, L);
+	if (LL < ParallelEps) return 2; // 平行/共面 —— 交给 CPU/后续处理
+
+	// A 与平面 B 的交线段 sA（用 db*），B 与平面 A 的交线段 sB（用 da*）
+	float3 sA0, sA1; bool okA;
+	EdgeCrossings(A0, A1, A2, db0, db1, db2, sA0, sA1, okA);
+	float3 sB0, sB1; bool okB;
+	EdgeCrossings(B0, B1, B2, da0, da1, da2, sB0, sB1, okB);
+	if (!okA || !okB) return 0; // 顶点贴平面等退化，v1 跳过
+
+	float ta0 = dot(sA0, L), ta1 = dot(sA1, L);
+	float tb0 = dot(sB0, L), tb1 = dot(sB1, L);
+	float aLo = min(ta0, ta1), aHi = max(ta0, ta1);
+	float bLo = min(tb0, tb1), bHi = max(tb0, tb1);
+	float Lo = max(aLo, bLo), Hi = min(aHi, bHi);
+	if (Lo >= Hi) return 0; // 区间不重叠 → 不相交
+
+	float3 Perp = sA0 - (dot(sA0, L) / LL) * L; // L 上所有点的公共垂直分量
+	P = Perp + (Lo / LL) * L;
+	Q = Perp + (Hi / LL) * L;
+	return 1;
+}
+
+// 两三角是否共享一条边（≥2 个近重合顶点）——滤掉单网格相邻三角的噪声
+bool SharesEdge(uint TriA, uint TriB)
+{
+	float3 A0 = LoadTriVert(TriA, 0), A1 = LoadTriVert(TriA, 1), A2 = LoadTriVert(TriA, 2);
+	float3 B0 = LoadTriVert(TriB, 0), B1 = LoadTriVert(TriB, 1), B2 = LoadTriVert(TriB, 2);
+	float Eps = 1e-6f;
+	uint Match = 0u;
+	float3 Av[3] = { A0, A1, A2 };
+	float3 Bv[3] = { B0, B1, B2 };
+	[unroll] for (uint i = 0u; i < 3u; ++i)
+	{
+		[unroll] for (uint j = 0u; j < 3u; ++j)
+		{
+			float3 D = Av[i] - Bv[j];
+			if (dot(D, D) < Eps) { Match++; break; }
+		}
+	}
+	return Match >= 2u;
+}
+
+void AppendCut(uint TriA, uint TriB, float3 P, float3 Q)
+{
+	uint Slot;
+	InterlockedAdd(RW_CutCounter[0], 1u, Slot);
+	if (Slot < MaxCutSegments)
+	{
+		RW_CutP0[Slot] = float4(P, asfloat(TriA));
+		RW_CutP1[Slot] = float4(Q, asfloat(TriB));
+	}
+	else
+	{
+		InterlockedAdd(RW_CutCounter[1], 1u);
+		InterlockedAdd(RW_Stats[STAT_SEG_OVERFLOW], 1u);
+	}
+}
+
+// 单归属约束段：两个 .w 都写 owner。CPU 端只塞进 owner 一个三角（TriB==TriA 时跳过第二次）。
+void AppendCutOwner(uint OwnerTri, float3 P, float3 Q)
+{
+	uint Slot;
+	InterlockedAdd(RW_CutCounter[0], 1u, Slot);
+	if (Slot < MaxCutSegments)
+	{
+		RW_CutP0[Slot] = float4(P, asfloat(OwnerTri));
+		RW_CutP1[Slot] = float4(Q, asfloat(OwnerTri));
+	}
+	else
+	{
+		InterlockedAdd(RW_CutCounter[1], 1u);
+		InterlockedAdd(RW_Stats[STAT_SEG_OVERFLOW], 1u);
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 共面处理：判定 + 平面基投影 + 段-三角 2D 裁剪 + 互相沿边切割
+// -----------------------------------------------------------------------------
+float Cross2D(float2 A, float2 B) { return A.x * B.y - A.y * B.x; }
+
+float2 ProjectToPlane(float3 P, float3 Org, float3 Uax, float3 Vax)
+{
+	float3 D = P - Org;
+	return float2(dot(D, Uax), dot(D, Vax));
+}
+
+float3 UnprojectFromPlane(float2 p, float3 Org, float3 Uax, float3 Vax)
+{
+	return Org + p.x * Uax + p.y * Vax;
+}
+
+// 两三角是否共面（二面角 < 阈值 且 平面偏移 < 带宽，均归一化）。共面时 nAout=A 单位法线。
+bool AreCoplanar(uint TriA, uint TriB, out float3 nAout)
+{
+	float3 A0 = LoadTriVert(TriA, 0), A1 = LoadTriVert(TriA, 1), A2 = LoadTriVert(TriA, 2);
+	float3 B0 = LoadTriVert(TriB, 0), B1 = LoadTriVert(TriB, 1), B2 = LoadTriVert(TriB, 2);
+	float3 NA = cross(A1 - A0, A2 - A0);
+	float3 NB = cross(B1 - B0, B2 - B0);
+	float la = length(NA), lb = length(NB);
+	nAout = float3(0.0f, 0.0f, 1.0f);
+	if (la < 1e-9f || lb < 1e-9f) return false;    // 退化三角
+	float3 nA = NA / la, nB = NB / lb;
+	nAout = nA;
+	float3 cr = cross(nA, nB);
+	if (dot(cr, cr) > SinCoplanarSq) return false; // 二面角超阈值 → 非共面
+	float d0 = dot(nA, B0 - A0), d1 = dot(nA, B1 - A0), d2 = dot(nA, B2 - A0);
+	float dmax = max(abs(d0), max(abs(d1), abs(d2)));
+	if (dmax > CoplanarOffsetEps) return false;    // 平行但不同面 → 非共面（无重叠切割）
+	return true;
+}
+
+// 把 2D 线段 [P,Q] 裁到三角 (T0,T1,T2) 内部。用“与对顶点同侧”判定内部，不依赖绕序。
+bool ClipSegmentToTriangle2D(float2 P, float2 Q, float2 T0, float2 T1, float2 T2,
+	out float2 R0, out float2 R1)
+{
+	R0 = P; R1 = P;
+	float tEnter = 0.0f, tExit = 1.0f;
+	float2 Ev[3] = { T0, T1, T2 };
+	[unroll] for (uint e = 0u; e < 3u; ++e)
+	{
+		float2 E0 = Ev[e];
+		float2 E1 = Ev[(e + 1u) % 3u];
+		float2 Eo = Ev[(e + 2u) % 3u];
+		float2 Dir = E1 - E0;
+		float s = (Cross2D(Dir, Eo - E0) >= 0.0f) ? 1.0f : -1.0f; // 内侧参照符号
+		float gP = s * Cross2D(Dir, P - E0);   // >=0 表示在内侧
+		float gQ = s * Cross2D(Dir, Q - E0);
+		float dG = gQ - gP;
+		if (abs(dG) < 1e-20f)
+		{
+			if (gP < 0.0f) return false;       // 整段在该边外侧
+		}
+		else
+		{
+			float tHit = -gP / dG;
+			if (dG > 0.0f) tEnter = max(tEnter, tHit); // 由外入内
+			else           tExit  = min(tExit,  tHit); // 由内出外
+		}
+		if (tEnter > tExit) return false;
+	}
+	R0 = lerp(P, Q, tEnter);
+	R1 = lerp(P, Q, tExit);
+	return true;
+}
+
+// 共面对 (TriA,TriB)：把 B 的边裁进 A（约束归 A）、A 的边裁进 B（约束归 B），
+// 各自沿对方边界被切开。3D 端点在 A 平面内，两侧重三角化再各自投影。
+void EmitCoplanarCuts(uint TriA, uint TriB, float3 nA)
+{
+	float3 A0 = LoadTriVert(TriA, 0), A1 = LoadTriVert(TriA, 1), A2 = LoadTriVert(TriA, 2);
+	float3 B0 = LoadTriVert(TriB, 0), B1 = LoadTriVert(TriB, 1), B2 = LoadTriVert(TriB, 2);
+
+	float3 Uax = A1 - A0;
+	float ul = length(Uax);
+	if (ul < 1e-9f) return;
+	Uax /= ul;
+	float3 Vax = cross(nA, Uax); // nA、Uax 单位正交 → Vax 单位
+
+	float2 a0 = ProjectToPlane(A0, A0, Uax, Vax);
+	float2 a1 = ProjectToPlane(A1, A0, Uax, Vax);
+	float2 a2 = ProjectToPlane(A2, A0, Uax, Vax);
+	float2 b0 = ProjectToPlane(B0, A0, Uax, Vax);
+	float2 b1 = ProjectToPlane(B1, A0, Uax, Vax);
+	float2 b2 = ProjectToPlane(B2, A0, Uax, Vax);
+
+	float2 Av[3] = { a0, a1, a2 };
+	float2 Bv[3] = { b0, b1, b2 };
+
+	// B 的 3 条边裁进 A → 约束归 A
+	[unroll] for (uint i = 0u; i < 3u; ++i)
+	{
+		float2 R0, R1;
+		if (ClipSegmentToTriangle2D(Bv[i], Bv[(i + 1u) % 3u], a0, a1, a2, R0, R1))
+		{
+			float3 W0 = UnprojectFromPlane(R0, A0, Uax, Vax);
+			float3 W1 = UnprojectFromPlane(R1, A0, Uax, Vax);
+			float3 D = W1 - W0;
+			if (dot(D, D) >= MinSegLenSq) AppendCutOwner(TriA, W0, W1);
+		}
+	}
+	// A 的 3 条边裁进 B → 约束归 B
+	[unroll] for (uint j = 0u; j < 3u; ++j)
+	{
+		float2 R0, R1;
+		if (ClipSegmentToTriangle2D(Av[j], Av[(j + 1u) % 3u], b0, b1, b2, R0, R1))
+		{
+			float3 W0 = UnprojectFromPlane(R0, A0, Uax, Vax);
+			float3 W1 = UnprojectFromPlane(R1, A0, Uax, Vax);
+			float3 D = W1 - W0;
+			if (dot(D, D) >= MinSegLenSq) AppendCutOwner(TriB, W0, W1);
+		}
+	}
+}
+
+// tri-tri broad-phase LBVH（2 float4/node：[2n]=min.xyz|asfloat(left)，[2n+1]=max.xyz|asfloat(right)，
+// 叶 .w=原三角序号），由父类共享 AddTriangleLBVHToRDG 建（与 winding/rayvis 同一套）。
+Buffer<float4> TriTriBVHNodes;
+
+// 处理一对三角 (TriA,TriB)：共享边跳过、共面只计数、穿插求交线段 append。（原 all-pairs 内层体，抽成函数供 BVH 复用）
+void ProcessTriPair(uint TriA, uint TriB)
+{
+	if (SharesEdge(TriA, TriB)) return;
+	float3 nA;
+	if (AreCoplanar(TriA, TriB, nA)) { InterlockedAdd(RW_Stats[STAT_COPLANAR], 1u); return; } // 共面交 CPU §7.1 簇 arrangement
+	float3 P, Q;
+	int Kind = TriTriSegment(TriA, TriB, P, Q);
+	if (Kind == 2) { InterlockedAdd(RW_Stats[STAT_COPLANAR], 1u); return; }
+	if (Kind != 1) return;
+	float3 D = Q - P;
+	if (dot(D, D) < MinSegLenSq) { InterlockedAdd(RW_Stats[STAT_DEGENERATE], 1u); return; }
+	AppendCut(TriA, TriB, P, Q);
+}
+
+bool AabbOverlap(float3 lo1, float3 hi1, float3 lo2, float3 hi2)
+{
+	return all(lo1 <= hi2) && all(hi1 >= lo2);
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void TriTriIntersectCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	// 包裹 dispatch 线性化（>65535 组的 2D 组网）；1D 组网时结果与 DTid.x 相同，向后兼容。
+	uint TriA = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	uint Count = TriangleCounter[0];
+	if (TriA >= Count || TriA >= TriangleCapacity) return;
+
+	// LBVH broad-phase：只对 AABB 与 A 相交的 B>A 求交（每对由较小 index 线程处理一次）
+	float3 A0 = LoadTriVert(TriA, 0), A1 = LoadTriVert(TriA, 1), A2 = LoadTriVert(TriA, 2);
+	float3 aLo = min(A0, min(A1, A2));
+	float3 aHi = max(A0, max(A1, A2));
+	uint leafBase = TriangleCapacity - 1u;   // BVH 建于 TriangleCapacity 个三角：内部 0..N-2，叶 N-1..2N-2
+	int stack[96];
+	int sp = 0;
+	stack[sp++] = 0;   // 根（N>1 内部0，N==1 叶0）
+	[loop] while (sp > 0)
+	{
+		int ni = stack[--sp];
+		float4 n0 = TriTriBVHNodes[ni * 2u + 0u];
+		float4 n1 = TriTriBVHNodes[ni * 2u + 1u];
+		if (!AabbOverlap(aLo, aHi, n0.xyz, n1.xyz)) continue;
+		if ((uint)ni >= leafBase)
+		{
+			uint TriB = (uint)asint(n0.w);
+			if (TriB > TriA && TriB < Count) ProcessTriPair(TriA, TriB);
+		}
+		else if (sp <= 94)
+		{
+			stack[sp++] = asint(n0.w);   // left
+			stack[sp++] = asint(n1.w);   // right
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// 最终 BSP emit 的射线可见性救回。
+//   从面内起点（数量∝面积，≤MaxSamples）向绕正面法线的方向锥
+//   （半角由 CapMinCos 控制：0=前向半球，-1=全球）投 RayCount 条射线，对 occluder soup 做
+//   Möller–Trumbore any-hit（跳过自身源三角）。中途无命中=逃逸=该方向可见。
+// -----------------------------------------------------------------------------
+Buffer<float4> OccluderVerts;   // 3 顶点/occluder，.xyz
+uint  OccluderTriCount;
+uint  RayCount;
+uint  MaxSamples;
+float CapMinCos;                // 方向锥下限 cosθ（0=半球，-1=全球）
+float ShellRadius;              // 逃逸距离（射线飞这么远仍未命中即可见）
+float RayBias;                  // 起点沿射线偏移（避让自相交）
+float SampleDensity;            // 每单位面积起点数
+uint  bKeepBack;                // 是否保留仅反面可见
+
+// Möller–Trumbore：命中且 t∈(1e-3, MaxT) 返回 true
+bool RayHitsTri(float3 o, float3 d, float3 v0, float3 v1, float3 v2, float MaxT)
+{
+	float3 e1 = v1 - v0, e2 = v2 - v0;
+	float3 p = cross(d, e2);
+	float det = dot(e1, p);
+	if (abs(det) < 1e-12f) return false;   // 平行
+	float invDet = 1.0f / det;
+	float3 tv = o - v0;
+	float u = dot(tv, p) * invDet;
+	if (u < 0.0f || u > 1.0f) return false;
+	float3 q = cross(tv, e1);
+	float v = dot(d, q) * invDet;
+	if (v < 0.0f || u + v > 1.0f) return false;
+	float tHit = dot(e2, q) * invDet;
+	return (tHit > 1e-3f && tHit < MaxT);
+}
+
+// 位反转 radical inverse（base 2），用于面内低差异起点
+float RadicalInverse2(uint bits)
+{
+	return float(reversebits(bits)) * 2.3283064365386963e-10f; // 1/2^32
+}
+
+// GPU LBVH 遍历（build 核见 CSGpuTriangleUtilities.ush）。节点作 SRV 读；叶 tri 从 occluder soup 取。
+Buffer<float4> LBVHNodesSRV;   // 2 float4/node：[2n]=min.xyz|asfloat(left)，[2n+1]=max.xyz|asfloat(right)
+
+bool RayOccludedBVH(float3 o, float3 d, float MaxT, uint SkipIdx)
+{
+	float3 invD = 1.0f / d;              // d 分量为 0 → ±inf，slab min/max 判定仍成立
+	uint leafBase = OccluderTriCount - 1u; // 节点 >= leafBase 为叶（内部 0..N-2，叶 N-1..2N-2）
+	int stack[96];                       // 深度上限 ~2·log2(N)；96 给退化/大 soup 留余量
+	int sp = 0;
+	stack[sp++] = 0;                     // 根：N>1 时内部 0，N==1 时叶 0（都在索引 0）
+	[loop] while (sp > 0)
+	{
+		int ni = stack[--sp];
+		float4 a0 = LBVHNodesSRV[ni * 2u + 0u];
+		float4 a1 = LBVHNodesSRV[ni * 2u + 1u];
+		float pad = MaxT * 1e-5f;              // 稳健 padding：薄/共面 AABB 的 slab 舍入否则会误判 tmin>tmax → 假剔除
+		float3 t0 = (a0.xyz - pad - o) * invD;
+		float3 t1 = (a1.xyz + pad - o) * invD;
+		float3 ts = min(t0, t1), tb = max(t0, t1);
+		float tmin = max(max(ts.x, ts.y), max(ts.z, 0.0f));
+		float tmax = min(min(tb.x, tb.y), min(tb.z, MaxT));
+		if (tmin > tmax) continue;             // 未命中该节点包围盒（padding 后对薄/共面 AABB 稳健）
+		if ((uint)ni >= leafBase)
+		{
+			int tri = asint(a0.w);
+			if ((uint)tri != SkipIdx)
+			{
+				float3 v0 = OccluderVerts[tri * 3u + 0u].xyz;
+				float3 v1 = OccluderVerts[tri * 3u + 1u].xyz;
+				float3 v2 = OccluderVerts[tri * 3u + 2u].xyz;
+				if (RayHitsTri(o, d, v0, v1, v2, MaxT)) return true;
+			}
+		}
+		else if (sp <= 94)
+		{
+			stack[sp++] = asint(a0.w);   // left
+			stack[sp++] = asint(a1.w);   // right
+		}
+	}
+	return false;
+}
+
+uint EvaluateTriangleVisibility(float3 v0, float3 v1, float3 v2, uint SkipIdx)
+{
+	float3 nn = cross(v1 - v0, v2 - v0);
+	float nlen = length(nn);
+	if (nlen < 1e-12f) return 0u;
+	float3 n = nn / nlen;
+	float area = 0.5f * nlen;
+
+	// 正交切向基
+	float3 up = (abs(n.z) < 0.9f) ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+	float3 tx = normalize(cross(up, n));
+	float3 ty = cross(n, tx);
+
+	uint nOrigin = (uint)clamp(ceil(SampleDensity * area), 1.0f, (float)MaxSamples);
+	float minCos = (bKeepBack != 0u) ? CapMinCos : max(CapMinCos, 0.0f); // 不留反面→只采前向半球
+
+	bool frontEscaped = false, backEscaped = false;
+	float invRays = 1.0f / (float)max(RayCount, 1u);
+
+	for (uint s = 0u; s < nOrigin && !frontEscaped; ++s)
+	{
+		float3 o0;
+		if (s == 0u)
+		{
+			o0 = (v0 + v1 + v2) * (1.0f / 3.0f);
+		}
+		else
+		{
+			float u1 = ((float)s + 0.5f) / (float)nOrigin;
+			float u2 = RadicalInverse2(s);
+			float su = sqrt(u1);
+			o0 = (1.0f - su) * v0 + (su * (1.0f - u2)) * v1 + (su * u2) * v2;
+		}
+
+		for (uint i = 0u; i < RayCount && !frontEscaped; ++i)
+		{
+			// cosθ 在 [minCos,1] 均匀 → 锥内均匀；i==0 恒取正对法线 d=n（doc §7/§8：保证正对可见绝不漏判）
+			float ct = (i == 0u) ? 1.0f : (1.0f - ((float)i + 0.5f) * invRays * (1.0f - minCos));
+			float st = sqrt(saturate(1.0f - ct * ct));
+			float phi = (float)i * 2.39996323f; // 黄金角
+			float3 d = (i == 0u) ? n : ((st * cos(phi)) * tx + (st * sin(phi)) * ty + ct * n);
+			bool isFront = (ct >= 0.0f);
+			// 起点沿法线抬离 subject 平面（前向 +n / 背向 -n）：既避免共面自相交，又不吞掉沿射线方向的近距遮挡
+			float3 o = o0 + n * (isFront ? RayBias : -RayBias);
+			bool occ = RayOccludedBVH(o, d, ShellRadius, SkipIdx);
+			if (!occ)
+			{
+				if (isFront) frontEscaped = true;
+				else         backEscaped = true;
+			}
+		}
+	}
+
+	bool keep = frontEscaped || (backEscaped && bKeepBack != 0u);
+	// 0=不可见，1=从源正面可见，2=仅从源背面可见。该值只用于分类/诊断，不允许改变拓扑绕序。
+	return keep ? (frontEscaped ? 1u : 2u) : 0u;
+}
+Buffer<uint> FinalSoupCounter;
+Buffer<uint> FinalCutCounter;
+Buffer<uint> FinalTriStats;
+Buffer<uint> FinalOutputCounter;
+Buffer<uint> FinalBSPStats;
+RWBuffer<uint> RW_FinalStatus;
+uint FinalBSPStatCount;
+
+[numthreads(1, 1, 1)]
+void FinalStatusCS(uint3 DTid : SV_DispatchThreadID)
+{
+	RW_FinalStatus[0] = FinalSoupCounter[0];
+	RW_FinalStatus[1] = FinalCutCounter[0];
+	RW_FinalStatus[2] = FinalCutCounter[1];
+	[unroll] for (uint i = 0u; i < 8u; ++i) RW_FinalStatus[3u + i] = FinalTriStats[i];
+	RW_FinalStatus[11] = FinalOutputCounter[0];
+	RW_FinalStatus[12] = FinalOutputCounter[1];
+	for (uint i = 0u; i < FinalBSPStatCount; ++i) RW_FinalStatus[13u + i] = FinalBSPStats[i];
+}
+
+// =============================================================================
+// GPU arrangement grouping（Milestone 1，全 GPU 零回读第一步）：把交线段按 owner 三角
+//   计数-排序成 per-triangle CSR，复现 CPU SegsPerTri（cpp:697-706）。
+//   CountCutsCS（每段给 owner +1）→ 3-pass 块前缀和（ScanBlocks/ScanBlockSums/AddOffsets，
+//   镜像 VoxelCavitySpan.usf）→ ScatterCutsCS（按 owner 写入各自 CSR 区间）。
+//   段的 owner 编码：非共面段 P0.w=asfloat(TriA)、P1.w=asfloat(TriB)（a!=b，各归一次）；
+//   共面单归属段两个 .w 都是 owner（a==b，只归一次）——与 CPU 侧塞两侧的规则一致。
+// =============================================================================
+#define MB_SCAN_BLOCK 512
+
+Buffer<float4> GCutP0;      // 交线段起点，.w=asfloat(TriA)
+Buffer<float4> GCutP1;      // 交线段终点，.w=asfloat(TriB)
+Buffer<uint>   GCutTotal;   // [0]=有效交线段数
+uint GTriCap;               // 三角容量 N（owner 上界）
+uint GCutCap;               // 交线段容量（dispatch 上界）
+uint GScanCount;            // 前缀和列数（= N）
+uint GNumBlocks;            // 前缀和块数（= ceil(N/MB_SCAN_BLOCK)）
+
+RWBuffer<uint> RW_CutCount;   // per-tri 段计数（size N）
+Buffer<uint>   GCutCountSRV;  // 同一 buffer 的 SRV（ScanBlocks 读）
+RWBuffer<uint> RW_CutOffset;  // per-tri CSR 起点 = exclusive scan（size N；ScanBlocks/AddOffsets 写）
+Buffer<uint>   GCutOffsetSRV; // 同一 buffer 的 SRV（ScatterCuts 读）
+RWBuffer<uint> RW_BlockSums;  // 块总和 → 块 exclusive prefix（size NumBlocks）
+Buffer<uint>   GBlockSumsSRV; // 同一 buffer 的 SRV（AddOffsets 读）
+RWBuffer<uint> RW_ScanTotal;  // 段总归属数（size 1，暂只作调试）
+RWBuffer<uint> RW_CutFill;    // scatter 填充游标（size N）
+RWBuffer<uint> RW_CutCSR;     // 展开的 cut 序号（size 2*GCutCap）
+
+// 1) 计数：每段给它的 owner(s) +1。
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void CountCutsCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint c = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (c >= GCutCap || c >= GCutTotal[0]) return;
+	uint a = asuint(GCutP0[c].w);
+	uint b = asuint(GCutP1[c].w);
+	if (a < GTriCap) InterlockedAdd(RW_CutCount[a], 1u);
+	if (b < GTriCap && b != a) InterlockedAdd(RW_CutCount[b], 1u);
+}
+
+// 2a) 块内 exclusive 前缀和（Hillis–Steele），块总和写 RW_BlockSums。镜像 VoxelCavitySpan ScanBlocksCS。
+groupshared uint MBScanTemp[MB_SCAN_BLOCK];
+[numthreads(MB_SCAN_BLOCK, 1, 1)]
+void ScanBlocksCS(uint3 DTid : SV_DispatchThreadID, uint GI : SV_GroupIndex, uint3 GID : SV_GroupID)
+{
+	uint gi = DTid.x;
+	uint v = (gi < GScanCount) ? GCutCountSRV[gi] : 0u;
+	MBScanTemp[GI] = v;
+	GroupMemoryBarrierWithGroupSync();
+	[unroll] for (uint off = 1u; off < MB_SCAN_BLOCK; off <<= 1u)
+	{
+		uint add = (GI >= off) ? MBScanTemp[GI - off] : 0u;
+		GroupMemoryBarrierWithGroupSync();
+		MBScanTemp[GI] += add;
+		GroupMemoryBarrierWithGroupSync();
+	}
+	uint excl = MBScanTemp[GI] - v;
+	if (gi < GScanCount) RW_CutOffset[gi] = excl;
+	if (GI == MB_SCAN_BLOCK - 1u) RW_BlockSums[GID.x] = MBScanTemp[GI];
+}
+
+// 2b) 块总和的 exclusive 前缀和（单组）。镜像 ScanBlockSumsCS。要求 NumBlocks <= MB_SCAN_BLOCK。
+groupshared uint MBBlockTemp[MB_SCAN_BLOCK];
+[numthreads(MB_SCAN_BLOCK, 1, 1)]
+void ScanBlockSumsCS(uint GI : SV_GroupIndex)
+{
+	uint v = (GI < GNumBlocks) ? RW_BlockSums[GI] : 0u;
+	MBBlockTemp[GI] = v;
+	GroupMemoryBarrierWithGroupSync();
+	[unroll] for (uint off = 1u; off < MB_SCAN_BLOCK; off <<= 1u)
+	{
+		uint add = (GI >= off) ? MBBlockTemp[GI - off] : 0u;
+		GroupMemoryBarrierWithGroupSync();
+		MBBlockTemp[GI] += add;
+		GroupMemoryBarrierWithGroupSync();
+	}
+	uint excl = MBBlockTemp[GI] - v;
+	if (GI < GNumBlocks) RW_BlockSums[GI] = excl;
+	if (GNumBlocks > 0u && GI == GNumBlocks - 1u) RW_ScanTotal[0] = MBBlockTemp[GI];
+}
+
+// 2c) 把块 offset 加回各列 exclusive prefix。镜像 AddOffsetsCS。
+[numthreads(MB_SCAN_BLOCK, 1, 1)]
+void AddOffsetsCS(uint3 DTid : SV_DispatchThreadID, uint3 GID : SV_GroupID)
+{
+	uint gi = DTid.x;
+	if (gi >= GScanCount) return;
+	RW_CutOffset[gi] += GBlockSumsSRV[GID.x];
+}
+
+// 3) 散列：每段按 owner 原子占位，写入 CSR 区间 [CutOffset[owner], +CutCount[owner])。
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void ScatterCutsCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint c = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (c >= GCutCap || c >= GCutTotal[0]) return;
+	uint a = asuint(GCutP0[c].w);
+	uint b = asuint(GCutP1[c].w);
+	if (a < GTriCap)
+	{
+		uint slot; InterlockedAdd(RW_CutFill[a], 1u, slot);
+		RW_CutCSR[GCutOffsetSRV[a] + slot] = c;
+	}
+	if (b < GTriCap && b != a)
+	{
+		uint slot; InterlockedAdd(RW_CutFill[b], 1u, slot);
+		RW_CutCSR[GCutOffsetSRV[b] + slot] = c;
+	}
+}
+
+// =============================================================================
+// N 段 BSP-by-cut-line 重三角化的共享输入与最终 emit。
+// =============================================================================
+Buffer<float4> GBSPSoup;       // 上传的源 soup（3 float4/三角，.xyz）
+Buffer<uint>   GCutCSRSRV;     // CSR 展开 cut 序号（RW_CutCSR 的 SRV）
+float3 GSnapOrigin;            // snap 平移帧原点（= QueryBox.Min）
+float  GSnapQuantum;           // snap 量化步长（>0）
+uint   GBSPTriBase;            // 当前分块的源三角起始序号
+uint   GBSPTriCount;           // 当前分块的源三角数
+uint   GOutCap;                // 子三角输出容量
+RWStructuredBuffer<float3> RW_OutSoup; // 子三角 soup（3 float3/子三角）
+RWBuffer<uint>   RW_OutSource; // 每子三角的源三角序号
+RWBuffer<uint>   RW_OutCounter;// [0]=子三角数 [1]=溢出
+RWBuffer<uint>   RW_BSPStats;  // BSP01: [0]=多段直通 [1]=退化；BSPN 使用下方 MB_BSP_STAT_* 布局
+
+// Stage B classification policy. Consumed by the standalone classify/rescue kernels
+// below, never by the BSP kernel: keeping winding and ray work out of the per-source
+// BSP thread is what stops one heavily-cut triangle from stalling its whole group.
+uint  GBooleanDebugColor;
+float GBooleanWindingSampleOffset;
+float GBooleanWindingThreshold;
+float GBooleanExpansionDistance;
+
+// OutSource encoding. The low bits carry the source triangle; the high bits carry the
+// classification produced after emit. 29 bits covers 536M source triangles, far above
+// the 8M pipeline ceiling.
+#define MB_SRC_MASK      0x1fffffffu
+#define MB_SRC_AMBIGUOUS 0x20000000u
+#define MB_SRC_INTERIOR  0x40000000u
+#define MB_SRC_KEEP      0x80000000u
+
+float3 BSPSnap(float3 p) { return round((p - GSnapOrigin) / GSnapQuantum) * GSnapQuantum + GSnapOrigin; }
+float2 BSPTo2(float3 P, float3 Org, float3 Uax, float3 Vax) { float3 d = P - Org; return float2(dot(d, Uax), dot(d, Vax)); }
+float3 BSPTo3(float2 p, float3 Org, float3 Uax, float3 Vax) { return Org + p.x * Uax + p.y * Vax; }
+
+// Stage A emit only. Every fragment is written unclassified; ClassifyFragmentsCS and
+// RayRescueCS decide what survives. Winding and ray queries used to run here, which made
+// a single heavily-cut source triangle serialize its entire 64-thread group.
+void BSPEmit(uint tri, float3 p0, float3 p1, float3 p2)
+{
+	uint encodedSource = tri;
+
+	uint slot; InterlockedAdd(RW_OutCounter[0], 1u, slot);
+	if (slot < GOutCap)
+	{
+		RW_OutSoup[slot * 3u + 0u] = p0;
+		RW_OutSoup[slot * 3u + 1u] = p1;
+		RW_OutSoup[slot * 3u + 2u] = p2;
+		RW_OutSource[slot] = encodedSource;
+	}
+	else { InterlockedAdd(RW_OutCounter[1], 1u); }
+}
+
+// =============================================================================
+// RetriangulateBSPNCS（Milestone 3）：逐源三角 **N 段** BSP-by-cut-line 重三角化。
+//   分块复用 scratch 存凸胞：当前批次每源三角一片 [64 胞 × 16 顶点]。每段切线把每个现有凸胞
+//   一刀两分（Sutherland–Hodgman），全切完后逐胞 fan 三角化 emit。面积守恒不变量与 M2 相同
+//   （一刀两分天然 partition 凸胞）。任何单三角上限将被突破时保留 split 前完整 cell partition，停止后续 cut，
+//   并记录唯一 source triangle 的 LimitedReason；不会 clamp polygon 或提交半个 split。
+//   一线程一源三角，独占自己那片 scratch（无跨线程竞争）；批次间清零 counter，output/stats 持续累计。
+// =============================================================================
+#define MB_BSP_MAXCUTS 64
+#define MB_BSP_MAXVERTS 16
+#define MB_BSP_MAXCELLS 64
+#define MB_BSP_MAXOUTPUT 64u
+#define MB_BSP_STAT_LIMITED_TRIANGLES 0u
+#define MB_BSP_STAT_DEGENERATE 1u
+#define MB_BSP_STAT_CUT_LIMIT 2u
+#define MB_BSP_STAT_VERT_LIMIT 3u
+#define MB_BSP_STAT_CELL_LIMIT 4u
+#define MB_BSP_STAT_OUTPUT_LIMIT 5u
+#define MB_BSP_STAT_MAX_SEGMENTS 6u
+#define MB_BSP_STAT_MAX_VERTICES 7u
+#define MB_BSP_STAT_MAX_CELLS 8u
+#define MB_BSP_STAT_SCRATCH_OVERFLOW 9u
+#define MB_BSP_STAT_PARTIAL_SPLIT_COMMIT 10u
+#define MB_BSP_STAT_MAX_OUTPUT_PER_SOURCE 11u
+#define MB_BSP_STAT_AREA_MISMATCH 12u
+#define MB_BSP_LIMIT_CUT 1u
+#define MB_BSP_LIMIT_VERT 2u
+#define MB_BSP_LIMIT_CELL 4u
+#define MB_BSP_LIMIT_OUTPUT 8u
+
+RWStructuredBuffer<float2> RW_CellVerts;  // scratch：每 scratch 槽 64*16 个 float2
+RWBuffer<uint>   RW_CellVN;     // scratch：每 scratch 槽 64 个 uint（每胞当前顶点数）
+RWBuffer<uint>   RW_ScratchCounter; // 当前批次 bump-alloc 槽计数；只 cut-bearing 三角占槽，批次间清零
+RWBuffer<uint>   RW_LimitedReasons; // 每源三角的 MB_BSP_LIMIT_* bit mask
+
+bool BSPLexLess3(float3 lhs, float3 rhs)
+{
+	if (lhs.x != rhs.x) return lhs.x < rhs.x;
+	if (lhs.y != rhs.y) return lhs.y < rhs.y;
+	return lhs.z < rhs.z;
+}
+
+void BSPCanonicalCut(uint cutIndex, out float3 lo, out float3 hi)
+{
+	float3 p = GCutP0[cutIndex].xyz;
+	float3 q = GCutP1[cutIndex].xyz;
+	if (BSPLexLess3(q, p)) { lo = q; hi = p; }
+	else { lo = p; hi = q; }
+}
+
+uint BSPCutOtherOwner(uint cutIndex, uint tri)
+{
+	uint a = asuint(GCutP0[cutIndex].w);
+	uint b = asuint(GCutP1[cutIndex].w);
+	if (a == tri && b != tri) return b;
+	if (b == tri && a != tri) return a;
+	return min(a, b);
+}
+
+bool BSPCutLess(uint lhs, uint rhs, uint tri)
+{
+	uint lhsOther = BSPCutOtherOwner(lhs, tri);
+	uint rhsOther = BSPCutOtherOwner(rhs, tri);
+	if (lhsOther != rhsOther) return lhsOther < rhsOther;
+	float3 lhsLo, lhsHi, rhsLo, rhsHi;
+	BSPCanonicalCut(lhs, lhsLo, lhsHi);
+	BSPCanonicalCut(rhs, rhsLo, rhsHi);
+	if (any(lhsLo != rhsLo)) return BSPLexLess3(lhsLo, rhsLo);
+	if (any(lhsHi != rhsHi)) return BSPLexLess3(lhsHi, rhsHi);
+	return false;
+}
+
+float BSPCross2(float2 a, float2 b) { return a.x * b.y - a.y * b.x; }
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void RetriangulateBSPNCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint localTri = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (localTri >= GBSPTriCount) return;
+	uint tri = GBSPTriBase + localTri;
+	if (tri >= GTriCap) return;
+
+	float3 A = GBSPSoup[tri * 3u + 0u].xyz;
+	float3 B = GBSPSoup[tri * 3u + 1u].xyz;
+	float3 C = GBSPSoup[tri * 3u + 2u].xyz;
+	float3 Nv = cross(B - A, C - A);
+	float lenN = length(Nv);
+	if (lenN < 1e-9f) { InterlockedAdd(RW_BSPStats[MB_BSP_STAT_DEGENERATE], 1u); return; } // 退化源三角
+	float3 n = Nv / lenN;
+	float3 up = (abs(n.z) < 0.9f) ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+	float3 Uax = normalize(cross(up, n));
+	float3 Vax = cross(n, Uax);
+	float2 a2 = BSPTo2(A, A, Uax, Vax);
+	float2 b2 = BSPTo2(B, A, Uax, Vax);
+	float2 c2 = BSPTo2(C, A, Uax, Vax);
+
+	uint segCount = GCutCountSRV[tri];
+	if (segCount == 0u) { InterlockedMax(RW_BSPStats[MB_BSP_STAT_MAX_OUTPUT_PER_SOURCE], 1u); BSPEmit(tri, A, B, C); return; }   // 直通
+	InterlockedMax(RW_BSPStats[MB_BSP_STAT_MAX_SEGMENTS], segCount);
+
+	// bump-alloc 一个 scratch 槽（只 cut-bearing 三角需要占槽）；超预算则直通（面积仍守恒），计数进 stats。
+	uint sslot;
+	InterlockedAdd(RW_ScratchCounter[0], 1u, sslot);
+	if (sslot >= GBSPTriCount) { BSPEmit(tri, A, B, C); InterlockedAdd(RW_BSPStats[MB_BSP_STAT_SCRATCH_OVERFLOW], 1u); return; }
+	uint vbase = sslot * MB_BSP_MAXCELLS * MB_BSP_MAXVERTS;
+	uint cbase = sslot * MB_BSP_MAXCELLS;
+	// cell 0 = 源三角投影
+	RW_CellVerts[vbase + 0u] = a2;
+	RW_CellVerts[vbase + 1u] = b2;
+	RW_CellVerts[vbase + 2u] = c2;
+	RW_CellVN[cbase + 0u] = 3u;
+	uint nCells = 1u;
+	uint outputTriangleCount = 1u;
+	uint maxRequiredVerts = 3u;
+	uint maxRequiredCells = 1u;
+	uint limitedReason = 0u;
+
+	uint segBase = GCutOffsetSRV[tri];
+	uint selectedCuts[MB_BSP_MAXCUTS];
+	uint nUse = 0u;
+	// CSR scatter 使用原子占位，物理顺序不稳定；按 other-owner + canonical endpoints 选出确定性的前 64 条。
+	for (uint sourceCut = 0u; sourceCut < segCount; ++sourceCut)
+	{
+		uint candidate = GCutCSRSRV[segBase + sourceCut];
+		uint insertAt = nUse;
+		if (nUse < MB_BSP_MAXCUTS) nUse++;
+		else
+		{
+			if (!BSPCutLess(candidate, selectedCuts[MB_BSP_MAXCUTS - 1], tri)) continue;
+			insertAt = MB_BSP_MAXCUTS - 1;
+		}
+		while (insertAt > 0u && BSPCutLess(candidate, selectedCuts[insertAt - 1u], tri))
+		{
+			selectedCuts[insertAt] = selectedCuts[insertAt - 1u];
+			insertAt--;
+		}
+		selectedCuts[insertAt] = candidate;
+	}
+	if (segCount > MB_BSP_MAXCUTS) limitedReason |= MB_BSP_LIMIT_CUT;
+
+	bool stopCuts = false;
+	for (uint s = 0u; s < nUse && !stopCuts; ++s)
+	{
+		uint c = selectedCuts[s];
+		float2 P2 = BSPTo2(BSPSnap(GCutP0[c].xyz), A, Uax, Vax);
+		float2 Q2 = BSPTo2(BSPSnap(GCutP1[c].xyz), A, Uax, Vax);
+		float2 dir = Q2 - P2; float dl = length(dir);
+		if (dl < 1e-7f) continue;
+		float2 nrm = float2(-dir.y, dir.x) / dl; float off = dot(nrm, P2);
+
+		uint baseCells = nCells;   // 定格：本段只切已存在的胞，不切本段新生的
+		for (uint k = 0u; k < baseCells; ++k)
+		{
+			uint kvn = RW_CellVN[cbase + k];
+			if (kvn < 3u) continue;
+			if (kvn > MB_BSP_MAXVERTS) { limitedReason |= MB_BSP_LIMIT_VERT; maxRequiredVerts = max(maxRequiredVerts, kvn); stopCuts = true; break; }
+			float2 cell[MB_BSP_MAXVERTS];
+			float sd[MB_BSP_MAXVERTS];
+			uint kb = vbase + k * MB_BSP_MAXVERTS;
+			bool hasPos = false, hasNeg = false;
+			for (uint i = 0u; i < kvn; ++i)
+			{
+				cell[i] = RW_CellVerts[kb + i];
+				sd[i] = dot(nrm, cell[i]) - off;
+				if (sd[i] >= 0.0f) hasPos = true; else hasNeg = true;
+			}
+			if (!(hasPos && hasNeg)) continue;   // 切线不穿过该胞 → 保持不变（面积不动）
+			// 一刀两分：>=0 归左，<0 归右，符号变处插入交点到两侧
+			float2 Lp[MB_BSP_MAXVERTS + 2]; uint ln = 0u;
+			float2 Rp[MB_BSP_MAXVERTS + 2]; uint rn = 0u;
+			for (uint i = 0u; i < kvn; ++i)
+			{
+				uint j = (i + 1u < kvn) ? (i + 1u) : 0u;
+				if (sd[i] >= 0.0f) Lp[ln++] = cell[i];
+				else Rp[rn++] = cell[i];
+				if ((sd[i] < 0.0f) != (sd[j] < 0.0f))
+				{
+					float t = sd[i] / (sd[i] - sd[j]);
+					float2 X = lerp(cell[i], cell[j], t);
+					Lp[ln++] = X;
+					Rp[rn++] = X;
+				}
+			}
+			maxRequiredVerts = max(maxRequiredVerts, max(ln, rn));
+			if (ln < 3u || rn < 3u) continue;   // 退化分割（切线擦顶点）→ 不变
+			uint preSplitCells = nCells;
+			uint preSplitOutput = outputTriangleCount;
+			uint predictedCells = preSplitCells + 1u;
+			uint predictedOutput = preSplitOutput - (kvn - 2u) + (ln - 2u) + (rn - 2u);
+			maxRequiredCells = max(maxRequiredCells, predictedCells);
+			uint splitLimitReason = 0u;
+			if (ln > MB_BSP_MAXVERTS || rn > MB_BSP_MAXVERTS) splitLimitReason |= MB_BSP_LIMIT_VERT;
+			if (predictedCells > MB_BSP_MAXCELLS) splitLimitReason |= MB_BSP_LIMIT_CELL;
+			if (predictedOutput > MB_BSP_MAXOUTPUT) splitLimitReason |= MB_BSP_LIMIT_OUTPUT;
+			if (splitLimitReason != 0u)
+			{
+				limitedReason |= splitLimitReason;
+				if (nCells != preSplitCells || outputTriangleCount != preSplitOutput)
+					InterlockedAdd(RW_BSPStats[MB_BSP_STAT_PARTIAL_SPLIT_COMMIT], 1u);
+				stopCuts = true;
+				break;
+			}
+			// Transaction commit: both child polygons and every capacity check are complete before the first scratch write.
+			for (uint i = 0u; i < ln; ++i) RW_CellVerts[kb + i] = Lp[i];
+			RW_CellVN[cbase + k] = ln;
+			uint nb = vbase + nCells * MB_BSP_MAXVERTS;
+			for (uint i = 0u; i < rn; ++i) RW_CellVerts[nb + i] = Rp[i];
+			RW_CellVN[cbase + nCells] = rn;
+			nCells = predictedCells;
+			outputTriangleCount = predictedOutput;
+		}
+	}
+	InterlockedMax(RW_BSPStats[MB_BSP_STAT_MAX_VERTICES], maxRequiredVerts);
+	InterlockedMax(RW_BSPStats[MB_BSP_STAT_MAX_CELLS], maxRequiredCells);
+	InterlockedMax(RW_BSPStats[MB_BSP_STAT_MAX_OUTPUT_PER_SOURCE], outputTriangleCount);
+	RW_LimitedReasons[tri] = limitedReason;
+	if (limitedReason != 0u)
+	{
+		InterlockedAdd(RW_BSPStats[MB_BSP_STAT_LIMITED_TRIANGLES], 1u);
+		if ((limitedReason & MB_BSP_LIMIT_CUT) != 0u) InterlockedAdd(RW_BSPStats[MB_BSP_STAT_CUT_LIMIT], 1u);
+		if ((limitedReason & MB_BSP_LIMIT_VERT) != 0u) InterlockedAdd(RW_BSPStats[MB_BSP_STAT_VERT_LIMIT], 1u);
+		if ((limitedReason & MB_BSP_LIMIT_CELL) != 0u) InterlockedAdd(RW_BSPStats[MB_BSP_STAT_CELL_LIMIT], 1u);
+		if ((limitedReason & MB_BSP_LIMIT_OUTPUT) != 0u) InterlockedAdd(RW_BSPStats[MB_BSP_STAT_OUTPUT_LIMIT], 1u);
+	}
+
+	float partitionArea2 = 0.0f;
+	for (uint k = 0u; k < nCells; ++k)
+	{
+		uint vn = RW_CellVN[cbase + k];
+		uint kb = vbase + k * MB_BSP_MAXVERTS;
+		float cellArea2 = 0.0f;
+		for (uint i = 0u; i < vn; ++i)
+			cellArea2 += BSPCross2(RW_CellVerts[kb + i], RW_CellVerts[kb + ((i + 1u < vn) ? i + 1u : 0u)]);
+		partitionArea2 += abs(cellArea2);
+	}
+	float sourceArea2 = abs(BSPCross2(b2 - a2, c2 - a2));
+	float areaTolerance2 = max(sourceArea2 * 1e-4f, GSnapQuantum * GSnapQuantum * 8.0f);
+	if (abs(partitionArea2 - sourceArea2) > areaTolerance2) InterlockedAdd(RW_BSPStats[MB_BSP_STAT_AREA_MISMATCH], 1u);
+
+	// 逐胞 fan 三角化 emit
+	for (uint k = 0u; k < nCells; ++k)
+	{
+		uint vn = RW_CellVN[cbase + k];
+		if (vn < 3u) continue;
+		uint kb = vbase + k * MB_BSP_MAXVERTS;
+		float3 v0 = BSPTo3(RW_CellVerts[kb + 0u], A, Uax, Vax);
+		for (uint f = 1u; f + 1u < vn; ++f)
+		{
+			float3 vf = BSPTo3(RW_CellVerts[kb + f], A, Uax, Vax);
+			float3 vf1 = BSPTo3(RW_CellVerts[kb + f + 1u], A, Uax, Vax);
+			BSPEmit(tri, v0, vf, vf1);
+		}
+	}
+}
+
+// =============================================================================
+// Stage B —— 独立分类 pass（原先融合在 RetriangulateBSPNCS 内）。
+//
+// 融合版的问题：winding/射线查询按【源三角】分配线程，一个被切成 64 片的源三角要在
+// 单线程里串行做上千次树遍历，而同组的直通三角只做 2 次——组内负载差约 2000 倍，再乘
+// 66 个串行批次，单次 dispatch 长达数十秒并触发 TDR。
+//
+// 拆分后按【fragment】分配线程、全宽 indirect dispatch，负载天然均衡；只有 winding
+// 判不出来的少数 fragment 被 compaction 收集进列表，再单独发射线，避免整 warp 陪跑。
+// =============================================================================
+StructuredBuffer<float3> MBFragmentSoup;      // RW_OutSoup 的 SRV
+Buffer<uint>   MBFragmentCounter;             // RW_OutCounter 的 SRV
+RWBuffer<uint> RW_MBFragmentSource;           // RW_OutSource 的 UAV：低位源序号 + 高位分类
+RWBuffer<uint> RW_MBAmbiguousList;            // 待救回 fragment 序号
+RWBuffer<uint> RW_MBAmbiguousCounter;         // [0]=数量 [1]=溢出
+Buffer<uint>   MBAmbiguousCounterSRV;
+Buffer<uint>   MBAmbiguousListSRV;
+RWBuffer<uint> RW_MBIndirectArgs;
+uint MBFragmentCapacity;
+uint MBAmbiguousCapacity;
+
+// fragment 的源朝向法线与质心。分类采样必须沿源三角朝向的那一侧，与源 winding 一致。
+void MBFragmentFrame(uint f, uint tri, out float3 p0, out float3 p1, out float3 p2,
+	out float3 outNormal, out float3 outCenter, out bool bValid)
+{
+	p0 = MBFragmentSoup[f * 3u + 0u];
+	p1 = MBFragmentSoup[f * 3u + 1u];
+	p2 = MBFragmentSoup[f * 3u + 2u];
+	outCenter = (p0 + p1 + p2) * (1.0f / 3.0f);
+	outNormal = float3(0.0f, 0.0f, 1.0f);
+	bValid = false;
+
+	float3 fragmentNormal = cross(p1 - p0, p2 - p0);
+	float normalLength = length(fragmentNormal);
+	if (normalLength < 1e-12f) return;
+	fragmentNormal /= normalLength;
+
+	float3 sourceP0 = GBSPSoup[tri * 3u + 0u].xyz;
+	float3 sourceP1 = GBSPSoup[tri * 3u + 1u].xyz;
+	float3 sourceP2 = GBSPSoup[tri * 3u + 2u].xyz;
+	float3 sourceNormal = cross(sourceP1 - sourceP0, sourceP2 - sourceP0);
+	if (dot(fragmentNormal, sourceNormal) < 0.0f)
+	{
+		fragmentNormal = -fragmentNormal;
+		float3 swapPosition = p1;
+		p1 = p2;
+		p2 = swapPosition;
+	}
+	outNormal = fragmentNormal;
+	bValid = true;
+}
+
+// 每 fragment 一线程：双侧 winding 定 keep/interior；判不出来的进 compaction 列表。
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void ClassifyFragmentsCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint f = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	uint fragmentCount = min(MBFragmentCounter[0], MBFragmentCapacity);
+	if (f >= fragmentCount) return;
+
+	uint encoded = RW_MBFragmentSource[f];
+	uint tri = encoded & MB_SRC_MASK;
+	if (tri >= GTriCap) return;   // 无效源：保持未 keep，CPU 侧一并丢弃
+
+	float3 p0, p1, p2, fragmentNormal, fragmentCenter;
+	bool bValid;
+	MBFragmentFrame(f, tri, p0, p1, p2, fragmentNormal, fragmentCenter, bValid);
+	if (!bValid) return;          // 退化 fragment：等价于融合版的 early return
+
+	float sampleOffset = max(GBooleanWindingSampleOffset, 0.001f);
+	bool inPos = abs(EvaluateFastWindingAt(fragmentCenter + fragmentNormal * sampleOffset)) >= GBooleanWindingThreshold;
+	bool inNeg = abs(EvaluateFastWindingAt(fragmentCenter - fragmentNormal * sampleOffset)) >= GBooleanWindingThreshold;
+	bool keep = inPos != inNeg;
+	bool interior = inPos && inNeg;
+
+	uint flags = 0u;
+	if (interior) flags |= MB_SRC_INTERIOR;
+	if (keep) flags |= MB_SRC_KEEP;
+	else
+	{
+		// 融合版：!keep && !interior 走射线救回；!keep 且开了 expansion 再做扩距复查。
+		// 两者都在 rescue pass 里做，故此处的入列条件与之完全等价。
+		bool bNeedsRescue = !interior || GBooleanExpansionDistance > 0.0f;
+		if (bNeedsRescue)
+		{
+			uint slot;
+			InterlockedAdd(RW_MBAmbiguousCounter[0], 1u, slot);
+			if (slot < MBAmbiguousCapacity)
+			{
+				RW_MBAmbiguousList[slot] = f;
+				flags |= MB_SRC_AMBIGUOUS;
+			}
+			else
+			{
+				// 列表满：这条 fragment 拿不到射线救回的机会。保守判 keep——多留一片面
+				// 只是冗余几何，漏掉一片可见面却会在外壳上留洞。计数供 CPU 上报。
+				InterlockedAdd(RW_MBAmbiguousCounter[1], 1u);
+				flags |= MB_SRC_KEEP;
+			}
+		}
+	}
+	RW_MBFragmentSource[f] = tri | flags;
+}
+
+// 只对 compaction 列表里的 fragment 发射线：整个 warp 都是重活，无陪跑线程。
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void RayRescueCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint i = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	uint ambiguousCount = min(MBAmbiguousCounterSRV[0], MBAmbiguousCapacity);
+	if (i >= ambiguousCount) return;
+
+	uint f = MBAmbiguousListSRV[i];
+	if (f >= MBFragmentCapacity) return;
+	uint encoded = RW_MBFragmentSource[f];
+	uint tri = encoded & MB_SRC_MASK;
+	if (tri >= GTriCap) return;
+	bool interior = (encoded & MB_SRC_INTERIOR) != 0u;
+
+	float3 p0, p1, p2, fragmentNormal, fragmentCenter;
+	bool bValid;
+	MBFragmentFrame(f, tri, p0, p1, p2, fragmentNormal, fragmentCenter, bValid);
+	if (!bValid) return;
+
+	bool keep = false;
+	if (!interior) keep = EvaluateTriangleVisibility(p0, p1, p2, tri) != 0u;
+
+	if (!keep && GBooleanExpansionDistance > 0.0f)
+	{
+		float expandedOffset = max(GBooleanWindingSampleOffset, 0.001f) + GBooleanExpansionDistance;
+		bool expandedPos = abs(EvaluateFastWindingAt(fragmentCenter + fragmentNormal * expandedOffset)) >= GBooleanWindingThreshold;
+		bool expandedNeg = abs(EvaluateFastWindingAt(fragmentCenter - fragmentNormal * expandedOffset)) >= GBooleanWindingThreshold;
+		keep = expandedPos != expandedNeg;
+	}
+
+	if (keep) RW_MBFragmentSource[f] = encoded | MB_SRC_KEEP;
+}
+
+// indirect 参数：GetUnWrappedDispatchThreadId 用 ComputeShaderUtils.ush 固定的
+// WRAPPED_GROUP_STRIDE(128)，故 X 维必须按同一 stride 截断。
+void MBWriteIndirectArgs(uint threadCount)
+{
+	uint groupCount = (threadCount + THREADGROUPSIZE_X - 1u) / THREADGROUPSIZE_X;
+	uint groupCountX = min(groupCount, 128u);
+	RW_MBIndirectArgs[0] = groupCountX;
+	RW_MBIndirectArgs[1] = groupCountX > 0u ? (groupCount + groupCountX - 1u) / groupCountX : 1u;
+	RW_MBIndirectArgs[2] = 1u;
+}
+
+[numthreads(1, 1, 1)]
+void ClassifyIndirectArgsCS(uint3 DTid : SV_DispatchThreadID)
+{
+	MBWriteIndirectArgs(min(MBFragmentCounter[0], MBFragmentCapacity));
+}
+
+[numthreads(1, 1, 1)]
+void RescueIndirectArgsCS(uint3 DTid : SV_DispatchThreadID)
+{
+	MBWriteIndirectArgs(min(MBAmbiguousCounterSRV[0], MBAmbiguousCapacity));
+}

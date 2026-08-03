@@ -305,28 +305,3 @@ public:
 	
 };
 
-
-
-UCLASS()
-class COMPUTESHADERGENERATOR_API UComputeShaderMeshFillFunctions : public UBlueprintFunctionLibrary
-{
-	GENERATED_BODY()
-	// UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	// static void CSMeshFill(ACSGenerateCaptureScene* Capturer, UStaticMesh* StaticMesh, UTextureRenderTarget2D* DubugView, UTextureRenderTarget2D*
-	//                        Result, UTexture2D* TMeshDepth, float SpawnSize = 1, float TestSizeScale = 1, FName Tag = FName(TEXT("Auto")));
-
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	static void CSMeshFillMult(ACSGenerateCaptureScene* Capturer, UStaticMesh* StaticMesh, UTextureRenderTarget2D* DubugView, UTextureRenderTarget2D*
-	                           Result, UTextureRenderTarget2D* CurrentSceneDepth, UTexture2D* TMeshDepth, int32 Iteration = 100, float SpawnSize = 1, float
-	                           TestSizeScale = 1, FName Tag = FName(TEXT("Auto")));
-
-	
-	// UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	// static void CalculateMeshLoctionAndRotation(FCSGenerateParameter Params);
-
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	static void CalculateMeshLoctionAndRotationMult(FCSGenerateParameter Params, int32 NumIteraion);
-
-
-};
-

@@ -9,16 +9,25 @@
 #include "RenderGraphBuilder.h"
 #include "UDynamicMesh.h"
 #include "ComputeShaderDebugParams.h"
+#include "CSGpuTriangleUtilities.h"
 #include "ComputeShaderMeshGenerator.generated.h"
 
 class AActor;
 class ALandscape;
+class UCSDirectTriangleMeshComponent;
+class UCSMeshGeneratorDebugComponent;
 class UHierarchicalInstancedStaticMeshComponent;
+class UMaterialInterface;
 class UStaticMesh;
+class UStaticMeshComponent;
 
 class AComputeShaderMeshGenerator;
 
 DECLARE_MULTICAST_DELEGATE_OneParam(FCSInstanceBrushEditorRequest, AComputeShaderMeshGenerator*);
+
+// Triangle-soup 鏉愯川 id 鐨?鏃犳潗璐?鍝ㄥ叺鍊硷紙濡傚湴褰?CPU 涓夎褰級銆俿oup 鏉愯川 buffer 浼氶娓呮垚璇ュ€硷紝
+// GPU extract 鍙 static mesh 涓夎褰㈠啓鍏ョ湡瀹?registry id锛屽洜姝ゅ湴褰?鏈啓鍏ョ殑涓夎淇濇寔鏃犳潗璐ㄣ€?
+inline constexpr uint32 CS_NO_MATERIAL_ID = 0xFFFFFFFFu;
 
 // -----------------------------------------------------------------------------
 // Core Data
@@ -29,24 +38,24 @@ struct COMPUTESHADERGENERATOR_API FCSTriangleMeshData
 {
 	GENERATED_BODY()
 public:
-	// GPU readback 后的 compact vertex buffer。xyz 是顶点位置。
+	// GPU readback 鍚庣殑 compact vertex buffer銆倄yz 鏄《鐐逛綅缃€?
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	TArray<FVector> Vertices;
 
-	// 有效 vertex 数。小于 0 时使用 Vertices.Num()。
+	// 鏈夋晥 vertex 鏁般€傚皬浜?0 鏃朵娇鐢?Vertices.Num()銆?
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	int32 VertexCount = -1;
 
-	// 可选 index buffer。每 3 个 index 组成一个 triangle。
-	// 如果为空，则 Vertices 会按 triangle soup 解释：0/1/2, 3/4/5, ...
+	// 鍙€?index buffer銆傛瘡 3 涓?index 缁勬垚涓€涓?triangle銆?
+	// 濡傛灉涓虹┖锛屽垯 Vertices 浼氭寜 triangle soup 瑙ｉ噴锛?/1/2, 3/4/5, ...
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	TArray<int32> Indices;
 
-	// 有效 index 数。小于 0 时使用 Indices.Num()。
+	// 鏈夋晥 index 鏁般€傚皬浜?0 鏃朵娇鐢?Indices.Num()銆?
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	int32 IndexCount = -1;
 
-	// 可选 vertex normal。若 bRecomputeNormals 为 true，下游 DynamicMesh 可忽略它并重算法线。
+	// 鍙€?vertex normal銆傝嫢 bRecomputeNormals 涓?true锛屼笅娓?DynamicMesh 鍙拷鐣ュ畠骞堕噸绠楁硶绾裤€?
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	TArray<FVector> VertexNormals;
 };
@@ -65,13 +74,22 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	FTransform LocalToWorld = FTransform::Identity;
 
-	// 可选包围盒。有效时作为粗筛；无效时不按 Bounds 筛选。
+	// 鍙€夊寘鍥寸洅銆傛湁鏁堟椂浣滀负绮楃瓫锛涙棤鏁堟椂涓嶆寜 Bounds 绛涢€夈€?
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	FBox WorldBounds = FBox(ForceInit);
 
-	// 生成 Request 的来源 Actor。用于在 RDG 三角形提取阶段排除自身或指定 Tag 的 Actor。
+	// 鐢熸垚 Request 鐨勬潵婧?Actor銆傜敤浜庡湪 RDG 涓夎褰㈡彁鍙栭樁娈垫帓闄よ嚜韬垨鎸囧畾 Tag 鐨?Actor銆?
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	AActor* SourceActor = nullptr;
+
+	// Optional originating component. Used to preserve component-instance painted vertex colors.
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "CS Mesh")
+	TObjectPtr<UStaticMeshComponent> SourceComponent = nullptr;
+
+	// 鏉ユ簮 component 鐨勬潗璐ㄦЫ锛坥verride-aware锛屾潵鑷?Component->GetMaterial(i)锛夈€?
+	// FStaticMeshSection.MaterialIndex 绱㈠紩杩涙湰鏁扮粍锛岀敤浜庢妸姣忎釜涓夎褰㈡槧灏勫洖鍏舵簮鏉愯川銆?
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
+	TArray<TObjectPtr<UMaterialInterface>> MaterialSlots;
 };
 
 USTRUCT(BlueprintType, meta = (DisplayName = "CS Surface Voxel Data"))
@@ -79,39 +97,39 @@ struct COMPUTESHADERGENERATOR_API FCSSurfaceVoxelData
 {
 	GENERATED_BODY()
 public:
-	// GPU 生成的 surface voxel 中心点。每个 voxel 只表示一个表面面片，不生成封闭 cube。
+	// GPU 鐢熸垚鐨?surface voxel 涓績鐐广€傛瘡涓?voxel 鍙〃绀轰竴涓〃闈㈤潰鐗囷紝涓嶇敓鎴愬皝闂?cube銆?
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	TArray<FVector> Positions;
 
-	// 与 Positions 一一对应的表面法线；用于后续生成开放 mesh 的面朝向。
+	// 涓?Positions 涓€涓€瀵瑰簲鐨勮〃闈㈡硶绾匡紱鐢ㄤ簬鍚庣画鐢熸垚寮€鏀?mesh 鐨勯潰鏈濆悜銆?
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	TArray<FVector> Normals;
 
-	// 有效 voxel 数。小于 0 时使用 Positions.Num()。
+	// 鏈夋晥 voxel 鏁般€傚皬浜?0 鏃朵娇鐢?Positions.Num()銆?
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	int32 VoxelCount = -1;
 
-	// 生成 voxel 时使用的 cell size，后续转 mesh 时可作为默认面片大小。
+	// 鐢熸垚 voxel 鏃朵娇鐢ㄧ殑 cell size锛屽悗缁浆 mesh 鏃跺彲浣滀负榛樿闈㈢墖澶у皬銆?
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	float VoxelSize = 0.0f;
 
-	// 体素整数网格坐标，与 Positions 一一对应（-1 索引为无效）。
+	// 浣撶礌鏁存暟缃戞牸鍧愭爣锛屼笌 Positions 涓€涓€瀵瑰簲锛?1 绱㈠紩涓烘棤鏁堬級銆?
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	TArray<FIntVector> Cells;
 
-	// 面积加权质心（target position），与 Positions 一一对应。用于更精确的表面匹配。
+	// 闈㈢Н鍔犳潈璐ㄥ績锛坱arget position锛夛紝涓?Positions 涓€涓€瀵瑰簲銆傜敤浜庢洿绮剧‘鐨勮〃闈㈠尮閰嶃€?
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	TArray<FVector> TargetPositions;
 
-	// 体素网格的世界空间原点（与 Cells 坐标系对应）。
-	// Cell (cx, cy, cz) 的世界空间中心 = VoxelOrigin + (Cell + 0.5) * VoxelSize。
+	// 浣撶礌缃戞牸鐨勪笘鐣岀┖闂村師鐐癸紙涓?Cells 鍧愭爣绯诲搴旓級銆?
+	// Cell (cx, cy, cz) 鐨勪笘鐣岀┖闂翠腑蹇?= VoxelOrigin + (Cell + 0.5) * VoxelSize銆?
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh")
 	FVector VoxelOrigin = FVector::ZeroVector;
 };
 
-// game-thread 预备好的盒内场景三角形数据：static mesh 已 resolve 出渲染资源引用，
-// landscape 已在 game thread 完成 CPU 提取。可安全捕获进 render 线程 lambda，再交给
-// AddPreparedBoxSceneTrianglesToRDG 消费。内部用 PImpl 隐藏 .cpp-only 的 resolved 类型。
+// game-thread 棰勫濂界殑鐩掑唴鍦烘櫙涓夎褰㈡暟鎹細static mesh 宸?resolve 鍑烘覆鏌撹祫婧愬紩鐢紝
+// landscape 宸插湪 game thread 瀹屾垚 CPU 鎻愬彇銆傚彲瀹夊叏鎹曡幏杩?render 绾跨▼ lambda锛屽啀浜ょ粰
+// AddPreparedBoxSceneTrianglesToRDG 娑堣垂銆傚唴閮ㄧ敤 PImpl 闅愯棌 .cpp-only 鐨?resolved 绫诲瀷銆?
 struct FCSBoxScenePreparedDataImpl;
 
 struct COMPUTESHADERGENERATOR_API FCSBoxScenePreparedData
@@ -120,50 +138,78 @@ struct COMPUTESHADERGENERATOR_API FCSBoxScenePreparedData
 
 	bool IsValid() const { return Impl.IsValid(); }
 	bool HasAnyTriangles() const;
+
+	// 鍘婚噸鍚庣殑鏉愯川琛細soup 鏉愯川 buffer 閲岀殑 id 绱㈠紩杩涙湰琛ㄣ€侰S_NO_MATERIAL_ID 琛ㄧず鏃犳潗璐紙濡傚湴褰級銆?
+	int32 GetMaterialRegistryNum() const;
+	UMaterialInterface* GetMaterialByRegistryIndex(int32 Index) const;
 };
 
 struct COMPUTESHADERGENERATOR_API FCSStaticMeshTriangleRDGOutput
 {
-	// Triangle soup: 每个 triangle 占 3 个 float4 vertex，vertex.w = 1。
+	// Triangle soup: 姣忎釜 triangle 鍗?3 涓?float4 vertex锛寁ertex.w = 1銆?
 	FRDGBufferRef TriangleVertices = nullptr;
 	FRDGBufferUAVRef TriangleVerticesUAV = nullptr;
 	FRDGBufferSRVRef TriangleVerticesSRV = nullptr;
 
-	// 与 TriangleVertices 一一对应；每个 vertex 存 triangle normal，normal.w = 0。
+	// 涓?TriangleVertices 涓€涓€瀵瑰簲锛涙瘡涓?vertex 瀛?triangle normal锛宯ormal.w = 0銆?
 	FRDGBufferRef TriangleNormals = nullptr;
 	FRDGBufferUAVRef TriangleNormalsUAV = nullptr;
 	FRDGBufferSRVRef TriangleNormalsSRV = nullptr;
 
-	// Counter[0] = 实际写入的 triangle 数；有效 vertex 数 = Counter[0] * 3。
+	// Counter[0] = 瀹為檯鍐欏叆鐨?triangle 鏁帮紱鏈夋晥 vertex 鏁?= Counter[0] * 3銆?
 	FRDGBufferRef TriangleCounter = nullptr;
 	FRDGBufferUAVRef TriangleCounterUAV = nullptr;
 	FRDGBufferSRVRef TriangleCounterSRV = nullptr;
 
+	// 姣忎釜 triangle 涓€涓?uint 鏉愯川 id锛堜笌 TriangleVertices 骞宠锛屾寜 triangle 鑰岄潪 vertex 绱㈠紩锛夈€?
+	// 鍊间负 FCSBoxScenePreparedData 鏉愯川琛ㄤ笅鏍囷紱CS_NO_MATERIAL_ID 琛ㄧず鏃犳潗璐紙濡傚湴褰級銆?
+	// 鐢?GPU 鍦ㄤ笌椤剁偣鐩稿悓鐨?atomic slot 涓婂啓鍏ワ紝鏁?readback 鍚庡彲鎸?soup 涓夎搴忓彿鍙栧洖鏉愯川銆?
+	FRDGBufferRef TriangleMaterialIds = nullptr;
+	FRDGBufferUAVRef TriangleMaterialIdsUAV = nullptr;
+	FRDGBufferSRVRef TriangleMaterialIdsSRV = nullptr;
+
+	// 涓?TriangleVertices 涓€涓€瀵瑰簲锛堟寜 vertex 绱㈠紩锛? per triangle锛夛細姣忛《鐐?UV0锛坒loat2锛夈€?
+	// 鐢?GPU extract 鍦ㄤ笌椤剁偣鐩稿悓鐨?atomic slot 鍐欏叆锛涙棤 UV 鐨勬簮锛堝湴褰?鏈粦瀹氾級淇濇寔 (0,0)銆?
+	FRDGBufferRef TriangleUVs = nullptr;
+	FRDGBufferUAVRef TriangleUVsUAV = nullptr;
+	FRDGBufferSRVRef TriangleUVsSRV = nullptr;
+
+	// Per-corner source vertex attributes, parallel to TriangleVertices.
+	FRDGBufferRef TriangleColors = nullptr;
+	FRDGBufferUAVRef TriangleColorsUAV = nullptr;
+	FRDGBufferSRVRef TriangleColorsSRV = nullptr;
+	FRDGBufferRef TriangleTangents = nullptr;
+	FRDGBufferUAVRef TriangleTangentsUAV = nullptr;
+	FRDGBufferSRVRef TriangleTangentsSRV = nullptr;
+	FRDGBufferRef TriangleBiTangents = nullptr;
+	FRDGBufferUAVRef TriangleBiTangentsUAV = nullptr;
+	FRDGBufferSRVRef TriangleBiTangentsSRV = nullptr;
+
 	uint32 MaxTriangles = 0;
 	uint32 MaxVertices = 0;
 
-	// 保持外部 RHI SRV 引用直到 GraphBuilder.Execute()，避免 RDG pass 执行前被释放。
+	// 淇濇寔澶栭儴 RHI SRV 寮曠敤鐩村埌 GraphBuilder.Execute()锛岄伩鍏?RDG pass 鎵ц鍓嶈閲婃斁銆?
 	TArray<FShaderResourceViewRHIRef> ReferencedIndexBufferSRVs;
 };
 
 struct COMPUTESHADERGENERATOR_API FCSSurfaceVoxelRDGOutput
 {
-	// Surface voxel center，xyz 是 voxel 中心，w = 1。
+	// Surface voxel center锛寈yz 鏄?voxel 涓績锛寃 = 1銆?
 	FRDGBufferRef VoxelPositions = nullptr;
 	FRDGBufferUAVRef VoxelPositionsUAV = nullptr;
 	FRDGBufferSRVRef VoxelPositionsSRV = nullptr;
 
-	// Surface voxel normal，xyz 是法线，w = 0。
+	// Surface voxel normal锛寈yz 鏄硶绾匡紝w = 0銆?
 	FRDGBufferRef VoxelNormals = nullptr;
 	FRDGBufferUAVRef VoxelNormalsUAV = nullptr;
 	FRDGBufferSRVRef VoxelNormalsSRV = nullptr;
 
-	// Counter[0] = 实际写入的 voxel 数。
+	// Counter[0] = 瀹為檯鍐欏叆鐨?voxel 鏁般€?
 	FRDGBufferRef VoxelCounter = nullptr;
 	FRDGBufferUAVRef VoxelCounterUAV = nullptr;
 	FRDGBufferSRVRef VoxelCounterSRV = nullptr;
 
-	// GPU 端去重用 hash slots。
+	// GPU 绔幓閲嶇敤 hash slots銆?
 	FRDGBufferRef VoxelHashSlots = nullptr;
 	FRDGBufferUAVRef VoxelHashSlotsUAV = nullptr;
 
@@ -206,6 +252,34 @@ struct COMPUTESHADERGENERATOR_API FCSSurfaceVoxelRDGOutput
 	uint32 HashSlotCount = 0;
 	float VoxelSize = 0.0f;
 	FVector VoxelOrigin = FVector::ZeroVector;
+};
+
+// GPU-resident surface voxels retained across the game/render boundary. The surface
+// voxelizer (GetBoxSceneFilteredSurfaceVoxels) already builds these on the GPU as
+// pooled buffers; retaining them here lets a consumer register them directly
+// (RegisterExternalBuffer) instead of the readback -> repack -> re-upload round-trip.
+// Layout matches what the vine VVVoxel projection consumes: float4 positions/normals/
+// target-positions, int4 cells, uint hash slots. Counts/params come with them so no
+// per-consume readback is needed. IsValid() means the buffers are usable.
+struct COMPUTESHADERGENERATOR_API FCSSurfaceVoxelGPUBuffers
+{
+	TRefCountPtr<FRDGPooledBuffer> Positions;       // float4 (xyz center, w=1)
+	TRefCountPtr<FRDGPooledBuffer> Normals;         // float4 (xyz normal, w=0), blur-resolved
+	TRefCountPtr<FRDGPooledBuffer> TargetPositions; // float4 (xyz clipped centroid, w=1), blur-resolved
+	TRefCountPtr<FRDGPooledBuffer> Cells;           // int4 (grid xyz, w=0)
+	TRefCountPtr<FRDGPooledBuffer> Counter;         // uint2 ([0]=valid count, [1]=dropped count)
+	// Two-buffer cell hash (producer format, StaticMeshPointSampler.usf): HashSlots[slot] =
+	// HashCell(cell)+1 (key), HashIndices[slot] = voxelIndex+1. Probe (Hash+Probe*1103515245)%Count.
+	TRefCountPtr<FRDGPooledBuffer> HashSlots;        // uint keys
+	TRefCountPtr<FRDGPooledBuffer> HashIndices;      // uint voxelIndex+1 parallel to HashSlots
+	int32 VoxelCapacity = 0;
+	int32 VoxelCount = 0;
+	uint32 HashSlotCount = 0;
+	float VoxelSize = 0.0f;
+	FVector VoxelOrigin = FVector::ZeroVector;
+	FBox WorldBounds = FBox(ForceInit);
+	bool IsValid() const { return Positions.IsValid() && Normals.IsValid() && TargetPositions.IsValid() && Cells.IsValid() && Counter.IsValid() && VoxelCapacity > 0; }
+	void Reset() { *this = FCSSurfaceVoxelGPUBuffers(); }
 };
 
 // -----------------------------------------------------------------------------
@@ -400,6 +474,9 @@ public:
 	/** Creates the generator actor, scene root, bounds component, and DynamicMesh rendering defaults. */
 	AComputeShaderMeshGenerator(const FObjectInitializer& ObjectInitializer);
 
+	/** Delegating default constructor so subclasses can keep plain default constructors. */
+	AComputeShaderMeshGenerator();
+
 	/** Returns the DynamicMeshComponent owned by this actor. */
 	UDynamicMeshComponent* GetDynamicMeshComponent() const { return DynamicMeshComponent; }
 
@@ -415,6 +492,20 @@ public:
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator")
 	TObjectPtr<UBoxComponent> GeneratorBounds;
+
+	/** Draws GPU triangle soup submitted via SubmitBoxSceneTrianglesToRenderPipeline directly through
+	 *  the render pipeline (no readback, no DynamicMesh). Uses an absolute (world-origin) transform so
+	 *  the world-space triangle positions render 1:1. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator")
+	TObjectPtr<UCSDirectTriangleMeshComponent> DirectMeshComponent;
+
+	/** GPU-only visualization for surface voxels and cache cells. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Debug")
+	TObjectPtr<UCSMeshGeneratorDebugComponent> MeshGeneratorDebugComponent;
+
+	/** Dedicated GPU triangle component used by the surface-triangle debug entry point. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Debug")
+	TObjectPtr<UCSDirectTriangleMeshComponent> DebugTriangleComponent;
 
 
 
@@ -443,7 +534,7 @@ public:
 	float DynamicMeshCullBoundsScale = 10.0f;
 
 	// -------------------------------------------------------------------------
-	// Surface Voxel Blur — ResinRattan port
+	// Surface Voxel Blur 鈥?ResinRattan port
 	// -------------------------------------------------------------------------
 
 	/** Number of 3D mean-filter iterations applied after voxelization. 0 = disabled. */
@@ -471,6 +562,12 @@ public:
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "CS Mesh Generator|Generated Data|Debug")
 	FCSSurfaceVoxelData LastSurfaceVoxelData;
 
+	// GPU-resident mirror of LastSurfaceVoxelData: the same voxel buffers the readback
+	// sources, kept pooled so a consumer can register them directly instead of the
+	// readback -> repack -> re-upload round-trip. Populated alongside LastSurfaceVoxelData
+	// by GetBoxSceneFilteredSurfaceVoxels. Not a UPROPERTY (holds render resources).
+	FCSSurfaceVoxelGPUBuffers LastSurfaceVoxelGPUBuffers;
+
 	/** Triangle surface data used by the CPU/BVH vine visualization path.
 	 *  Filled by GenerateVines(). */
 	FCSTriangleMeshData CachedSurfaceTriangles;
@@ -486,11 +583,11 @@ public:
 		const FBox& QueryBox,
 		TArray<FCSStaticMeshTriangleRequest>& OutRequests);
 
-	/** [game thread] 用 FLandscapeComponentDataInterface 在 CPU 端把 QueryBox 内的 landscape 高度场
-	 *  提取成 triangle-soup（世界坐标，已按上朝向定向），暂存进 OutTriangleData，供后续 RDG 流程作为
-	 *  initial triangle 上传。必须在 game thread 调用（CDI 构造强制 game thread）。普通 static mesh 不走
-	 *  这里，仍用本 class 的 GPU resolve 流程。InReferencePoints 非空且 InReferenceFilterDistance > 0 时，
-	 *  按到参考点的距离做 CPU 粗筛；否则保留盒内全部三角形。MaxTriangles == 0 时直接返回空。 */
+	/** [game thread] 鐢?FLandscapeComponentDataInterface 鍦?CPU 绔妸 QueryBox 鍐呯殑 landscape 楂樺害鍦?
+	 *  鎻愬彇鎴?triangle-soup锛堜笘鐣屽潗鏍囷紝宸叉寜涓婃湞鍚戝畾鍚戯級锛屾殏瀛樿繘 OutTriangleData锛屼緵鍚庣画 RDG 娴佺▼浣滀负
+	 *  initial triangle 涓婁紶銆傚繀椤诲湪 game thread 璋冪敤锛圕DI 鏋勯€犲己鍒?game thread锛夈€傛櫘閫?static mesh 涓嶈蛋
+	 *  杩欓噷锛屼粛鐢ㄦ湰 class 鐨?GPU resolve 娴佺▼銆侷nReferencePoints 闈炵┖涓?InReferenceFilterDistance > 0 鏃讹紝
+	 *  鎸夊埌鍙傝€冪偣鐨勮窛绂诲仛 CPU 绮楃瓫锛涘惁鍒欎繚鐣欑洅鍐呭叏閮ㄤ笁瑙掑舰銆侻axTriangles == 0 鏃剁洿鎺ヨ繑鍥炵┖銆?*/
 	static void BuildBoxSceneLandscapeTriangles(UWorld* World,
 		const FBox& QueryBox,
 		const TArray<FVector>& InReferencePoints,
@@ -514,21 +611,23 @@ public:
 		FName RequiredActorTag = NAME_None,
 		bool bSortComponentsByDistance = true);
 
-	/** [game thread] 枚举 QueryBox 内的 static mesh + landscape，完成 static mesh 渲染资源 resolve
-	 *  与 landscape CPU 三角形提取，返回可安全捕获进 render 线程 lambda 的预备数据。
-	 *  必须在 game thread 调用（触碰 UObject / FLandscapeComponentDataInterface）。
-	 *  RequiredActorTag != NAME_None 时，仅保留带该 Tag 的 Actor 的 static mesh（landscape 始终包含）。 */
+	/** [game thread] 鏋氫妇 QueryBox 鍐呯殑 static mesh + landscape锛屽畬鎴?static mesh 娓叉煋璧勬簮 resolve
+	 *  涓?landscape CPU 涓夎褰㈡彁鍙栵紝杩斿洖鍙畨鍏ㄦ崟鑾疯繘 render 绾跨▼ lambda 鐨勯澶囨暟鎹€?
+	 *  蹇呴』鍦?game thread 璋冪敤锛堣Е纰?UObject / FLandscapeComponentDataInterface锛夈€?
+	 *  RequiredActorTag != NAME_None 鏃讹紝浠呬繚鐣欏甫璇?Tag 鐨?Actor 鐨?static mesh锛坙andscape 濮嬬粓鍖呭惈锛夈€?*/
 	FCSBoxScenePreparedData PrepareBoxSceneTriangles(
 		UWorld* World,
 		const FBox& QueryBox,
 		int32 InMaxTriangles = -1,
 		const TArray<FVector>& InReferencePoints = TArray<FVector>(),
 		float InReferenceFilterDistance = 0.0f,
-		FName RequiredActorTag = NAME_None);
+		FName RequiredActorTag = NAME_None,
+		bool bIncludeLandscape = true,
+		bool bUseMeshDescriptionSourceTriangles = true);
 
-	/** [render thread] 消费 PrepareBoxSceneTriangles 的预备数据，在 GraphBuilder 上建出 triangle-soup
-	 *  buffer。只做 RHI/RDG 操作，不触碰 UObject，可安全在 ENQUEUE_RENDER_COMMAND lambda 内调用。 */
-	FCSStaticMeshTriangleRDGOutput AddPreparedBoxSceneTrianglesToRDG(
+	/** [render thread] 娑堣垂 PrepareBoxSceneTriangles 鐨勯澶囨暟鎹紝鍦?GraphBuilder 涓婂缓鍑?triangle-soup
+	 *  buffer銆傚彧鍋?RHI/RDG 鎿嶄綔锛屼笉瑙︾ UObject锛屽彲瀹夊叏鍦?ENQUEUE_RENDER_COMMAND lambda 鍐呰皟鐢ㄣ€?*/
+	static FCSStaticMeshTriangleRDGOutput AddPreparedBoxSceneTrianglesToRDG(
 		FRDGBuilder& GraphBuilder,
 		FRHICommandListImmediate& RHICmdList,
 		const FCSBoxScenePreparedData& Prepared,
@@ -563,8 +662,8 @@ public:
 		float LandscapeOriginZ);
 
 	/** Captures the landscape heightmap using GeneratorBounds as the capture area.
-	 *  bOutputWorldHeight=true  → RGBA16f with RGB=Normal, A=WorldZ (cm)
-	 *  bOutputWorldHeight=false → Depth from CameraHeight (R channel)
+	 *  bOutputWorldHeight=true  鈫?RGBA16f with RGB=Normal, A=WorldZ (cm)
+	 *  bOutputWorldHeight=false 鈫?Depth from CameraHeight (R channel)
 	 *  If OutRT is null, auto-creates a temporary RT and draws DrawDebugPoint.
 	 *  Iterates ALL ALandscape actors; supports multi-landscape merge and World Partition.
 	 *  @param OutRT Output render target (null for debug mode)
@@ -583,7 +682,7 @@ public:
 	/** Converts an ALandscape::RenderHeightmap G16 output into Normal+Height format
 	 *  (RGBA: Normal.XYZ, WorldHeight_cm) via finite-difference normals.
 	 *  When bMergeByMaxZ is true, only overwrites texels where the new worldZ exceeds the
-	 *  existing .w value — used to composite multiple landscapes (output must be pre-cleared
+	 *  existing .w value 鈥?used to composite multiple landscapes (output must be pre-cleared
 	 *  with .w = -large for correct results).
 	 *  Runs entirely within the supplied FRDGBuilder; must be called on the render thread. */
 	void ConvertLandscapeHeightmapToNormalHeightRDG(
@@ -608,6 +707,26 @@ public:
 	 *  @param TextureSize Resolution of the intermediate heightmap (default 128) */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Heightmap")
 	FCSTriangleMeshData CaptureLandscapeTrianglesGPU(int32 TextureSize = 128);
+
+	/** Generic: rasterize an indexed GPU triangle mesh into OutHeightmap via top-down orthographic
+	 *  projection (texel.x = CameraHeight - WorldZ). Extracts a triangle soup from the position/index
+	 *  buffers (FExtractStaticMeshTrianglesCS) then runs RasterizeTriangleSoupToHeightmapRDG. Adds
+	 *  passes to GraphBuilder; the caller executes. Must be called on the render thread.
+	 *  @param PositionSRV      Buffer<float> SRV, xyz per vertex (stride 3 floats).
+	 *  @param IndexSRV         Buffer<uint>  SRV, triangle-list indices.
+	 *  @param TriangleCapacity Number of triangles to process (index_count / 3); extra degenerate
+	 *                          triangles from unused capacity rasterize to nothing.
+	 *  @param LocalToWorld     Transforms the (local-space) positions to world.
+	 *  @param OutHeightmap     UAV-capable float heightmap (RDG-registered). */
+	void RasterizeIndexedMeshToHeightmapRDG(
+		FRDGBuilder& GraphBuilder,
+		FRHIShaderResourceView* PositionSRV,
+		FRHIShaderResourceView* IndexSRV,
+		uint32 TriangleCapacity,
+		const FMatrix44f& LocalToWorld,
+		FRDGTextureRef OutHeightmap,
+		const FBox& WorldBounds,
+		float CameraHeight);
 
 	/** Static utility: renders a landscape heightmap via ALandscape::RenderHeightmap (GPU)
 	 *  and converts to Normal+Height (RGB=Normal, A=WorldHeight_cm) in the given RT.
@@ -654,6 +773,10 @@ public:
 		TArray<FVector>& OutPositions,
 		TArray<FVector>& OutNormals);
 
+	/** Builds and retains bounded scene surface voxels entirely on the GPU. The valid count remains
+	 *  in FCSSurfaceVoxelGPUBuffers::Counter and is consumed by downstream compute/indirect draws. */
+	bool PrepareBoxSceneSurfaceVoxelsGPU(float VoxelSize, float ReferenceFilterDistance = 0.0f);
+
 	/** Synchronously voxelizes the bounded scene surface and reads the voxels back to the CPU by
 	 *  running the RDG surface-voxel pass on the render thread and blocking via FlushRenderingCommands.
 	 *  Keeps all triangles within the generator bounds (no reference-point filtering). Refreshes the
@@ -684,26 +807,28 @@ public:
 	// Debug System
 	// -------------------------------------------------------------------------
 
-	/** Builds an isolated debug quad at each surface voxel to visualize voxel placement and orientation. */
+	/** Draws an isolated quad at each surface voxel directly from retained GPU buffers. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh|Debug")
-	UDynamicMesh* SurfaceVoxelsToIsolatedQuadsDebug(float VoxelSize = 10.0f,
+	bool SurfaceVoxelsToIsolatedQuadsDebug(float VoxelSize = 10.0f,
 		bool bReverseOrientation = false);
 
-	/** Draws debug direction lines and optional points from the last cached surface-voxel data. */
+	/** Draws debug direction lines and optional points from the last retained GPU surface voxels. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug", meta = (DevelopmentOnly))
 	int32 DrawDebugLastSurfaceVoxelDirections(
-		const FCSDebugLastVoxelDirectionOptions& Options = FCSDebugLastVoxelDirectionOptions()) const;
+		const FCSDebugLastVoxelDirectionOptions& Options = FCSDebugLastVoxelDirectionOptions());
 
 	/** Regenerates bounded scene surface voxels and draws their normals as debug direction lines. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug", meta = (DevelopmentOnly))
 	int32 DrawDebugBoxSceneSurfaceVoxelDirections(
 		const FCSDebugBoxVoxelDirectionOptions& Options);
 
-	/** Spawns a temporary ADynamicMeshActor at this actor's location,
-	 *  converts CachedSurfaceTriangles into a DynamicMesh,
-	 *  and destroys the actor after LifetimeSeconds. */
-	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Debug", meta = (DevelopmentOnly, DisplayName = "Spawn Debug Surface Triangles DynamicMesh Actor"))
+	/** Extracts and draws bounded scene surface triangles through a dedicated GPU component. */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Debug", meta = (DevelopmentOnly, DisplayName = "Draw GPU Surface Triangles"))
 	void SpawnDebugSurfaceTrianglesDynamicMeshActor(float LifetimeSeconds = 10.0f);
+
+	/** Clears all GPU-only MeshGenerator debug visualization. */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Debug", meta = (DevelopmentOnly))
+	void ClearMeshGeneratorGPUDebug();
 
 	// -------------------------------------------------------------------------
 	// Core System - Dynamic Mesh Helpers
@@ -713,28 +838,95 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh")
 	bool SetGeneratedDynamicMesh(UDynamicMesh* NewMesh, float BoundsScale = -1.0f);
 
+	// -------------------------------------------------------------------------
+	// Core System - Direct GPU Render (no readback, no DynamicMesh)
+	// -------------------------------------------------------------------------
+
+	/** Directly submits the bounded scene surface triangles to the render pipeline: extracts the
+	 *  GPU triangle soup for GeneratorBounds and draws it every frame through a custom scene proxy
+	 *  (UCSDirectTriangleMeshComponent / FCSDirectTriangleMeshSceneProxy), with vertex/index data
+	 *  living only on the GPU 閳?no CPU readback and no UDynamicMesh. Material is applied on the draw
+	 *  (null keeps the component's current material). MaxDirectTriangles bounds the persistent GPU
+	 *  buffers (the actual count is discovered on the GPU and never read back, so this cap sizes the
+	 *  allocation). ReferenceFilterDistance filters by distance to ReferencePoints when > 0 and
+	 *  ReferencePoints is non-empty. Returns false when there is no world/bounds/geometry. */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh")
+	bool SubmitBoxSceneTrianglesToRenderPipeline(UMaterialInterface* Material = nullptr,
+		int32 MaxDirectTriangles = 500000,
+		float ReferenceFilterDistance = 0.0f);
+
+	/** Returns the direct-render component that draws the submitted GPU triangle soup. */
+	UFUNCTION(BlueprintPure, Category = "CS Mesh Generator|Mesh")
+	UCSDirectTriangleMeshComponent* GetDirectMeshComponent() const { return DirectMeshComponent; }
+
+	/** Saves the current direct GPU mesh as a StaticMesh asset. Editor only; returns null otherwise. */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh")
+	UStaticMesh* SaveDirectGPUMeshToStaticMesh(
+		const FString& AssetPathAndName,
+		bool bReplaceExistingAsset = true,
+		bool bSaveAsset = true,
+		bool bConvertToActorLocalSpace = true);
+
 	/** Updates DynamicMeshComponent culling settings after geometry or bounds-scale changes. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh")
 	void RefreshDynamicMeshComponentCullingBounds(float BoundsScale = -1.0f);
 
 protected:
 	// -------------------------------------------------------------------------
-	// Core System - Lifecycle
+	// Shared GPU triangle-soup algorithms
 	// -------------------------------------------------------------------------
 
-	/** Draws a bounded number of debug directions and optional points from matched position/direction arrays. */
-	int32 DrawDebugDirectionArray(
-		const TArray<FVector>& Positions,
-		const TArray<FVector>& Directions,
-		float DirectionLength = 100.0f,
-		FLinearColor DirectionColor = FLinearColor::Blue,
-		float Duration = 5.0f,
-		float Thickness = 2.0f,
-		bool bPersistentLines = false,
-		bool bDrawPoints = true,
-		FLinearColor PointColor = FLinearColor::Yellow,
-		float PointSize = 8.0f,
-		int32 MaxDirectionsToDraw = 0) const;
+	/**
+	 * Protected convenience entry point for derived generators that need spatial queries.
+	 *
+	 * The implementation is delegated to the stateless CSGpuTriangleUtilities module:
+	 * inheritance provides discoverability to subclasses, while the actor remains free of
+	 * render-resource ownership and Boolean-specific policy.
+	 */
+	static CSGpuTriangleUtilities::FTriangleLBVH AddTriangleLBVHToRDG(
+		FRDGBuilder& GraphBuilder,
+		FRDGBufferSRVRef TriangleSoupSRV,
+		int32 TriangleCount,
+		int32 SortElementCount,
+		const FVector3f& AabbMin,
+		const FVector3f& InvExtent);
+
+	/**
+	 * Builds fast-winding multipoles for a shared LBVH. The base class exposes only
+	 * geometric preprocessing; derived classes retain their own iso thresholds and
+	 * sampling rules because those values describe algorithm policy.
+	 */
+	static FRDGBufferRef AddFastWindingToRDG(
+		FRDGBuilder& GraphBuilder,
+		FRDGBufferSRVRef TriangleSoupSRV,
+		const CSGpuTriangleUtilities::FTriangleLBVH& LBVH,
+		int32 TriangleCount);
+
+	/**
+	 * Finds positional weld representatives on the GPU. Mesh-attribute merging and
+	 * topology cleanup remain with the derived producer because different outputs have
+	 * different seam, material, and winding requirements.
+	 */
+	static FRDGBufferRef AddVertexWeldToRDG(
+		FRDGBuilder& GraphBuilder,
+		FRDGBufferRef OutputTriangleSoup,
+		FRDGBufferRef OutputTriangleCounter,
+		int32 OutputTriangleCapacity,
+		int32 SourceTriangleCapacity,
+		const FVector3f& GridOrigin,
+		float WeldDistance,
+		FRDGBufferSRVRef TriangleFilter = nullptr,
+		uint32 TriangleFilterMask = 0u);
+
+	// -------------------------------------------------------------------------
+	// Core System - Lifecycle
+	// -------------------------------------------------------------------------
+	/** Shared surface-voxel producer. CPU output/readback is performed only when bReadbackToCPU is true. */
+	void BuildBoxSceneFilteredSurfaceVoxels(float VoxelSize,
+		float ReferenceFilterDistance,
+		TArray<FVector>& OutPositions,
+		TArray<FVector>& OutNormals,
+		bool bReadbackToCPU);
 
 	/** Keeps construction-time component/render settings synchronized when actor properties change in editor. */
 	virtual void OnConstruction(const FTransform& Transform) override;
@@ -742,6 +934,9 @@ protected:
 	virtual void PostRegisterAllComponents() override;
 	/** Releases transient GPU resources when the actor leaves play. */
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+
+	/** Clears the dedicated triangle debug component after its requested lifetime. */
+	void ClearDebugTriangleComponent();
 
 	/** Returns the current GeneratorBounds component as a valid world-space box when possible. */
 	FBox GetGeneratorBoundsWorldBox() const;
@@ -755,4 +950,6 @@ protected:
 	void ClearSurfaceVoxelTextureData();
 	/** Gets or allocates a transient generated-data render target with the requested size. */
 	UTextureRenderTarget2D* GetOrCreateGeneratedDataRenderTarget(TObjectPtr<UTextureRenderTarget2D>& RenderTarget, const TCHAR* BaseName, int32 Width, int32 Height);
+
+	FTimerHandle DebugTriangleClearTimerHandle;
 };

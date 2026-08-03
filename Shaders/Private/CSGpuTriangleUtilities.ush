@@ -1,0 +1,438 @@
+#ifndef CS_GPU_TRIANGLE_UTILITIES_USH
+#define CS_GPU_TRIANGLE_UTILITIES_USH
+
+// Shared triangle-soup GPU infrastructure.
+//
+// This file is deliberately independent of Boolean classification. LBVH topology,
+// fast-winding field construction/evaluation, and positional weld representatives
+// are useful to multiple mesh generators. Consumers supply policy such as winding
+// thresholds, sample placement, attribute seams, and topology cleanup.
+
+// -----------------------------------------------------------------------------
+// Order-1 hierarchical fast winding (Barill et al. 2018).
+// -----------------------------------------------------------------------------
+Buffer<float4> WMTopo;         // 2 float4/node; w contains child or triangle index
+Buffer<float4> WMMultipole;    // 5 float4/node: center/radius, N/S1, P1, area
+Buffer<float4> WSoup;          // 3 float4/triangle
+uint WFastTriCount;
+float WBetaSq;
+
+float SolidAngleAt(float3 A, float3 B, float3 C)
+{
+	float La = length(A), Lb = length(B), Lc = length(C);
+	float Num = dot(A, cross(B, C));
+	float Den = La * Lb * Lc + dot(A, B) * Lc + dot(B, C) * La + dot(C, A) * Lb;
+	return 2.0f * atan2(Num, Den);
+}
+
+float EvaluateFastWindingAt(float3 query)
+{
+	uint leafBase = WFastTriCount - 1u;
+	float accum = 0.0f;
+	uint stack[96];
+	int sp = 0;
+	stack[sp++] = 0u;
+
+	[loop] while (sp > 0)
+	{
+		uint ni = stack[--sp];
+		if (ni >= leafBase)
+		{
+			int tri = asint(WMTopo[ni * 2u + 0u].w);
+			uint vb = uint(tri) * 3u;
+			float3 v0 = WSoup[vb + 0u].xyz;
+			float3 v1 = WSoup[vb + 1u].xyz;
+			float3 v2 = WSoup[vb + 2u].xyz;
+			accum += SolidAngleAt(v0 - query, v1 - query, v2 - query);
+			continue;
+		}
+
+		uint mb = ni * 5u;
+		float4 m0 = WMMultipole[mb + 0u];
+		float3 D = m0.xyz - query;
+		float d2 = dot(D, D);
+		float thresholdSq = WBetaSq * m0.w * m0.w;
+		bool descend = d2 <= thresholdSq;
+		if (descend && sp <= 94)
+		{
+			stack[sp++] = asuint(WMTopo[ni * 2u + 0u].w);
+			stack[sp++] = asuint(WMTopo[ni * 2u + 1u].w);
+			continue;
+		}
+
+		float4 m1 = WMMultipole[mb + 1u];
+		float4 m2 = WMMultipole[mb + 2u];
+		float4 m3 = WMMultipole[mb + 3u];
+		float4 m4 = WMMultipole[mb + 4u];
+		float3 r0 = float3(m2.x, m2.y, m2.z);
+		float3 r1 = float3(m2.w, m3.x, m3.y);
+		float3 r2 = float3(m3.z, m3.w, m4.x);
+		float3 P1D = float3(dot(r0, D), dot(r1, D), dot(r2, D));
+		float invd = rsqrt(max(d2, 1e-30f));
+		float invd2 = invd * invd;
+		float invd3 = invd2 * invd;
+		float invd5 = invd3 * invd2;
+		accum += (dot(m1.xyz, D) + m1.w) * invd3 - 3.0f * dot(D, P1D) * invd5;
+	}
+
+	return accum * (1.0f / (4.0f * 3.14159265358979f));
+}
+
+// -----------------------------------------------------------------------------
+// Position-only vertex welding.
+//
+// The common pass returns a corner-to-representative map. It does not merge
+// attributes or remove triangles because seam/material/winding policy belongs
+// to the mesh producer.
+// -----------------------------------------------------------------------------
+uint WeldHashCell(int3 Cell)
+{
+	uint3 U = asuint(Cell);
+	uint H = U.x * 0x8da6b343u;
+	H ^= U.y * 0xd8163841u;
+	H ^= U.z * 0xcb1ab31fu;
+	H ^= H >> 16u;
+	H *= 0x7feb352du;
+	H ^= H >> 15u;
+	return H;
+}
+
+StructuredBuffer<float3> WeldOutputPositions;
+Buffer<uint> WeldOutputCounter;
+RWBuffer<uint> RW_WeldOutputBuckets;
+RWBuffer<uint> RW_WeldOutputRepresentatives;
+RWBuffer<uint> RW_WeldOutputIndirectArgs;
+uint WeldOutputMaxTriangles;
+uint WeldOutputBucketMask;
+float3 WeldOutputOrigin;
+float WeldOutputInvCellSize;
+float WeldOutputDistanceSq;
+
+// Optional per-triangle participation filter. Producers that keep discarded triangles
+// resident in the soup must exclude them: a bucket stores only its lowest corner index,
+// so a dead corner with a lower index would shadow the live merge partner and silently
+// defeat welding. Mask 0 disables filtering and the buffer binding is then ignored.
+Buffer<uint> WeldTriangleFilter;
+uint WeldTriangleFilterMask;
+
+bool WeldCornerParticipates(uint cornerIndex)
+{
+	if (WeldTriangleFilterMask == 0u) return true;
+	return (WeldTriangleFilter[cornerIndex / 3u] & WeldTriangleFilterMask) != 0u;
+}
+
+uint WeldOutputCornerCount()
+{
+	return min(WeldOutputCounter[0], WeldOutputMaxTriangles) * 3u;
+}
+
+[numthreads(1, 1, 1)]
+void OutputWeldIndirectArgsCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint groupCount = (WeldOutputCornerCount() + THREADGROUPSIZE_X - 1u) / THREADGROUPSIZE_X;
+	// GetUnWrappedDispatchThreadId uses ComputeShaderUtils.ush's fixed
+	// WRAPPED_GROUP_STRIDE (128), so the indirect dimensions must use the same stride.
+	uint groupCountX = min(groupCount, 128u);
+	RW_WeldOutputIndirectArgs[0] = groupCountX;
+	RW_WeldOutputIndirectArgs[1] = groupCountX > 0u ? (groupCount + groupCountX - 1u) / groupCountX : 1u;
+	RW_WeldOutputIndirectArgs[2] = 1u;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void OutputWeldHashCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint cornerIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	uint cornerCount = WeldOutputCornerCount();
+	if (cornerIndex >= cornerCount) return;
+	if (!WeldCornerParticipates(cornerIndex)) return;
+	int3 cell = (int3)floor((WeldOutputPositions[cornerIndex] - WeldOutputOrigin) * WeldOutputInvCellSize);
+	uint bucket = WeldHashCell(cell) & WeldOutputBucketMask;
+	InterlockedMin(RW_WeldOutputBuckets[bucket], cornerIndex);
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void OutputWeldResolveCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint cornerIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	uint cornerCount = WeldOutputCornerCount();
+	if (cornerIndex >= cornerCount) return;
+	if (!WeldCornerParticipates(cornerIndex)) return;
+
+	float3 position = WeldOutputPositions[cornerIndex];
+	int3 cell = (int3)floor((position - WeldOutputOrigin) * WeldOutputInvCellSize);
+	uint best = cornerIndex;
+	float limitSq = WeldOutputDistanceSq + max(1e-12f, WeldOutputDistanceSq * 1e-5f);
+	[unroll] for (int z = -1; z <= 1; ++z)
+	{
+		[unroll] for (int y = -1; y <= 1; ++y)
+		{
+			[unroll] for (int x = -1; x <= 1; ++x)
+			{
+				uint candidate = RW_WeldOutputBuckets[WeldHashCell(cell + int3(x, y, z)) & WeldOutputBucketMask];
+				if (candidate >= cornerCount || candidate >= best) continue;
+				float3 delta = WeldOutputPositions[candidate] - position;
+				if (dot(delta, delta) <= limitSq) best = candidate;
+			}
+		}
+	}
+	RW_WeldOutputRepresentatives[cornerIndex] = best;
+}
+
+// -----------------------------------------------------------------------------
+// Karras linear BVH construction.
+// -----------------------------------------------------------------------------
+Buffer<float4> LBVHTriVerts;
+uint LBVHTriCount;
+uint LBVHArraySize;
+float3 LBVHAabbMin;
+float3 LBVHInvExtent;
+RWBuffer<uint> LBVHKeys;
+RWBuffer<uint> LBVHPayload;
+RWBuffer<float4> LBVHNodes;
+RWBuffer<uint> LBVHParent;
+RWBuffer<uint> LBVHAMin;
+RWBuffer<uint> LBVHAMax;
+uint LBVHSortJ;
+uint LBVHSortK;
+
+uint LBVHExpandBits10(uint v)
+{
+	v = (v * 0x00010001u) & 0xFF0000FFu;
+	v = (v * 0x00000101u) & 0x0F00F00Fu;
+	v = (v * 0x00000011u) & 0xC30C30C3u;
+	v = (v * 0x00000005u) & 0x49249249u;
+	return v;
+}
+
+uint LBVHMorton3D(float3 p)
+{
+	float3 q = clamp(p, 0.0f, 1.0f) * 1023.0f;
+	uint x = LBVHExpandBits10((uint)q.x);
+	uint y = LBVHExpandBits10((uint)q.y);
+	uint z = LBVHExpandBits10((uint)q.z);
+	return (x << 2) | (y << 1) | z;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void LBVHMortonCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint t = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (t >= LBVHArraySize) return;
+	if (t >= LBVHTriCount) { LBVHKeys[t] = 0xFFFFFFFFu; LBVHPayload[t] = 0xFFFFFFFFu; return; }
+	float3 v0 = LBVHTriVerts[t * 3u + 0u].xyz;
+	float3 v1 = LBVHTriVerts[t * 3u + 1u].xyz;
+	float3 v2 = LBVHTriVerts[t * 3u + 2u].xyz;
+	float3 c = (v0 + v1 + v2) * (1.0f / 3.0f);
+	LBVHKeys[t] = LBVHMorton3D((c - LBVHAabbMin) * LBVHInvExtent);
+	LBVHPayload[t] = t;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void LBVHBitonicCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint i = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (i >= LBVHArraySize) return;
+	uint ixj = i ^ LBVHSortJ;
+	if (ixj <= i) return;
+	bool ascending = ((i & LBVHSortK) == 0u);
+	uint ki = LBVHKeys[i], kj = LBVHKeys[ixj];
+	bool doSwap = ascending ? (ki > kj) : (ki < kj);
+	if (doSwap)
+	{
+		LBVHKeys[i] = kj; LBVHKeys[ixj] = ki;
+		uint pi = LBVHPayload[i]; LBVHPayload[i] = LBVHPayload[ixj]; LBVHPayload[ixj] = pi;
+	}
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void LBVHLeavesCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint k = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (k >= LBVHTriCount) return;
+	uint tri = LBVHPayload[k];
+	float3 v0 = LBVHTriVerts[tri * 3u + 0u].xyz;
+	float3 v1 = LBVHTriVerts[tri * 3u + 1u].xyz;
+	float3 v2 = LBVHTriVerts[tri * 3u + 2u].xyz;
+	float3 mn, mx;
+	// Capacity padding and completely collapsed triangles use an inverted AABB.
+	// Refit excludes the same leaves, so padding never creates a hot origin subtree.
+	if (all(v0 == v1) && all(v1 == v2))
+	{
+		mn = float3(3.0e38f, 3.0e38f, 3.0e38f);
+		mx = float3(-3.0e38f, -3.0e38f, -3.0e38f);
+	}
+	else
+	{
+		mn = min(v0, min(v1, v2));
+		mx = max(v0, max(v1, v2));
+	}
+	uint node = (LBVHTriCount - 1u) + k;
+	LBVHNodes[node * 2u + 0u] = float4(mn, asfloat((int)tri));
+	LBVHNodes[node * 2u + 1u] = float4(mx, asfloat((int)-1));
+}
+
+int LBVHClz(uint x) { return (x == 0u) ? 32 : (31 - (int)firstbithigh(x)); }
+
+int LBVHDelta(int i, int j)
+{
+	if (j < 0 || j >= (int)LBVHTriCount) return -1;
+	uint x = LBVHKeys[i] ^ LBVHKeys[j];
+	if (x == 0u) return 32 + LBVHClz((uint)i ^ (uint)j);
+	return LBVHClz(x);
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void LBVHHierarchyCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	int i = (int)GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	int n = (int)LBVHTriCount;
+	if (i >= n - 1) return;
+
+	int d = (LBVHDelta(i, i + 1) - LBVHDelta(i, i - 1)) >= 0 ? 1 : -1;
+	int deltaMin = LBVHDelta(i, i - d);
+	int lmax = 2;
+	while (LBVHDelta(i, i + lmax * d) > deltaMin) lmax <<= 1;
+	int l = 0;
+	for (int t0 = lmax >> 1; t0 >= 1; t0 >>= 1)
+		if (LBVHDelta(i, i + (l + t0) * d) > deltaMin) l += t0;
+	int j = i + l * d;
+
+	int deltaNode = LBVHDelta(i, j);
+	int s = 0;
+	for (int div = 2; ; div <<= 1)
+	{
+		int t1 = (l + div - 1) / div;
+		if (LBVHDelta(i, i + (s + t1) * d) > deltaNode) s += t1;
+		if (t1 <= 1) break;
+	}
+	int gamma = i + s * d + min(d, 0);
+
+	int leftIdx = (min(i, j) == gamma) ? (gamma + (n - 1)) : gamma;
+	int rightIdx = (max(i, j) == gamma + 1) ? (gamma + 1 + (n - 1)) : (gamma + 1);
+	LBVHNodes[i * 2u + 0u] = float4(0.0f, 0.0f, 0.0f, asfloat(leftIdx));
+	LBVHNodes[i * 2u + 1u] = float4(0.0f, 0.0f, 0.0f, asfloat(rightIdx));
+	LBVHParent[leftIdx] = (uint)i;
+	LBVHParent[rightIdx] = (uint)i;
+}
+
+uint LBVHFloatFlip(float f)
+{
+	uint u = asuint(f);
+	uint mask = (uint)(-(int)(u >> 31)) | 0x80000000u;
+	return u ^ mask;
+}
+
+float LBVHFloatUnflip(uint u)
+{
+	uint mask = ((u >> 31) - 1u) | 0x80000000u;
+	return asfloat(u ^ mask);
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void LBVHRefitAtomicCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint k = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (k >= LBVHTriCount) return;
+	uint tri = LBVHPayload[k];
+	float3 v0 = LBVHTriVerts[tri * 3u + 0u].xyz;
+	float3 v1 = LBVHTriVerts[tri * 3u + 1u].xyz;
+	float3 v2 = LBVHTriVerts[tri * 3u + 2u].xyz;
+	if (all(v0 == v1) && all(v1 == v2)) return;
+	float3 mn = min(v0, min(v1, v2));
+	float3 mx = max(v0, max(v1, v2));
+	uint3 umn = uint3(LBVHFloatFlip(mn.x), LBVHFloatFlip(mn.y), LBVHFloatFlip(mn.z));
+	uint3 umx = uint3(LBVHFloatFlip(mx.x), LBVHFloatFlip(mx.y), LBVHFloatFlip(mx.z));
+	uint parent = LBVHParent[(LBVHTriCount - 1u) + k];
+	[loop] while (parent != 0xFFFFFFFFu)
+	{
+		InterlockedMin(LBVHAMin[parent * 3u + 0u], umn.x);
+		InterlockedMin(LBVHAMin[parent * 3u + 1u], umn.y);
+		InterlockedMin(LBVHAMin[parent * 3u + 2u], umn.z);
+		InterlockedMax(LBVHAMax[parent * 3u + 0u], umx.x);
+		InterlockedMax(LBVHAMax[parent * 3u + 1u], umx.y);
+		InterlockedMax(LBVHAMax[parent * 3u + 2u], umx.z);
+		parent = LBVHParent[parent];
+	}
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void LBVHFinalizeCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint i = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (i + 1u >= LBVHTriCount) return;
+	float3 mn = float3(LBVHFloatUnflip(LBVHAMin[i * 3u + 0u]), LBVHFloatUnflip(LBVHAMin[i * 3u + 1u]), LBVHFloatUnflip(LBVHAMin[i * 3u + 2u]));
+	float3 mx = float3(LBVHFloatUnflip(LBVHAMax[i * 3u + 0u]), LBVHFloatUnflip(LBVHAMax[i * 3u + 1u]), LBVHFloatUnflip(LBVHAMax[i * 3u + 2u]));
+	int left = asint(LBVHNodes[i * 2u + 0u].w);
+	int right = asint(LBVHNodes[i * 2u + 1u].w);
+	LBVHNodes[i * 2u + 0u] = float4(mn, asfloat(left));
+	LBVHNodes[i * 2u + 1u] = float4(mx, asfloat(right));
+}
+
+// -----------------------------------------------------------------------------
+// Fast-winding multipole construction over the shared LBVH.
+// -----------------------------------------------------------------------------
+RWBuffer<float4> WMpA;
+RWBuffer<float4> WMpB;
+Buffer<float4> WMpIn;
+RWBuffer<float4> WMpOut;
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void WindingLeafInitCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint k = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (k >= LBVHTriCount) return;
+	uint tri = LBVHPayload[k];
+	float3 v0 = LBVHTriVerts[tri * 3u + 0u].xyz;
+	float3 v1 = LBVHTriVerts[tri * 3u + 1u].xyz;
+	float3 v2 = LBVHTriVerts[tri * 3u + 2u].xyz;
+	float3 c = (v0 + v1 + v2) * (1.0f / 3.0f);
+	float3 an = 0.5f * cross(v1 - v0, v2 - v0);
+	float area = length(an);
+	float radius = max(length(v0 - c), max(length(v1 - c), length(v2 - c)));
+	uint b = ((LBVHTriCount - 1u) + k) * 5u;
+	float4 m0 = float4(c, radius);
+	float4 m1 = float4(an, 0.0f);
+	float4 m4 = float4(0.0f, area, 0.0f, 0.0f);
+	float4 z4 = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	WMpA[b + 0u] = m0; WMpA[b + 1u] = m1; WMpA[b + 2u] = z4; WMpA[b + 3u] = z4; WMpA[b + 4u] = m4;
+	WMpB[b + 0u] = m0; WMpB[b + 1u] = m1; WMpB[b + 2u] = z4; WMpB[b + 3u] = z4; WMpB[b + 4u] = m4;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void WindingMergeCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint i = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (i + 1u >= LBVHTriCount) return;
+	uint left = asuint(WMTopo[i * 2u + 0u].w);
+	uint right = asuint(WMTopo[i * 2u + 1u].w);
+	uint lb = left * 5u, rb = right * 5u;
+	float4 L0 = WMpIn[lb + 0u], L1 = WMpIn[lb + 1u], L2 = WMpIn[lb + 2u], L3 = WMpIn[lb + 3u], L4 = WMpIn[lb + 4u];
+	float4 R0 = WMpIn[rb + 0u], R1 = WMpIn[rb + 1u], R2 = WMpIn[rb + 2u], R3 = WMpIn[rb + 3u], R4 = WMpIn[rb + 4u];
+
+	float3 cL = L0.xyz; float rL = L0.w; float3 NL = L1.xyz; float SL = L1.w; float AL = L4.y;
+	float3 cR = R0.xyz; float rR = R0.w; float3 NR = R1.xyz; float SR = R1.w; float AR = R4.y;
+	float PL[9] = { L2.x, L2.y, L2.z, L2.w, L3.x, L3.y, L3.z, L3.w, L4.x };
+	float PR[9] = { R2.x, R2.y, R2.z, R2.w, R3.x, R3.y, R3.z, R3.w, R4.x };
+
+	float Area = AL + AR;
+	float3 C = (Area > 1e-12f) ? ((AL * cL + AR * cR) / Area) : cL;
+	float3 dL = cL - C, dR = cR - C;
+	float3 N = NL + NR;
+	float S1 = SL + dot(NL, dL) + SR + dot(NR, dR);
+	float NLa[3] = { NL.x, NL.y, NL.z }, NRa[3] = { NR.x, NR.y, NR.z };
+	float dLa[3] = { dL.x, dL.y, dL.z }, dRa[3] = { dR.x, dR.y, dR.z };
+	float P1[9];
+	[unroll] for (int a = 0; a < 3; ++a)
+		[unroll] for (int bb = 0; bb < 3; ++bb)
+			P1[a * 3 + bb] = PL[a * 3 + bb] + NLa[a] * dLa[bb] + PR[a * 3 + bb] + NRa[a] * dRa[bb];
+	float radius = max(length(C - cL) + rL, length(C - cR) + rR);
+
+	uint b = i * 5u;
+	WMpOut[b + 0u] = float4(C, radius);
+	WMpOut[b + 1u] = float4(N, S1);
+	WMpOut[b + 2u] = float4(P1[0], P1[1], P1[2], P1[3]);
+	WMpOut[b + 3u] = float4(P1[4], P1[5], P1[6], P1[7]);
+	WMpOut[b + 4u] = float4(P1[8], Area, 0.0f, 0.0f);
+}
+
+#endif // CS_GPU_TRIANGLE_UTILITIES_USH

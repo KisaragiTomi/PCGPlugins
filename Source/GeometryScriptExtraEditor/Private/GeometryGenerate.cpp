@@ -1,4 +1,5 @@
 ﻿#include "GeometryGenerate.h"
+#include "CSMeshBuild.h"
 
 #include "CollisionQueryParams.h"
 #include "Components/PrimitiveComponent.h"
@@ -361,159 +362,7 @@ void AddActorComponentPoints(UStaticMeshComponent* StaticMeshComponent, const FB
 	}
 }
 
-bool IsValidCSTriangleIndex(int32 Index, int32 VertexCount)
-{
-	return Index >= 0 && Index < VertexCount;
-}
-
-bool IsFiniteCSVertex(const FVector& Vertex)
-{
-	return !Vertex.ContainsNaN()
-		&& FMath::IsFinite(Vertex.X)
-		&& FMath::IsFinite(Vertex.Y)
-		&& FMath::IsFinite(Vertex.Z);
-}
-
-bool IsDegenerateCSTriangle(const FVector& A, const FVector& B, const FVector& C)
-{
-	const FVector AB = B - A;
-	const FVector AC = C - A;
-	const double AreaSq4 = FVector::CrossProduct(AB, AC).SizeSquared();
-	return AreaSq4 <= 1.0e-8;
-}
-
-UDynamicMesh* BuildDynamicMeshFromCSTriangleData(const TArray<FVector>& Vertices,
-	const TArray<int32>& Indices,
-	const TArray<FVector>& VertexNormals,
-	int32 VertexCount,
-	int32 IndexCount,
-	bool bReverseOrientation,
-	bool bSkipDegenerateTriangles,
-	bool bRecomputeNormals)
-{
-	UDynamicMesh* OutMesh = NewObject<UDynamicMesh>();
-	if (!OutMesh)
-	{
-		return nullptr;
-	}
-	OutMesh->Reset();
-
-	const int32 EffectiveVertexCount = VertexCount >= 0
-		? FMath::Clamp(VertexCount, 0, Vertices.Num())
-		: Vertices.Num();
-	const int32 EffectiveIndexCount = IndexCount >= 0
-		? FMath::Clamp(IndexCount, 0, Indices.Num())
-		: Indices.Num();
-
-	if (EffectiveVertexCount < 3)
-	{
-		return OutMesh;
-	}
-
-	const bool bUseTriangleSoup = EffectiveIndexCount == 0;
-	const int32 TriangleCount = bUseTriangleSoup ? EffectiveVertexCount / 3 : EffectiveIndexCount / 3;
-	if (TriangleCount <= 0)
-	{
-		return OutMesh;
-	}
-
-	const bool bUseInputVertexNormals = !bRecomputeNormals && VertexNormals.Num() >= EffectiveVertexCount;
-
-	FDynamicMesh3 Mesh;
-	TArray<int32> VertexIDMap;
-	VertexIDMap.Reserve(EffectiveVertexCount);
-	for (int32 VertexIndex = 0; VertexIndex < EffectiveVertexCount; ++VertexIndex)
-	{
-		const FVector& Vertex = Vertices[VertexIndex];
-		if (IsFiniteCSVertex(Vertex))
-		{
-			VertexIDMap.Add(Mesh.AppendVertex(FVector3d(Vertex)));
-		}
-		else
-		{
-			VertexIDMap.Add(INDEX_NONE);
-		}
-	}
-
-	if (bUseInputVertexNormals)
-	{
-		Mesh.EnableVertexNormals(FVector3f::UpVector);
-		for (int32 VertexIndex = 0; VertexIndex < EffectiveVertexCount; ++VertexIndex)
-		{
-			const int32 MeshVertexID = VertexIDMap[VertexIndex];
-			if (MeshVertexID == INDEX_NONE || VertexNormals[VertexIndex].ContainsNaN())
-			{
-				continue;
-			}
-
-			const FVector SafeNormal = VertexNormals[VertexIndex].GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
-			Mesh.SetVertexNormal(MeshVertexID, FVector3f(SafeNormal));
-		}
-	}
-
-	int32 AddedTriangles = 0;
-	for (int32 TriangleIndex = 0; TriangleIndex < TriangleCount; ++TriangleIndex)
-	{
-		int32 A = INDEX_NONE;
-		int32 B = INDEX_NONE;
-		int32 C = INDEX_NONE;
-
-		if (bUseTriangleSoup)
-		{
-			A = TriangleIndex * 3 + 0;
-			B = TriangleIndex * 3 + 1;
-			C = TriangleIndex * 3 + 2;
-		}
-		else
-		{
-			A = Indices[TriangleIndex * 3 + 0];
-			B = Indices[TriangleIndex * 3 + 1];
-			C = Indices[TriangleIndex * 3 + 2];
-		}
-
-		if (!IsValidCSTriangleIndex(A, EffectiveVertexCount)
-			|| !IsValidCSTriangleIndex(B, EffectiveVertexCount)
-			|| !IsValidCSTriangleIndex(C, EffectiveVertexCount)
-			|| VertexIDMap[A] == INDEX_NONE
-			|| VertexIDMap[B] == INDEX_NONE
-			|| VertexIDMap[C] == INDEX_NONE
-			|| A == B || B == C || A == C)
-		{
-			continue;
-		}
-
-		if (bSkipDegenerateTriangles && IsDegenerateCSTriangle(Vertices[A], Vertices[B], Vertices[C]))
-		{
-			continue;
-		}
-
-		if (bReverseOrientation)
-		{
-			Swap(B, C);
-		}
-
-		const int32 NewTriangleID = Mesh.AppendTriangle(FIndex3i(VertexIDMap[A], VertexIDMap[B], VertexIDMap[C]), 0);
-		if (NewTriangleID >= 0)
-		{
-			++AddedTriangles;
-		}
-	}
-
-	if (AddedTriangles == 0)
-	{
-		return OutMesh;
-	}
-
-	OutMesh->SetMesh(MoveTemp(Mesh));
-
-	if (bRecomputeNormals)
-	{
-		FGeometryScriptCalculateNormalsOptions CalculateOptions;
-		UGeometryScriptLibrary_MeshNormalsFunctions::RecomputeNormals(OutMesh, CalculateOptions);
-	}
-
-	return OutMesh;
-}
+// IsValid/IsFinite/IsDegenerate helpers + BuildDynamicMeshFromCSTriangleData moved to CSMeshBuild.cpp (ComputeShaderGenerator).
 }
 
 
@@ -535,7 +384,7 @@ UDynamicMesh* UGeometryGenerate::CSTriangleDataToDynamicMesh(FCSTriangleMeshData
 
 UDynamicMesh* UGeometryGenerate::CSTriangleBuffersToDynamicMesh(TArray<FVector> Vertices, TArray<int32> Indices, TArray<FVector> VertexNormals, int32 VertexCount, int32 IndexCount, bool bReverseOrientation, bool bSkipDegenerateTriangles, bool bRecomputeNormals)
 {
-	return BuildDynamicMeshFromCSTriangleData(
+	return CSMeshBuild::BuildDynamicMeshFromCSTriangleData(
 		Vertices,
 		Indices,
 		VertexNormals,
@@ -582,7 +431,7 @@ UDynamicMesh* UGeometryGenerate::CSTriangleReadbackToDynamicMesh(const TArray<FV
 		}
 	}
 
-	return BuildDynamicMeshFromCSTriangleData(
+	return CSMeshBuild::BuildDynamicMeshFromCSTriangleData(
 		Vertices,
 		Indices,
 		VertexNormals,

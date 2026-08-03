@@ -27,10 +27,29 @@ RWStructuredBuffer<float4> RW_PathPointNormals;
 RWStructuredBuffer<float4> RW_PathPointFrameNormals;
 RWStructuredBuffer<float4> RW_PathPointSurfaceTargets;
 RWStructuredBuffer<float4> RW_PathPointSurfaceNormals;
+#if VINE_OUTPUT_BASESTREAMS
+// Base-stream output layout (matches RoadBuilder.usf): interleaved-free typed buffers the
+// GPU-resident mesh path consumes directly, plus DrawIndexedIndirect args and CPU-readback counters.
+RWBuffer<float> RWPositions;    // 3 floats / vertex
+RWBuffer<uint>  RWTangents;     // 2 packed 8888 SNORM / vertex (TangentX, TangentZ)
+RWBuffer<float> RWTexCoords;    // 2 floats / vertex
+RWBuffer<uint>  RWColors;       // packed / vertex
+RWBuffer<uint>  RWBaseIndices;
+RWBuffer<uint>  RWIndirectArgs; // DrawIndexedIndirect: 5 uints
+RWBuffer<uint>  RWMeshCounters; // [0]=vertexCount [1]=indexCount (CPU readback carrier)
+float4x4 VineWorldToLocal;
+#else
 RWStructuredBuffer<float4> RW_OutVertices;
 RWStructuredBuffer<float2> RW_OutUVs;
 RWStructuredBuffer<uint> RW_OutIndices;
+#endif
 RWStructuredBuffer<float4> RW_PathPointsNoised;
+
+uint PackSnorm8888(float4 V)
+{
+	int4 I = int4(round(clamp(V, -1.0, 1.0) * 127.0));
+	return (uint(I.x) & 0xFF) | ((uint(I.y) & 0xFF) << 8) | ((uint(I.z) & 0xFF) << 16) | ((uint(I.w) & 0xFF) << 24);
+}
 
 uint PathPointCount;
 uint SegmentCount;
@@ -118,6 +137,200 @@ int FindVoxelIndexForCell(int3 QueryCell)
     }
 
     return -1;
+}
+
+// Trip B: rebuild the vine's one-buffer voxel-cell hash on the GPU straight from the
+// producer's retained GPU cells, so the vine can consume the GPU-resident surface voxels
+// without the readback + CPU BuildVineVoxelHashSlots + re-upload. The layout it writes is
+// exactly what FindVoxelIndexForCell above decodes: slot = HashVoxelCell(cell) & (Count-1),
+// linear probe, slot stores voxelIndex+1 (0 = empty). RW_HashBuildSlots must be cleared to
+// 0 before this dispatch. HashBuildSlotCount must be a power of two.
+StructuredBuffer<int4> HashBuildCells;
+RWStructuredBuffer<uint> RW_HashBuildSlots;
+uint HashBuildVoxelCount;
+uint HashBuildSlotCount;
+
+[numthreads(64, 1, 1)]
+void BuildVineVoxelHashCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint i = DispatchThreadId.x;
+    if (i >= HashBuildVoxelCount || HashBuildSlotCount == 0u)
+    {
+        return;
+    }
+    int3 Cell = HashBuildCells[i].xyz;
+    uint Mask = HashBuildSlotCount - 1u;
+    uint Slot = HashVoxelCell(Cell) & Mask;
+    for (uint Probe = 0u; Probe < HashBuildSlotCount; ++Probe)
+    {
+        uint Prev = 0u;
+        InterlockedCompareExchange(RW_HashBuildSlots[Slot], 0u, i + 1u, Prev);
+        if (Prev == 0u)
+        {
+            return; // claimed an empty slot
+        }
+        Slot = (Slot + 1u) & Mask;
+    }
+}
+
+// Trip B / Stage 2: build the target-bucket CSR acceleration structure on the GPU straight from
+// the producer's GPU-resident target positions, so the vine no longer needs the blocking surface-
+// voxel readback + CPU BuildVineTargetBucketBuffers. The layout produced here is exactly what
+// FindTargetBucketRangeForCell (below) decodes: RW_BB_HashSlots[slot] = rangeIndex+1 (0=empty),
+// linear probe; RW_BB_Ranges[r] = (cellX, cellY, cellZ, itemStart); RW_BB_RangeCounts[r] = count;
+// RW_BB_VoxelIndices is the concatenated per-bucket target-index list (CSR). BB_SlotCount is a
+// power of two; BB_TargetCount (= voxel/target count) is an upper bound on the real bucket count.
+StructuredBuffer<float4> BB_TargetPositions;
+RWStructuredBuffer<uint>  RW_BB_HashSlots;    // [SB], cleared 0; 0=empty, 0xffffffff=claiming, else rangeIndex+1
+RWStructuredBuffer<int4>  RW_BB_Ranges;       // [N]; xyz=bucket cell, w=item start offset
+RWStructuredBuffer<uint>  RW_BB_RangeCounts;  // [N], cleared 0; items per bucket
+RWStructuredBuffer<uint>  RW_BB_Counter;      // [1], cleared 0; dense bucket allocator
+RWStructuredBuffer<uint>  RW_BB_ItemCursor;   // [1], cleared 0; CSR start allocator
+RWStructuredBuffer<uint>  RW_BB_RangeFill;    // [N], cleared 0; per-bucket scatter cursor
+RWStructuredBuffer<uint>  RW_BB_VoxelIndices; // [N]; CSR item list (target indices)
+float3 BB_Origin;
+float  BB_BucketSize;
+uint   BB_TargetCount;
+uint   BB_SlotCount;
+
+// Byte-identical to GetTargetBucketCell below so the built cells match what the decode queries.
+int3 BuildTargetBucketCell(float3 Position)
+{
+    return int3(floor((Position - BB_Origin) / max(BB_BucketSize, 1.0e-8f)));
+}
+
+static const uint BB_SLOT_LOCK = 0xffffffffu;
+
+// Pass 1: dedup targets into coarse-cell buckets, allocate a dense range index per unique cell,
+// build the hash-slot table, and count items per bucket. Adapts StaticMeshPointSampler.usf's
+// claim -> allocate -> DeviceMemoryBarrier -> publish -> bounded-spin pattern to the single-array
+// (rangeIndex+1) slot format the vine decodes.
+[numthreads(64, 1, 1)]
+void VVBuildTargetBucketsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint i = DispatchThreadId.x;
+    if (i >= BB_TargetCount || BB_SlotCount == 0u)
+    {
+        return;
+    }
+    float3 T = BB_TargetPositions[i].xyz;
+    if (!all(isfinite(T)))
+    {
+        return; // matches the CPU build's non-finite skip
+    }
+    int3 Cell = BuildTargetBucketCell(T);
+    uint Mask = BB_SlotCount - 1u;
+    uint Slot = HashVoxelCell(Cell) & Mask;
+    for (uint Probe = 0u; Probe < BB_SlotCount; ++Probe)
+    {
+        uint Prev = 0u;
+        InterlockedCompareExchange(RW_BB_HashSlots[Slot], 0u, BB_SLOT_LOCK, Prev);
+        if (Prev == 0u)
+        {
+            // Claimed an empty slot -> this thread owns a brand-new bucket.
+            uint RangeIndex = 0u;
+            InterlockedAdd(RW_BB_Counter[0], 1u, RangeIndex);
+            RW_BB_Ranges[RangeIndex] = int4(Cell, 0);
+            InterlockedAdd(RW_BB_RangeCounts[RangeIndex], 1u); // count this target
+            DeviceMemoryBarrier();
+            uint Ignored = 0u;
+            InterlockedExchange(RW_BB_HashSlots[Slot], RangeIndex + 1u, Ignored); // publish
+            return;
+        }
+        else if (Prev == BB_SLOT_LOCK)
+        {
+            // Another thread is mid-claim on this slot; wait (bounded) for it to publish.
+            uint Published = BB_SLOT_LOCK;
+            for (uint Wait = 0u; Wait < 64u; ++Wait)
+            {
+                Published = RW_BB_HashSlots[Slot];
+                if (Published != BB_SLOT_LOCK)
+                {
+                    break;
+                }
+            }
+            if (Published != BB_SLOT_LOCK && Published != 0u)
+            {
+                uint RangeIndex = Published - 1u;
+                if (all(RW_BB_Ranges[RangeIndex].xyz == Cell))
+                {
+                    InterlockedAdd(RW_BB_RangeCounts[RangeIndex], 1u);
+                    return;
+                }
+            }
+            Slot = (Slot + 1u) & Mask; // different cell (or spin timeout) -> linear probe
+        }
+        else
+        {
+            // Slot already holds a published rangeIndex+1.
+            uint RangeIndex = Prev - 1u;
+            if (all(RW_BB_Ranges[RangeIndex].xyz == Cell))
+            {
+                InterlockedAdd(RW_BB_RangeCounts[RangeIndex], 1u);
+                return;
+            }
+            Slot = (Slot + 1u) & Mask; // hash collision, different cell -> linear probe
+        }
+    }
+}
+
+// Pass 2: turn per-bucket counts into CSR start offsets via an atomic bump (order-independent;
+// each real bucket gets a unique contiguous [start, start+count) slice). No prefix-sum needed.
+[numthreads(64, 1, 1)]
+void VVComputeBucketStartsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint RangeIndex = DispatchThreadId.x;
+    if (RangeIndex >= BB_TargetCount)
+    {
+        return;
+    }
+    uint Count = RW_BB_RangeCounts[RangeIndex];
+    if (Count == 0u)
+    {
+        return; // not an allocated bucket
+    }
+    uint Start = 0u;
+    InterlockedAdd(RW_BB_ItemCursor[0], Count, Start);
+    RW_BB_Ranges[RangeIndex].w = int(Start);
+}
+
+// Pass 3: scatter each target index into its bucket's CSR slice (re-probe the published hash).
+[numthreads(64, 1, 1)]
+void VVScatterTargetsToBucketsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint i = DispatchThreadId.x;
+    if (i >= BB_TargetCount || BB_SlotCount == 0u)
+    {
+        return;
+    }
+    float3 T = BB_TargetPositions[i].xyz;
+    if (!all(isfinite(T)))
+    {
+        return;
+    }
+    int3 Cell = BuildTargetBucketCell(T);
+    uint Mask = BB_SlotCount - 1u;
+    uint Slot = HashVoxelCell(Cell) & Mask;
+    for (uint Probe = 0u; Probe < BB_SlotCount; ++Probe)
+    {
+        uint Packed = RW_BB_HashSlots[Slot];
+        if (Packed == 0u)
+        {
+            return; // unreachable: pass 1 created a slot for every finite target
+        }
+        if (Packed != BB_SLOT_LOCK)
+        {
+            uint RangeIndex = Packed - 1u;
+            if (all(RW_BB_Ranges[RangeIndex].xyz == Cell))
+            {
+                uint LocalPos = 0u;
+                InterlockedAdd(RW_BB_RangeFill[RangeIndex], 1u, LocalPos);
+                RW_BB_VoxelIndices[uint(RW_BB_Ranges[RangeIndex].w) + LocalPos] = i;
+                return;
+            }
+        }
+        Slot = (Slot + 1u) & Mask;
+    }
 }
 
 int3 GetTargetBucketCell(float3 Position)
@@ -1134,10 +1347,37 @@ void BuildVVVoxelCS(uint3 DispatchThreadId : SV_DispatchThreadID)
             float3 Center = SurfaceTarget + SurfaceNormal * TinyJitter;
             float3 OutPosition = Center + Binormal * Profile.x + FrameNormal * Profile.y;
 
+#if VINE_OUTPUT_BASESTREAMS
+            float3 LocalPos = mul(float4(OutPosition, 1.0f), VineWorldToLocal).xyz;
+            RWPositions[Index*3+0] = LocalPos.x; RWPositions[Index*3+1] = LocalPos.y; RWPositions[Index*3+2] = LocalPos.z;
+            float3 RadialNormal = SafeNormalize3(Binormal * Profile.x + FrameNormal * Profile.y, FrameNormal);
+            RWTangents[Index*2+0] = PackSnorm8888(float4(Tangent, 0.0f));       // TangentX = 沿管切线
+            RWTangents[Index*2+1] = PackSnorm8888(float4(RadialNormal, 1.0f));  // TangentZ = 法线(+w 符号)
+            RWTexCoords[Index*2+0] = U; RWTexCoords[Index*2+1] = V;
+            RWColors[Index] = 0xFFFFFFFFu;
+#else
             RW_OutVertices[Index] = float4(OutPosition, 1.0f);
             RW_OutUVs[Index] = float2(U, V);
+#endif
         }
+
+#if VINE_OUTPUT_BASESTREAMS
+        // Only thread 0 publishes the fixed vine mesh counts / indirect draw args once.
+        if (Index == 0u)
+        {
+            RWMeshCounters[0] = OutputVertexCount; RWMeshCounters[1] = OutputIndexCount;
+            RWIndirectArgs[0] = OutputIndexCount; RWIndirectArgs[1] = 1u;
+            RWIndirectArgs[2] = 0u; RWIndirectArgs[3] = 0u; RWIndirectArgs[4] = 0u;
+        }
+#endif
     }
+
+    // Index target is chosen once here; index values / winding below are identical either way.
+#if VINE_OUTPUT_BASESTREAMS
+#define OUT_INDEX(i) RWBaseIndices[i]
+#else
+#define OUT_INDEX(i) RW_OutIndices[i]
+#endif
 
     if (Index < SegmentCount && ProfileCount > 0u)
     {
@@ -1169,12 +1409,12 @@ void BuildVVVoxelCS(uint3 DispatchThreadId : SV_DispatchThreadID)
                 uint B0 = BBase + Edge;
                 uint B1 = BBase + NextEdge;
 
-                RW_OutIndices[WriteBase + 0u] = A0;
-                RW_OutIndices[WriteBase + 1u] = B0;
-                RW_OutIndices[WriteBase + 2u] = B1;
-                RW_OutIndices[WriteBase + 3u] = A0;
-                RW_OutIndices[WriteBase + 4u] = B1;
-                RW_OutIndices[WriteBase + 5u] = A1;
+                OUT_INDEX(WriteBase + 0u) = A0;
+                OUT_INDEX(WriteBase + 1u) = B0;
+                OUT_INDEX(WriteBase + 2u) = B1;
+                OUT_INDEX(WriteBase + 3u) = A0;
+                OUT_INDEX(WriteBase + 4u) = B1;
+                OUT_INDEX(WriteBase + 5u) = A1;
             }
         }
         else
@@ -1187,16 +1427,17 @@ void BuildVVVoxelCS(uint3 DispatchThreadId : SV_DispatchThreadID)
                 uint B0 = BBase + 0u;
                 uint B1 = BBase + 1u;
 
-                RW_OutIndices[WriteBase + 0u] = A0;
-                RW_OutIndices[WriteBase + 1u] = B0;
-                RW_OutIndices[WriteBase + 2u] = B1;
-                RW_OutIndices[WriteBase + 3u] = A0;
-                RW_OutIndices[WriteBase + 4u] = B1;
-                RW_OutIndices[WriteBase + 5u] = A1;
+                OUT_INDEX(WriteBase + 0u) = A0;
+                OUT_INDEX(WriteBase + 1u) = B0;
+                OUT_INDEX(WriteBase + 2u) = B1;
+                OUT_INDEX(WriteBase + 3u) = A0;
+                OUT_INDEX(WriteBase + 4u) = B1;
+                OUT_INDEX(WriteBase + 5u) = A1;
             }
         }
     }
 }
+#undef OUT_INDEX
 
 // ============================================================================
 // Pass P - ApplyVVPerlinNoiseCS: offset SurfaceTarget along SurfaceNormal
@@ -1231,4 +1472,158 @@ void ApplyVVPerlinNoiseCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     float Displacement = PerlinNoiseStrength * NoiseValue;
 
     RW_PathPointSurfaceTargets[PointIndex] = float4(Target + Normal * Displacement, PackedTarget.w);
+}
+
+// ============================================================================
+// Base-stream axial V (mesh UV.y) — GPU port of the CPU
+// RecomputeVineOutputUVsFromGeneratedLength. ONLY dispatched on the base-stream
+// path (see AddVineMeshPasses / Out.bBaseStreams). BuildVVVoxelCS (pass#8) writes
+// RWTexCoords[Index*2+1] = 0; these four passes overwrite it with the correct V.
+// Everything works over scratch structured buffers holding one entry per output
+// point (PointCount = OutputVertexCount / ProfileCount):
+//   V1 VineUVCentersCS (PointCount threads):  ring center + circumference
+//   V2 VineUVSegLenCS  (SegmentCount threads): per-segment axial length; SegLen is
+//        cleared to -1 first, and -1 marks a line boundary (V resets there)
+//   V3 VineUVScanCS    (single thread):        serial prefix scan with reset -> CurveV
+//   V4 VineUVWriteCS   (OutputVertexCount thr): broadcast CurveV[P] to every ring vert
+// The base-stream leaf is an identity transform, so RWPositions is local==world and
+// the distances/perimeters match the CPU (which runs on world-space output verts).
+// Names are VineUV_-prefixed to avoid clashing with the globals above.
+// ============================================================================
+Buffer<float>            VineUV_Positions;    // base-stream RWPositions, read as typed Buffer<float> (3 floats/vertex)
+StructuredBuffer<int4>   VineUV_SegmentMeta;  // same SegmentMeta the mesh build consumes (.x=A, .y=B)
+StructuredBuffer<float4> VineUV_Centers;      // ring centers (xyz) written by V1
+StructuredBuffer<float>  VineUV_RingCirc;     // ring circumferences written by V1
+StructuredBuffer<float>  VineUV_SegLen;       // per-point forward axial length (-1 = line boundary)
+StructuredBuffer<float>  VineUV_CurveV;       // prefix-scanned V per point written by V3
+RWStructuredBuffer<float4> RW_VineUV_Centers;
+RWStructuredBuffer<float>  RW_VineUV_RingCirc;
+RWStructuredBuffer<float>  RW_VineUV_SegLen;
+RWStructuredBuffer<float>  RW_VineUV_CurveV;
+RWBuffer<float>            RW_VineUV_TexCoords; // same buffer as base-stream RWTexCoords
+uint  VineUV_PointCount;
+uint  VineUV_ProfileCount;
+uint  VineUV_SegmentCount;
+uint  VineUV_OutputVertexCount;
+float VineUV_LengthScale;                       // raw VV.UVLengthScale (max()'d in the scan)
+
+float3 VineUV_LoadVertex(uint VertexIndex)
+{
+    uint Base = VertexIndex * 3u;
+    return float3(VineUV_Positions[Base + 0u], VineUV_Positions[Base + 1u], VineUV_Positions[Base + 2u]);
+}
+
+// V1: Center(P) = mean of the P point's ProfileCount ring vertices; RingCirc(P) =
+// closed polygon perimeter of that ring. Mirrors GetVineOutputProfileCenter + the
+// perimeter loop in RecomputeVineOutputUVsFromGeneratedLength.
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void VineUVCentersCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint P = DispatchThreadId.x;
+    if (P >= VineUV_PointCount || VineUV_ProfileCount == 0u)
+    {
+        return;
+    }
+    uint BaseVertex = P * VineUV_ProfileCount;
+    float3 Sum = float3(0.0f, 0.0f, 0.0f);
+    float Perimeter = 0.0f;
+    for (uint k = 0u; k < VineUV_ProfileCount; ++k)
+    {
+        float3 Curr = VineUV_LoadVertex(BaseVertex + k);
+        float3 Next = VineUV_LoadVertex(BaseVertex + ((k + 1u) % VineUV_ProfileCount));
+        Sum += Curr;
+        Perimeter += length(Next - Curr);
+    }
+    RW_VineUV_Centers[P] = float4(Sum / (float)VineUV_ProfileCount, 0.0f);
+    RW_VineUV_RingCirc[P] = Perimeter;
+}
+
+// V2: per-segment axial length. Only consecutive within-line pairs (B == A+1) with
+// A in [0,PointCount-1) contribute; SegLen[A] stays at its cleared -1 otherwise,
+// marking a line boundary for the scan. Matches the CPU SegmentMeta guard exactly.
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void VineUVSegLenCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint i = DispatchThreadId.x;
+    if (i >= VineUV_SegmentCount)
+    {
+        return;
+    }
+    int4 Seg = VineUV_SegmentMeta[i];
+    int A = Seg.x;
+    int B = Seg.y;
+    if (A < 0 || B != A + 1)
+    {
+        return;
+    }
+    if (A >= (int)VineUV_PointCount - 1 || B >= (int)VineUV_PointCount)
+    {
+        return;
+    }
+    float3 CA = VineUV_Centers[A].xyz;
+    float3 CB = VineUV_Centers[B].xyz;
+    RW_VineUV_SegLen[A] = length(CB - CA);
+}
+
+// V3: serial prefix scan (single thread). CurveV[0]=0; walk P=1..N-1 accumulating
+// (axial / avgCircumference) * LengthScale, resetting to 0 at any line boundary
+// (SegLen[P-1] < 0). Prev tracks CurveV[P-1]. Byte-for-byte the CPU accumulation.
+[numthreads(1, 1, 1)]
+void VineUVScanCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (DispatchThreadId.x != 0u)
+    {
+        return;
+    }
+    uint N = VineUV_PointCount;
+    if (N == 0u)
+    {
+        return;
+    }
+    float LengthScale = max(VineUV_LengthScale, 1.0e-8f);
+    RW_VineUV_CurveV[0] = 0.0f;
+    float Prev = 0.0f; // == CurveV[P-1]
+    for (uint P = 1u; P < N; ++P)
+    {
+        float Axial = VineUV_SegLen[P - 1u];
+        if (Axial < 0.0f)
+        {
+            RW_VineUV_CurveV[P] = 0.0f; // segment break -> V resets, next run starts at 0
+            Prev = 0.0f;
+            continue;
+        }
+        float AvgCirc = max((VineUV_RingCirc[P - 1u] + VineUV_RingCirc[P]) * 0.5f, 1.0e-4f);
+        float V = Prev + (Axial / AvgCirc) * LengthScale;
+        RW_VineUV_CurveV[P] = V;
+        Prev = V;
+    }
+}
+
+// V4: broadcast the per-point V to all ProfileCount ring vertices, overwriting the 0
+// pass#8 wrote into RWTexCoords[Index*2+1]. U (Index*2+0) is left untouched.
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void VineUVWriteCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint Index = DispatchThreadId.x;
+    if (Index >= VineUV_OutputVertexCount || VineUV_ProfileCount == 0u)
+    {
+        return;
+    }
+    uint P = Index / VineUV_ProfileCount;
+    float V = (P < VineUV_PointCount) ? VineUV_CurveV[P] : 0.0f;
+    RW_VineUV_TexCoords[Index * 2u + 1u] = V;
+}
+
+StructuredBuffer<int4> VineDebugSegmentMeta;
+RWBuffer<uint> RWVineDebugIndices;
+uint VineDebugSegmentCount;
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void VineDebugLineIndicesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint SegmentIndex = DispatchThreadId.x;
+    if (SegmentIndex >= VineDebugSegmentCount) return;
+    int4 Segment = VineDebugSegmentMeta[SegmentIndex];
+    RWVineDebugIndices[SegmentIndex * 2u] = (uint)max(Segment.x, 0);
+    RWVineDebugIndices[SegmentIndex * 2u + 1u] = (uint)max(Segment.y, 0);
 }

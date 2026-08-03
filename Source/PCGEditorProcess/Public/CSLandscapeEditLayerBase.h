@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "ComputeShaderMeshGenerator.h"
 #include "ComputeShaderBasicFunction.h"
 #include "LandscapeEditLayerRenderer.h"
 #include "LandscapeEditLayerRendererState.h"
@@ -24,7 +25,7 @@ class UTextureRenderTarget2D;
  * that fills their own render targets.
  */
 UCLASS(Abstract)
-class PCGEDITORPROCESS_API ACSLandscapeEditLayerBase : public AActor
+class PCGEDITORPROCESS_API ACSLandscapeEditLayerBase : public AComputeShaderMeshGenerator
 #if CPP && WITH_EDITOR
 	, public ILandscapeEditLayerRenderer
 #endif
@@ -38,6 +39,17 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "LandscapeEditLayer")
 	void RequestLandscapeUpdate(bool bInUserTriggered = false);
 
+	/** Opacity of this actor's Edit Layer heightmap contribution, mapped to the Landscape layer Alpha
+	 *  (-1..1). Drive it from the Construction Script via SetEditLayerAlpha(). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LandscapeEditLayer",
+		meta = (ClampMin = "-1.0", ClampMax = "1.0"))
+	float EditLayerAlpha = 1.0f;
+
+	/** Set EditLayerAlpha and push it to the owning Landscape edit layer immediately (Blueprint-callable). */
+	UFUNCTION(BlueprintCallable, Category = "LandscapeEditLayer")
+	void SetEditLayerAlpha(float InAlpha);
+
+	virtual void PostActorCreated() override;
 	virtual void PostLoad() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void Destroyed() override;
@@ -78,20 +90,28 @@ protected:
 	/** Remove this actor's owned Edit Layer from the Landscape. */
 	void RemoveEditLayer();
 
+	/** Push EditLayerAlpha to the owning Landscape edit layer (no-op until the layer exists). */
+	void ApplyEditLayerAlpha();
+
 	/**
 	 * Bake a render target into the Landscape heightmap (persistent layer 0).
 	 * Shared by every subclass Commit; differences are passed in.
 	 *
-	 * @param SourceRT                 RT whose Alpha channel holds the world-space height.
+	 * @param SourceRT                 RT holding the world-space height (channel selected by bHeightInAlpha).
 	 * @param LandscapeData            Region descriptor (TextureValidSize + ReadRange).
 	 * @param bClearLayerFirst         Clear the target layer's heightmap before writing.
 	 * @param bWriteAlphaBlendAndFlags Also write zeroed AlphaBlend/Flags channels.
+	 * @param bHeightInAlpha           true: height in Alpha (legacy). false: height in Red (Copy/merge convention).
 	 */
 	void BakeResultToLandscape(
 		UTextureRenderTarget2D* SourceRT,
 		const FCSReadLandscapeData& LandscapeData,
 		bool bClearLayerFirst,
-		bool bWriteAlphaBlendAndFlags);
+		bool bWriteAlphaBlendAndFlags,
+		bool bHeightInAlpha = true);
+
+	/** Bake a merge-pipeline texture whose landscape uint16 height is packed in normalized RG. */
+	void BakePackedHeightToLandscape(UTextureRenderTarget2D* SourceRT, const FIntRect& SectionRect);
 
 	// --- Subclass customization hooks ---
 

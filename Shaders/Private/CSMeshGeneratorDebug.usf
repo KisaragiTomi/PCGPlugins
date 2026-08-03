@@ -1,0 +1,102 @@
+// GPU-only surface-voxel debug geometry. Counter[0] remains GPU-resident and drives
+// DrawIndexedIndirect, so neither the valid count nor the generated geometry is read back.
+
+#include "/Engine/Public/Platform.ush"
+
+Buffer<float4> InVoxelPositions;
+Buffer<float4> InVoxelNormals;
+Buffer<uint> InVoxelCounter;
+
+RWBuffer<float4> RWDebugPositions;
+RWBuffer<uint> RWMainIndices;
+RWBuffer<uint> RWPointIndices;
+RWBuffer<uint> RWMainIndirectArgs;
+RWBuffer<uint> RWPointIndirectArgs;
+
+uint VoxelCapacity;
+uint MaxVoxelsToDraw;
+uint DebugMode;
+uint bDrawPoints;
+uint bReverseOrientation;
+float VoxelSize;
+float DirectionLength;
+float QuadScale;
+float NormalOffsetScale;
+
+float3 SafeNormal(float3 Value)
+{
+	const float LengthSquared = dot(Value, Value);
+	if (!all(isfinite(Value)) || LengthSquared < 1.0e-8f) return float3(0.0f, 0.0f, 1.0f);
+	return Value * rsqrt(LengthSquared);
+}
+
+[numthreads(64, 1, 1)]
+void BuildDebugGeometryCS(uint3 Id : SV_DispatchThreadID)
+{
+	const uint VoxelIndex = Id.x;
+	if (VoxelIndex >= MaxVoxelsToDraw || VoxelIndex >= VoxelCapacity) return;
+
+	const float3 Position = InVoxelPositions[VoxelIndex].xyz;
+	const float3 Normal = SafeNormal(InVoxelNormals[VoxelIndex].xyz);
+	if (DebugMode == 0u)
+	{
+		const uint BaseVertex = VoxelIndex * 2u;
+		RWDebugPositions[BaseVertex + 0u] = float4(Position, 1.0f);
+		RWDebugPositions[BaseVertex + 1u] = float4(Position + Normal * DirectionLength, 1.0f);
+		RWMainIndices[BaseVertex + 0u] = BaseVertex + 0u;
+		RWMainIndices[BaseVertex + 1u] = BaseVertex + 1u;
+		if (bDrawPoints != 0u) RWPointIndices[VoxelIndex] = BaseVertex;
+		return;
+	}
+
+	const float3 Helper = abs(Normal.z) < 0.99f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+	const float3 AxisX = SafeNormal(cross(Helper, Normal));
+	const float3 AxisY = SafeNormal(cross(Normal, AxisX));
+	const float3 Center = Position + Normal * (VoxelSize * NormalOffsetScale);
+	const float HalfSize = max(VoxelSize * QuadScale * 0.5f, 1.0e-4f);
+	const float3 DX = AxisX * HalfSize;
+	const float3 DY = AxisY * HalfSize;
+	const uint BaseVertex = VoxelIndex * 4u;
+	const uint BaseIndex = VoxelIndex * 6u;
+	RWDebugPositions[BaseVertex + 0u] = float4(Center - DX - DY, 1.0f);
+	RWDebugPositions[BaseVertex + 1u] = float4(Center + DX - DY, 1.0f);
+	RWDebugPositions[BaseVertex + 2u] = float4(Center + DX + DY, 1.0f);
+	RWDebugPositions[BaseVertex + 3u] = float4(Center - DX + DY, 1.0f);
+
+	if (bReverseOrientation != 0u)
+	{
+		RWMainIndices[BaseIndex + 0u] = BaseVertex + 0u;
+		RWMainIndices[BaseIndex + 1u] = BaseVertex + 2u;
+		RWMainIndices[BaseIndex + 2u] = BaseVertex + 1u;
+		RWMainIndices[BaseIndex + 3u] = BaseVertex + 0u;
+		RWMainIndices[BaseIndex + 4u] = BaseVertex + 3u;
+		RWMainIndices[BaseIndex + 5u] = BaseVertex + 2u;
+	}
+	else
+	{
+		RWMainIndices[BaseIndex + 0u] = BaseVertex + 0u;
+		RWMainIndices[BaseIndex + 1u] = BaseVertex + 1u;
+		RWMainIndices[BaseIndex + 2u] = BaseVertex + 2u;
+		RWMainIndices[BaseIndex + 3u] = BaseVertex + 0u;
+		RWMainIndices[BaseIndex + 4u] = BaseVertex + 2u;
+		RWMainIndices[BaseIndex + 5u] = BaseVertex + 3u;
+	}
+}
+
+[numthreads(1, 1, 1)]
+void BuildDebugIndirectArgsCS(uint3 Id : SV_DispatchThreadID)
+{
+	const uint ValidVoxels = min(min(InVoxelCounter[0], MaxVoxelsToDraw), VoxelCapacity);
+	const uint MainIndexCount = DebugMode == 0u ? ValidVoxels * 2u : ValidVoxels * 6u;
+	RWMainIndirectArgs[0] = MainIndexCount;
+	RWMainIndirectArgs[1] = 1u;
+	RWMainIndirectArgs[2] = 0u;
+	RWMainIndirectArgs[3] = 0u;
+	RWMainIndirectArgs[4] = 0u;
+
+	RWPointIndirectArgs[0] = DebugMode == 0u && bDrawPoints != 0u ? ValidVoxels : 0u;
+	RWPointIndirectArgs[1] = 1u;
+	RWPointIndirectArgs[2] = 0u;
+	RWPointIndirectArgs[3] = 0u;
+	RWPointIndirectArgs[4] = 0u;
+}

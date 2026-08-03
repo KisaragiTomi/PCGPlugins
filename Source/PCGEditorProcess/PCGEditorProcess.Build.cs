@@ -63,7 +63,6 @@ public class PCGEditorProcess : ModuleRules
 				"MaterialUtilities",
 				"Blutility",
 				"LandscapeEditorUtilities",
-				"DataLayerEditor",
 			"AnimationCore",
 			"MeshDescription",
 			"SkeletalMeshDescription",

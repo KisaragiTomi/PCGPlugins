@@ -2,7 +2,6 @@
 #include "MeshGeneratorBrushCache.h"
 
 #include "ComputeShaderBasicFunction.h"
-#include "DynamicMeshActor.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
@@ -27,6 +26,10 @@
 #include "Landscape.h"
 #include "LandscapeComponent.h"
 #include "LandscapeProxy.h"
+#include "CSDirectTriangleMeshComponent.h"
+#include "CSGpuMeshSave.h"
+#include "CSMeshGeneratorDebugComponent.h"
+#include "Materials/MaterialInterface.h"
 #include "MeshDescription.h"
 #include "MeshDescriptionToDynamicMesh.h"
 #if WITH_EDITOR
@@ -34,12 +37,19 @@
 #endif
 #include "RawIndexBuffer.h"
 #include "RenderGraphResources.h"
+#include "RenderResource.h"
 #include "RHI.h"
+#include "RHIResourceUtils.h"
 #include "RHIGPUReadback.h"
 #include "ShaderParameterStruct.h"
 #include "StaticMeshResources.h"
+#include "StaticMeshComponentLODInfo.h"
 #include "StaticMeshAttributes.h"
+#include "Rendering/ColorVertexBuffer.h"
 #include "UObject/UObjectIterator.h"
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+#endif
 
 #include <openvdb/tools/ParticlesToLevelSet.h>
 #include <openvdb/tools/VolumeToMesh.h>
@@ -271,6 +281,25 @@ void ConvertVDBVolumeToMeshDescription(openvdb::FloatGrid::ConstPtr SDFVolume, F
 }
 }
 
+// 娑撯偓娑擃亝瀵旀稊鍛畱 1 閸忓啰绀岄妴浣稿弿 0 閻?float2 typed 妞ゅ墎鍋ｇ紓鎾冲暱 + SRV閵嗗倻绮版稉宥堟嫹闊?UV 閻?extract 鐠侯垰绶?
+// 閿涘牆顩?heightmap閿涘鍨ㄥ┃?mesh 閺?tex-coord SRV 閺冨墎绮︾€?SourceTexCoordBuffer閿涘矂鍘ら崥?NumTexCoords=0
+// 娴?shader 娑撳秶婀″锝堫嚢閸欐牕鐣犻妴鍌滄暏 PF_G32R32F 娴犮儱灏柊?shader 閻?Buffer<float2> 鐠у嫭绨猾璇茬€烽妴?
+class FCSDummyTexCoordVertexBuffer : public FVertexBufferWithSRV
+{
+public:
+	virtual void InitRHI(FRHICommandListBase& RHICmdList) override
+	{
+		const FVector2f Zero(0.0f, 0.0f);
+		VertexBufferRHI = UE::RHIResourceUtils::CreateVertexBufferFromArray(
+			RHICmdList, TEXT("CSDummyTexCoord"), EBufferUsageFlags::ShaderResource,
+			MakeArrayView(&Zero, 1));
+		ShaderResourceViewRHI = RHICmdList.CreateShaderResourceView(
+			VertexBufferRHI,
+			FRHIViewDesc::CreateBufferSRV().SetType(FRHIViewDesc::EBufferType::Typed).SetFormat(PF_G32R32F));
+	}
+};
+static TGlobalResource<FCSDummyTexCoordVertexBuffer> GCSDummyTexCoordVertexBuffer;
+
 class FExtractStaticMeshTrianglesCS : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FExtractStaticMeshTrianglesCS);
@@ -279,10 +308,14 @@ class FExtractStaticMeshTrianglesCS : public FGlobalShader
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_SRV(Buffer<uint>, IndexBuffer)
 		SHADER_PARAMETER_SRV(Buffer<float>, PositionBuffer)
+		SHADER_PARAMETER_SRV(Buffer<float2>, SourceTexCoordBuffer)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, ReferencePoints)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, TriToMaterial)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleVertices)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleNormals)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_TriangleCounter)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_OutTriangleMaterialIds)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float2>, RW_OutTriangleUVs)
 		SHADER_PARAMETER(FMatrix44f, LocalToWorld)
 		SHADER_PARAMETER(FVector3f, BoundsMin)
 		SHADER_PARAMETER(FVector3f, BoundsMax)
@@ -290,6 +323,7 @@ class FExtractStaticMeshTrianglesCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, PositionStrideFloat)
 		SHADER_PARAMETER(uint32, ReferenceCount)
 		SHADER_PARAMETER(uint32, TriangleCapacity)
+		SHADER_PARAMETER(uint32, NumTexCoords)
 		SHADER_PARAMETER(uint32, bUseBounds)
 		SHADER_PARAMETER(uint32, bUseReferenceFilter)
 		SHADER_PARAMETER(float, ReferenceFilterDistanceSq)
@@ -308,6 +342,56 @@ class FExtractStaticMeshTrianglesCS : public FGlobalShader
 };
 
 IMPLEMENT_GLOBAL_SHADER(FExtractStaticMeshTrianglesCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "ExtractStaticMeshTrianglesCS", SF_Compute);
+
+
+// Nanite 閸忋劎绮忛懞鍌涚爱娑撳顫楁潻钘夊閿涙俺顕伴崣?game thread 娴?editor MeshDescription 閹绘劕褰囬妴浣稿嚒閸欐ɑ宕查崚棰佺瑯閻ｅ瞼鈹栭梻瀵告畱濠ф劒绗佺憴?
+// 閿涘澋orld-space 妞ゅ墎鍋?+ UV0 + 閺夋劘宸?registry id閿涘绱濋崢鐔风摍鏉╄棄濮炴潻娑楃瑢 FExtractStaticMeshTrianglesCS 鐎瑰苯鍙忛惄绋挎倱閻?
+// triangle soup閿涘牆顦查悽銊ユ倱娑撯偓 RW_TriangleCounter/妞ゅ墎鍋?濞夋洜鍤?閺夋劘宸?UV UAV閿涘鈧倻鏁ゆ禍搴㈡禌閹?Nanite 缂冩垶鐗搁惃鍕秵濡?render fallback閵?
+class FAppendSourceTrianglesCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FAppendSourceTrianglesCS);
+	SHADER_USE_PARAMETER_STRUCT(FAppendSourceTrianglesCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, SourceTriangleVertices)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, SourceTriangleNormals)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float2>, SourceTriangleUVs)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, SourceTriangleColors)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, SourceTriangleTangents)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, SourceTriangleBiTangents)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SourceTriangleMaterialIds)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, ReferencePoints)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleVertices)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleNormals)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_TriangleCounter)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_OutTriangleMaterialIds)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float2>, RW_OutTriangleUVs)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleColors)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleTangents)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleBiTangents)
+		SHADER_PARAMETER(FVector3f, BoundsMin)
+		SHADER_PARAMETER(FVector3f, BoundsMax)
+		SHADER_PARAMETER(uint32, TriangleCount)
+		SHADER_PARAMETER(uint32, TriangleCapacity)
+		SHADER_PARAMETER(uint32, ReferenceCount)
+		SHADER_PARAMETER(uint32, bUseBounds)
+		SHADER_PARAMETER(uint32, bUseReferenceFilter)
+		SHADER_PARAMETER(float, ReferenceFilterDistanceSq)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FAppendSourceTrianglesCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "AppendSourceTrianglesCS", SF_Compute);
 
 
 class FFilterTriangleSoupByReferenceCS : public FGlobalShader
@@ -539,7 +623,7 @@ class FScatterTrianglesToVoxelCacheCS : public FGlobalShader
 IMPLEMENT_GLOBAL_SHADER(FScatterTrianglesToVoxelCacheCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "ScatterTrianglesToVoxelCacheCS", SF_Compute);
 
 // -----------------------------------------------------------------------------
-// Triangle Soup → Heightmap rasterization
+// Triangle Soup 閳?Heightmap rasterization
 // -----------------------------------------------------------------------------
 
 class FTriangleSoupToHeightmapCS : public FGlobalShader
@@ -680,6 +764,32 @@ struct FResolvedStaticMeshTriangleRequest
 	FBox3f WorldBounds = FBox3f(EForceInit::ForceInit);
 	int32 TriangleCount = 0;
 	int32 PositionStrideFloat = 3;
+	// 闂€鍨 == TriangleCount閿涙碍鐦℃稉顏呯爱娑撳顫楄ぐ銏㈡畱閺夋劘宸?registry id閿涘湑S_NO_MATERIAL_ID = 閺冪姵娼楃拹顭掔礆閵?
+	// 閻?section 閼煎啫娲?+ Request.MaterialSlots 閸?game thread 閺嬪嫬缂撻敍宀勬 request 娑撳﹣绱剁紒?GPU extract閵?
+	TArray<uint32> TriToMaterial;
+};
+
+// Nanite 缂冩垶鐗搁惃鍕弿缂佸棜濡┃鎰瑏鐟欐帪绱欓弶銉ㄥ殰 editor MeshDescription閿涘瞼绮潻鍥︾秵濡?render fallback閿涘鈧?
+// 瀹告彃婀?game thread 閸欐ɑ宕查崚棰佺瑯閻ｅ瞼鈹栭梻鏉戣嫙閹?request bounds 缁鐡敍娑欑槨娑撳顫楅幖鍝勭敨 3 娑?UV0 娑?1 娑擃亝娼楃拹?registry id
+// 閿涘牅绗?render 鐠侯垰绶為崥灞肩瀵姵娼楃拹銊ㄣ€冮敍澶涚礉閻?AppendSourceTrianglesCS 閸樼喎鐡欐潻钘夊鏉╂稐绗?render 閹绘劕褰囬惄绋挎倱閻?triangle soup閵?
+// 婢舵矮閲?Nanite request 閸忚京鏁ゆ稉鈧禒钘夌杽娓氬绱欓幍浣搁挬閹峰吋甯撮敍澶涚礉閺佸懍绔村▎?dispatch 閸楀啿褰叉潻钘夊閺佹潙婧€閺咁垳娈戦崗銊╁劥 Nanite 濠ф劒绗佺憴鎺嬧偓?
+struct FCSNaniteSourceTriangleData
+{
+	// 濮ｅ繋绗佺憴?3 娑擃亙绗橀悾宀€鈹栭梻鎾€婇悙鐧哥礉閹典礁閽╅敍姝攖0.v0, t0.v1, t0.v2, t1.v0, ...]閿涘瘍=1閵嗗倻绮惔蹇庣瑢 render index buffer 娑撯偓閼锋番鈧?
+	TArray<FVector4f> Positions;
+	// Per-corner source normals transformed to world space, parallel to Positions.
+	TArray<FVector4f> Normals;
+	TArray<FVector4f> Colors;
+	TArray<FVector4f> Tangents;
+	TArray<FVector4f> BiTangents;
+	// 濮ｅ繋绗佺憴?3 娑?UV0閿涘本澧庨獮绛圭礉娑?Positions 楠炲疇顢戦妴?
+	TArray<FVector2f> UVs;
+	// 濮ｅ繋绗佺憴?1 娑擃亝娼楃拹?registry id閿涘湑S_NO_MATERIAL_ID = 閺冪姵娼楃拹顭掔礆閵?
+	TArray<uint32> MaterialIds;
+	// 閺堝鏅ユ稉澶庮潡閺佸府绱?= Positions.Num() / 3 == MaterialIds.Num()閿涘鈧?
+	int32 NumTriangles = 0;
+
+	bool IsEmpty() const { return NumTriangles <= 0; }
 };
 
 bool IsValidCSTriangleIndex(int32 Index, int32 VertexCount);
@@ -1187,16 +1297,496 @@ bool ShouldExcludeStaticMeshTriangleRequest(const FCSStaticMeshTriangleRequest& 
 	return false;
 }
 
+// 娑撹桨绔存稉顏勫嚒 resolve 閻?request 閺嬪嫬缂?per-triangle 閺夋劘宸?id閿涙碍瀵?LOD section 閼煎啫娲块幎濠佺瑏鐟欐帗妲х亸鍕煂濠ф劖娼楃拹顭掔礉
+// 閺夋劘宸濈紒?SharedRegistry 閸樺鍣搁幋?registry id閵嗗倹妫?section / 閺冪姵娼楃拹銊π弮璺哄弿闁劏顔囨稉?CS_NO_MATERIAL_ID閵?
+// Material registry dedupe key. Keying by material pointer alone merges every slot that
+// resolves to the same material - and every empty slot, since they all hash as nullptr - so a
+// source with five slots collapses to a single output slot. Including the source mesh and slot
+// index keeps each source slot distinct, which is what lets an unassigned 5-slot mesh come out
+// the other side as five (still empty) slots the user can fill in afterwards. Instances of the
+// same mesh share the same keys, so instancing does not multiply slots.
+struct FCSMaterialRegistryKey
+{
+	TObjectPtr<UMaterialInterface> Material = nullptr;
+	const UStaticMesh* SourceMesh = nullptr;
+	int32 SlotIndex = INDEX_NONE;
+
+	bool operator==(const FCSMaterialRegistryKey& Other) const
+	{
+		return Material == Other.Material && SourceMesh == Other.SourceMesh && SlotIndex == Other.SlotIndex;
+	}
+};
+
+FORCEINLINE uint32 GetTypeHash(const FCSMaterialRegistryKey& Key)
+{
+	return HashCombine(
+		HashCombine(GetTypeHash(Key.Material.Get()), GetTypeHash(Key.SourceMesh)),
+		::GetTypeHash(Key.SlotIndex));
+}
+
+// bPreserveSourceSlots=false reproduces the old pointer-only dedupe, which yields the most
+// compact material list when many sources share one material.
+FCSMaterialRegistryKey MakeMaterialRegistryKey(
+	UMaterialInterface* Material, const UStaticMesh* SourceMesh, int32 SlotIndex, bool bPreserveSourceSlots)
+{
+	FCSMaterialRegistryKey Key;
+	Key.Material = Material;
+	if (bPreserveSourceSlots)
+	{
+		Key.SourceMesh = SourceMesh;
+		Key.SlotIndex = SlotIndex;
+	}
+	return Key;
+}
+
+void BuildTriToMaterialForResolvedRequest(
+	const FCSStaticMeshTriangleRequest& Request,
+	FResolvedStaticMeshTriangleRequest& Resolved,
+	TArray<TObjectPtr<UMaterialInterface>>& SharedRegistry,
+	TMap<FCSMaterialRegistryKey, int32>& MaterialToRegistry,
+	bool bPreserveSourceMaterialSlots)
+{
+	const int32 TriangleCount = FMath::Max(0, Resolved.TriangleCount);
+	Resolved.TriToMaterial.Init(CS_NO_MATERIAL_ID, TriangleCount);
+
+	const FStaticMeshLODResources* LODResource = Resolved.LODResource.GetReference();
+	if (!LODResource || TriangleCount == 0 || Request.MaterialSlots.Num() == 0)
+	{
+		return;
+	}
+
+	for (const FStaticMeshSection& Section : LODResource->Sections)
+	{
+		UMaterialInterface* Material = Request.MaterialSlots.IsValidIndex(Section.MaterialIndex)
+			? Request.MaterialSlots[Section.MaterialIndex].Get()
+			: nullptr;
+
+		const FCSMaterialRegistryKey Key = MakeMaterialRegistryKey(
+			Material, Request.StaticMesh, Section.MaterialIndex, bPreserveSourceMaterialSlots);
+		int32 RegistryIndex = INDEX_NONE;
+		if (const int32* Found = MaterialToRegistry.Find(Key)) RegistryIndex = *Found;
+		else
+		{
+			RegistryIndex = SharedRegistry.Add(Material);
+			MaterialToRegistry.Add(Key, RegistryIndex);
+		}
+
+		const int32 FirstTri = FMath::Max(0, int32(Section.FirstIndex / 3u));
+		const int32 LastTri = FMath::Min(FirstTri + int32(Section.NumTriangles), TriangleCount);
+		for (int32 Tri = FirstTri; Tri < LastTri; ++Tri) Resolved.TriToMaterial[Tri] = uint32(RegistryIndex);
+	}
+}
+
+// Triangle facing is topology, never shading data. Vertex normals are authored art:
+// smoothed shells, foliage cards, baked-from-highpoly props, and hard creases routinely
+// produce normals that oppose the geometric face or sit near-perpendicular to it, so a
+// per-triangle "normals vote on the winding" rule flips isolated triangles and leaves the
+// soup inconsistent with its own connectivity. The only transform that genuinely reverses
+// world-space winding is a mirrored (negative-determinant) one, so that is the only case
+// the extractor compensates for; everything else keeps the source corner order verbatim.
+bool IsMirroredStaticMeshTransform(const FTransform& LocalToWorld)
+{
+	return LocalToWorld.GetDeterminant() < 0.0;
+}
+
+FVector3f TransformStaticMeshSourceNormal(
+	const FTransform& LocalToWorld,
+	const FVector3f& LocalNormal,
+	const FVector3f& FallbackNormal)
+{
+	const FVector Scale = LocalToWorld.GetScale3D();
+	if (FMath::Abs(Scale.X) <= UE_SMALL_NUMBER
+		|| FMath::Abs(Scale.Y) <= UE_SMALL_NUMBER
+		|| FMath::Abs(Scale.Z) <= UE_SMALL_NUMBER)
+	{
+		return FallbackNormal;
+	}
+
+	const FVector InverseScaledNormal(
+		double(LocalNormal.X) / Scale.X,
+		double(LocalNormal.Y) / Scale.Y,
+		double(LocalNormal.Z) / Scale.Z);
+	const FVector WorldNormal = LocalToWorld.TransformVectorNoScale(InverseScaledNormal);
+	return FVector3f(WorldNormal.GetSafeNormal(UE_SMALL_NUMBER, FVector(FallbackNormal)));
+}
+
+#if WITH_EDITOR
+// 娴?Nanite 缂冩垶鐗搁惃?LOD0 缂傛牞绶崳?MeshDescription 閹绘劕褰?閸忋劎绮忛懞?濠ф劒绗佺憴鎺炵礄閺侀绔緙閺佹壆娅ㄦ稉鍥╅獓閿涘绱濈紒鏇＄箖娴ｅ孩膩 render fallback閵?
+// 濮ｅ繋绗佺憴鎺炵窗3 娑擃亪銆婇悙閫涚秴缂?閳?LocalToWorld 閸欐ɑ宕查崚棰佺瑯閻ｅ瞼鈹栭梻杈剧幢閹?request bounds 閸?CPU 缁鐡敍鍫㈢搼娴犺渹绨?render 鐠侯垰绶為惃?
+// bUseBounds 闁劒绗佺憴鎺戝ⅶ闂勩倧绱濋崥灞炬閸戝繐鐨稉濠佺炊闁插骏绱氶敍娌€V0 閸?vertex-instance 闁岸浜?0閿涙稒娼楃拹銊х病 polygon group 閳?slot name 閳?
+// Request.MaterialSlots 閳?閸忓彉闊?registry 閸樺鍣搁敍鍫滅瑢 render 鐠侯垰绶炵€瑰苯鍙忛崥灞肩瀵姾銆冮敍灞肩箽鐠囦焦娼楃拹銊π紒鐔剁閿涘鈧?
+// 缂佹挻鐏夐幍浣搁挬鏉╄棄濮炴潻?OutTriangles閿涘牆褰茬捄銊ヮ樋娑?request 缁鳖垳袧閿涘鈧倽绻戦崶?true 鐞涖劎銇氶幋鎰閹绘劕褰囬敍娑欐￥閸欘垳鏁?MeshDescription
+// 閿涘潏ooked / 閺?editor 閺佺増宓侀敍澶庣箲閸?false閿涘矁鐨熼悽銊︽煙閹诡喗顒濋崶鐐衡偓鈧担搴⒛?render fallback 鐠侯垰绶為妴?
+// 缂佹洖绨拠瀛樻閿涙瓉eshDescription 娑撳顫楃紒鏇炵碍娑?render index buffer 娑撯偓閼疯揪绱欐稉銈堚偓鍛倱濠ф劘鍤?build 閸撳秶娈戝┃鎰秹閺嶈偐绮惔蹇ョ礆閿涘本鏅犳稉濠佺炊閻?
+// P0/P1/P2 閻╁瓨甯存禍銈囩舶 AppendSourceTrianglesCS 鐠ч绗?ExtractStaticMeshTrianglesCS 闁劕鐡ч惄绋挎倱閻ㄥ嫬寮界紒鏇⑩偓鏄忕帆閿涘矁绶崙鐑樻篂閸氭垳绔撮懛娣偓?
+bool ExtractNaniteSourceTrianglesForRequest(
+	const FCSStaticMeshTriangleRequest& Request,
+	TArray<TObjectPtr<UMaterialInterface>>& SharedRegistry,
+	TMap<FCSMaterialRegistryKey, int32>& MaterialToRegistry,
+	bool bPreserveSourceMaterialSlots,
+	FCSNaniteSourceTriangleData& OutTriangles)
+{
+	UStaticMesh* StaticMesh = Request.StaticMesh;
+	if (!StaticMesh)
+	{
+		return false;
+	}
+
+	const FMeshDescription* MeshDescription = StaticMesh->GetMeshDescription(0);
+	if (!MeshDescription)
+	{
+		return false;
+	}
+
+	const int32 SourceTriangleNum = MeshDescription->Triangles().Num();
+	if (SourceTriangleNum <= 0)
+	{
+		return false;
+	}
+
+	FStaticMeshConstAttributes Attributes(*MeshDescription);
+	TVertexAttributesConstRef<FVector3f> VertexPositions = Attributes.GetVertexPositions();
+	TVertexInstanceAttributesConstRef<FVector3f> VertexInstanceNormals = Attributes.GetVertexInstanceNormals();
+	TVertexInstanceAttributesConstRef<FVector3f> VertexInstanceTangents = Attributes.GetVertexInstanceTangents();
+	TVertexInstanceAttributesConstRef<float> VertexInstanceBinormalSigns = Attributes.GetVertexInstanceBinormalSigns();
+	TVertexInstanceAttributesConstRef<FVector4f> VertexInstanceColors = Attributes.GetVertexInstanceColors();
+	TVertexInstanceAttributesConstRef<FVector2f> VertexInstanceUVs = Attributes.GetVertexInstanceUVs();
+	if (!VertexPositions.IsValid())
+	{
+		return false;
+	}
+	const bool bHasUVs = VertexInstanceUVs.IsValid() && VertexInstanceUVs.GetNumChannels() > 0;
+	const bool bHasNormals = VertexInstanceNormals.IsValid();
+	const bool bHasTangents = VertexInstanceTangents.IsValid() && VertexInstanceBinormalSigns.IsValid();
+	const bool bHasColors = VertexInstanceColors.IsValid();
+
+	struct FComponentColorSample
+	{
+		FVector3f Position = FVector3f::ZeroVector;
+		FVector3f Normal = FVector3f::ZeroVector;
+		FVector4f Color = FVector4f(1, 1, 1, 1);
+	};
+	TArray<FComponentColorSample> ComponentColorSamples;
+	TMap<FIntVector, TArray<int32>> ComponentColorCells;
+	constexpr float ColorCellScale = 100.0f; // 0.01 cm cells tolerate render-buffer position quantization.
+	auto ColorCell = [](const FVector3f& Position)
+	{
+		return FIntVector(
+			FMath::RoundToInt(Position.X * ColorCellScale),
+			FMath::RoundToInt(Position.Y * ColorCellScale),
+			FMath::RoundToInt(Position.Z * ColorCellScale));
+	};
+	auto SRGBVectorFromColor = [](const FColor& Color)
+	{
+		constexpr float Inv255 = 1.0f / 255.0f;
+		return FVector4f(Color.R * Inv255, Color.G * Inv255, Color.B * Inv255, Color.A * Inv255);
+	};
+	auto AddColorSample = [&](const FVector3f& Position, const FVector3f& Normal, const FColor& Color)
+	{
+		const int32 SampleIndex = ComponentColorSamples.Add({
+			Position,
+			Normal.GetSafeNormal(),
+			SRGBVectorFromColor(Color)});
+		ComponentColorCells.FindOrAdd(ColorCell(Position)).Add(SampleIndex);
+	};
+
+	if (Request.SourceComponent && Request.SourceComponent->LODData.IsValidIndex(0))
+	{
+		const FStaticMeshComponentLODInfo& ComponentLOD = Request.SourceComponent->LODData[0];
+		const FStaticMeshRenderData* RenderData = StaticMesh->GetRenderData();
+		const FStaticMeshLODResources* RenderLOD = RenderData && RenderData->LODResources.IsValidIndex(0)
+			? &RenderData->LODResources[0]
+			: nullptr;
+		if (ComponentLOD.OverrideVertexColors && RenderLOD
+			&& ComponentLOD.OverrideVertexColors->GetNumVertices() == RenderLOD->VertexBuffers.PositionVertexBuffer.GetNumVertices())
+		{
+			const uint32 NumColors = ComponentLOD.OverrideVertexColors->GetNumVertices();
+			ComponentColorSamples.Reserve(NumColors);
+			for (uint32 VertexIndex = 0; VertexIndex < NumColors; ++VertexIndex)
+			{
+				AddColorSample(
+					RenderLOD->VertexBuffers.PositionVertexBuffer.VertexPosition(VertexIndex),
+					FVector3f(RenderLOD->VertexBuffers.StaticMeshVertexBuffer.VertexTangentZ(VertexIndex)),
+					ComponentLOD.OverrideVertexColors->VertexColor(VertexIndex));
+			}
+		}
+		else
+		{
+			ComponentColorSamples.Reserve(ComponentLOD.PaintedVertices.Num());
+			for (const FPaintedVertex& PaintedVertex : ComponentLOD.PaintedVertices)
+				AddColorSample(
+					FVector3f(PaintedVertex.Position),
+					FVector3f(float(PaintedVertex.Normal.X), float(PaintedVertex.Normal.Y), float(PaintedVertex.Normal.Z)),
+					PaintedVertex.Color);
+		}
+	}
+
+	auto SourceColor = [&](const FVertexInstanceID VertexInstanceID)
+	{
+		const FVector3f Position = VertexPositions[MeshDescription->GetVertexInstanceVertex(VertexInstanceID)];
+		const FVector3f Normal = bHasNormals ? VertexInstanceNormals[VertexInstanceID].GetSafeNormal() : FVector3f::ZeroVector;
+		const FIntVector Cell = ColorCell(Position);
+		int32 BestSample = INDEX_NONE;
+		float BestScore = TNumericLimits<float>::Max();
+		for (int32 Z = -1; Z <= 1; ++Z)
+		for (int32 Y = -1; Y <= 1; ++Y)
+		for (int32 X = -1; X <= 1; ++X)
+		{
+			const TArray<int32>* Candidates = ComponentColorCells.Find(Cell + FIntVector(X, Y, Z));
+			if (!Candidates) continue;
+			for (const int32 SampleIndex : *Candidates)
+			{
+				const FComponentColorSample& Sample = ComponentColorSamples[SampleIndex];
+				const float PositionError = FVector3f::DistSquared(Position, Sample.Position);
+				if (PositionError > 0.0004f) continue;
+				const float NormalError = bHasNormals ? 1.0f - FVector3f::DotProduct(Normal, Sample.Normal) : 0.0f;
+				const float Score = PositionError + FMath::Max(0.0f, NormalError) * 0.0001f;
+				if (Score < BestScore) { BestScore = Score; BestSample = SampleIndex; }
+			}
+		}
+		if (BestSample != INDEX_NONE) return ComponentColorSamples[BestSample].Color;
+		return bHasColors
+			? SRGBVectorFromColor(FLinearColor(VertexInstanceColors[VertexInstanceID]).ToFColor(true))
+			: FVector4f(1, 1, 1, 1);
+	};
+
+	// 濮?polygon group 妫板嫯袙閺嬫劒绔村▎?registry id閿涙roup 閳?slot name 閳?Request.MaterialSlots 閳?閸忓彉闊?registry閵?
+	const int32 PolygonGroupArraySize = MeshDescription->PolygonGroups().GetArraySize();
+	TArray<uint32> PolyGroupToRegistry;
+	PolyGroupToRegistry.Init(CS_NO_MATERIAL_ID, FMath::Max(1, PolygonGroupArraySize));
+	for (const FPolygonGroupID PolygonGroupID : MeshDescription->PolygonGroups().GetElementIDs())
+	{
+		// Single source of truth: the component's material array (Request.MaterialSlots, filled from
+		// UStaticMeshComponent::GetMaterial, so component overrides already win). Polygon group index
+		// is the material slot index for StaticMesh mesh descriptions, so no second lookup is needed.
+		// The asset-side GetMaterialIndexFromImportedMaterialSlotName remap used to run here as well;
+		// it read authority off the asset instead of the component and silently collapsed groups to
+		// slot 0 whenever imported slot names were empty or duplicated, which is common for merged
+		// and procedurally generated meshes.
+		//
+		// Keep this comment ASCII. It once held CJK text and the file on disk had no line break
+		// between it and the statement below, so the lookup sat inside the comment and every
+		// compiler dropped it - Material stayed null for every group and all materials were lost.
+		const int32 MaterialIndex = PolygonGroupID.GetValue();
+		UMaterialInterface* Material = Request.MaterialSlots.IsValidIndex(MaterialIndex)
+			? Request.MaterialSlots[MaterialIndex].Get()
+			: nullptr;
+
+		// Key on the source slot so an unassigned multi-slot mesh keeps its slot count instead of
+		// having every empty slot dedupe together into one.
+		const FCSMaterialRegistryKey Key = MakeMaterialRegistryKey(
+			Material, StaticMesh, MaterialIndex, bPreserveSourceMaterialSlots);
+		int32 RegistryIndex = INDEX_NONE;
+		if (const int32* Found = MaterialToRegistry.Find(Key)) RegistryIndex = *Found;
+		else
+		{
+			RegistryIndex = SharedRegistry.Add(Material);
+			MaterialToRegistry.Add(Key, RegistryIndex);
+		}
+		if (PolyGroupToRegistry.IsValidIndex(PolygonGroupID.GetValue())) PolyGroupToRegistry[PolygonGroupID.GetValue()] = uint32(RegistryIndex);
+	}
+
+	const FMatrix44f LocalToWorld(Request.LocalToWorld.ToMatrixWithScale());
+	const FBox3f RequestBounds = Request.WorldBounds.IsValid
+		? FBox3f(FVector3f(Request.WorldBounds.Min), FVector3f(Request.WorldBounds.Max))
+		: FBox3f(EForceInit::ForceInit);
+	const bool bUseBounds = (Request.WorldBounds.IsValid != 0);
+	const bool bMirroredTransform = IsMirroredStaticMeshTransform(Request.LocalToWorld);
+	const float TransformHandedness = bMirroredTransform ? -1.0f : 1.0f;
+	// A mirrored instance reverses world-space winding, so swap two emitted corners to keep
+	// the soup front face pointing where the engine's reversed culling renders it.
+	const int32 SourceCornerOrder[3] = { 0, bMirroredTransform ? 2 : 1, bMirroredTransform ? 1 : 2 };
+
+	OutTriangles.Positions.Reserve(OutTriangles.Positions.Num() + SourceTriangleNum * 3);
+	OutTriangles.Normals.Reserve(OutTriangles.Normals.Num() + SourceTriangleNum * 3);
+	OutTriangles.Colors.Reserve(OutTriangles.Colors.Num() + SourceTriangleNum * 3);
+	OutTriangles.Tangents.Reserve(OutTriangles.Tangents.Num() + SourceTriangleNum * 3);
+	OutTriangles.BiTangents.Reserve(OutTriangles.BiTangents.Num() + SourceTriangleNum * 3);
+	OutTriangles.UVs.Reserve(OutTriangles.UVs.Num() + SourceTriangleNum * 3);
+	OutTriangles.MaterialIds.Reserve(OutTriangles.MaterialIds.Num() + SourceTriangleNum);
+
+	for (const FTriangleID TriangleID : MeshDescription->Triangles().GetElementIDs())
+	{
+		TArrayView<const FVertexInstanceID> TriVertexInstances = MeshDescription->GetTriangleVertexInstances(TriangleID);
+		if (TriVertexInstances.Num() < 3)
+		{
+			continue;
+		}
+
+		const FVertexInstanceID VertexInstances[3] =
+		{
+			TriVertexInstances[0],
+			TriVertexInstances[1],
+			TriVertexInstances[2]
+		};
+		FVector3f Positions[3];
+		for (int32 Corner = 0; Corner < 3; ++Corner)
+		{
+			const FVertexID VertexID = MeshDescription->GetVertexInstanceVertex(VertexInstances[Corner]);
+			const FVector4f HomogeneousPosition = LocalToWorld.TransformPosition(VertexPositions[VertexID]);
+			Positions[Corner] = FVector3f(
+				HomogeneousPosition.X,
+				HomogeneousPosition.Y,
+				HomogeneousPosition.Z);
+		}
+
+		// Front face of the triangle as it is actually emitted below (UE convention:
+		// cross(P2 - P0, P1 - P0) over the emitted corner order). Only used as the
+		// fallback normal for assets that carry no vertex-instance normals.
+		const FVector3f FaceNormal = FVector3f::CrossProduct(
+			Positions[SourceCornerOrder[2]] - Positions[0],
+			Positions[SourceCornerOrder[1]] - Positions[0])
+			.GetSafeNormal(UE_SMALL_NUMBER, FVector3f::UnitZ());
+		auto WorldNormal = [&](const FVertexInstanceID VertexInstanceID)
+		{
+			if (!bHasNormals) return FaceNormal;
+			return TransformStaticMeshSourceNormal(
+				Request.LocalToWorld,
+				VertexInstanceNormals[VertexInstanceID],
+				FaceNormal);
+		};
+		auto WorldTangent = [&](const FVertexInstanceID VertexInstanceID, const FVector3f& WorldN)
+		{
+			if (!bHasTangents)
+			{
+				const FVector3f Axis = FMath::Abs(WorldN.Z) < 0.9f ? FVector3f::UnitZ() : FVector3f::UnitX();
+				return FVector3f::CrossProduct(Axis, WorldN).GetSafeNormal();
+			}
+			FVector3f Tangent(Request.LocalToWorld.TransformVector(FVector(VertexInstanceTangents[VertexInstanceID])).GetSafeNormal());
+			Tangent = (Tangent - FVector3f::DotProduct(Tangent, WorldN) * WorldN).GetSafeNormal();
+			if (!Tangent.IsNearlyZero()) return Tangent;
+			const FVector3f Axis = FMath::Abs(WorldN.Z) < 0.9f ? FVector3f::UnitZ() : FVector3f::UnitX();
+			return FVector3f::CrossProduct(Axis, WorldN).GetSafeNormal();
+		};
+		// Normals are copied through as authored. Forcing them into the face hemisphere
+		// here would be the same normals-versus-facing coupling in the other direction and
+		// would destroy intentionally divergent art normals; the Boolean output stage
+		// already aligns its own corner normals to the fragment's geometric face.
+		const FVector3f WorldNormals[3] =
+		{
+			WorldNormal(VertexInstances[0]),
+			WorldNormal(VertexInstances[1]),
+			WorldNormal(VertexInstances[2])
+		};
+
+		if (bUseBounds)
+		{
+			FBox3f TriBox(EForceInit::ForceInit);
+			TriBox += Positions[0];
+			TriBox += Positions[1];
+			TriBox += Positions[2];
+			if (!TriBox.Intersect(RequestBounds))
+			{
+				continue;
+			}
+		}
+
+		FVector2f UVs[3] =
+		{
+			FVector2f::ZeroVector,
+			FVector2f::ZeroVector,
+			FVector2f::ZeroVector
+		};
+		if (bHasUVs)
+		{
+			UVs[0] = VertexInstanceUVs.Get(VertexInstances[0], 0);
+			UVs[1] = VertexInstanceUVs.Get(VertexInstances[1], 0);
+			UVs[2] = VertexInstanceUVs.Get(VertexInstances[2], 0);
+		}
+
+		const FPolygonGroupID PolygonGroupID = MeshDescription->GetTrianglePolygonGroup(TriangleID);
+		const uint32 MaterialId = PolyGroupToRegistry.IsValidIndex(PolygonGroupID.GetValue())
+			? PolyGroupToRegistry[PolygonGroupID.GetValue()]
+			: CS_NO_MATERIAL_ID;
+
+		for (int32 UploadCorner = 0; UploadCorner < 3; ++UploadCorner)
+		{
+			const int32 SourceCorner = SourceCornerOrder[UploadCorner];
+			const FVertexInstanceID VertexInstanceID = VertexInstances[SourceCorner];
+			const FVector3f N = WorldNormals[SourceCorner];
+			const FVector3f T = WorldTangent(VertexInstanceID, N);
+			const float Sign = bHasTangents ? VertexInstanceBinormalSigns[VertexInstanceID] : 1.0f;
+			const FVector3f B = FVector3f::CrossProduct(N, T).GetSafeNormal() * Sign * TransformHandedness;
+			OutTriangles.Positions.Add(FVector4f(Positions[SourceCorner], 1.0f));
+			OutTriangles.Normals.Add(FVector4f(N, 0.0f));
+			OutTriangles.Tangents.Add(FVector4f(T, 0.0f));
+			OutTriangles.BiTangents.Add(FVector4f(B, 0.0f));
+			OutTriangles.Colors.Add(SourceColor(VertexInstanceID));
+			OutTriangles.UVs.Add(UVs[SourceCorner]);
+		}
+		OutTriangles.MaterialIds.Add(MaterialId);
+		++OutTriangles.NumTriangles;
+	}
+
+	if (bMirroredTransform) UE_LOG(LogTemp, Log, TEXT("[SceneTriangles] compensated mirrored-instance winding (negative-determinant transform): %s"), *StaticMesh->GetPathName());
+	return true;
+}
+
+#if WITH_DEV_AUTOMATION_TESTS
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSSceneTriangleSourceOrientationAutomationTest,
+	"PCGPlugins.ComputeShaderGenerator.MeshBoolean.SourceSoupOrientation",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSSceneTriangleSourceOrientationAutomationTest::RunTest(const FString& Parameters)
+{
+	// Winding must follow the source topology, so vertex normals never enter the decision
+	// and only a negative-determinant transform reverses the emitted corner order.
+	TestFalse(
+		TEXT("A positive-determinant transform keeps the source triangle winding"),
+		IsMirroredStaticMeshTransform(
+			FTransform(FQuat::Identity, FVector::ZeroVector, FVector(2.0, 3.0, 4.0))));
+	TestTrue(
+		TEXT("One mirrored axis reverses the emitted winding"),
+		IsMirroredStaticMeshTransform(
+			FTransform(FQuat::Identity, FVector::ZeroVector, FVector(-2.0, 3.0, 4.0))));
+	TestFalse(
+		TEXT("Two mirrored axes cancel and keep the source triangle winding"),
+		IsMirroredStaticMeshTransform(
+			FTransform(FQuat::Identity, FVector::ZeroVector, FVector(-2.0, -3.0, 4.0))));
+	TestTrue(
+		TEXT("Three mirrored axes reverse the emitted winding"),
+		IsMirroredStaticMeshTransform(
+			FTransform(FQuat::Identity, FVector::ZeroVector, FVector(-2.0, -3.0, -4.0))));
+
+	const FTransform MirroredTransform(
+		FQuat::Identity,
+		FVector::ZeroVector,
+		FVector(-2.0, 3.0, 4.0));
+	const FVector3f MirroredNormal = TransformStaticMeshSourceNormal(
+		MirroredTransform,
+		FVector3f::UnitX(),
+		FVector3f::UnitZ());
+	TestTrue(
+		TEXT("Source normals use inverse-transpose scaling for mirrored components"),
+		MirroredNormal.Equals(-FVector3f::UnitX(), UE_KINDA_SMALL_NUMBER));
+	return true;
+}
+
+#endif
+#endif // WITH_EDITOR
+
 uint64 ResolveStaticMeshTriangleRequests(
 	const TArray<FCSStaticMeshTriangleRequest>& Requests,
 	const AActor* ExcludedActor,
 	const TArray<FName>& ExcludedActorTags,
 	bool bNaniteOnlyFallbackMesh,
-	TArray<FResolvedStaticMeshTriangleRequest>& OutResolvedRequests)
+	TArray<FResolvedStaticMeshTriangleRequest>& OutResolvedRequests,
+	TArray<TObjectPtr<UMaterialInterface>>* OutMaterialRegistry = nullptr,
+	FCSNaniteSourceTriangleData* OutNaniteTriangles = nullptr,
+	bool bPreserveSourceMaterialSlots = true)
 {
 	OutResolvedRequests.Reset();
 	OutResolvedRequests.Reserve(Requests.Num());
 
+	TArray<TObjectPtr<UMaterialInterface>> MaterialRegistry;
+	TMap<FCSMaterialRegistryKey, int32> MaterialToRegistry;
+
+	// 鏉╂柨娲栭崐闂寸矌缂佺喕顓?render-resolve 閸戣櫣娈戞稉澶庮潡閿?= OutResolvedRequests[i].TriangleCount 娑斿鎷伴敍澶堚偓渚糰nite 閸忋劎绮忛懞鍌涚爱娑撳顫?
+	// 閸楁洜瀚槐顖溞濇潻?*OutNaniteTriangles閿涘牆鍙鹃懛顏勭敨 NumTriangles閿涘绱濈€瑰綊鍣洪弽鍝ョ暬閻?AddResolvedStaticMeshTrianglesToRDGInternal
+	// 閹跺﹣琚遍懓鍛祲閸旂姴鐣幋鎰剁礉闁灝鍘ら柌宥咁槻鐠佲剝鏆熼妴渚絬tNaniteTriangles == nullptr 閺冩儼顢戞稉杞扮瑢閺€鐟板З閸撳秹鈧劕鐡ф稉鈧懛杈剧礄Nanite 缂冩垶鐗搁悡褎妫挧?
+	// render fallback 楠炴儼顓搁崗銉ㄧ箲閸ョ偛鈧》绱氶敍灞炬櫊閹碘偓閺堝婀幒銉ュ弳 Nanite 閻ㄥ嫭妫﹂張澶庣殶閻劍鏌熼梿璺烘礀瑜版帇鈧?
 	uint64 TotalTriangleCount = 0;
 	for (const FCSStaticMeshTriangleRequest& Request : Requests)
 	{
@@ -1205,11 +1795,25 @@ uint64 ResolveStaticMeshTriangleRequests(
 			continue;
 		}
 
+		// Nanite 缂冩垶鐗搁敍姘喘閸忓牊褰侀崣?editor MeshDescription 閻ㄥ嫬鍙忕紒鍡氬Ν濠ф劕鍤戞担鏇礉閺囧じ鍞担搴⒛?render fallback閵?
+		// 娴犲懎缍嬬拫鍐暏閺傜顩﹀Ч鍌︾礄OutNaniteTriangles 闂堢偟鈹栭敍澶嬫閸氼垳鏁ら敍娑欏絹閸欐牗鍨氶崝鐔峰祮鐠哄疇绻?render resolve閵?
+		if (OutNaniteTriangles && Request.StaticMesh)
+		{
+#if WITH_EDITOR
+            if (ExtractNaniteSourceTrianglesForRequest(Request, MaterialRegistry, MaterialToRegistry, bPreserveSourceMaterialSlots, *OutNaniteTriangles)) continue;
+            UE_LOG(LogTemp, Warning, TEXT("[ResolveStaticMeshTriangleRequests] Nanite mesh '%s' has no usable editor MeshDescription; using render fallback."), *Request.StaticMesh->GetPathName());
+#else
+            UE_LOG(LogTemp, Warning, TEXT("[ResolveStaticMeshTriangleRequests] Nanite mesh '%s' requires editor MeshDescription; using render fallback."), *Request.StaticMesh->GetPathName());
+#endif
+		}
+
 		FResolvedStaticMeshTriangleRequest Resolved;
 		if (!ResolveTriangleRequest(Request, Resolved, bNaniteOnlyFallbackMesh))
 		{
 			continue;
 		}
+
+		BuildTriToMaterialForResolvedRequest(Request, Resolved, MaterialRegistry, MaterialToRegistry, bPreserveSourceMaterialSlots);
 
 		TotalTriangleCount = FMath::Min<uint64>(
 			TotalTriangleCount + uint64(FMath::Max(0, Resolved.TriangleCount)),
@@ -1217,6 +1821,7 @@ uint64 ResolveStaticMeshTriangleRequests(
 		OutResolvedRequests.Add(MoveTemp(Resolved));
 	}
 
+	if (OutMaterialRegistry) *OutMaterialRegistry = MoveTemp(MaterialRegistry);
 	return TotalTriangleCount;
 }
 
@@ -1572,6 +2177,12 @@ void BuildBoxSceneTriangleRequestsInternal(UWorld* World,
 			continue;
 		}
 
+		// override-aware 閺夋劘宸濆Σ鏂ょ窗section.MaterialIndex 缁便垹绱╂潻娑欐拱閺佹壆绮嶉妴淇玜me thread 閹靛秷鍏樼€瑰鍙忕拠鑽ょ矋娴犺埖娼楃拹銊ｂ偓?
+		TArray<TObjectPtr<UMaterialInterface>> ComponentMaterialSlots;
+		const int32 NumComponentMaterials = StaticMeshComponent->GetNumMaterials();
+		ComponentMaterialSlots.Reserve(NumComponentMaterials);
+		for (int32 MatIdx = 0; MatIdx < NumComponentMaterials; ++MatIdx) ComponentMaterialSlots.Add(StaticMeshComponent->GetMaterial(MatIdx));
+
 		if (UInstancedStaticMeshComponent* InstancedComponent = Cast<UInstancedStaticMeshComponent>(StaticMeshComponent))
 		{
 			const FBox LocalMeshBounds = StaticMesh->GetBoundingBox();
@@ -1592,6 +2203,8 @@ void BuildBoxSceneTriangleRequestsInternal(UWorld* World,
 				Request.LocalToWorld = InstanceTransform;
 				Request.WorldBounds = QueryBox;
 				Request.SourceActor = SourceActor;
+				Request.SourceComponent = StaticMeshComponent;
+				Request.MaterialSlots = ComponentMaterialSlots;
 			}
 			continue;
 		}
@@ -1608,6 +2221,8 @@ void BuildBoxSceneTriangleRequestsInternal(UWorld* World,
 		Request.LocalToWorld = StaticMeshComponent->GetComponentTransform();
 		Request.WorldBounds = QueryBox;
 		Request.SourceActor = SourceActor;
+		Request.SourceComponent = StaticMeshComponent;
+		Request.MaterialSlots = MoveTemp(ComponentMaterialSlots);
 	}
 }
 }
@@ -1638,12 +2253,16 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 	float ReferenceFilterDistance,
 	int32 MaxTriangles,
 	const FCSTriangleMeshData* InitialTriangleData,
-	const TCHAR* DebugName)
+	const TCHAR* DebugName,
+	const FCSNaniteSourceTriangleData* NaniteTriangles = nullptr)
 {
 	FCSStaticMeshTriangleRDGOutput Output;
 
 	const uint64 InitialTriangleCount = InitialTriangleData ? uint64(FMath::Max(0, GetTriangleMeshDataTriangleCount(*InitialTriangleData))) : 0ull;
-	const uint64 CombinedTriangleCount = FMath::Min<uint64>(TotalTriangleCount + InitialTriangleCount, uint64(TNumericLimits<int32>::Max()));
+	// Nanite 閸忋劎绮忛懞鍌涚爱娑撳顫楃拋鈥冲弳閹顔愰柌蹇ョ窗TotalTriangleCount 閸欘亜鎯?render-resolve 娑撳顫楅敍瀛╝nite 娑撳顫楅崡鏇犲閸︺劍顒濈槐顖氬閿?
+	// 娣囨繆鐦?soup buffer 鐏忓搫顕憰鍡欐磰 render + landscape(initial) + Nanite 娑撳鈧懍绠ｉ崪宀嬬礄濞嗙姴鏄傜€甸晲绱扮憗浣稿鏉堟挸鍤敍澶堚偓?
+	const uint64 NaniteTriangleCount = NaniteTriangles ? uint64(FMath::Max(0, NaniteTriangles->NumTriangles)) : 0ull;
+	const uint64 CombinedTriangleCount = FMath::Min<uint64>(TotalTriangleCount + InitialTriangleCount + NaniteTriangleCount, uint64(TNumericLimits<int32>::Max()));
 	if (CombinedTriangleCount == 0)
 	{
 		return Output;
@@ -1675,6 +2294,36 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 	Output.TriangleCounterUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.TriangleCounter, PF_R32_UINT));
 	Output.TriangleCounterSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.TriangleCounter, PF_R32_UINT));
 	AddClearUAVPass(GraphBuilder, Output.TriangleCounterUAV, 0u);
+
+	// 濮?triangle 娑撯偓娑擃亝娼楃拹?id閿涘牅绗屾い鍓佸仯楠炲疇顢戦敍灞惧瘻 triangle 缁便垹绱╅敍澶堚偓鍌烆暕濞撳懏鍨?CS_NO_MATERIAL_ID閿?
+	// GPU extract 閸欘亜顕?static mesh 娑撳顫楅崘娆戞埂鐎?registry id閿涘苯婀磋ぐ?閺堫亜鍟撻崗銉ф畱娑撳顫楅懛顏勫З娣囨繃瀵旈弮鐘虫綏鐠愩劊鈧?
+	Output.TriangleMaterialIds = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), TriangleCapacity),
+		TEXT("CS.StaticMeshTriangles.MaterialIds"));
+	Output.TriangleMaterialIdsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.TriangleMaterialIds, PF_R32_UINT));
+	Output.TriangleMaterialIdsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.TriangleMaterialIds, PF_R32_UINT));
+	AddClearUAVPass(GraphBuilder, Output.TriangleMaterialIdsUAV, CS_NO_MATERIAL_ID);
+
+	// 濮?vertex 娑撯偓娑?UV0閿涘牅绗屾い鍓佸仯楠炲疇顢戦敍? per triangle閿涘鈧倿顣╁〒鍛灇 (0,0)閿涙PU extract 閸欘亜顕?static mesh
+	// 妞ゅ墎鍋ｉ崘娆戞埂鐎?UV閿涙稑婀磋ぐ?閺堫亜鍟撻崗?閺?UV 閻ㄥ嫭绨懛顏勫З娣囨繃瀵?(0,0)閵嗕揪F_G32R32F 閸栧綊鍘?shader Buffer<float2>閵?
+	Output.TriangleUVs = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector2f), VertexCapacity),
+		TEXT("CS.StaticMeshTriangles.UVs"));
+	Output.TriangleUVsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.TriangleUVs, PF_G32R32F));
+	Output.TriangleUVsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.TriangleUVs, PF_G32R32F));
+	AddClearUAVPass(GraphBuilder, Output.TriangleUVsUAV, 0.0f);
+
+	auto CreateFloat4AttributeBuffer = [&GraphBuilder, VertexCapacity](const TCHAR* Name, FRDGBufferRef& Buffer, FRDGBufferUAVRef& UAV, FRDGBufferSRVRef& SRV)
+	{
+		Buffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), VertexCapacity), Name);
+		UAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Buffer, PF_A32B32G32R32F));
+		SRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Buffer, PF_A32B32G32R32F));
+		AddClearUAVPass(GraphBuilder, UAV, 0.0f);
+	};
+	CreateFloat4AttributeBuffer(TEXT("CS.StaticMeshTriangles.Colors"), Output.TriangleColors, Output.TriangleColorsUAV, Output.TriangleColorsSRV);
+	AddClearUAVPass(GraphBuilder, Output.TriangleColorsUAV, 1.0f);
+	CreateFloat4AttributeBuffer(TEXT("CS.StaticMeshTriangles.Tangents"), Output.TriangleTangents, Output.TriangleTangentsUAV, Output.TriangleTangentsSRV);
+	CreateFloat4AttributeBuffer(TEXT("CS.StaticMeshTriangles.BiTangents"), Output.TriangleBiTangents, Output.TriangleBiTangentsUAV, Output.TriangleBiTangentsSRV);
 
 	if (InitialTriangleData && InitialTriangleCount > 0)
 	{
@@ -1803,13 +2452,35 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 		}
 		Output.ReferencedIndexBufferSRVs.Add(IndexBufferSRV);
 
+		// UV0 閻╁瓨甯寸拠缁樼爱 mesh 閻?tex-coord SRV閿涘牅绗?position 鐠囩粯纭舵稉鈧懛杈剧礆閵嗗倹妫?UV 閻?mesh 閳?缂?dummy + NumTexCoords=0閵?
+		FRHIShaderResourceView* TexCoordSRV = Request.LODResource->VertexBuffers.StaticMeshVertexBuffer.GetTexCoordsSRV();
+		const uint32 RequestNumTexCoords = TexCoordSRV ? Request.LODResource->VertexBuffers.StaticMeshVertexBuffer.GetNumTexCoords() : 0u;
+		if (!TexCoordSRV || RequestNumTexCoords == 0u) TexCoordSRV = GCSDummyTexCoordVertexBuffer.ShaderResourceViewRHI.GetReference();
+
+		// 娑撳﹣绱堕張?request 閻?per-triangle 閺夋劘宸?id閿涘湐uffer<uint>閿涘矂鏆辨惔?== 濠ф劒绗佺憴鎺撴殶閿涘鈧?
+		// TriToMaterial 閺堫亜锝為敍鍫濆従鐎瑰啳鐨熼悽銊︽煙閿涘妞傞敍宀勨偓鈧崠鏍﹁礋閸?CS_NO_MATERIAL_ID閿涘矁顢戞稉铏圭搼娴犺渹绨弮鐘虫綏鐠愩劏鎷烽煪顏傗偓?
+		const int32 RequestTriangleCount = FMath::Max(1, Request.TriangleCount);
+		FRDGBufferRef TriToMaterialBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), RequestTriangleCount),
+			TEXT("CS.StaticMeshTriangles.TriToMaterial"));
+		uint32* TriToMaterialUploadData = GraphBuilder.AllocPODArray<uint32>(RequestTriangleCount);
+		if (Request.TriToMaterial.Num() == Request.TriangleCount && Request.TriangleCount > 0)
+			FMemory::Memcpy(TriToMaterialUploadData, Request.TriToMaterial.GetData(), Request.TriangleCount * sizeof(uint32));
+		else
+			for (int32 FillIndex = 0; FillIndex < RequestTriangleCount; ++FillIndex) TriToMaterialUploadData[FillIndex] = CS_NO_MATERIAL_ID;
+		GraphBuilder.QueueBufferUpload(TriToMaterialBuffer, TriToMaterialUploadData, RequestTriangleCount * sizeof(uint32));
+
 		FExtractStaticMeshTrianglesCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FExtractStaticMeshTrianglesCS::FParameters>();
 		PassParameters->IndexBuffer = Output.ReferencedIndexBufferSRVs.Last().GetReference();
 		PassParameters->PositionBuffer = PositionBufferSRV;
+		PassParameters->SourceTexCoordBuffer = TexCoordSRV;
 		PassParameters->ReferencePoints = ReferencePointSRV;
+		PassParameters->TriToMaterial = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(TriToMaterialBuffer, PF_R32_UINT));
 		PassParameters->RW_OutTriangleVertices = Output.TriangleVerticesUAV;
 		PassParameters->RW_OutTriangleNormals = Output.TriangleNormalsUAV;
 		PassParameters->RW_TriangleCounter = Output.TriangleCounterUAV;
+		PassParameters->RW_OutTriangleMaterialIds = Output.TriangleMaterialIdsUAV;
+		PassParameters->RW_OutTriangleUVs = Output.TriangleUVsUAV;
 		PassParameters->LocalToWorld = Request.LocalToWorld;
 		PassParameters->BoundsMin = Request.WorldBounds.IsValid ? Request.WorldBounds.Min : FVector3f(-TNumericLimits<float>::Max());
 		PassParameters->BoundsMax = Request.WorldBounds.IsValid ? Request.WorldBounds.Max : FVector3f(TNumericLimits<float>::Max());
@@ -1817,6 +2488,7 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 		PassParameters->PositionStrideFloat = uint32(Request.PositionStrideFloat);
 		PassParameters->ReferenceCount = uint32(ReferencePoints.Num());
 		PassParameters->TriangleCapacity = TriangleCapacity;
+		PassParameters->NumTexCoords = RequestNumTexCoords;
 		PassParameters->bUseBounds = Request.WorldBounds.IsValid ? 1u : 0u;
 		PassParameters->bUseReferenceFilter = ReferencePoints.Num() > 0 ? 1u : 0u;
 		PassParameters->ReferenceFilterDistanceSq = ReferenceFilterDistance > 0.0f
@@ -1830,7 +2502,97 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 			[PassParameters, TriangleShader, TriangleCount = Request.TriangleCount, IndexBufferSRV](FRHIComputeCommandList& InRHICmdList)
 			{
 				(void)IndexBufferSRV;
-				FComputeShaderUtils::Dispatch(InRHICmdList, TriangleShader, *PassParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TriangleCount, 1, 1), 64));
+				// wrapped閿涙瓖riangleCount 閸欘垵鎻弫鎵娑撳浄绱?65535*64=4.19M閿涘绱濋棁鈧?2D 閸栧懓锛欓柆鍨帳 GroupCount.X 鐡掑﹪妾?ensure閿涘澃hader 缁?GetUnWrappedDispatchThreadId 鏉╂ê甯敍?
+				FComputeShaderUtils::Dispatch(InRHICmdList, TriangleShader, *PassParameters, FComputeShaderUtils::GetGroupCountWrapped(FMath::Max(1, int32(TriangleCount)), 64));
+			});
+	}
+
+	// Nanite 閸忋劎绮忛懞鍌涚爱娑撳顫楅敍姘瑐娴肩姴鍑￠崣妯诲床閸掗绗橀悾宀€鈹栭梻瀵告畱濠ф劒绗佺憴鎺炵礄妞ゅ墎鍋?+ UV0 + 閺夋劘宸?id閿涘绱濋悽?AppendSourceTrianglesCS
+	// 閸樼喎鐡欐潻钘夊鏉╂稐绗傞棃?extract 瀹告彃鍟撻崗銉ф畱閸氬奔绔?soup閿涘牆鍙℃禍?RW_TriangleCounter閿涘鈧倷缍呯純顔兼躬 CPU 缁旑垰鍑￠幐?request bounds
+	// 缁鐡敍灞炬櫊鏉╂瑩鍣?bUseBounds=0閿涙稑寮懓鍐仯鏉╁洦鎶ゆ禒宥呮躬 GPU 缁旑垱澧界悰灞间簰鐎靛綊缍?render 閹绘劕褰囩捄顖氱窞閵嗗倸锛愰弰搴℃躬 extract 瀵邦亞骞嗘稊瀣倵閿?
+	// 娓氭繆绂?RW_TriangleCounter 娴?RDG 閼奉亜濮╅幎濠冩拱 pass 閹烘帒婀幍鈧張?extract pass 娑斿鎮楅敍鍫ｆ嫹閸旂娀銆庢惔蹇庣瑝瑜板崬鎼烽張鈧紒?soup 閸愬懎顔愰敍澶堚偓?
+	if (NaniteTriangles && NaniteTriangles->NumTriangles > 0)
+	{
+		const int32 NaniteTriCount = NaniteTriangles->NumTriangles;
+		const int32 NaniteVertCount = NaniteTriCount * 3;
+
+		FRDGBufferRef NaniteVertexBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), NaniteVertCount),
+			TEXT("CS.StaticMeshTriangles.NaniteSrcVertices"));
+		FVector4f* NaniteVertexUpload = GraphBuilder.AllocPODArray<FVector4f>(NaniteVertCount);
+		FMemory::Memcpy(NaniteVertexUpload, NaniteTriangles->Positions.GetData(), NaniteVertCount * sizeof(FVector4f));
+		GraphBuilder.QueueBufferUpload(NaniteVertexBuffer, NaniteVertexUpload, NaniteVertCount * sizeof(FVector4f));
+
+		FRDGBufferRef NaniteUVBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateBufferDesc(sizeof(FVector2f), NaniteVertCount),
+			TEXT("CS.StaticMeshTriangles.NaniteSrcUVs"));
+		FVector2f* NaniteUVUpload = GraphBuilder.AllocPODArray<FVector2f>(NaniteVertCount);
+		FMemory::Memcpy(NaniteUVUpload, NaniteTriangles->UVs.GetData(), NaniteVertCount * sizeof(FVector2f));
+		GraphBuilder.QueueBufferUpload(NaniteUVBuffer, NaniteUVUpload, NaniteVertCount * sizeof(FVector2f));
+
+		FRDGBufferRef NaniteNormalBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), NaniteVertCount),
+			TEXT("CS.StaticMeshTriangles.NaniteSrcNormals"));
+		FVector4f* NaniteNormalUpload = GraphBuilder.AllocPODArray<FVector4f>(NaniteVertCount);
+		FMemory::Memcpy(NaniteNormalUpload, NaniteTriangles->Normals.GetData(), NaniteVertCount * sizeof(FVector4f));
+		GraphBuilder.QueueBufferUpload(NaniteNormalBuffer, NaniteNormalUpload, NaniteVertCount * sizeof(FVector4f));
+
+		auto UploadFloat4Attribute = [&GraphBuilder, NaniteVertCount](const TCHAR* Name, const TArray<FVector4f>& Values)
+		{
+			FRDGBufferRef Buffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), NaniteVertCount), Name);
+			FVector4f* Upload = GraphBuilder.AllocPODArray<FVector4f>(NaniteVertCount);
+			FMemory::Memcpy(Upload, Values.GetData(), NaniteVertCount * sizeof(FVector4f));
+			GraphBuilder.QueueBufferUpload(Buffer, Upload, NaniteVertCount * sizeof(FVector4f));
+			return Buffer;
+		};
+		FRDGBufferRef NaniteColorBuffer = UploadFloat4Attribute(TEXT("CS.StaticMeshTriangles.SourceColors"), NaniteTriangles->Colors);
+		FRDGBufferRef NaniteTangentBuffer = UploadFloat4Attribute(TEXT("CS.StaticMeshTriangles.SourceTangents"), NaniteTriangles->Tangents);
+		FRDGBufferRef NaniteBiTangentBuffer = UploadFloat4Attribute(TEXT("CS.StaticMeshTriangles.SourceBiTangents"), NaniteTriangles->BiTangents);
+
+		FRDGBufferRef NaniteMaterialBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), NaniteTriCount),
+			TEXT("CS.StaticMeshTriangles.NaniteSrcMaterialIds"));
+		uint32* NaniteMaterialUpload = GraphBuilder.AllocPODArray<uint32>(NaniteTriCount);
+		FMemory::Memcpy(NaniteMaterialUpload, NaniteTriangles->MaterialIds.GetData(), NaniteTriCount * sizeof(uint32));
+		GraphBuilder.QueueBufferUpload(NaniteMaterialBuffer, NaniteMaterialUpload, NaniteTriCount * sizeof(uint32));
+
+		TShaderMapRef<FAppendSourceTrianglesCS> AppendShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FAppendSourceTrianglesCS::FParameters* AppendParameters = GraphBuilder.AllocParameters<FAppendSourceTrianglesCS::FParameters>();
+		AppendParameters->SourceTriangleVertices = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(NaniteVertexBuffer, PF_A32B32G32R32F));
+		AppendParameters->SourceTriangleNormals = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(NaniteNormalBuffer, PF_A32B32G32R32F));
+		AppendParameters->SourceTriangleUVs = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(NaniteUVBuffer, PF_G32R32F));
+		AppendParameters->SourceTriangleColors = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(NaniteColorBuffer, PF_A32B32G32R32F));
+		AppendParameters->SourceTriangleTangents = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(NaniteTangentBuffer, PF_A32B32G32R32F));
+		AppendParameters->SourceTriangleBiTangents = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(NaniteBiTangentBuffer, PF_A32B32G32R32F));
+		AppendParameters->SourceTriangleMaterialIds = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(NaniteMaterialBuffer, PF_R32_UINT));
+		AppendParameters->ReferencePoints = ReferencePointSRV;
+		AppendParameters->RW_OutTriangleVertices = Output.TriangleVerticesUAV;
+		AppendParameters->RW_OutTriangleNormals = Output.TriangleNormalsUAV;
+		AppendParameters->RW_TriangleCounter = Output.TriangleCounterUAV;
+		AppendParameters->RW_OutTriangleMaterialIds = Output.TriangleMaterialIdsUAV;
+		AppendParameters->RW_OutTriangleUVs = Output.TriangleUVsUAV;
+		AppendParameters->RW_OutTriangleColors = Output.TriangleColorsUAV;
+		AppendParameters->RW_OutTriangleTangents = Output.TriangleTangentsUAV;
+		AppendParameters->RW_OutTriangleBiTangents = Output.TriangleBiTangentsUAV;
+		AppendParameters->BoundsMin = FVector3f(-TNumericLimits<float>::Max());
+		AppendParameters->BoundsMax = FVector3f(TNumericLimits<float>::Max());
+		AppendParameters->TriangleCount = uint32(NaniteTriCount);
+		AppendParameters->TriangleCapacity = TriangleCapacity;
+		AppendParameters->ReferenceCount = uint32(ReferencePoints.Num());
+		AppendParameters->bUseBounds = 0u; // CPU 缁旑垰鍑￠幐?request bounds 缁鐡?
+		AppendParameters->bUseReferenceFilter = ReferencePoints.Num() > 0 ? 1u : 0u;
+		AppendParameters->ReferenceFilterDistanceSq = ReferenceFilterDistance > 0.0f
+			? ReferenceFilterDistance * ReferenceFilterDistance
+			: TNumericLimits<float>::Max();
+
+		GraphBuilder.AddPass(
+			RDG_EVENT_NAME("%s.AppendNaniteSource", DebugName),
+			AppendParameters,
+			ERDGPassFlags::Compute,
+			[AppendParameters, AppendShader, NaniteTriCount](FRHIComputeCommandList& InRHICmdList)
+			{
+				// 娑?extract 閻╃鎮撻惃鍕瘶鐟?dispatch閿涙瓊anite 濠ф劒绗佺憴鎺戝讲鏉堢偓鏆熼惂鍙ョ閵?
+				FComputeShaderUtils::Dispatch(InRHICmdList, AppendShader, *AppendParameters, FComputeShaderUtils::GetGroupCountWrapped(FMath::Max(1, NaniteTriCount), 64));
 			});
 	}
 
@@ -2258,7 +3020,7 @@ FCSSurfaceVoxelRDGOutput AddTriangleSurfaceVoxelsToRDGInternal(
 				FComputeShaderUtils::GetGroupCount(FIntVector(int32(VoxelCapacity), 1, 1), 64));
 		});
 
-	// Blur pass (ported from ResinRattan) — only executes when BlurIterations > 0
+	// Blur pass (ported from ResinRattan) 閳?only executes when BlurIterations > 0
 	{
 		const uint32 BlurIters = uint32(FMath::Max(0, BlurIterations));
 		if (BlurIters > 0u)
@@ -2348,12 +3110,30 @@ struct FCSBoxScenePreparedDataImpl
 	TArray<FVector> ReferencePoints;
 	float ReferenceFilterDistance = 0.0f;
 	int32 SafeMaxTriangles = 1;
+	// 閸樺鍣搁弶鎰窛鐞涱煉绱皊oup 閺夋劘宸?buffer 闁插瞼娈?id 缁便垹绱╂潻娑欐拱鐞涖劊鈧繂ObjectPtr 閹镐焦婀佸鍝勭穿閻㈩煉绱濇穱婵婄槈 readback 閸撳秳绗夌悮?GC閵?
+	TArray<TObjectPtr<UMaterialInterface>> MaterialRegistry;
+	// Nanite 缂冩垶鐗搁惃鍕弿缂佸棜濡┃鎰瑏鐟欐帪绱檈ditor MeshDescription 閹绘劕褰囬敍瀵僶rld-space + UV0 + 閺夋劘宸?id閿涘鈧?
+	// game thread 閸?PrepareBoxSceneTriangles 闁插苯锝為崗鍜冪礉render thread 閸?AddPreparedBoxSceneTrianglesToRDG 鏉╄棄濮炴潻?soup閵?
+	FCSNaniteSourceTriangleData NaniteTriangles;
 };
 
 bool FCSBoxScenePreparedData::HasAnyTriangles() const
 {
 	if (!Impl) return false;
-	return !Impl->ResolvedRequests.IsEmpty() || GetTriangleMeshDataTriangleCount(Impl->LandscapeTriangleData) > 0;
+	return !Impl->ResolvedRequests.IsEmpty()
+		|| GetTriangleMeshDataTriangleCount(Impl->LandscapeTriangleData) > 0
+		|| !Impl->NaniteTriangles.IsEmpty();
+}
+
+int32 FCSBoxScenePreparedData::GetMaterialRegistryNum() const
+{
+	return Impl ? Impl->MaterialRegistry.Num() : 0;
+}
+
+UMaterialInterface* FCSBoxScenePreparedData::GetMaterialByRegistryIndex(int32 Index) const
+{
+	if (!Impl || !Impl->MaterialRegistry.IsValidIndex(Index)) return nullptr;
+	return Impl->MaterialRegistry[Index].Get();
 }
 
 FCSBoxScenePreparedData AComputeShaderMeshGenerator::PrepareBoxSceneTriangles(
@@ -2362,7 +3142,10 @@ FCSBoxScenePreparedData AComputeShaderMeshGenerator::PrepareBoxSceneTriangles(
 	int32 InMaxTriangles,
 	const TArray<FVector>& InReferencePoints,
 	float InReferenceFilterDistance,
-	FName RequiredActorTag)
+	FName RequiredActorTag,
+	bool bIncludeLandscape,
+	bool bUseMeshDescriptionSourceTriangles,
+	bool bPreserveSourceMaterialSlots)
 {
 	FCSBoxScenePreparedData Result;
 	if (!World || !QueryBox.IsValid) return Result;
@@ -2383,12 +3166,17 @@ FCSBoxScenePreparedData AComputeShaderMeshGenerator::PrepareBoxSceneTriangles(
 		});
 	}
 
-	BuildBoxSceneLandscapeTrianglesInternal(
-		World, QueryBox, InReferencePoints, SafeRefDist, SafeMaxTriangles,
-		ImplData->LandscapeTriangleData);
+	if (bIncludeLandscape)
+	{
+		BuildBoxSceneLandscapeTrianglesInternal(
+			World, QueryBox, InReferencePoints, SafeRefDist, SafeMaxTriangles,
+			ImplData->LandscapeTriangleData);
+	}
 
 	ImplData->TotalStaticMeshTriangleCount = ResolveStaticMeshTriangleRequests(
-		Requests, this, ExcludedActorTags, true, ImplData->ResolvedRequests);
+		Requests, this, ExcludedActorTags, true, ImplData->ResolvedRequests, &ImplData->MaterialRegistry,
+		bUseMeshDescriptionSourceTriangles ? &ImplData->NaniteTriangles : nullptr,
+		bPreserveSourceMaterialSlots);
 
 	ImplData->ReferencePoints = InReferencePoints;
 	ImplData->ReferenceFilterDistance = SafeRefDist;
@@ -2410,11 +3198,12 @@ FCSStaticMeshTriangleRDGOutput AComputeShaderMeshGenerator::AddPreparedBoxSceneT
 	const auto& D = *Prepared.Impl;
 	const FCSTriangleMeshData* InitialTriangleData =
 		GetTriangleMeshDataTriangleCount(D.LandscapeTriangleData) > 0 ? &D.LandscapeTriangleData : nullptr;
+	const FCSNaniteSourceTriangleData* NaniteTriangles = !D.NaniteTriangles.IsEmpty() ? &D.NaniteTriangles : nullptr;
 
 	Output = AddResolvedStaticMeshTrianglesToRDGInternal(
 		GraphBuilder, RHICmdList, D.ResolvedRequests, D.TotalStaticMeshTriangleCount,
 		D.ReferencePoints, D.ReferenceFilterDistance, D.SafeMaxTriangles,
-		InitialTriangleData, DebugName);
+		InitialTriangleData, DebugName, NaniteTriangles);
 
 	return Output;
 }
@@ -2459,13 +3248,16 @@ FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPUFilt
 	}
 
 	TArray<FResolvedStaticMeshTriangleRequest> ResolvedRequests;
+	FCSNaniteSourceTriangleData NaniteTriangles;
 	const uint64 TotalStaticMeshTriangleCount = ResolveStaticMeshTriangleRequests(
 		Requests,
 		this,
 		ExcludedActorTags,
 		true,
-		ResolvedRequests);
-	if (ResolvedRequests.IsEmpty() && !bHasLandscapeTriangles)
+		ResolvedRequests,
+		nullptr,
+		&NaniteTriangles);
+	if (ResolvedRequests.IsEmpty() && !bHasLandscapeTriangles && NaniteTriangles.IsEmpty())
 	{
 		return ResultTriangleData;
 	}
@@ -2481,12 +3273,14 @@ FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPUFilt
 
 	ENQUEUE_RENDER_COMMAND(GetBoxSceneTrianglesFromGPUFilteredGPU)(
 		[ResolvedRequests = MoveTemp(ResolvedRequests), TotalStaticMeshTriangleCount, LandscapeTriangleData = MoveTemp(LandscapeTriangleData),
+		 NaniteTriangles = MoveTemp(NaniteTriangles),
 		 VertexReadback, NormalReadback, CounterReadback, CounterReadbackBytes,
 		 ReferencePointsForRender, SafeFilterDistance, SafeMaxTriangles,
 		 &bRenderWorkQueued, &bHasGPUOutput, &VertexCapacity, &ActualVertexReadbackBytes](FRHICommandListImmediate& RHICmdList)
 		{
 			FRDGBuilder GraphBuilder(RHICmdList);
 			const FCSTriangleMeshData* InitialTriangleData = GetTriangleMeshDataTriangleCount(LandscapeTriangleData) > 0 ? &LandscapeTriangleData : nullptr;
+			const FCSNaniteSourceTriangleData* NaniteTrianglesPtr = !NaniteTriangles.IsEmpty() ? &NaniteTriangles : nullptr;
 
 			FCSStaticMeshTriangleRDGOutput TriangleOutput = AddResolvedStaticMeshTrianglesToRDGInternal(
 				GraphBuilder,
@@ -2497,7 +3291,8 @@ FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPUFilt
 				SafeFilterDistance,
 				SafeMaxTriangles,
 				InitialTriangleData,
-				TEXT("CS.BoxSceneTrianglesFiltered"));
+				TEXT("CS.BoxSceneTrianglesFiltered"),
+				NaniteTrianglesPtr);
 
 			if (TriangleOutput.TriangleVertices && TriangleOutput.TriangleNormals && TriangleOutput.TriangleCounter)
 			{
@@ -2645,6 +3440,23 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 	TArray<FVector>& OutPositions,
 	TArray<FVector>& OutNormals)
 {
+	BuildBoxSceneFilteredSurfaceVoxels(VoxelSize, ReferenceFilterDistance, OutPositions, OutNormals, true);
+}
+
+bool AComputeShaderMeshGenerator::PrepareBoxSceneSurfaceVoxelsGPU(float VoxelSize, float ReferenceFilterDistance)
+{
+	TArray<FVector> UnusedPositions;
+	TArray<FVector> UnusedNormals;
+	BuildBoxSceneFilteredSurfaceVoxels(VoxelSize, ReferenceFilterDistance, UnusedPositions, UnusedNormals, false);
+	return LastSurfaceVoxelGPUBuffers.IsValid();
+}
+
+void AComputeShaderMeshGenerator::BuildBoxSceneFilteredSurfaceVoxels(float VoxelSize,
+	float ReferenceFilterDistance,
+	TArray<FVector>& OutPositions,
+	TArray<FVector>& OutNormals,
+	bool bReadbackToCPU)
+{
 	OutPositions.Reset();
 	OutNormals.Reset();
 
@@ -2656,6 +3468,7 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 	LastSurfaceVoxelTextureData.bValid = false;
 	LastSurfaceVoxelTextureData.VoxelCount = 0;
 	LastSurfaceVoxelTextureData.VoxelSize = SafeVoxelSize;
+	LastSurfaceVoxelGPUBuffers.Reset();
 
 	UWorld* World = GetWorld();
 	if (!World)
@@ -2704,7 +3517,7 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 	}
 
 	const uint64 MaxVoxelReadbackBytes64 = uint64(SafeMaxVoxels) * sizeof(FVector4f);
-	if (MaxVoxelReadbackBytes64 > uint64(TNumericLimits<uint32>::Max()))
+	if (bReadbackToCPU && MaxVoxelReadbackBytes64 > uint64(TNumericLimits<uint32>::Max()))
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneFilteredSurfaceVoxels] Readback request too large. MaxVoxels=%d"), SafeMaxVoxels);
 		return;
@@ -2712,22 +3525,28 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 
 	const uint32 CounterReadbackBytes = sizeof(uint32) * 2;
 
-	FRHIGPUBufferReadback* PositionReadback = new FRHIGPUBufferReadback(TEXT("FilteredSurfaceVoxels_PositionReadback"));
-	FRHIGPUBufferReadback* NormalReadback = new FRHIGPUBufferReadback(TEXT("FilteredSurfaceVoxels_NormalReadback"));
-	FRHIGPUBufferReadback* TargetPositionReadback = new FRHIGPUBufferReadback(TEXT("FilteredSurfaceVoxels_TargetPositionReadback"));
-	FRHIGPUBufferReadback* CellReadback = new FRHIGPUBufferReadback(TEXT("FilteredSurfaceVoxels_CellReadback"));
-	FRHIGPUBufferReadback* CounterReadback = new FRHIGPUBufferReadback(TEXT("FilteredSurfaceVoxels_CounterReadback"));
+	FRHIGPUBufferReadback* PositionReadback = bReadbackToCPU ? new FRHIGPUBufferReadback(TEXT("FilteredSurfaceVoxels_PositionReadback")) : nullptr;
+	FRHIGPUBufferReadback* NormalReadback = bReadbackToCPU ? new FRHIGPUBufferReadback(TEXT("FilteredSurfaceVoxels_NormalReadback")) : nullptr;
+	FRHIGPUBufferReadback* TargetPositionReadback = bReadbackToCPU ? new FRHIGPUBufferReadback(TEXT("FilteredSurfaceVoxels_TargetPositionReadback")) : nullptr;
+	FRHIGPUBufferReadback* CellReadback = bReadbackToCPU ? new FRHIGPUBufferReadback(TEXT("FilteredSurfaceVoxels_CellReadback")) : nullptr;
+	FRHIGPUBufferReadback* CounterReadback = bReadbackToCPU ? new FRHIGPUBufferReadback(TEXT("FilteredSurfaceVoxels_CounterReadback")) : nullptr;
 	bool bRenderWorkQueued = false;
 	bool bHasGPUOutput = false;
 	int32 VoxelCapacity = 0;
 	uint32 ActualVoxelReadbackBytes = 0;
 	uint32 ActualVoxelCellReadbackBytes = 0;
 
+	// Trip B: retain the GPU voxel buffers so a consumer can register them directly
+	// instead of reading them back + re-uploading. The game thread blocks on
+	// FlushRenderingCommands below, so storing into this member from the render lambda
+	// is race-free (the flush is a barrier). Counts/params are filled after the flush.
+	FCSSurfaceVoxelGPUBuffers* OutGPUVoxels = &LastSurfaceVoxelGPUBuffers;
+
 	ENQUEUE_RENDER_COMMAND(GetBoxSceneFilteredSurfaceVoxelsGPU)(
 		[ResolvedRequests = MoveTemp(ResolvedRequests), TotalStaticMeshTriangleCount, LandscapeTriangleData = MoveTemp(LandscapeTriangleData),
 		 PositionReadback, NormalReadback, TargetPositionReadback, CellReadback, CounterReadback, CounterReadbackBytes,
-		 SafeMaxTriangles, SafeMaxVoxels, VoxelOrigin = QueryBox.Min, SafeVoxelSize,
-		 ReferencePointsForRender, SafeFilterDistance, SafeSurfaceVoxelBlurIterations, SafeSurfaceVoxelBlurRadius,
+		 SafeMaxTriangles, SafeMaxVoxels, VoxelOrigin = QueryBox.Min, VoxelWorldBounds = QueryBox, SafeVoxelSize, bReadbackToCPU,
+		 ReferencePointsForRender, SafeFilterDistance, SafeSurfaceVoxelBlurIterations, SafeSurfaceVoxelBlurRadius, OutGPUVoxels,
 		 &bRenderWorkQueued, &bHasGPUOutput, &VoxelCapacity, &ActualVoxelReadbackBytes, &ActualVoxelCellReadbackBytes](FRHICommandListImmediate& RHICmdList)
 		{
 			const uint32 VoxCap = uint32(FMath::Max(1, SafeMaxVoxels));
@@ -2961,12 +3780,36 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 				VoxelCapacity = int32(VoxCap);
 				ActualVoxelReadbackBytes = uint32(uint64(VoxCap) * sizeof(FVector4f));
 				ActualVoxelCellReadbackBytes = uint32(uint64(VoxCap) * sizeof(FIntVector4));
-				AddEnqueueCopyPass(FinalGraph, PositionReadback, FPositions, ActualVoxelReadbackBytes);
-				AddEnqueueCopyPass(FinalGraph, NormalReadback, FNormals, ActualVoxelReadbackBytes);
-				AddEnqueueCopyPass(FinalGraph, TargetPositionReadback, FTargetPositions, ActualVoxelReadbackBytes);
-				AddEnqueueCopyPass(FinalGraph, CellReadback, FCells, ActualVoxelCellReadbackBytes);
-				AddEnqueueCopyPass(FinalGraph, CounterReadback, FCounter, CounterReadbackBytes);
+				const bool bFinalDataInBlurBuffers = BlurIters > 0u && (BlurIters & 1u) != 0u;
+				FRDGBufferRef FinalNormals = bFinalDataInBlurBuffers ? FBlurNormals : FNormals;
+				FRDGBufferRef FinalTargets = bFinalDataInBlurBuffers ? FBlurTargets : FTargetPositions;
+				if (bReadbackToCPU)
+				{
+					AddEnqueueCopyPass(FinalGraph, PositionReadback, FPositions, ActualVoxelReadbackBytes);
+					AddEnqueueCopyPass(FinalGraph, NormalReadback, FinalNormals, ActualVoxelReadbackBytes);
+					AddEnqueueCopyPass(FinalGraph, TargetPositionReadback, FinalTargets, ActualVoxelReadbackBytes);
+					AddEnqueueCopyPass(FinalGraph, CellReadback, FCells, ActualVoxelCellReadbackBytes);
+					AddEnqueueCopyPass(FinalGraph, CounterReadback, FCounter, CounterReadbackBytes);
+				}
 				bHasGPUOutput = true;
+
+				// Trip B: keep the same buffers the readback sources (base pooled buffers,
+				// which hold the final blur-resolved data), so a consumer can register them.
+				if (OutGPUVoxels)
+				{
+					OutGPUVoxels->Positions = VoxelPositionsBuf;
+					OutGPUVoxels->Normals = bFinalDataInBlurBuffers ? BlurredNormalsBuf : VoxelNormalsBuf;
+					OutGPUVoxels->TargetPositions = bFinalDataInBlurBuffers ? BlurredTargetsBuf : VoxelTargetPositionsBuf;
+					OutGPUVoxels->Cells = VoxelCellsBuf;
+					OutGPUVoxels->Counter = VoxelCounterBuf;
+					OutGPUVoxels->HashSlots = VoxelHashSlotsBuf;
+					OutGPUVoxels->HashIndices = VoxelHashIndicesBuf;
+					OutGPUVoxels->VoxelCapacity = int32(VoxCap);
+					OutGPUVoxels->HashSlotCount = HashSlotCount;
+					OutGPUVoxels->VoxelSize = SafeVoxelSize;
+					OutGPUVoxels->VoxelOrigin = FVector(VoxelOrigin);
+					OutGPUVoxels->WorldBounds = VoxelWorldBounds;
+				}
 
 				FinalGraph.Execute();
 			}
@@ -2985,6 +3828,8 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 		delete CounterReadback;
 		return;
 	}
+
+	if (!bReadbackToCPU) return;
 
 	TArray<FVector4f> PositionData;
 	TArray<FVector4f> NormalData;
@@ -3222,6 +4067,15 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 	// Update cached data
 	LastSurfaceVoxelData = FilteredVoxelData;
 	StoreSurfaceVoxelTextureData(LastSurfaceVoxelData, QueryBox.Min);
+
+	// Trip B: finalize the retained GPU voxel buffers with the same counts/params as the
+	// CPU cache (the buffers themselves were stored on the render thread above). VoxelCount
+	// comes from the tiny counter readback; the big per-voxel arrays no longer need reading
+	// back once a consumer registers these buffers directly.
+	LastSurfaceVoxelGPUBuffers.VoxelCount = LastSurfaceVoxelData.VoxelCount > 0
+		? LastSurfaceVoxelData.VoxelCount : LastSurfaceVoxelData.Positions.Num();
+	LastSurfaceVoxelGPUBuffers.VoxelSize = LastSurfaceVoxelData.VoxelSize;
+	LastSurfaceVoxelGPUBuffers.VoxelOrigin = LastSurfaceVoxelData.VoxelOrigin;
 }
 
 FCSSurfaceVoxelData AComputeShaderMeshGenerator::ReadbackBoxSceneSurfaceVoxelsSync(float VoxelSize, const TCHAR* DebugName)
@@ -3255,128 +4109,40 @@ void AComputeShaderMeshGenerator::ClearGeneratedDataTextureCache()
 	ClearSurfaceVoxelTextureData();
 }
 
-int32 AComputeShaderMeshGenerator::DrawDebugDirectionArray(
-	const TArray<FVector>& Positions,
-	const TArray<FVector>& Directions,
-	float DirectionLength,
-	FLinearColor DirectionColor,
-	float Duration,
-	float Thickness,
-	bool bPersistentLines,
-	bool bDrawPoints,
-	FLinearColor PointColor,
-	float PointSize,
-	int32 MaxDirectionsToDraw) const
-{
-	UWorld* World = GetWorld();
-	if (!World || Positions.IsEmpty() || Directions.IsEmpty())
-	{
-		return 0;
-	}
-
-	const int32 AvailableCount = FMath::Min(Positions.Num(), Directions.Num());
-	const int32 DrawLimit = MaxDirectionsToDraw > 0
-		? FMath::Min(MaxDirectionsToDraw, AvailableCount)
-		: AvailableCount;
-	if (DrawLimit <= 0)
-	{
-		return 0;
-	}
-
-	const float SafeDirectionLength = FMath::Max(0.0f, DirectionLength);
-	const float SafeDuration = FMath::Max(0.0f, Duration);
-	const float SafeThickness = FMath::Max(0.0f, Thickness);
-	const float SafePointSize = FMath::Max(0.0f, PointSize);
-	const float ArrowHeadSize = FMath::Max(SafeDirectionLength * 0.15f, SafeThickness * 4.0f);
-	const FColor DirectionDrawColor = DirectionColor.ToFColor(true);
-	const FColor PointDrawColor = PointColor.ToFColor(true);
-
-	int32 DrawnCount = 0;
-	for (int32 Index = 0; Index < DrawLimit; ++Index)
-	{
-		const FVector& Position = Positions[Index];
-		if (!IsFiniteCSVertex(Position))
-		{
-			continue;
-		}
-
-		FVector Direction = Directions[Index];
-		if (!Direction.Normalize())
-		{
-			continue;
-		}
-
-		const FVector EndPosition = Position + Direction * SafeDirectionLength;
-		DrawDebugDirectionalArrow(
-			World,
-			Position,
-			EndPosition,
-			ArrowHeadSize,
-			DirectionDrawColor,
-			bPersistentLines,
-			SafeDuration,
-			0,
-			SafeThickness);
-
-		if (bDrawPoints && SafePointSize > 0.0f)
-		{
-			DrawDebugPoint(
-				World,
-				Position,
-				SafePointSize,
-				PointDrawColor,
-				bPersistentLines,
-				SafeDuration,
-				0);
-		}
-
-		++DrawnCount;
-	}
-
-	return DrawnCount;
-}
-
-
-
 int32 AComputeShaderMeshGenerator::DrawDebugLastSurfaceVoxelDirections(
-	const FCSDebugLastVoxelDirectionOptions& Options) const
+	const FCSDebugLastVoxelDirectionOptions& Options)
 {
+	if (!MeshGeneratorDebugComponent || !LastSurfaceVoxelGPUBuffers.IsValid()) return 0;
 	const float EffectiveDirectionLength = Options.DirectionLength > 0.0f
 		? Options.DirectionLength
-		: FMath::Max(LastSurfaceVoxelData.VoxelSize, UE_KINDA_SMALL_NUMBER);
-	return DrawDebugDirectionArray(
-		LastSurfaceVoxelData.Positions,
-		LastSurfaceVoxelData.Normals,
+		: FMath::Max(LastSurfaceVoxelGPUBuffers.VoxelSize, UE_KINDA_SMALL_NUMBER);
+	return MeshGeneratorDebugComponent->SetDirectionSource(
+		LastSurfaceVoxelGPUBuffers,
 		EffectiveDirectionLength,
 		Options.DirectionColor,
-		Options.Duration,
-		Options.Thickness,
-		Options.bPersistentLines,
 		Options.bDrawPoints,
 		Options.PointColor,
-		Options.PointSize,
-		Options.MaxDirectionsToDraw);
+		Options.MaxDirectionsToDraw,
+		Options.Duration,
+		Options.bPersistentLines);
 }
 
 int32 AComputeShaderMeshGenerator::DrawDebugBoxSceneSurfaceVoxelDirections(
 	const FCSDebugBoxVoxelDirectionOptions& Options)
 {
-	const FCSSurfaceVoxelData SurfaceVoxels = ReadbackBoxSceneSurfaceVoxelsSync(Options.VoxelSize);
+	if (!MeshGeneratorDebugComponent || !PrepareBoxSceneSurfaceVoxelsGPU(Options.VoxelSize)) return 0;
 	const float EffectiveDirectionLength = Options.DirectionLength > 0.0f
 		? Options.DirectionLength
-		: FMath::Max(SurfaceVoxels.VoxelSize, UE_KINDA_SMALL_NUMBER);
-	return DrawDebugDirectionArray(
-		SurfaceVoxels.Positions,
-		SurfaceVoxels.Normals,
+		: FMath::Max(LastSurfaceVoxelGPUBuffers.VoxelSize, UE_KINDA_SMALL_NUMBER);
+	return MeshGeneratorDebugComponent->SetDirectionSource(
+		LastSurfaceVoxelGPUBuffers,
 		EffectiveDirectionLength,
 		Options.DirectionColor,
-		Options.Duration,
-		Options.Thickness,
-		Options.bPersistentLines,
 		Options.bDrawPoints,
 		Options.PointColor,
-		Options.PointSize,
-		Options.MaxDirectionsToDraw);
+		Options.MaxDirectionsToDraw,
+		Options.Duration,
+		Options.bPersistentLines);
 }
 
 UTextureRenderTarget2D* AComputeShaderMeshGenerator::GetOrCreateGeneratedDataRenderTarget(
@@ -3666,112 +4432,15 @@ void AComputeShaderMeshGenerator::ClearSurfaceVoxelTextureData()
 }
 
 // -----------------------------------------------------------------------------
-// Debug System - Dynamic Mesh Output
+// Debug System - GPU Output
 // -----------------------------------------------------------------------------
 
-UDynamicMesh* AComputeShaderMeshGenerator::SurfaceVoxelsToIsolatedQuadsDebug(float VoxelSize,
+bool AComputeShaderMeshGenerator::SurfaceVoxelsToIsolatedQuadsDebug(float VoxelSize,
 	bool bReverseOrientation)
 {
-	const FCSSurfaceVoxelData SurfaceVoxels = ReadbackBoxSceneSurfaceVoxelsSync(VoxelSize);
-
-	UDynamicMesh* OutMesh = CreateEmptyDynamicMesh();
-	if (!OutMesh)
-	{
-		return nullptr;
-	}
-
-	const int32 EffectiveVoxelCount = SurfaceVoxels.VoxelCount >= 0
-		? FMath::Clamp(SurfaceVoxels.VoxelCount, 0, SurfaceVoxels.Positions.Num())
-		: SurfaceVoxels.Positions.Num();
-	if (EffectiveVoxelCount <= 0)
-	{
-		UE_LOG(LogTemp, Log, TEXT("[SurfaceVoxelDebug] IsolatedQuads: Empty EffectiveVoxelCount=%d"), EffectiveVoxelCount);
-		return OutMesh;
-	}
-
-	const float BaseVoxelSize = VoxelSize > 0.0f ? VoxelSize : SurfaceVoxels.VoxelSize;
-	const float SafeVoxelSize = FMath::Max(BaseVoxelSize, UE_KINDA_SMALL_NUMBER);
-	const float HalfQuadSize = SafeVoxelSize * FMath::Max(QuadScale, UE_KINDA_SMALL_NUMBER) * 0.5f;
-
-	UE::Geometry::FDynamicMesh3 Mesh;
-	Mesh.EnableVertexNormals(FVector3f::UpVector);
-
-	int32 AddedPatches = 0;
-	int32 AddedTriangles = 0;
-	int32 InvalidPositionCount = 0;
-	int32 InvalidNormalCount = 0;
-
-	for (int32 VoxelIndex = 0; VoxelIndex < EffectiveVoxelCount; ++VoxelIndex)
-	{
-		const FVector& Position = SurfaceVoxels.Positions[VoxelIndex];
-		if (!IsFiniteCSVertex(Position))
-		{
-			++InvalidPositionCount;
-			continue;
-		}
-
-		FVector Normal = SurfaceVoxels.Normals.IsValidIndex(VoxelIndex)
-			? SurfaceVoxels.Normals[VoxelIndex]
-			: FVector::UpVector;
-		if (Normal.ContainsNaN())
-		{
-			++InvalidNormalCount;
-			continue;
-		}
-		Normal = Normal.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
-
-		const FVector HelperAxis = FMath::Abs(Normal.Z) < 0.99 ? FVector::UpVector : FVector::RightVector;
-		const FVector AxisX = FVector::CrossProduct(HelperAxis, Normal).GetSafeNormal(UE_SMALL_NUMBER, FVector::ForwardVector);
-		const FVector AxisY = FVector::CrossProduct(Normal, AxisX).GetSafeNormal(UE_SMALL_NUMBER, FVector::RightVector);
-		const FVector Center = Position + Normal * (SafeVoxelSize * NormalOffsetScale);
-		const FVector DX = AxisX * HalfQuadSize;
-		const FVector DY = AxisY * HalfQuadSize;
-
-		const int32 A = Mesh.AppendVertex(FVector3d(Center - DX - DY));
-		const int32 B = Mesh.AppendVertex(FVector3d(Center + DX - DY));
-		const int32 C = Mesh.AppendVertex(FVector3d(Center + DX + DY));
-		const int32 D = Mesh.AppendVertex(FVector3d(Center - DX + DY));
-		Mesh.SetVertexNormal(A, FVector3f(Normal));
-		Mesh.SetVertexNormal(B, FVector3f(Normal));
-		Mesh.SetVertexNormal(C, FVector3f(Normal));
-		Mesh.SetVertexNormal(D, FVector3f(Normal));
-
-		const int32 T0 = bReverseOrientation
-			? Mesh.AppendTriangle(UE::Geometry::FIndex3i(A, C, B), 0)
-			: Mesh.AppendTriangle(UE::Geometry::FIndex3i(A, B, C), 0);
-		const int32 T1 = bReverseOrientation
-			? Mesh.AppendTriangle(UE::Geometry::FIndex3i(A, D, C), 0)
-			: Mesh.AppendTriangle(UE::Geometry::FIndex3i(A, C, D), 0);
-		if (T0 >= 0)
-		{
-			++AddedTriangles;
-		}
-		if (T1 >= 0)
-		{
-			++AddedTriangles;
-		}
-		++AddedPatches;
-	}
-
-	UE_LOG(LogTemp, Log, TEXT("[SurfaceVoxelDebug] IsolatedQuads: Input=%d AddedPatches=%d AddedTriangles=%d InvalidPositions=%d InvalidNormals=%d MeshVertices=%d MeshTriangles=%d"),
-		EffectiveVoxelCount,
-		AddedPatches,
-		AddedTriangles,
-		InvalidPositionCount,
-		InvalidNormalCount,
-		Mesh.VertexCount(),
-		Mesh.TriangleCount());
-
-	if (AddedTriangles <= 0)
-	{
-		return OutMesh;
-	}
-
-	OutMesh->SetMesh(MoveTemp(Mesh));
-	FGeometryScriptCalculateNormalsOptions CalculateOptions;
-	UGeometryScriptLibrary_MeshNormalsFunctions::RecomputeNormals(OutMesh, CalculateOptions);
-	SetGeneratedDynamicMesh(OutMesh);
-	return OutMesh;
+	if (!MeshGeneratorDebugComponent || !PrepareBoxSceneSurfaceVoxelsGPU(VoxelSize)) return false;
+	return MeshGeneratorDebugComponent->SetIsolatedQuadSource(
+		LastSurfaceVoxelGPUBuffers, QuadScale, NormalOffsetScale, bReverseOrientation);
 }
 
 // -----------------------------------------------------------------------------
@@ -3959,79 +4628,36 @@ UDynamicMesh* AComputeShaderMeshGenerator::GetBoxSceneTrianglesFilteredToDynamic
 void AComputeShaderMeshGenerator::SpawnDebugSurfaceTrianglesDynamicMeshActor(float LifetimeSeconds)
 {
 	UWorld* World = GetWorld();
-	if (!World)
+	if (!World || !DebugTriangleComponent) return;
+
+	const FBox QueryBox = GetGeneratorBoundsWorldBox();
+	if (!QueryBox.IsValid) return;
+	const int32 SafeMaxTriangles = FMath::Max(1, MaxTriangles);
+	const FCSBoxScenePreparedData Prepared = PrepareBoxSceneTriangles(
+		World, QueryBox, SafeMaxTriangles, TArray<FVector>(), 0.0f);
+	if (!Prepared.IsValid() || !Prepared.HasAnyTriangles())
 	{
+		ClearDebugTriangleComponent();
 		return;
 	}
 
-	const int32 EffectiveVertexCount = CachedSurfaceTriangles.VertexCount >= 0
-		? FMath::Min(CachedSurfaceTriangles.VertexCount, CachedSurfaceTriangles.Vertices.Num())
-		: CachedSurfaceTriangles.Vertices.Num();
+	DebugTriangleComponent->SetTriangleSource(Prepared, uint32(SafeMaxTriangles) * 3u, QueryBox);
+	World->GetTimerManager().ClearTimer(DebugTriangleClearTimerHandle);
+	if (LifetimeSeconds > 0.0f)
+		World->GetTimerManager().SetTimer(DebugTriangleClearTimerHandle, this,
+			&AComputeShaderMeshGenerator::ClearDebugTriangleComponent, LifetimeSeconds, false);
+}
 
-	const int32 EffectiveIndexCount = CachedSurfaceTriangles.IndexCount >= 0
-		? FMath::Min(CachedSurfaceTriangles.IndexCount, CachedSurfaceTriangles.Indices.Num())
-		: CachedSurfaceTriangles.Indices.Num();
+void AComputeShaderMeshGenerator::ClearDebugTriangleComponent()
+{
+	if (UWorld* World = GetWorld()) World->GetTimerManager().ClearTimer(DebugTriangleClearTimerHandle);
+	if (DebugTriangleComponent) DebugTriangleComponent->ClearTriangleSource();
+}
 
-	if (EffectiveVertexCount < 3)
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[SpawnDebugSurfaceTriangles] No cached surface triangles on %s. Run GenerateVines first."),
-			*GetActorNameOrLabel());
-		return;
-	}
-
-	// Convert cached triangles to a DynamicMesh
-	UDynamicMesh* DebugMesh = BuildDynamicMeshFromCSTriangleData(
-		CachedSurfaceTriangles.Vertices,
-		CachedSurfaceTriangles.Indices,
-		CachedSurfaceTriangles.VertexNormals,
-		CachedSurfaceTriangles.VertexCount,
-		CachedSurfaceTriangles.IndexCount,
-		true,  // bReverseOrientation
-		true,  // bSkipDegenerateTriangles
-		true); // bRecomputeNormals
-
-	if (!DebugMesh)
-	{
-		return;
-	}
-
-	// Spawn a temporary ADynamicMeshActor at this actor's location
-	FActorSpawnParameters SpawnParams;
-	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-
-	ADynamicMeshActor* SpawnedActor = World->SpawnActor<ADynamicMeshActor>(
-		ADynamicMeshActor::StaticClass(),
-		FVector::ZeroVector,
-		FRotator::ZeroRotator,
-		SpawnParams);
-
-	if (!SpawnedActor)
-	{
-		return;
-	}
-
-	// Set the debug mesh on the spawned actor
-	UDynamicMeshComponent* MeshComponent = SpawnedActor->GetDynamicMeshComponent();
-	if (MeshComponent)
-	{
-		MeshComponent->SetDynamicMesh(DebugMesh);
-	}
-
-	// Destroy the actor after LifetimeSeconds
-	const float SafeLifetime = FMath::Max(0.1f, LifetimeSeconds);
-	FTimerHandle DestroyTimerHandle;
-	World->GetTimerManager().SetTimer(
-		DestroyTimerHandle,
-		[SpawnedActor]()
-		{
-			if (IsValid(SpawnedActor))
-			{
-				SpawnedActor->Destroy();
-			}
-		},
-		SafeLifetime,
-		false);
+void AComputeShaderMeshGenerator::ClearMeshGeneratorGPUDebug()
+{
+	if (MeshGeneratorDebugComponent) MeshGeneratorDebugComponent->ClearDebug();
+	ClearDebugTriangleComponent();
 }
 
 bool AComputeShaderMeshGenerator::SetGeneratedDynamicMesh(UDynamicMesh* NewMesh, float BoundsScale)
@@ -4045,6 +4671,66 @@ bool AComputeShaderMeshGenerator::SetGeneratedDynamicMesh(UDynamicMesh* NewMesh,
 	MeshComponent->SetDynamicMesh(NewMesh);
 	RefreshDynamicMeshComponentCullingBounds(BoundsScale);
 	return true;
+}
+
+bool AComputeShaderMeshGenerator::SubmitBoxSceneTrianglesToRenderPipeline(UMaterialInterface* Material, int32 MaxDirectTriangles, float ReferenceFilterDistance)
+{
+	if (!DirectMeshComponent)
+	{
+		return false;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return false;
+	}
+
+	const FBox QueryBox = GetGeneratorBoundsWorldBox();
+	if (!QueryBox.IsValid)
+	{
+		return false;
+	}
+
+	const int32 SafeMaxTriangles = FMath::Max(1, MaxDirectTriangles);
+	const TArray<FVector> ReferencePointsForRender = ReferencePoints;
+	const float SafeFilterDistance = ReferencePointsForRender.IsEmpty() ? 0.0f : FMath::Max(0.0f, ReferenceFilterDistance);
+
+	// Game-thread resolve of scene triangles into a render-thread-safe snapshot (no UObject access
+	// happens later on the render thread). Static meshes carrying ExcludedActorTags are skipped.
+	const FCSBoxScenePreparedData Prepared = PrepareBoxSceneTriangles(
+		World, QueryBox, SafeMaxTriangles, ReferencePointsForRender, SafeFilterDistance);
+
+	if (!Prepared.IsValid() || !Prepared.HasAnyTriangles())
+	{
+		return false;
+	}
+
+	if (Material)
+	{
+		DirectMeshComponent->MeshMaterial = Material;
+	}
+
+	// VertexCapacity = triangle capacity * 3 (triangle soup: 3 verts per triangle).
+	const uint32 VertexCapacity = uint32(SafeMaxTriangles) * 3u;
+	DirectMeshComponent->SetTriangleSource(Prepared, VertexCapacity, QueryBox);
+	return true;
+}
+
+UStaticMesh* AComputeShaderMeshGenerator::SaveDirectGPUMeshToStaticMesh(
+	const FString& AssetPathAndName,
+	bool bReplaceExistingAsset,
+	bool bSaveAsset,
+	bool bConvertToActorLocalSpace)
+{
+#if WITH_EDITOR
+	return CSGpuMeshSave::SaveGpuMeshComponentToStaticMesh(
+		DirectMeshComponent, AssetPathAndName,
+		DirectMeshComponent ? DirectMeshComponent->MeshMaterial.Get() : nullptr,
+		GetActorTransform(), bConvertToActorLocalSpace, bReplaceExistingAsset, bSaveAsset);
+#else
+	return nullptr;
+#endif
 }
 
 void AComputeShaderMeshGenerator::RefreshDynamicMeshComponentCullingBounds(float BoundsScale)
@@ -4080,6 +4766,56 @@ void AComputeShaderMeshGenerator::RefreshDynamicMeshComponentCullingBounds(float
 // -----------------------------------------------------------------------------
 // Core System - Lifecycle
 // -----------------------------------------------------------------------------
+
+CSGpuTriangleUtilities::FTriangleLBVH AComputeShaderMeshGenerator::AddTriangleLBVHToRDG(
+	FRDGBuilder& GraphBuilder,
+	FRDGBufferSRVRef TriangleSoupSRV,
+	int32 TriangleCount,
+	int32 SortElementCount,
+	const FVector3f& AabbMin,
+	const FVector3f& InvExtent)
+{
+	return CSGpuTriangleUtilities::AddTriangleLBVHBuildPasses(
+		GraphBuilder, TriangleSoupSRV, TriangleCount, SortElementCount, AabbMin, InvExtent);
+}
+
+FRDGBufferRef AComputeShaderMeshGenerator::AddFastWindingToRDG(
+	FRDGBuilder& GraphBuilder,
+	FRDGBufferSRVRef TriangleSoupSRV,
+	const CSGpuTriangleUtilities::FTriangleLBVH& LBVH,
+	int32 TriangleCount)
+{
+	return CSGpuTriangleUtilities::AddFastWindingMultipolePasses(
+		GraphBuilder, TriangleSoupSRV, LBVH, TriangleCount);
+}
+
+FRDGBufferRef AComputeShaderMeshGenerator::AddVertexWeldToRDG(
+	FRDGBuilder& GraphBuilder,
+	FRDGBufferRef OutputTriangleSoup,
+	FRDGBufferRef OutputTriangleCounter,
+	int32 OutputTriangleCapacity,
+	int32 SourceTriangleCapacity,
+	const FVector3f& GridOrigin,
+	float WeldDistance,
+	FRDGBufferSRVRef TriangleFilter,
+	uint32 TriangleFilterMask)
+{
+	return CSGpuTriangleUtilities::AddVertexWeldPasses(
+		GraphBuilder,
+		OutputTriangleSoup,
+		OutputTriangleCounter,
+		OutputTriangleCapacity,
+		SourceTriangleCapacity,
+		GridOrigin,
+		WeldDistance,
+		TriangleFilter,
+		TriangleFilterMask);
+}
+
+AComputeShaderMeshGenerator::AComputeShaderMeshGenerator()
+	: AComputeShaderMeshGenerator(FObjectInitializer::Get())
+{
+}
 
 AComputeShaderMeshGenerator::AComputeShaderMeshGenerator(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
@@ -4125,6 +4861,15 @@ AComputeShaderMeshGenerator::AComputeShaderMeshGenerator(const FObjectInitialize
 	GeneratorBounds->SetHiddenInGame(true);
 	GeneratorBounds->SetBoxExtent(FVector(500.0, 500.0, 500.0));
 	GeneratorBounds->SetupAttachment(SceneRoot);
+
+	DirectMeshComponent = CreateDefaultSubobject<UCSDirectTriangleMeshComponent>(TEXT("DirectMeshComponent"));
+	DirectMeshComponent->SetupAttachment(SceneRoot);
+
+	MeshGeneratorDebugComponent = CreateDefaultSubobject<UCSMeshGeneratorDebugComponent>(TEXT("MeshGeneratorDebugComponent"));
+	MeshGeneratorDebugComponent->SetupAttachment(SceneRoot);
+
+	DebugTriangleComponent = CreateDefaultSubobject<UCSDirectTriangleMeshComponent>(TEXT("DebugTriangleComponent"));
+	DebugTriangleComponent->SetupAttachment(SceneRoot);
 }
 
 void AComputeShaderMeshGenerator::OnConstruction(const FTransform& Transform)
@@ -4141,6 +4886,8 @@ void AComputeShaderMeshGenerator::PostRegisterAllComponents()
 
 void AComputeShaderMeshGenerator::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	ClearMeshGeneratorGPUDebug();
+	LastSurfaceVoxelGPUBuffers.Reset();
 	ClearGeneratedDataTextureCache();
 	Super::EndPlay(EndPlayReason);
 }
@@ -5131,7 +5878,7 @@ FName AMeshGeneratorBrushCache::NormalizeRequestId(FName RequestId) const
 }
 
 // -----------------------------------------------------------------------------
-// Triangle Soup → Heightmap RDG pass
+// Triangle Soup 閳?Heightmap RDG pass
 // -----------------------------------------------------------------------------
 
 void AComputeShaderMeshGenerator::RasterizeTriangleSoupToHeightmapRDG(
@@ -5208,6 +5955,105 @@ void AComputeShaderMeshGenerator::RasterizeTriangleSoupToHeightmapRDG(
 			ConvertParams,
 			GroupCount);
 	}
+}
+
+void AComputeShaderMeshGenerator::RasterizeIndexedMeshToHeightmapRDG(
+	FRDGBuilder& GraphBuilder,
+	FRHIShaderResourceView* PositionSRV,
+	FRHIShaderResourceView* IndexSRV,
+	uint32 TriangleCapacity,
+	const FMatrix44f& LocalToWorld,
+	FRDGTextureRef OutHeightmap,
+	const FBox& WorldBounds,
+	float CameraHeight)
+{
+	if (!PositionSRV || !IndexSRV || TriangleCapacity == 0 || !OutHeightmap)
+	{
+		return;
+	}
+
+	FCSStaticMeshTriangleRDGOutput Soup;
+	Soup.MaxTriangles = TriangleCapacity;
+	Soup.MaxVertices = TriangleCapacity * 3u;
+	Soup.TriangleVertices = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), TriangleCapacity * 3u), TEXT("IdxMeshHM.Soup.Verts"));
+	Soup.TriangleVerticesUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Soup.TriangleVertices, PF_A32B32G32R32F));
+	Soup.TriangleVerticesSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Soup.TriangleVertices, PF_A32B32G32R32F));
+	AddClearUAVPass(GraphBuilder, Soup.TriangleVerticesUAV, 0.0f);
+
+	Soup.TriangleNormals = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), TriangleCapacity * 3u), TEXT("IdxMeshHM.Soup.Normals"));
+	Soup.TriangleNormalsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Soup.TriangleNormals, PF_A32B32G32R32F));
+	AddClearUAVPass(GraphBuilder, Soup.TriangleNormalsUAV, 0.0f);
+
+	Soup.TriangleCounter = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1), TEXT("IdxMeshHM.Soup.Counter"));
+	Soup.TriangleCounterUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Soup.TriangleCounter, PF_R32_UINT));
+	Soup.TriangleCounterSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Soup.TriangleCounter, PF_R32_UINT));
+	AddClearUAVPass(GraphBuilder, Soup.TriangleCounterUAV, 0u);
+
+	// Dummy reference-point buffer (filter disabled).
+	FRDGBufferRef RefBuf = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), 1), TEXT("IdxMeshHM.Soup.Ref"));
+	FVector4f* RefData = GraphBuilder.AllocPODArray<FVector4f>(1);
+	RefData[0] = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+	GraphBuilder.QueueBufferUpload(RefBuf, RefData, sizeof(FVector4f));
+	FRDGBufferSRVRef RefSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(RefBuf, PF_A32B32G32R32F));
+
+	// Heightmap 鐠侯垰绶炴稉宥堟嫹闊亝娼楃拹顭掔礉娴?shader 閸欏倹鏆熻箛鍛淬€忕紒鎴濈暰閿涙氨绮版稉鈧稉顏勫弿 CS_NO_MATERIAL_ID 閻ㄥ嫯绶崗?+
+	// 娑撯偓娑擃亙娑鍐暏閻ㄥ嫯绶崙?material buffer閵?
+	FRDGBufferRef TriToMaterialBuf = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), TriangleCapacity), TEXT("IdxMeshHM.Soup.TriToMaterial"));
+	uint32* TriToMaterialData = GraphBuilder.AllocPODArray<uint32>(TriangleCapacity);
+	for (uint32 FillIndex = 0; FillIndex < TriangleCapacity; ++FillIndex) TriToMaterialData[FillIndex] = CS_NO_MATERIAL_ID;
+	GraphBuilder.QueueBufferUpload(TriToMaterialBuf, TriToMaterialData, TriangleCapacity * sizeof(uint32));
+
+	FRDGBufferRef MaterialIdsBuf = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), TriangleCapacity), TEXT("IdxMeshHM.Soup.MaterialIds"));
+	FRDGBufferUAVRef MaterialIdsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(MaterialIdsBuf, PF_R32_UINT));
+	AddClearUAVPass(GraphBuilder, MaterialIdsUAV, CS_NO_MATERIAL_ID);
+
+	// Heightmap 鐠侯垰绶炴稉宥堟嫹闊?UV閿涘奔绲?shader 閸欏倹鏆熻箛鍛淬€忕紒鎴濈暰閿涙俺绶崗銉х拨 dummy tex-coord SRV閿涘湤umTexCoords=0
+	// 娴?shader 娑撳秶婀″锝堫嚢閸欐牭绱氶敍宀冪翻閸戣櫣绮︽稉鈧稉顏冩丢瀵啰鏁ら惃?UV buffer閵?
+	FRDGBufferRef UVsBuf = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector2f), TriangleCapacity * 3u), TEXT("IdxMeshHM.Soup.UVs"));
+	FRDGBufferUAVRef UVsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(UVsBuf, PF_G32R32F));
+	AddClearUAVPass(GraphBuilder, UVsUAV, 0.0f);
+
+	TShaderMapRef<FExtractStaticMeshTrianglesCS> ExtractCS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	auto* EP = GraphBuilder.AllocParameters<FExtractStaticMeshTrianglesCS::FParameters>();
+	EP->IndexBuffer = IndexSRV;
+	EP->PositionBuffer = PositionSRV;
+	EP->SourceTexCoordBuffer = GCSDummyTexCoordVertexBuffer.ShaderResourceViewRHI.GetReference();
+	EP->ReferencePoints = RefSRV;
+	EP->TriToMaterial = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(TriToMaterialBuf, PF_R32_UINT));
+	EP->RW_OutTriangleVertices = Soup.TriangleVerticesUAV;
+	EP->RW_OutTriangleNormals = Soup.TriangleNormalsUAV;
+	EP->RW_TriangleCounter = Soup.TriangleCounterUAV;
+	EP->RW_OutTriangleMaterialIds = MaterialIdsUAV;
+	EP->RW_OutTriangleUVs = UVsUAV;
+	EP->LocalToWorld = LocalToWorld;
+	EP->BoundsMin = FVector3f(-TNumericLimits<float>::Max());
+	EP->BoundsMax = FVector3f(TNumericLimits<float>::Max());
+	// Unused indices are zero -> degenerate (0,0,0) triangles that rasterize to nothing.
+	EP->TriangleCount = TriangleCapacity;
+	EP->PositionStrideFloat = 3u;
+	EP->ReferenceCount = 0u;
+	EP->TriangleCapacity = TriangleCapacity;
+	EP->NumTexCoords = 0u;
+	EP->bUseBounds = 0u;
+	EP->bUseReferenceFilter = 0u;
+	EP->ReferenceFilterDistanceSq = TNumericLimits<float>::Max();
+
+	GraphBuilder.AddPass(RDG_EVENT_NAME("IdxMeshHM.Extract"), EP, ERDGPassFlags::Compute,
+		[EP, ExtractCS, TriangleCapacity](FRHIComputeCommandList& CmdList)
+		{
+			// wrapped閿涙矮绗?ExtractStaticMeshTrianglesCS 閻?GetUnWrappedDispatchThreadId 闁板秴顨滈敍鍫濄亣缂冩垶鐗?TriangleCapacity 閸?>4.19M閿?
+			FComputeShaderUtils::Dispatch(CmdList, ExtractCS, *EP,
+				FComputeShaderUtils::GetGroupCountWrapped(FMath::Max(1, int32(TriangleCapacity)), 64));
+		});
+
+	RasterizeTriangleSoupToHeightmapRDG(GraphBuilder, Soup, OutHeightmap, WorldBounds, CameraHeight);
 }
 
 void AComputeShaderMeshGenerator::ConvertLandscapeHeightmapToDepthRDG(
@@ -5452,7 +6298,7 @@ bool AComputeShaderMeshGenerator::CaptureLandscapeHeightmapGPU(
 	const int32 TexSize = OutNormalHeightRT->SizeX;
 	const bool bMultipleLandscapes = Landscapes.Num() > 1;
 
-	// Pre-clear output: Normal=(0,0,1) up, Height=-1e10 (very low → any real terrain wins merge)
+	// Pre-clear output: Normal=(0,0,1) up, Height=-1e10 (very low 閳?any real terrain wins merge)
 	FTextureRenderTargetResource* R_Out = OutNormalHeightRT->GameThread_GetRenderTargetResource();
 	if (bMultipleLandscapes)
 	{

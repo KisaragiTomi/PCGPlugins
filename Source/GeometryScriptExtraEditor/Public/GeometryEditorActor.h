@@ -14,6 +14,7 @@
 #include "GeometryEditorActor.generated.h"
 
 class AStaticMeshActor;
+class UVineMeshComponent;
 
 USTRUCT(BlueprintType, meta = (DisplayName = "SC Options"))
 struct GEOMETRYSCRIPTEXTRAEDITOR_API FSpaceColonizationOptions
@@ -48,8 +49,8 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options, meta = (ClampMin = "0"))
 	float InfluenceRadius = 200.0f;
 
-	// GPU space colonization is the default path. The CPU reference remains available
-	// (set false) for validation; flip bSpaceColonizationStepLogs to diff the two.
+	// DEPRECATED: the vine is fully GPU now, so this flag is ignored by C++. Kept only so existing
+	// Blueprints that still Set it keep compiling; remove once those BP nodes are cleaned up.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
 	bool bUseComputeShader = true;
 };
@@ -137,6 +138,7 @@ public:
 	UCurveLinearColor* CurveControl = nullptr;
 
 	// --- moved from FVisVineParameters ---
+	// DEPRECATED: the vine is fully GPU now, so this flag is ignored by C++. Kept for Blueprint compat.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
 	bool bUseGPUMode = true;
 
@@ -176,12 +178,6 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options, meta = (ClampMin = "3"))
 	int32 VisVineGPUTubeSegments = 3;
 
-	// Temporarily run the post-projection passes (RS/B/FT/AS/C) on the CPU instead of the GPU.
-	// The GPU still runs the voxel-dependent stages (N/A/P/FP) and reads back the projected
-	// surface; the CPU then resamples, smooths, rebuilds tangents and sweeps the mesh.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
-	bool bVisVineGPUUseCPUForPostPasses = false;
-
 };
 
 USTRUCT()
@@ -204,6 +200,12 @@ struct FVineLinePointAxisData
 
 // VisVine debug parameter structs moved to ComputeShaderDebugParams.h
 
+// Trip A (GPU line hand-off): the space-colonization solve's fully-prepped output
+// buffers, kept GPU-resident (pooled) so VisVine can consume them directly instead
+// of the CPU round-trip (readback -> re-trace -> BuildVVGPUInput re-derive).
+// Defined in GeometryEditorActor.cpp (holds RDG pooled-buffer refs).
+struct FVineSCGPUBuffers;
+
 UCLASS()
 class GEOMETRYSCRIPTEXTRAEDITOR_API AVineContainer : public AMeshGeneratorBrushCache
 {
@@ -220,6 +222,13 @@ public:
 
 	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
 	UInstancedStaticMeshComponent* TubeVineSource;
+
+	// M1 GPU-resident vine leaf: renders the tube vine mesh directly through the render pipeline
+	// (base persistent GPU streams + indirect draw), in PARALLEL with the legacy UDynamicMesh path
+	// for side-by-side comparison. Fed by VisVineGPUInternal via SetBuildInput from the same shared
+	// FVineBuildInput bundle. Kept at an identity world transform (vine renders in world space).
+	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
+	UVineMeshComponent* VineGpuMesh;
 
 	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
 	UFoliageType* TargetType;
@@ -277,6 +286,11 @@ public:
 	UPROPERTY(Transient)
 	TArray<FVineLinePointAxisData> TubeLinePointAxes;
 
+	// Trip A: per-source GPU-resident SC output buffers, parallel to TubeLines.
+	// Populated by the tube SC loop, consumed by the VisVine GPU path to skip the
+	// line-data CPU round-trip. Not a UPROPERTY (holds render resources, transient).
+	TArray<TSharedPtr<FVineSCGPUBuffers>> TubeLineGPUBuffers;
+
 	// ---- Core Operations ----
 
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
@@ -321,6 +335,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "SpaceColonization")
 	TArray<FSpaceColonizationLineResult> SpaceColonizationWithScales(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, bool bUseComputeShader = false);
 
+	// Non-reflected worker: same as SpaceColonizationWithScales but can also export the
+	// GPU-resident prepped buffers (Trip A). FVineSCGPUBuffers isn't a USTRUCT, so this
+	// cannot be a UFUNCTION. The BlueprintCallable version above forwards here with nullptr.
+	TArray<FSpaceColonizationLineResult> SpaceColonizationWithScalesInternal(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, FVineSCGPUBuffers* OutGPUBuffers);
+
 	// ---- Debug ----
 
 	UFUNCTION(BlueprintCallable, Category = "VineActions|Debug")
@@ -336,8 +355,6 @@ public:
 	int32 DrawDebugCachedSurfaceTriangles(float Duration = 5.0f);
 
 private:
-	FCSSurfaceVoxelData CachedSurfaceVoxels;
-
 	bool VisVineGPUInternal();
 
 	void DrawDebugVineCenterLines(

@@ -168,6 +168,15 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|Boolean")
 	TObjectPtr<UMaterialInterface> DebugMaterial;
 
+	/**
+	 * 保留源网格的材质槽结构：源 mesh 有几个槽，输出就有几个槽——即使这些槽指向同一个材质，
+	 * 或者全都没指定材质（输出得到同样数量的空槽，可事后逐槽填）。
+	 * 关掉则按材质指针去重，材质列表最紧凑，但槽位结构会丢：同材质的槽会被合并，
+	 * 所有空槽也会合并成一个。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|Output")
+	bool bPreserveSourceMaterialSlots = true;
+
 	/** Last generated transient StaticMesh. Material slots preserve the source triangle material IDs. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "CS Mesh Boolean|Output")
 	TObjectPtr<UStaticMesh> OutputStaticMesh;

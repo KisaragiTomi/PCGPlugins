@@ -146,8 +146,23 @@ bool UCSGpuMeshComponent::ReadbackMeshSync(FCSGpuMeshCPUData& OutMeshData) const
 	OutMeshData.Positions.SetNumUninitialized(VertexCount);
 	OutMeshData.Normals.SetNumUninitialized(VertexCount);
 	OutMeshData.Tangents.SetNumUninitialized(VertexCount);
-	OutMeshData.TexCoords.SetNumUninitialized(VertexCount);
+	OutMeshData.TexCoords().SetNumUninitialized(VertexCount);
 	OutMeshData.Indices.SetNumUninitialized(IndexCount);
+	// 按注册的 TexCoord 流决定实际有几条 UV 通道，并为每条预分配（通道 0 已在上面分配）。
+	{
+		int32 HighestTexCoordIndex = 0;
+		for (const FCSGpuStreamDesc& Desc : ReadbackDescs)
+		{
+			if (Desc.CpuSemantic != ECSGpuMeshSemantic::TexCoord) continue;
+			HighestTexCoordIndex = FMath::Max<int32>(HighestTexCoordIndex, Desc.TexCoordIndex);
+		}
+		OutMeshData.NumTexCoordChannels = FMath::Clamp(
+			HighestTexCoordIndex + 1, 1, FCSGpuMeshCPUData::MaxTexCoordChannels);
+		for (int32 Channel = 1; Channel < OutMeshData.NumTexCoordChannels; ++Channel)
+		{
+			OutMeshData.TexCoordChannels[Channel].SetNumZeroed(VertexCount);
+		}
+	}
 
 	bool bMeshRead = false;
 	ENQUEUE_RENDER_COMMAND(CSGpuMeshConsumeStreams)(
@@ -199,9 +214,15 @@ bool UCSGpuMeshComponent::ReadbackMeshSync(FCSGpuMeshCPUData& OutMeshData) const
 					}
 					case ECSGpuMeshSemantic::TexCoord:
 					{
+						// 每条 TexCoord 流按自己的 TexCoordIndex 落到对应通道，多条 UV 才能各归各位。
+						const int32 Channel = FMath::Clamp<int32>(
+							D.TexCoordIndex, 0, FCSGpuMeshCPUData::MaxTexCoordChannels - 1);
+						if (Channel >= OutMeshData.NumTexCoordChannels) break;
+						TArray<FVector2f>& ChannelUVs = OutMeshData.TexCoordChannels[Channel];
+						if (ChannelUVs.Num() != int32(VertexCount)) ChannelUVs.SetNumUninitialized(VertexCount);
 						const float* UV = static_cast<const float*>(Raw);
 						for (uint32 v = 0; v < VertexCount; ++v)
-							OutMeshData.TexCoords[v] = FVector2f(UV[v * 2 + 0], UV[v * 2 + 1]);
+							ChannelUVs[v] = FVector2f(UV[v * 2 + 0], UV[v * 2 + 1]);
 						break;
 					}
 					case ECSGpuMeshSemantic::Index:

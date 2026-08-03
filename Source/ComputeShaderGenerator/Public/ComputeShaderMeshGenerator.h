@@ -623,7 +623,12 @@ public:
 		float InReferenceFilterDistance = 0.0f,
 		FName RequiredActorTag = NAME_None,
 		bool bIncludeLandscape = true,
-		bool bUseMeshDescriptionSourceTriangles = true);
+		bool bUseMeshDescriptionSourceTriangles = true,
+		// true keeps one registry entry per source (mesh, material slot), so a mesh with five
+		// slots yields five output slots even when they share a material or are all unassigned.
+		// false dedupes by material pointer only, giving the most compact list but losing the
+		// source slot layout - every empty slot merges into one.
+		bool bPreserveSourceMaterialSlots = true);
 
 	/** [render thread] 娑堣垂 PrepareBoxSceneTriangles 鐨勯澶囨暟鎹紝鍦?GraphBuilder 涓婂缓鍑?triangle-soup
 	 *  buffer銆傚彧鍋?RHI/RDG 鎿嶄綔锛屼笉瑙︾ UObject锛屽彲瀹夊叏鍦?ENQUEUE_RENDER_COMMAND lambda 鍐呰皟鐢ㄣ€?*/

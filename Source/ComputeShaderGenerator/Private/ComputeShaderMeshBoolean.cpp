@@ -1,6 +1,7 @@
 #include "ComputeShaderMeshBoolean.h"
 
 #include "CSGpuMeshSave.h"
+#include "CSGpuMeshConvert.h"
 
 #include "GlobalShader.h"
 #include "ShaderParameterStruct.h"
@@ -519,7 +520,8 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_MeshDescriptionExtraction);
 		Prepared = PrepareBoxSceneTriangles(
-			World, QueryBox, MaxTriangles, TArray<FVector>(), 0.0f, NAME_None, bReadLandscape, bUseMeshDescriptionSourceTriangles);
+			World, QueryBox, MaxTriangles, TArray<FVector>(), 0.0f, NAME_None, bReadLandscape,
+			bUseMeshDescriptionSourceTriangles, bPreserveSourceMaterialSlots);
 	}
 	if (!Prepared.IsValid() || !Prepared.HasAnyTriangles()) return nullptr;
 
@@ -1443,9 +1445,13 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	StaticMeshData.Indices = MoveTemp(FinalIndices);
 	StaticMeshData.Normals.SetNumUninitialized(StaticMeshData.Indices.Num());
 	StaticMeshData.Tangents.SetNumUninitialized(StaticMeshData.Indices.Num());
-	StaticMeshData.TexCoords.SetNumUninitialized(StaticMeshData.Indices.Num());
+	StaticMeshData.TexCoords().SetNumUninitialized(StaticMeshData.Indices.Num());
 	StaticMeshData.Colors.SetNumUninitialized(StaticMeshData.Indices.Num());
 	StaticMeshData.BinormalSigns.SetNumUninitialized(StaticMeshData.Indices.Num());
+	// 布尔输出是世界空间、逐角点属性（焊接后的顶点仍要保留各自的 UV/法线/颜色接缝）。
+	// 显式标注，转换段据此决定是否烘到局部空间，不再靠数组长度猜。
+	StaticMeshData.SourceSpace = FCSGpuMeshCPUData::ESpace::World;
+	StaticMeshData.AttrLayout = FCSGpuMeshCPUData::EAttrLayout::PerCorner;
 
 	// 每个三角只写自己那 3 个 corner 槽位，彼此不重叠，可直接并行；修正计数改用原子。
 	std::atomic<int32> CorrectedOutputCornerNormalsAtomic{ 0 };
@@ -1476,7 +1482,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 			for (int32 Corner = 0; Corner < 3; ++Corner)
 			{
 				UVs[Corner] = bHasSource ? BaryUV(Source, BaryWeights[Corner]) : FVector2f::ZeroVector;
-				StaticMeshData.TexCoords[CornerBase + Corner] = UVs[Corner];
+				StaticMeshData.TexCoords()[CornerBase + Corner] = UVs[Corner];
 			}
 
 			FVector3f RecomputedTangent = P[1] - P[0];
@@ -1598,22 +1604,30 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	const FTransform OutputTransform = GetDynamicMeshComponent()
 		? GetDynamicMeshComponent()->GetComponentTransform()
 		: GetActorTransform();
-	// 结果落盘为资产：level 同级 result 文件夹（/<level 目录>/result/SM_<actor>_<时间戳>），建完标脏，
-	// 由用户自行 Save All 决定是否写盘。非编辑器构建没有资产系统，退回 transient。
+	// 统一走公用转换入口：属性装配与落盘的策略（绕序、退化面阈值、空槽兜底默认材质）都在
+	// CSGpuMeshConvert 里，不再由各产出路径各写一份。
+	// 结果落盘为 level 同级 result 文件夹（/<level 目录>/result/SM_<actor>_<时间戳>），建完标脏，
+	// 由用户自行 Save All 决定是否写盘。非编辑器构建没有资产系统，公用入口内部退回 transient。
+	CSGpuMeshConvert::FConvertOptions ConvertOptions;
+	ConvertOptions.TargetTransform = OutputTransform;
+	ConvertOptions.bBakeToLocalSpace = true;
+	ConvertOptions.bRecomputeNormals = bRecomputeNormals;
+
+	CSGpuMeshConvert::FAssetOptions AssetOptions;
 #if WITH_EDITOR
-	const FString ResultAssetPath = CSGpuMeshSave::BuildResultAssetPath(this, MeshBooleanResultAssetSuffix());
-	OutputStaticMesh = CSGpuMeshSave::SaveGpuMeshDataToStaticMesh(
-		this, StaticMeshData, OutputMaterialSlots, OutputTransform, true, ResultAssetPath);
-	if (!OutputStaticMesh)
+	AssetOptions.AssetPath = CSGpuMeshSave::BuildResultAssetPath(this, MeshBooleanResultAssetSuffix());
+#else
+	AssetOptions.bTransient = true;
+#endif
+	OutputStaticMesh = CSGpuMeshConvert::BuildStaticMesh(
+		this, this, StaticMeshData, OutputMaterialSlots, ConvertOptions, AssetOptions);
+	if (!OutputStaticMesh && !AssetOptions.bTransient)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[MeshBoolean:%s] result 资产保存失败，回退为 transient StaticMesh。"), *GetName());
-		OutputStaticMesh = CSGpuMeshSave::BuildTransientStaticMesh(
-			this, StaticMeshData, OutputMaterialSlots, OutputTransform, true);
+		AssetOptions.bTransient = true;
+		OutputStaticMesh = CSGpuMeshConvert::BuildStaticMesh(
+			this, this, StaticMeshData, OutputMaterialSlots, ConvertOptions, AssetOptions);
 	}
-#else
-	OutputStaticMesh = CSGpuMeshSave::BuildTransientStaticMesh(
-		this, StaticMeshData, OutputMaterialSlots, OutputTransform, true);
-#endif
 	if (!OutputStaticMesh)
 	{
 		UE_LOG(LogTemp, Error, TEXT("[MeshBoolean:%s] shared GPU-mesh StaticMesh conversion failed (vertices=%d indices=%d triangles=%d)."),

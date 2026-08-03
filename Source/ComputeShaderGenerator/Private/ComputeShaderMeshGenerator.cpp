@@ -1299,11 +1299,52 @@ bool ShouldExcludeStaticMeshTriangleRequest(const FCSStaticMeshTriangleRequest& 
 
 // 娑撹桨绔存稉顏勫嚒 resolve 閻?request 閺嬪嫬缂?per-triangle 閺夋劘宸?id閿涙碍瀵?LOD section 閼煎啫娲块幎濠佺瑏鐟欐帗妲х亸鍕煂濠ф劖娼楃拹顭掔礉
 // 閺夋劘宸濈紒?SharedRegistry 閸樺鍣搁幋?registry id閵嗗倹妫?section / 閺冪姵娼楃拹銊π弮璺哄弿闁劏顔囨稉?CS_NO_MATERIAL_ID閵?
+// Material registry dedupe key. Keying by material pointer alone merges every slot that
+// resolves to the same material - and every empty slot, since they all hash as nullptr - so a
+// source with five slots collapses to a single output slot. Including the source mesh and slot
+// index keeps each source slot distinct, which is what lets an unassigned 5-slot mesh come out
+// the other side as five (still empty) slots the user can fill in afterwards. Instances of the
+// same mesh share the same keys, so instancing does not multiply slots.
+struct FCSMaterialRegistryKey
+{
+	TObjectPtr<UMaterialInterface> Material = nullptr;
+	const UStaticMesh* SourceMesh = nullptr;
+	int32 SlotIndex = INDEX_NONE;
+
+	bool operator==(const FCSMaterialRegistryKey& Other) const
+	{
+		return Material == Other.Material && SourceMesh == Other.SourceMesh && SlotIndex == Other.SlotIndex;
+	}
+};
+
+FORCEINLINE uint32 GetTypeHash(const FCSMaterialRegistryKey& Key)
+{
+	return HashCombine(
+		HashCombine(GetTypeHash(Key.Material.Get()), GetTypeHash(Key.SourceMesh)),
+		::GetTypeHash(Key.SlotIndex));
+}
+
+// bPreserveSourceSlots=false reproduces the old pointer-only dedupe, which yields the most
+// compact material list when many sources share one material.
+FCSMaterialRegistryKey MakeMaterialRegistryKey(
+	UMaterialInterface* Material, const UStaticMesh* SourceMesh, int32 SlotIndex, bool bPreserveSourceSlots)
+{
+	FCSMaterialRegistryKey Key;
+	Key.Material = Material;
+	if (bPreserveSourceSlots)
+	{
+		Key.SourceMesh = SourceMesh;
+		Key.SlotIndex = SlotIndex;
+	}
+	return Key;
+}
+
 void BuildTriToMaterialForResolvedRequest(
 	const FCSStaticMeshTriangleRequest& Request,
 	FResolvedStaticMeshTriangleRequest& Resolved,
 	TArray<TObjectPtr<UMaterialInterface>>& SharedRegistry,
-	TMap<UMaterialInterface*, int32>& MaterialToRegistry)
+	TMap<FCSMaterialRegistryKey, int32>& MaterialToRegistry,
+	bool bPreserveSourceMaterialSlots)
 {
 	const int32 TriangleCount = FMath::Max(0, Resolved.TriangleCount);
 	Resolved.TriToMaterial.Init(CS_NO_MATERIAL_ID, TriangleCount);
@@ -1320,12 +1361,14 @@ void BuildTriToMaterialForResolvedRequest(
 			? Request.MaterialSlots[Section.MaterialIndex].Get()
 			: nullptr;
 
+		const FCSMaterialRegistryKey Key = MakeMaterialRegistryKey(
+			Material, Request.StaticMesh, Section.MaterialIndex, bPreserveSourceMaterialSlots);
 		int32 RegistryIndex = INDEX_NONE;
-		if (const int32* Found = MaterialToRegistry.Find(Material)) RegistryIndex = *Found;
+		if (const int32* Found = MaterialToRegistry.Find(Key)) RegistryIndex = *Found;
 		else
 		{
 			RegistryIndex = SharedRegistry.Add(Material);
-			MaterialToRegistry.Add(Material, RegistryIndex);
+			MaterialToRegistry.Add(Key, RegistryIndex);
 		}
 
 		const int32 FirstTri = FMath::Max(0, int32(Section.FirstIndex / 3u));
@@ -1379,7 +1422,8 @@ FVector3f TransformStaticMeshSourceNormal(
 bool ExtractNaniteSourceTrianglesForRequest(
 	const FCSStaticMeshTriangleRequest& Request,
 	TArray<TObjectPtr<UMaterialInterface>>& SharedRegistry,
-	TMap<UMaterialInterface*, int32>& MaterialToRegistry,
+	TMap<FCSMaterialRegistryKey, int32>& MaterialToRegistry,
+	bool bPreserveSourceMaterialSlots,
 	FCSNaniteSourceTriangleData& OutTriangles)
 {
 	UStaticMesh* StaticMesh = Request.StaticMesh;
@@ -1407,7 +1451,6 @@ bool ExtractNaniteSourceTrianglesForRequest(
 	TVertexInstanceAttributesConstRef<float> VertexInstanceBinormalSigns = Attributes.GetVertexInstanceBinormalSigns();
 	TVertexInstanceAttributesConstRef<FVector4f> VertexInstanceColors = Attributes.GetVertexInstanceColors();
 	TVertexInstanceAttributesConstRef<FVector2f> VertexInstanceUVs = Attributes.GetVertexInstanceUVs();
-	TPolygonGroupAttributesConstRef<FName> SlotNames = Attributes.GetPolygonGroupMaterialSlotNames();
 	if (!VertexPositions.IsValid())
 	{
 		return false;
@@ -1513,22 +1556,32 @@ bool ExtractNaniteSourceTrianglesForRequest(
 	PolyGroupToRegistry.Init(CS_NO_MATERIAL_ID, FMath::Max(1, PolygonGroupArraySize));
 	for (const FPolygonGroupID PolygonGroupID : MeshDescription->PolygonGroups().GetElementIDs())
 	{
-		UMaterialInterface* Material = nullptr;
-		int32 MaterialIndex = PolygonGroupID.GetValue();
-		if (SlotNames.IsValid())
-		{
-			const FName SlotName = SlotNames[PolygonGroupID];
-			const int32 ImportedMaterialIndex = StaticMesh->GetMaterialIndexFromImportedMaterialSlotName(SlotName);
-			if (ImportedMaterialIndex != INDEX_NONE) MaterialIndex = ImportedMaterialIndex;
-		}
-		// 閺冪姴顕遍崗銉π崥宥呯潣閹勫灗閸氬秶袨閺勭姴鐨犳径杈Е閺冭绱漰olygon group 妞ゅ搫绨崡铏綏鐠愩劍蝎妞ゅ搫绨妴?		if (Request.MaterialSlots.IsValidIndex(MaterialIndex)) Material = Request.MaterialSlots[MaterialIndex].Get();
+		// Single source of truth: the component's material array (Request.MaterialSlots, filled from
+		// UStaticMeshComponent::GetMaterial, so component overrides already win). Polygon group index
+		// is the material slot index for StaticMesh mesh descriptions, so no second lookup is needed.
+		// The asset-side GetMaterialIndexFromImportedMaterialSlotName remap used to run here as well;
+		// it read authority off the asset instead of the component and silently collapsed groups to
+		// slot 0 whenever imported slot names were empty or duplicated, which is common for merged
+		// and procedurally generated meshes.
+		//
+		// Keep this comment ASCII. It once held CJK text and the file on disk had no line break
+		// between it and the statement below, so the lookup sat inside the comment and every
+		// compiler dropped it - Material stayed null for every group and all materials were lost.
+		const int32 MaterialIndex = PolygonGroupID.GetValue();
+		UMaterialInterface* Material = Request.MaterialSlots.IsValidIndex(MaterialIndex)
+			? Request.MaterialSlots[MaterialIndex].Get()
+			: nullptr;
 
+		// Key on the source slot so an unassigned multi-slot mesh keeps its slot count instead of
+		// having every empty slot dedupe together into one.
+		const FCSMaterialRegistryKey Key = MakeMaterialRegistryKey(
+			Material, StaticMesh, MaterialIndex, bPreserveSourceMaterialSlots);
 		int32 RegistryIndex = INDEX_NONE;
-		if (const int32* Found = MaterialToRegistry.Find(Material)) RegistryIndex = *Found;
+		if (const int32* Found = MaterialToRegistry.Find(Key)) RegistryIndex = *Found;
 		else
 		{
 			RegistryIndex = SharedRegistry.Add(Material);
-			MaterialToRegistry.Add(Material, RegistryIndex);
+			MaterialToRegistry.Add(Key, RegistryIndex);
 		}
 		if (PolyGroupToRegistry.IsValidIndex(PolygonGroupID.GetValue())) PolyGroupToRegistry[PolygonGroupID.GetValue()] = uint32(RegistryIndex);
 	}
@@ -1721,13 +1774,14 @@ uint64 ResolveStaticMeshTriangleRequests(
 	bool bNaniteOnlyFallbackMesh,
 	TArray<FResolvedStaticMeshTriangleRequest>& OutResolvedRequests,
 	TArray<TObjectPtr<UMaterialInterface>>* OutMaterialRegistry = nullptr,
-	FCSNaniteSourceTriangleData* OutNaniteTriangles = nullptr)
+	FCSNaniteSourceTriangleData* OutNaniteTriangles = nullptr,
+	bool bPreserveSourceMaterialSlots = true)
 {
 	OutResolvedRequests.Reset();
 	OutResolvedRequests.Reserve(Requests.Num());
 
 	TArray<TObjectPtr<UMaterialInterface>> MaterialRegistry;
-	TMap<UMaterialInterface*, int32> MaterialToRegistry;
+	TMap<FCSMaterialRegistryKey, int32> MaterialToRegistry;
 
 	// 鏉╂柨娲栭崐闂寸矌缂佺喕顓?render-resolve 閸戣櫣娈戞稉澶庮潡閿?= OutResolvedRequests[i].TriangleCount 娑斿鎷伴敍澶堚偓渚糰nite 閸忋劎绮忛懞鍌涚爱娑撳顫?
 	// 閸楁洜瀚槐顖溞濇潻?*OutNaniteTriangles閿涘牆鍙鹃懛顏勭敨 NumTriangles閿涘绱濈€瑰綊鍣洪弽鍝ョ暬閻?AddResolvedStaticMeshTrianglesToRDGInternal
@@ -1746,7 +1800,7 @@ uint64 ResolveStaticMeshTriangleRequests(
 		if (OutNaniteTriangles && Request.StaticMesh)
 		{
 #if WITH_EDITOR
-            if (ExtractNaniteSourceTrianglesForRequest(Request, MaterialRegistry, MaterialToRegistry, *OutNaniteTriangles)) continue;
+            if (ExtractNaniteSourceTrianglesForRequest(Request, MaterialRegistry, MaterialToRegistry, bPreserveSourceMaterialSlots, *OutNaniteTriangles)) continue;
             UE_LOG(LogTemp, Warning, TEXT("[ResolveStaticMeshTriangleRequests] Nanite mesh '%s' has no usable editor MeshDescription; using render fallback."), *Request.StaticMesh->GetPathName());
 #else
             UE_LOG(LogTemp, Warning, TEXT("[ResolveStaticMeshTriangleRequests] Nanite mesh '%s' requires editor MeshDescription; using render fallback."), *Request.StaticMesh->GetPathName());
@@ -1759,7 +1813,7 @@ uint64 ResolveStaticMeshTriangleRequests(
 			continue;
 		}
 
-		BuildTriToMaterialForResolvedRequest(Request, Resolved, MaterialRegistry, MaterialToRegistry);
+		BuildTriToMaterialForResolvedRequest(Request, Resolved, MaterialRegistry, MaterialToRegistry, bPreserveSourceMaterialSlots);
 
 		TotalTriangleCount = FMath::Min<uint64>(
 			TotalTriangleCount + uint64(FMath::Max(0, Resolved.TriangleCount)),
@@ -3090,7 +3144,8 @@ FCSBoxScenePreparedData AComputeShaderMeshGenerator::PrepareBoxSceneTriangles(
 	float InReferenceFilterDistance,
 	FName RequiredActorTag,
 	bool bIncludeLandscape,
-	bool bUseMeshDescriptionSourceTriangles)
+	bool bUseMeshDescriptionSourceTriangles,
+	bool bPreserveSourceMaterialSlots)
 {
 	FCSBoxScenePreparedData Result;
 	if (!World || !QueryBox.IsValid) return Result;
@@ -3120,7 +3175,8 @@ FCSBoxScenePreparedData AComputeShaderMeshGenerator::PrepareBoxSceneTriangles(
 
 	ImplData->TotalStaticMeshTriangleCount = ResolveStaticMeshTriangleRequests(
 		Requests, this, ExcludedActorTags, true, ImplData->ResolvedRequests, &ImplData->MaterialRegistry,
-		bUseMeshDescriptionSourceTriangles ? &ImplData->NaniteTriangles : nullptr);
+		bUseMeshDescriptionSourceTriangles ? &ImplData->NaniteTriangles : nullptr,
+		bPreserveSourceMaterialSlots);
 
 	ImplData->ReferencePoints = InReferencePoints;
 	ImplData->ReferenceFilterDistance = SafeRefDist;

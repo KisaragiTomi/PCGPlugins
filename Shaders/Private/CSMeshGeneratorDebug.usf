@@ -7,7 +7,7 @@ Buffer<float4> InVoxelPositions;
 Buffer<float4> InVoxelNormals;
 Buffer<uint> InVoxelCounter;
 
-RWBuffer<float4> RWDebugPositions;
+RWBuffer<float> RWDebugPositions;
 RWBuffer<uint> RWMainIndices;
 RWBuffer<uint> RWPointIndices;
 RWBuffer<uint> RWMainIndirectArgs;
@@ -22,6 +22,15 @@ float VoxelSize;
 float DirectionLength;
 float QuadScale;
 float NormalOffsetScale;
+
+// Debug positions are three floats per vertex: the local vertex factory fetches them
+// manually as Buffer<float> indexed at VertexId*3.
+void WriteDebugPosition(uint VertexIndex, float3 Position)
+{
+	RWDebugPositions[VertexIndex * 3u + 0u] = Position.x;
+	RWDebugPositions[VertexIndex * 3u + 1u] = Position.y;
+	RWDebugPositions[VertexIndex * 3u + 2u] = Position.z;
+}
 
 float3 SafeNormal(float3 Value)
 {
@@ -41,8 +50,8 @@ void BuildDebugGeometryCS(uint3 Id : SV_DispatchThreadID)
 	if (DebugMode == 0u)
 	{
 		const uint BaseVertex = VoxelIndex * 2u;
-		RWDebugPositions[BaseVertex + 0u] = float4(Position, 1.0f);
-		RWDebugPositions[BaseVertex + 1u] = float4(Position + Normal * DirectionLength, 1.0f);
+		WriteDebugPosition(BaseVertex + 0u, Position);
+		WriteDebugPosition(BaseVertex + 1u, Position + Normal * DirectionLength);
 		RWMainIndices[BaseVertex + 0u] = BaseVertex + 0u;
 		RWMainIndices[BaseVertex + 1u] = BaseVertex + 1u;
 		if (bDrawPoints != 0u) RWPointIndices[VoxelIndex] = BaseVertex;
@@ -58,10 +67,10 @@ void BuildDebugGeometryCS(uint3 Id : SV_DispatchThreadID)
 	const float3 DY = AxisY * HalfSize;
 	const uint BaseVertex = VoxelIndex * 4u;
 	const uint BaseIndex = VoxelIndex * 6u;
-	RWDebugPositions[BaseVertex + 0u] = float4(Center - DX - DY, 1.0f);
-	RWDebugPositions[BaseVertex + 1u] = float4(Center + DX - DY, 1.0f);
-	RWDebugPositions[BaseVertex + 2u] = float4(Center + DX + DY, 1.0f);
-	RWDebugPositions[BaseVertex + 3u] = float4(Center - DX + DY, 1.0f);
+	WriteDebugPosition(BaseVertex + 0u, Center - DX - DY);
+	WriteDebugPosition(BaseVertex + 1u, Center + DX - DY);
+	WriteDebugPosition(BaseVertex + 2u, Center + DX + DY);
+	WriteDebugPosition(BaseVertex + 3u, Center - DX + DY);
 
 	if (bReverseOrientation != 0u)
 	{

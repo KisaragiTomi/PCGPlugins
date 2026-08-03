@@ -5,6 +5,7 @@
 #include "LocalVertexFactory.h"
 #include "RenderResource.h"
 #include "RenderGraphResources.h"
+#include "CSGpuDebugDraw.h"
 #include "CSMeshGeneratorDebugComponent.h"
 
 class UCSMeshGeneratorDebugComponent;
@@ -26,27 +27,20 @@ public:
 	virtual bool CanBeOccluded() const override;
 
 private:
-	struct FPooledVertexBuffer final : public FVertexBuffer
-	{
-		TRefCountPtr<FRDGPooledBuffer> Pooled;
-		virtual void InitRHI(FRHICommandListBase& RHICmdList) override;
-		virtual void ReleaseRHI() override;
-	};
-
-	struct FPooledIndexBuffer final : public FIndexBuffer
-	{
-		TRefCountPtr<FRDGPooledBuffer> Pooled;
-		virtual void InitRHI(FRHICommandListBase& RHICmdList) override;
-		virtual void ReleaseRHI() override;
-	};
-
 	void BuildGeometry(FRHICommandListBase& RHICmdList);
 
 	FCSMeshGeneratorDebugData Data;
+
+	// GPU voxel source: buffers filled by the debug compute passes, counts decided on the GPU.
 	FLocalVertexFactory VertexFactory;
-	FPooledVertexBuffer Positions;
-	FPooledIndexBuffer MainIndices;
-	FPooledIndexBuffer PointIndices;
+	FCSGpuDebugPositionStream Positions;
+	FCSPooledIndexBuffer MainIndices;
+	FCSPooledIndexBuffer PointIndices;
+
+	// CPU-supplied primitives: one uploaded position/index pair, one draw per batch.
+	FLocalVertexFactory BatchVertexFactory;
+	FCSGpuDebugPositionStream BatchPositions;
+	FCSPooledIndexBuffer BatchIndices;
 	TRefCountPtr<FRDGPooledBuffer> MainIndirectArgs;
 	TRefCountPtr<FRDGPooledBuffer> PointIndirectArgs;
 	FMaterialRelevance MaterialRelevance;

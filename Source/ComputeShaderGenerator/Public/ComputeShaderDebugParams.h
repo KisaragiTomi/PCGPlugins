@@ -282,7 +282,8 @@ public:
 	int32 TriangleDebugCountLimit = 0;
 };
 
-/** Debug draw options for DrawDebugActiveVoxels. */
+/** Debug draw options for DrawDebugActiveVoxels. Drawn as GPU-submitted box edges, so
+ *  Thickness has no effect (a GPU line list has no width). */
 USTRUCT(BlueprintType, meta = (DisplayName = "CS Active Voxel Debug"))
 struct COMPUTESHADERGENERATOR_API FCSDebugActiveVoxelOptions
 {

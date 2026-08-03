@@ -86,35 +86,15 @@ public:
 		uint32 MaxVertexIndex,
 		bool bCastShadow = false,
 		FRHIBuffer* IndirectArgsBuffer = nullptr,
-		uint32 IndirectArgsOffset = 0);
+		uint32 IndirectArgsOffset = 0,
+		uint32 FirstIndex = 0);
 
 protected:
-	// Thin FRenderResource wrappers that expose a pooled buffer's RHI object as a
-	// vertex/index buffer for the vertex-factory streams. Shared by all subclasses.
-	struct FPooledVertexBuffer final : public FVertexBuffer
-	{
-		TRefCountPtr<FRDGPooledBuffer> Pooled;
-		virtual void InitRHI(FRHICommandListBase& RHICmdList) override
-		{
-			if (Pooled.IsValid()) VertexBufferRHI = Pooled->GetRHI();
-		}
-		virtual void ReleaseRHI() override
-		{
-			VertexBufferRHI.SafeRelease();
-		}
-	};
-	struct FPooledIndexBuffer final : public FIndexBuffer
-	{
-		TRefCountPtr<FRDGPooledBuffer> Pooled;
-		virtual void InitRHI(FRHICommandListBase& RHICmdList) override
-		{
-			if (Pooled.IsValid()) IndexBufferRHI = Pooled->GetRHI();
-		}
-		virtual void ReleaseRHI() override
-		{
-			IndexBufferRHI.SafeRelease();
-		}
-	};
+	// The pooled-buffer render-resource wrappers live in CSGpuMeshTypes.h so debug geometry
+	// (FCSGpuDebugDraw) and non-derived proxies can use the same types; these aliases keep the
+	// long-standing member/leaf spelling.
+	using FPooledVertexBuffer = FCSPooledVertexBuffer;
+	using FPooledIndexBuffer = FCSPooledIndexBuffer;
 
 	// One entry in the descriptor-driven buffer set. Heap-allocated (TUniquePtr in the
 	// Streams array) so &VB / &IB stay stable for the vertex-factory streams even as the

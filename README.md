@@ -95,9 +95,32 @@ AVineContainer.GenerateVines()
 - **Landscape**（`LandscapeExtra`）：投影平面、地形数据采样与纹理数据生成
 - **Foliage 互转**（`FoliageConverter`）：Foliage 实例 ↔ Transform 数组、增删改查实例、自定义数据、距离排序
 
-### 4. 编辑器工具 · PCGEditorProcess
+### 4. GPU 地形编辑 · Landscape Edit Layer
 
-Landscape 图层/临时图层编辑（`ComputeShaderLandscape*`）、实例笔刷编辑模式（`CSInstanceBrushEdMode`）、资产处理（`CSAssetProcess`）、Actor Tag 快捷操作、选中 Actor 的视口叠加基类等。
+`ACSLandscape` 通过 UE 5.7 的程序化 Landscape Edit Layer 接入地形高度图合并管线。每个 Actor 自动维护一个 `UCSLandscapeEditLayer`，编辑结果先在 GPU 上以 RDG Compute Pass 生成并参与 Landscape 合并，可实时预览、调整或移除；只有调用 `BakeLandscape()` 时才会将当前结果永久写入基础高度图并删除对应 Edit Layer。
+
+地形编辑区域由 Actor 的 `Box` 决定，支持旋转后的局部坐标映射和边缘衰减。实时编辑可选择以下高度来源：
+
+| `SourceMode` | 输入 | 用途 |
+|---|---|---|
+| `ExternalRT` | `ExternalHeightRT` 或 `SetExternalHeightRT()` | 接收蓝图、模拟器或其他 GPU 工具生成的高度 RenderTarget。 |
+| `FlatOffset` | `HeightOffset` | 在框选区域内整体抬高或降低地形。 |
+| `ProceduralNoise` | `NoiseFrequency`、`NoiseAmplitude`、`NoiseOctaves` | 在世界空间生成多层程序噪声地形。 |
+
+- `BlendMode` 支持 `Alpha`、`Override`、`Additive`、`Subtract`、`Multiply`；`LayerAlpha` 控制本次 GPU 混合强度，`EditLayerAlpha` 控制 Landscape 图层整体权重。
+- `FalloffWidth` 以厘米定义 `Box` 边缘的过渡宽度；移动 Actor 或修改参数后会请求 Landscape 重新合并，也可在蓝图中调用 `RefreshLayer()`。
+- `CopyLandscapeData()` 捕获框选区域的现有地形并发布为可持久化的 Edit Layer 结果；`RT_Result`、`RT_RealtimeResult` 和 `RT_DebugView` 可用于结果或调试检查。
+- `ApplyHeightmapRTToLandscape()` 提供统一的“高度 RT → 地形”入口，供其他 GPU 生成器复用。
+
+`ACSLandscapeRoad` 是道路专用扩展：它收集自身及附属 Actor 的 Spline，在 `RoadBuilder.usf` 的 GPU Pass 中构建道路和交叉口网格，再将三角形栅格化到 `RT_RoadHeight` 并驱动同一套 Landscape Edit Layer。`RoadInfluence`、`RoadHeightOffset` 和 `RoadEdgeFalloff` 分别控制贴合强度、道路相对高度和路肩过渡宽度，`RebuildRoad()` 可在编辑器或蓝图中重建结果。
+
+- Shader：[`Shaders/Private/CSLandscape.usf`](Shaders/Private/CSLandscape.usf)、[`Shaders/Private/RoadBuilder.usf`](Shaders/Private/RoadBuilder.usf)
+- C++：`CSLandscapeEditLayerBase.*`、`ComputeShaderLandscape.*`、`ComputeShaderLandscapeRoad.*`
+- 开发测试内容：`Content/Landscape/`（包括 Copy、River 与 RoadLandscape 相关资产；仍属于原型内容）
+
+### 5. 编辑器工具 · PCGEditorProcess
+
+实例笔刷编辑模式（`CSInstanceBrushEdMode`）、资产处理（`CSAssetProcess`）、Actor Tag 快捷操作、选中 Actor 的视口叠加基类等。
 
 ---
 

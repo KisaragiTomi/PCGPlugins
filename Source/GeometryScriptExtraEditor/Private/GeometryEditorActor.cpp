@@ -39,6 +39,7 @@
 #include "ShaderParameterStruct.h"
 #include "Misc/PackageName.h"
 #include "VineMeshComponent.h"
+#include "CSGpuDebugDraw.h"
 #include "CSGpuMeshSceneProxy.h"
 #include "CSGpuMeshSave.h"
 #include "SceneInterface.h"
@@ -3899,20 +3900,11 @@ public:
 	{
 		if (bDrawDebugLines)
 		{
-			FRDGBufferDesc PositionDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), FMath::Max(Input.PathPointCount, 1u));
-			PositionDesc.Usage |= EBufferUsageFlags::VertexBuffer;
-			DebugPositions.Pooled = AllocatePooledBuffer(PositionDesc, TEXT("VineDebug.Positions"));
-			DebugPositions.InitResource(RHICmdList);
-
-			FRDGBufferDesc IndexDesc = FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), FMath::Max(Input.SegmentCount * 2u, 2u));
-			IndexDesc.Usage = (IndexDesc.Usage & ~EBufferUsageFlags::VertexBuffer) | EBufferUsageFlags::IndexBuffer;
-			DebugIndices.Pooled = AllocatePooledBuffer(IndexDesc, TEXT("VineDebug.Indices"));
-			DebugIndices.InitResource(RHICmdList);
-
-			FLocalVertexFactory::FDataType Data;
-			Data.PositionComponent = FVertexStreamComponent(&DebugPositions, 0, sizeof(FVector4f), VET_Float3);
-			DebugVertexFactory.SetData(RHICmdList, Data);
-			DebugVertexFactory.InitResource(RHICmdList);
+			FCSGpuDebugDraw::AllocatePositionStream(RHICmdList, DebugPositions, Input.PathPointCount,
+				TEXT("VineDebug.Positions"));
+			FCSGpuDebugDraw::AllocateIndexBuffer(RHICmdList, DebugIndices, FMath::Max(Input.SegmentCount * 2u, 2u),
+				TEXT("VineDebug.Indices"));
+			FCSGpuDebugDraw::BindPositionOnlyVertexFactory(RHICmdList, DebugVertexFactory, DebugPositions);
 		}
 		FCSGpuMeshSceneProxy::CreateRenderThreadResources(RHICmdList);
 	}
@@ -3922,10 +3914,8 @@ public:
 		if (bDrawDebugLines)
 		{
 			DebugVertexFactory.ReleaseResource();
-			DebugIndices.ReleaseResource();
-			DebugPositions.ReleaseResource();
-			DebugIndices.Pooled.SafeRelease();
-			DebugPositions.Pooled.SafeRelease();
+			FCSGpuDebugDraw::ReleaseIndexBuffer(DebugIndices);
+			FCSGpuDebugDraw::ReleasePositionStream(DebugPositions);
 		}
 		FCSGpuMeshSceneProxy::DestroyRenderThreadResources();
 	}
@@ -3935,10 +3925,8 @@ public:
 	{
 		FCSGpuMeshSceneProxy::GetDynamicMeshElements(Views, ViewFamily, VisibilityMap, Collector);
 		if (!bDrawDebugLines || !DebugIndices.Pooled.IsValid()) return;
-		FColoredMaterialRenderProxy& DebugMaterialProxy = Collector.AllocateOneFrameResource<FColoredMaterialRenderProxy>(
-			GEngine->DebugMeshMaterial->GetRenderProxy(), Input.DebugLineColor);
-		SubmitGpuBufferDraw(*this, Views, VisibilityMap, Collector, DebugVertexFactory, DebugMaterialProxy,
-			DebugIndices, PT_LineList, Input.SegmentCount, Input.PathPointCount - 1u);
+		FCSGpuDebugDraw::SubmitColoredDraw(*this, Views, VisibilityMap, Collector, DebugVertexFactory,
+			DebugIndices, PT_LineList, Input.DebugLineColor, Input.SegmentCount, Input.PathPointCount - 1u);
 	}
 
 protected:
@@ -3994,10 +3982,11 @@ protected:
 		if (bDrawDebugLines)
 		{
 			check(DebugCenterSource && SegmentMetaSource);
-			FRDGBufferRef DebugPositionBuf = GraphBuilder.RegisterExternalBuffer(DebugPositions.Pooled, TEXT("VineDebug.Positions.External"));
+			FRDGBufferRef DebugPositionBuf = GraphBuilder.RegisterExternalBuffer(DebugPositions.Buffer.Pooled, TEXT("VineDebug.Positions.External"));
 			FRDGBufferRef DebugIndexBuf = GraphBuilder.RegisterExternalBuffer(DebugIndices.Pooled, TEXT("VineDebug.Indices.External"));
-			AddCopyBufferPass(GraphBuilder, DebugPositionBuf, 0, DebugCenterSource, 0,
-				uint64(Input.PathPointCount) * sizeof(FVector4f));
+			// The center line is float4 on the GPU; the shared debug layout is float triples.
+			FCSGpuDebugDraw::AddPositionUnpackPass(GraphBuilder, GetScene().GetFeatureLevel(), DebugCenterSource,
+				Input.PathPointCount, DebugPositionBuf);
 
 			FVineDebugLineIndicesCS::FParameters* DebugParameters = GraphBuilder.AllocParameters<FVineDebugLineIndicesCS::FParameters>();
 			DebugParameters->VineDebugSegmentMeta = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SegmentMetaSource));
@@ -4025,7 +4014,7 @@ protected:
 
 private:
 	FLocalVertexFactory DebugVertexFactory;
-	FPooledVertexBuffer DebugPositions;
+	FCSGpuDebugPositionStream DebugPositions;
 	FPooledIndexBuffer DebugIndices;
 	bool bDrawDebugLines = false;
 	FVineBuildInput Input;

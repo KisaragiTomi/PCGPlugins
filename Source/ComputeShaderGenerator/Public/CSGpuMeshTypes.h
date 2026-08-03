@@ -2,6 +2,8 @@
 
 #include "CoreMinimal.h"
 #include "PixelFormat.h"
+#include "RenderGraphResources.h"
+#include "RenderResource.h"
 #include "RHIDefinitions.h"
 
 // -----------------------------------------------------------------------------
@@ -14,6 +16,35 @@
 // AddStream(...) call in a leaf's RegisterStreams() — the alloc / VF-bind / readback /
 // save code never has to change.
 // -----------------------------------------------------------------------------
+
+// Thin FRenderResource wrappers that expose a pooled buffer's RHI object as a vertex /
+// index buffer for a vertex-factory stream. Shared by every GPU-resident path in the
+// plugin: the descriptor-driven mesh base, and the debug geometry built by FCSGpuDebugDraw.
+struct FCSPooledVertexBuffer final : public FVertexBuffer
+{
+	TRefCountPtr<FRDGPooledBuffer> Pooled;
+	virtual void InitRHI(FRHICommandListBase& RHICmdList) override
+	{
+		if (Pooled.IsValid()) VertexBufferRHI = Pooled->GetRHI();
+	}
+	virtual void ReleaseRHI() override
+	{
+		VertexBufferRHI.SafeRelease();
+	}
+};
+
+struct FCSPooledIndexBuffer final : public FIndexBuffer
+{
+	TRefCountPtr<FRDGPooledBuffer> Pooled;
+	virtual void InitRHI(FRHICommandListBase& RHICmdList) override
+	{
+		if (Pooled.IsValid()) IndexBufferRHI = Pooled->GetRHI();
+	}
+	virtual void ReleaseRHI() override
+	{
+		IndexBufferRHI.SafeRelease();
+	}
+};
 
 // What a stream is used for. Drives buffer usage flags and the vertex-factory binding.
 enum class ECSGpuStreamRole : uint8

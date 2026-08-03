@@ -1,12 +1,9 @@
 #include "CSMeshGeneratorDebugSceneProxy.h"
 #include "CSMeshGeneratorDebugComponent.h"
-#include "CSGpuMeshSceneProxy.h"
+#include "CSGpuDebugDraw.h"
 
 #include "DataDrivenShaderPlatformInfo.h"
-#include "Engine/Engine.h"
 #include "GlobalShader.h"
-#include "Materials/Material.h"
-#include "Materials/MaterialRenderProxy.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
 #include "RHICommandList.h"
@@ -22,7 +19,7 @@ public:
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, InVoxelPositions)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, InVoxelNormals)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RWDebugPositions)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, RWDebugPositions)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RWMainIndices)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RWPointIndices)
 		SHADER_PARAMETER(uint32, VoxelCapacity)
@@ -75,9 +72,9 @@ FCSMeshGeneratorDebugSceneProxy::FCSMeshGeneratorDebugSceneProxy(
 	: FPrimitiveSceneProxy(Component)
 	, Data(InData)
 	, VertexFactory(GetScene().GetFeatureLevel(), "FCSMeshGeneratorDebugVertexFactory")
+	, BatchVertexFactory(GetScene().GetFeatureLevel(), "FCSMeshGeneratorDebugBatchVertexFactory")
 {
-	UMaterialInterface* DebugMaterial = GEngine ? GEngine->DebugMeshMaterial.Get() : UMaterial::GetDefaultMaterial(MD_Surface);
-	MaterialRelevance = DebugMaterial->GetRelevance_Concurrent(GetScene().GetShaderPlatform());
+	MaterialRelevance = FCSGpuDebugDraw::GetDebugMaterial()->GetRelevance_Concurrent(GetScene().GetShaderPlatform());
 	bVerifyUsedMaterials = false;
 	bSupportsDistanceFieldRepresentation = false;
 }
@@ -97,75 +94,52 @@ uint32 FCSMeshGeneratorDebugSceneProxy::GetMemoryFootprint() const
 	return sizeof(*this) + GetAllocatedSize();
 }
 
-void FCSMeshGeneratorDebugSceneProxy::FPooledVertexBuffer::InitRHI(FRHICommandListBase& RHICmdList)
-{
-	if (Pooled.IsValid()) VertexBufferRHI = Pooled->GetRHI();
-}
-
-void FCSMeshGeneratorDebugSceneProxy::FPooledVertexBuffer::ReleaseRHI()
-{
-	VertexBufferRHI.SafeRelease();
-}
-
-void FCSMeshGeneratorDebugSceneProxy::FPooledIndexBuffer::InitRHI(FRHICommandListBase& RHICmdList)
-{
-	if (Pooled.IsValid()) IndexBufferRHI = Pooled->GetRHI();
-}
-
-void FCSMeshGeneratorDebugSceneProxy::FPooledIndexBuffer::ReleaseRHI()
-{
-	IndexBufferRHI.SafeRelease();
-}
-
 void FCSMeshGeneratorDebugSceneProxy::CreateRenderThreadResources(FRHICommandListBase& RHICmdList)
 {
 	FPrimitiveSceneProxy::CreateRenderThreadResources(RHICmdList);
 
-	const uint32 VoxelLimit = uint32(FMath::Max(Data.MaxVoxelsToDraw, 1));
-	PositionCapacity = Data.Mode == ECSMeshGeneratorDebugMode::Directions ? VoxelLimit * 2u : VoxelLimit * 4u;
-	MainIndexCapacity = Data.Mode == ECSMeshGeneratorDebugMode::Directions ? VoxelLimit * 2u : VoxelLimit * 6u;
-	PointIndexCapacity = Data.Mode == ECSMeshGeneratorDebugMode::Directions && Data.bDrawPoints ? VoxelLimit : 1u;
+	if (Data.HasVoxelSource())
+	{
+		const uint32 VoxelLimit = uint32(FMath::Max(Data.MaxVoxelsToDraw, 1));
+		PositionCapacity = Data.Mode == ECSMeshGeneratorDebugMode::Directions ? VoxelLimit * 2u : VoxelLimit * 4u;
+		MainIndexCapacity = Data.Mode == ECSMeshGeneratorDebugMode::Directions ? VoxelLimit * 2u : VoxelLimit * 6u;
+		PointIndexCapacity = Data.Mode == ECSMeshGeneratorDebugMode::Directions && Data.bDrawPoints ? VoxelLimit : 1u;
 
-	FRDGBufferDesc PositionDesc = FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), PositionCapacity);
-	PositionDesc.Usage |= EBufferUsageFlags::VertexBuffer;
-	Positions.Pooled = AllocatePooledBuffer(PositionDesc, TEXT("CSMeshGeneratorDebug.Positions"));
+		FCSGpuDebugDraw::AllocatePositionStream(RHICmdList, Positions, PositionCapacity, TEXT("CSMeshGeneratorDebug.Positions"));
+		FCSGpuDebugDraw::AllocateIndexBuffer(RHICmdList, MainIndices, MainIndexCapacity, TEXT("CSMeshGeneratorDebug.MainIndices"));
+		FCSGpuDebugDraw::AllocateIndexBuffer(RHICmdList, PointIndices, PointIndexCapacity, TEXT("CSMeshGeneratorDebug.PointIndices"));
+		MainIndirectArgs = FCSGpuDebugDraw::AllocateIndirectArgs(TEXT("CSMeshGeneratorDebug.MainIndirectArgs"));
+		PointIndirectArgs = FCSGpuDebugDraw::AllocateIndirectArgs(TEXT("CSMeshGeneratorDebug.PointIndirectArgs"));
+		FCSGpuDebugDraw::BindPositionOnlyVertexFactory(RHICmdList, VertexFactory, Positions);
 
-	FRDGBufferDesc MainIndexDesc = FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), MainIndexCapacity);
-	MainIndexDesc.Usage = (MainIndexDesc.Usage & ~EBufferUsageFlags::VertexBuffer) | EBufferUsageFlags::IndexBuffer;
-	MainIndices.Pooled = AllocatePooledBuffer(MainIndexDesc, TEXT("CSMeshGeneratorDebug.MainIndices"));
+		BuildGeometry(RHICmdList);
+	}
 
-	FRDGBufferDesc PointIndexDesc = FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), PointIndexCapacity);
-	PointIndexDesc.Usage = (PointIndexDesc.Usage & ~EBufferUsageFlags::VertexBuffer) | EBufferUsageFlags::IndexBuffer;
-	PointIndices.Pooled = AllocatePooledBuffer(PointIndexDesc, TEXT("CSMeshGeneratorDebug.PointIndices"));
-
-	MainIndirectArgs = AllocatePooledBuffer(
-		FRDGBufferDesc::CreateIndirectDesc(sizeof(uint32), 5), TEXT("CSMeshGeneratorDebug.MainIndirectArgs"));
-	PointIndirectArgs = AllocatePooledBuffer(
-		FRDGBufferDesc::CreateIndirectDesc(sizeof(uint32), 5), TEXT("CSMeshGeneratorDebug.PointIndirectArgs"));
-
-	Positions.InitResource(RHICmdList);
-	MainIndices.InitResource(RHICmdList);
-	PointIndices.InitResource(RHICmdList);
-
-	FLocalVertexFactory::FDataType VertexData;
-	VertexData.PositionComponent = FVertexStreamComponent(&Positions, 0, sizeof(FVector4f), VET_Float3);
-	VertexFactory.SetData(RHICmdList, VertexData);
-	VertexFactory.InitResource(RHICmdList);
-
-	BuildGeometry(RHICmdList);
+	if (Data.HasBatchGeometry())
+	{
+		FCSGpuDebugDraw::UploadGeometry(RHICmdList, BatchPositions, BatchIndices,
+			Data.BatchPositions, Data.BatchIndices, TEXT("CSMeshGeneratorDebug.Batches"));
+		FCSGpuDebugDraw::BindPositionOnlyVertexFactory(RHICmdList, BatchVertexFactory, BatchPositions);
+	}
 }
 
 void FCSMeshGeneratorDebugSceneProxy::DestroyRenderThreadResources()
 {
-	VertexFactory.ReleaseResource();
-	PointIndices.ReleaseResource();
-	MainIndices.ReleaseResource();
-	Positions.ReleaseResource();
-	PointIndirectArgs.SafeRelease();
-	MainIndirectArgs.SafeRelease();
-	PointIndices.Pooled.SafeRelease();
-	MainIndices.Pooled.SafeRelease();
-	Positions.Pooled.SafeRelease();
+	if (Data.HasBatchGeometry())
+	{
+		BatchVertexFactory.ReleaseResource();
+		FCSGpuDebugDraw::ReleaseIndexBuffer(BatchIndices);
+		FCSGpuDebugDraw::ReleasePositionStream(BatchPositions);
+	}
+	if (Data.HasVoxelSource())
+	{
+		VertexFactory.ReleaseResource();
+		FCSGpuDebugDraw::ReleaseIndexBuffer(PointIndices);
+		FCSGpuDebugDraw::ReleaseIndexBuffer(MainIndices);
+		FCSGpuDebugDraw::ReleasePositionStream(Positions);
+		PointIndirectArgs.SafeRelease();
+		MainIndirectArgs.SafeRelease();
+	}
 	FPrimitiveSceneProxy::DestroyRenderThreadResources();
 }
 
@@ -175,19 +149,24 @@ void FCSMeshGeneratorDebugSceneProxy::GetDynamicMeshElements(
 	uint32 VisibilityMap,
 	FMeshElementCollector& Collector) const
 {
-	if (!Positions.Pooled.IsValid() || !MainIndices.Pooled.IsValid() || !MainIndirectArgs.IsValid()) return;
-	UMaterialInterface* DebugMaterial = GEngine ? GEngine->DebugMeshMaterial.Get() : UMaterial::GetDefaultMaterial(MD_Surface);
-	FColoredMaterialRenderProxy& MainMaterial = Collector.AllocateOneFrameResource<FColoredMaterialRenderProxy>(
-		DebugMaterial->GetRenderProxy(), Data.DirectionColor);
+	// CPU-supplied primitives: one uploaded buffer pair, one draw per batch slice.
+	if (BatchPositions.Buffer.Pooled.IsValid() && BatchIndices.Pooled.IsValid())
+	{
+		const uint32 MaxBatchVertexIndex = uint32(Data.BatchPositions.Num()) - 1u;
+		for (const FCSGpuDebugBatchDraw& Draw : Data.BatchDraws)
+			FCSGpuDebugDraw::SubmitColoredDraw(*this, Views, VisibilityMap, Collector, BatchVertexFactory,
+				BatchIndices, Draw.PrimitiveType, Draw.Color, Draw.NumPrimitives, MaxBatchVertexIndex,
+				nullptr, 0u, Draw.FirstIndex);
+	}
+
+	if (!Positions.Buffer.Pooled.IsValid() || !MainIndices.Pooled.IsValid() || !MainIndirectArgs.IsValid()) return;
 	const EPrimitiveType MainType = Data.Mode == ECSMeshGeneratorDebugMode::Directions ? PT_LineList : PT_TriangleList;
-	FCSGpuMeshSceneProxy::SubmitGpuBufferDraw(*this, Views, VisibilityMap, Collector, VertexFactory, MainMaterial,
-		MainIndices, MainType, 0u, PositionCapacity - 1u, false, MainIndirectArgs->GetRHI(), 0u);
+	FCSGpuDebugDraw::SubmitColoredDraw(*this, Views, VisibilityMap, Collector, VertexFactory,
+		MainIndices, MainType, Data.DirectionColor, 0u, PositionCapacity - 1u, MainIndirectArgs->GetRHI(), 0u);
 
 	if (Data.Mode != ECSMeshGeneratorDebugMode::Directions || !Data.bDrawPoints || !PointIndirectArgs.IsValid()) return;
-	FColoredMaterialRenderProxy& PointMaterial = Collector.AllocateOneFrameResource<FColoredMaterialRenderProxy>(
-		DebugMaterial->GetRenderProxy(), Data.PointColor);
-	FCSGpuMeshSceneProxy::SubmitGpuBufferDraw(*this, Views, VisibilityMap, Collector, VertexFactory, PointMaterial,
-		PointIndices, PT_PointList, 0u, PositionCapacity - 1u, false, PointIndirectArgs->GetRHI(), 0u);
+	FCSGpuDebugDraw::SubmitColoredDraw(*this, Views, VisibilityMap, Collector, VertexFactory,
+		PointIndices, PT_PointList, Data.PointColor, 0u, PositionCapacity - 1u, PointIndirectArgs->GetRHI(), 0u);
 }
 
 FPrimitiveViewRelevance FCSMeshGeneratorDebugSceneProxy::GetViewRelevance(const FSceneView* View) const
@@ -217,7 +196,7 @@ void FCSMeshGeneratorDebugSceneProxy::BuildGeometry(FRHICommandListBase& RHICmdL
 	FRDGBufferRef SourcePositions = GraphBuilder.RegisterExternalBuffer(Data.Positions, TEXT("CSMeshGeneratorDebug.SourcePositions"));
 	FRDGBufferRef SourceNormals = GraphBuilder.RegisterExternalBuffer(Data.Normals, TEXT("CSMeshGeneratorDebug.SourceNormals"));
 	FRDGBufferRef SourceCounter = GraphBuilder.RegisterExternalBuffer(Data.Counter, TEXT("CSMeshGeneratorDebug.SourceCounter"));
-	FRDGBufferRef DebugPositions = GraphBuilder.RegisterExternalBuffer(Positions.Pooled, TEXT("CSMeshGeneratorDebug.Positions.External"));
+	FRDGBufferRef DebugPositions = GraphBuilder.RegisterExternalBuffer(Positions.Buffer.Pooled, TEXT("CSMeshGeneratorDebug.Positions.External"));
 	FRDGBufferRef DebugMainIndices = GraphBuilder.RegisterExternalBuffer(MainIndices.Pooled, TEXT("CSMeshGeneratorDebug.MainIndices.External"));
 	FRDGBufferRef DebugPointIndices = GraphBuilder.RegisterExternalBuffer(PointIndices.Pooled, TEXT("CSMeshGeneratorDebug.PointIndices.External"));
 	FRDGBufferRef DebugMainArgs = GraphBuilder.RegisterExternalBuffer(MainIndirectArgs, TEXT("CSMeshGeneratorDebug.MainArgs.External"));
@@ -227,7 +206,7 @@ void FCSMeshGeneratorDebugSceneProxy::BuildGeometry(FRHICommandListBase& RHICmdL
 	FCSMeshGeneratorDebugGeometryCS::FParameters* GeometryParams = GraphBuilder.AllocParameters<FCSMeshGeneratorDebugGeometryCS::FParameters>();
 	GeometryParams->InVoxelPositions = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SourcePositions, PF_A32B32G32R32F));
 	GeometryParams->InVoxelNormals = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SourceNormals, PF_A32B32G32R32F));
-	GeometryParams->RWDebugPositions = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(DebugPositions, PF_A32B32G32R32F));
+	GeometryParams->RWDebugPositions = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(DebugPositions, PF_R32_FLOAT));
 	GeometryParams->RWMainIndices = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(DebugMainIndices, PF_R32_UINT));
 	GeometryParams->RWPointIndices = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(DebugPointIndices, PF_R32_UINT));
 	GeometryParams->VoxelCapacity = uint32(Data.VoxelCapacity);

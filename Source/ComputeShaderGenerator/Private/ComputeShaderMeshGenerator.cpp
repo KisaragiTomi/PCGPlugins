@@ -28,6 +28,7 @@
 #include "LandscapeProxy.h"
 #include "CSDirectTriangleMeshComponent.h"
 #include "CSGpuMeshSave.h"
+#include "CSGpuDebugDraw.h"
 #include "CSMeshGeneratorDebugComponent.h"
 #include "Materials/MaterialInterface.h"
 #include "MeshDescription.h"
@@ -1521,7 +1522,14 @@ bool ExtractNaniteSourceTrianglesForRequest(
 			const int32 ImportedMaterialIndex = StaticMesh->GetMaterialIndexFromImportedMaterialSlotName(SlotName);
 			if (ImportedMaterialIndex != INDEX_NONE) MaterialIndex = ImportedMaterialIndex;
 		}
-		// 閺冪姴顕遍崗銉π崥宥呯潣閹勫灗閸氬秶袨閺勭姴鐨犳径杈Е閺冭绱漰olygon group 妞ゅ搫绨崡铏綏鐠愩劍蝎妞ゅ搫绨妴?		if (Request.MaterialSlots.IsValidIndex(MaterialIndex)) Material = Request.MaterialSlots[MaterialIndex].Get();
+		// ASCII only on purpose. This comment used to hold CJK text and the file on disk had no
+		// line break at all between it and the statement below - just '?' and two tabs - so the
+		// lookup sat inside the comment and every compiler dropped it. Material then stayed null
+		// for every polygon group, all groups deduped to one null registry entry, and any
+		// multi-material source collapsed to a single empty slot. Keep the statement on its own
+		// line, and keep this comment ASCII: the sources are UTF-8 without a BOM, so MSVC reads
+		// them as the system codepage and a CJK byte pair at end of line can eat the newline again.
+		if (Request.MaterialSlots.IsValidIndex(MaterialIndex)) Material = Request.MaterialSlots[MaterialIndex].Get();
 
 		int32 RegistryIndex = INDEX_NONE;
 		if (const int32* Found = MaterialToRegistry.Find(Material)) RegistryIndex = *Found;
@@ -5151,10 +5159,18 @@ int32 AMeshGeneratorBrushCache::DrawDebugActiveVoxels(
 		return 0;
 	}
 
+	if (!MeshGeneratorDebugComponent)
+	{
+		return 0;
+	}
+
 	const float SafeDuration = FMath::Max(0.0f, Options.Duration);
-	const float SafeThickness = FMath::Max(0.0f, Options.Thickness);
 	const int32 DrawLimit = Options.MaxVoxelsToDraw > 0 ? Options.MaxVoxelsToDraw : TNumericLimits<int32>::Max();
-	const FColor LineColor = Options.DebugColor.ToFColor(true);
+
+	// GPU-submitted box edges (Options.Thickness has no line-list equivalent and is ignored).
+	FCSGpuDebugBatch CellBatch;
+	CellBatch.Primitive = ECSGpuDebugPrimitive::Boxes;
+	CellBatch.Color = Options.DebugColor;
 
 	int32 DrawnCount = 0;
 	for (const FCSMeshGeneratorVoxelKey& Cell : *CellsToDraw)
@@ -5170,31 +5186,28 @@ int32 AMeshGeneratorBrushCache::DrawDebugActiveVoxels(
 			continue;
 		}
 
-		DrawDebugBox(
-			World,
-			CellBounds.GetCenter(),
-			CellBounds.GetExtent(),
-			LineColor,
-			Options.bPersistentLines,
-			SafeDuration,
-			0,
-			SafeThickness);
+		CellBatch.Positions.Add(FVector3f(CellBounds.Min));
+		CellBatch.Positions.Add(FVector3f(CellBounds.Max));
 		++DrawnCount;
+	}
+
+	TArray<FCSGpuDebugBatch> Batches;
+	if (DrawnCount > 0)
+	{
+		Batches.Add(MoveTemp(CellBatch));
 	}
 
 	if (Options.bDrawCacheBounds)
 	{
-		DrawDebugBox(
-			World,
-			CacheState.CachedWorldBounds.GetCenter(),
-			CacheState.CachedWorldBounds.GetExtent(),
-			FColor::White,
-			Options.bPersistentLines,
-			SafeDuration,
-			0,
-			FMath::Max(1.0f, SafeThickness));
+		FCSGpuDebugBatch BoundsBatch;
+		BoundsBatch.Primitive = ECSGpuDebugPrimitive::Boxes;
+		BoundsBatch.Color = FLinearColor::White;
+		BoundsBatch.Positions.Add(FVector3f(CacheState.CachedWorldBounds.Min));
+		BoundsBatch.Positions.Add(FVector3f(CacheState.CachedWorldBounds.Max));
+		Batches.Add(MoveTemp(BoundsBatch));
 	}
 
+	MeshGeneratorDebugComponent->SetPrimitiveBatches(MoveTemp(Batches), SafeDuration, Options.bPersistentLines);
 	return DrawnCount;
 }
 
@@ -6059,6 +6072,7 @@ bool AComputeShaderMeshGenerator::CaptureLandscapeHeightmap(UTextureRenderTarget
 		QueryParams.AddIgnoredActor(this);
 
 		int32 HitCount = 0;
+		TArray<FVector> HitPoints;
 		const double TraceStart = FPlatformTime::Seconds();
 		for (int32 Y = 0; Y < GridSize; ++Y)
 		{
@@ -6074,12 +6088,23 @@ bool AComputeShaderMeshGenerator::CaptureLandscapeHeightmap(UTextureRenderTarget
 					ECC_WorldStatic, QueryParams)
 					&& Hit.GetActor() && Hit.GetActor()->IsA<ALandscapeProxy>())
 				{
-					DrawDebugPoint(World, Hit.ImpactPoint + FVector(0,0,10), 8.0f, FColor::Green, false, 15.0f);
+					HitPoints.Add(Hit.ImpactPoint + FVector(0, 0, 10));
 					++HitCount;
 				}
 			}
 		}
 		const double TraceMs = (FPlatformTime::Seconds() - TraceStart) * 1000.0;
+		if (MeshGeneratorDebugComponent && !HitPoints.IsEmpty())
+		{
+			FCSGpuDebugBatch HitBatch;
+			HitBatch.Primitive = ECSGpuDebugPrimitive::Points;
+			HitBatch.Color = FLinearColor::Green;
+			HitBatch.Positions.Reserve(HitPoints.Num());
+			for (const FVector& HitPoint : HitPoints) HitBatch.Positions.Add(FVector3f(HitPoint));
+			TArray<FCSGpuDebugBatch> HitBatches;
+			HitBatches.Add(MoveTemp(HitBatch));
+			MeshGeneratorDebugComponent->SetPrimitiveBatches(MoveTemp(HitBatches), 15.0f, false);
+		}
 		UE_LOG(LogTemp, Log, TEXT("[CaptureLandscapeHeightmap] DD mode: %d/%d landscape hits, %.2f ms, Center=(%.0f,%.0f,%.0f) Extent=%.0f"),
 			HitCount, GridSize * GridSize, TraceMs, Center.X, Center.Y, Center.Z, CaptureExtent);
 		return HitCount > 0;

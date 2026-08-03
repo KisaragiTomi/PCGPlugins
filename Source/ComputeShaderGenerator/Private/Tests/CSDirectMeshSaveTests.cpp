@@ -34,7 +34,7 @@ bool FCSGpuMeshDescriptionSharedVertexAutomationTest::RunTest(const FString& Par
 	FCSGpuMeshCPUData MeshData;
 	for (const FVector& Position : LocalPositions) MeshData.Positions.Add(FVector3f(ActorTransform.TransformPosition(Position)));
 	MeshData.Indices = { 0, 1, 2, 0, 2, 3 };
-	MeshData.TexCoords =
+	MeshData.TexCoords() =
 	{
 		FVector2f(0.0f, 0.0f), FVector2f(1.0f, 0.0f), FVector2f(1.0f, 1.0f),
 		FVector2f(0.25f, 0.25f), FVector2f(0.75f, 0.75f), FVector2f(0.0f, 1.0f)
@@ -79,7 +79,7 @@ bool FCSGpuMeshDescriptionSharedVertexAutomationTest::RunTest(const FString& Par
 	{
 		const FVertexInstanceID VertexInstanceID(Corner);
 		TestTrue(TEXT("Per-corner UV survives shared-position conversion"),
-			UVs.Get(VertexInstanceID, 0).Equals(MeshData.TexCoords[Corner], UE_SMALL_NUMBER));
+			UVs.Get(VertexInstanceID, 0).Equals(MeshData.TexCoords()[Corner], UE_SMALL_NUMBER));
 		TestTrue(TEXT("Per-corner color survives shared-position conversion"),
 			Colors[VertexInstanceID].Equals(MeshData.Colors[Corner], UE_SMALL_NUMBER));
 		TestEqual(TEXT("Negative scale restores local tangent handedness"), BinormalSigns[VertexInstanceID], 1.0f);

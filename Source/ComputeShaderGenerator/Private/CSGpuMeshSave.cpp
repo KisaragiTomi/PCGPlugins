@@ -1,4 +1,5 @@
 #include "CSGpuMeshSave.h"
+#include "CSGpuMeshConvert.h"
 
 #include "Engine/StaticMesh.h"
 #include "MeshDescription.h"
@@ -107,7 +108,14 @@ bool CSGpuMeshSave::BuildGpuMeshDescription(
 	TVertexInstanceAttributesRef<float> VertexInstanceBinormalSigns = Attributes.GetVertexInstanceBinormalSigns();
 	TVertexInstanceAttributesRef<FVector4f> VertexInstanceColors = Attributes.GetVertexInstanceColors();
 	TVertexInstanceAttributesRef<FVector2f> VertexInstanceUVs = Attributes.GetVertexInstanceUVs();
-	if (VertexInstanceUVs.GetNumChannels() < 1) VertexInstanceUVs.SetNumChannels(1);
+	// 只为真正填了数据的通道开 UV 槽：声明了 N 条但某条为空时不开，避免写出一整条零 UV。
+	int32 ActiveTexCoordChannels = FMath::Clamp(
+		MeshData.NumTexCoordChannels, 1, FCSGpuMeshCPUData::MaxTexCoordChannels);
+	while (ActiveTexCoordChannels > 1 && MeshData.TexCoordChannels[ActiveTexCoordChannels - 1].IsEmpty())
+	{
+		--ActiveTexCoordChannels;
+	}
+	if (VertexInstanceUVs.GetNumChannels() < ActiveTexCoordChannels) VertexInstanceUVs.SetNumChannels(ActiveTexCoordChannels);
 
 	int32 MaxMaterialSlot = 0;
 	for (int32 Slot : MeshData.TriangleMaterialSlots) MaxMaterialSlot = FMath::Max(MaxMaterialSlot, Slot);
@@ -216,7 +224,7 @@ bool CSGpuMeshSave::BuildGpuMeshDescription(
 
 			const int32 NormalIndex = AttributeIndex(MeshData.Normals.Num(), SourceIndex, CornerIndex);
 			const int32 TangentIndex = AttributeIndex(MeshData.Tangents.Num(), SourceIndex, CornerIndex);
-			const int32 UVIndex = AttributeIndex(MeshData.TexCoords.Num(), SourceIndex, CornerIndex);
+			const int32 UVIndex = AttributeIndex(MeshData.TexCoords().Num(), SourceIndex, CornerIndex);
 			FVector Normal = TransformedNormals[NormalIndex];
 			if (!IsFiniteVec(Normal) || Normal.IsNearlyZero()) Normal = FaceNormal;
 			const bool bNormalFlipped = FVector::DotProduct(Normal, FaceNormal) < 0.0;
@@ -229,7 +237,7 @@ bool CSGpuMeshSave::BuildGpuMeshDescription(
 				Tangent = FVector::CrossProduct(Helper, Normal).GetSafeNormal();
 			}
 
-			const FVector2f UV = MeshData.TexCoords[UVIndex];
+			const FVector2f UV = MeshData.TexCoords()[UVIndex];
 			const FVector2f SafeUV = FMath::IsFinite(UV.X) && FMath::IsFinite(UV.Y) ? UV : FVector2f::ZeroVector;
 			FVector4f Color(1.0f, 1.0f, 1.0f, 1.0f);
 			if (!MeshData.Colors.IsEmpty())
@@ -249,6 +257,14 @@ bool CSGpuMeshSave::BuildGpuMeshDescription(
 			VertexInstanceBinormalSigns[VertexInstanceID] = BinormalSign * TransformHandedness * (bNormalFlipped ? -1.0f : 1.0f);
 			VertexInstanceColors[VertexInstanceID] = Color;
 			VertexInstanceUVs.Set(VertexInstanceID, 0, SafeUV);
+			// 额外 UV 通道与通道 0 等长（IsValid 已校验），沿用同一个角点下标。
+			for (int32 Channel = 1; Channel < ActiveTexCoordChannels; ++Channel)
+			{
+				const TArray<FVector2f>& ChannelUVs = MeshData.TexCoordChannels[Channel];
+				const FVector2f ChannelUV = ChannelUVs.IsValidIndex(UVIndex) ? ChannelUVs[UVIndex] : FVector2f::ZeroVector;
+				const bool bFinite = FMath::IsFinite(ChannelUV.X) && FMath::IsFinite(ChannelUV.Y);
+				VertexInstanceUVs.Set(VertexInstanceID, Channel, bFinite ? ChannelUV : FVector2f::ZeroVector);
+			}
 			VertexInstanceIDs[Corner] = VertexInstanceID;
 		}
 
@@ -384,60 +400,14 @@ UStaticMesh* CSGpuMeshSave::SaveGpuMeshComponentToStaticMesh(
 	bool bReplaceExistingAsset,
 	bool bSaveAsset)
 {
+	// 这个函数现在只做两件事：把组件的 GPU 网格回读到 CPU，然后交给公用转换入口。
+	// 路径校验、材质槽装配、绕序与退化面处理全部收敛在 CSGpuMeshConvert 里，不再各写一份。
+	// 原先这里另起一套 UE::AssetUtils::CreateStaticMeshAsset 流程，且硬编码 NumMaterialSlots=1，
+	// 使三条 leaf 路径（Road / Vine / DirectMesh）结构上无法输出多材质。
 	if (!Component)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: null component."));
 		return nullptr;
-	}
-
-	// Empty path -> default to a "result" folder next to the current level (see BuildDefaultResultAssetPath).
-	FString EffectiveAssetPath = AssetPathAndName.TrimStartAndEnd();
-	if (EffectiveAssetPath.IsEmpty())
-	{
-		EffectiveAssetPath = BuildDefaultResultAssetPath(Component->GetOwner());
-		if (EffectiveAssetPath.IsEmpty())
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: no path given and could not derive a default 'result' folder from the current level (unsaved map?). Pass an explicit /Game/... path."));
-			return nullptr;
-		}
-		UE_LOG(LogTemp, Display, TEXT("[CSGpuMesh] No path given; defaulting to '%s' (result folder next to the current level)."), *EffectiveAssetPath);
-	}
-
-	const FString SanitizedAssetPathAndName = UPackageTools::SanitizePackageName(EffectiveAssetPath);
-	if (!FPackageName::IsValidLongPackageName(SanitizedAssetPathAndName))
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: invalid asset path '%s'. Use a long package path such as /Game/AutoResult/SM_Mesh."), *SanitizedAssetPathAndName);
-		return nullptr;
-	}
-
-	const FString AssetName = FPackageName::GetLongPackageAssetName(SanitizedAssetPathAndName);
-	if (AssetName.IsEmpty())
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: asset name is empty."));
-		return nullptr;
-	}
-
-	const FString AssetFolderPath = FPackageName::GetLongPackagePath(SanitizedAssetPathAndName);
-	if (!AssetFolderPath.IsEmpty()
-		&& !UEditorAssetLibrary::DoesDirectoryExist(AssetFolderPath)
-		&& !UEditorAssetLibrary::MakeDirectory(AssetFolderPath))
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: could not create asset folder '%s'."), *AssetFolderPath);
-		return nullptr;
-	}
-
-	if (UEditorAssetLibrary::DoesAssetExist(SanitizedAssetPathAndName))
-	{
-		if (!bReplaceExistingAsset)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save skipped: asset already exists at '%s'."), *SanitizedAssetPathAndName);
-			return nullptr;
-		}
-		if (!UEditorAssetLibrary::DeleteAsset(SanitizedAssetPathAndName))
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: could not replace '%s'."), *SanitizedAssetPathAndName);
-			return nullptr;
-		}
 	}
 
 	FCSGpuMeshCPUData MeshData;
@@ -447,46 +417,31 @@ UStaticMesh* CSGpuMeshSave::SaveGpuMeshComponentToStaticMesh(
 		return nullptr;
 	}
 
-	FMeshDescription MeshDescription;
-	if (!BuildGpuMeshDescription(MeshData, ActorTransform, bConvertToActorLocalSpace, MeshDescription))
+	// 调用方给的单材质仍然生效；组件回读若已带材质表则以它为准（多材质路径）。
+	if (MeshData.Materials.IsEmpty() && Material) MeshData.Materials.Add(Material);
+
+	CSGpuMeshConvert::FConvertOptions ConvertOptions;
+	ConvertOptions.TargetTransform = ActorTransform;
+	ConvertOptions.bBakeToLocalSpace = bConvertToActorLocalSpace;
+
+	CSGpuMeshConvert::FAssetOptions AssetOptions;
+	AssetOptions.AssetPath = AssetPathAndName.TrimStartAndEnd();
+	if (AssetOptions.AssetPath.IsEmpty())
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: readback data could not produce a MeshDescription."));
-		return nullptr;
+		AssetOptions.AssetPath = BuildDefaultResultAssetPath(Component->GetOwner());
+		if (AssetOptions.AssetPath.IsEmpty())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: no path given and could not derive a default 'result' folder from the current level (unsaved map?). Pass an explicit /Game/... path."));
+			return nullptr;
+		}
+		UE_LOG(LogTemp, Display, TEXT("[CSGpuMesh] No path given; defaulting to '%s' (result folder next to the current level)."), *AssetOptions.AssetPath);
 	}
+	AssetOptions.bReplaceExisting = bReplaceExistingAsset;
+	AssetOptions.bSaveToDisk = bSaveAsset;
 
-	UE::AssetUtils::FStaticMeshAssetOptions AssetOptions;
-	AssetOptions.NewAssetPath = SanitizedAssetPathAndName;
-	AssetOptions.NumSourceModels = 1;
-	AssetOptions.NumMaterialSlots = 1;
-	AssetOptions.AssetMaterials.Add(Material);
-	AssetOptions.bEnableRecomputeNormals = false;
-	AssetOptions.bEnableRecomputeTangents = false;
-	AssetOptions.bGenerateLightmapUVs = false;
-	AssetOptions.bBuildReversedIndexBuffer = false;
-	AssetOptions.CollisionType = ECollisionTraceFlag::CTF_UseComplexAsSimple;
-	AssetOptions.SourceMeshes.MoveMeshDescriptions.Add(&MeshDescription);
-
-	UE::AssetUtils::FStaticMeshResults Results;
-	const UE::AssetUtils::ECreateStaticMeshResult CreateResult = UE::AssetUtils::CreateStaticMeshAsset(AssetOptions, Results);
-	UStaticMesh* NewStaticMesh = CreateResult == UE::AssetUtils::ECreateStaticMeshResult::Ok ? Results.StaticMesh : nullptr;
-	if (!NewStaticMesh)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: StaticMesh asset creation failed for '%s'."), *SanitizedAssetPathAndName);
-		return nullptr;
-	}
-
-	FAssetRegistryModule::AssetCreated(NewStaticMesh);
-	NewStaticMesh->MarkPackageDirty();
-	if (UPackage* Package = NewStaticMesh->GetOutermost()) Package->SetDirtyFlag(true);
-	if (bSaveAsset && !UEditorAssetLibrary::SaveLoadedAsset(NewStaticMesh, false))
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Created '%s' but failed to write the package to disk."), *SanitizedAssetPathAndName);
-		return NewStaticMesh;
-	}
-
-	UE_LOG(LogTemp, Display, TEXT("[CSGpuMesh] Saved '%s' from GPU buffers. Vertices=%d Indices=%d Triangles=%d LocalSpace=%d"),
-		*SanitizedAssetPathAndName, MeshData.Positions.Num(), MeshData.Indices.Num(), MeshData.Indices.Num() / 3, bConvertToActorLocalSpace ? 1 : 0);
-	return NewStaticMesh;
+	return CSGpuMeshConvert::BuildStaticMesh(
+		Component, Component->GetOwner(), MeshData, TArray<UMaterialInterface*>(),
+		ConvertOptions, AssetOptions);
 }
 
 #endif // WITH_EDITOR

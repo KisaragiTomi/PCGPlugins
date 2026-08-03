@@ -427,17 +427,13 @@ namespace
 
 	// CPU winding BVH 已移除：最终 BSP emit 直接遍历同一 RDG 内的 GPU LBVH + 多极 refit。
 
-	/** 每种运算落到各自的资产，避免 Stage A 的中间结果与最终布尔结果互相覆盖。 */
-	FString MeshBooleanOpAssetSuffix(ECSMeshBooleanOp Op)
+	/**
+	 * 每次运行的结果落到带时间戳的独立资产，互不覆盖：Stage A 的中间结果与最终布尔结果
+	 * 可以并存对比，重复运行也能留下历史。秒级精度足够——单次布尔远超一秒。
+	 */
+	FString MeshBooleanResultAssetSuffix()
 	{
-		switch (Op)
-		{
-		case ECSMeshBooleanOp::ArrangementOnly: return TEXT("_Arrangement");
-		case ECSMeshBooleanOp::Union:           return TEXT("_Union");
-		case ECSMeshBooleanOp::KeepInside:      return TEXT("_KeepInside");
-		case ECSMeshBooleanOp::KeepOutside:     return TEXT("_KeepOutside");
-		}
-		return FString();
+		return FDateTime::Now().ToString(TEXT("_%Y%m%d_%H%M%S"));
 	}
 }
 
@@ -514,6 +510,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	const uint32 StageBKeepBackV = bKeepBackFacingVisible ? 1u : 0u;
 	const uint32 StageBDebugColorV = bDebugColor ? 1u : 0u;
 	const float OutputWeldDistanceV = FMath::Max(0.0f, VertexWeldDistance);
+	const int32 OutputTrianglesPerSourceV = FMath::Max(2, ArrangementOutputTrianglesPerSource);
 
 	// ---- game thread：解析场景三角形（bReadLandscape 控制是否纳入地形）----
 	// Stage 2（Game Thread）：收集查询框内的场景三角形及其顶点属性，形成源 triangle soup。
@@ -581,6 +578,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 		 bRunStageB, StageBWindingBetaSqV, StageBWindingSampleOffsetV, StageBWindingThresholdV,
 		 StageBExpansionDistanceV, StageBRayCountV, StageBCapMinCosV, StageBShellRadiusV,
 		 StageBRayBiasV, StageBSampleDensityV, StageBKeepBackV, StageBDebugColorV, OutputWeldDistanceV,
+		 OutputTrianglesPerSourceV,
 		 VertexReadback, NormalReadback, FinalStatusReadback, MaterialReadback, UVReadback, ColorReadback, TangentReadback, BiTangentReadback,
 		 OutSoupReadback, OutSourceReadback, WeldRepresentativeReadback,
 		 bNeedSourceNormals, bNeedSourceTangents, bNeedSourceColors, bNeedSourceMaterials,
@@ -615,9 +613,13 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 				bRenderWorkQueued = true;
 				return;
 			}
-			const uint64 ArrangementOutSoupCapacityBytes = uint64(ArrangementOutputTriangleCapacity) * 3ull * sizeof(FVector3f);
+			// 按实际要分配的容量校验 RHI 上限，而不是按 1536 MiB 硬预算——缩容后本就更容易通过。
+			const int64 PlannedOutputTriangleCapacity = FMath::Clamp<int64>(
+				int64(TriangleCapacity) * int64(OutputTrianglesPerSourceV),
+				1024, int64(ArrangementOutputTriangleCapacity));
+			const uint64 ArrangementOutSoupCapacityBytes = uint64(PlannedOutputTriangleCapacity) * 3ull * sizeof(FVector3f);
 			if (ArrangementOutSoupCapacityBytes > GRHIGlobals.MaxViewSizeBytesForNonTypedBuffer ||
-				uint64(ArrangementOutputTriangleCapacity) > GRHIGlobals.MaxViewDimensionForTypedBuffer)
+				uint64(PlannedOutputTriangleCapacity) > GRHIGlobals.MaxViewDimensionForTypedBuffer)
 			{
 				bArrangementCapacityUnsupported = true;
 				ExecuteSingleGraph();
@@ -741,7 +743,12 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 			{
 				TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_ArrangementSubmission);
 				const int32 ScratchBatchSize = FMath::Min(int32(TriangleCapacity), GPUArrangementTriangleBatchSize);
-				const int32 OutCapLocal = ArrangementOutputTriangleCapacity;
+				// 输出容量按源三角数缩放，不再无条件买断 1536 MiB：实测子三角数约为源三角的 2.5 倍，
+				// 固定容量的利用率只有 ~7%，其余全是每次调用都要分配并清零的死重。溢出仍由
+				// GPUArrOutOverflow 拦下并报错（提示调大倍率），语义与固定容量时一致。
+				const int32 OutCapLocal = int32(FMath::Clamp<int64>(
+					int64(TriangleCapacity) * int64(OutputTrianglesPerSourceV),
+					1024, int64(ArrangementOutputTriangleCapacity)));
 				FRDGBufferRef ArrOutSoup = nullptr, ArrOutSrc = nullptr, ArrOutCnt = nullptr, ArrOutStat = nullptr;
 				AddArrangementToRDG(GraphBuilder, Soup.TriangleVerticesSRV,
 					GraphBuilder.CreateSRV(FRDGBufferSRVDesc(CutP0Buf, PF_A32B32G32R32F)),
@@ -790,9 +797,12 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("MB.FinalStatus"),
 					FinalStatusShader, FinalStatusParameters, FIntVector(1, 1, 1));
 				AddEnqueueCopyPass(GraphBuilder, FinalStatusReadback, FinalStatusBuf, FinalStatusBytes);
-				UE_LOG(LogTemp, Log, TEXT("[MeshBoolean:%s] [GPU-arr] scratchBatch=%d batches=%d limits=%d cuts/%d verts/%d cells/%d outputsPerSource outCap=%d budget=1536MiB"),
+				UE_LOG(LogTemp, Log, TEXT("[MeshBoolean:%s] [GPU-arr] scratchBatch=%d batches=%d limits=%d cuts/%d verts/%d cells/%d outputsPerSource outCap=%d (%.0fx源三角, %.0fMiB, 硬上限 %d/1536MiB)"),
 					*GetName(), ScratchBatchSize, FMath::DivideAndRoundUp(int32(TriangleCapacity), ScratchBatchSize),
-					BSPMaxCuts, BSPMaxVerts, BSPMaxCells, BSPMaxOutputTrianglesPerSource, OutCapLocal);
+					BSPMaxCuts, BSPMaxVerts, BSPMaxCells, BSPMaxOutputTrianglesPerSource, OutCapLocal,
+					double(OutCapLocal) / FMath::Max(1.0, double(TriangleCapacity)),
+					double(uint64(OutCapLocal) * 40ull) / (1024.0 * 1024.0),
+					ArrangementOutputTriangleCapacity);
 				OutSubTriCap = OutCapLocal;
 				GraphBuilder.QueueBufferExtraction(ArrOutSoup, &ArrOutSoupExtracted, ERHIAccess::CopySrc);
 				GraphBuilder.QueueBufferExtraction(ArrOutSrc, &ArrOutSourceExtracted, ERHIAccess::CopySrc);
@@ -1042,6 +1052,9 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	}
 	if (bArrangementOverflow)
 	{
+		if (GOutCnt[1] > 0u || GOutCnt[0] > uint32(FMath::Max(0, OutSubTriCap)))
+			UE_LOG(LogTemp, Error, TEXT("[MeshBoolean:%s] 子三角输出超出容量（需要 %u > 容量 %d）。把 ArrangementOutputTrianglesPerSource 调大（当前 %d）后重试。"),
+				*GetName(), GOutCnt[0], OutSubTriCap, OutputTrianglesPerSourceV);
 		UE_LOG(LogTemp, Error, TEXT("[MeshBoolean:%s] GPU arrangement aborted: structural/global failure (outOverflow=%u scratchOverflow=%u partialSplitCommit=%u areaMismatch=%u maxSeg=%u maxVerts=%u maxCells=%u maxOutputPerSource=%u)"),
 			*GetName(), GOutCnt[1], GStat[BSPStatScratchOverflow], GStat[BSPStatPartialSplitCommit],
 			GStat[BSPStatAreaMismatch], GStat[BSPStatMaxSegments], GStat[BSPStatMaxVertices],
@@ -1585,11 +1598,10 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	const FTransform OutputTransform = GetDynamicMeshComponent()
 		? GetDynamicMeshComponent()->GetComponentTransform()
 		: GetActorTransform();
-	// 结果落盘为资产：level 同级 result 文件夹（/<level 目录>/result/SM_<actor>_<Op>），建完标脏，
+	// 结果落盘为资产：level 同级 result 文件夹（/<level 目录>/result/SM_<actor>_<时间戳>），建完标脏，
 	// 由用户自行 Save All 决定是否写盘。非编辑器构建没有资产系统，退回 transient。
-	// 资产名带上运算类型：ArrangementOnly 是可供检查的中间结果，若与最终布尔结果同名会互相覆盖。
 #if WITH_EDITOR
-	const FString ResultAssetPath = CSGpuMeshSave::BuildResultAssetPath(this, MeshBooleanOpAssetSuffix(Op));
+	const FString ResultAssetPath = CSGpuMeshSave::BuildResultAssetPath(this, MeshBooleanResultAssetSuffix());
 	OutputStaticMesh = CSGpuMeshSave::SaveGpuMeshDataToStaticMesh(
 		this, StaticMeshData, OutputMaterialSlots, OutputTransform, true, ResultAssetPath);
 	if (!OutputStaticMesh)
@@ -1818,9 +1830,9 @@ static void AddArrangementToRDG(
 	// fragment 经 compaction 单独发射线，避免 warp 里少数重线程拖住其余 63 条。
 	// OutSource 已在上面清成 0xFFFFFFFF；未被 BSP 写过的槽位掩码后 tri >= TriCapacity，
 	// classify 与 CPU 侧都会跳过，无需额外清零。
-	// 含糊 fragment 只占输出的小部分，按 OutCap（固定 4026 万）分配会白占 153.6 MiB。
-	// 实测 fragment 数约为源三角的 2.5 倍，这里留到 4 倍再夹到 OutCap；万一仍装不下，
-	// classify 会把装不下的那些直接判 keep（保守：宁可多留面也不破洞），并计数上报。
+	// 含糊 fragment 只占输出的小部分，按 OutCap 分配是纯浪费；实测 fragment 数约为源三角的
+	// 2.5 倍，这里留到 4 倍再夹到 OutCap。万一仍装不下，classify 会把装不下的那些直接判 keep
+	//（保守：宁可多留面也不破洞），并计数上报。
 	const int32 AmbiguousCap = FMath::Clamp(TriCapacity * 4, 1024, OutCap);
 	FRDGBufferRef AmbiguousListBuf = GraphBuilder.CreateBuffer(
 		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), AmbiguousCap), TEXT("MB.StageB.AmbiguousList"));

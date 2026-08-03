@@ -928,6 +928,9 @@ void RetriangulateBSPNCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupI
 StructuredBuffer<float3> MBFragmentSoup;      // RW_OutSoup 的 SRV
 Buffer<uint>   MBFragmentCounter;             // RW_OutCounter 的 SRV
 RWBuffer<uint> RW_MBFragmentSource;           // RW_OutSource 的 UAV：低位源序号 + 高位分类
+// 待救回 fragment 统一入一条列表。曾按「要发射线」与「只需扩距」拆成两条各自 dispatch，
+// 想消除 warp 内发散，实测反而慢 1~1.7s：混合列表让两类工作在飞时互相掩盖延迟，拆开后
+// 两段串行执行丢了这层重叠，还多一个 pass 的 barrier。保持单列表。
 RWBuffer<uint> RW_MBAmbiguousList;            // 待救回 fragment 序号
 RWBuffer<uint> RW_MBAmbiguousCounter;         // [0]=数量 [1]=溢出
 Buffer<uint>   MBAmbiguousCounterSRV;
@@ -1009,8 +1012,8 @@ void ClassifyFragmentsCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupI
 			}
 			else
 			{
-				// 列表满：这条 fragment 拿不到射线救回的机会。保守判 keep——多留一片面
-				// 只是冗余几何，漏掉一片可见面却会在外壳上留洞。计数供 CPU 上报。
+				// 列表满：这条 fragment 拿不到救回机会。保守判 keep——多留一片冗余面，
+				// 好过在外壳上留洞。计数供 CPU 上报。
 				InterlockedAdd(RW_MBAmbiguousCounter[1], 1u);
 				flags |= MB_SRC_KEEP;
 			}

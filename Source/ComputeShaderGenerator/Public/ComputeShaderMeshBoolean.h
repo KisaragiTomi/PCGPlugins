@@ -180,6 +180,14 @@ public:
 	float SnapRoundQuantum = 0.01f;
 
 	/**
+	 * 子三角输出容量 = 源三角数 × 该倍率（再夹到 1536 MiB 硬预算）。切分后的子三角数实测约为
+	 * 源三角数的 2.5 倍，默认 8 留了 3 倍余量。调大更耐受高度互切的场景，代价是显存；
+	 * 若日志报 outOverflow 就把它调大。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|GPU Arrangement", meta = (ClampMin = "2"))
+	int32 ArrangementOutputTrianglesPerSource = 8;
+
+	/**
 	 * Stage A：对 GeneratorBounds 盒内的场景三角形消除互相穿插，返回切分后的 transient StaticMesh。
 	 * 不创建或覆盖 Content Browser 资产；需要持久化时由调用方显式保存。同步执行（内部 FlushRenderingCommands）。
 	 * @param bRecomputeNormals 输出后重算法线

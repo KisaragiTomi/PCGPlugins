@@ -32,8 +32,9 @@ namespace CSGpuMeshSave
 
 #if WITH_EDITOR
 	/** Builds "<OwnerActor's level folder>/result/SM_<owner><NameSuffix>". Producers that emit
-	 *  more than one kind of result from the same actor (e.g. an intermediate stage and the final
-	 *  mesh) must pass distinct suffixes, otherwise each run replaces the other's asset.
+	 *  more than one result from the same actor (an intermediate stage and the final mesh, or
+	 *  repeated runs) must pass distinct suffixes — a timestamp works — otherwise each run
+	 *  replaces the previous asset.
 	 *  Returns an empty string when the owning level has no content path (unsaved map). */
 	COMPUTESHADERGENERATOR_API FString BuildResultAssetPath(
 		const AActor* OwnerActor,

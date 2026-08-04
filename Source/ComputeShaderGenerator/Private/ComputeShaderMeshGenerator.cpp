@@ -15,8 +15,11 @@
 #include "DynamicMesh/DynamicMesh3.h"
 #include "DynamicMesh/DynamicMeshAttributeSet.h"
 #include "Engine/Engine.h"
+#include "Engine/Level.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
+#include "Misc/PackageName.h"
+#include "UObject/Package.h"
 #include "TimerManager.h"
 #include "GameFramework/Actor.h"
 #include "GeometryScript/MeshNormalsFunctions.h"
@@ -28,7 +31,6 @@
 #include "LandscapeProxy.h"
 #include "CSDirectTriangleMeshComponent.h"
 #include "CSGpuMeshSave.h"
-#include "CSGpuDebugDraw.h"
 #include "CSMeshGeneratorDebugComponent.h"
 #include "Materials/MaterialInterface.h"
 #include "MeshDescription.h"
@@ -317,6 +319,7 @@ class FExtractStaticMeshTrianglesCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_TriangleCounter)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_OutTriangleMaterialIds)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float2>, RW_OutTriangleUVs)
+		SHADER_PARAMETER(uint32, CSNumUVChannels)
 		SHADER_PARAMETER(FMatrix44f, LocalToWorld)
 		SHADER_PARAMETER(FVector3f, BoundsMin)
 		SHADER_PARAMETER(FVector3f, BoundsMax)
@@ -367,6 +370,7 @@ class FAppendSourceTrianglesCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_TriangleCounter)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_OutTriangleMaterialIds)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float2>, RW_OutTriangleUVs)
+		SHADER_PARAMETER(uint32, CSNumUVChannels)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleColors)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleTangents)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleBiTangents)
@@ -784,7 +788,12 @@ struct FCSNaniteSourceTriangleData
 	TArray<FVector4f> Tangents;
 	TArray<FVector4f> BiTangents;
 	// 濮ｅ繋绗佺憴?3 娑?UV0閿涘本澧庨獮绛圭礉娑?Positions 楠炲疇顢戦妴?
+	// 逐角点 UV，按通道交错存放：UVs[Corner * NumUVChannels + Channel]。
+	// 用交错而不是 N 条并行数组，是为了让整条链（上传/GPU/回读）只需要多一个通道数标量，
+	// 而不是每加一条 UV 就多一套 buffer、SRV、readback。
 	TArray<FVector2f> UVs;
+	// 源模型实际有几条 UV 就是几条；所有 request 取最大值，缺的通道补 (0,0)。
+	int32 NumUVChannels = 1;
 	// 濮ｅ繋绗佺憴?1 娑擃亝娼楃拹?registry id閿涘湑S_NO_MATERIAL_ID = 閺冪姵娼楃拹顭掔礆閵?
 	TArray<uint32> MaterialIds;
 	// 閺堝鏅ユ稉澶庮潡閺佸府绱?= Positions.Num() / 3 == MaterialIds.Num()閿涘鈧?
@@ -1457,6 +1466,24 @@ bool ExtractNaniteSourceTrianglesForRequest(
 		return false;
 	}
 	const bool bHasUVs = VertexInstanceUVs.IsValid() && VertexInstanceUVs.GetNumChannels() > 0;
+	// 源模型实际有几条 UV。soup 是所有 request 共享的，通道数必须取到目前为止的最大值：
+	// 先写进来的单 UV 网格已经按旧步长排好了，遇到更多通道的网格就得把已有数据重排，
+	// 否则步长不一致会让整段 UV 错位。
+	const int32 SourceUVChannels = bHasUVs
+		? FMath::Clamp(VertexInstanceUVs.GetNumChannels(), 1, FCSGpuMeshCPUData::MaxTexCoordChannels)
+		: 1;
+	if (SourceUVChannels > OutTriangles.NumUVChannels)
+	{
+		const int32 OldChannels = OutTriangles.NumUVChannels;
+		const int32 CornerCount = OldChannels > 0 ? OutTriangles.UVs.Num() / OldChannels : 0;
+		TArray<FVector2f> Restrided;
+		Restrided.SetNumZeroed(CornerCount * SourceUVChannels);
+		for (int32 Corner = 0; Corner < CornerCount; ++Corner)
+			for (int32 Channel = 0; Channel < OldChannels; ++Channel)
+				Restrided[Corner * SourceUVChannels + Channel] = OutTriangles.UVs[Corner * OldChannels + Channel];
+		OutTriangles.UVs = MoveTemp(Restrided);
+		OutTriangles.NumUVChannels = SourceUVChannels;
+	}
 	const bool bHasNormals = VertexInstanceNormals.IsValid();
 	const bool bHasTangents = VertexInstanceTangents.IsValid() && VertexInstanceBinormalSigns.IsValid();
 	const bool bHasColors = VertexInstanceColors.IsValid();
@@ -1477,17 +1504,23 @@ bool ExtractNaniteSourceTrianglesForRequest(
 			FMath::RoundToInt(Position.Y * ColorCellScale),
 			FMath::RoundToInt(Position.Z * ColorCellScale));
 	};
-	auto SRGBVectorFromColor = [](const FColor& Color)
+	// Painted vertex colours are stored as sRGB-encoded bytes, but everything downstream - the
+	// barycentric interpolation in the boolean rebuild and MeshDescription's VertexInstanceColors -
+	// works in linear space (the engine applies ToFColor(true) itself when it builds render data,
+	// see StaticMesh.cpp ~8448). Dividing by 255 only rescaled the bytes and left them gamma
+	// encoded, so the value was encoded a second time on save and every result came out washed
+	// out. FLinearColor(FColor) does the proper sRGB -> linear conversion.
+	auto LinearVectorFromSRGBColor = [](const FColor& Color)
 	{
-		constexpr float Inv255 = 1.0f / 255.0f;
-		return FVector4f(Color.R * Inv255, Color.G * Inv255, Color.B * Inv255, Color.A * Inv255);
+		const FLinearColor Linear(Color);
+		return FVector4f(Linear.R, Linear.G, Linear.B, Linear.A);
 	};
 	auto AddColorSample = [&](const FVector3f& Position, const FVector3f& Normal, const FColor& Color)
 	{
 		const int32 SampleIndex = ComponentColorSamples.Add({
 			Position,
 			Normal.GetSafeNormal(),
-			SRGBVectorFromColor(Color)});
+			LinearVectorFromSRGBColor(Color)});
 		ComponentColorCells.FindOrAdd(ColorCell(Position)).Add(SampleIndex);
 	};
 
@@ -1546,8 +1579,10 @@ bool ExtractNaniteSourceTrianglesForRequest(
 			}
 		}
 		if (BestSample != INDEX_NONE) return ComponentColorSamples[BestSample].Color;
+		// MeshDescription vertex colours are already linear; the old round trip through
+		// ToFColor(true) gamma encoded them and the engine then encoded the result again.
 		return bHasColors
-			? SRGBVectorFromColor(FLinearColor(VertexInstanceColors[VertexInstanceID]).ToFColor(true))
+			? VertexInstanceColors[VertexInstanceID]
 			: FVector4f(1, 1, 1, 1);
 	};
 
@@ -1682,17 +1717,16 @@ bool ExtractNaniteSourceTrianglesForRequest(
 			}
 		}
 
-		FVector2f UVs[3] =
-		{
-			FVector2f::ZeroVector,
-			FVector2f::ZeroVector,
-			FVector2f::ZeroVector
-		};
+		// 逐角点读出源模型的每一条 UV。源只有 1 条就只读 1 条，多的通道保持 (0,0)。
+		FVector2f UVs[3][FCSGpuMeshCPUData::MaxTexCoordChannels];
+		for (int32 Corner = 0; Corner < 3; ++Corner)
+			for (int32 Channel = 0; Channel < FCSGpuMeshCPUData::MaxTexCoordChannels; ++Channel)
+				UVs[Corner][Channel] = FVector2f::ZeroVector;
 		if (bHasUVs)
 		{
-			UVs[0] = VertexInstanceUVs.Get(VertexInstances[0], 0);
-			UVs[1] = VertexInstanceUVs.Get(VertexInstances[1], 0);
-			UVs[2] = VertexInstanceUVs.Get(VertexInstances[2], 0);
+			for (int32 Corner = 0; Corner < 3; ++Corner)
+				for (int32 Channel = 0; Channel < SourceUVChannels; ++Channel)
+					UVs[Corner][Channel] = VertexInstanceUVs.Get(VertexInstances[Corner], Channel);
 		}
 
 		const FPolygonGroupID PolygonGroupID = MeshDescription->GetTrianglePolygonGroup(TriangleID);
@@ -1713,7 +1747,9 @@ bool ExtractNaniteSourceTrianglesForRequest(
 			OutTriangles.Tangents.Add(FVector4f(T, 0.0f));
 			OutTriangles.BiTangents.Add(FVector4f(B, 0.0f));
 			OutTriangles.Colors.Add(SourceColor(VertexInstanceID));
-			OutTriangles.UVs.Add(UVs[SourceCorner]);
+			// UV 按通道交错写入，步长 = soup 的通道数（各 request 取最大值，见 SourceUVChannels）。
+			for (int32 Channel = 0; Channel < OutTriangles.NumUVChannels; ++Channel)
+				OutTriangles.UVs.Add(UVs[SourceCorner][Channel]);
 		}
 		OutTriangles.MaterialIds.Add(MaterialId);
 		++OutTriangles.NumTriangles;
@@ -2307,8 +2343,11 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 
 	// 濮?vertex 娑撯偓娑?UV0閿涘牅绗屾い鍓佸仯楠炲疇顢戦敍? per triangle閿涘鈧倿顣╁〒鍛灇 (0,0)閿涙PU extract 閸欘亜顕?static mesh
 	// 妞ゅ墎鍋ｉ崘娆戞埂鐎?UV閿涙稑婀磋ぐ?閺堫亜鍟撻崗?閺?UV 閻ㄥ嫭绨懛顏勫З娣囨繃瀵?(0,0)閵嗕揪F_G32R32F 閸栧綊鍘?shader Buffer<float2>閵?
+	// 逐角点、按通道交错：容量 = 顶点容量 * 通道数。通道数由源模型决定（见 NumUVChannels）。
+	Output.NumUVChannels = FMath::Clamp(
+		NaniteTriangles ? NaniteTriangles->NumUVChannels : 1, 1, FCSGpuMeshCPUData::MaxTexCoordChannels);
 	Output.TriangleUVs = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector2f), VertexCapacity),
+		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector2f), VertexCapacity * uint32(Output.NumUVChannels)),
 		TEXT("CS.StaticMeshTriangles.UVs"));
 	Output.TriangleUVsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.TriangleUVs, PF_G32R32F));
 	Output.TriangleUVsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.TriangleUVs, PF_G32R32F));
@@ -2482,6 +2521,7 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 		PassParameters->RW_TriangleCounter = Output.TriangleCounterUAV;
 		PassParameters->RW_OutTriangleMaterialIds = Output.TriangleMaterialIdsUAV;
 		PassParameters->RW_OutTriangleUVs = Output.TriangleUVsUAV;
+		PassParameters->CSNumUVChannels = uint32(Output.NumUVChannels);
 		PassParameters->LocalToWorld = Request.LocalToWorld;
 		PassParameters->BoundsMin = Request.WorldBounds.IsValid ? Request.WorldBounds.Min : FVector3f(-TNumericLimits<float>::Max());
 		PassParameters->BoundsMax = Request.WorldBounds.IsValid ? Request.WorldBounds.Max : FVector3f(TNumericLimits<float>::Max());
@@ -2524,12 +2564,16 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 		FMemory::Memcpy(NaniteVertexUpload, NaniteTriangles->Positions.GetData(), NaniteVertCount * sizeof(FVector4f));
 		GraphBuilder.QueueBufferUpload(NaniteVertexBuffer, NaniteVertexUpload, NaniteVertCount * sizeof(FVector4f));
 
+		// UV 按通道交错：每角点 NumUVChannels 个 float2，buffer 与上传量都要乘上通道数。
+		const int32 SourceUVChannelCount = FMath::Clamp(
+			NaniteTriangles->NumUVChannels, 1, FCSGpuMeshCPUData::MaxTexCoordChannels);
+		const uint32 NaniteUVElemCount = NaniteVertCount * uint32(SourceUVChannelCount);
 		FRDGBufferRef NaniteUVBuffer = GraphBuilder.CreateBuffer(
-			FRDGBufferDesc::CreateBufferDesc(sizeof(FVector2f), NaniteVertCount),
+			FRDGBufferDesc::CreateBufferDesc(sizeof(FVector2f), NaniteUVElemCount),
 			TEXT("CS.StaticMeshTriangles.NaniteSrcUVs"));
-		FVector2f* NaniteUVUpload = GraphBuilder.AllocPODArray<FVector2f>(NaniteVertCount);
-		FMemory::Memcpy(NaniteUVUpload, NaniteTriangles->UVs.GetData(), NaniteVertCount * sizeof(FVector2f));
-		GraphBuilder.QueueBufferUpload(NaniteUVBuffer, NaniteUVUpload, NaniteVertCount * sizeof(FVector2f));
+		FVector2f* NaniteUVUpload = GraphBuilder.AllocPODArray<FVector2f>(NaniteUVElemCount);
+		FMemory::Memcpy(NaniteUVUpload, NaniteTriangles->UVs.GetData(), NaniteUVElemCount * sizeof(FVector2f));
+		GraphBuilder.QueueBufferUpload(NaniteUVBuffer, NaniteUVUpload, NaniteUVElemCount * sizeof(FVector2f));
 
 		FRDGBufferRef NaniteNormalBuffer = GraphBuilder.CreateBuffer(
 			FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), NaniteVertCount),
@@ -2572,6 +2616,7 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 		AppendParameters->RW_TriangleCounter = Output.TriangleCounterUAV;
 		AppendParameters->RW_OutTriangleMaterialIds = Output.TriangleMaterialIdsUAV;
 		AppendParameters->RW_OutTriangleUVs = Output.TriangleUVsUAV;
+		AppendParameters->CSNumUVChannels = uint32(Output.NumUVChannels);
 		AppendParameters->RW_OutTriangleColors = Output.TriangleColorsUAV;
 		AppendParameters->RW_OutTriangleTangents = Output.TriangleTangentsUAV;
 		AppendParameters->RW_OutTriangleBiTangents = Output.TriangleBiTangentsUAV;
@@ -4718,6 +4763,57 @@ bool AComputeShaderMeshGenerator::SubmitBoxSceneTrianglesToRenderPipeline(UMater
 	return true;
 }
 
+int64 AComputeShaderMeshGenerator::EnsureGeneratorTimeCode()
+{
+	if (GeneratorTimeCode == -1)
+	{
+		const FDateTime Now = FDateTime::Now();
+		GeneratorTimeCode =
+			int64(Now.GetYear() % 100) * 100000000LL +
+			int64(Now.GetMonth()) * 1000000LL +
+			int64(Now.GetDay()) * 10000LL +
+			int64(Now.GetHour()) * 100LL +
+			int64(Now.GetMinute());
+		// 编号必须随 actor 一起存盘，否则下次打开关卡又会生成一个新编号，重跑就不再覆盖旧资产。
+		Modify();
+	}
+	return GeneratorTimeCode;
+}
+
+FString AComputeShaderMeshGenerator::GetResultAssetBaseName() const
+{
+	const FString ActorName = GetName();
+	return ActorName.IsEmpty() ? TEXT("GpuMesh") : ActorName;
+}
+
+FString AComputeShaderMeshGenerator::GetResultAssetUniqueTag()
+{
+	return LexToString(EnsureGeneratorTimeCode());
+}
+
+FString AComputeShaderMeshGenerator::GetResultAssetFolderPath() const
+{
+	const ULevel* ActorLevel = GetLevel();
+	const UPackage* LevelPackage = ActorLevel ? ActorLevel->GetPackage() : nullptr;
+	const FString LevelPackageName = LevelPackage ? LevelPackage->GetName() : FString();
+	if (!FPackageName::IsValidLongPackageName(LevelPackageName)) return FString();
+
+	const FString LevelFolder = FPackageName::GetLongPackagePath(LevelPackageName); // 例如 /Game/Maps
+	if (LevelFolder.IsEmpty()) return FString();
+
+	const FString FolderName = GetResultAssetFolderName();
+	return FolderName.IsEmpty() ? LevelFolder : LevelFolder / FolderName;
+}
+
+FString AComputeShaderMeshGenerator::BuildResultAssetPath(const FString& NameSuffix)
+{
+	const FString ResultFolderPath = GetResultAssetFolderPath();
+	if (ResultFolderPath.IsEmpty()) return FString();
+
+	return FString::Printf(TEXT("%s/SM_%s_%s%s"),
+		*ResultFolderPath, *GetResultAssetBaseName(), *GetResultAssetUniqueTag(), *NameSuffix);
+}
+
 UStaticMesh* AComputeShaderMeshGenerator::SaveDirectGPUMeshToStaticMesh(
 	const FString& AssetPathAndName,
 	bool bReplaceExistingAsset,
@@ -4725,8 +4821,11 @@ UStaticMesh* AComputeShaderMeshGenerator::SaveDirectGPUMeshToStaticMesh(
 	bool bConvertToActorLocalSpace)
 {
 #if WITH_EDITOR
+	// 空路径走本 actor 的稳定结果命名（覆盖上一次的结果），而不是让落盘层各自兜底。
+	FString EffectiveAssetPath = AssetPathAndName.TrimStartAndEnd();
+	if (EffectiveAssetPath.IsEmpty()) EffectiveAssetPath = BuildResultAssetPath();
 	return CSGpuMeshSave::SaveGpuMeshComponentToStaticMesh(
-		DirectMeshComponent, AssetPathAndName,
+		DirectMeshComponent, EffectiveAssetPath,
 		DirectMeshComponent ? DirectMeshComponent->MeshMaterial.Get() : nullptr,
 		GetActorTransform(), bConvertToActorLocalSpace, bReplaceExistingAsset, bSaveAsset);
 #else
@@ -4813,6 +4912,26 @@ FRDGBufferRef AComputeShaderMeshGenerator::AddVertexWeldToRDG(
 		TriangleFilterMask);
 }
 
+bool AComputeShaderMeshGenerator::ConfirmGpuMemoryBudgetForBoxScene(
+	const TCHAR* OperationName,
+	const FBox& QueryBox,
+	const CSGpuMemoryBudget::FTriangleSoupCostModel& Cost,
+	bool bIncludeLandscape) const
+{
+	if (!bCheckGpuMemoryBudget) return true;
+
+	CSGpuMemoryBudget::FBudgetCheckSettings Settings;
+	Settings.SafetyRatio = GpuMemoryBudgetSafetyRatio;
+	Settings.bPromptOnExceed = bPromptWhenExceedingGpuMemoryBudget;
+	Settings.bProceedWhenUnattended = bProceedWhenGpuMemoryBudgetUnattended;
+
+	// The scene estimate walks the same components the extraction would, so it must run with the
+	// LOD the requests will actually use.
+	const CSGpuMemoryBudget::FBudgetCheckResult Result = CSGpuMemoryBudget::CheckBoxSceneTriangleBudget(
+		OperationName, GetWorld(), QueryBox, VoxelGridSettings.LODIndex, bIncludeLandscape, Cost, Settings);
+	return Result.ShouldProceed();
+}
+
 AComputeShaderMeshGenerator::AComputeShaderMeshGenerator()
 	: AComputeShaderMeshGenerator(FObjectInitializer::Get())
 {
@@ -4823,16 +4942,9 @@ AComputeShaderMeshGenerator::AComputeShaderMeshGenerator(const FObjectInitialize
 {
 	PrimaryActorTick.bCanEverTick = false;
 
-	if (GeneratorTimeCode == -1)
-	{
-		const FDateTime Now = FDateTime::Now();
-		GeneratorTimeCode =
-			int64(Now.GetYear() % 100) * 100000000LL +
-			int64(Now.GetMonth()) * 1000000LL +
-			int64(Now.GetDay()) * 10000LL +
-			int64(Now.GetHour()) * 100LL +
-			int64(Now.GetMinute());
-	}
+	// GeneratorTimeCode 留在 -1，由 EnsureGeneratorTimeCode() 在第一次保存结果时懒生成：
+	// 在构造期赋值会连 CDO 一起写上编号，与 CDO 同值的实例不会被 delta 序列化，重新加载后
+	// 编号变成加载时刻的值，资产名跟着变，重跑就不再覆盖旧模型。
 
 	USceneComponent* ExistingRoot = GetRootComponent();
 	SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
@@ -5208,18 +5320,10 @@ int32 AMeshGeneratorBrushCache::DrawDebugActiveVoxels(
 		return 0;
 	}
 
-	if (!MeshGeneratorDebugComponent)
-	{
-		return 0;
-	}
-
 	const float SafeDuration = FMath::Max(0.0f, Options.Duration);
+	const float SafeThickness = FMath::Max(0.0f, Options.Thickness);
 	const int32 DrawLimit = Options.MaxVoxelsToDraw > 0 ? Options.MaxVoxelsToDraw : TNumericLimits<int32>::Max();
-
-	// GPU-submitted box edges (Options.Thickness has no line-list equivalent and is ignored).
-	FCSGpuDebugBatch CellBatch;
-	CellBatch.Primitive = ECSGpuDebugPrimitive::Boxes;
-	CellBatch.Color = Options.DebugColor;
+	const FColor LineColor = Options.DebugColor.ToFColor(true);
 
 	int32 DrawnCount = 0;
 	for (const FCSMeshGeneratorVoxelKey& Cell : *CellsToDraw)
@@ -5235,28 +5339,31 @@ int32 AMeshGeneratorBrushCache::DrawDebugActiveVoxels(
 			continue;
 		}
 
-		CellBatch.Positions.Add(FVector3f(CellBounds.Min));
-		CellBatch.Positions.Add(FVector3f(CellBounds.Max));
+		DrawDebugBox(
+			World,
+			CellBounds.GetCenter(),
+			CellBounds.GetExtent(),
+			LineColor,
+			Options.bPersistentLines,
+			SafeDuration,
+			0,
+			SafeThickness);
 		++DrawnCount;
-	}
-
-	TArray<FCSGpuDebugBatch> Batches;
-	if (DrawnCount > 0)
-	{
-		Batches.Add(MoveTemp(CellBatch));
 	}
 
 	if (Options.bDrawCacheBounds)
 	{
-		FCSGpuDebugBatch BoundsBatch;
-		BoundsBatch.Primitive = ECSGpuDebugPrimitive::Boxes;
-		BoundsBatch.Color = FLinearColor::White;
-		BoundsBatch.Positions.Add(FVector3f(CacheState.CachedWorldBounds.Min));
-		BoundsBatch.Positions.Add(FVector3f(CacheState.CachedWorldBounds.Max));
-		Batches.Add(MoveTemp(BoundsBatch));
+		DrawDebugBox(
+			World,
+			CacheState.CachedWorldBounds.GetCenter(),
+			CacheState.CachedWorldBounds.GetExtent(),
+			FColor::White,
+			Options.bPersistentLines,
+			SafeDuration,
+			0,
+			FMath::Max(1.0f, SafeThickness));
 	}
 
-	MeshGeneratorDebugComponent->SetPrimitiveBatches(MoveTemp(Batches), SafeDuration, Options.bPersistentLines);
 	return DrawnCount;
 }
 
@@ -6038,6 +6145,8 @@ void AComputeShaderMeshGenerator::RasterizeIndexedMeshToHeightmapRDG(
 	EP->RW_TriangleCounter = Soup.TriangleCounterUAV;
 	EP->RW_OutTriangleMaterialIds = MaterialIdsUAV;
 	EP->RW_OutTriangleUVs = UVsUAV;
+	// 这条路径的 UV buffer 是单通道的，交错步长必须显式给 1，否则 shader 会按未初始化的步长写越界。
+	EP->CSNumUVChannels = 1u;
 	EP->LocalToWorld = LocalToWorld;
 	EP->BoundsMin = FVector3f(-TNumericLimits<float>::Max());
 	EP->BoundsMax = FVector3f(TNumericLimits<float>::Max());
@@ -6121,7 +6230,6 @@ bool AComputeShaderMeshGenerator::CaptureLandscapeHeightmap(UTextureRenderTarget
 		QueryParams.AddIgnoredActor(this);
 
 		int32 HitCount = 0;
-		TArray<FVector> HitPoints;
 		const double TraceStart = FPlatformTime::Seconds();
 		for (int32 Y = 0; Y < GridSize; ++Y)
 		{
@@ -6137,23 +6245,12 @@ bool AComputeShaderMeshGenerator::CaptureLandscapeHeightmap(UTextureRenderTarget
 					ECC_WorldStatic, QueryParams)
 					&& Hit.GetActor() && Hit.GetActor()->IsA<ALandscapeProxy>())
 				{
-					HitPoints.Add(Hit.ImpactPoint + FVector(0, 0, 10));
+					DrawDebugPoint(World, Hit.ImpactPoint + FVector(0,0,10), 8.0f, FColor::Green, false, 15.0f);
 					++HitCount;
 				}
 			}
 		}
 		const double TraceMs = (FPlatformTime::Seconds() - TraceStart) * 1000.0;
-		if (MeshGeneratorDebugComponent && !HitPoints.IsEmpty())
-		{
-			FCSGpuDebugBatch HitBatch;
-			HitBatch.Primitive = ECSGpuDebugPrimitive::Points;
-			HitBatch.Color = FLinearColor::Green;
-			HitBatch.Positions.Reserve(HitPoints.Num());
-			for (const FVector& HitPoint : HitPoints) HitBatch.Positions.Add(FVector3f(HitPoint));
-			TArray<FCSGpuDebugBatch> HitBatches;
-			HitBatches.Add(MoveTemp(HitBatch));
-			MeshGeneratorDebugComponent->SetPrimitiveBatches(MoveTemp(HitBatches), 15.0f, false);
-		}
 		UE_LOG(LogTemp, Log, TEXT("[CaptureLandscapeHeightmap] DD mode: %d/%d landscape hits, %.2f ms, Center=(%.0f,%.0f,%.0f) Extent=%.0f"),
 			HitCount, GridSize * GridSize, TraceMs, Center.X, Center.Y, Center.Z, CaptureExtent);
 		return HitCount > 0;

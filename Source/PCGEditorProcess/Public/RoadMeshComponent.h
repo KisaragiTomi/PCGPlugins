@@ -36,8 +36,8 @@ public:
 	/** Reads the rendered road mesh back to the CPU and saves it as a StaticMesh asset via the
 	 *  shared CSGpuMeshSave path. Road vertices are already in the component's local space, so
 	 *  bConvertToActorLocalSpace defaults to false (the asset reproduces the road when placed at
-	 *  this component's transform). Leave AssetPathAndName empty to default to a "result" folder next
-	 *  to the current level (/Game/.../result/SM_<owner>). The asset is marked dirty; bSaveAsset=false
+	 *  this component's transform). Leave AssetPathAndName empty to default to an "AutoResult" folder next
+	 *  to the current level (/Game/.../AutoResult/SM_<owner>). The asset is marked dirty; bSaveAsset=false
 	 *  (default) leaves it unsaved for a manual Save. Editor only. */
 	UStaticMesh* SaveToStaticMesh(const FString& AssetPathAndName = TEXT(""), bool bReplaceExistingAsset = true,
 		bool bSaveAsset = false, bool bConvertToActorLocalSpace = false);

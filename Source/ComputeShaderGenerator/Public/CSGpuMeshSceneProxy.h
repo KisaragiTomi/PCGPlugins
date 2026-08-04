@@ -86,8 +86,7 @@ public:
 		uint32 MaxVertexIndex,
 		bool bCastShadow = false,
 		FRHIBuffer* IndirectArgsBuffer = nullptr,
-		uint32 IndirectArgsOffset = 0,
-		uint32 FirstIndex = 0);
+		uint32 IndirectArgsOffset = 0);
 
 protected:
 	// The pooled-buffer render-resource wrappers live in CSGpuMeshTypes.h so debug geometry

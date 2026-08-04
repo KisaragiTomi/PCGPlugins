@@ -1,6 +1,5 @@
 #include "ComputeShaderMeshBoolean.h"
 
-#include "CSGpuMeshSave.h"
 #include "CSGpuMeshConvert.h"
 
 #include "GlobalShader.h"
@@ -12,20 +11,15 @@
 #include "RHIGPUReadback.h"
 #include "RHIGlobals.h"
 #include "Engine/World.h"
-#include "DrawDebugHelpers.h"
-#include "UObject/ConstructorHelpers.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 
-#include "Components/DynamicMeshComponent.h"
 #include "Materials/MaterialInterface.h"
 #include "Engine/StaticMesh.h"
 #include "VectorTypes.h"
 #include "IndexTypes.h"
 #include "Algo/Sort.h"
 #include "Async/ParallelFor.h"
-#include <atomic>
 #if WITH_DEV_AUTOMATION_TESTS
-#include "DynamicMesh/DynamicMesh3.h"
 #include "Misc/AutomationTest.h"
 #endif
 
@@ -41,34 +35,6 @@ namespace
 		int32 MissingSources = 0;
 	};
 
-#if WITH_DEV_AUTOMATION_TESTS
-	FMeshBooleanOrientationStats EnforceSourceTriangleOrientation(
-		FDynamicMesh3& Mesh,
-		TConstArrayView<int32> TriangleToSource,
-		TConstArrayView<FVector3d> SourceFacingNormals)
-	{
-		FMeshBooleanOrientationStats Stats;
-		for (int32 Tid : Mesh.TriangleIndicesItr())
-		{
-			const int32 SoupIdx = TriangleToSource.IsValidIndex(Tid) ? TriangleToSource[Tid] : INDEX_NONE;
-			if (!SourceFacingNormals.IsValidIndex(SoupIdx)
-				|| SourceFacingNormals[SoupIdx].SquaredLength() <= UE_DOUBLE_SMALL_NUMBER)
-			{
-				++Stats.MissingSources;
-				continue;
-			}
-
-			const double Alignment = Mesh.GetTriNormal(Tid).Dot(SourceFacingNormals[SoupIdx]);
-			const bool bNeedsCorrection = FMath::IsFinite(Alignment) && Alignment < 0.0;
-			if (bNeedsCorrection && Mesh.ReverseTriOrientation(Tid) == EMeshResult::Ok) ++Stats.Corrections;
-			else if (bNeedsCorrection) ++Stats.CorrectionFailures;
-
-			const double FinalAlignment = Mesh.GetTriNormal(Tid).Dot(SourceFacingNormals[SoupIdx]);
-			if (!FMath::IsFinite(FinalAlignment) || FinalAlignment < 0.0) ++Stats.ResidualMismatches;
-		}
-		return Stats;
-	}
-#endif
 }
 
 // =============================================================================
@@ -363,7 +329,6 @@ struct FMeshBooleanStageBRDGContext
 	float RayBias = 0.001f;
 	float SampleDensity = 0.0f;
 	uint32 bKeepBack = 0;
-	uint32 bDebugColor = 0;
 };
 
 // Forward declaration: Boolean-specific arrangement remains local. Shared LBVH, winding,
@@ -428,26 +393,11 @@ namespace
 
 	// CPU winding BVH 已移除：最终 BSP emit 直接遍历同一 RDG 内的 GPU LBVH + 多极 refit。
 
-	/**
-	 * 每次运行的结果落到带时间戳的独立资产，互不覆盖：Stage A 的中间结果与最终布尔结果
-	 * 可以并存对比，重复运行也能留下历史。秒级精度足够——单次布尔远超一秒。
-	 */
-	FString MeshBooleanResultAssetSuffix()
-	{
-		return FDateTime::Now().ToString(TEXT("_%Y%m%d_%H%M%S"));
-	}
 }
 
 // =============================================================================
 // AComputeShaderMeshBoolean
 // =============================================================================
-
-AComputeShaderMeshBoolean::AComputeShaderMeshBoolean()
-{
-	// 默认 debug 材质 = M_VertexColor（保留原行为）；蓝图里可改/置空。置空则 debug 用源材质。
-	static ConstructorHelpers::FObjectFinder<UMaterialInterface> DebugMatFinder(TEXT("/PCGPlugins/MeshBoolean/M_VertexColor.M_VertexColor"));
-	if (DebugMatFinder.Succeeded()) DebugMaterial = DebugMatFinder.Object;
-}
 
 UStaticMesh* AComputeShaderMeshBoolean::SplitInterpenetratingBoxScene(bool bRecomputeNormals)
 {
@@ -497,7 +447,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	// M4 GPU arrangement：snap-round 平移帧（origin=QueryBox.Min=LBVHAabbMinV；量化=max(SnapRoundQuantum, 最大边·2^-18)）。
 	const FVector3f SnapOriginV = LBVHAabbMinV;
 	const float SnapQV = FMath::Max(FMath::Max(SnapRoundQuantum, float(QBExt.GetMax()) * FMath::Pow(2.0f, -18.0f)), 1e-6f);
-	const bool bRunStageB = (Op != ECSMeshBooleanOp::ArrangementOnly) || bDebugColor;
+	const bool bRunStageB = (Op != ECSMeshBooleanOp::ArrangementOnly);
 	const float StageBWindingBetaSqV = FMath::Max(1.0f, WindingBeta * WindingBeta);
 	const float StageBWindingSampleOffsetV = FMath::Max(0.001f, WindingSampleOffset);
 	const float StageBWindingThresholdV = FMath::Max(0.0f, WindingIsoThreshold);
@@ -509,9 +459,26 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	const float StageBRayBiasV = FMath::Max(0.0f, VisibilityRayBiasEpsilon);
 	const float StageBSampleDensityV = FMath::Max(0.0f, VisibilitySampleDensity);
 	const uint32 StageBKeepBackV = bKeepBackFacingVisible ? 1u : 0u;
-	const uint32 StageBDebugColorV = bDebugColor ? 1u : 0u;
 	const float OutputWeldDistanceV = FMath::Max(0.0f, VertexWeldDistance);
 	const int32 OutputTrianglesPerSourceV = FMath::Max(2, ArrangementOutputTrianglesPerSource);
+
+	// Stage 1.5: VRAM pre-flight. Every buffer below scales linearly with the source triangle
+	// count, so the machine-dependent ceiling is knowable before any work starts - unlike the
+	// fixed 8M guard on the render thread, which fires only after the soup was already built and
+	// uploaded. The cost model mirrors what this run will actually allocate, so toggling Stage B,
+	// welding or recomputed normals moves the limit accordingly.
+	{
+		CSGpuMemoryBudget::FTriangleSoupCostModel Cost;
+		Cost.CutSegmentsPerTriangle = CutPerTri;
+		Cost.OutputTrianglesPerSource = OutputTrianglesPerSourceV;
+		Cost.bBuildLBVH = true;
+		Cost.bBuildWindingField = bRunStageB;
+		Cost.bWeldOutput = OutputWeldDistanceV > UE_SMALL_NUMBER;
+		// Same predicates the readback allocation uses further down.
+		Cost.bSourceNormals = !bRecomputeNormals;
+		Cost.bSourceTangents = !bRecomputeNormals;
+		if (!ConfirmGpuMemoryBudgetForBoxScene(TEXT("Mesh Boolean"), QueryBox, Cost, bReadLandscape)) return nullptr;
+	}
 
 	// ---- game thread：解析场景三角形（bReadLandscape 控制是否纳入地形）----
 	// Stage 2（Game Thread）：收集查询框内的场景三角形及其顶点属性，形成源 triangle soup。
@@ -527,8 +494,6 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 
 	const bool bNeedSourceNormals = !bRecomputeNormals;
 	const bool bNeedSourceTangents = !bRecomputeNormals;
-	const bool bNeedSourceColors = !bDebugColor;
-	const bool bNeedSourceMaterials = !(bDebugColor && DebugMaterial != nullptr);
 
 	// ---- readback 对象 ----
 	// Stage 3：按输出策略创建 GPU 回读对象；未使用的属性不分配回读资源。
@@ -536,10 +501,10 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	FRHIGPUBufferReadback* NormalReadback = bNeedSourceNormals ? new FRHIGPUBufferReadback(TEXT("MeshBoolean_NormalReadback")) : nullptr;
 	FRHIGPUBufferReadback* FinalStatusReadback = new FRHIGPUBufferReadback(TEXT("MeshBoolean_FinalStatusReadback"));
 	// Phase 2 材质追踪：与 soup 顶点平行的 per-triangle 材质 id（同一 atomic slot 写入）。
-	FRHIGPUBufferReadback* MaterialReadback = bNeedSourceMaterials ? new FRHIGPUBufferReadback(TEXT("MeshBoolean_MaterialReadback")) : nullptr;
+	FRHIGPUBufferReadback* MaterialReadback = new FRHIGPUBufferReadback(TEXT("MeshBoolean_MaterialReadback"));
 	// UV 追踪：与 soup 顶点平行的 per-vertex UV0（同一 atomic slot 写入，3 per triangle）。
 	FRHIGPUBufferReadback* UVReadback = new FRHIGPUBufferReadback(TEXT("MeshBoolean_UVReadback"));
-	FRHIGPUBufferReadback* ColorReadback = bNeedSourceColors ? new FRHIGPUBufferReadback(TEXT("MeshBoolean_ColorReadback")) : nullptr;
+	FRHIGPUBufferReadback* ColorReadback = new FRHIGPUBufferReadback(TEXT("MeshBoolean_ColorReadback"));
 	FRHIGPUBufferReadback* TangentReadback = bNeedSourceTangents ? new FRHIGPUBufferReadback(TEXT("MeshBoolean_TangentReadback")) : nullptr;
 	FRHIGPUBufferReadback* BiTangentReadback = bNeedSourceTangents ? new FRHIGPUBufferReadback(TEXT("MeshBoolean_BiTangentReadback")) : nullptr;
 	// GPU arrangement 子三角 soup 回读。
@@ -569,6 +534,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	int32 MaterialCapacity = 0;
 	uint32 MaterialBytes = 0;
 	int32 UVCapacity = 0;
+	int32 SoupUVChannels = 1;
 	uint32 UVBytes = 0;
 	uint32 CornerAttributeBytes = 0;
 	uint32 WeldRepresentativeBytes = 0;
@@ -579,15 +545,15 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 		 LBVHAabbMinV, LBVHInvExtV, SnapOriginV, SnapQV,
 		 bRunStageB, StageBWindingBetaSqV, StageBWindingSampleOffsetV, StageBWindingThresholdV,
 		 StageBExpansionDistanceV, StageBRayCountV, StageBCapMinCosV, StageBShellRadiusV,
-		 StageBRayBiasV, StageBSampleDensityV, StageBKeepBackV, StageBDebugColorV, OutputWeldDistanceV,
+		 StageBRayBiasV, StageBSampleDensityV, StageBKeepBackV, OutputWeldDistanceV,
 		 OutputTrianglesPerSourceV,
 		 VertexReadback, NormalReadback, FinalStatusReadback, MaterialReadback, UVReadback, ColorReadback, TangentReadback, BiTangentReadback,
 		 OutSoupReadback, OutSourceReadback, WeldRepresentativeReadback,
-		 bNeedSourceNormals, bNeedSourceTangents, bNeedSourceColors, bNeedSourceMaterials,
+		 bNeedSourceNormals, bNeedSourceTangents,
 		 FinalStatusBytes, &FinalStatusData,
 		 &bRenderWorkQueued, &bHasGPUOutput, &bArrangementCapacityUnsupported, &OutSubTriCap, &OutSoupBytes, &OutSrcBytes,
 		 &GPUArrOutCount, &GPUArrOutOverflow, &SoupTriangleCount, &WeldRepresentativeBytes,
-		 &VertexCapacity, &VertexBytes, &NormalBytes, &CutCapacity, &MaterialCapacity, &MaterialBytes, &UVCapacity, &UVBytes, &CornerAttributeBytes]
+		 &VertexCapacity, &VertexBytes, &NormalBytes, &CutCapacity, &MaterialCapacity, &MaterialBytes, &UVCapacity, &UVBytes, &SoupUVChannels, &CornerAttributeBytes]
 		(FRHICommandListImmediate& RHICmdList)
 		{
 			// Stage 4（Render Thread）：上传源 triangle soup，并检查输入及固定输出容量是否受 RHI 支持。
@@ -637,8 +603,9 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 			CutCapacity = int32(MaxCutSegments);
 			MaterialCapacity = int32(Soup.MaxTriangles);
 			MaterialBytes = uint32(uint64(Soup.MaxTriangles) * sizeof(uint32));
-			UVCapacity = int32(Soup.MaxVertices);
-			UVBytes = uint32(uint64(Soup.MaxVertices) * sizeof(FVector2f));
+			SoupUVChannels = FMath::Max(1, Soup.NumUVChannels);
+			UVCapacity = int32(Soup.MaxVertices) * SoupUVChannels;
+			UVBytes = uint32(uint64(Soup.MaxVertices) * uint64(SoupUVChannels) * sizeof(FVector2f));
 			CornerAttributeBytes = uint32(uint64(Soup.MaxVertices) * sizeof(FVector4f));
 
 			TRefCountPtr<FRDGPooledBuffer> SourceVerticesExtracted;
@@ -650,9 +617,9 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 			TRefCountPtr<FRDGPooledBuffer> SourceBiTangentsExtracted;
 			GraphBuilder.QueueBufferExtraction(Soup.TriangleVertices, &SourceVerticesExtracted, ERHIAccess::CopySrc);
 			if (bNeedSourceNormals && Soup.TriangleNormals) GraphBuilder.QueueBufferExtraction(Soup.TriangleNormals, &SourceNormalsExtracted, ERHIAccess::CopySrc);
-			if (bNeedSourceMaterials && Soup.TriangleMaterialIds) GraphBuilder.QueueBufferExtraction(Soup.TriangleMaterialIds, &SourceMaterialsExtracted, ERHIAccess::CopySrc);
+			if (Soup.TriangleMaterialIds) GraphBuilder.QueueBufferExtraction(Soup.TriangleMaterialIds, &SourceMaterialsExtracted, ERHIAccess::CopySrc);
 			if (Soup.TriangleUVs) GraphBuilder.QueueBufferExtraction(Soup.TriangleUVs, &SourceUVsExtracted, ERHIAccess::CopySrc);
-			if (bNeedSourceColors && Soup.TriangleColors) GraphBuilder.QueueBufferExtraction(Soup.TriangleColors, &SourceColorsExtracted, ERHIAccess::CopySrc);
+			if (Soup.TriangleColors) GraphBuilder.QueueBufferExtraction(Soup.TriangleColors, &SourceColorsExtracted, ERHIAccess::CopySrc);
 			if (bNeedSourceTangents && Soup.TriangleTangents) GraphBuilder.QueueBufferExtraction(Soup.TriangleTangents, &SourceTangentsExtracted, ERHIAccess::CopySrc);
 			if (bNeedSourceTangents && Soup.TriangleBiTangents) GraphBuilder.QueueBufferExtraction(Soup.TriangleBiTangents, &SourceBiTangentsExtracted, ERHIAccess::CopySrc);
 
@@ -709,7 +676,6 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 				StageBContext.RayBias = StageBRayBiasV;
 				StageBContext.SampleDensity = StageBSampleDensityV;
 				StageBContext.bKeepBack = StageBKeepBackV;
-				StageBContext.bDebugColor = StageBDebugColorV;
 			}
 
 			// ---- 三角形对求交（LBVH broad-phase），包裹 dispatch 支持 >4.19M 三角 ----
@@ -766,8 +732,8 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 					// duplicate removal, and winding restoration are Boolean output policy.
 					// Stage B 只给 fragment 打标记而不从 soup 里移除，故必须让 weld 跳过被剔除的
 					// 角点：桶里只保留最小角点序号，混入的死角点会遮蔽真正该配对的活角点。
-					// 过滤条件与 CPU 消费端一致：debug 上色保留全部 fragment，此时不过滤。
-					const bool bFilterWeldByKeep = bRunStageB && StageBDebugColorV == 0u;
+					// 过滤条件与 CPU 消费端一致：ArrangementOnly 不跑分类，此时不过滤。
+					const bool bFilterWeldByKeep = bRunStageB;
 					FRDGBufferSRVRef WeldFilterSRV = bFilterWeldByKeep
 						? GraphBuilder.CreateSRV(FRDGBufferSRVDesc(ArrOutSrc, PF_R32_UINT))
 						: nullptr;
@@ -831,17 +797,17 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 				VertexCapacity = int32(SourceVertexCount);
 				VertexBytes = SourceVertexCount * sizeof(FVector4f);
 				NormalBytes = bNeedSourceNormals ? VertexBytes : 0u;
-				MaterialCapacity = bNeedSourceMaterials ? int32(SoupTriangleCount) : 0;
-				MaterialBytes = bNeedSourceMaterials ? SoupTriangleCount * sizeof(uint32) : 0u;
-				UVCapacity = int32(SourceVertexCount);
-				UVBytes = SourceVertexCount * sizeof(FVector2f);
+				MaterialCapacity = int32(SoupTriangleCount);
+				MaterialBytes = SoupTriangleCount * sizeof(uint32);
+				UVCapacity = int32(SourceVertexCount) * SoupUVChannels;
+				UVBytes = SourceVertexCount * uint32(SoupUVChannels) * sizeof(FVector2f);
 				CornerAttributeBytes = SourceVertexCount * sizeof(FVector4f);
 				if (bHasGPUOutput && VertexBytes > 0u && SourceVerticesExtracted) VertexReadback->EnqueueCopy(RHICmdList, SourceVerticesExtracted->GetRHI(), VertexBytes);
 				else bHasGPUOutput = false;
 				if (bHasGPUOutput && NormalBytes > 0u && SourceNormalsExtracted) NormalReadback->EnqueueCopy(RHICmdList, SourceNormalsExtracted->GetRHI(), NormalBytes);
 				if (bHasGPUOutput && MaterialBytes > 0u && SourceMaterialsExtracted) MaterialReadback->EnqueueCopy(RHICmdList, SourceMaterialsExtracted->GetRHI(), MaterialBytes);
 				if (bHasGPUOutput && UVBytes > 0u && SourceUVsExtracted) UVReadback->EnqueueCopy(RHICmdList, SourceUVsExtracted->GetRHI(), UVBytes);
-				if (bHasGPUOutput && bNeedSourceColors && CornerAttributeBytes > 0u && SourceColorsExtracted) ColorReadback->EnqueueCopy(RHICmdList, SourceColorsExtracted->GetRHI(), CornerAttributeBytes);
+				if (bHasGPUOutput && CornerAttributeBytes > 0u && SourceColorsExtracted) ColorReadback->EnqueueCopy(RHICmdList, SourceColorsExtracted->GetRHI(), CornerAttributeBytes);
 				if (bHasGPUOutput && bNeedSourceTangents && CornerAttributeBytes > 0u && SourceTangentsExtracted) TangentReadback->EnqueueCopy(RHICmdList, SourceTangentsExtracted->GetRHI(), CornerAttributeBytes);
 				if (bHasGPUOutput && bNeedSourceTangents && CornerAttributeBytes > 0u && SourceBiTangentsExtracted) BiTangentReadback->EnqueueCopy(RHICmdList, SourceBiTangentsExtracted->GetRHI(), CornerAttributeBytes);
 
@@ -916,7 +882,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	TArray<FVector2f> UVData;
 	UVData.SetNumZeroed(FMath::Max(1, UVCapacity));
 	TArray<FVector4f> ColorData, TangentData, BiTangentData;
-	if (bNeedSourceColors) ColorData.SetNumZeroed(FMath::Max(1, UVCapacity));
+	ColorData.SetNumZeroed(FMath::Max(1, UVCapacity));
 	if (bNeedSourceTangents)
 	{
 		TangentData.SetNumZeroed(FMath::Max(1, UVCapacity));
@@ -929,7 +895,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 		 OutSoupReadback, OutSourceReadback, WeldRepresentativeReadback,
 		 VertexBytes, NormalBytes, MaterialBytes, UVBytes, CornerAttributeBytes, OutSoupBytes, OutSrcBytes,
 		 WeldRepresentativeBytes,
-		 bNeedSourceColors, bNeedSourceTangents,
+		 bNeedSourceTangents,
 		 OutSubTriCap, GPUArrOutCount, GPUArrOutOverflow,
 		 &VertexData, &NormalData, &MaterialIds, &UVData, &ColorData, &TangentData, &BiTangentData,
 		 &GOutSoup, &GOutSrc, &GOutWeldRepresentatives, &GOutCnt, &bReadbackOk]
@@ -941,7 +907,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 				|| (NormalBytes > 0u && !NormalReadback->IsReady())
 				|| (MaterialBytes > 0u && !MaterialReadback->IsReady())
 				|| (UVBytes > 0u && !UVReadback->IsReady())
-				|| (bNeedSourceColors && CornerAttributeBytes > 0u && !ColorReadback->IsReady())
+				|| (CornerAttributeBytes > 0u && !ColorReadback->IsReady())
 				|| (bNeedSourceTangents && CornerAttributeBytes > 0u
 					&& (!TangentReadback->IsReady() || !BiTangentReadback->IsReady()))
 				|| (OutSoupBytes > 0u && !OutSoupReadback->IsReady())
@@ -1009,7 +975,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 				if (const FVector2f* Ptr = static_cast<const FVector2f*>(UVReadback->Lock(UVBytes)))
 				{ FMemory::Memcpy(UVData.GetData(), Ptr, UVBytes); UVReadback->Unlock(); }
 			}
-			if (bNeedSourceColors && CornerAttributeBytes > 0)
+			if (CornerAttributeBytes > 0)
 			{
 				if (const FVector4f* Ptr = static_cast<const FVector4f*>(ColorReadback->Lock(CornerAttributeBytes)))
 				{ FMemory::Memcpy(ColorData.GetData(), Ptr, CornerAttributeBytes); ColorReadback->Unlock(); }
@@ -1090,10 +1056,11 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 		const FVector4f& P = VertexData[Tri * 3 + K];
 		return FVector3d(P.X, P.Y, P.Z);
 	};
-	// 源顶点 UV0（3 per triangle，与 SoupVert 平行）。无 UV 的源读到清零的 (0,0)。
-	auto SoupUV = [&](int32 Tri, int32 K) -> FVector2f
+	// 源顶点 UV（3 per triangle，与 SoupVert 平行），按通道交错：[(Tri*3+K) * 通道数 + 通道]。
+	// 源没有该通道时读到清零的 (0,0)。
+	auto SoupUV = [&](int32 Tri, int32 K, int32 Channel) -> FVector2f
 	{
-		const int32 Idx = Tri * 3 + K;
+		const int32 Idx = (Tri * 3 + K) * SoupUVChannels + Channel;
 		return UVData.IsValidIndex(Idx) ? UVData[Idx] : FVector2f(0.0f, 0.0f);
 	};
 	auto SoupNormal = [&](int32 Tri, int32 K) -> FVector3f
@@ -1127,9 +1094,9 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 		else { Wa = 1.0; Wb = 0.0; Wc = 0.0; }
 		return FVector3d(Wa, Wb, Wc);
 	};
-	auto BaryUV = [&](int32 Tri, const FVector3d& W) -> FVector2f
+	auto BaryUV = [&](int32 Tri, const FVector3d& W, int32 Channel) -> FVector2f
 	{
-		const FVector2f Ua = SoupUV(Tri, 0), Ub = SoupUV(Tri, 1), Uc = SoupUV(Tri, 2);
+		const FVector2f Ua = SoupUV(Tri, 0, Channel), Ub = SoupUV(Tri, 1, Channel), Uc = SoupUV(Tri, 2, Channel);
 		return FVector2f(
 			float(W.X) * Ua.X + float(W.Y) * Ub.X + float(W.Z) * Uc.X,
 			float(W.X) * Ua.Y + float(W.Y) * Ub.Y + float(W.Z) * Uc.Y);
@@ -1159,14 +1126,12 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 
 	TArray<FVector3f> OutputCorners;
 	TArray<int32> OutputSources;
-	TArray<FVector4f> OutputDebugColors;
 	TArray<uint32> OutputWeldRepresentatives;
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_GPUOutputArrayBuild);
 		const int32 OutCount = FMath::Clamp<int32>(int32(GOutCnt[0]), 0, OutSubTriCap);
 		OutputCorners.Reserve(OutCount * 3);
 		OutputSources.Reserve(OutCount);
-		if (bDebugColor) OutputDebugColors.Reserve(OutCount * 3);
 		if (OutputWeldDistanceV > UE_SMALL_NUMBER) OutputWeldRepresentatives.Reserve(OutCount * 3);
 		for (int32 i = 0; i < OutCount; ++i)
 		{
@@ -1175,7 +1140,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 			if (Source < 0 || Source >= TriCount) continue;
 			// Stage B 现在只在 OutSource 上打标记而不再于 emit 时丢弃，故过滤移到这里。
 			// ArrangementOnly 不跑分类 pass，全部 fragment 保留。
-			if (bRunStageB && !bDebugColor && (EncodedSource & MeshBooleanSourceKeep) == 0u) continue;
+			if (bRunStageB && (EncodedSource & MeshBooleanSourceKeep) == 0u) continue;
 			FVector3f P0 = GOutSoup[i * 3 + 0];
 			FVector3f P1 = GOutSoup[i * 3 + 1];
 			FVector3f P2 = GOutSoup[i * 3 + 2];
@@ -1211,18 +1176,6 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 				OutputWeldRepresentatives.Add(Representatives[0]);
 				OutputWeldRepresentatives.Add(Representatives[1]);
 				OutputWeldRepresentatives.Add(Representatives[2]);
-			}
-			if (bDebugColor)
-			{
-				// 红 = 被布尔剔除（埋在实体内部，或分类+射线救回都没通过），白 = 保留。
-				const bool bDiscarded = (EncodedSource & MeshBooleanSourceKeep) == 0u
-					|| (EncodedSource & MeshBooleanSourceInterior) != 0u;
-				const FVector4f DebugColor = bDiscarded
-					? FVector4f(1.0f, 0.0f, 0.0f, 1.0f)
-					: FVector4f(1.0f, 1.0f, 1.0f, 1.0f);
-				OutputDebugColors.Add(DebugColor);
-				OutputDebugColors.Add(DebugColor);
-				OutputDebugColors.Add(DebugColor);
 			}
 		}
 		UE_LOG(LogTemp, Log, TEXT("[MeshBoolean:%s] [GPU-arr] outSubTris=%d tris=%d cuts=%d degen=%u limited=%u cutLimit=%u vertLimit=%u cellLimit=%u outputLimit=%u scratchOverflow=%u partialSplitCommit=%u areaMismatch=%u maxSeg=%u maxVerts=%u maxCells=%u maxOutputPerSource=%u outOverflow=%u"),
@@ -1278,8 +1231,8 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 		*GetName(), OutputSources.Num(), OverlapSame, OverlapCross);
 
 
-	UE_LOG(LogTemp, Log, TEXT("[MeshBoolean:%s] StageB standalone classify/rescue passes: enabled=%d debug=%d threshold=%.3f expansion=%.3f emittedFragments=%u keptTriangles=%d"),
-		*GetName(), bRunStageB ? 1 : 0, bDebugColor ? 1 : 0, StageBWindingThresholdV,
+	UE_LOG(LogTemp, Log, TEXT("[MeshBoolean:%s] StageB standalone classify/rescue passes: enabled=%d threshold=%.3f expansion=%.3f emittedFragments=%u keptTriangles=%d"),
+		*GetName(), bRunStageB ? 1 : 0, StageBWindingThresholdV,
 		StageBExpansionDistanceV, GOutCnt[0], OutputSources.Num());
 
 	const float EffectiveWeldDistance = FMath::Max(0.0f, VertexWeldDistance);
@@ -1287,14 +1240,8 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	TArray<FVector3f> FinalPositions = OutputCorners;
 	TArray<uint32> FinalIndices;
 	TArray<int32> FinalSources = OutputSources;
-	TArray<FVector4f> FinalDebugColors;
 	FinalIndices.SetNumUninitialized(FinalPositions.Num());
 	for (int32 Corner = 0; Corner < FinalIndices.Num(); ++Corner) FinalIndices[Corner] = uint32(Corner);
-	if (bDebugColor)
-	{
-		FinalDebugColors.Init(DefaultColor, FinalIndices.Num());
-		if (OutputDebugColors.Num() == FinalDebugColors.Num()) FinalDebugColors = OutputDebugColors;
-	}
 
 	if (EffectiveWeldDistance > UE_SMALL_NUMBER && !OutputSources.IsEmpty())
 	{
@@ -1306,10 +1253,8 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 			FinalPositions.Reset();
 			FinalIndices.Reset();
 			FinalSources.Reset();
-			FinalDebugColors.Reset();
 			FinalIndices.Reserve(OutputCorners.Num());
 			FinalSources.Reserve(OutputSources.Num());
-			if (bDebugColor) FinalDebugColors.Reserve(OutputCorners.Num());
 
 			TMap<uint32, int32> RepresentativeToVertex;
 			TSet<FIntVector> SeenTriangles;
@@ -1375,14 +1320,6 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 
 				for (int32 Corner = 0; Corner < 3; ++Corner) FinalIndices.Add(FindOrAppendVertex(Representatives[Corner], WeldedPositions[Corner]));
 				FinalSources.Add(OutputSources[TriangleIndex]);
-				if (bDebugColor)
-				{
-					for (int32 Corner = 0; Corner < 3; ++Corner)
-					{
-						const int32 SourceCorner = CornerBase + Corner;
-						FinalDebugColors.Add(OutputDebugColors.IsValidIndex(SourceCorner) ? OutputDebugColors[SourceCorner] : DefaultColor);
-					}
-				}
 			}
 
 			const double ReductionPercent = OutputCorners.IsEmpty()
@@ -1426,7 +1363,6 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 			if (FMath::IsFinite(Alignment) && Alignment > 0.0)
 			{
 				Swap(FinalIndices[CornerBase + 1], FinalIndices[CornerBase + 2]);
-				if (bDebugColor) Swap(FinalDebugColors[CornerBase + 1], FinalDebugColors[CornerBase + 2]);
 				++WorldOrientationStats.Corrections;
 			}
 			const FVector3d Q1(FinalPositions[FinalIndices[CornerBase + 1]]);
@@ -1445,7 +1381,11 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	StaticMeshData.Indices = MoveTemp(FinalIndices);
 	StaticMeshData.Normals.SetNumUninitialized(StaticMeshData.Indices.Num());
 	StaticMeshData.Tangents.SetNumUninitialized(StaticMeshData.Indices.Num());
-	StaticMeshData.TexCoords().SetNumUninitialized(StaticMeshData.Indices.Num());
+	// 源模型有几条 UV 就输出几条：通道数直接继承 soup，源只有 1 条时退化成单通道。
+	const int32 OutputUVChannels = FMath::Clamp(SoupUVChannels, 1, FCSGpuMeshCPUData::MaxTexCoordChannels);
+	StaticMeshData.NumTexCoordChannels = OutputUVChannels;
+	for (int32 Channel = 0; Channel < OutputUVChannels; ++Channel)
+		StaticMeshData.TexCoordChannels[Channel].SetNumUninitialized(StaticMeshData.Indices.Num());
 	StaticMeshData.Colors.SetNumUninitialized(StaticMeshData.Indices.Num());
 	StaticMeshData.BinormalSigns.SetNumUninitialized(StaticMeshData.Indices.Num());
 	// 布尔输出是世界空间、逐角点属性（焊接后的顶点仍要保留各自的 UV/法线/颜色接缝）。
@@ -1453,8 +1393,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	StaticMeshData.SourceSpace = FCSGpuMeshCPUData::ESpace::World;
 	StaticMeshData.AttrLayout = FCSGpuMeshCPUData::EAttrLayout::PerCorner;
 
-	// 每个三角只写自己那 3 个 corner 槽位，彼此不重叠，可直接并行；修正计数改用原子。
-	std::atomic<int32> CorrectedOutputCornerNormalsAtomic{ 0 };
+	// 每个三角只写自己那 3 个 corner 槽位，彼此不重叠，可直接并行。
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_StaticMeshAttributeBuild);
 		ParallelFor(FinalSources.Num(), [&](int32 TriangleIndex)
@@ -1471,18 +1410,41 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 			// geometric normal for StaticMesh attributes requires the reversed cross product.
 			// 与引擎 StaticMeshOperations.cpp 的 CrossProduct(DPosition2, DPosition1) 同一口径；
 			// 上面输出重建的绕序判定也按这个口径取反，两处必须同时改，否则网格整体翻面。
-			const FVector3f GeometricNormal = FVector3f::CrossProduct(P[2] - P[0], P[1] - P[0])
-				.GetSafeNormal(UE_SMALL_NUMBER, FVector3f::UnitZ());
 			const bool bHasSource = Source >= 0 && Source < TriCount;
+			// 半球判据必须稳：布尔切出的窄条/尖角碎片上，这个 float32 世界坐标叉积会因灾难性
+			// 抵消而方向失真，模平方过小时更会 fallback 成 UnitZ()。此时逐角点的
+			// dot(Normal, ref) < 0 就成了近似随机的判据，三个角点里只有个别被误判取反 ——
+			// 表现为少数三角的某一个顶点法线朝里、该角出现异常暗部。
+			// SrcN 是源三角的 double 精度法线，每个源三角只算一次且不受碎片退化影响；
+			// 绕序修复后 GeometricNormal 与 SrcN 同向，换成它不改变语义，只是更稳。
+			const FVector3f FragmentNormal = FVector3f::CrossProduct(P[2] - P[0], P[1] - P[0])
+				.GetSafeNormal(UE_SMALL_NUMBER, FVector3f::UnitZ());
+			const bool bStableSourceNormal = bHasSource
+				&& SrcN.IsValidIndex(Source)
+				&& SrcN[Source].SquaredLength() > UE_DOUBLE_SMALL_NUMBER;
+			const FVector3f GeometricNormal = bStableSourceNormal
+				? FVector3f(SrcN[Source]).GetSafeNormal(UE_SMALL_NUMBER, FragmentNormal)
+				: FragmentNormal;
 			// 每个 corner 的重心权重解一次，下面 UV/法线/切线/副切线/颜色全部复用。
 			FVector3d BaryWeights[3];
 			for (int32 Corner = 0; Corner < 3; ++Corner)
 				BaryWeights[Corner] = bHasSource ? SolveBary(Source, FVector3d(P[Corner])) : FVector3d(1.0, 0.0, 0.0);
+			// 通道 0 另外留一份给切线重算用；其余通道只写进各自的输出数组。
 			FVector2f UVs[3];
 			for (int32 Corner = 0; Corner < 3; ++Corner)
 			{
-				UVs[Corner] = bHasSource ? BaryUV(Source, BaryWeights[Corner]) : FVector2f::ZeroVector;
+				UVs[Corner] = bHasSource ? BaryUV(Source, BaryWeights[Corner], 0) : FVector2f::ZeroVector;
 				StaticMeshData.TexCoords()[CornerBase + Corner] = UVs[Corner];
+			}
+			for (int32 Channel = 1; Channel < OutputUVChannels; ++Channel)
+			{
+				TArray<FVector2f>& ChannelUVs = StaticMeshData.TexCoordChannels[Channel];
+				for (int32 Corner = 0; Corner < 3; ++Corner)
+				{
+					ChannelUVs[CornerBase + Corner] = bHasSource
+						? BaryUV(Source, BaryWeights[Corner], Channel)
+						: FVector2f::ZeroVector;
+				}
 			}
 
 			FVector3f RecomputedTangent = P[1] - P[0];
@@ -1502,12 +1464,11 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 				const FVector3d& W = BaryWeights[Corner];
 				const bool bUseGeometric = bRecomputeNormals || !bHasSource;
 				FVector3f Normal = bUseGeometric ? GeometricNormal : BaryNormal(Source, W);
+				// 源法线原样保留，不做半球校正。那段校正是为了掩盖输出绕序的 bug 而加的：
+				// 绕序修好前它每次触发约 450 万次，修好后只剩 7 千次，剩下的多半是作者有意的
+				// 背面法线（双面卡片、硬边烘焙、外扩 shell）或近切向法线 —— 翻转它们是破坏而非修复，
+				// 而且是逐角点翻转，会在三角内部造成着色断裂。零长度法线仍由下面的兜底处理。
 				Normal = Normal.GetSafeNormal(UE_SMALL_NUMBER, GeometricNormal);
-				if (FVector3f::DotProduct(Normal, GeometricNormal) < 0.0f)
-				{
-					Normal = -Normal;
-					CorrectedOutputCornerNormalsAtomic.fetch_add(1, std::memory_order_relaxed);
-				}
 				FVector3f Tangent;
 				FVector3f BiTangent;
 				if (bUseGeometric)
@@ -1535,25 +1496,12 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 				StaticMeshData.Tangents[CornerBase + Corner] = Tangent;
 				StaticMeshData.BinormalSigns[CornerBase + Corner] =
 					FVector3f::DotProduct(FVector3f::CrossProduct(Normal, Tangent), BiTangent) < 0.0f ? -1.0f : 1.0f;
-				StaticMeshData.Colors[CornerBase + Corner] = bDebugColor
-					? FinalDebugColors[CornerBase + Corner]
-					: (bHasSource ? BaryFloat4(ColorData, Source, W, DefaultColor) : DefaultColor);
+				StaticMeshData.Colors[CornerBase + Corner] =
+					bHasSource ? BaryFloat4(ColorData, Source, W, DefaultColor) : DefaultColor;
 			}
 		});
 	}
-	const int32 CorrectedOutputCornerNormals = CorrectedOutputCornerNormalsAtomic.load(std::memory_order_relaxed);
-	if (CorrectedOutputCornerNormals > 0)
-		UE_LOG(LogTemp, Log, TEXT("[MeshBoolean:%s] corrected %d output corner normals to the geometric face hemisphere"),
-			*GetName(), CorrectedOutputCornerNormals);
-
 	TArray<UMaterialInterface*> OutputMaterialSlots;
-	const bool bUseDebugMat = bDebugColor && DebugMaterial != nullptr;
-	if (bUseDebugMat)
-	{
-		OutputMaterialSlots.Add(DebugMaterial);
-		StaticMeshData.TriangleMaterialSlots.Init(0, FinalSources.Num());
-	}
-	else
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_MaterialAttributeBuild);
 		TMap<int32, int32> RegistryToSlot;
@@ -1601,13 +1549,14 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 		else LogMaterialWarnings();
 	}
 
-	const FTransform OutputTransform = GetDynamicMeshComponent()
-		? GetDynamicMeshComponent()->GetComponentTransform()
-		: GetActorTransform();
+	// 输出是 StaticMesh 资产，与 DynamicMesh 组件无关，直接用 actor 变换把世界空间结果烘到局部空间。
+	const FTransform OutputTransform = GetActorTransform();
 	// 统一走公用转换入口：属性装配与落盘的策略（绕序、退化面阈值、空槽兜底默认材质）都在
 	// CSGpuMeshConvert 里，不再由各产出路径各写一份。
-	// 结果落盘为 level 同级 result 文件夹（/<level 目录>/result/SM_<actor>_<时间戳>），建完标脏，
-	// 由用户自行 Save All 决定是否写盘。非编辑器构建没有资产系统，公用入口内部退回 transient。
+	// 结果落盘为 level 同级 AutoResult 文件夹（/<level 目录>/AutoResult/SM_<actor>_<稳定编号>），建完标脏，
+	// 由用户自行 Save All 决定是否写盘。名字里不带每次运行的时间戳（命名规则与 CSSW 烘焙一致），
+	// 同一个 actor 反复运行始终写同一个资产，直接覆盖旧模型，引用它的组件仍指向同一份资产。
+	// 非编辑器构建没有资产系统，公用入口内部退回 transient。
 	CSGpuMeshConvert::FConvertOptions ConvertOptions;
 	ConvertOptions.TargetTransform = OutputTransform;
 	ConvertOptions.bBakeToLocalSpace = true;
@@ -1615,7 +1564,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 
 	CSGpuMeshConvert::FAssetOptions AssetOptions;
 #if WITH_EDITOR
-	AssetOptions.AssetPath = CSGpuMeshSave::BuildResultAssetPath(this, MeshBooleanResultAssetSuffix());
+	AssetOptions.AssetPath = BuildResultAssetPath();
 #else
 	AssetOptions.bTransient = true;
 #endif
@@ -1637,65 +1586,6 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	return OutputStaticMesh;
 }
 
-#if WITH_DEV_AUTOMATION_TESTS
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FMeshBooleanSourceOrientationAutomationTest,
-	"PCGPlugins.ComputeShaderGenerator.MeshBoolean.SourceTriangleOrientation",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
-
-bool FMeshBooleanSourceOrientationAutomationTest::RunTest(const FString& Parameters)
-{
-	FDynamicMesh3 SplitMesh;
-	const int32 A0 = SplitMesh.AppendVertex(FVector3d(0.0, 0.0, 0.0));
-	const int32 A1 = SplitMesh.AppendVertex(FVector3d(1.0, 0.0, 0.0));
-	const int32 A2 = SplitMesh.AppendVertex(FVector3d(0.0, 1.0, 0.0));
-	const int32 B0 = SplitMesh.AppendVertex(FVector3d(2.0, 0.0, 0.0));
-	const int32 B1 = SplitMesh.AppendVertex(FVector3d(3.0, 0.0, 0.0));
-	const int32 B2 = SplitMesh.AppendVertex(FVector3d(2.0, 1.0, 0.0));
-	const int32 CorrectTid = SplitMesh.AppendTriangle(A0, A2, A1);
-	const int32 ReversedTid = SplitMesh.AppendTriangle(B0, B1, B2);
-	if (!TestTrue(TEXT("Test triangles were created"), CorrectTid >= 0 && ReversedTid >= 0)) return false;
-
-	TArray<int32> TriangleToSource;
-	TriangleToSource.Init(0, SplitMesh.MaxTriangleID());
-	const TArray<FVector3d> SourceNormals = { FVector3d::UnitZ() };
-	const FMeshBooleanOrientationStats SplitStats = EnforceSourceTriangleOrientation(
-		SplitMesh, TriangleToSource, SourceNormals);
-	TestEqual(TEXT("Only the reversed split triangle is corrected"), SplitStats.Corrections, 1);
-	TestEqual(TEXT("Split triangle orientation has no residual mismatch"), SplitStats.ResidualMismatches, 0);
-	TestTrue(TEXT("First split triangle keeps source facing"), SplitMesh.GetTriNormal(CorrectTid).Dot(FVector3d::UnitZ()) > 0.0);
-	TestTrue(TEXT("Second split triangle is restored to source facing"), SplitMesh.GetTriNormal(ReversedTid).Dot(FVector3d::UnitZ()) > 0.0);
-
-	const FTransform NegativeScaleTransform(FQuat::Identity, FVector::ZeroVector, FVector(-2.0, 3.0, 1.0));
-	const FVector3d WorldS0(0.0, 0.0, 0.0);
-	const FVector3d WorldS1(1.0, 0.0, 0.0);
-	const FVector3d WorldS2(0.0, 1.0, 0.0);
-	const FVector3d LocalS0 = NegativeScaleTransform.InverseTransformPosition(WorldS0);
-	const FVector3d LocalS1 = NegativeScaleTransform.InverseTransformPosition(WorldS1);
-	const FVector3d LocalS2 = NegativeScaleTransform.InverseTransformPosition(WorldS2);
-	const TArray<FVector3d> LocalSourceNormals = {
-		(LocalS1 - LocalS0).Cross(LocalS2 - LocalS0).GetSafeNormal()
-	};
-
-	FDynamicMesh3 NegativeScaleMesh;
-	const int32 L0 = NegativeScaleMesh.AppendVertex(LocalS0);
-	const int32 L1 = NegativeScaleMesh.AppendVertex(LocalS1);
-	const int32 L2 = NegativeScaleMesh.AppendVertex(LocalS2);
-	const int32 LocalTid = NegativeScaleMesh.AppendTriangle(L0, L2, L1);
-	if (!TestTrue(TEXT("Negative-scale test triangle was created"), LocalTid >= 0)) return false;
-	NegativeScaleMesh.ReverseTriOrientation(LocalTid);
-	const TArray<int32> LocalTriangleToSource = { 0 };
-	const FMeshBooleanOrientationStats LocalStats = EnforceSourceTriangleOrientation(
-		NegativeScaleMesh, LocalTriangleToSource, LocalSourceNormals);
-	TestEqual(TEXT("Negative-scale local winding is corrected"), LocalStats.Corrections, 1);
-	TestEqual(TEXT("Negative-scale local winding has no residual mismatch"), LocalStats.ResidualMismatches, 0);
-	TestTrue(TEXT("Local triangle matches the transformed source winding"),
-		NegativeScaleMesh.GetTriNormal(LocalTid).Dot(LocalSourceNormals[0]) > 0.0);
-	return true;
-}
-
-#endif
 
 // [M4c] 多级 exclusive 前缀和：InSRV(N uint) → OutUAV(N uint)。块数>512 时递归扫「块总和」，支持任意 N
 // （单级 ScanBlockSums 只能扫 <=512 块 = 262144 元素；C1 的 5.67M 需 2 级）。ScanBlocks/AddOffsets 的组数

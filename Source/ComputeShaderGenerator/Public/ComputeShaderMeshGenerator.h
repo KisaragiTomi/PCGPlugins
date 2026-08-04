@@ -9,6 +9,7 @@
 #include "RenderGraphBuilder.h"
 #include "UDynamicMesh.h"
 #include "ComputeShaderDebugParams.h"
+#include "CSGpuMemoryBudget.h"
 #include "CSGpuTriangleUtilities.h"
 #include "ComputeShaderMeshGenerator.generated.h"
 
@@ -170,9 +171,12 @@ struct COMPUTESHADERGENERATOR_API FCSStaticMeshTriangleRDGOutput
 
 	// 涓?TriangleVertices 涓€涓€瀵瑰簲锛堟寜 vertex 绱㈠紩锛? per triangle锛夛細姣忛《鐐?UV0锛坒loat2锛夈€?
 	// 鐢?GPU extract 鍦ㄤ笌椤剁偣鐩稿悓鐨?atomic slot 鍐欏叆锛涙棤 UV 鐨勬簮锛堝湴褰?鏈粦瀹氾級淇濇寔 (0,0)銆?
+	// 按通道交错存放：UV[Corner * NumUVChannels + Channel]。通道数取自源模型，
+	// 源只有 1 条 UV 时就是 1，退化成原来的逐角点单 UV 布局。
 	FRDGBufferRef TriangleUVs = nullptr;
 	FRDGBufferUAVRef TriangleUVsUAV = nullptr;
 	FRDGBufferSRVRef TriangleUVsSRV = nullptr;
+	int32 NumUVChannels = 1;
 
 	// Per-corner source vertex attributes, parallel to TriangleVertices.
 	FRDGBufferRef TriangleColors = nullptr;
@@ -524,6 +528,35 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "1"))
 	int32 MaxVoxels = 2000000;
 
+	// -------------------------------------------------------------------------
+	// GPU memory budget
+	//
+	// MaxTriangles above is a fixed authoring limit; it says nothing about the machine the
+	// generator actually runs on. These settings drive the shared pre-flight check in
+	// CSGpuMemoryBudget, which sizes the limit from the adapter's live free VRAM instead.
+	// -------------------------------------------------------------------------
+
+	/** Runs the shared VRAM pre-flight check before box-scene GPU pipelines start. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Memory Budget")
+	bool bCheckGpuMemoryBudget = true;
+
+	/** Fraction of the free VRAM a single operation is allowed to claim. The rest covers RDG
+	 *  pooling, fragmentation and driver overhead, so values near 1.0 will crash before the
+	 *  check ever fires. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Memory Budget", meta = (ClampMin = "0.05", ClampMax = "1.0"))
+	float GpuMemoryBudgetSafetyRatio = 0.7f;
+
+	/** Asks for confirmation when the estimate exceeds the budget. False aborts (or proceeds,
+	 *  per bProceedWhenGpuMemoryBudgetUnattended) without showing a dialog. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Memory Budget")
+	bool bPromptWhenExceedingGpuMemoryBudget = true;
+
+	/** What to do when the budget is exceeded but no dialog can be shown (commandlet, unattended
+	 *  run, or a non-game thread caller). Default aborts, so batch jobs fail loudly instead of
+	 *  taking the machine down. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Generator|Memory Budget")
+	bool bProceedWhenGpuMemoryBudgetUnattended = false;
+
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator|Mesh", meta = (ClampMin = "0.001"))
 	float QuadScale = 1.0f;
 
@@ -572,6 +605,8 @@ public:
 	 *  Filled by GenerateVines(). */
 	FCSTriangleMeshData CachedSurfaceTriangles;
 
+	/** 结果资产名尾部的稳定编号（YYMMDDHHMM）。-1 表示尚未生成，首次保存时由
+	 *  EnsureGeneratorTimeCode() 赋值并随 actor 存盘，之后每次运行都复用。 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Mesh|Debug")
 	int64 GeneratorTimeCode = -1;
 
@@ -876,7 +911,47 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh")
 	void RefreshDynamicMeshComponentCullingBounds(float BoundsScale = -1.0f);
 
+	// -------------------------------------------------------------------------
+	// Core System - Result Asset Naming
+	// -------------------------------------------------------------------------
+	//
+	// 结果资产的命名策略集中在这里，来自 CSSW 的烘焙流程：每个 actor 只认一个稳定编号，
+	// 名字里不带每次运行的时间戳，因此同一个 actor 反复运行始终写同一个资产 —— 覆盖旧模型，
+	// 而不是在 content browser 里堆出一串只差时间戳的副本。
+
+	/** 返回本 actor 的稳定编号，首次调用时按当前时间生成一次并记入 GeneratorTimeCode。
+	 *  懒生成而不是在构造函数里生成：构造期赋值会让 CDO 也带上一个编号，与 CDO 同值的实例不会被
+	 *  delta 序列化，重新打开关卡后编号就变了 —— 编号一变，重跑就写出新资产而不是覆盖旧的。 */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh")
+	int64 EnsureGeneratorTimeCode();
+
+	/** 结果资产所在文件夹：<关卡所在目录>/<GetResultAssetFolderName()>（关卡 /Game/Maps/L_Foo
+	 *  -> /Game/Maps/AutoResult）。关卡没有内容路径（未存盘的 /Temp 地图）时返回空串。 */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh")
+	FString GetResultAssetFolderPath() const;
+
+	/** 结果资产完整路径 <文件夹>/SM_<基名>_<编号><NameSuffix>。同一个 actor 编号恒定，重跑即覆盖。
+	 *  只有一个 actor 要同时产出多份互不覆盖的结果时才需要传 NameSuffix。
+	 *  关卡没有内容路径时返回空串，调用方应据此退回 transient 或显式路径。 */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh")
+	FString BuildResultAssetPath(const FString& NameSuffix = TEXT(""));
+
 protected:
+	// -------------------------------------------------------------------------
+	// Result asset naming policy (子类覆写点)
+	// -------------------------------------------------------------------------
+
+	/** 结果资产文件夹名，落在关卡同级。 */
+	virtual FString GetResultAssetFolderName() const { return TEXT("AutoResult"); }
+
+	/** 结果资产名里 SM_ 之后、编号之前的部分。默认用 actor 名（已是合法的包内对象名）。 */
+	virtual FString GetResultAssetBaseName() const;
+
+	/** 结果资产名尾部的稳定编号。子类若已有自己的持久化编号（如 CSSW 的 SWUniqueID），
+	 *  覆写此函数即可沿用，已烘好的资产名不会变。 */
+	virtual FString GetResultAssetUniqueTag();
+
+
 	// -------------------------------------------------------------------------
 	// Shared GPU triangle-soup algorithms
 	// -------------------------------------------------------------------------
@@ -922,6 +997,22 @@ protected:
 		float WeldDistance,
 		FRDGBufferSRVRef TriangleFilter = nullptr,
 		uint32 TriangleFilterMask = 0u);
+
+	/**
+	 * Pre-flight VRAM check for a box-scene pipeline, using this actor's budget settings.
+	 *
+	 * The cost model is the caller's: only the derived generator knows which buffers its own
+	 * pass will allocate and at what multiplier. Everything device-dependent - free VRAM,
+	 * the triangle estimate, the confirmation policy - is delegated to CSGpuMemoryBudget so
+	 * every generator answers the question the same way.
+	 *
+	 * Must be called on the game thread, before any extraction work. Returns true to proceed.
+	 */
+	bool ConfirmGpuMemoryBudgetForBoxScene(
+		const TCHAR* OperationName,
+		const FBox& QueryBox,
+		const CSGpuMemoryBudget::FTriangleSoupCostModel& Cost,
+		bool bIncludeLandscape) const;
 
 	// -------------------------------------------------------------------------
 	// Core System - Lifecycle

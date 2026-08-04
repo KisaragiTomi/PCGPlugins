@@ -174,8 +174,14 @@ public:
 	// Debug
 	// -------------------------------------------------------------------------
 
+	/** 烘焙资产名尾部的稳定编号（DDHHMMSS）。负值表示尚未生成，首次烘焙时由
+	 *  EnsureSWUniqueID() 赋值并随 actor 存盘，之后每次烘焙都复用，因此重复烘焙覆盖同一批资产。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug", Meta=(Priority=1000))
 	int32 SWUniqueID = -99999;
+
+	/** 返回（首次调用时生成）本 actor 的烘焙编号。SM_/MI_/T_ 三类烘焙资产共用它。 */
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader|Bake")
+	int32 EnsureSWUniqueID();
 
 	UPROPERTY(BlueprintReadWrite, Category = "Debug")
 	UStaticMesh* DebugMesh;
@@ -270,6 +276,13 @@ public:
 	
 	UFUNCTION(BlueprintCallable, Category = "Debug|DebugViewPlane")
 	void ShowDebugViewPlane(float Duration = 5.0f);
+
+protected:
+	// 烘焙结果沿用基类的结果资产命名（关卡同级文件夹 + 稳定编号），只把文件夹、基名和编号
+	// 换成 CSSW 自己那套，已烘好的 SM_CSSW_Water_<SWUniqueID> 名字保持不变。
+	virtual FString GetResultAssetFolderName() const override { return TEXT("CSSWData"); }
+	virtual FString GetResultAssetBaseName() const override { return TEXT("CSSW_Water"); }
+	virtual FString GetResultAssetUniqueTag() override;
 
 private:
 	void ClearSolverTimer();

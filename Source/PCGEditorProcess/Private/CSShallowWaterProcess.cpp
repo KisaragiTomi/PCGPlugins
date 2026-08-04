@@ -12,6 +12,7 @@
 #include "AssetToolsModule.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "MeshDescription.h"
+#include "Misc/PackageName.h"
 #include "StaticMeshAttributes.h"
 #include "StaticMeshOperations.h"
 #include "TimerManager.h"
@@ -48,20 +49,16 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 
 	if (!SourceMesh) return;
 
-	ULevel* CurrentLevel = InCSSWActor->GetLevel();
-	FString LevelPathName = GetPathNameSafe(CurrentLevel);
-	FString FileName;
-	FString LevelPath;
-	FString Extension;
-	FPaths::Split(LevelPathName, LevelPath, FileName, Extension);
-	FString AssetFolderPath = LevelPath.Append("/CSSWData");
-
-	if (InCSSWActor->SWUniqueID < 0)
+	// 文件夹与编号都来自基类的结果资产命名（AComputeShaderMeshGenerator）：关卡同级的 CSSWData
+	// 目录 + actor 自己的稳定编号，重复烘焙因此始终写同一批资产名。
+	const FString AssetFolderPath = InCSSWActor->GetResultAssetFolderPath();
+	if (AssetFolderPath.IsEmpty())
 	{
-		FDateTime Time = FDateTime::Now();
-		InCSSWActor->SWUniqueID = Time.GetDay() * 1e6 + Time.GetHour() * 1e4 + Time.GetMinute() * 1e2 + Time.GetSecond();
+		UE_LOG(LogTemp, Warning, TEXT("[CSSW] Bake failed: %s 所在关卡没有内容路径（地图未保存？）。"),
+			*InCSSWActor->GetActorNameOrLabel());
+		return;
 	}
-	int32 ActorId = InCSSWActor->SWUniqueID;
+	const int32 ActorId = InCSSWActor->EnsureSWUniqueID();
 
 	TArray<FFloat16Color> Pixels;
 	int32 RTWidth = 0, RTHeight = 0;
@@ -96,8 +93,8 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 		}
 	}
 
-	FString MeshAssetName = FString::Printf(TEXT("SM_CSSW_Water_%d"), ActorId);
-	FString DuplicateMeshPath = AssetFolderPath / MeshAssetName;
+	const FString DuplicateMeshPath = InCSSWActor->BuildResultAssetPath(); // <关卡目录>/CSSWData/SM_CSSW_Water_<编号>
+	const FString MeshAssetName = FPackageName::GetLongPackageAssetName(DuplicateMeshPath);
 
 	const FStaticMeshRenderData* RenderData = SourceMesh->GetRenderData();
 	if (!RenderData || RenderData->LODResources.Num() == 0)

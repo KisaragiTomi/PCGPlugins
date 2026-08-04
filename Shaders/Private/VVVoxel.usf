@@ -1614,16 +1614,3 @@ void VineUVWriteCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     RW_VineUV_TexCoords[Index * 2u + 1u] = V;
 }
 
-StructuredBuffer<int4> VineDebugSegmentMeta;
-RWBuffer<uint> RWVineDebugIndices;
-uint VineDebugSegmentCount;
-
-[numthreads(THREADGROUPSIZE_X, 1, 1)]
-void VineDebugLineIndicesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
-{
-    uint SegmentIndex = DispatchThreadId.x;
-    if (SegmentIndex >= VineDebugSegmentCount) return;
-    int4 Segment = VineDebugSegmentMeta[SegmentIndex];
-    RWVineDebugIndices[SegmentIndex * 2u] = (uint)max(Segment.x, 0);
-    RWVineDebugIndices[SegmentIndex * 2u + 1u] = (uint)max(Segment.y, 0);
-}

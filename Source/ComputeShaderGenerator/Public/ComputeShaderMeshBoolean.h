@@ -4,7 +4,6 @@
 #include "ComputeShaderMeshGenerator.h"
 #include "ComputeShaderMeshBoolean.generated.h"
 
-class UMaterialInterface;
 class UStaticMesh;
 
 /** Stage B 布尔运算。当前用 self-winding（整个 soup 一起求缠绕数）实现，见各枚举说明。 */
@@ -38,8 +37,6 @@ class COMPUTESHADERGENERATOR_API AComputeShaderMeshBoolean : public AComputeShad
 	GENERATED_BODY()
 
 public:
-	AComputeShaderMeshBoolean();
-
 	/** 是否把地形（landscape）也纳入切分的场景三角形。false 时只读 static mesh，不读地形。 */
 	UPROPERTY(BlueprintReadWrite, Category = "CS Mesh Boolean")
 	bool bReadLandscape = false;
@@ -144,29 +141,6 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|PostProcess", meta = (ClampMin = "0.0"))
 	float VertexWeldDistance = 0.0f;
-
-	/** Debug：用 DrawDebugPoint 画碰撞球采样点 + 面内起点，核对形态与密度。 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|RayVisibility|Debug")
-	bool bDrawDebugSamples = false;
-
-	/** Debug：最多为多少个三角画采样点（防刷爆视口）；<=0 表示不限。 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|RayVisibility|Debug")
-	int32 DebugDrawMaxTriangles = 8;
-
-	/**
-	 * Debug 上色：勾选后**不删**内部面，而是保留全部面、把"埋在实体内部"的三角形涂成红色
-	 * vertex color，并把组件材质切换成 /PCGPlugins/MeshBoolean/M_VertexColor。取消勾选则正常
-	 * 布尔（删内部面）并回退默认材质。
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|Boolean")
-	bool bDebugColor = false;
-
-	/**
-	 * Debug 上色时用的材质（默认 M_VertexColor，显示红/白 vertex color）。
-	 * 置空(None)则 debug 几何（保留全部面）改用**源 mesh 原材质**，不套 debug 材质。
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|Boolean")
-	TObjectPtr<UMaterialInterface> DebugMaterial;
 
 	/**
 	 * 保留源网格的材质槽结构：源 mesh 有几个槽，输出就有几个槽——即使这些槽指向同一个材质，

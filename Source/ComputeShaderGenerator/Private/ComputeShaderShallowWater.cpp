@@ -1195,14 +1195,27 @@ void ACSShallowWaterCapture::BakeResultMesh()
 	}
 }
 
+int32 ACSShallowWaterCapture::EnsureSWUniqueID()
+{
+	if (SWUniqueID < 0)
+	{
+		const FDateTime Time = FDateTime::Now();
+		SWUniqueID = Time.GetDay() * 1000000 + Time.GetHour() * 10000 + Time.GetMinute() * 100 + Time.GetSecond();
+		// 编号要随 actor 存盘，否则下次打开关卡重新烘焙会写到一组新名字上，旧资产被留在原地。
+		Modify();
+	}
+	return SWUniqueID;
+}
+
+FString ACSShallowWaterCapture::GetResultAssetUniqueTag()
+{
+	return LexToString(EnsureSWUniqueID());
+}
+
 void ACSShallowWaterCapture::BrowseBakedAssets()
 {
 #if WITH_EDITOR
-	ULevel* CurrentLevel = GetLevel();
-	FString LevelPathName = GetPathNameSafe(CurrentLevel);
-	FString FileName, LevelPath, Extension;
-	FPaths::Split(LevelPathName, LevelPath, FileName, Extension);
-	FString AssetFolderPath = LevelPath / TEXT("CSSWData");
+	const FString AssetFolderPath = GetResultAssetFolderPath();
 
 	TArray<UObject*> ObjectsToSync;
 
@@ -1211,7 +1224,7 @@ void ACSShallowWaterCapture::BrowseBakedAssets()
 		ObjectsToSync.Add(BakedResultMesh);
 	}
 
-	if (SWUniqueID >= 0)
+	if (SWUniqueID >= 0 && !AssetFolderPath.IsEmpty())
 	{
 		FString MICPath = AssetFolderPath / FString::Printf(TEXT("MI_CSSW_Water_%d"), SWUniqueID);
 		UObject* MIC = StaticLoadObject(UObject::StaticClass(), nullptr, *MICPath, nullptr, LOAD_NoWarn | LOAD_Quiet);

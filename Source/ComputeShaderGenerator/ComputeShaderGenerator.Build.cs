@@ -68,6 +68,15 @@ public class ComputeShaderGenerator : ModuleRules
 			}
 			);
 
+		// CSGpuMemoryBudget queries the adapter's live local-VRAM budget through DXGI, which is the
+		// only way to see memory other processes already took. Everything else falls back to the
+		// cross-RHI estimate, so these dependencies stay Windows-only.
+		if (Target.Platform == UnrealTargetPlatform.Win64)
+		{
+			PrivateDependencyModuleNames.Add("D3D12RHI");
+			AddEngineThirdPartyPrivateStaticDependencies(Target, "DX12");
+		}
+
 		if (Target.Type == TargetType.Editor)
 		{
 			PrivateDependencyModuleNames.AddRange(

@@ -246,30 +246,6 @@ class FVineUVWriteCS : public FGlobalShader
 
 IMPLEMENT_GLOBAL_SHADER(FVineUVWriteCS, "/Plugin/PCGPlugins/Shaders/Private/VVVoxel.usf", "VineUVWriteCS", SF_Compute);
 
-class FVineDebugLineIndicesCS : public FGlobalShader
-{
-	DECLARE_GLOBAL_SHADER(FVineDebugLineIndicesCS);
-	SHADER_USE_PARAMETER_STRUCT(FVineDebugLineIndicesCS, FGlobalShader);
-
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, VineDebugSegmentMeta)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RWVineDebugIndices)
-		SHADER_PARAMETER(uint32, VineDebugSegmentCount)
-	END_SHADER_PARAMETER_STRUCT()
-
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
-	}
-};
-
-IMPLEMENT_GLOBAL_SHADER(FVineDebugLineIndicesCS, "/Plugin/PCGPlugins/Shaders/Private/VVVoxel.usf", "VineDebugLineIndicesCS", SF_Compute);
 
 // Trip B: rebuild the vine's one-buffer voxel-cell hash on the GPU from the producer's
 // retained cells (writes the exact layout FindVoxelIndexForCell decodes). Lets the vine
@@ -3988,13 +3964,8 @@ protected:
 			FCSGpuDebugDraw::AddPositionUnpackPass(GraphBuilder, GetScene().GetFeatureLevel(), DebugCenterSource,
 				Input.PathPointCount, DebugPositionBuf);
 
-			FVineDebugLineIndicesCS::FParameters* DebugParameters = GraphBuilder.AllocParameters<FVineDebugLineIndicesCS::FParameters>();
-			DebugParameters->VineDebugSegmentMeta = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SegmentMetaSource));
-			DebugParameters->RWVineDebugIndices = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(DebugIndexBuf, PF_R32_UINT));
-			DebugParameters->VineDebugSegmentCount = Input.SegmentCount;
-			TShaderMapRef<FVineDebugLineIndicesCS> DebugShader(GetGlobalShaderMap(GetScene().GetFeatureLevel()));
-			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VineDebug.BuildLineIndices"), DebugShader,
-				DebugParameters, FComputeShaderUtils::GetGroupCount(Input.SegmentCount, 64));
+			FCSGpuDebugDraw::AddLineIndicesPass(GraphBuilder, GetScene().GetFeatureLevel(), SegmentMetaSource,
+				Input.SegmentCount, DebugIndexBuf);
 			GraphBuilder.SetBufferAccessFinal(DebugPositionBuf, ERHIAccess::VertexOrIndexBuffer);
 			GraphBuilder.SetBufferAccessFinal(DebugIndexBuf, ERHIAccess::VertexOrIndexBuffer);
 		}
@@ -5247,16 +5218,8 @@ void AVineContainer::SaveStaticmesh()
 		return;
 	}
 
-	if (GeneratorTimeCode == -1)
-	{
-		const FDateTime Now = FDateTime::Now();
-		GeneratorTimeCode =
-			int64(Now.GetYear() % 100) * 100000000LL +
-			int64(Now.GetMonth()) * 1000000LL +
-			int64(Now.GetDay()) * 10000LL +
-			int64(Now.GetHour()) * 100LL +
-			int64(Now.GetMinute());
-	}
+	// 编号的生成（含随 actor 存盘）统一由基类负责，见 AComputeShaderMeshGenerator。
+	EnsureGeneratorTimeCode();
 
 	ULevel* ActorLevel = GetLevel();
 	UPackage* LevelPackage = ActorLevel ? ActorLevel->GetOutermost() : nullptr;

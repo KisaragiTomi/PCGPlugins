@@ -55,15 +55,20 @@ bool PopulateStaticMeshFromDescription(
 
 	UStaticMesh::FBuildMeshDescriptionsParams BuildParams;
 	BuildParams.bBuildSimpleCollision = false;
-	BuildParams.bFastBuild = true;
+	// The fast path (UStaticMesh::BuildFromMeshDescription) emits one render vertex per vertex
+	// instance and never merges them, so a perfectly welded MeshDescription still renders with
+	// 3 vertices per triangle - welding looks like it did nothing and the buffers stay large.
+	// Saved assets therefore take the full build, which merges vertices by attribute equality.
+	// Transient results are throwaway previews, so they keep the fast path.
+	BuildParams.bFastBuild = !bCommitMeshDescription;
 	// A saved asset must keep its editable source data; a transient one must not pay for it.
 	BuildParams.bCommitMeshDescription = bCommitMeshDescription;
 	return StaticMesh->BuildFromMeshDescriptions({ &MeshDescription }, BuildParams);
 }
 
 #if WITH_EDITOR
-// Default save location when the caller passes an empty path: a "result" folder sitting next to
-// the component's current level asset — e.g. level /Game/Maps/L_Foo -> /Game/Maps/result/SM_<owner>.
+// Default save location when the caller passes an empty path: an "AutoResult" folder sitting next to
+// the component's current level asset — e.g. level /Game/Maps/L_Foo -> /Game/Maps/AutoResult/SM_<owner>.
 // Returns an empty string when the owning level can't be resolved to a content path (e.g. an
 // unsaved /Temp map), in which case the caller must supply an explicit path.
 FString BuildDefaultResultAssetPath(const AActor* Owner, const FString& NameSuffix = FString())
@@ -78,7 +83,7 @@ FString BuildDefaultResultAssetPath(const AActor* Owner, const FString& NameSuff
 
 	FString BaseName = Owner->GetName();
 	if (BaseName.IsEmpty()) BaseName = TEXT("GpuMesh");
-	return FString::Printf(TEXT("%s/result/SM_%s%s"), *LevelFolder, *BaseName, *NameSuffix);
+	return FString::Printf(TEXT("%s/AutoResult/SM_%s%s"), *LevelFolder, *BaseName, *NameSuffix);
 }
 #endif
 }
@@ -343,6 +348,10 @@ UStaticMesh* CSGpuMeshSave::SaveGpuMeshDataToStaticMesh(
 		return nullptr;
 	}
 
+	// 同名资产已存在时优先「就地重建」而不是删掉重建：删除会打断所有已有引用（本 actor 的
+	// OutputStaticMesh、场上的 StaticMeshComponent、其他关卡），而且只要还有人在内存里引用它，
+	// DeleteAsset 本身就会失败，重跑等于永远存不上。就地重建保留同一个 UObject，引用自然跟着更新。
+	UStaticMesh* ExistingStaticMesh = nullptr;
 	if (UEditorAssetLibrary::DoesAssetExist(SanitizedAssetPathAndName))
 	{
 		if (!bReplaceExistingAsset)
@@ -350,7 +359,9 @@ UStaticMesh* CSGpuMeshSave::SaveGpuMeshDataToStaticMesh(
 			UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save skipped: asset already exists at '%s'."), *SanitizedAssetPathAndName);
 			return nullptr;
 		}
-		if (!UEditorAssetLibrary::DeleteAsset(SanitizedAssetPathAndName))
+		ExistingStaticMesh = Cast<UStaticMesh>(UEditorAssetLibrary::LoadAsset(SanitizedAssetPathAndName));
+		// 同名的不是 StaticMesh（材质、贴图……）就没法就地重建，只能按老路子删掉。
+		if (!ExistingStaticMesh && !UEditorAssetLibrary::DeleteAsset(SanitizedAssetPathAndName))
 		{
 			UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: could not replace '%s'."), *SanitizedAssetPathAndName);
 			return nullptr;
@@ -362,11 +373,22 @@ UStaticMesh* CSGpuMeshSave::SaveGpuMeshDataToStaticMesh(
 	if (!BuildGpuMeshDescription(MeshData, ActorTransform, bConvertToActorLocalSpace, MeshDescription)) return nullptr;
 	const double DescriptionBuiltTime = FPlatformTime::Seconds();
 
-	UPackage* Package = CreatePackage(*SanitizedAssetPathAndName);
+	UPackage* Package = ExistingStaticMesh ? ExistingStaticMesh->GetPackage() : CreatePackage(*SanitizedAssetPathAndName);
 	if (!Package) return nullptr;
 	Package->FullyLoad();
 
-	UStaticMesh* StaticMesh = NewObject<UStaticMesh>(Package, *AssetName, RF_Public | RF_Standalone);
+	UStaticMesh* StaticMesh = ExistingStaticMesh;
+	if (StaticMesh)
+	{
+		StaticMesh->Modify();
+		// 材质槽与 section 映射是按本次网格重新装配的，先清空，否则上一轮的槽位会残留在前面。
+		StaticMesh->GetStaticMaterials().Empty();
+		StaticMesh->GetSectionInfoMap().Clear();
+	}
+	else
+	{
+		StaticMesh = NewObject<UStaticMesh>(Package, *AssetName, RF_Public | RF_Standalone);
+	}
 	// Committed on purpose: this one is a real asset that must survive save/reload and stay editable.
 	if (!PopulateStaticMeshFromDescription(StaticMesh, MeshDescription, MeshData, Materials, true))
 	{
@@ -375,7 +397,8 @@ UStaticMesh* CSGpuMeshSave::SaveGpuMeshDataToStaticMesh(
 	}
 	const double MeshBuiltTime = FPlatformTime::Seconds();
 
-	FAssetRegistryModule::AssetCreated(StaticMesh);
+	// 就地重建的资产 registry 里本来就有，再报一次 AssetCreated 会多出一条重复记录。
+	if (!ExistingStaticMesh) FAssetRegistryModule::AssetCreated(StaticMesh);
 	StaticMesh->MarkPackageDirty();
 	Package->SetDirtyFlag(true);
 	UE_LOG(LogTemp, Log, TEXT("[CSGpuMesh] save timing: meshDescription=%.3fs staticMeshBuild=%.3fs registry=%.3fs"),
@@ -386,7 +409,8 @@ UStaticMesh* CSGpuMeshSave::SaveGpuMeshDataToStaticMesh(
 	if (bSaveAsset && !UEditorAssetLibrary::SaveLoadedAsset(StaticMesh, false))
 		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Created '%s' but failed to write the package to disk."), *SanitizedAssetPathAndName);
 
-	UE_LOG(LogTemp, Display, TEXT("[CSGpuMesh] Saved '%s' (dirty): vertices=%d triangles=%d slots=%d"),
+	UE_LOG(LogTemp, Display, TEXT("[CSGpuMesh] %s '%s' (dirty): vertices=%d triangles=%d slots=%d"),
+		ExistingStaticMesh ? TEXT("Overwrote") : TEXT("Saved"),
 		*SanitizedAssetPathAndName, MeshData.Positions.Num(), MeshData.Indices.Num() / 3, StaticMesh->GetStaticMaterials().Num());
 	return StaticMesh;
 }

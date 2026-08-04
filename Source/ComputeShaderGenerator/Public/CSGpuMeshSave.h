@@ -31,7 +31,7 @@ namespace CSGpuMeshSave
 		bool bConvertToActorLocalSpace = true);
 
 #if WITH_EDITOR
-	/** Builds "<OwnerActor's level folder>/result/SM_<owner><NameSuffix>". Producers that emit
+	/** Builds "<OwnerActor's level folder>/AutoResult/SM_<owner><NameSuffix>". Producers that emit
 	 *  more than one result from the same actor (an intermediate stage and the final mesh, or
 	 *  repeated runs) must pass distinct suffixes — a timestamp works — otherwise each run
 	 *  replaces the previous asset.
@@ -41,8 +41,8 @@ namespace CSGpuMeshSave
 		const FString& NameSuffix = FString());
 
 	/** Saves an already-read-back GPU mesh snapshot as a StaticMesh asset, preserving every
-	 *  material slot. With an empty AssetPathAndName the location defaults to a "result" folder
-	 *  next to OwnerActor's level (e.g. level /Game/Maps/L_Foo -> /Game/Maps/result/SM_<owner>).
+	 *  material slot. With an empty AssetPathAndName the location defaults to an "AutoResult" folder
+	 *  next to OwnerActor's level (e.g. level /Game/Maps/L_Foo -> /Game/Maps/AutoResult/SM_<owner>).
 	 *  The asset and its package are always marked dirty; bSaveAsset additionally writes it to
 	 *  disk (default false = leave it dirty for a manual Save-All). */
 	COMPUTESHADERGENERATOR_API UStaticMesh* SaveGpuMeshDataToStaticMesh(
@@ -58,8 +58,8 @@ namespace CSGpuMeshSave
 	/** Reads Component's rendered GPU mesh back to the CPU (one blocking readback) and saves it
 	 *  as a StaticMesh asset. The created asset is always marked dirty; bSaveAsset controls whether
 	 *  it is also written to disk (default false = leave it dirty for a manual/Save-All).
-	 *  Pass an empty AssetPathAndName to default the location to a "result" folder next to the
-	 *  current level (e.g. /Game/Maps/result/SM_<owner>). Returns the created mesh (possibly unsaved)
+	 *  Pass an empty AssetPathAndName to default the location to an "AutoResult" folder next to the
+	 *  current level (e.g. /Game/Maps/AutoResult/SM_<owner>). Returns the created mesh (possibly unsaved)
 	 *  or nullptr on any failure. */
 	COMPUTESHADERGENERATOR_API UStaticMesh* SaveGpuMeshComponentToStaticMesh(
 		UCSGpuMeshComponent* Component,

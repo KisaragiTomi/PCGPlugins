@@ -625,7 +625,6 @@ RWBuffer<uint>   RW_BSPStats;  // BSP01: [0]=多段直通 [1]=退化；BSPN 使�
 // Stage B classification policy. Consumed by the standalone classify/rescue kernels
 // below, never by the BSP kernel: keeping winding and ray work out of the per-source
 // BSP thread is what stops one heavily-cut triangle from stalling its whole group.
-uint  GBooleanDebugColor;
 float GBooleanWindingSampleOffset;
 float GBooleanWindingThreshold;
 float GBooleanExpansionDistance;

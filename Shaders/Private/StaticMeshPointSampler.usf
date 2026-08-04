@@ -38,6 +38,7 @@ Buffer<float4> SourceTriangleBiTangents;
 RWBuffer<float4> RW_OutTriangleColors;
 RWBuffer<float4> RW_OutTriangleTangents;
 RWBuffer<float4> RW_OutTriangleBiTangents;
+uint CSNumUVChannels;                     // UV 通道数；UV 按 [Corner * CSNumUVChannels + Channel] 交错
 Buffer<float2> SourceTriangleUVs;        // UV0，3 per triangle（与 SourceTriangleVertices 平行）
 Buffer<uint>   SourceTriangleMaterialIds;// 材质 registry id，1 per triangle
 Buffer<float4> TriangleVertices;
@@ -413,9 +414,13 @@ void ExtractStaticMeshTrianglesCS(uint3 GroupId : SV_GroupID, uint GroupIndex : 
 	RW_OutTriangleNormals[OutVertexBase + 1u] = float4(N, 0.0f);
 	RW_OutTriangleNormals[OutVertexBase + 2u] = float4(N, 0.0f);
 	// UV 必须跟随上面的顶点重排（slot0=P0/I0, slot1=P2/I2, slot2=P1/I1）。
-	RW_OutTriangleUVs[OutVertexBase + 0u] = UV0;
-	RW_OutTriangleUVs[OutVertexBase + 1u] = UV2;
-	RW_OutTriangleUVs[OutVertexBase + 2u] = UV1;
+	// 交错布局：每角点 CSNumUVChannels 个 float2。该路径只有 UV0，其余通道写 0。
+	for (uint Ch = 0u; Ch < CSNumUVChannels; ++Ch)
+	{
+		RW_OutTriangleUVs[(OutVertexBase + 0u) * CSNumUVChannels + Ch] = (Ch == 0u) ? UV0 : float2(0.0f, 0.0f);
+		RW_OutTriangleUVs[(OutVertexBase + 1u) * CSNumUVChannels + Ch] = (Ch == 0u) ? UV2 : float2(0.0f, 0.0f);
+		RW_OutTriangleUVs[(OutVertexBase + 2u) * CSNumUVChannels + Ch] = (Ch == 0u) ? UV1 : float2(0.0f, 0.0f);
+	}
 	RW_OutTriangleMaterialIds[OutTriangleIndex] = MaterialId;
 }
 
@@ -470,9 +475,6 @@ void AppendSourceTrianglesCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_Gr
 	}
 
 	uint MaterialId = SourceTriangleMaterialIds[TriIndex];
-	float2 UV0 = SourceTriangleUVs[SrcBase + 0u];
-	float2 UV1 = SourceTriangleUVs[SrcBase + 1u];
-	float2 UV2 = SourceTriangleUVs[SrcBase + 2u];
 	uint OutTriangleIndex = 0u;
 	for (;;)
 	{
@@ -500,9 +502,13 @@ void AppendSourceTrianglesCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_Gr
 	RW_OutTriangleNormals[OutVertexBase + 1u] = float4(N2, 0.0f);
 	RW_OutTriangleNormals[OutVertexBase + 2u] = float4(N1, 0.0f);
 	// All vertex-instance attributes follow the selected source corner order.
-	RW_OutTriangleUVs[OutVertexBase + 0u] = UV0;
-	RW_OutTriangleUVs[OutVertexBase + 1u] = SourceTriangleUVs[SrcBase + Corner1];
-	RW_OutTriangleUVs[OutVertexBase + 2u] = SourceTriangleUVs[SrcBase + Corner2];
+	// 每条 UV 通道都跟随同一角点重排，交错读写：src[(SrcBase+corner)*N + Ch]。
+	for (uint Ch = 0u; Ch < CSNumUVChannels; ++Ch)
+	{
+		RW_OutTriangleUVs[(OutVertexBase + 0u) * CSNumUVChannels + Ch] = SourceTriangleUVs[(SrcBase + 0u) * CSNumUVChannels + Ch];
+		RW_OutTriangleUVs[(OutVertexBase + 1u) * CSNumUVChannels + Ch] = SourceTriangleUVs[(SrcBase + Corner1) * CSNumUVChannels + Ch];
+		RW_OutTriangleUVs[(OutVertexBase + 2u) * CSNumUVChannels + Ch] = SourceTriangleUVs[(SrcBase + Corner2) * CSNumUVChannels + Ch];
+	}
 	RW_OutTriangleColors[OutVertexBase + 0u] = SourceTriangleColors[SrcBase + 0u];
 	RW_OutTriangleColors[OutVertexBase + 1u] = SourceTriangleColors[SrcBase + Corner1];
 	RW_OutTriangleColors[OutVertexBase + 2u] = SourceTriangleColors[SrcBase + Corner2];

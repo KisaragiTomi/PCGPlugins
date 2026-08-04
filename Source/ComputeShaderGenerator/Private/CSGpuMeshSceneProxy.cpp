@@ -78,8 +78,7 @@ void FCSGpuMeshSceneProxy::SubmitGpuBufferDraw(
 	uint32 MaxVertexIndex,
 	bool bCastShadow,
 	FRHIBuffer* IndirectArgsBuffer,
-	uint32 IndirectArgsOffset,
-	uint32 FirstIndex)
+	uint32 IndirectArgsOffset)
 {
 
 	for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ++ViewIndex)
@@ -97,7 +96,7 @@ void FCSGpuMeshSceneProxy::SubmitGpuBufferDraw(
 
 		FMeshBatchElement& BatchElement = Mesh.Elements[0];
 		BatchElement.IndexBuffer = &IndexBuffer;
-		BatchElement.FirstIndex = FirstIndex;
+		BatchElement.FirstIndex = 0;
 		BatchElement.MinVertexIndex = 0;
 		BatchElement.MaxVertexIndex = MaxVertexIndex;
 		if (IndirectArgsBuffer)

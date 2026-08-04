@@ -3,12 +3,8 @@
 #include "CoreMinimal.h"
 #include "PrimitiveSceneProxy.h"
 #include "LocalVertexFactory.h"
-#include "RenderResource.h"
-#include "RenderGraphResources.h"
 #include "CSGpuDebugDraw.h"
 #include "CSMeshGeneratorDebugComponent.h"
-
-class UCSMeshGeneratorDebugComponent;
 
 /** GPU-only scene proxy for surface-voxel directions, points, and isolated quads. */
 class FCSMeshGeneratorDebugSceneProxy final : public FPrimitiveSceneProxy
@@ -27,24 +23,41 @@ public:
 	virtual bool CanBeOccluded() const override;
 
 private:
+	bool IsDirectionsMode() const { return Data.Mode == ECSMeshGeneratorDebugMode::Directions; }
+
+	// -------------------------------------------------------------------------
+	// One entry trio per debug shape: size and allocate what that shape draws with, record its
+	// compute passes, submit its draws. The mode is read exactly three times — once per override
+	// above — so a new shape is a new trio, not another branch inside these.
+	// -------------------------------------------------------------------------
+
+	/** Directions: 2 vertices / 2 line indices / 1 point index per voxel (AddVoxelDirectionsPass). */
+	void AllocateDirectionBuffers(FRHICommandListBase& RHICmdList);
+	void BuildDirectionGeometry(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type FeatureLevel,
+		const FCSGpuDebugVoxelSource& Source, FRDGBufferRef DebugPositions, FRDGBufferRef DebugIndices,
+		FRDGBufferRef DebugArgs);
+	void SubmitDirectionDraws(const TArray<const FSceneView*>& Views, uint32 VisibilityMap,
+		FMeshElementCollector& Collector) const;
+
+	/** Isolated quads: 4 vertices / 6 indices per voxel (AddVoxelQuadsPass). */
+	void AllocateQuadBuffers(FRHICommandListBase& RHICmdList);
+	void BuildQuadGeometry(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type FeatureLevel,
+		const FCSGpuDebugVoxelSource& Source, FRDGBufferRef DebugPositions, FRDGBufferRef DebugIndices,
+		FRDGBufferRef DebugArgs);
+	void SubmitQuadDraws(const TArray<const FSceneView*>& Views, uint32 VisibilityMap,
+		FMeshElementCollector& Collector) const;
+
+	/** Registers the buffers every shape writes, then hands off to the active shape's build entry. */
 	void BuildGeometry(FRHICommandListBase& RHICmdList);
 
 	FCSMeshGeneratorDebugData Data;
-
-	// GPU voxel source: buffers filled by the debug compute passes, counts decided on the GPU.
 	FLocalVertexFactory VertexFactory;
 	FCSGpuDebugPositionStream Positions;
+	// Main = the shape's own primitive (lines or triangles); Point = the direction-mode centres.
 	FCSPooledIndexBuffer MainIndices;
 	FCSPooledIndexBuffer PointIndices;
-
-	// CPU-supplied primitives: one uploaded position/index pair, one draw per batch.
-	FLocalVertexFactory BatchVertexFactory;
-	FCSGpuDebugPositionStream BatchPositions;
-	FCSPooledIndexBuffer BatchIndices;
 	TRefCountPtr<FRDGPooledBuffer> MainIndirectArgs;
 	TRefCountPtr<FRDGPooledBuffer> PointIndirectArgs;
 	FMaterialRelevance MaterialRelevance;
 	uint32 PositionCapacity = 0;
-	uint32 MainIndexCapacity = 0;
-	uint32 PointIndexCapacity = 0;
 };

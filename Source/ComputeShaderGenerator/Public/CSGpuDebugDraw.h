@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "CSGpuMeshTypes.h"
 #include "LocalVertexFactory.h"
+#include "RenderGraphResources.h"
 
 class FMeshElementCollector;
 class FPrimitiveSceneProxy;
@@ -39,6 +40,28 @@ struct FCSGpuDebugVoxelSource
 	uint32 MaxItems = 0;
 
 	bool IsValid() const { return Positions && Normals && Counter && Capacity > 0; }
+};
+
+/**
+ * The pooled counterpart of FCSGpuDebugVoxelSource: what a game-thread producer retains between
+ * frames and hands to a debug component, which registers it into its own graph. Same layout the
+ * shapes below consume, so anything that can fill a float4 position / float4 normal pair plus a
+ * GPU-written counter gets the whole direction-and-point visual for free.
+ *
+ * Allocate all three with AllocatePooledBuffer(FRDGBufferDesc::CreateBufferDesc(...)) — the passes
+ * view them as typed Buffer<float4> / Buffer<uint>, which a structured buffer cannot satisfy.
+ */
+struct FCSGpuDebugPooledSource
+{
+	TRefCountPtr<FRDGPooledBuffer> Positions; // float4 (xyz world position, w unused)
+	TRefCountPtr<FRDGPooledBuffer> Normals;   // float4 (xyz normal, w unused)
+	TRefCountPtr<FRDGPooledBuffer> Counter;   // uint2 ([0] = live item count)
+	int32 Capacity = 0;
+	float ItemSize = 0.0f;                    // world size of one item; pads the debug bounds
+	FBox WorldBounds = FBox(ForceInit);
+
+	bool IsValid() const { return Positions.IsValid() && Normals.IsValid() && Counter.IsValid() && Capacity > 0; }
+	void Reset() { *this = FCSGpuDebugPooledSource(); }
 };
 
 /**

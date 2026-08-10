@@ -1,4 +1,5 @@
 #include "CSMeshGeneratorDebugComponent.h"
+#include "CSGpuDebugDraw.h"
 #include "CSMeshGeneratorDebugSceneProxy.h"
 #include "ComputeShaderMeshGenerator.h"
 
@@ -17,7 +18,7 @@ UCSMeshGeneratorDebugComponent::UCSMeshGeneratorDebugComponent()
 }
 
 int32 UCSMeshGeneratorDebugComponent::SetDirectionSource(
-	const FCSSurfaceVoxelGPUBuffers& Source,
+	const FCSGpuDebugPooledSource& Source,
 	float DirectionLength,
 	FLinearColor DirectionColor,
 	bool bDrawPoints,
@@ -36,11 +37,11 @@ int32 UCSMeshGeneratorDebugComponent::SetDirectionSource(
 	NewData.Positions = Source.Positions;
 	NewData.Normals = Source.Normals;
 	NewData.Counter = Source.Counter;
-	NewData.VoxelCapacity = Source.VoxelCapacity;
+	NewData.VoxelCapacity = Source.Capacity;
 	NewData.MaxVoxelsToDraw = MaxDirectionsToDraw > 0
-		? FMath::Min(MaxDirectionsToDraw, Source.VoxelCapacity)
-		: Source.VoxelCapacity;
-	NewData.VoxelSize = FMath::Max(Source.VoxelSize, UE_KINDA_SMALL_NUMBER);
+		? FMath::Min(MaxDirectionsToDraw, Source.Capacity)
+		: Source.Capacity;
+	NewData.VoxelSize = FMath::Max(Source.ItemSize, UE_KINDA_SMALL_NUMBER);
 	NewData.DirectionLength = FMath::Max(DirectionLength, UE_KINDA_SMALL_NUMBER);
 	NewData.DirectionColor = DirectionColor;
 	NewData.PointColor = PointColor;
@@ -50,6 +51,27 @@ int32 UCSMeshGeneratorDebugComponent::SetDirectionSource(
 	SubmitData(MoveTemp(NewData));
 	ScheduleClear(Duration, bPersistent);
 	return PendingData.MaxVoxelsToDraw;
+}
+
+int32 UCSMeshGeneratorDebugComponent::SetDirectionSource(
+	const FCSSurfaceVoxelGPUBuffers& Source,
+	float DirectionLength,
+	FLinearColor DirectionColor,
+	bool bDrawPoints,
+	FLinearColor PointColor,
+	int32 MaxDirectionsToDraw,
+	float Duration,
+	bool bPersistent)
+{
+	FCSGpuDebugPooledSource PooledSource;
+	PooledSource.Positions = Source.Positions;
+	PooledSource.Normals = Source.Normals;
+	PooledSource.Counter = Source.Counter;
+	PooledSource.Capacity = Source.VoxelCapacity;
+	PooledSource.ItemSize = Source.VoxelSize;
+	PooledSource.WorldBounds = Source.WorldBounds;
+	return SetDirectionSource(PooledSource, DirectionLength, DirectionColor, bDrawPoints, PointColor,
+		MaxDirectionsToDraw, Duration, bPersistent);
 }
 
 bool UCSMeshGeneratorDebugComponent::SetIsolatedQuadSource(

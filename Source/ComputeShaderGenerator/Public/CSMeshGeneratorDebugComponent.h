@@ -5,6 +5,7 @@
 #include "RenderGraphResources.h"
 #include "CSMeshGeneratorDebugComponent.generated.h"
 
+struct FCSGpuDebugPooledSource;
 struct FCSSurfaceVoxelGPUBuffers;
 
 enum class ECSMeshGeneratorDebugMode : uint8
@@ -51,7 +52,19 @@ class COMPUTESHADERGENERATOR_API UCSMeshGeneratorDebugComponent : public UPrimit
 public:
 	UCSMeshGeneratorDebugComponent();
 
-	/** Submits GPU normal lines and optional point primitives. Returns the submitted capacity. */
+	/** Submits GPU normal lines and optional point primitives from any retained pooled source.
+	 *  Returns the submitted capacity. Pass a tiny DirectionLength for a points-only visual. */
+	int32 SetDirectionSource(
+		const FCSGpuDebugPooledSource& Source,
+		float DirectionLength,
+		FLinearColor DirectionColor,
+		bool bDrawPoints,
+		FLinearColor PointColor,
+		int32 MaxDirectionsToDraw,
+		float Duration,
+		bool bPersistent);
+
+	/** Surface-voxel entry point; forwards to the pooled-source overload above. */
 	int32 SetDirectionSource(
 		const FCSSurfaceVoxelGPUBuffers& Source,
 		float DirectionLength,

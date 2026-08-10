@@ -8,6 +8,7 @@
 #include "ComputeShaderDebugParams.h"
 
 class AComputeShaderMeshGenerator;
+class ACSPointBrushActor;
 class AGPUSkeletalTree;
 class FVineContainerViewportOverlay;
 
@@ -22,9 +23,11 @@ public:
 private:
 	void InitializeEditorUI();
 	void StartInstanceBrush(AComputeShaderMeshGenerator* TargetActor);
+	void StartPointBrush(ACSPointBrushActor* TargetActor);
 	void GenerateGPUSkeletalTree(AGPUSkeletalTree* TargetActor);
 
 	FDelegateHandle PostEngineInitHandle;
 	TUniquePtr<FVineContainerViewportOverlay> VineContainerViewportOverlay;
 	bool bEditorModeRegistered = false;
+	bool bPointBrushModeRegistered = false;
 };

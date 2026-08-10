@@ -120,7 +120,15 @@ AVineContainer.GenerateVines()
 
 ### 5. 编辑器工具 · PCGEditorProcess
 
-实例笔刷编辑模式（`CSInstanceBrushEdMode`）、资产处理（`CSAssetProcess`）、Actor Tag 快捷操作、选中 Actor 的视口叠加基类等。
+实例笔刷编辑模式（`CSInstanceBrushEdMode`）、点笔刷编辑模式（`CSPointBrushEdMode`）、资产处理（`CSAssetProcess`）、Actor Tag 快捷操作、选中 Actor 的视口叠加基类等。
+
+### 🖌️ PointBrush · 绘制点 → GPU 可直读 buffer
+
+放置 `ACSPointBrushActor`，点 `Start Point Brush` 进入笔刷模式：拖拽只累积预览点（`DrawDebugPoint`），松开鼠标才提交；`Esc` 取消并退出。
+
+- **两份表示，一个 owner**：`PaintedPoints`（`UPROPERTY`，随关卡存盘）是 CPU 真值；`GetPointBuffers()` 是由它重建的 GPU 镜像 —— float4 位置 / float4 法线 / 2-uint 计数器（`[0]` = 有效点数）。消费者 `RegisterExternalBuffer` 后按计数器间接派发，点和数量都不回 CPU。
+- **显示**：走共享的 GPU debug draw（`UCSMeshGeneratorDebugComponent` + `FCSGpuDebugPooledSource`），每点一个点图元加一条可选法线线，全部由 compute pass 从上述 buffer 直接生成。
+- **生命周期**：pooled 引用只有该 Actor 持有，在重建 / `Release Point Buffer` / `EndPlay` / 删除 Actor / GC（关关卡、关引擎）时于渲染线程释放。
 
 ---
 

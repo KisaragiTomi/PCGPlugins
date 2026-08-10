@@ -3,6 +3,8 @@
 #include "PCGEditorProcess.h"
 #include "ActorTagShortcut.h"
 #include "CSInstanceBrushEdMode.h"
+#include "CSPointBrushActor.h"
+#include "CSPointBrushEdMode.h"
 #include "MeshGeneratorBrushCache.h"
 #include "ComputeShaderShallowWater.h"
 #include "CSShallowWaterProcess.h"
@@ -148,6 +150,7 @@ void FPCGEditorProcessModule::StartupModule()
 	// Bind delegates that don't require Slate/LevelEditor
 	ACSShallowWaterCapture::OnBakeResultMeshDelegate.BindStatic(&UCSShallowWaterProcess::SaveSWData);
 	AMeshGeneratorBrushCache::OnInstanceBrushEditorRequest.AddRaw(this, &FPCGEditorProcessModule::StartInstanceBrush);
+	ACSPointBrushActor::OnPointBrushEditorRequest.AddRaw(this, &FPCGEditorProcessModule::StartPointBrush);
 	AGPUSkeletalTree::OnGenerateTreeEditorRequest.BindRaw(this, &FPCGEditorProcessModule::GenerateGPUSkeletalTree);
 
 	// Defer editor UI initialization until the engine is fully loaded.
@@ -175,12 +178,15 @@ void FPCGEditorProcessModule::ShutdownModule()
 
 	VineContainerViewportOverlay.Reset();
 	AMeshGeneratorBrushCache::OnInstanceBrushEditorRequest.RemoveAll(this);
+	ACSPointBrushActor::OnPointBrushEditorRequest.RemoveAll(this);
 	AGPUSkeletalTree::OnGenerateTreeEditorRequest.Unbind();
-	if (bEditorModeRegistered && !IsEngineExitRequested() && GEditor)
+	if (!IsEngineExitRequested() && GEditor)
 	{
-		FEditorModeRegistry::Get().UnregisterMode(FCSInstanceBrushEdMode::EM_CSInstanceBrush);
+		if (bEditorModeRegistered) FEditorModeRegistry::Get().UnregisterMode(FCSInstanceBrushEdMode::EM_CSInstanceBrush);
+		if (bPointBrushModeRegistered) FEditorModeRegistry::Get().UnregisterMode(FCSPointBrushEdMode::EM_CSPointBrush);
 	}
 	bEditorModeRegistered = false;
+	bPointBrushModeRegistered = false;
 	ACSShallowWaterCapture::OnBakeResultMeshDelegate.Unbind();
 }
 
@@ -210,6 +216,16 @@ void FPCGEditorProcessModule::InitializeEditorUI()
 		bEditorModeRegistered = true;
 	}
 
+	if (!FEditorModeRegistry::Get().GetFactoryMap().Contains(FCSPointBrushEdMode::EM_CSPointBrush))
+	{
+		FEditorModeRegistry::Get().RegisterMode<FCSPointBrushEdMode>(
+			FCSPointBrushEdMode::EM_CSPointBrush,
+			LOCTEXT("CSPointBrushMode", "CS Point Brush"),
+			FSlateIcon(),
+			false);
+		bPointBrushModeRegistered = true;
+	}
+
 	VineContainerViewportOverlay = MakeUnique<FVineContainerViewportOverlay>();
 	VineContainerViewportOverlay->Start();
 }
@@ -227,6 +243,18 @@ void FPCGEditorProcessModule::StartInstanceBrush(AComputeShaderMeshGenerator* Ta
 	if (FCSInstanceBrushEdMode* BrushMode = ModeTools.GetActiveModeTyped<FCSInstanceBrushEdMode>(FCSInstanceBrushEdMode::EM_CSInstanceBrush))
 	{
 		BrushMode->SetTargetActor(BrushCacheActor);
+	}
+}
+
+void FPCGEditorProcessModule::StartPointBrush(ACSPointBrushActor* TargetActor)
+{
+	if (!TargetActor || !GEditor) return;
+
+	FEditorModeTools& ModeTools = GLevelEditorModeTools();
+	ModeTools.ActivateMode(FCSPointBrushEdMode::EM_CSPointBrush);
+	if (FCSPointBrushEdMode* BrushMode = ModeTools.GetActiveModeTyped<FCSPointBrushEdMode>(FCSPointBrushEdMode::EM_CSPointBrush))
+	{
+		BrushMode->SetTargetActor(TargetActor);
 	}
 }
 

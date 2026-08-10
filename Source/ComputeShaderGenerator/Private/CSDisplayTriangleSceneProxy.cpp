@@ -1,5 +1,5 @@
-#include "CSDirectTriangleMeshSceneProxy.h"
-#include "CSDirectTriangleMeshComponent.h"
+#include "CSDisplayTriangleSceneProxy.h"
+#include "CSDisplayComponent.h"
 
 #include "GlobalShader.h"
 #include "ShaderParameterStruct.h"
@@ -60,35 +60,35 @@ IMPLEMENT_GLOBAL_SHADER(FCSDirectMeshPackCS, "/Plugin/PCGPlugins/Shaders/Private
 IMPLEMENT_GLOBAL_SHADER(FCSDirectMeshArgsCS, "/Plugin/PCGPlugins/Shaders/Private/CSDirectMesh.usf", "BuildIndirectArgsCS", SF_Compute);
 
 // -----------------------------------------------------------------------------
-// FCSDirectTriangleMeshSceneProxy
+// FCSDisplayTriangleSceneProxy
 // -----------------------------------------------------------------------------
 
-FCSDirectTriangleMeshSceneProxy::FCSDirectTriangleMeshSceneProxy(UCSDirectTriangleMeshComponent* Component,
+FCSDisplayTriangleSceneProxy::FCSDisplayTriangleSceneProxy(UCSDisplayComponent* Component,
 	const FCSBoxScenePreparedData& InPrepared, uint32 InVertexCapacity)
-	: FCSGpuMeshSceneProxy(Component, Component->MeshMaterial, "FCSDirectTriangleMeshSceneProxy")
+	: FCSGpuMeshSceneProxy(Component, Component->MeshMaterial, "FCSDisplayTriangleSceneProxy")
 	, Prepared(InPrepared)
 	, InputVertexCapacity(InVertexCapacity)
 {
 }
 
-FCSDirectTriangleMeshSceneProxy::~FCSDirectTriangleMeshSceneProxy()
+FCSDisplayTriangleSceneProxy::~FCSDisplayTriangleSceneProxy()
 {
 }
 
-SIZE_T FCSDirectTriangleMeshSceneProxy::GetTypeHash() const
+SIZE_T FCSDisplayTriangleSceneProxy::GetTypeHash() const
 {
 	static size_t UniquePointer;
 	return reinterpret_cast<size_t>(&UniquePointer);
 }
 
-void FCSDirectTriangleMeshSceneProxy::RegisterStreams()
+void FCSDisplayTriangleSceneProxy::RegisterStreams()
 {
 	VertexCapacity = FMath::Max(InputVertexCapacity, 3u);
 	IndexCapacity = VertexCapacity; // triangle soup: identity index buffer, V == I
 	AddStandardTriangleStreams();
 }
 
-void FCSDirectTriangleMeshSceneProxy::BuildGeometry(FRHICommandListBase& RHICmdList)
+void FCSDisplayTriangleSceneProxy::BuildGeometry(FRHICommandListBase& RHICmdList)
 {
 	const uint32 MaxVertices = FMath::Max(VertexCapacity, 3u);
 

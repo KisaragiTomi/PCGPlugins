@@ -4,10 +4,10 @@
 #include "CSGpuMeshSceneProxy.h"
 #include "ComputeShaderMeshGenerator.h" // FCSBoxScenePreparedData
 
-class UCSDirectTriangleMeshComponent;
+class UCSDisplayComponent;
 
 /**
- * Scene proxy for UCSDirectTriangleMeshComponent. On the render thread it runs the
+ * Scene proxy for UCSDisplayComponent. On the render thread it runs the
  * generator's box-scene triangle extraction (AddPreparedBoxSceneTrianglesToRDG) into a
  * transient triangle soup, then a pack pass fills the base-owned LocalVertexFactory streams
  * (positions, tangent basis, zero UV, white colour) with an identity index buffer and builds
@@ -17,11 +17,11 @@ class UCSDirectTriangleMeshComponent;
  *
  * The soup is a triangle list with a unique vertex per index, so IndexCapacity == VertexCapacity.
  */
-class FCSDirectTriangleMeshSceneProxy final : public FCSGpuMeshSceneProxy
+class FCSDisplayTriangleSceneProxy final : public FCSGpuMeshSceneProxy
 {
 public:
-	FCSDirectTriangleMeshSceneProxy(UCSDirectTriangleMeshComponent* Component, const FCSBoxScenePreparedData& InPrepared, uint32 InVertexCapacity);
-	virtual ~FCSDirectTriangleMeshSceneProxy() override;
+	FCSDisplayTriangleSceneProxy(UCSDisplayComponent* Component, const FCSBoxScenePreparedData& InPrepared, uint32 InVertexCapacity);
+	virtual ~FCSDisplayTriangleSceneProxy() override;
 
 	virtual SIZE_T GetTypeHash() const override;
 

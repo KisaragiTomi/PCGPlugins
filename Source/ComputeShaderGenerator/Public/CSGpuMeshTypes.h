@@ -198,3 +198,44 @@ struct FCSGpuMeshCPUData
 			&& (TriangleMaterialSlots.IsEmpty() || TriangleMaterialSlots.Num() == Indices.Num() / 3);
 	}
 };
+
+// -----------------------------------------------------------------------------
+// 「GPU 网格快照 -> StaticMesh」的转换/落盘选项。实现是 UCSGpuMeshComponent 的
+// 静态成员（原 namespace CSGpuMeshConvert，2026-08 并入基类）。
+// -----------------------------------------------------------------------------
+
+/** 属性装配选项。退化面阈值等判据统一在此，避免各路径各自为政。 */
+struct FCSGpuMeshConvertOptions
+{
+	/** 目标 actor/组件变换。bBakeToLocalSpace 为真时把世界空间数据烘到它的局部空间。 */
+	FTransform TargetTransform = FTransform::Identity;
+
+	/** 源数据是世界空间、需要烘到 TargetTransform 的局部空间。源数据本就是局部空间时置 false。 */
+	bool bBakeToLocalSpace = true;
+
+	/** 忽略源法线切线，按几何重算。 */
+	bool bRecomputeNormals = false;
+
+	/** 三角面积平方低于该值视为退化并丢弃。 */
+	float DegenerateAreaThresholdSq = 1.0e-8f;
+
+	/** 材质槽为空时填入引擎默认表面材质，避免输出网格渲染成默认灰且无法在编辑器里区分槽位。 */
+	bool bFillEmptySlotsWithDefaultMaterial = true;
+};
+
+/** 落盘选项。空 AssetPath 表示用 OwnerActor 所在 level 旁的 result 目录。 */
+struct FCSGpuMeshAssetOptions
+{
+	FString AssetPath;
+	bool bTransient = false;
+	bool bReplaceExisting = true;
+	bool bSaveToDisk = false;
+
+	/**
+	 * 产出的 StaticMesh 是否启用 Nanite。布尔结果动辄上百万三角，正是 Nanite 的适用场景：
+	 * 开启后由 Nanite 自己做 LOD 与剔除，省掉手工 LOD，渲染开销与三角数基本脱钩。
+	 * 代价是构建时会多一步 Nanite 数据生成（大网格上是秒级），且资产体积变大。
+	 * 必须在 BuildFromMeshDescriptions 之前设置，否则这次构建不会产出 Nanite 数据。
+	 */
+	bool bEnableNanite = false;
+};

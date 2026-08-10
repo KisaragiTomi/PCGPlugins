@@ -51,6 +51,11 @@ void FCSPointBrushEdMode::CommitSamples(const TArray<FCSBrushSample>& Samples)
 		AddedCount, *GetNameSafe(Target), Target->GetBrushPointCount());
 }
 
+void FCSPointBrushEdMode::ClearBrushTarget()
+{
+	TargetActor.Reset();
+}
+
 bool FCSPointBrushEdMode::IsTooCloseToCommitted(const FVector& Location, float MinSpacingSq) const
 {
 	const ACSPointBrushActor* Target = TargetActor.Get();

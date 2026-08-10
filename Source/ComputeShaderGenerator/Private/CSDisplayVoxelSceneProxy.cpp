@@ -1,14 +1,14 @@
-#include "CSMeshGeneratorDebugSceneProxy.h"
-#include "CSMeshGeneratorDebugComponent.h"
+#include "CSDisplayVoxelSceneProxy.h"
+#include "CSDisplayComponent.h"
 #include "CSGpuDebugDraw.h"
 
 #include "RenderGraphBuilder.h"
 #include "RHICommandList.h"
 #include "SceneInterface.h"
 
-FCSMeshGeneratorDebugSceneProxy::FCSMeshGeneratorDebugSceneProxy(
-	const UCSMeshGeneratorDebugComponent* Component,
-	const FCSMeshGeneratorDebugData& InData)
+FCSDisplayVoxelSceneProxy::FCSDisplayVoxelSceneProxy(
+	const UCSDisplayComponent* Component,
+	const FCSDisplayVoxelData& InData)
 	: FPrimitiveSceneProxy(Component)
 	, Data(InData)
 	, VertexFactory(GetScene().GetFeatureLevel(), "FCSMeshGeneratorDebugVertexFactory")
@@ -18,22 +18,22 @@ FCSMeshGeneratorDebugSceneProxy::FCSMeshGeneratorDebugSceneProxy(
 	bSupportsDistanceFieldRepresentation = false;
 }
 
-FCSMeshGeneratorDebugSceneProxy::~FCSMeshGeneratorDebugSceneProxy()
+FCSDisplayVoxelSceneProxy::~FCSDisplayVoxelSceneProxy()
 {
 }
 
-SIZE_T FCSMeshGeneratorDebugSceneProxy::GetTypeHash() const
+SIZE_T FCSDisplayVoxelSceneProxy::GetTypeHash() const
 {
 	static size_t UniquePointer;
 	return reinterpret_cast<size_t>(&UniquePointer);
 }
 
-uint32 FCSMeshGeneratorDebugSceneProxy::GetMemoryFootprint() const
+uint32 FCSDisplayVoxelSceneProxy::GetMemoryFootprint() const
 {
 	return sizeof(*this) + GetAllocatedSize();
 }
 
-void FCSMeshGeneratorDebugSceneProxy::CreateRenderThreadResources(FRHICommandListBase& RHICmdList)
+void FCSDisplayVoxelSceneProxy::CreateRenderThreadResources(FRHICommandListBase& RHICmdList)
 {
 	FPrimitiveSceneProxy::CreateRenderThreadResources(RHICmdList);
 
@@ -44,7 +44,7 @@ void FCSMeshGeneratorDebugSceneProxy::CreateRenderThreadResources(FRHICommandLis
 	BuildGeometry(RHICmdList);
 }
 
-void FCSMeshGeneratorDebugSceneProxy::AllocateDirectionBuffers(FRHICommandListBase& RHICmdList)
+void FCSDisplayVoxelSceneProxy::AllocateDirectionBuffers(FRHICommandListBase& RHICmdList)
 {
 	const uint32 VoxelLimit = uint32(FMath::Max(Data.MaxVoxelsToDraw, 1));
 	PositionCapacity = VoxelLimit * 2u;
@@ -55,7 +55,7 @@ void FCSMeshGeneratorDebugSceneProxy::AllocateDirectionBuffers(FRHICommandListBa
 	PointIndirectArgs = FCSGpuDebugDraw::AllocateIndirectArgs(TEXT("CSMeshGeneratorDebug.PointArgs"));
 }
 
-void FCSMeshGeneratorDebugSceneProxy::AllocateQuadBuffers(FRHICommandListBase& RHICmdList)
+void FCSDisplayVoxelSceneProxy::AllocateQuadBuffers(FRHICommandListBase& RHICmdList)
 {
 	const uint32 VoxelLimit = uint32(FMath::Max(Data.MaxVoxelsToDraw, 1));
 	PositionCapacity = VoxelLimit * 4u;
@@ -64,7 +64,7 @@ void FCSMeshGeneratorDebugSceneProxy::AllocateQuadBuffers(FRHICommandListBase& R
 	MainIndirectArgs = FCSGpuDebugDraw::AllocateIndirectArgs(TEXT("CSMeshGeneratorDebug.QuadArgs"));
 }
 
-void FCSMeshGeneratorDebugSceneProxy::DestroyRenderThreadResources()
+void FCSDisplayVoxelSceneProxy::DestroyRenderThreadResources()
 {
 	VertexFactory.ReleaseResource();
 	if (PointIndices.Pooled.IsValid()) FCSGpuDebugDraw::ReleaseIndexBuffer(PointIndices);
@@ -75,7 +75,7 @@ void FCSMeshGeneratorDebugSceneProxy::DestroyRenderThreadResources()
 	FPrimitiveSceneProxy::DestroyRenderThreadResources();
 }
 
-void FCSMeshGeneratorDebugSceneProxy::GetDynamicMeshElements(
+void FCSDisplayVoxelSceneProxy::GetDynamicMeshElements(
 	const TArray<const FSceneView*>& Views,
 	const FSceneViewFamily& ViewFamily,
 	uint32 VisibilityMap,
@@ -87,7 +87,7 @@ void FCSMeshGeneratorDebugSceneProxy::GetDynamicMeshElements(
 	else SubmitQuadDraws(Views, VisibilityMap, Collector);
 }
 
-void FCSMeshGeneratorDebugSceneProxy::SubmitDirectionDraws(const TArray<const FSceneView*>& Views,
+void FCSDisplayVoxelSceneProxy::SubmitDirectionDraws(const TArray<const FSceneView*>& Views,
 	uint32 VisibilityMap, FMeshElementCollector& Collector) const
 {
 	FCSGpuDebugDraw::SubmitColoredDraw(*this, Views, VisibilityMap, Collector, VertexFactory,
@@ -98,14 +98,14 @@ void FCSMeshGeneratorDebugSceneProxy::SubmitDirectionDraws(const TArray<const FS
 		PointIndices, PT_PointList, Data.PointColor, 0u, PositionCapacity - 1u, PointIndirectArgs->GetRHI(), 0u);
 }
 
-void FCSMeshGeneratorDebugSceneProxy::SubmitQuadDraws(const TArray<const FSceneView*>& Views,
+void FCSDisplayVoxelSceneProxy::SubmitQuadDraws(const TArray<const FSceneView*>& Views,
 	uint32 VisibilityMap, FMeshElementCollector& Collector) const
 {
 	FCSGpuDebugDraw::SubmitColoredDraw(*this, Views, VisibilityMap, Collector, VertexFactory,
 		MainIndices, PT_TriangleList, Data.DirectionColor, 0u, PositionCapacity - 1u, MainIndirectArgs->GetRHI(), 0u);
 }
 
-FPrimitiveViewRelevance FCSMeshGeneratorDebugSceneProxy::GetViewRelevance(const FSceneView* View) const
+FPrimitiveViewRelevance FCSDisplayVoxelSceneProxy::GetViewRelevance(const FSceneView* View) const
 {
 	FPrimitiveViewRelevance Result;
 	Result.bDrawRelevance = IsShown(View);
@@ -119,12 +119,12 @@ FPrimitiveViewRelevance FCSMeshGeneratorDebugSceneProxy::GetViewRelevance(const 
 	return Result;
 }
 
-bool FCSMeshGeneratorDebugSceneProxy::CanBeOccluded() const
+bool FCSDisplayVoxelSceneProxy::CanBeOccluded() const
 {
 	return !MaterialRelevance.bDisableDepthTest;
 }
 
-void FCSMeshGeneratorDebugSceneProxy::BuildGeometry(FRHICommandListBase& RHICmdList)
+void FCSDisplayVoxelSceneProxy::BuildGeometry(FRHICommandListBase& RHICmdList)
 {
 	FRHICommandListImmediate& Immediate = FRHICommandListExecutor::GetImmediateCommandList();
 	FRDGBuilder GraphBuilder(Immediate, RDG_EVENT_NAME("CSMeshGeneratorDebug.Build"));
@@ -150,7 +150,7 @@ void FCSMeshGeneratorDebugSceneProxy::BuildGeometry(FRHICommandListBase& RHICmdL
 	GraphBuilder.Execute();
 }
 
-void FCSMeshGeneratorDebugSceneProxy::BuildDirectionGeometry(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type FeatureLevel,
+void FCSDisplayVoxelSceneProxy::BuildDirectionGeometry(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type FeatureLevel,
 	const FCSGpuDebugVoxelSource& Source, FRDGBufferRef DebugPositions, FRDGBufferRef DebugIndices, FRDGBufferRef DebugArgs)
 {
 	FRDGBufferRef DebugPointIndices = GraphBuilder.RegisterExternalBuffer(PointIndices.Pooled, TEXT("CSMeshGeneratorDebug.PointIndices.External"));
@@ -167,7 +167,7 @@ void FCSMeshGeneratorDebugSceneProxy::BuildDirectionGeometry(FRDGBuilder& GraphB
 	GraphBuilder.SetBufferAccessFinal(DebugPointArgs, ERHIAccess::IndirectArgs);
 }
 
-void FCSMeshGeneratorDebugSceneProxy::BuildQuadGeometry(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type FeatureLevel,
+void FCSDisplayVoxelSceneProxy::BuildQuadGeometry(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type FeatureLevel,
 	const FCSGpuDebugVoxelSource& Source, FRDGBufferRef DebugPositions, FRDGBufferRef DebugIndices, FRDGBufferRef DebugArgs)
 {
 	FCSGpuDebugDraw::AddVoxelQuadsPass(GraphBuilder, FeatureLevel, Source, Data.VoxelSize, Data.QuadScale,

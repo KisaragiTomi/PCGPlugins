@@ -3,7 +3,7 @@
 #include "RHI.h"
 
 #if WITH_EDITOR
-#include "CSGpuMeshSave.h"
+#include "CSGpuMeshComponent.h"
 #endif
 
 URoadMeshComponent::URoadMeshComponent()
@@ -35,8 +35,8 @@ FPrimitiveSceneProxy* URoadMeshComponent::CreateSceneProxy()
 UStaticMesh* URoadMeshComponent::SaveToStaticMesh(const FString& AssetPathAndName, bool bReplaceExistingAsset,
 	bool bSaveAsset, bool bConvertToActorLocalSpace)
 {
-	return CSGpuMeshSave::SaveGpuMeshComponentToStaticMesh(
-		this, AssetPathAndName, RoadMaterial, GetComponentTransform(),
+	return SaveRenderedMeshToStaticMesh(
+		AssetPathAndName, RoadMaterial, GetComponentTransform(),
 		bConvertToActorLocalSpace, bReplaceExistingAsset, bSaveAsset);
 }
 #endif

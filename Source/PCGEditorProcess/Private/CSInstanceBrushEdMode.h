@@ -23,6 +23,7 @@ protected:
 	virtual AActor* GetBrushTargetActor() const override;
 	virtual FCSBrushSettings GetBrushSettings() const override;
 	virtual void CommitSamples(const TArray<FCSBrushSample>& Samples) override;
+	virtual void ClearBrushTarget() override;
 	virtual bool IsTooCloseToCommitted(const FVector& Location, float MinSpacingSq) const override;
 	virtual bool IsPointAllowed(const FVector& Location) const override;
 	virtual bool IsReadyToPaint() const override;

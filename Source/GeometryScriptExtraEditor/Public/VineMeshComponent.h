@@ -50,7 +50,7 @@ public:
 
 #if WITH_EDITOR
 	/** Reads the rendered vine mesh back to the CPU and saves it as a StaticMesh asset via the
-	 *  shared CSGpuMeshSave path. Vine vertices are already in world space, so
+	 *  shared CSGpuMeshConvert path. Vine vertices are already in world space, so
 	 *  bConvertToActorLocalSpace defaults to false. Editor only. */
 	UStaticMesh* SaveToStaticMesh(const FString& AssetPathAndName = TEXT(""), bool bReplaceExistingAsset = true,
 		bool bSaveAsset = false, bool bConvertToActorLocalSpace = false);

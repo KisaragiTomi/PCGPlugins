@@ -2,7 +2,7 @@
 
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 
-#include "CSGpuMeshSave.h"
+#include "CSGpuMeshComponent.h"
 #include "ComputeShaderMeshGenerator.h"
 
 #include "Components/BoxComponent.h"
@@ -53,7 +53,7 @@ bool FCSGpuMeshDescriptionSharedVertexAutomationTest::RunTest(const FString& Par
 
 	FMeshDescription MeshDescription;
 	if (!TestTrue(TEXT("Shared converter builds MeshDescription"),
-		CSGpuMeshSave::BuildGpuMeshDescription(MeshData, ActorTransform, true, MeshDescription)))
+		UCSGpuMeshComponent::BuildGpuMeshDescription(MeshData, ActorTransform, true, MeshDescription)))
 	{
 		return false;
 	}

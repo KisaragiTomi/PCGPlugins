@@ -14,8 +14,7 @@
 
 class AActor;
 class ALandscape;
-class UCSDirectTriangleMeshComponent;
-class UCSMeshGeneratorDebugComponent;
+class UCSDisplayComponent;
 class UHierarchicalInstancedStaticMeshComponent;
 class UMaterialInterface;
 class UStaticMesh;
@@ -449,19 +448,12 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator")
 	TObjectPtr<UBoxComponent> GeneratorBounds;
 
-	/** Draws GPU triangle soup submitted via SubmitBoxSceneTrianglesToRenderPipeline directly through
-	 *  the render pipeline (no readback, no DynamicMesh). Uses an absolute (world-origin) transform so
-	 *  the world-space triangle positions render 1:1. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator")
-	TObjectPtr<UCSDirectTriangleMeshComponent> DirectMeshComponent;
-
-	/** GPU-only visualization for surface voxels and cache cells. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Debug")
-	TObjectPtr<UCSMeshGeneratorDebugComponent> MeshGeneratorDebugComponent;
-
-	/** Dedicated GPU triangle component used by the surface-triangle debug entry point. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Debug")
-	TObjectPtr<UCSDirectTriangleMeshComponent> DebugTriangleComponent;
+	/** 统一的 GPU 内容显示组件：场景三角汤（可回读存盘）、体素方向线/点、体素孤立面片，
+	 *  一个实例同时显示一种，生命周期由各显示入口的 Lifetime 决定。
+	 *  以绝对（世界原点）变换渲染，世界空间数据 1:1 画出。
+	 *  需要多组内容并存时，在本 Actor 上追加一个同类实例即可。 */
+	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator")
+	TObjectPtr<UCSDisplayComponent> DisplayComponent;
 
 
 
@@ -804,7 +796,7 @@ public:
 
 	/** Directly submits the bounded scene surface triangles to the render pipeline: extracts the
 	 *  GPU triangle soup for GeneratorBounds and draws it every frame through a custom scene proxy
-	 *  (UCSDirectTriangleMeshComponent / FCSDirectTriangleMeshSceneProxy), with vertex/index data
+	 *  (UCSDisplayComponent / FCSDisplayTriangleSceneProxy), with vertex/index data
 	 *  living only on the GPU — no CPU readback and no UDynamicMesh. Material is applied on the draw
 	 *  (null keeps the component's current material). MaxDirectTriangles bounds the persistent GPU
 	 *  buffers (the actual count is discovered on the GPU and never read back, so this cap sizes the
@@ -814,10 +806,6 @@ public:
 	bool SubmitBoxSceneTrianglesToRenderPipeline(UMaterialInterface* Material = nullptr,
 		int32 MaxDirectTriangles = 500000,
 		float ReferenceFilterDistance = 0.0f);
-
-	/** Returns the direct-render component that draws the submitted GPU triangle soup. */
-	UFUNCTION(BlueprintPure, Category = "CS Mesh Generator|Mesh")
-	UCSDirectTriangleMeshComponent* GetDirectMeshComponent() const { return DirectMeshComponent; }
 
 	/** Saves the current direct GPU mesh as a StaticMesh asset. Editor only; returns null otherwise. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh")
@@ -943,9 +931,6 @@ protected:
 	/** Releases transient GPU resources when the actor leaves play. */
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
-	/** Clears the dedicated triangle debug component after its requested lifetime. */
-	void ClearDebugTriangleComponent();
-
 	/** Returns the current GeneratorBounds component as a valid world-space box when possible. */
 	FBox GetGeneratorBoundsWorldBox() const;
 	/** Stores CPU triangle data into generated-data texture targets and updates LastTriangleTextureData. */
@@ -958,6 +943,4 @@ protected:
 	void ClearSurfaceVoxelTextureData();
 	/** Gets or allocates a transient generated-data render target with the requested size. */
 	UTextureRenderTarget2D* GetOrCreateGeneratedDataRenderTarget(TObjectPtr<UTextureRenderTarget2D>& RenderTarget, const TCHAR* BaseName, int32 Width, int32 Height);
-
-	FTimerHandle DebugTriangleClearTimerHandle;
 };

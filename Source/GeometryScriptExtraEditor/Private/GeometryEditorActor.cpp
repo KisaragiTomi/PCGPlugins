@@ -40,7 +40,7 @@
 #include "VineMeshComponent.h"
 #include "CSGpuDebugDraw.h"
 #include "CSGpuMeshSceneProxy.h"
-#include "CSGpuMeshSave.h"
+#include "CSGpuMeshComponent.h"
 #include "SceneInterface.h"
 #include "Engine/Engine.h"
 #include "Materials/MaterialRenderProxy.h"
@@ -3882,8 +3882,8 @@ FPrimitiveSceneProxy* UVineMeshComponent::CreateSceneProxy()
 UStaticMesh* UVineMeshComponent::SaveToStaticMesh(const FString& AssetPathAndName, bool bReplaceExistingAsset,
 	bool bSaveAsset, bool bConvertToActorLocalSpace)
 {
-	return CSGpuMeshSave::SaveGpuMeshComponentToStaticMesh(
-		this, AssetPathAndName, VineMaterial, GetComponentTransform(),
+	return SaveRenderedMeshToStaticMesh(
+		AssetPathAndName, VineMaterial, GetComponentTransform(),
 		bConvertToActorLocalSpace, bReplaceExistingAsset, bSaveAsset);
 }
 #endif
@@ -4056,20 +4056,20 @@ void AVineContainer::ImportFoliageToTransformArray(UFoliageType* InFoliageType)
 
 	TArray<FTransform> Transforms;
 	GetAllFoliageInstanceTransforms(GetWorld(), InFoliageType, Transforms);
-	UInstancedStaticMeshComponent* DisplayComponent = nullptr;
-	if (!ResolveVineReferenceComponent(this, InFoliageType, DisplayComponent) || !DisplayComponent)
+	UInstancedStaticMeshComponent* FoliageDisplayComponent = nullptr;
+	if (!ResolveVineReferenceComponent(this, InFoliageType, FoliageDisplayComponent) || !FoliageDisplayComponent)
 	{
 		return;
 	}
 
 	Modify();
-	DisplayComponent->Modify();
+	FoliageDisplayComponent->Modify();
 	if (!Transforms.IsEmpty())
 	{
-		DisplayComponent->AddInstances(Transforms, false, true, false);
+		FoliageDisplayComponent->AddInstances(Transforms, false, true, false);
 	}
 	MarkPackageDirty();
-	RefreshVineDisplayComponent(DisplayComponent);
+	RefreshVineDisplayComponent(FoliageDisplayComponent);
 
 	for (TActorIterator<AInstancedFoliageActor> It(GetWorld()); It; ++It)
 	{
@@ -4083,16 +4083,16 @@ void AVineContainer::ExportTransformArrayToFoliage(UFoliageType* InFoliageType)
 	if (InFoliageType == nullptr)
 		return;
 
-	UInstancedStaticMeshComponent* DisplayComponent = nullptr;
-	if (!ResolveVineReferenceComponent(this, InFoliageType, DisplayComponent) || !DisplayComponent)
+	UInstancedStaticMeshComponent* FoliageDisplayComponent = nullptr;
+	if (!ResolveVineReferenceComponent(this, InFoliageType, FoliageDisplayComponent) || !FoliageDisplayComponent)
 		return;
 
 	TArray<FTransform> InstanceTransforms;
-	GetVineInstanceTransforms(DisplayComponent, InstanceTransforms);
+	GetVineInstanceTransforms(FoliageDisplayComponent, InstanceTransforms);
 
 	if (InstanceTransforms.IsEmpty())
 	{
-		RefreshVineDisplayComponent(DisplayComponent);
+		RefreshVineDisplayComponent(FoliageDisplayComponent);
 		return;
 	}
 
@@ -4133,10 +4133,10 @@ void AVineContainer::ExportTransformArrayToFoliage(UFoliageType* InFoliageType)
 		}
 	}
 
-	DisplayComponent->Modify();
-	DisplayComponent->ClearInstances();
+	FoliageDisplayComponent->Modify();
+	FoliageDisplayComponent->ClearInstances();
 	MarkPackageDirty();
-	RefreshVineDisplayComponent(DisplayComponent);
+	RefreshVineDisplayComponent(FoliageDisplayComponent);
 	RefreshFoliageType(GetWorld(), InFoliageType);
 }
 
@@ -4160,17 +4160,9 @@ bool AVineContainer::VisVineGPUInternal()
 		VV.CurveControl = NewObject<UCurveLinearColor>(this);
 	}
 
-	UDynamicMeshComponent* MeshComponent = GetDynamicMeshComponent();
-	if (!MeshComponent)
+	if (!VineGpuMesh)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] DynamicMeshComponent is null."));
-		return false;
-	}
-
-	UDynamicMesh* ContainerMesh = MeshComponent->GetDynamicMesh();
-	if (!ContainerMesh)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] Container dynamic mesh is null."));
+		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] Vine GPU mesh component is null."));
 		return false;
 	}
 
@@ -4192,65 +4184,26 @@ bool AVineContainer::VisVineGPUInternal()
 		return false;
 	}
 
-	// DispatchVVGPU_Voxel reads the geometry from ConcatenatedGPULines; these locals stay empty.
+	// The prepped line geometry stays GPU-resident, so the CPU-side input arrays the shared helper
+	// takes are empty — it reads everything from ConcatenatedGPULines.
 	TArray<FVector4f> PathPoints;
 	TArray<FVector4f> PathPointAxes;
 	TArray<FIntVector4> PathPointMeta;
 	TArray<FIntVector4> SegmentMeta;
-	double PrepareLinesMs = 0.0;
-	double BuildGPUInputMs = 0.0;
 
 	UE_LOG(LogTemp, Display, TEXT("[VineSCFused] GPU-resident lines: points=%d segments=%d"),
 		ConcatenatedGPULines.PointCount, ConcatenatedGPULines.SegmentCount);
 
-	TArray<FVector4f> OutVertices;
-	TArray<FVector2f> OutUVs;
-	TArray<uint32> OutIndices;
 	const EVisVineGPUDebugStage DebugStage = SplineDebug.DebugStage;
 	const bool bWantStageDraw = SplineDebug.bDrawDebugLines && DebugStage != EVisVineGPUDebugStage::None;
+	uint32 LeafVertexCount = 0;
+	uint32 LeafIndexCount = 0;
 
-	const double DispatchStartSeconds = FPlatformTime::Seconds();
-	if (!DispatchVVGPU_Voxel(
-		PathPoints,
-		PathPointAxes,
-		PathPointMeta,
-		SegmentMeta,
-		true,
-		uint32(FMath::Max(VV.VisVineGPUTubeSegments, 3)),
-		VV.CircleScale,
-		VV.LineScale,
-		VV.UVLengthScale,
-		VV.VinesOffset,
-		0.1f,
-		VV.VisVineGPUPostProjectionSmoothIterations,
-		VV.VisVineGPUPostProjectionSmoothKernelRadius,
-		VV.VisVineGPUPostProjectionSmallSmoothIterations,
-		VV.VisVineGPUPostProjectionSmoothAngleStrength,
-		VV.bVisVineGPUResampleSurfaceEnabled,
-		VV.ResampleLength,
-		VV.CurlNoiseScale / 10.0f,
-		VV.CurlNoiseFre,
-		VV.PerlinNoiseScale,
-		VV.PerlinNoiseFre,
-		VV.VisVineGPUNoiseIterations,
-		EmptySurfaceVoxelData,
-		OutVertices,
-		OutUVs,
-		OutIndices,
-		DebugStage,
-		&ConcatenatedGPULines,
-		LastSurfaceVoxelGPUBuffers.IsValid() ? &LastSurfaceVoxelGPUBuffers : nullptr))
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] Voxel GPU dispatch/readback failed."));
-		return false;
-	}
-	const double DispatchMs = (FPlatformTime::Seconds() - DispatchStartSeconds) * 1000.0;
-
-	// M1 parallel path: the DynamicMesh path above stays authoritative and untouched. ADDITIONALLY,
-	// feed the SAME inputs through the shared CPU-prep helper and hand the resulting bundle to the
-	// GPU-resident leaf, which builds + draws the tube vine entirely on the GPU (base-stream
-	// permutation, no readback). The two representations render side by side for visual comparison.
-	if (VineGpuMesh)
+	// The GPU-resident leaf is the vine. The shared vine compute passes emit straight into its
+	// persistent base streams (positions / tangents / texcoords / colors / indices) plus the
+	// indirect args and mesh counters that drive the draw, so no vertex, index or count ever
+	// comes back to the CPU. Save Mesh reads the streams back once, on demand.
+	const double BuildLeafStartSeconds = FPlatformTime::Seconds();
 	{
 		FVineBuildInput LeafInput = VineLeaf_BuildVineBuildInput(
 			PathPoints,
@@ -4279,130 +4232,31 @@ bool AVineContainer::VisVineGPUInternal()
 			bWantStageDraw ? DebugStage : EVisVineGPUDebugStage::None,
 			&ConcatenatedGPULines,
 			LastSurfaceVoxelGPUBuffers.IsValid() ? &LastSurfaceVoxelGPUBuffers : nullptr);
-		if (LeafInput.bValid)
+		if (!LeafInput.bValid)
 		{
-			LeafInput.DebugLineColor = SplineDebug.SplineColor;
-			const uint32 LeafVertexCount = LeafInput.OutputVertexCount;
-			const uint32 LeafIndexCount = LeafInput.OutputIndexCount;
-			// Mirror the legacy DynamicMeshComponent's slot-0 material onto the leaf so the base-stream
-			// render matches the old path instead of the gray default-material fallback (M1 verification).
-			if (UDynamicMeshComponent* VineDMC = GetDynamicMeshComponent()) VineGpuMesh->VineMaterial = VineDMC->GetMaterial(0);
-			VineGpuMesh->SetBuildInput(MoveTemp(LeafInput));
-			UE_LOG(LogTemp, Log, TEXT("[VisVineGPU] GPU-resident vine leaf built (parallel). Verts=%u Indices=%u"),
-				LeafVertexCount, LeafIndexCount);
+			UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] Vine build input was invalid; nothing generated."));
+			return false;
 		}
-		else
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] GPU-resident vine leaf input was invalid; leaf not rebuilt."));
-		}
+
+		LeafInput.DebugLineColor = SplineDebug.SplineColor;
+		LeafVertexCount = LeafInput.OutputVertexCount;
+		LeafIndexCount = LeafInput.OutputIndexCount;
+		// The vine surface material still lives on the container's DynamicMeshComponent slot 0,
+		// which is where the actor exposes it; mirror it onto the leaf that now does the drawing.
+		if (UDynamicMeshComponent* VineDMC = GetDynamicMeshComponent()) VineGpuMesh->VineMaterial = VineDMC->GetMaterial(0);
+		VineGpuMesh->SetBuildInput(MoveTemp(LeafInput));
 	}
+	const double BuildLeafMs = (FPlatformTime::Seconds() - BuildLeafStartSeconds) * 1000.0;
 
 	// The selected center-line stage is rendered directly from GPU buffers by VineGpuMesh.
 	// Clear any persistent CPU DrawDebug lines left by an older generation.
 	ClearDebugVineSplineActor();
 
-	// On the fused path the CPU-side SegmentMeta array is never populated (the prepped line
-	// geometry stays GPU-resident), but RecomputeVineOutputUVsFromGeneratedLength below needs
-	// the within-line consecutive point pairs to accumulate the axial V (it resets V at line
-	// boundaries, where no segment exists). Reconstruct that connectivity from the output tube
-	// topology: a segment (A, A+1) exists iff a triangle spans rings A and A+1
-	// (pointIndex = vertexIndex / ProfileCount). Without this the recompute sees all-(-1)
-	// segment lengths and writes V=0 everywhere.
-	if (SegmentMeta.Num() == 0)
-	{
-		const int32 ProfileCount = 3;
-		const int32 FusedPointCount = OutVertices.Num() / ProfileCount;
-		if (FusedPointCount > 1 && OutIndices.Num() >= 3)
-		{
-			TArray<bool> HasSegment;
-			HasSegment.Init(false, FusedPointCount - 1);
-			for (int32 i = 0; i + 2 < OutIndices.Num(); i += 3)
-			{
-				const int32 P0 = int32(OutIndices[i] / uint32(ProfileCount));
-				const int32 P1 = int32(OutIndices[i + 1] / uint32(ProfileCount));
-				const int32 P2 = int32(OutIndices[i + 2] / uint32(ProfileCount));
-				const int32 PMin = FMath::Min3(P0, P1, P2);
-				const int32 PMax = FMath::Max3(P0, P1, P2);
-				if (PMax == PMin + 1 && HasSegment.IsValidIndex(PMin)) HasSegment[PMin] = true;
-			}
-			SegmentMeta.Reserve(FusedPointCount - 1);
-			for (int32 A = 0; A < HasSegment.Num(); ++A)
-				if (HasSegment[A]) SegmentMeta.Add(FIntVector4(A, A + 1, 0, 0));
-		}
-	}
-
-	const double RecomputeUVStartSeconds = FPlatformTime::Seconds();
-	RecomputeVineOutputUVsFromGeneratedLength(OutVertices, PathPoints, SegmentMeta, 3u, VV, OutUVs);
-	const double RecomputeUVMs = (FPlatformTime::Seconds() - RecomputeUVStartSeconds) * 1000.0;
-
-	const int32 MaterialID = 0;
-	const double BuildDynamicMeshStartSeconds = FPlatformTime::Seconds();
-	UDynamicMesh* VineMesh = BuildDynamicMeshFromGPUVineOutput(this, OutVertices, OutUVs, OutIndices, MaterialID, true);
-	if (!VineMesh || VineMesh->GetTriangleCount() <= 0)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] GPU output produced no valid triangles."));
-		return false;
-	}
-	const double BuildDynamicMeshMs = (FPlatformTime::Seconds() - BuildDynamicMeshStartSeconds) * 1000.0;
-
-	const double AppendStartSeconds = FPlatformTime::Seconds();
-	int32 PreviousMaxTriangleID = 0;
-	ContainerMesh->ProcessMesh([&](const FDynamicMesh3& Mesh)
-	{
-		PreviousMaxTriangleID = Mesh.MaxTriangleID();
-	});
-
-	FGeometryScriptAppendMeshOptions AppendOptions;
-	UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(
-		ContainerMesh,
-		VineMesh,
-		FTransform::Identity,
-		false,
-		AppendOptions);
-
-	ContainerMesh->EditMesh([&](FDynamicMesh3& Mesh)
-	{
-		if (!Mesh.HasAttributes())
-		{
-			Mesh.EnableAttributes();
-		}
-
-		if (!Mesh.Attributes()->HasMaterialID())
-		{
-			Mesh.Attributes()->EnableMaterialID();
-		}
-
-		UE::Geometry::FDynamicMeshMaterialAttribute* MaterialIDs = Mesh.Attributes()->GetMaterialID();
-		for (const int32 TriangleID : Mesh.TriangleIndicesItr())
-		{
-			if (TriangleID >= PreviousMaxTriangleID)
-			{
-				MaterialIDs->SetNewValue(TriangleID, MaterialID);
-			}
-		}
-	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
-
-	TransformDynamicMeshToLocalSpace(ContainerMesh, MeshComponent->GetComponentTransform());
-	MeshComponent->NotifyMeshUpdated();
-	MeshComponent->UpdateBounds();
-	MeshComponent->MarkRenderTransformDirty();
-	MeshComponent->MarkRenderStateDirty();
-	const double AppendMs = (FPlatformTime::Seconds() - AppendStartSeconds) * 1000.0;
-
-	UE_LOG(LogTemp, Display,
-		TEXT("[VisVineGPUTiming] tube prepareLines=%.3f ms buildGPUInput=%.3f ms dispatchReadback=%.3f ms recomputeUV=%.3f ms buildDynamicMesh=%.3f ms appendAndNotify=%.3f ms"),
-		PrepareLinesMs,
-		BuildGPUInputMs,
-		DispatchMs,
-		RecomputeUVMs,
-		BuildDynamicMeshMs,
-		AppendMs);
-
-	UE_LOG(LogTemp, Log, TEXT("[VisVineGPU] Appended tube vine mesh. Lines=%d Vertices=%d Indices=%d Triangles=%d"),
+	UE_LOG(LogTemp, Display, TEXT("[VisVineGPUTiming] tube buildLeaf=%.3f ms"), BuildLeafMs);
+	UE_LOG(LogTemp, Log, TEXT("[VisVineGPU] Built tube vine on the GPU. Lines=%d Vertices=%u Indices=%u"),
 		Lines.Num(),
-		OutVertices.Num(),
-		OutIndices.Num(),
-		VineMesh->GetTriangleCount());
+		LeafVertexCount,
+		LeafIndexCount);
 	return true;
 }
 
@@ -5096,11 +4950,9 @@ int32 AVineContainer::DrawDebugCachedSurfaceTriangles(float Duration)
 
 void AVineContainer::SaveStaticmesh()
 {
-	UDynamicMeshComponent* MeshComponent = GetDynamicMeshComponent();
-	UDynamicMesh* TargetMesh = MeshComponent ? MeshComponent->GetDynamicMesh() : nullptr;
-	if (!TargetMesh || TargetMesh->GetTriangleCount() == 0)
+	if (!VineGpuMesh)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[VineContainer] SaveStaticmesh skipped: no generated DynamicMesh on %s."), *GetActorNameOrLabel());
+		UE_LOG(LogTemp, Warning, TEXT("[VineContainer] SaveStaticmesh skipped: no vine GPU mesh on %s."), *GetActorNameOrLabel());
 		return;
 	}
 
@@ -5132,16 +4984,23 @@ void AVineContainer::SaveStaticmesh()
 	}
 	const FString AssetPathAndName = UPackageTools::SanitizePackageName(AssetFolderPath / AssetName);
 
-	UStaticMesh* NewStaticMesh = UGeometryGeneral::SaveDynamicMeshToStaticMesh(
-		TargetMesh,
+	// The vine only ever exists as GPU streams now, so this is the one point where it comes back:
+	// the shared base reads the rendered streams once and converts them straight to a StaticMesh.
+	//
+	// The leaf itself is pinned to an identity world transform, so its own component transform is
+	// useless for the local-space bake. Pass the ACTOR transform instead — it is what the spawned
+	// StaticMeshActor below is placed at, so the asset ends up actor-local exactly like the mesh
+	// the DynamicMesh path used to store, rather than pinned to world coordinates.
+	UStaticMesh* NewStaticMesh = VineGpuMesh->SaveRenderedMeshToStaticMesh(
 		AssetPathAndName,
-		MeshComponent,
+		VineGpuMesh->VineMaterial,
+		GetActorTransform(),
 		true,
-		false,
+		true,
 		true);
 	if (!NewStaticMesh)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[VineContainer] SaveStaticmesh failed: could not create %s."), *AssetPathAndName);
+		UE_LOG(LogTemp, Warning, TEXT("[VineContainer] SaveStaticmesh failed: could not create %s (no rendered vine geometry?)."), *AssetPathAndName);
 		return;
 	}
 
@@ -5164,7 +5023,7 @@ void AVineContainer::SaveStaticmesh()
 
 	AStaticMeshActor* SpawnedStaticMeshActor = World->SpawnActor<AStaticMeshActor>(
 		AStaticMeshActor::StaticClass(),
-		MeshComponent->GetComponentTransform(),
+		GetActorTransform(),
 		SpawnParams);
 	if (!SpawnedStaticMeshActor)
 	{
@@ -6011,9 +5870,7 @@ static void DeleteSpaceColonizationReadbackArray(TArray<FRHIGPUBufferReadback*>&
 }
 
 static void DeleteSpaceColonizationCSReadbacks(
-	FRHIGPUBufferReadback*& TargetReadback,
-	FRHIGPUBufferReadback*& State0Readback,
-	FRHIGPUBufferReadback*& State1Readback,
+	FRHIGPUBufferReadback*& LineCountsReadback,
 	FRHIGPUBufferReadback*& InitialTargetDebugReadback,
 	FRHIGPUBufferReadback*& InitialState0DebugReadback,
 	FRHIGPUBufferReadback*& InitialState1DebugReadback,
@@ -6024,16 +5881,12 @@ static void DeleteSpaceColonizationCSReadbacks(
 	TArray<FRHIGPUBufferReadback*>& IterationState0DebugReadbacks,
 	TArray<FRHIGPUBufferReadback*>& IterationState1DebugReadbacks)
 {
-	delete TargetReadback;
-	delete State0Readback;
-	delete State1Readback;
+	delete LineCountsReadback;
 	delete InitialTargetDebugReadback;
 	delete InitialState0DebugReadback;
 	delete InitialState1DebugReadback;
 	delete NeighborCountsDebugReadback;
-	TargetReadback = nullptr;
-	State0Readback = nullptr;
-	State1Readback = nullptr;
+	LineCountsReadback = nullptr;
 	InitialTargetDebugReadback = nullptr;
 	InitialState0DebugReadback = nullptr;
 	InitialState1DebugReadback = nullptr;
@@ -6058,9 +5911,7 @@ static bool AreSpaceColonizationReadbacksReady(const TArray<FRHIGPUBufferReadbac
 }
 
 static bool AreSpaceColonizationCSReadbacksReady(
-	FRHIGPUBufferReadback* TargetReadback,
-	FRHIGPUBufferReadback* State0Readback,
-	FRHIGPUBufferReadback* State1Readback,
+	FRHIGPUBufferReadback* LineCountsReadback,
 	FRHIGPUBufferReadback* InitialTargetDebugReadback,
 	FRHIGPUBufferReadback* InitialState0DebugReadback,
 	FRHIGPUBufferReadback* InitialState1DebugReadback,
@@ -6071,10 +5922,8 @@ static bool AreSpaceColonizationCSReadbacksReady(
 	const TArray<FRHIGPUBufferReadback*>& IterationState0DebugReadbacks,
 	const TArray<FRHIGPUBufferReadback*>& IterationState1DebugReadbacks)
 {
-	const bool bResultReady = TargetReadback && TargetReadback->IsReady()
-		&& State0Readback && State0Readback->IsReady()
-		&& State1Readback && State1Readback->IsReady();
-	// Production collects no debug readbacks; only the three result buffers must be ready.
+	const bool bResultReady = LineCountsReadback && LineCountsReadback->IsReady();
+	// Production collects no debug readbacks; only the line-counts buffer must be ready.
 	if constexpr (bSpaceColonizationStepLogs)
 	{
 		return bResultReady
@@ -6109,15 +5958,9 @@ static bool BuildSpaceColonizationQueueCSImpl(
 	const TArray<float>& TargetPointScales,
 	const TArray<float>& StartSourceScales,
 	float ScatterDistance,
-	TArray<FVector4f>& OutGPUPathPoints,
-	TArray<FVector>& OutTargetLocations,
-	TArray<FSpaceColonizationAttribute>& OutSCAttributes,
 	FVineSCGPUBuffers* OutGPUBuffers)
 {
 	GV_TIME_SCOPE(TEXT("SpaceColonizationCS.Queue.Total"));
-	OutGPUPathPoints.Reset();
-	OutTargetLocations.Reset();
-	OutSCAttributes.Reset();
 
 	const int32 SourceCount = SourceTransforms.Num();
 	const int32 TargetCount = InTargetTransforms.Num();
@@ -6169,27 +6012,22 @@ static bool BuildSpaceColonizationQueueCSImpl(
 		const uint32 StateReadbackBytes = uint32(StateReadbackBytes64);
 		const uint32 UIntReadbackBytes = uint32(UIntReadbackBytes64);
 		const uint32 NeighborIndexCount = uint32(NeighborIndexCount64);
-		FRHIGPUBufferReadback* TargetReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_TargetReadback"));
-		FRHIGPUBufferReadback* State0Readback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_State0Readback"));
-		FRHIGPUBufferReadback* State1Readback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_State1Readback"));
-		// GPU line-building (Increment B) validation counters: [lineCount, totalPoints, totalSegments, 0].
+		// The only result the CPU still needs: [lineCount, totalPoints, totalSegments, 0], which sizes
+		// the downstream VisVine buffers and dispatches. The growth state itself (target positions,
+		// per-node flags) stays on the GPU — nothing downstream reads it.
 		FRHIGPUBufferReadback* LineCountsReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_LineCounts"));
 		TArray<uint32> LineCountsData;
 		LineCountsData.SetNumZeroed(4);
 		const uint32 LineCountsReadbackBytes = uint32(sizeof(uint32) * 4);
 		// Stage B2 emit-kernel output. Buffer is over-allocated to the worst-case bound
 		// (each of <=TargetCount lines has <= SC_MAX_BACKTRACK+1 points); only [0,totalPoints)
-		// is written compactly. Readback is capped to keep the validation copy small.
+		// is written compactly.
 		constexpr int32 SpaceColonizationMaxBacktrack = 100;
 		const uint32 PathPointCapacity = uint32(FMath::Min<int64>(int64(TargetCount) * int64(SpaceColonizationMaxBacktrack + 1), 4000000));
 		const uint32 SegmentCapacity = PathPointCapacity;
 		// Resample can grow lines; keep a generous compact capacity for the post-resample set.
 		const uint32 PathPoint2Capacity = PathPointCapacity;
 		const uint32 Segment2Capacity = PathPointCapacity;
-		const uint32 PathPointsReadbackCount = FMath::Min<uint32>(PathPointCapacity, 65536u);
-		const uint32 PathPointsReadbackBytes = uint32(sizeof(FVector4f) * uint64(PathPointsReadbackCount));
-		FRHIGPUBufferReadback* PathPointsReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_PathPoints"));
-		TArray<FVector4f> PathPointsData;
 		// Trip A: when requested, extract the prepped output buffers as pooled (external)
 		// RDG buffers inside the render command below so they outlive the graph and can be
 		// handed to VisVine. Assigned on the render thread; valid after FlushRenderingCommands.
@@ -6204,7 +6042,7 @@ static bool BuildSpaceColonizationQueueCSImpl(
 		// Debug readbacks exist solely to feed the [SpaceColonizationStep] validation logs.
 		// In production (bSpaceColonizationStepLogs == false) they stay null and every
 		// debug copy-pass / lock below is compiled out, so the GPU path only pays for the
-		// three result readbacks (Target/State0/State1).
+		// four-uint line-counts readback.
 		FRHIGPUBufferReadback* InitialTargetDebugReadback = nullptr;
 		FRHIGPUBufferReadback* InitialState0DebugReadback = nullptr;
 		FRHIGPUBufferReadback* InitialState1DebugReadback = nullptr;
@@ -6242,7 +6080,7 @@ static bool BuildSpaceColonizationQueueCSImpl(
 			GV_TIME_SCOPE(TEXT("SpaceColonizationCS.Queue.DispatchAndFlush"));
 			ENQUEUE_RENDER_COMMAND(SpaceColonizationQueueCS)(
 				[SourcePositions = MoveTemp(SourcePositions), InitialTargetPositions = MoveTemp(InitialTargetPositions),
-				 TargetReadback, State0Readback, State1Readback, TargetReadbackBytes, StateReadbackBytes,
+				 TargetReadbackBytes, StateReadbackBytes,
 				 UIntReadbackBytes, InitialTargetDebugReadback, InitialState0DebugReadback, InitialState1DebugReadback,
 				 NeighborCountsDebugReadback, ResetProposalOwnerDebugReadbacks, ProposalOwnerDebugReadbacks,
 				 IterationTargetDebugReadbacks, IterationState0DebugReadbacks, IterationState1DebugReadbacks,
@@ -6250,7 +6088,7 @@ static bool BuildSpaceColonizationQueueCSImpl(
 				 MaxNeighborsPerTarget, NeighborIndexCount, BackGrowCount, ForkTaperForkOrdinal,
 				 LineCountsReadback, LineCountsReadbackBytes,
 				 EmitTargetPointScales = MoveTemp(EmitTargetPointScales), EmitStartSourceScales = MoveTemp(EmitStartSourceScales),
-				 PathPointsReadback, PathPointsReadbackBytes, PathPointCapacity, SegmentCapacity,
+				 PathPointCapacity, SegmentCapacity,
 				 ResampleLength, PathPoint2Capacity, Segment2Capacity,
 				 EmitCurveLUT = MoveTemp(EmitCurveLUT), CurveLUTSize,
 				 ScatterDistance,
@@ -6680,12 +6518,6 @@ static bool BuildSpaceColonizationQueueCSImpl(
 
 					// The resampled counts (post-resample) drive the readback slice.
 					AddEnqueueCopyPass(GraphBuilder, LineCountsReadback, NewCountsBuffer, LineCountsReadbackBytes);
-					AddEnqueueCopyPass(GraphBuilder, PathPointsReadback, PathPoints2Buffer, PathPointsReadbackBytes);
-
-					AddEnqueueCopyPass(GraphBuilder, TargetReadback, TargetBuffer, TargetReadbackBytes);
-					AddEnqueueCopyPass(GraphBuilder, State0Readback, State0Buffer, StateReadbackBytes);
-					AddEnqueueCopyPass(GraphBuilder, State1Readback, State1Buffer, StateReadbackBytes);
-
 					GraphBuilder.Execute();
 					bRenderWorkQueued = true;
 				});
@@ -6696,9 +6528,7 @@ static bool BuildSpaceColonizationQueueCSImpl(
 		if (!bRenderWorkQueued)
 		{
 			DeleteSpaceColonizationCSReadbacks(
-				TargetReadback,
-				State0Readback,
-				State1Readback,
+				LineCountsReadback,
 				InitialTargetDebugReadback,
 				InitialState0DebugReadback,
 				InitialState1DebugReadback,
@@ -6708,38 +6538,26 @@ static bool BuildSpaceColonizationQueueCSImpl(
 				IterationTargetDebugReadbacks,
 				IterationState0DebugReadbacks,
 				IterationState1DebugReadbacks);
-			delete LineCountsReadback;
-			LineCountsReadback = nullptr;
-			delete PathPointsReadback;
-			PathPointsReadback = nullptr;
 			return false;
 		}
 
-		TArray<FVector4f> TargetPositionData;
-		TArray<FSpaceColonizationGPUState4> State0Data;
-		TArray<FSpaceColonizationGPUState4> State1Data;
-		TargetPositionData.SetNumZeroed(TargetCount);
-		State0Data.SetNumZeroed(TargetCount);
-		State1Data.SetNumZeroed(TargetCount);
 		bool bReadbackSucceeded = false;
 
 		{
 			GV_TIME_SCOPE(TEXT("SpaceColonizationCS.Queue.ReadbackAndFlush"));
 			ENQUEUE_RENDER_COMMAND(SpaceColonizationQueueCSReadback)(
-				[TargetReadback, State0Readback, State1Readback, InitialTargetDebugReadback, InitialState0DebugReadback, InitialState1DebugReadback,
+				[InitialTargetDebugReadback, InitialState0DebugReadback, InitialState1DebugReadback,
 				 NeighborCountsDebugReadback, ResetProposalOwnerDebugReadbacks, ProposalOwnerDebugReadbacks, IterationTargetDebugReadbacks,
-				 IterationState0DebugReadbacks, IterationState1DebugReadbacks, TargetReadbackBytes, StateReadbackBytes, UIntReadbackBytes, LineCountsReadback, LineCountsReadbackBytes, &LineCountsData, PathPointsReadback, PathPointsReadbackBytes, &PathPointsData,
-				 TargetCount, &TargetPositionData, &State0Data, &State1Data, &CSDebugData, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList) mutable
+				 IterationState0DebugReadbacks, IterationState1DebugReadbacks, TargetReadbackBytes, StateReadbackBytes, UIntReadbackBytes, LineCountsReadback, LineCountsReadbackBytes, &LineCountsData,
+				 TargetCount, &CSDebugData, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList) mutable
 				{
-					if (!TargetReadback || !State0Readback || !State1Readback)
+					if (!LineCountsReadback)
 					{
 						return;
 					}
 
 					if (!AreSpaceColonizationCSReadbacksReady(
-						TargetReadback,
-						State0Readback,
-						State1Readback,
+						LineCountsReadback,
 						InitialTargetDebugReadback,
 						InitialState0DebugReadback,
 						InitialState1DebugReadback,
@@ -6754,9 +6572,7 @@ static bool BuildSpaceColonizationQueueCSImpl(
 					}
 
 					if (!AreSpaceColonizationCSReadbacksReady(
-						TargetReadback,
-						State0Readback,
-						State1Readback,
+						LineCountsReadback,
 						InitialTargetDebugReadback,
 						InitialState0DebugReadback,
 						InitialState1DebugReadback,
@@ -6769,9 +6585,7 @@ static bool BuildSpaceColonizationQueueCSImpl(
 					{
 						UE_LOG(LogTemp, Warning, TEXT("[SpaceColonizationQueueCS] GPU readback was not ready after flush."));
 						DeleteSpaceColonizationCSReadbacks(
-							TargetReadback,
-							State0Readback,
-							State1Readback,
+							LineCountsReadback,
 							InitialTargetDebugReadback,
 							InitialState0DebugReadback,
 							InitialState1DebugReadback,
@@ -6784,13 +6598,8 @@ static bool BuildSpaceColonizationQueueCSImpl(
 						return;
 					}
 
-					bool bLockedAll =
-						LockSpaceColonizationReadbackToArray(TargetReadback, TargetReadbackBytes, TargetCount, TargetPositionData) &&
-						LockSpaceColonizationReadbackToArray(State0Readback, StateReadbackBytes, TargetCount, State0Data) &&
-						LockSpaceColonizationReadbackToArray(State1Readback, StateReadbackBytes, TargetCount, State1Data);
-
-					LockSpaceColonizationReadbackToArray(LineCountsReadback, LineCountsReadbackBytes, 4, LineCountsData);
-					LockSpaceColonizationReadbackToArray(PathPointsReadback, PathPointsReadbackBytes, int32(PathPointsReadbackBytes / sizeof(FVector4f)), PathPointsData);
+					const bool bLockedAll =
+						LockSpaceColonizationReadbackToArray(LineCountsReadback, LineCountsReadbackBytes, 4, LineCountsData);
 
 					CSDebugData.bInitialReadbackSucceeded =
 						LockSpaceColonizationReadbackToArray(InitialTargetDebugReadback, TargetReadbackBytes, TargetCount, CSDebugData.InitialTargetPositions) &&
@@ -6832,9 +6641,7 @@ static bool BuildSpaceColonizationQueueCSImpl(
 					}
 
 					DeleteSpaceColonizationCSReadbacks(
-						TargetReadback,
-						State0Readback,
-						State1Readback,
+						LineCountsReadback,
 						InitialTargetDebugReadback,
 						InitialState0DebugReadback,
 						InitialState1DebugReadback,
@@ -6850,38 +6657,15 @@ static bool BuildSpaceColonizationQueueCSImpl(
 			FlushRenderingCommands();
 		}
 
-		// GPU line-building (Increment B, Stage B1) validation: the GPU tree walk
-		// must produce the SAME line/point counts as the CPU tracer (anti-web check).
 		UE_LOG(LogTemp, Display, TEXT("[SpaceColonizationLinesCS] GPU lineCount=%u totalPoints=%u totalSegments=%u (Targets=%d)"),
 			LineCountsData.IsValidIndex(0) ? LineCountsData[0] : 0u,
 			LineCountsData.IsValidIndex(1) ? LineCountsData[1] : 0u,
 			LineCountsData.IsValidIndex(2) ? LineCountsData[2] : 0u,
 			TargetCount);
-		delete LineCountsReadback;
-		LineCountsReadback = nullptr;
-
-		// Slice the emit readback to the compact [0, totalPoints) range for validation.
-		{
-			const uint32 GPUTotalPoints = LineCountsData.IsValidIndex(1) ? LineCountsData[1] : 0u;
-			const int32 CopyCount = FMath::Min<int32>(int32(GPUTotalPoints), PathPointsData.Num());
-			OutGPUPathPoints.Reset();
-			OutGPUPathPoints.Append(PathPointsData.GetData(), FMath::Max(CopyCount, 0));
-			if (int32(GPUTotalPoints) > PathPointsData.Num())
-			{
-				UE_LOG(LogTemp, Warning, TEXT("[SpaceColonizationEmitCS] totalPoints=%u exceeds readback cap=%d; checksum is partial."), GPUTotalPoints, PathPointsData.Num());
-			}
-		}
-		delete PathPointsReadback;
-		PathPointsReadback = nullptr;
 
 		if (!bReadbackSucceeded)
 		{
 			return false;
-		}
-
-		{
-			GV_TIME_SCOPE(TEXT("SpaceColonizationCS.Queue.CopyResults"));
-			ConvertSpaceColonizationGPUStateToAttributes(TargetPositionData, State0Data, State1Data, OutTargetLocations, OutSCAttributes);
 		}
 
 		// Trip A: publish the GPU-resident prepped buffers + their compact counts.
@@ -6923,8 +6707,6 @@ TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales
 TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScalesInternal(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, FVineSCGPUBuffers* OutGPUBuffers)
 {
 	GV_TIME_SCOPE(TEXT("SpaceColonization.TotalCS"));
-	TArray<FVector> TargetLocations;
-	TArray<FSpaceColonizationAttribute> SCAttributes;
 	TArray<float> TargetPointScales;
 	TArray<float> StartSourceScales;
 	BuildSpaceColonizationScaleLookups(SourceTransforms, TargetTransforms, TargetPointScales, StartSourceScales);
@@ -6947,7 +6729,6 @@ TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales
 	}
 	// The GPU space-colonization pass emits the fully smoothed / resampled / scaled line geometry
 	// straight into OutGPUBuffers, which the fused VisVine path consumes. No CPU tree re-trace.
-	TArray<FVector4f> GPUPathPoints;
 	if (!BuildSpaceColonizationQueueCSImpl(
 		SourceTransforms,
 		TargetTransforms,
@@ -6963,9 +6744,6 @@ TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales
 		TargetPointScales,
 		StartSourceScales,
 		FMath::Max(CVarVineSCScatter.GetValueOnGameThread(), 0.0f),
-		GPUPathPoints,
-		TargetLocations,
-		SCAttributes,
 		OutGPUBuffers))
 	{
 		return {};

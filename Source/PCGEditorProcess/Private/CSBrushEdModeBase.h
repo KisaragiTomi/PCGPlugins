@@ -52,6 +52,8 @@ public:
 	virtual void Enter() override;
 	virtual void Exit() override;
 	virtual void AddReferencedObjects(FReferenceCollector& Collector) override;
+	/** Names the concrete mode, not the base, so a GC report points at the leaf that is active. */
+	virtual FString GetReferencerName() const override { return GetID().ToString(); }
 	virtual bool MouseMove(FEditorViewportClient* ViewportClient, FViewport* Viewport, int32 x, int32 y) override;
 	virtual bool CapturedMouseMove(FEditorViewportClient* ViewportClient, FViewport* Viewport, int32 x, int32 y) override;
 	virtual bool InputKey(FEditorViewportClient* ViewportClient, FViewport* Viewport, FKey Key, EInputEvent Event) override;
@@ -74,6 +76,9 @@ protected:
 
 	/** Hands a finished stroke to the target. Called once on mouse-up, never during the drag. */
 	virtual void CommitSamples(const TArray<FCSBrushSample>& Samples) = 0;
+
+	/** Drops the leaf's target. Called from Exit so a deactivated mode holds nothing of the level. */
+	virtual void ClearBrushTarget() = 0;
 
 	/** Spacing check against what the target already holds. Default: no committed set to check. */
 	virtual bool IsTooCloseToCommitted(const FVector& Location, float MinSpacingSq) const { return false; }

@@ -4,7 +4,7 @@
 
 #include "CSPointBrushActor.h"
 
-#include "CSMeshGeneratorDebugComponent.h"
+#include "CSDisplayComponent.h"
 
 #include "Engine/World.h"
 #include "RenderingThread.h"
@@ -55,7 +55,7 @@ bool FCSPointBrushBufferAutomationTest::RunTest(const FString& Parameters)
 	World->UpdateWorldComponents(true, false);
 	FlushRenderingCommands();
 
-	UCSMeshGeneratorDebugComponent* Debug = BrushActor->FindComponentByClass<UCSMeshGeneratorDebugComponent>();
+	UCSDisplayComponent* Debug = BrushActor->FindComponentByClass<UCSDisplayComponent>();
 	if (!TestNotNull(TEXT("Point debug component"), Debug)) return false;
 	TestFalse(TEXT("A fresh actor holds no GPU buffer"), BrushActor->HasPointBuffer());
 

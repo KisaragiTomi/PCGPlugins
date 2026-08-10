@@ -6,7 +6,7 @@
 #include "CSPointBrushActor.generated.h"
 
 class ACSPointBrushActor;
-class UCSMeshGeneratorDebugComponent;
+class UCSDisplayComponent;
 
 DECLARE_MULTICAST_DELEGATE_OneParam(FCSPointBrushEditorRequest, ACSPointBrushActor*);
 
@@ -196,7 +196,7 @@ private:
 	FBox ComputePaintedPointBounds() const;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Point Brush|Debug Draw", meta = (AllowPrivateAccess = "true"))
-	TObjectPtr<UCSMeshGeneratorDebugComponent> PointDebugComponent;
+	TObjectPtr<UCSDisplayComponent> PointDebugComponent;
 
 	/** GPU mirror of PaintedPoints. Not a UPROPERTY — it holds render resources. */
 	FCSGpuDebugPooledSource PointBuffers;

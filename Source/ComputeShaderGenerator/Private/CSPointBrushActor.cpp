@@ -1,6 +1,6 @@
 #include "CSPointBrushActor.h"
 
-#include "CSMeshGeneratorDebugComponent.h"
+#include "CSDisplayComponent.h"
 
 #include "Engine/World.h"
 #include "RenderGraphBuilder.h"
@@ -96,7 +96,7 @@ ACSPointBrushActor::ACSPointBrushActor()
 	USceneComponent* Root = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
 	SetRootComponent(Root);
 
-	PointDebugComponent = CreateDefaultSubobject<UCSMeshGeneratorDebugComponent>(TEXT("PointDebug"));
+	PointDebugComponent = CreateDefaultSubobject<UCSDisplayComponent>(TEXT("PointDebug"));
 	PointDebugComponent->SetupAttachment(Root);
 }
 
@@ -177,27 +177,26 @@ void ACSPointBrushActor::RefreshDebugDraw()
 	if (!PointDebugComponent) return;
 	if (!PointBuffers.IsValid())
 	{
-		PointDebugComponent->ClearDebug();
+		PointDebugComponent->ClearDisplay();
 		return;
 	}
 
 	// The shape is always "one line plus one point per item"; a near-zero line length is how a
 	// points-only visual is expressed, since the line then covers no pixels.
 	const float DirectionLength = bDrawNormals ? FMath::Max(NormalLength, 1.0f) : UE_KINDA_SMALL_NUMBER;
-	PointDebugComponent->SetDirectionSource(
+	PointDebugComponent->ShowVoxelDirections(
 		PointBuffers,
 		DirectionLength,
 		NormalColor,
 		true,
 		PointColor,
 		MaxPointsToDraw,
-		0.0f,
-		true);
+		/*Lifetime*/ -1.0f); // 常驻，跟随笔刷数据存在
 }
 
 void ACSPointBrushActor::ReleasePointBuffer()
 {
-	if (PointDebugComponent) PointDebugComponent->ClearDebug();
+	if (PointDebugComponent) PointDebugComponent->ClearDisplay();
 	ReleasePooledSourceOnRenderThread(PointBuffers);
 }
 

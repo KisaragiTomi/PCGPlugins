@@ -47,6 +47,11 @@ void FCSInstanceBrushEdMode::CommitSamples(const TArray<FCSBrushSample>& Samples
 	UE_LOG(LogTemp, Log, TEXT("[CSInstanceBrush] Added %d instances to %s."), AddedCount, *GetNameSafe(Target));
 }
 
+void FCSInstanceBrushEdMode::ClearBrushTarget()
+{
+	TargetActor.Reset();
+}
+
 bool FCSInstanceBrushEdMode::IsTooCloseToCommitted(const FVector& Location, float MinSpacingSq) const
 {
 	const AMeshGeneratorBrushCache* Target = TargetActor.Get();

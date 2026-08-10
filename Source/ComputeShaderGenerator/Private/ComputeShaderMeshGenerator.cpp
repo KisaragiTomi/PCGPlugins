@@ -30,11 +30,10 @@
 #include "Landscape.h"
 #include "LandscapeComponent.h"
 #include "LandscapeProxy.h"
-#include "CSDirectTriangleMeshComponent.h"
-#include "CSGpuMeshSave.h"
+#include "CSDisplayComponent.h"
+#include "CSGpuMeshComponent.h"
 #include "CSGpuMeshTypes.h"
 #include "CSMeshBuild.h"
-#include "CSMeshGeneratorDebugComponent.h"
 #include "Materials/MaterialInterface.h"
 #include "MeshDescription.h"
 #include "MeshDescriptionToDynamicMesh.h"
@@ -2997,35 +2996,37 @@ namespace
 // 两个 DrawDebug*VoxelDirections 入口的共同体：两个 Options USTRUCT（Last/Box）字段同名同义，
 // 仅入口守卫不同（缓存有效性 vs 现场准备），故用 duck-typed 模板吃掉公共部分。
 template <typename TOptions>
-int32 CSMeshGen_DrawVoxelDirections(UCSMeshGeneratorDebugComponent* DebugComponent, const FCSSurfaceVoxelGPUBuffers& Buffers, const TOptions& Options)
+int32 CSMeshGen_DrawVoxelDirections(UCSDisplayComponent* DisplayComponent, const FCSSurfaceVoxelGPUBuffers& Buffers, const TOptions& Options)
 {
 	const float EffectiveDirectionLength = Options.DirectionLength > 0.0f
 		? Options.DirectionLength
 		: FMath::Max(Buffers.VoxelSize, UE_KINDA_SMALL_NUMBER);
-	return DebugComponent->SetDirectionSource(
+	// Options 的 (Duration, bPersistentLines) 映射到统一的 Lifetime：
+	// 常驻 => -1；否则沿用 Duration（<=0 即一帧可视，与改动前逐字一致）。
+	const float Lifetime = Options.bPersistentLines ? -1.0f : Options.Duration;
+	return DisplayComponent->ShowVoxelDirections(
 		Buffers,
 		EffectiveDirectionLength,
 		Options.DirectionColor,
 		Options.bDrawPoints,
 		Options.PointColor,
 		Options.MaxDirectionsToDraw,
-		Options.Duration,
-		Options.bPersistentLines);
+		Lifetime);
 }
 } // namespace
 
 int32 AComputeShaderMeshGenerator::DrawDebugLastSurfaceVoxelDirections(
 	const FCSDebugLastVoxelDirectionOptions& Options)
 {
-	if (!MeshGeneratorDebugComponent || !LastSurfaceVoxelGPUBuffers.IsValid()) return 0;
-	return CSMeshGen_DrawVoxelDirections(MeshGeneratorDebugComponent, LastSurfaceVoxelGPUBuffers, Options);
+	if (!DisplayComponent || !LastSurfaceVoxelGPUBuffers.IsValid()) return 0;
+	return CSMeshGen_DrawVoxelDirections(DisplayComponent, LastSurfaceVoxelGPUBuffers, Options);
 }
 
 int32 AComputeShaderMeshGenerator::DrawDebugBoxSceneSurfaceVoxelDirections(
 	const FCSDebugBoxVoxelDirectionOptions& Options)
 {
-	if (!MeshGeneratorDebugComponent || !PrepareBoxSceneSurfaceVoxelsGPU(Options.VoxelSize)) return 0;
-	return CSMeshGen_DrawVoxelDirections(MeshGeneratorDebugComponent, LastSurfaceVoxelGPUBuffers, Options);
+	if (!DisplayComponent || !PrepareBoxSceneSurfaceVoxelsGPU(Options.VoxelSize)) return 0;
+	return CSMeshGen_DrawVoxelDirections(DisplayComponent, LastSurfaceVoxelGPUBuffers, Options);
 }
 
 UTextureRenderTarget2D* AComputeShaderMeshGenerator::GetOrCreateGeneratedDataRenderTarget(
@@ -3293,8 +3294,8 @@ void AComputeShaderMeshGenerator::ClearSurfaceVoxelTextureData()
 bool AComputeShaderMeshGenerator::SurfaceVoxelsToIsolatedQuadsDebug(float VoxelSize,
 	bool bReverseOrientation)
 {
-	if (!MeshGeneratorDebugComponent || !PrepareBoxSceneSurfaceVoxelsGPU(VoxelSize)) return false;
-	return MeshGeneratorDebugComponent->SetIsolatedQuadSource(
+	if (!DisplayComponent || !PrepareBoxSceneSurfaceVoxelsGPU(VoxelSize)) return false;
+	return DisplayComponent->ShowVoxelQuads(
 		LastSurfaceVoxelGPUBuffers, QuadScale, NormalOffsetScale, bReverseOrientation);
 }
 
@@ -3480,7 +3481,7 @@ UDynamicMesh* AComputeShaderMeshGenerator::GetBoxSceneTrianglesFilteredToDynamic
 void AComputeShaderMeshGenerator::DrawDebugBoxSceneSurfaceTrianglesGPU(float LifetimeSeconds)
 {
 	UWorld* World = GetWorld();
-	if (!World || !DebugTriangleComponent) return;
+	if (!World || !DisplayComponent) return;
 
 	const FBox QueryBox = GetGeneratorBoundsWorldBox();
 	if (!QueryBox.IsValid) return;
@@ -3489,15 +3490,14 @@ void AComputeShaderMeshGenerator::DrawDebugBoxSceneSurfaceTrianglesGPU(float Lif
 		World, QueryBox, SafeMaxTriangles, TArray<FVector>(), 0.0f);
 	if (!Prepared.IsValid() || !Prepared.HasAnyTriangles())
 	{
-		ClearDebugTriangleComponent();
+		DisplayComponent->ClearDisplay();
 		return;
 	}
 
-	DebugTriangleComponent->SetTriangleSource(Prepared, uint32(SafeMaxTriangles) * 3u, QueryBox);
-	World->GetTimerManager().ClearTimer(DebugTriangleClearTimerHandle);
-	if (LifetimeSeconds > 0.0f)
-		World->GetTimerManager().SetTimer(DebugTriangleClearTimerHandle, this,
-			&AComputeShaderMeshGenerator::ClearDebugTriangleComponent, LifetimeSeconds, false);
+	// LifetimeSeconds <= 0 沿用改动前的语义（常驻），映射到组件的 Lifetime = -1；
+	// 定时清除由组件自己管，Actor 不再持有 FTimerHandle。
+	DisplayComponent->ShowTriangleSoup(Prepared, uint32(SafeMaxTriangles) * 3u, QueryBox,
+		LifetimeSeconds > 0.0f ? LifetimeSeconds : -1.0f);
 }
 
 void AComputeShaderMeshGenerator::SpawnDebugSurfaceTrianglesDynamicMeshActor(float LifetimeSeconds)
@@ -3505,21 +3505,14 @@ void AComputeShaderMeshGenerator::SpawnDebugSurfaceTrianglesDynamicMeshActor(flo
 	DrawDebugBoxSceneSurfaceTrianglesGPU(LifetimeSeconds);
 }
 
-void AComputeShaderMeshGenerator::ClearDebugTriangleComponent()
-{
-	if (UWorld* World = GetWorld()) World->GetTimerManager().ClearTimer(DebugTriangleClearTimerHandle);
-	if (DebugTriangleComponent) DebugTriangleComponent->ClearTriangleSource();
-}
-
 void AComputeShaderMeshGenerator::ClearMeshGeneratorGPUDebug()
 {
-	if (MeshGeneratorDebugComponent) MeshGeneratorDebugComponent->ClearDebug();
-	ClearDebugTriangleComponent();
+	if (DisplayComponent) DisplayComponent->ClearDisplay();
 }
 
 bool AComputeShaderMeshGenerator::SubmitBoxSceneTrianglesToRenderPipeline(UMaterialInterface* Material, int32 MaxDirectTriangles, float ReferenceFilterDistance)
 {
-	if (!DirectMeshComponent)
+	if (!DisplayComponent)
 	{
 		return false;
 	}
@@ -3552,12 +3545,13 @@ bool AComputeShaderMeshGenerator::SubmitBoxSceneTrianglesToRenderPipeline(UMater
 
 	if (Material)
 	{
-		DirectMeshComponent->MeshMaterial = Material;
+		DisplayComponent->MeshMaterial = Material;
 	}
 
 	// VertexCapacity = triangle capacity * 3 (triangle soup: 3 verts per triangle).
+	// 提交路径是常驻显示（Lifetime = -1），后续可回读存盘。
 	const uint32 VertexCapacity = uint32(SafeMaxTriangles) * 3u;
-	DirectMeshComponent->SetTriangleSource(Prepared, VertexCapacity, QueryBox);
+	DisplayComponent->ShowTriangleSoup(Prepared, VertexCapacity, QueryBox);
 	return true;
 }
 
@@ -3622,9 +3616,9 @@ UStaticMesh* AComputeShaderMeshGenerator::SaveDirectGPUMeshToStaticMesh(
 	// 空路径走本 actor 的稳定结果命名（覆盖上一次的结果），而不是让落盘层各自兜底。
 	FString EffectiveAssetPath = AssetPathAndName.TrimStartAndEnd();
 	if (EffectiveAssetPath.IsEmpty()) EffectiveAssetPath = BuildResultAssetPath();
-	return CSGpuMeshSave::SaveGpuMeshComponentToStaticMesh(
-		DirectMeshComponent, EffectiveAssetPath,
-		DirectMeshComponent ? DirectMeshComponent->MeshMaterial.Get() : nullptr,
+	if (!DisplayComponent) return nullptr;
+	return DisplayComponent->SaveRenderedMeshToStaticMesh(
+		EffectiveAssetPath, DisplayComponent->MeshMaterial.Get(),
 		GetActorTransform(), bConvertToActorLocalSpace, bReplaceExistingAsset, bSaveAsset);
 #else
 	return nullptr;
@@ -3735,14 +3729,8 @@ AComputeShaderMeshGenerator::AComputeShaderMeshGenerator(const FObjectInitialize
 	GeneratorBounds->SetBoxExtent(FVector(500.0, 500.0, 500.0));
 	GeneratorBounds->SetupAttachment(SceneRoot);
 
-	DirectMeshComponent = CreateDefaultSubobject<UCSDirectTriangleMeshComponent>(TEXT("DirectMeshComponent"));
-	DirectMeshComponent->SetupAttachment(SceneRoot);
-
-	MeshGeneratorDebugComponent = CreateDefaultSubobject<UCSMeshGeneratorDebugComponent>(TEXT("MeshGeneratorDebugComponent"));
-	MeshGeneratorDebugComponent->SetupAttachment(SceneRoot);
-
-	DebugTriangleComponent = CreateDefaultSubobject<UCSDirectTriangleMeshComponent>(TEXT("DebugTriangleComponent"));
-	DebugTriangleComponent->SetupAttachment(SceneRoot);
+	DisplayComponent = CreateDefaultSubobject<UCSDisplayComponent>(TEXT("DisplayComponent"));
+	DisplayComponent->SetupAttachment(SceneRoot);
 }
 
 void AComputeShaderMeshGenerator::EndPlay(const EEndPlayReason::Type EndPlayReason)

@@ -79,6 +79,7 @@ void FCSBrushEdModeBase::Exit()
 {
 	CancelStroke();
 	DestroyBrushComponent();
+	ClearBrushTarget();
 	FEdMode::Exit();
 }
 

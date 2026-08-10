@@ -4,14 +4,14 @@
 #include "PrimitiveSceneProxy.h"
 #include "LocalVertexFactory.h"
 #include "CSGpuDebugDraw.h"
-#include "CSMeshGeneratorDebugComponent.h"
+#include "CSDisplayComponent.h"
 
 /** GPU-only scene proxy for surface-voxel directions, points, and isolated quads. */
-class FCSMeshGeneratorDebugSceneProxy final : public FPrimitiveSceneProxy
+class FCSDisplayVoxelSceneProxy final : public FPrimitiveSceneProxy
 {
 public:
-	FCSMeshGeneratorDebugSceneProxy(const UCSMeshGeneratorDebugComponent* Component, const FCSMeshGeneratorDebugData& InData);
-	virtual ~FCSMeshGeneratorDebugSceneProxy() override;
+	FCSDisplayVoxelSceneProxy(const UCSDisplayComponent* Component, const FCSDisplayVoxelData& InData);
+	virtual ~FCSDisplayVoxelSceneProxy() override;
 
 	virtual SIZE_T GetTypeHash() const override;
 	virtual uint32 GetMemoryFootprint() const override;
@@ -23,7 +23,7 @@ public:
 	virtual bool CanBeOccluded() const override;
 
 private:
-	bool IsDirectionsMode() const { return Data.Mode == ECSMeshGeneratorDebugMode::Directions; }
+	bool IsDirectionsMode() const { return Data.Mode == ECSDisplayMode::VoxelDirections; }
 
 	// -------------------------------------------------------------------------
 	// One entry trio per debug shape: size and allocate what that shape draws with, record its
@@ -50,7 +50,7 @@ private:
 	/** Registers the buffers every shape writes, then hands off to the active shape's build entry. */
 	void BuildGeometry(FRHICommandListBase& RHICmdList);
 
-	FCSMeshGeneratorDebugData Data;
+	FCSDisplayVoxelData Data;
 	FLocalVertexFactory VertexFactory;
 	FCSGpuDebugPositionStream Positions;
 	// Main = the shape's own primitive (lines or triangles); Point = the direction-mode centres.

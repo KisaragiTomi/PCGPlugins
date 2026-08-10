@@ -77,7 +77,7 @@ bool FRoadMeshSaveGPUAutomationTest::RunTest(const FString& Parameters)
 		TEXT("/Game/Automation/RoadMesh/SM_RoadGPUReadback_%s"),
 		*FGuid::NewGuid().ToString(EGuidFormats::Digits));
 
-	// Save via the road component's editor-only wrapper (delegates to the shared CSGpuMeshSave).
+	// Save via the road component's editor-only wrapper (delegates to the shared CSGpuMeshConvert).
 	UStaticMesh* SavedMesh = Road->SaveToStaticMesh(TestAssetPath, /*bReplace*/ true, /*bSaveAsset*/ false, /*bConvertToLocal*/ false);
 	if (!TestNotNull(TEXT("StaticMesh created from road GPU buffers"), SavedMesh)) return false;
 

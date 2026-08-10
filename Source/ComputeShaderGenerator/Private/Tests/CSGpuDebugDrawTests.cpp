@@ -2,7 +2,7 @@
 
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 
-#include "CSMeshGeneratorDebugComponent.h"
+#include "CSDisplayComponent.h"
 #include "ComputeShaderDebugParams.h"
 #include "ComputeShaderMeshGenerator.h"
 
@@ -43,7 +43,7 @@ bool FCSGpuDebugDrawSubmitAutomationTest::RunTest(const FString& Parameters)
 	AComputeShaderMeshGenerator* Generator = World->SpawnActor<AComputeShaderMeshGenerator>();
 	if (!TestNotNull(TEXT("Compute shader mesh generator"), Generator)) return false;
 	Generator->GeneratorBounds->SetBoxExtent(FVector(75.0));
-	UCSMeshGeneratorDebugComponent* Debug = Generator->MeshGeneratorDebugComponent;
+	UCSDisplayComponent* Debug = Generator->DisplayComponent;
 	if (!TestNotNull(TEXT("GPU debug component"), Debug)) return false;
 	World->UpdateWorldComponents(true, false);
 	FlushRenderingCommands();

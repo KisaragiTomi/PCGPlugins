@@ -1,6 +1,6 @@
 #include "ComputeShaderMeshBoolean.h"
 
-#include "CSGpuMeshConvert.h"
+#include "CSGpuMeshComponent.h"
 #include "ComputeShaderGenerateHelper.h"
 
 #include "GlobalShader.h"
@@ -1536,11 +1536,11 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 	// 由用户自行 Save All 决定是否写盘。名字里不带每次运行的时间戳（命名规则与 CSSW 烘焙一致），
 	// 同一个 actor 反复运行始终写同一个资产，直接覆盖旧模型，引用它的组件仍指向同一份资产。
 	// 非编辑器构建没有资产系统，公用入口内部退回 transient。
-	CSGpuMeshConvert::FConvertOptions ConvertOptions;
+	FCSGpuMeshConvertOptions ConvertOptions;
 	ConvertOptions.TargetTransform = OutputTransform;
 	ConvertOptions.bBakeToLocalSpace = true;
 
-	CSGpuMeshConvert::FAssetOptions AssetOptions;
+	FCSGpuMeshAssetOptions AssetOptions;
 	// 布尔结果动辄百万级三角，正是 Nanite 的适用场景：交给它做 LOD 与剔除，
 	// 省掉手工 LOD，渲染开销与三角数基本脱钩。
 	AssetOptions.bEnableNanite = bOutputNanite;
@@ -1549,13 +1549,13 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 #else
 	AssetOptions.bTransient = true;
 #endif
-	OutputStaticMesh = CSGpuMeshConvert::BuildStaticMesh(
+	OutputStaticMesh = UCSGpuMeshComponent::BuildStaticMesh(
 		this, this, StaticMeshData, OutputMaterialSlots, ConvertOptions, AssetOptions);
 	if (!OutputStaticMesh && !AssetOptions.bTransient)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[MeshBoolean:%s] result 资产保存失败，回退为 transient StaticMesh。"), *GetName());
 		AssetOptions.bTransient = true;
-		OutputStaticMesh = CSGpuMeshConvert::BuildStaticMesh(
+		OutputStaticMesh = UCSGpuMeshComponent::BuildStaticMesh(
 			this, this, StaticMeshData, OutputMaterialSlots, ConvertOptions, AssetOptions);
 	}
 	if (!OutputStaticMesh)

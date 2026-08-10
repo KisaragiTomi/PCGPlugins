@@ -53,6 +53,14 @@ namespace CSGpuMeshConvert
 		bool bTransient = false;
 		bool bReplaceExisting = true;
 		bool bSaveToDisk = false;
+
+		/**
+		 * 产出的 StaticMesh 是否启用 Nanite。布尔结果动辄上百万三角，正是 Nanite 的适用场景：
+		 * 开启后由 Nanite 自己做 LOD 与剔除，省掉手工 LOD，渲染开销与三角数基本脱钩。
+		 * 代价是构建时会多一步 Nanite 数据生成（大网格上是秒级），且资产体积变大。
+		 * 必须在 BuildFromMeshDescriptions 之前设置，否则这次构建不会产出 Nanite 数据。
+		 */
+		bool bEnableNanite = false;
 	};
 
 	/** 返回引擎默认表面材质，供空槽兜底。 */

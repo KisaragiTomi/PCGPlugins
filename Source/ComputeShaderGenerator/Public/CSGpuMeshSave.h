@@ -28,7 +28,8 @@ namespace CSGpuMeshSave
 		const FCSGpuMeshCPUData& MeshData,
 		const TArray<UMaterialInterface*>& Materials,
 		const FTransform& ActorTransform,
-		bool bConvertToActorLocalSpace = true);
+		bool bConvertToActorLocalSpace = true,
+		bool bEnableNanite = false);
 
 #if WITH_EDITOR
 	/** Builds "<OwnerActor's level folder>/AutoResult/SM_<owner><NameSuffix>". Producers that emit
@@ -53,7 +54,8 @@ namespace CSGpuMeshSave
 		bool bConvertToActorLocalSpace = true,
 		const FString& AssetPathAndName = FString(),
 		bool bReplaceExistingAsset = true,
-		bool bSaveAsset = false);
+		bool bSaveAsset = false,
+		bool bEnableNanite = false);
 
 	/** Reads Component's rendered GPU mesh back to the CPU (one blocking readback) and saves it
 	 *  as a StaticMesh asset. The created asset is always marked dirty; bSaveAsset controls whether

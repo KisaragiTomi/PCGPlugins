@@ -151,6 +151,15 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|Output")
 	bool bPreserveSourceMaterialSlots = true;
 
+	/**
+	 * 输出的 StaticMesh 启用 Nanite。布尔结果通常是百万级三角的一次性产物，交给 Nanite 做
+	 * LOD 与剔除比手工 LOD 现实得多，渲染开销也基本与三角数脱钩，因此默认开启。
+	 * 代价是构建时多一步 Nanite 数据生成（大网格上是秒级）、资产体积变大。
+	 * 需要给不支持 Nanite 的管线（半透明、部分自定义材质、移动端）用时关掉。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|Output")
+	bool bOutputNanite = true;
+
 	/** Last generated transient StaticMesh. Material slots preserve the source triangle material IDs. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "CS Mesh Boolean|Output")
 	TObjectPtr<UStaticMesh> OutputStaticMesh;
@@ -173,20 +182,19 @@ public:
 	/**
 	 * Stage A：对 GeneratorBounds 盒内的场景三角形消除互相穿插，返回切分后的 transient StaticMesh。
 	 * 不创建或覆盖 Content Browser 资产；需要持久化时由调用方显式保存。同步执行（内部 FlushRenderingCommands）。
-	 * @param bRecomputeNormals 输出后重算法线
 	 */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Boolean")
-	UStaticMesh* SplitInterpenetratingBoxScene(bool bRecomputeNormals = false);
+	UStaticMesh* SplitInterpenetratingBoxScene();
 
 	/**
 	 * Stage A + Stage B：切分后再用 GPU 缠绕数分类筛面，得到布尔结果（self-winding）；输出绕序保持源三角形约定。
 	 * @param Op 布尔运算；ArrangementOnly 时等价于 SplitInterpenetratingBoxScene。
 	 */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Boolean")
-	UStaticMesh* BooleanBoxScene(ECSMeshBooleanOp Op, bool bRecomputeNormals = false);
+	UStaticMesh* BooleanBoxScene(ECSMeshBooleanOp Op);
 
 private:
 	/** Split / Boolean 的共用实现。Op 决定是否跑 Stage B 缠绕数分类。 */
-	UStaticMesh* RunBooleanInternal(ECSMeshBooleanOp Op, bool bRecomputeNormals);
+	UStaticMesh* RunBooleanInternal(ECSMeshBooleanOp Op);
 
 };

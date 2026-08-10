@@ -282,6 +282,11 @@ void EmitCoplanarCuts(uint TriA, uint TriB, float3 nA)
 // 叶 .w=原三角序号），由父类共享 AddTriangleLBVHToRDG 建（与 winding/rayvis 同一套）。
 Buffer<float4> TriTriBVHNodes;
 
+// 逐三角参照标志（1=参照体）。参照三角照常在 LBVH 与 fast-winding 场里，因此参与 inside/outside
+// 判定与射线遮挡；但不参与 tri-tri 切分、也不会被 BSP 输出——它只提供体积信息，不产出几何。
+Buffer<uint> TriangleReferenceFlags;
+bool IsReferenceTriangle(uint Tri) { return TriangleReferenceFlags[Tri] != 0u; }
+
 // 处理一对三角 (TriA,TriB)：共享边跳过、共面只计数、穿插求交线段 append。（原 all-pairs 内层体，抽成函数供 BVH 复用）
 void ProcessTriPair(uint TriA, uint TriB)
 {
@@ -309,6 +314,8 @@ void TriTriIntersectCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupInd
 	uint TriA = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
 	uint Count = TriangleCounter[0];
 	if (TriA >= Count || TriA >= TriangleCapacity) return;
+	// 参照体不被切开，也不去切别人。
+	if (IsReferenceTriangle(TriA)) return;
 
 	// LBVH broad-phase：只对 AABB 与 A 相交的 B>A 求交（每对由较小 index 线程处理一次）
 	float3 A0 = LoadTriVert(TriA, 0), A1 = LoadTriVert(TriA, 1), A2 = LoadTriVert(TriA, 2);
@@ -327,7 +334,7 @@ void TriTriIntersectCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupInd
 		if ((uint)ni >= leafBase)
 		{
 			uint TriB = (uint)asint(n0.w);
-			if (TriB > TriA && TriB < Count) ProcessTriPair(TriA, TriB);
+			if (TriB > TriA && TriB < Count && !IsReferenceTriangle(TriB)) ProcessTriPair(TriA, TriB);
 		}
 		else if (sp <= 94)
 		{
@@ -344,6 +351,12 @@ void TriTriIntersectCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupInd
 //   （半角由 CapMinCos 控制：0=前向半球，-1=全球）投 RayCount 条射线，对 occluder soup 做
 //   Möller–Trumbore any-hit（跳过自身源三角）。中途无命中=逃逸=该方向可见。
 // -----------------------------------------------------------------------------
+// occluder soup 就是完整的源 soup，**参照体（Ref 标签）也在里面、也会遮挡射线**。
+// 这是有意的：参照体的语义是「代表实体、只提供体积信息」，既然它能让 winding 判定认为
+// 某处是实心的，那它也应该挡住可见性射线；否则会出现「winding 说被埋住、射线却说看得见」
+// 的自相矛盾，被埋的面又被救回来。
+// 若将来需要「只影响 winding、不影响可见性」的参照体，在 RayOccludedBVH 的叶子测试里
+// 按 IsReferenceTriangle(tri) 跳过即可，其余逻辑不用动。
 Buffer<float4> OccluderVerts;   // 3 顶点/occluder，.xyz
 uint  OccluderTriCount;
 uint  RayCount;
@@ -740,6 +753,8 @@ void RetriangulateBSPNCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupI
 	if (localTri >= GBSPTriCount) return;
 	uint tri = GBSPTriBase + localTri;
 	if (tri >= GTriCap) return;
+	// 参照体不产出几何。必须拦在下面的「0 段直通」之前，否则未被切分的参照三角会原样 emit。
+	if (IsReferenceTriangle(tri)) return;
 
 	float3 A = GBSPSoup[tri * 3u + 0u].xyz;
 	float3 B = GBSPSoup[tri * 3u + 1u].xyz;

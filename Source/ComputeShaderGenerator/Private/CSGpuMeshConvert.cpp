@@ -90,16 +90,17 @@ UStaticMesh* CSGpuMeshConvert::BuildStaticMesh(
 	if (AssetOptions.bTransient)
 	{
 		return CSGpuMeshSave::BuildTransientStaticMesh(
-			Outer, MeshData, ResolvedMaterials, Options.TargetTransform, bNeedsBake);
+			Outer, MeshData, ResolvedMaterials, Options.TargetTransform, bNeedsBake, AssetOptions.bEnableNanite);
 	}
 
 #if WITH_EDITOR
 	return CSGpuMeshSave::SaveGpuMeshDataToStaticMesh(
 		OwnerActor, MeshData, ResolvedMaterials, Options.TargetTransform, bNeedsBake,
-		AssetOptions.AssetPath, AssetOptions.bReplaceExisting, AssetOptions.bSaveToDisk);
+		AssetOptions.AssetPath, AssetOptions.bReplaceExisting, AssetOptions.bSaveToDisk,
+		AssetOptions.bEnableNanite);
 #else
 	// 非编辑器构建没有资产系统，只能退回 transient。
 	return CSGpuMeshSave::BuildTransientStaticMesh(
-		Outer, MeshData, ResolvedMaterials, Options.TargetTransform, bNeedsBake);
+		Outer, MeshData, ResolvedMaterials, Options.TargetTransform, bNeedsBake, AssetOptions.bEnableNanite);
 #endif
 }

@@ -40,9 +40,18 @@ bool PopulateStaticMeshFromDescription(
 	FMeshDescription& MeshDescription,
 	const FCSGpuMeshCPUData& MeshData,
 	const TArray<UMaterialInterface*>& Materials,
-	bool bCommitMeshDescription)
+	bool bCommitMeshDescription,
+	bool bEnableNanite)
 {
 	if (!StaticMesh) return false;
+
+	// 必须在 BuildFromMeshDescriptions 之前设置：Nanite 数据是在那次构建里生成的，
+	// 建完再改设置只会标脏，不会真的产出 Nanite 数据。
+	{
+		FMeshNaniteSettings NaniteSettings = StaticMesh->GetNaniteSettings();
+		NaniteSettings.bEnabled = bEnableNanite;
+		StaticMesh->SetNaniteSettings(NaniteSettings);
+	}
 
 	int32 RequiredMaterialSlots = FMath::Max(1, Materials.Num());
 	for (int32 Slot : MeshData.TriangleMaterialSlots) RequiredMaterialSlots = FMath::Max(RequiredMaterialSlots, Slot + 1);
@@ -291,7 +300,8 @@ UStaticMesh* CSGpuMeshSave::BuildTransientStaticMesh(
 	const FCSGpuMeshCPUData& MeshData,
 	const TArray<UMaterialInterface*>& Materials,
 	const FTransform& ActorTransform,
-	bool bConvertToActorLocalSpace)
+	bool bConvertToActorLocalSpace,
+	bool bEnableNanite)
 {
 	if (!Outer) return nullptr;
 
@@ -302,7 +312,7 @@ UStaticMesh* CSGpuMeshSave::BuildTransientStaticMesh(
 	if (!StaticMesh) return nullptr;
 	// Transient results are rebuilt from scratch every run, so the editable MeshDescription
 	// copy is dead weight; skipping the commit avoids ~1.5 GiB of resident bulk data per mesh.
-	if (!PopulateStaticMeshFromDescription(StaticMesh, MeshDescription, MeshData, Materials, false)) return nullptr;
+	if (!PopulateStaticMeshFromDescription(StaticMesh, MeshDescription, MeshData, Materials, false, bEnableNanite)) return nullptr;
 	return StaticMesh;
 }
 
@@ -316,7 +326,8 @@ UStaticMesh* CSGpuMeshSave::SaveGpuMeshDataToStaticMesh(
 	bool bConvertToActorLocalSpace,
 	const FString& AssetPathAndName,
 	bool bReplaceExistingAsset,
-	bool bSaveAsset)
+	bool bSaveAsset,
+	bool bEnableNanite)
 {
 	FString EffectiveAssetPath = AssetPathAndName.TrimStartAndEnd();
 	if (EffectiveAssetPath.IsEmpty())
@@ -390,7 +401,7 @@ UStaticMesh* CSGpuMeshSave::SaveGpuMeshDataToStaticMesh(
 		StaticMesh = NewObject<UStaticMesh>(Package, *AssetName, RF_Public | RF_Standalone);
 	}
 	// Committed on purpose: this one is a real asset that must survive save/reload and stay editable.
-	if (!PopulateStaticMeshFromDescription(StaticMesh, MeshDescription, MeshData, Materials, true))
+	if (!PopulateStaticMeshFromDescription(StaticMesh, MeshDescription, MeshData, Materials, true, bEnableNanite))
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: StaticMesh build failed for '%s'."), *SanitizedAssetPathAndName);
 		return nullptr;

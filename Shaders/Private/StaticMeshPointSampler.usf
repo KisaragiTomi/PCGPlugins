@@ -21,6 +21,8 @@ RWBuffer<uint> RW_TriangleCounter;
 Buffer<uint> TriToMaterial;
 // 与输出 triangle soup 平行（按 triangle 索引），在与顶点相同的 atomic slot 上写材质 id。
 RWBuffer<uint> RW_OutTriangleMaterialIds;
+// 逐三角参照标志（1=参照体）：进 LBVH 与 winding 场，但 tri-tri 与 BSP 会跳过。
+RWBuffer<uint> RW_OutTriangleReferenceFlags;
 // 源 mesh 的逐顶点 UV（typed float2，交错存 NumTexCoords 组/顶点）。NumTexCoords==0 表示无 UV。
 Buffer<float2> SourceTexCoordBuffer;
 // 与输出 triangle soup 顶点平行（3 per triangle），在与顶点相同的 atomic slot 上写 UV0。
@@ -41,6 +43,7 @@ RWBuffer<float4> RW_OutTriangleBiTangents;
 uint CSNumUVChannels;                     // UV 通道数；UV 按 [Corner * CSNumUVChannels + Channel] 交错
 Buffer<float2> SourceTriangleUVs;        // UV0，3 per triangle（与 SourceTriangleVertices 平行）
 Buffer<uint>   SourceTriangleMaterialIds;// 材质 registry id，1 per triangle
+Buffer<uint>   SourceTriangleReferenceFlags; // 参照标志，1 per triangle
 Buffer<float4> TriangleVertices;
 Buffer<float4> TriangleNormals;
 Buffer<uint> SurfaceTriangleCounter;
@@ -422,6 +425,7 @@ void ExtractStaticMeshTrianglesCS(uint3 GroupId : SV_GroupID, uint GroupIndex : 
 		RW_OutTriangleUVs[(OutVertexBase + 2u) * CSNumUVChannels + Ch] = (Ch == 0u) ? UV1 : float2(0.0f, 0.0f);
 	}
 	RW_OutTriangleMaterialIds[OutTriangleIndex] = MaterialId;
+	RW_OutTriangleReferenceFlags[OutTriangleIndex] = 0u;
 }
 
 // Nanite 网格全细节源三角追加：把 game thread 从 editor MeshDescription 提取并已变换到世界空间的
@@ -475,6 +479,7 @@ void AppendSourceTrianglesCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_Gr
 	}
 
 	uint MaterialId = SourceTriangleMaterialIds[TriIndex];
+	uint ReferenceFlag = SourceTriangleReferenceFlags[TriIndex];
 	uint OutTriangleIndex = 0u;
 	for (;;)
 	{
@@ -519,6 +524,7 @@ void AppendSourceTrianglesCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_Gr
 	RW_OutTriangleBiTangents[OutVertexBase + 1u] = SourceTriangleBiTangents[SrcBase + Corner1];
 	RW_OutTriangleBiTangents[OutVertexBase + 2u] = SourceTriangleBiTangents[SrcBase + Corner2];
 	RW_OutTriangleMaterialIds[OutTriangleIndex] = MaterialId;
+	RW_OutTriangleReferenceFlags[OutTriangleIndex] = ReferenceFlag;
 }
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]

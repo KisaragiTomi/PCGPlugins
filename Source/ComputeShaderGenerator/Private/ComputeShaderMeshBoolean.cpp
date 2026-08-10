@@ -1,6 +1,7 @@
 #include "ComputeShaderMeshBoolean.h"
 
 #include "CSGpuMeshConvert.h"
+#include "ComputeShaderGenerateHelper.h"
 
 #include "GlobalShader.h"
 #include "ShaderParameterStruct.h"
@@ -54,6 +55,7 @@ class FTriTriIntersectCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_CutCounter)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_Stats)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, TriTriBVHNodes)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, TriangleReferenceFlags)
 		SHADER_PARAMETER(uint32, TriangleCapacity)
 		SHADER_PARAMETER(uint32, MaxCutSegments)
 		SHADER_PARAMETER(float, SideEps)
@@ -63,15 +65,7 @@ class FTriTriIntersectCS : public FGlobalShader
 		SHADER_PARAMETER(float, CoplanarOffsetEps)
 	END_SHADER_PARAMETER_STRUCT()
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
-	}
+	CSGEN_SHADER_PERM_SM5_GROUPSIZE_X(64)
 };
 
 
@@ -88,10 +82,7 @@ class FFinalStatusCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_FinalStatus)
 		SHADER_PARAMETER(uint32, FinalBSPStatCount)
 	END_SHADER_PARAMETER_STRUCT()
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
+	CSGEN_SHADER_PERM_SM5()
 };
 
 // ---- GPU arrangement grouping（Milestone 1）：交线段按 owner 三角计数-排序成 per-tri CSR ----
@@ -177,6 +168,7 @@ class FRetriangulateBSPNCS : public FGlobalShader
 public:
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, GBSPSoup)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, TriangleReferenceFlags)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, GCutP0)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, GCutP1)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, GCutCountSRV)
@@ -197,15 +189,7 @@ public:
 		SHADER_PARAMETER(uint32, GOutCap)
 		SHADER_PARAMETER(uint32, GTriCap)
 	END_SHADER_PARAMETER_STRUCT()
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
-	}
+	CSGEN_SHADER_PERM_SM5_GROUPSIZE_X(64)
 };
 
 // ---- Stage B：从 BSP 核里拆出的独立分类 pass（每 fragment 一线程，indirect 全宽） ----
@@ -335,7 +319,8 @@ struct FMeshBooleanStageBRDGContext
 // and weld orchestration is inherited from AComputeShaderMeshGenerator and implemented by
 // CSGpuTriangleUtilities, so this file owns only Boolean policy.
 static void AddArrangementToRDG(FRDGBuilder& GraphBuilder,
-	FRDGBufferSRVRef SoupSRV, FRDGBufferSRVRef CutP0SRV, FRDGBufferSRVRef CutP1SRV, FRDGBufferSRVRef CutCounterSRV,
+	FRDGBufferSRVRef SoupSRV, FRDGBufferSRVRef ReferenceFlagsSRV,
+	FRDGBufferSRVRef CutP0SRV, FRDGBufferSRVRef CutP1SRV, FRDGBufferSRVRef CutCounterSRV,
 	int32 TriCapacity, int32 CutCapacity,
 	const FVector3f& SnapOrigin, float SnapQuantum,
 	int32 ScratchBatchSize, int32 OutCap, const FMeshBooleanStageBRDGContext& StageB,
@@ -399,17 +384,17 @@ namespace
 // AComputeShaderMeshBoolean
 // =============================================================================
 
-UStaticMesh* AComputeShaderMeshBoolean::SplitInterpenetratingBoxScene(bool bRecomputeNormals)
+UStaticMesh* AComputeShaderMeshBoolean::SplitInterpenetratingBoxScene()
 {
-	return RunBooleanInternal(ECSMeshBooleanOp::ArrangementOnly, bRecomputeNormals);
+	return RunBooleanInternal(ECSMeshBooleanOp::ArrangementOnly);
 }
 
-UStaticMesh* AComputeShaderMeshBoolean::BooleanBoxScene(ECSMeshBooleanOp Op, bool bRecomputeNormals)
+UStaticMesh* AComputeShaderMeshBoolean::BooleanBoxScene(ECSMeshBooleanOp Op)
 {
-	return RunBooleanInternal(Op, bRecomputeNormals);
+	return RunBooleanInternal(Op);
 }
 
-UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, bool bRecomputeNormals)
+UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 {
 	// Stage 0：校验运行环境与查询范围；任一条件无效时不启动 Boolean 管线。
 	TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_RunBooleanInternal);
@@ -465,8 +450,8 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	// Stage 1.5: VRAM pre-flight. Every buffer below scales linearly with the source triangle
 	// count, so the machine-dependent ceiling is knowable before any work starts - unlike the
 	// fixed 8M guard on the render thread, which fires only after the soup was already built and
-	// uploaded. The cost model mirrors what this run will actually allocate, so toggling Stage B,
-	// welding or recomputed normals moves the limit accordingly.
+	// uploaded. The cost model mirrors what this run will actually allocate, so toggling Stage B
+	// or welding moves the limit accordingly.
 	{
 		CSGpuMemoryBudget::FTriangleSoupCostModel Cost;
 		Cost.CutSegmentsPerTriangle = CutPerTri;
@@ -474,9 +459,9 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 		Cost.bBuildLBVH = true;
 		Cost.bBuildWindingField = bRunStageB;
 		Cost.bWeldOutput = OutputWeldDistanceV > UE_SMALL_NUMBER;
-		// Same predicates the readback allocation uses further down.
-		Cost.bSourceNormals = !bRecomputeNormals;
-		Cost.bSourceTangents = !bRecomputeNormals;
+		// 源法线/切线始终回读：输出沿用源属性，不再重算法线。
+		Cost.bSourceNormals = true;
+		Cost.bSourceTangents = true;
 		if (!ConfirmGpuMemoryBudgetForBoxScene(TEXT("Mesh Boolean"), QueryBox, Cost, bReadLandscape)) return nullptr;
 	}
 
@@ -492,8 +477,9 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	}
 	if (!Prepared.IsValid() || !Prepared.HasAnyTriangles()) return nullptr;
 
-	const bool bNeedSourceNormals = !bRecomputeNormals;
-	const bool bNeedSourceTangents = !bRecomputeNormals;
+	// 输出沿用源法线/切线，故两者恒需回读。
+	constexpr bool bNeedSourceNormals = true;
+	constexpr bool bNeedSourceTangents = true;
 
 	// ---- readback 对象 ----
 	// Stage 3：按输出策略创建 GPU 回读对象；未使用的属性不分配回读资源。
@@ -625,25 +611,17 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 
 			// ---- 交线 buffer ----
 			// Stage 5：创建相交线段、计数器及诊断缓冲区，供窄相位求交和 arrangement 共用。
-			FRDGBufferRef CutP0Buf = GraphBuilder.CreateBuffer(
-				FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), MaxCutSegments), TEXT("CS.MeshBoolean.CutP0"));
-			FRDGBufferUAVRef CutP0UAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(CutP0Buf, PF_A32B32G32R32F));
-			AddClearUAVPass(GraphBuilder, CutP0UAV, 0.0f);
+			FRDGBufferRef CutP0Buf; FRDGBufferUAVRef CutP0UAV;
+			CSHelper::CreateClearedTypedBuffer(GraphBuilder, CutP0Buf, CutP0UAV, sizeof(FVector4f), MaxCutSegments, PF_A32B32G32R32F, TEXT("CS.MeshBoolean.CutP0"), 0.0f);
 
-			FRDGBufferRef CutP1Buf = GraphBuilder.CreateBuffer(
-				FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), MaxCutSegments), TEXT("CS.MeshBoolean.CutP1"));
-			FRDGBufferUAVRef CutP1UAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(CutP1Buf, PF_A32B32G32R32F));
-			AddClearUAVPass(GraphBuilder, CutP1UAV, 0.0f);
+			FRDGBufferRef CutP1Buf; FRDGBufferUAVRef CutP1UAV;
+			CSHelper::CreateClearedTypedBuffer(GraphBuilder, CutP1Buf, CutP1UAV, sizeof(FVector4f), MaxCutSegments, PF_A32B32G32R32F, TEXT("CS.MeshBoolean.CutP1"), 0.0f);
 
-			FRDGBufferRef CutCounterBuf = GraphBuilder.CreateBuffer(
-				FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 2), TEXT("CS.MeshBoolean.CutCounter"));
-			FRDGBufferUAVRef CutCounterUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(CutCounterBuf, PF_R32_UINT));
-			AddClearUAVPass(GraphBuilder, CutCounterUAV, 0u);
+			FRDGBufferRef CutCounterBuf; FRDGBufferUAVRef CutCounterUAV;
+			CSHelper::CreateClearedTypedBuffer(GraphBuilder, CutCounterBuf, CutCounterUAV, sizeof(uint32), 2, PF_R32_UINT, TEXT("CS.MeshBoolean.CutCounter"), 0u);
 
-			FRDGBufferRef StatsBuf = GraphBuilder.CreateBuffer(
-				FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 8), TEXT("CS.MeshBoolean.Stats"));
-			FRDGBufferUAVRef StatsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(StatsBuf, PF_R32_UINT));
-			AddClearUAVPass(GraphBuilder, StatsUAV, 0u);
+			FRDGBufferRef StatsBuf; FRDGBufferUAVRef StatsUAV;
+			CSHelper::CreateClearedTypedBuffer(GraphBuilder, StatsBuf, StatsUAV, sizeof(uint32), 8, PF_R32_UINT, TEXT("CS.MeshBoolean.Stats"), 0u);
 
 			// ---- tri-tri broad-phase：固定构建并遍历 LBVH。 ----
 			// Stage 6：构建三角形 LBVH；需要布尔分类时同时构建快速缠绕数多极矩场。
@@ -690,6 +668,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 				P->RW_CutCounter = CutCounterUAV;
 				P->RW_Stats = StatsUAV;
 				P->TriTriBVHNodes = TriBVHNodesSRV;
+				P->TriangleReferenceFlags = Soup.TriangleReferenceFlagsSRV;
 				P->TriangleCapacity = TriangleCapacity;
 				P->MaxCutSegments = MaxCutSegments;
 				P->SideEps = SideEpsV;
@@ -718,7 +697,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 					int64(TriangleCapacity) * int64(OutputTrianglesPerSourceV),
 					1024, int64(ArrangementOutputTriangleCapacity)));
 				FRDGBufferRef ArrOutSoup = nullptr, ArrOutSrc = nullptr, ArrOutCnt = nullptr, ArrOutStat = nullptr;
-				AddArrangementToRDG(GraphBuilder, Soup.TriangleVerticesSRV,
+				AddArrangementToRDG(GraphBuilder, Soup.TriangleVerticesSRV, Soup.TriangleReferenceFlagsSRV,
 					GraphBuilder.CreateSRV(FRDGBufferSRVDesc(CutP0Buf, PF_A32B32G32R32F)),
 					GraphBuilder.CreateSRV(FRDGBufferSRVDesc(CutP1Buf, PF_A32B32G32R32F)),
 					GraphBuilder.CreateSRV(FRDGBufferSRVDesc(CutCounterBuf, PF_R32_UINT)),
@@ -1462,7 +1441,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 			for (int32 Corner = 0; Corner < 3; ++Corner)
 			{
 				const FVector3d& W = BaryWeights[Corner];
-				const bool bUseGeometric = bRecomputeNormals || !bHasSource;
+				const bool bUseGeometric = !bHasSource;
 				FVector3f Normal = bUseGeometric ? GeometricNormal : BaryNormal(Source, W);
 				// 源法线原样保留，不做半球校正。那段校正是为了掩盖输出绕序的 bug 而加的：
 				// 绕序修好前它每次触发约 450 万次，修好后只剩 7 千次，剩下的多半是作者有意的
@@ -1560,9 +1539,11 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op, 
 	CSGpuMeshConvert::FConvertOptions ConvertOptions;
 	ConvertOptions.TargetTransform = OutputTransform;
 	ConvertOptions.bBakeToLocalSpace = true;
-	ConvertOptions.bRecomputeNormals = bRecomputeNormals;
 
 	CSGpuMeshConvert::FAssetOptions AssetOptions;
+	// 布尔结果动辄百万级三角，正是 Nanite 的适用场景：交给它做 LOD 与剔除，
+	// 省掉手工 LOD，渲染开销与三角数基本脱钩。
+	AssetOptions.bEnableNanite = bOutputNanite;
 #if WITH_EDITOR
 	AssetOptions.AssetPath = BuildResultAssetPath();
 #else
@@ -1594,10 +1575,8 @@ static void AddExclusiveScan(FRDGBuilder& GraphBuilder, FRDGBufferSRVRef InSRV, 
 {
 	if (N <= 0) return;
 	const int32 Blocks = FMath::DivideAndRoundUp(N, 512);
-	FRDGBufferRef BlockSumsBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), Blocks), TEXT("MB.Scan.BlockSums"));
-	FRDGBufferUAVRef BlockSumsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(BlockSumsBuf, PF_R32_UINT));
-	FRDGBufferSRVRef BlockSumsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(BlockSumsBuf, PF_R32_UINT));
-	AddClearUAVPass(GraphBuilder, BlockSumsUAV, 0u);
+	FRDGBufferRef BlockSumsBuf; FRDGBufferUAVRef BlockSumsUAV; FRDGBufferSRVRef BlockSumsSRV;
+	CSHelper::CreateClearedTypedBuffer(GraphBuilder, BlockSumsBuf, BlockSumsUAV, BlockSumsSRV, sizeof(uint32), Blocks, PF_R32_UINT, TEXT("MB.Scan.BlockSums"), 0u);
 	{
 		FScanBlocksCS::FParameters* P = GraphBuilder.AllocParameters<FScanBlocksCS::FParameters>();
 		P->GCutCountSRV = InSRV; P->RW_CutOffset = OutUAV; P->RW_BlockSums = BlockSumsUAV; P->GScanCount = uint32(N);
@@ -1607,9 +1586,8 @@ static void AddExclusiveScan(FRDGBuilder& GraphBuilder, FRDGBufferSRVRef InSRV, 
 	FRDGBufferSRVRef BlockOffsetsSRV = BlockSumsSRV;  // 默认：块偏移就地存回 BlockSums（<=512 分支）
 	if (Blocks <= 512)
 	{
-		FRDGBufferRef TotalBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1), TEXT("MB.Scan.Total"));
-		FRDGBufferUAVRef TotalUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(TotalBuf, PF_R32_UINT));
-		AddClearUAVPass(GraphBuilder, TotalUAV, 0u);
+		FRDGBufferRef TotalBuf; FRDGBufferUAVRef TotalUAV;
+		CSHelper::CreateClearedTypedBuffer(GraphBuilder, TotalBuf, TotalUAV, sizeof(uint32), 1, PF_R32_UINT, TEXT("MB.Scan.Total"), 0u);
 		FScanBlockSumsCS::FParameters* P = GraphBuilder.AllocParameters<FScanBlockSumsCS::FParameters>();
 		P->RW_BlockSums = BlockSumsUAV; P->RW_ScanTotal = TotalUAV; P->GNumBlocks = uint32(Blocks);  // 就地 RMW（单 UAV，无 SRV/UAV 别名）
 		TShaderMapRef<FScanBlockSumsCS> S(GetGlobalShaderMap(GMaxRHIFeatureLevel));
@@ -1619,9 +1597,8 @@ static void AddExclusiveScan(FRDGBuilder& GraphBuilder, FRDGBufferSRVRef InSRV, 
 	{
 		// 递归：把块总和做 exclusive 前缀和，写到**独立** buffer。不能就地(In==Out)：递归里 ScanBlocksCS
 		// 会把同一 buffer 既绑 SRV 又绑 UAV，RDG/D3D12 同 pass 资源状态冲突 → ensure/device removed。
-		FRDGBufferRef BlockScanBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), Blocks), TEXT("MB.Scan.BlockScan"));
-		FRDGBufferUAVRef BlockScanUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(BlockScanBuf, PF_R32_UINT));
-		AddClearUAVPass(GraphBuilder, BlockScanUAV, 0u);
+		FRDGBufferRef BlockScanBuf; FRDGBufferUAVRef BlockScanUAV;
+		CSHelper::CreateClearedTypedBuffer(GraphBuilder, BlockScanBuf, BlockScanUAV, sizeof(uint32), Blocks, PF_R32_UINT, TEXT("MB.Scan.BlockScan"), 0u);
 		AddExclusiveScan(GraphBuilder, BlockSumsSRV, BlockScanUAV, Blocks);
 		BlockOffsetsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(BlockScanBuf, PF_R32_UINT));
 	}
@@ -1640,7 +1617,8 @@ static void AddExclusiveScan(FRDGBuilder& GraphBuilder, FRDGBufferSRVRef InSRV, 
 // 按源三角区间分块复用，每批清零 slot counter，OutCounter/BSPStats 跨批累计。产出 Out* 由出参返回。
 static void AddArrangementToRDG(
 	FRDGBuilder& GraphBuilder,
-	FRDGBufferSRVRef SoupSRV, FRDGBufferSRVRef CutP0SRV, FRDGBufferSRVRef CutP1SRV, FRDGBufferSRVRef CutCounterSRV,
+	FRDGBufferSRVRef SoupSRV, FRDGBufferSRVRef ReferenceFlagsSRV,
+	FRDGBufferSRVRef CutP0SRV, FRDGBufferSRVRef CutP1SRV, FRDGBufferSRVRef CutCounterSRV,
 	int32 TriCapacity, int32 CutCapacity,
 	const FVector3f& SnapOrigin, float SnapQuantum,
 	int32 ScratchBatchSize, int32 OutCap, const FMeshBooleanStageBRDGContext& StageB,
@@ -1714,7 +1692,8 @@ static void AddArrangementToRDG(
 		const int32 BatchCount = FMath::Min(ScrCap, TriCapacity - TriBase);
 		AddClearUAVPass(GraphBuilder, ScratchCntUAV, 0u);
 		FRetriangulateBSPNCS::FParameters* P = GraphBuilder.AllocParameters<FRetriangulateBSPNCS::FParameters>();
-		P->GBSPSoup = SoupSRV; P->GCutP0 = CutP0SRV; P->GCutP1 = CutP1SRV;
+		P->GBSPSoup = SoupSRV; P->TriangleReferenceFlags = ReferenceFlagsSRV;
+		P->GCutP0 = CutP0SRV; P->GCutP1 = CutP1SRV;
 		P->GCutCountSRV = CutCountSRV; P->GCutOffsetSRV = CutOffsetSRV; P->GCutCSRSRV = CutCSRSRV;
 		P->RW_OutSoup = OutSoupUAV; P->RW_OutSource = OutSrcUAV; P->RW_OutCounter = OutCntUAV; P->RW_BSPStats = BSPStatUAV;
 		P->RW_LimitedReasons = LimitedReasonsUAV;

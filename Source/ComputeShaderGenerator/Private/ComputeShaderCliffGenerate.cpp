@@ -1,7 +1,8 @@
 #include "ComputeShaderCliffGenerate.h"
 #include "ComputeShaderMeshFill.h"
 #include "ComputeShaderBasicFunction.h"
-#include "ComputeShaderGenerateHepler.h"
+#include "ComputeShaderGenerateHelper.h"
+#include "CSRangeGeneratorActor.h"
 #include "GlobalShader.h"
 #include "RenderGraphResources.h"
 #include "RenderGraphUtils.h"
@@ -17,7 +18,7 @@ DECLARE_CYCLE_STAT(TEXT("CS Execute"), STAT_CSCliffGenerate_Execute, STATGROUP_C
 DECLARE_CYCLE_STAT(TEXT("CS Capture"), STAT_CSCliffGenerate_Capture, STATGROUP_CSCliffGenerate)
 DECLARE_CYCLE_STAT(TEXT("CS Tatal"), STAT_CSCliffGenerate_Tatal, STATGROUP_CSCliffGenerate);
 
-using namespace CSHepler;
+using namespace CSHelper;
 
 ACSCliffGenerateCapture::ACSCliffGenerateCapture()
 : Super()

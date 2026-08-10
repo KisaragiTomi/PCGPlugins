@@ -1,5 +1,6 @@
 #include "ComputeShaderMeshGenerator.h"
 #include "MeshGeneratorBrushCache.h"
+#include "MeshGeneratorInternal.h"
 
 #include "ComputeShaderBasicFunction.h"
 #include "Engine/TextureRenderTarget2D.h"
@@ -31,6 +32,8 @@
 #include "LandscapeProxy.h"
 #include "CSDirectTriangleMeshComponent.h"
 #include "CSGpuMeshSave.h"
+#include "CSGpuMeshTypes.h"
+#include "CSMeshBuild.h"
 #include "CSMeshGeneratorDebugComponent.h"
 #include "Materials/MaterialInterface.h"
 #include "MeshDescription.h"
@@ -57,56 +60,10 @@
 #include <openvdb/tools/ParticlesToLevelSet.h>
 #include <openvdb/tools/VolumeToMesh.h>
 
-// Voxel cache cell key. The header unifies the cell key type on FIntVector; this alias keeps the
-// legacy name used throughout the cache implementation pointing at that same type.
-using FCSMeshGeneratorVoxelKey = FIntVector;
+// 跨 TU 的场景提取内部接口（结构体/常量/小 helper 已上移至 MeshGeneratorInternal.h）。
+using namespace CSMeshGenInternal;
 
-namespace
-{
-constexpr int32 CSGeneratorMinTextureDimension = 1;
-constexpr int32 CSGeneratorDefaultTextureDimension = 1;
-constexpr float CSGeneratorMinVoxelSize = 1.0e-3f;
-const FName CSGeneratorDefaultRequestId(TEXT("Default"));
-
-
-void ReleaseRTAndNull(TObjectPtr<UTextureRenderTarget2D>& RT)
-{
-	if (RT) { RT->ReleaseResource(); RT = nullptr; }
-}
-
-void InitCacheRT(UTextureRenderTarget2D* RT, int32 Width, int32 Height)
-{
-	if (!RT) { return; }
-	RT->RenderTargetFormat = RTF_RGBA32f;
-	RT->ClearColor = FLinearColor::Black;
-	RT->bCanCreateUAV = true;
-	RT->InitAutoFormat(Width, Height);
-	RT->UpdateResourceImmediate(true);
-}
-
-bool IsValidCacheRT(const UTextureRenderTarget2D* RT)
-{
-	return RT && RT->bCanCreateUAV && RT->SizeX > 0 && RT->SizeY > 0;
-}
-
-bool IsFiniteCSGeneratorVector(const FVector& Vector)
-{
-	return !Vector.ContainsNaN()
-		&& FMath::IsFinite(Vector.X)
-		&& FMath::IsFinite(Vector.Y)
-		&& FMath::IsFinite(Vector.Z);
-}
-
-int32 CeilDivInt64ToInt32(int64 Numerator, int64 Denominator)
-{
-	if (Denominator <= 0)
-	{
-		return 0;
-	}
-	return int32((Numerator + Denominator - 1) / Denominator);
-}
-
-FRDGTextureRef RegisterRenderTargetTexture(FRDGBuilder& GraphBuilder, FTextureRenderTargetResource* RenderTargetResource, const TCHAR* DebugName)
+FRDGTextureRef CSMeshGenInternal::RegisterRenderTargetTexture(FRDGBuilder& GraphBuilder, FTextureRenderTargetResource* RenderTargetResource, const TCHAR* DebugName)
 {
 	if (!RenderTargetResource || !RenderTargetResource->GetRenderTargetTexture())
 	{
@@ -115,17 +72,76 @@ FRDGTextureRef RegisterRenderTargetTexture(FRDGBuilder& GraphBuilder, FTextureRe
 	return RegisterExternalTexture(GraphBuilder, RenderTargetResource->GetRenderTargetTexture(), DebugName);
 }
 
-FIntPoint GetLinearDataTextureSize(int64 ElementCount, int32 MaxTextureDimension)
+namespace
 {
-	const int32 SafeMaxDimension = FMath::Max(CSGeneratorMinTextureDimension, MaxTextureDimension);
-	const int64 SafeElementCount = FMath::Max<int64>(1, ElementCount);
-	const int32 Width = FMath::Min<int32>(
-		SafeMaxDimension,
-		FMath::Max<int64>(CSGeneratorDefaultTextureDimension, FMath::Min<int64>(SafeElementCount, SafeMaxDimension)));
-	const int32 Height = FMath::Max(CSGeneratorDefaultTextureDimension, CeilDivInt64ToInt32(SafeElementCount, Width));
-	return FIntPoint(Width, Height);
+
+// 同步榨干一组 GPU readback：必要时 SubmitAndBlockUntilGPUIdle 等待就绪、校验尺寸、
+// 逐个 Lock/Memcpy/Unlock 到 Spec.Dst，并总是 delete 全部 readback 对象（与原三处手写逻辑一致）。
+// 全部拷贝成功才返回 true；告警文案统一为 DebugLabel + 尺寸。
+struct FCSMeshGenReadbackSpec
+{
+	FRHIGPUBufferReadback* Readback = nullptr;
+	void* Dst = nullptr;
+	uint32 NumBytes = 0;
+};
+
+bool CSMeshGen_DrainReadbacks(FRHICommandListImmediate& RHICmdList, TArrayView<const FCSMeshGenReadbackSpec> Specs, const TCHAR* DebugLabel)
+{
+	for (const FCSMeshGenReadbackSpec& Spec : Specs)
+		if (!Spec.Readback) return false;
+
+	auto AllReady = [&Specs]()
+	{
+		for (const FCSMeshGenReadbackSpec& Spec : Specs)
+			if (!Spec.Readback->IsReady()) return false;
+		return true;
+	};
+	auto DeleteAll = [&Specs]()
+	{
+		for (const FCSMeshGenReadbackSpec& Spec : Specs) delete Spec.Readback;
+	};
+
+	if (!AllReady()) RHICmdList.SubmitAndBlockUntilGPUIdle();
+
+	if (!AllReady())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[%s] GPU readback was not ready after flush."), DebugLabel);
+		DeleteAll();
+		return false;
+	}
+
+	for (const FCSMeshGenReadbackSpec& Spec : Specs)
+	{
+		if (Spec.Readback->GetGPUSizeBytes() < Spec.NumBytes)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[%s] GPU readback size mismatch: got %llu bytes, need %u."),
+				DebugLabel, Spec.Readback->GetGPUSizeBytes(), Spec.NumBytes);
+			DeleteAll();
+			return false;
+		}
+	}
+
+	bool bLockedAll = true;
+	for (const FCSMeshGenReadbackSpec& Spec : Specs)
+	{
+		if (const void* Ptr = Spec.Readback->Lock(Spec.NumBytes))
+		{
+			FMemory::Memcpy(Spec.Dst, Ptr, Spec.NumBytes);
+			Spec.Readback->Unlock();
+		}
+		else
+		{
+			bLockedAll = false;
+		}
+	}
+	DeleteAll();
+	return bLockedAll;
 }
 
+void CSMeshGen_ReleaseRT(UTextureRenderTarget2D* RT)
+{
+	if (RT) RT->ReleaseResource();
+}
 void UploadLinearColorsToRenderTarget(UTextureRenderTarget2D* RenderTarget, TArray<FLinearColor> Colors)
 {
 	if (!RenderTarget || RenderTarget->SizeX <= 0 || RenderTarget->SizeY <= 0) return;
@@ -284,9 +300,9 @@ void ConvertVDBVolumeToMeshDescription(openvdb::FloatGrid::ConstPtr SDFVolume, F
 }
 }
 
-// 娑撯偓娑擃亝瀵旀稊鍛畱 1 閸忓啰绀岄妴浣稿弿 0 閻?float2 typed 妞ゅ墎鍋ｇ紓鎾冲暱 + SRV閵嗗倻绮版稉宥堟嫹闊?UV 閻?extract 鐠侯垰绶?
-// 閿涘牆顩?heightmap閿涘鍨ㄥ┃?mesh 閺?tex-coord SRV 閺冨墎绮︾€?SourceTexCoordBuffer閿涘矂鍘ら崥?NumTexCoords=0
-// 娴?shader 娑撳秶婀″锝堫嚢閸欐牕鐣犻妴鍌滄暏 PF_G32R32F 娴犮儱灏柊?shader 閻?Buffer<float2> 鐠у嫭绨猾璇茬€烽妴?
+// 一个持久的 1 元素、全 0 的 float2 typed 顶点缓冲 + SRV。给不追踪 UV 的 extract 路径
+// （如 heightmap）或源 mesh 无 tex-coord SRV 时绑到 SourceTexCoordBuffer，配合 NumTexCoords=0
+// 让 shader 不真正读取它。用 PF_G32R32F 以匹配 shader 里 Buffer<float2> 的资源类型。
 class FCSDummyTexCoordVertexBuffer : public FVertexBufferWithSRV
 {
 public:
@@ -318,6 +334,7 @@ class FExtractStaticMeshTrianglesCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleNormals)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_TriangleCounter)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_OutTriangleMaterialIds)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_OutTriangleReferenceFlags)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float2>, RW_OutTriangleUVs)
 		SHADER_PARAMETER(uint32, CSNumUVChannels)
 		SHADER_PARAMETER(FMatrix44f, LocalToWorld)
@@ -333,24 +350,15 @@ class FExtractStaticMeshTrianglesCS : public FGlobalShader
 		SHADER_PARAMETER(float, ReferenceFilterDistanceSq)
 	END_SHADER_PARAMETER_STRUCT()
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
-	}
+	CSGEN_SHADER_PERM_SM5_GROUPSIZE_X(64)
 };
 
 IMPLEMENT_GLOBAL_SHADER(FExtractStaticMeshTrianglesCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "ExtractStaticMeshTrianglesCS", SF_Compute);
 
 
-// Nanite 閸忋劎绮忛懞鍌涚爱娑撳顫楁潻钘夊閿涙俺顕伴崣?game thread 娴?editor MeshDescription 閹绘劕褰囬妴浣稿嚒閸欐ɑ宕查崚棰佺瑯閻ｅ瞼鈹栭梻瀵告畱濠ф劒绗佺憴?
-// 閿涘澋orld-space 妞ゅ墎鍋?+ UV0 + 閺夋劘宸?registry id閿涘绱濋崢鐔风摍鏉╄棄濮炴潻娑楃瑢 FExtractStaticMeshTrianglesCS 鐎瑰苯鍙忛惄绋挎倱閻?
-// triangle soup閿涘牆顦查悽銊ユ倱娑撯偓 RW_TriangleCounter/妞ゅ墎鍋?濞夋洜鍤?閺夋劘宸?UV UAV閿涘鈧倻鏁ゆ禍搴㈡禌閹?Nanite 缂冩垶鐗搁惃鍕秵濡?render fallback閵?
+// Nanite 全细节源三角追加：读取 game thread 从 editor MeshDescription 提取、已变换到世界空间的源三角
+// （world-space 顶点 + UV0 + 材质 registry id），原子追加进与 FExtractStaticMeshTrianglesCS 完全相同的
+// triangle soup（复用同一 RW_TriangleCounter/顶点/法线/材质/UV UAV）。用于替代 Nanite 网格的低模 render fallback。
 class FAppendSourceTrianglesCS : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FAppendSourceTrianglesCS);
@@ -364,11 +372,13 @@ class FAppendSourceTrianglesCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, SourceTriangleTangents)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, SourceTriangleBiTangents)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SourceTriangleMaterialIds)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SourceTriangleReferenceFlags)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, ReferencePoints)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleVertices)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleNormals)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_TriangleCounter)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_OutTriangleMaterialIds)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_OutTriangleReferenceFlags)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float2>, RW_OutTriangleUVs)
 		SHADER_PARAMETER(uint32, CSNumUVChannels)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleColors)
@@ -384,16 +394,7 @@ class FAppendSourceTrianglesCS : public FGlobalShader
 		SHADER_PARAMETER(float, ReferenceFilterDistanceSq)
 	END_SHADER_PARAMETER_STRUCT()
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
-	}
+	CSGEN_SHADER_PERM_SM5_GROUPSIZE_X(64)
 };
 
 IMPLEMENT_GLOBAL_SHADER(FAppendSourceTrianglesCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "AppendSourceTrianglesCS", SF_Compute);
@@ -401,34 +402,25 @@ IMPLEMENT_GLOBAL_SHADER(FAppendSourceTrianglesCS, "/Plugin/PCGPlugins/Shaders/Pr
 
 class FFilterTriangleSoupByReferenceCS : public FGlobalShader
 {
-DECLARE_GLOBAL_SHADER(FFilterTriangleSoupByReferenceCS);
-SHADER_USE_PARAMETER_STRUCT(FFilterTriangleSoupByReferenceCS, FGlobalShader);
+	DECLARE_GLOBAL_SHADER(FFilterTriangleSoupByReferenceCS);
+	SHADER_USE_PARAMETER_STRUCT(FFilterTriangleSoupByReferenceCS, FGlobalShader);
 
-BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, TriangleVertices)
-SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, TriangleNormals)
-SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SurfaceTriangleCounter)
-SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, ReferencePoints)
-SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleVertices)
-SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleNormals)
-SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_TriangleCounter)
-SHADER_PARAMETER(uint32, TriangleCount)
-SHADER_PARAMETER(uint32, ReferenceCount)
-SHADER_PARAMETER(uint32, TriangleCapacity)
-SHADER_PARAMETER(uint32, bUseReferenceFilter)
-SHADER_PARAMETER(float, ReferenceFilterDistanceSq)
-END_SHADER_PARAMETER_STRUCT()
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, TriangleVertices)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, TriangleNormals)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SurfaceTriangleCounter)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, ReferencePoints)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleVertices)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RW_OutTriangleNormals)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_TriangleCounter)
+		SHADER_PARAMETER(uint32, TriangleCount)
+		SHADER_PARAMETER(uint32, ReferenceCount)
+		SHADER_PARAMETER(uint32, TriangleCapacity)
+		SHADER_PARAMETER(uint32, bUseReferenceFilter)
+		SHADER_PARAMETER(float, ReferenceFilterDistanceSq)
+	END_SHADER_PARAMETER_STRUCT()
 
-static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-{
-return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-}
-
-static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-{
-FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
-}
+	CSGEN_SHADER_PERM_SM5_GROUPSIZE_X(64)
 };
 
 IMPLEMENT_GLOBAL_SHADER(FFilterTriangleSoupByReferenceCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "FilterTriangleSoupByReferenceCS", SF_Compute);
@@ -465,16 +457,7 @@ class FTriangleSurfaceVoxelsCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, SurfaceVoxelHashSlotCount)
 	END_SHADER_PARAMETER_STRUCT()
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
-	}
+	CSGEN_SHADER_PERM_SM5_GROUPSIZE_X(64)
 };
 
 IMPLEMENT_GLOBAL_SHADER(FTriangleSurfaceVoxelsCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "TriangleSurfaceVoxelsCS", SF_Compute);
@@ -496,16 +479,7 @@ class FFinalizeSurfaceVoxelNormalsCS : public FGlobalShader
 		SHADER_PARAMETER(float, SurfaceVoxelSize)
 	END_SHADER_PARAMETER_STRUCT()
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
-	}
+	CSGEN_SHADER_PERM_SM5_GROUPSIZE_X(64)
 };
 
 IMPLEMENT_GLOBAL_SHADER(FFinalizeSurfaceVoxelNormalsCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "FinalizeSurfaceVoxelNormalsCS", SF_Compute);
@@ -530,105 +504,12 @@ class FBlurSurfaceVoxelsCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, SurfaceVoxelBlurRadius)
 	END_SHADER_PARAMETER_STRUCT()
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
-	}
+	CSGEN_SHADER_PERM_SM5_GROUPSIZE_X(64)
 };
 
 IMPLEMENT_GLOBAL_SHADER(FBlurSurfaceVoxelsCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "BlurSurfaceVoxelsCS", SF_Compute);
-
 // -----------------------------------------------------------------------------
-// Dirty Cache System - Shaders
-// -----------------------------------------------------------------------------
-
-class FClearDirtyVoxelCacheCS : public FGlobalShader
-{
-	DECLARE_GLOBAL_SHADER(FClearDirtyVoxelCacheCS);
-	SHADER_USE_PARAMETER_STRUCT(FClearDirtyVoxelCacheCS, FGlobalShader);
-
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint4>, DirtyVoxelPages)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_VoxelMetaTexture)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_TriangleVertexTexture)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_TriangleNormalTexture)
-		SHADER_PARAMETER(uint32, DirtyVoxelCount)
-		SHADER_PARAMETER(uint32, CacheGeneration)
-		SHADER_PARAMETER(uint32, MaxTrianglesPerVoxel)
-		SHADER_PARAMETER(uint32, MetaTextureWidth)
-		SHADER_PARAMETER(uint32, MetaTextureHeight)
-		SHADER_PARAMETER(uint32, TriangleVertexTextureWidth)
-		SHADER_PARAMETER(uint32, TriangleVertexTextureHeight)
-		SHADER_PARAMETER(uint32, TriangleNormalTextureWidth)
-		SHADER_PARAMETER(uint32, TriangleNormalTextureHeight)
-	END_SHADER_PARAMETER_STRUCT()
-
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
-	}
-};
-
-IMPLEMENT_GLOBAL_SHADER(FClearDirtyVoxelCacheCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "ClearDirtyVoxelCacheCS", SF_Compute);
-
-class FScatterTrianglesToVoxelCacheCS : public FGlobalShader
-{
-	DECLARE_GLOBAL_SHADER(FScatterTrianglesToVoxelCacheCS);
-	SHADER_USE_PARAMETER_STRUCT(FScatterTrianglesToVoxelCacheCS, FGlobalShader);
-
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, TriangleVertices)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, TriangleNormals)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SurfaceTriangleCounter)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint4>, DirtyVoxelPages)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_VoxelMetaTexture)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_TriangleVertexTexture)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_TriangleNormalTexture)
-		SHADER_PARAMETER(uint32, SurfaceTriangleCount)
-		SHADER_PARAMETER(uint32, DirtyVoxelCount)
-		SHADER_PARAMETER(uint32, CacheGeneration)
-		SHADER_PARAMETER(uint32, GridSizeX)
-		SHADER_PARAMETER(uint32, GridSizeY)
-		SHADER_PARAMETER(uint32, GridSizeZ)
-		SHADER_PARAMETER(uint32, MaxTrianglesPerVoxel)
-		SHADER_PARAMETER(uint32, MetaTextureWidth)
-		SHADER_PARAMETER(uint32, MetaTextureHeight)
-		SHADER_PARAMETER(uint32, TriangleVertexTextureWidth)
-		SHADER_PARAMETER(uint32, TriangleVertexTextureHeight)
-		SHADER_PARAMETER(uint32, TriangleNormalTextureWidth)
-		SHADER_PARAMETER(uint32, TriangleNormalTextureHeight)
-		SHADER_PARAMETER(FVector3f, CacheWorldMin)
-		SHADER_PARAMETER(float, CacheVoxelSize)
-	END_SHADER_PARAMETER_STRUCT()
-
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
-	}
-};
-
-IMPLEMENT_GLOBAL_SHADER(FScatterTrianglesToVoxelCacheCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "ScatterTrianglesToVoxelCacheCS", SF_Compute);
-
-// -----------------------------------------------------------------------------
-// Triangle Soup 閳?Heightmap rasterization
+// Triangle Soup → Heightmap rasterization
 // -----------------------------------------------------------------------------
 
 class FTriangleSoupToHeightmapCS : public FGlobalShader
@@ -646,15 +527,7 @@ class FTriangleSoupToHeightmapCS : public FGlobalShader
 		SHADER_PARAMETER(FIntPoint, HM_TextureSize)
 	END_SHADER_PARAMETER_STRUCT()
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
-	}
+	CSGEN_SHADER_PERM_SM5_GROUPSIZE_X(64)
 };
 
 IMPLEMENT_GLOBAL_SHADER(FTriangleSoupToHeightmapCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "TriangleSoupToHeightmapCS", SF_Compute);
@@ -670,81 +543,10 @@ class FConvertHeightmapUintToFloatCS : public FGlobalShader
 		SHADER_PARAMETER(FIntPoint, HM_TextureSize)
 	END_SHADER_PARAMETER_STRUCT()
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
+	CSGEN_SHADER_PERM_SM5()
 };
 
 IMPLEMENT_GLOBAL_SHADER(FConvertHeightmapUintToFloatCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "ConvertHeightmapUintToFloatCS", SF_Compute);
-
-class FLandscapeG16ToDepthCS : public FGlobalShader
-{
-	DECLARE_GLOBAL_SHADER(FLandscapeG16ToDepthCS);
-	SHADER_USE_PARAMETER_STRUCT(FLandscapeG16ToDepthCS, FGlobalShader);
-
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float4>, T_LandscapeRGBA)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_HeightmapFloat)
-		SHADER_PARAMETER(float, LHM_CameraHeight)
-		SHADER_PARAMETER(float, LHM_LandscapeScaleZ)
-		SHADER_PARAMETER(float, LHM_LandscapeOriginZ)
-		SHADER_PARAMETER(FIntPoint, LHM_TextureSize)
-	END_SHADER_PARAMETER_STRUCT()
-
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-};
-
-IMPLEMENT_GLOBAL_SHADER(FLandscapeG16ToDepthCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "LandscapeG16ToDepthCS", SF_Compute);
-
-class FLandscapeG16ToNormalHeightCS : public FGlobalShader
-{
-	DECLARE_GLOBAL_SHADER(FLandscapeG16ToNormalHeightCS);
-	SHADER_USE_PARAMETER_STRUCT(FLandscapeG16ToNormalHeightCS, FGlobalShader);
-
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float4>, T_LandscapeRGBA)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_HeightmapFloat)
-		SHADER_PARAMETER(float, LHM_LandscapeScaleZ)
-		SHADER_PARAMETER(float, LHM_LandscapeOriginZ)
-		SHADER_PARAMETER(FIntPoint, LHM_TextureSize)
-		SHADER_PARAMETER(FVector2f, LHM_TexelWorldSize)
-		SHADER_PARAMETER(uint32, LHM_MergeByMaxZ)
-	END_SHADER_PARAMETER_STRUCT()
-
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-};
-
-IMPLEMENT_GLOBAL_SHADER(FLandscapeG16ToNormalHeightCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "LandscapeG16ToNormalHeightCS", SF_Compute);
-
-class FLandscapeHeightmapToTrianglesCS : public FGlobalShader
-{
-	DECLARE_GLOBAL_SHADER(FLandscapeHeightmapToTrianglesCS);
-	SHADER_USE_PARAMETER_STRUCT(FLandscapeHeightmapToTrianglesCS, FGlobalShader);
-
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float4>, T_LandscapeRGBA)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FVector4f>, RW_TriangleVerts)
-		SHADER_PARAMETER(float, LHM_LandscapeScaleZ)
-		SHADER_PARAMETER(float, LHM_LandscapeOriginZ)
-		SHADER_PARAMETER(FIntPoint, LHM_TextureSize)
-		SHADER_PARAMETER(FVector2f, LHM_WorldOriginXY)
-		SHADER_PARAMETER(FVector2f, LHM_TexelWorldSize)
-	END_SHADER_PARAMETER_STRUCT()
-
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-};
-
-IMPLEMENT_GLOBAL_SHADER(FLandscapeHeightmapToTrianglesCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "LandscapeHeightmapToTrianglesCS", SF_Compute);
 
 // -----------------------------------------------------------------------------
 // Core System - Internal Helpers
@@ -752,72 +554,9 @@ IMPLEMENT_GLOBAL_SHADER(FLandscapeHeightmapToTrianglesCS, "/Plugin/PCGPlugins/Sh
 
 namespace
 {
-struct FCSMeshGeneratorDirtyVoxelPage
-{
-	uint32 X = 0;
-	uint32 Y = 0;
-	uint32 Z = 0;
-	uint32 PageIndex = 0;
-};
-
-static_assert(sizeof(FCSMeshGeneratorDirtyVoxelPage) == sizeof(uint32) * 4, "Dirty voxel page buffer must match shader uint4 layout.");
-
-struct FResolvedStaticMeshTriangleRequest
-{
-	TRefCountPtr<const FStaticMeshLODResources> LODResource;
-	FMatrix44f LocalToWorld = FMatrix44f::Identity;
-	FBox3f WorldBounds = FBox3f(EForceInit::ForceInit);
-	int32 TriangleCount = 0;
-	int32 PositionStrideFloat = 3;
-	// 闂€鍨 == TriangleCount閿涙碍鐦℃稉顏呯爱娑撳顫楄ぐ銏㈡畱閺夋劘宸?registry id閿涘湑S_NO_MATERIAL_ID = 閺冪姵娼楃拹顭掔礆閵?
-	// 閻?section 閼煎啫娲?+ Request.MaterialSlots 閸?game thread 閺嬪嫬缂撻敍宀勬 request 娑撳﹣绱剁紒?GPU extract閵?
-	TArray<uint32> TriToMaterial;
-};
-
-// Nanite 缂冩垶鐗搁惃鍕弿缂佸棜濡┃鎰瑏鐟欐帪绱欓弶銉ㄥ殰 editor MeshDescription閿涘瞼绮潻鍥︾秵濡?render fallback閿涘鈧?
-// 瀹告彃婀?game thread 閸欐ɑ宕查崚棰佺瑯閻ｅ瞼鈹栭梻鏉戣嫙閹?request bounds 缁鐡敍娑欑槨娑撳顫楅幖鍝勭敨 3 娑?UV0 娑?1 娑擃亝娼楃拹?registry id
-// 閿涘牅绗?render 鐠侯垰绶為崥灞肩瀵姵娼楃拹銊ㄣ€冮敍澶涚礉閻?AppendSourceTrianglesCS 閸樼喎鐡欐潻钘夊鏉╂稐绗?render 閹绘劕褰囬惄绋挎倱閻?triangle soup閵?
-// 婢舵矮閲?Nanite request 閸忚京鏁ゆ稉鈧禒钘夌杽娓氬绱欓幍浣搁挬閹峰吋甯撮敍澶涚礉閺佸懍绔村▎?dispatch 閸楀啿褰叉潻钘夊閺佹潙婧€閺咁垳娈戦崗銊╁劥 Nanite 濠ф劒绗佺憴鎺嬧偓?
-struct FCSNaniteSourceTriangleData
-{
-	// 濮ｅ繋绗佺憴?3 娑擃亙绗橀悾宀€鈹栭梻鎾€婇悙鐧哥礉閹典礁閽╅敍姝攖0.v0, t0.v1, t0.v2, t1.v0, ...]閿涘瘍=1閵嗗倻绮惔蹇庣瑢 render index buffer 娑撯偓閼锋番鈧?
-	TArray<FVector4f> Positions;
-	// Per-corner source normals transformed to world space, parallel to Positions.
-	TArray<FVector4f> Normals;
-	TArray<FVector4f> Colors;
-	TArray<FVector4f> Tangents;
-	TArray<FVector4f> BiTangents;
-	// 濮ｅ繋绗佺憴?3 娑?UV0閿涘本澧庨獮绛圭礉娑?Positions 楠炲疇顢戦妴?
-	// 逐角点 UV，按通道交错存放：UVs[Corner * NumUVChannels + Channel]。
-	// 用交错而不是 N 条并行数组，是为了让整条链（上传/GPU/回读）只需要多一个通道数标量，
-	// 而不是每加一条 UV 就多一套 buffer、SRV、readback。
-	TArray<FVector2f> UVs;
-	// 源模型实际有几条 UV 就是几条；所有 request 取最大值，缺的通道补 (0,0)。
-	int32 NumUVChannels = 1;
-	// 濮ｅ繋绗佺憴?1 娑擃亝娼楃拹?registry id閿涘湑S_NO_MATERIAL_ID = 閺冪姵娼楃拹顭掔礆閵?
-	TArray<uint32> MaterialIds;
-	// 閺堝鏅ユ稉澶庮潡閺佸府绱?= Positions.Num() / 3 == MaterialIds.Num()閿涘鈧?
-	int32 NumTriangles = 0;
-
-	bool IsEmpty() const { return NumTriangles <= 0; }
-};
-
 bool IsValidCSTriangleIndex(int32 Index, int32 VertexCount);
-bool IsFiniteCSVertex(const FVector& Vertex);
 bool IsDegenerateCSTriangle(const FVector& A, const FVector& B, const FVector& C);
 bool ShouldExcludeStaticMeshTriangleRequest(const FCSStaticMeshTriangleRequest& Request, const AActor* ExcludedActor, const TArray<FName>& ExcludedActorTags);
-
-int32 GetTriangleMeshDataTriangleCount(const FCSTriangleMeshData& TriangleData)
-{
-	const int32 EffectiveVertexCount = TriangleData.VertexCount >= 0
-		? FMath::Clamp(TriangleData.VertexCount, 0, TriangleData.Vertices.Num())
-		: TriangleData.Vertices.Num();
-	const int32 EffectiveIndexCount = TriangleData.IndexCount >= 0
-		? FMath::Clamp(TriangleData.IndexCount, 0, TriangleData.Indices.Num())
-		: TriangleData.Indices.Num();
-
-	return EffectiveIndexCount >= 3 ? EffectiveIndexCount / 3 : EffectiveVertexCount / 3;
-}
 
 FVector ClosestPointOnTriangleForReferenceFilterCPU(const FVector& P, const FVector& A, const FVector& B, const FVector& C)
 {
@@ -916,7 +655,7 @@ bool TryAppendTriangleSoup(FCSTriangleMeshData& OutTriangleData,
 		return false;
 	}
 
-	if (!IsFiniteCSVertex(P0) || !IsFiniteCSVertex(P1) || !IsFiniteCSVertex(P2) || IsDegenerateCSTriangle(P0, P1, P2))
+	if (!IsFiniteVector(P0) || !IsFiniteVector(P1) || !IsFiniteVector(P2) || IsDegenerateCSTriangle(P0, P1, P2))
 	{
 		return true;
 	}
@@ -950,68 +689,6 @@ bool TryAppendTriangleSoupOrientedToNormal(FCSTriangleMeshData& OutTriangleData,
 	return TryAppendTriangleSoup(OutTriangleData, P0, P1, P2, SafeDesiredNormal, MaxTriangles);
 }
 
-void AppendTriangleMeshData(FCSTriangleMeshData& OutTriangleData, const FCSTriangleMeshData& SourceTriangleData, int32 MaxTriangles)
-{
-	const int32 ExistingTriangleCount = GetTriangleMeshDataTriangleCount(OutTriangleData);
-	if (MaxTriangles > 0 && ExistingTriangleCount >= MaxTriangles)
-	{
-		return;
-	}
-
-	const int32 EffectiveVertexCount = SourceTriangleData.VertexCount >= 0
-		? FMath::Clamp(SourceTriangleData.VertexCount, 0, SourceTriangleData.Vertices.Num())
-		: SourceTriangleData.Vertices.Num();
-	const int32 EffectiveIndexCount = SourceTriangleData.IndexCount >= 0
-		? FMath::Clamp(SourceTriangleData.IndexCount, 0, SourceTriangleData.Indices.Num())
-		: SourceTriangleData.Indices.Num();
-	const bool bUseIndices = EffectiveIndexCount >= 3;
-	const int32 SourceTriangleCount = bUseIndices ? EffectiveIndexCount / 3 : EffectiveVertexCount / 3;
-	if (SourceTriangleCount <= 0)
-	{
-		return;
-	}
-
-	const bool bUseVertexNormals = SourceTriangleData.VertexNormals.Num() >= EffectiveVertexCount;
-	const int32 RemainingTriangleCapacity = MaxTriangles > 0
-		? FMath::Max(0, MaxTriangles - ExistingTriangleCount)
-		: SourceTriangleCount;
-	const int32 TrianglesToAppend = FMath::Min(SourceTriangleCount, RemainingTriangleCapacity);
-	OutTriangleData.Vertices.Reserve(OutTriangleData.Vertices.Num() + TrianglesToAppend * 3);
-	OutTriangleData.VertexNormals.Reserve(OutTriangleData.VertexNormals.Num() + TrianglesToAppend * 3);
-
-	for (int32 TriangleIndex = 0; TriangleIndex < TrianglesToAppend; ++TriangleIndex)
-	{
-		int32 I0 = TriangleIndex * 3 + 0;
-		int32 I1 = TriangleIndex * 3 + 1;
-		int32 I2 = TriangleIndex * 3 + 2;
-		if (bUseIndices)
-		{
-			I0 = SourceTriangleData.Indices[TriangleIndex * 3 + 0];
-			I1 = SourceTriangleData.Indices[TriangleIndex * 3 + 1];
-			I2 = SourceTriangleData.Indices[TriangleIndex * 3 + 2];
-		}
-
-		if (!IsValidCSTriangleIndex(I0, EffectiveVertexCount)
-			|| !IsValidCSTriangleIndex(I1, EffectiveVertexCount)
-			|| !IsValidCSTriangleIndex(I2, EffectiveVertexCount))
-		{
-			continue;
-		}
-
-		const FVector& P0 = SourceTriangleData.Vertices[I0];
-		const FVector& P1 = SourceTriangleData.Vertices[I1];
-		const FVector& P2 = SourceTriangleData.Vertices[I2];
-		const FVector Normal = bUseVertexNormals
-			? ((SourceTriangleData.VertexNormals[I0] + SourceTriangleData.VertexNormals[I1] + SourceTriangleData.VertexNormals[I2]) / 3.0).GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector)
-			: GetSafeTriangleNormal(P0, P1, P2);
-
-		if (!TryAppendTriangleSoup(OutTriangleData, P0, P1, P2, Normal, MaxTriangles))
-		{
-			break;
-		}
-	}
-}
-
 FVector MakeLandscapeNormalFaceUp(const FVector& Normal)
 {
 	FVector SafeNormal = Normal.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
@@ -1024,12 +701,8 @@ FVector MakeLandscapeNormalFaceUp(const FVector& Normal)
 
 void NormalizeTriangleMeshDataWinding(FCSTriangleMeshData& TriangleData)
 {
-	const int32 EffectiveVertexCount = TriangleData.VertexCount >= 0
-		? FMath::Clamp(TriangleData.VertexCount, 0, TriangleData.Vertices.Num())
-		: TriangleData.Vertices.Num();
-	const int32 EffectiveIndexCount = TriangleData.IndexCount >= 0
-		? FMath::Clamp(TriangleData.IndexCount, 0, TriangleData.Indices.Num())
-		: TriangleData.Indices.Num();
+	const int32 EffectiveVertexCount = GetEffectiveVertexCount(TriangleData);
+	const int32 EffectiveIndexCount = GetEffectiveIndexCount(TriangleData);
 	const bool bUseIndices = EffectiveIndexCount >= 3;
 	const int32 TriangleCount = bUseIndices ? EffectiveIndexCount / 3 : EffectiveVertexCount / 3;
 	const bool bHasVertexNormals = TriangleData.VertexNormals.Num() >= EffectiveVertexCount;
@@ -1106,12 +779,8 @@ uint32 BuildTriangleUploadData(const FCSTriangleMeshData& TriangleData,
 		return 0;
 	}
 
-	const int32 EffectiveVertexCount = TriangleData.VertexCount >= 0
-		? FMath::Clamp(TriangleData.VertexCount, 0, TriangleData.Vertices.Num())
-		: TriangleData.Vertices.Num();
-	const int32 EffectiveIndexCount = TriangleData.IndexCount >= 0
-		? FMath::Clamp(TriangleData.IndexCount, 0, TriangleData.Indices.Num())
-		: TriangleData.Indices.Num();
+	const int32 EffectiveVertexCount = GetEffectiveVertexCount(TriangleData);
+	const int32 EffectiveIndexCount = GetEffectiveIndexCount(TriangleData);
 	const bool bUseIndices = EffectiveIndexCount >= 3;
 	const int32 SourceTriangleCount = bUseIndices ? EffectiveIndexCount / 3 : EffectiveVertexCount / 3;
 	const int32 UploadTriangleCount = FMath::Min<int32>(SourceTriangleCount, int32(TriangleCapacity));
@@ -1260,14 +929,6 @@ bool IsValidCSTriangleIndex(int32 Index, int32 VertexCount)
 	return Index >= 0 && Index < VertexCount;
 }
 
-bool IsFiniteCSVertex(const FVector& Vertex)
-{
-	return !Vertex.ContainsNaN()
-		&& FMath::IsFinite(Vertex.X)
-		&& FMath::IsFinite(Vertex.Y)
-		&& FMath::IsFinite(Vertex.Z);
-}
-
 bool IsFiniteCSVector4(const FVector4f& Vector)
 {
 	return FMath::IsFinite(Vector.X)
@@ -1307,8 +968,8 @@ bool ShouldExcludeStaticMeshTriangleRequest(const FCSStaticMeshTriangleRequest& 
 	return false;
 }
 
-// 娑撹桨绔存稉顏勫嚒 resolve 閻?request 閺嬪嫬缂?per-triangle 閺夋劘宸?id閿涙碍瀵?LOD section 閼煎啫娲块幎濠佺瑏鐟欐帗妲х亸鍕煂濠ф劖娼楃拹顭掔礉
-// 閺夋劘宸濈紒?SharedRegistry 閸樺鍣搁幋?registry id閵嗗倹妫?section / 閺冪姵娼楃拹銊π弮璺哄弿闁劏顔囨稉?CS_NO_MATERIAL_ID閵?
+// 为一个已 resolve 的 request 构建 per-triangle 材质 id：按 LOD section 范围把三角映射到源材质，
+// 材质经 SharedRegistry 去重成 registry id。空 section / 无材质槽时全部记为 CS_NO_MATERIAL_ID。
 // Material registry dedupe key. Keying by material pointer alone merges every slot that
 // resolves to the same material - and every empty slot, since they all hash as nullptr - so a
 // source with five slots collapses to a single output slot. Including the source mesh and slot
@@ -1421,14 +1082,14 @@ FVector3f TransformStaticMeshSourceNormal(
 }
 
 #if WITH_EDITOR
-// 娴?Nanite 缂冩垶鐗搁惃?LOD0 缂傛牞绶崳?MeshDescription 閹绘劕褰?閸忋劎绮忛懞?濠ф劒绗佺憴鎺炵礄閺侀绔緙閺佹壆娅ㄦ稉鍥╅獓閿涘绱濈紒鏇＄箖娴ｅ孩膩 render fallback閵?
-// 濮ｅ繋绗佺憴鎺炵窗3 娑擃亪銆婇悙閫涚秴缂?閳?LocalToWorld 閸欐ɑ宕查崚棰佺瑯閻ｅ瞼鈹栭梻杈剧幢閹?request bounds 閸?CPU 缁鐡敍鍫㈢搼娴犺渹绨?render 鐠侯垰绶為惃?
-// bUseBounds 闁劒绗佺憴鎺戝ⅶ闂勩倧绱濋崥灞炬閸戝繐鐨稉濠佺炊闁插骏绱氶敍娌€V0 閸?vertex-instance 闁岸浜?0閿涙稒娼楃拹銊х病 polygon group 閳?slot name 閳?
-// Request.MaterialSlots 閳?閸忓彉闊?registry 閸樺鍣搁敍鍫滅瑢 render 鐠侯垰绶炵€瑰苯鍙忛崥灞肩瀵姾銆冮敍灞肩箽鐠囦焦娼楃拹銊π紒鐔剁閿涘鈧?
-// 缂佹挻鐏夐幍浣搁挬鏉╄棄濮炴潻?OutTriangles閿涘牆褰茬捄銊ヮ樋娑?request 缁鳖垳袧閿涘鈧倽绻戦崶?true 鐞涖劎銇氶幋鎰閹绘劕褰囬敍娑欐￥閸欘垳鏁?MeshDescription
-// 閿涘潏ooked / 閺?editor 閺佺増宓侀敍澶庣箲閸?false閿涘矁鐨熼悽銊︽煙閹诡喗顒濋崶鐐衡偓鈧担搴⒛?render fallback 鐠侯垰绶為妴?
-// 缂佹洖绨拠瀛樻閿涙瓉eshDescription 娑撳顫楃紒鏇炵碍娑?render index buffer 娑撯偓閼疯揪绱欐稉銈堚偓鍛倱濠ф劘鍤?build 閸撳秶娈戝┃鎰秹閺嶈偐绮惔蹇ョ礆閿涘本鏅犳稉濠佺炊閻?
-// P0/P1/P2 閻╁瓨甯存禍銈囩舶 AppendSourceTrianglesCS 鐠ч绗?ExtractStaticMeshTrianglesCS 闁劕鐡ч惄绋挎倱閻ㄥ嫬寮界紒鏇⑩偓鏄忕帆閿涘矁绶崙鐑樻篂閸氭垳绔撮懛娣偓?
+// 从 Nanite 网格的 LOD0 编辑器 MeshDescription 提取全细节源三角（数万~数百万级），绕过低模 render fallback。
+// 每三角：3 个顶点位置经 LocalToWorld 变换到世界空间；按 request bounds 在 CPU 粗筛（等价于 render 路径的
+// bUseBounds 逐三角剔除，同时减少上传量）；UV0 取 vertex-instance 通道 0；材质经 polygon group 的 slot name 在
+// Request.MaterialSlots 里经共享 registry 去重（与 render 路径完全同一张表，保证材质槽统一）。
+// 结果扁平追加进 OutTriangles（可跨多个 request 累积）。返回 true 表示成功提取；无可用 MeshDescription
+// （cooked / 非 editor 数据）返回 false，调用方据此回退低模 render fallback 路径。
+// 绕序说明：MeshDescription 三角绕序与 render index buffer 一致（两者同源于 build 前的源网格绕序），故上传后
+// P0/P1/P2 直接交给 AppendSourceTrianglesCS 走与 ExtractStaticMeshTrianglesCS 逐字相同的反绕逻辑，输出朝向一致。
 bool ExtractNaniteSourceTrianglesForRequest(
 	const FCSStaticMeshTriangleRequest& Request,
 	TArray<TObjectPtr<UMaterialInterface>>& SharedRegistry,
@@ -1586,7 +1247,7 @@ bool ExtractNaniteSourceTrianglesForRequest(
 			: FVector4f(1, 1, 1, 1);
 	};
 
-	// 濮?polygon group 妫板嫯袙閺嬫劒绔村▎?registry id閿涙roup 閳?slot name 閳?Request.MaterialSlots 閳?閸忓彉闊?registry閵?
+	// 按 polygon group 预解析一次 registry id：group 的 slot name 经 Request.MaterialSlots 进共享 registry。
 	const int32 PolygonGroupArraySize = MeshDescription->PolygonGroups().GetArraySize();
 	TArray<uint32> PolyGroupToRegistry;
 	PolyGroupToRegistry.Init(CS_NO_MATERIAL_ID, FMath::Max(1, PolygonGroupArraySize));
@@ -1640,6 +1301,7 @@ bool ExtractNaniteSourceTrianglesForRequest(
 	OutTriangles.BiTangents.Reserve(OutTriangles.BiTangents.Num() + SourceTriangleNum * 3);
 	OutTriangles.UVs.Reserve(OutTriangles.UVs.Num() + SourceTriangleNum * 3);
 	OutTriangles.MaterialIds.Reserve(OutTriangles.MaterialIds.Num() + SourceTriangleNum);
+	OutTriangles.ReferenceFlags.Reserve(OutTriangles.ReferenceFlags.Num() + SourceTriangleNum);
 
 	for (const FTriangleID TriangleID : MeshDescription->Triangles().GetElementIDs())
 	{
@@ -1752,6 +1414,7 @@ bool ExtractNaniteSourceTrianglesForRequest(
 				OutTriangles.UVs.Add(UVs[SourceCorner][Channel]);
 		}
 		OutTriangles.MaterialIds.Add(MaterialId);
+		OutTriangles.ReferenceFlags.Add(Request.bIsReference ? 1u : 0u);
 		++OutTriangles.NumTriangles;
 	}
 
@@ -1804,15 +1467,17 @@ bool FCSSceneTriangleSourceOrientationAutomationTest::RunTest(const FString& Par
 #endif
 #endif // WITH_EDITOR
 
-uint64 ResolveStaticMeshTriangleRequests(
+} // 匿名空间暂停：以下定义属于 CSMeshGenInternal，需要外部链接（跨 TU 使用，声明见 MeshGeneratorInternal.h）
+
+uint64 CSMeshGenInternal::ResolveStaticMeshTriangleRequests(
 	const TArray<FCSStaticMeshTriangleRequest>& Requests,
 	const AActor* ExcludedActor,
 	const TArray<FName>& ExcludedActorTags,
 	bool bNaniteOnlyFallbackMesh,
 	TArray<FResolvedStaticMeshTriangleRequest>& OutResolvedRequests,
-	TArray<TObjectPtr<UMaterialInterface>>* OutMaterialRegistry = nullptr,
-	FCSNaniteSourceTriangleData* OutNaniteTriangles = nullptr,
-	bool bPreserveSourceMaterialSlots = true)
+	TArray<TObjectPtr<UMaterialInterface>>* OutMaterialRegistry,
+	FCSNaniteSourceTriangleData* OutNaniteTriangles,
+	bool bPreserveSourceMaterialSlots)
 {
 	OutResolvedRequests.Reset();
 	OutResolvedRequests.Reserve(Requests.Num());
@@ -1820,10 +1485,10 @@ uint64 ResolveStaticMeshTriangleRequests(
 	TArray<TObjectPtr<UMaterialInterface>> MaterialRegistry;
 	TMap<FCSMaterialRegistryKey, int32> MaterialToRegistry;
 
-	// 鏉╂柨娲栭崐闂寸矌缂佺喕顓?render-resolve 閸戣櫣娈戞稉澶庮潡閿?= OutResolvedRequests[i].TriangleCount 娑斿鎷伴敍澶堚偓渚糰nite 閸忋劎绮忛懞鍌涚爱娑撳顫?
-	// 閸楁洜瀚槐顖溞濇潻?*OutNaniteTriangles閿涘牆鍙鹃懛顏勭敨 NumTriangles閿涘绱濈€瑰綊鍣洪弽鍝ョ暬閻?AddResolvedStaticMeshTrianglesToRDGInternal
-	// 閹跺﹣琚遍懓鍛祲閸旂姴鐣幋鎰剁礉闁灝鍘ら柌宥咁槻鐠佲剝鏆熼妴渚絬tNaniteTriangles == nullptr 閺冩儼顢戞稉杞扮瑢閺€鐟板З閸撳秹鈧劕鐡ф稉鈧懛杈剧礄Nanite 缂冩垶鐗搁悡褎妫挧?
-	// render fallback 楠炴儼顓搁崗銉ㄧ箲閸ョ偛鈧》绱氶敍灞炬櫊閹碘偓閺堝婀幒銉ュ弳 Nanite 閻ㄥ嫭妫﹂張澶庣殶閻劍鏌熼梿璺烘礀瑜版帇鈧?
+	// 返回值仅统计 render-resolve 出的三角（= OutResolvedRequests[i].TriangleCount 之和）。Nanite 全细节源三角
+	// 单独累积进 *OutNaniteTriangles（其自带 NumTriangles），容量核算在 AddResolvedStaticMeshTrianglesToRDGInternal
+	// 把两者相加完成，避免重复计数。OutNaniteTriangles == nullptr 时行为与改动前逐字一致（Nanite 网格照旧走
+	// render fallback 并计入返回值），故所有未接入 Nanite 的既有调用方零回归。
 	uint64 TotalTriangleCount = 0;
 	for (const FCSStaticMeshTriangleRequest& Request : Requests)
 	{
@@ -1832,8 +1497,8 @@ uint64 ResolveStaticMeshTriangleRequests(
 			continue;
 		}
 
-		// Nanite 缂冩垶鐗搁敍姘喘閸忓牊褰侀崣?editor MeshDescription 閻ㄥ嫬鍙忕紒鍡氬Ν濠ф劕鍤戞担鏇礉閺囧じ鍞担搴⒛?render fallback閵?
-		// 娴犲懎缍嬬拫鍐暏閺傜顩﹀Ч鍌︾礄OutNaniteTriangles 闂堢偟鈹栭敍澶嬫閸氼垳鏁ら敍娑欏絹閸欐牗鍨氶崝鐔峰祮鐠哄疇绻?render resolve閵?
+		// Nanite 网格：优先提取 editor MeshDescription 的全细节源几何，替代低模 render fallback。
+		// 仅当调用方要求（OutNaniteTriangles 非空）时启用；提取成功即跳过 render resolve。
 		if (OutNaniteTriangles && Request.StaticMesh)
 		{
 #if WITH_EDITOR
@@ -1862,151 +1527,16 @@ uint64 ResolveStaticMeshTriangleRequests(
 	return TotalTriangleCount;
 }
 
-UDynamicMesh* BuildDynamicMeshFromCSTriangleData(const TArray<FVector>& Vertices,
-	const TArray<int32>& Indices,
-	const TArray<FVector>& VertexNormals,
-	int32 VertexCount,
-	int32 IndexCount,
-	bool bReverseOrientation,
-	bool bSkipDegenerateTriangles,
-	bool bRecomputeNormals)
-{
-	UDynamicMesh* OutMesh = CreateEmptyDynamicMesh();
-	if (!OutMesh)
-	{
-		return nullptr;
-	}
-
-	const int32 EffectiveVertexCount = VertexCount >= 0
-		? FMath::Clamp(VertexCount, 0, Vertices.Num())
-		: Vertices.Num();
-	const int32 EffectiveIndexCount = IndexCount >= 0
-		? FMath::Clamp(IndexCount, 0, Indices.Num())
-		: Indices.Num();
-
-	if (EffectiveVertexCount < 3)
-	{
-		return OutMesh;
-	}
-
-	const bool bUseTriangleSoup = EffectiveIndexCount == 0;
-	const int32 TriangleCount = bUseTriangleSoup ? EffectiveVertexCount / 3 : EffectiveIndexCount / 3;
-	if (TriangleCount <= 0)
-	{
-		return OutMesh;
-	}
-
-	const bool bUseInputVertexNormals = !bRecomputeNormals && VertexNormals.Num() >= EffectiveVertexCount;
-
-	UE::Geometry::FDynamicMesh3 Mesh;
-	TArray<int32> VertexIDMap;
-	VertexIDMap.Reserve(EffectiveVertexCount);
-	for (int32 VertexIndex = 0; VertexIndex < EffectiveVertexCount; ++VertexIndex)
-	{
-		const FVector& Vertex = Vertices[VertexIndex];
-		if (IsFiniteCSVertex(Vertex))
-		{
-			VertexIDMap.Add(Mesh.AppendVertex(FVector3d(Vertex)));
-		}
-		else
-		{
-			VertexIDMap.Add(INDEX_NONE);
-		}
-	}
-
-	if (bUseInputVertexNormals)
-	{
-		Mesh.EnableVertexNormals(FVector3f::UpVector);
-		for (int32 VertexIndex = 0; VertexIndex < EffectiveVertexCount; ++VertexIndex)
-		{
-			const int32 MeshVertexID = VertexIDMap[VertexIndex];
-			if (MeshVertexID == INDEX_NONE || VertexNormals[VertexIndex].ContainsNaN())
-			{
-				continue;
-			}
-
-			const FVector SafeNormal = VertexNormals[VertexIndex].GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
-			Mesh.SetVertexNormal(MeshVertexID, FVector3f(SafeNormal));
-		}
-	}
-
-	int32 AddedTriangles = 0;
-	for (int32 TriangleIndex = 0; TriangleIndex < TriangleCount; ++TriangleIndex)
-	{
-		int32 A = INDEX_NONE;
-		int32 B = INDEX_NONE;
-		int32 C = INDEX_NONE;
-
-		if (bUseTriangleSoup)
-		{
-			A = TriangleIndex * 3 + 0;
-			B = TriangleIndex * 3 + 1;
-			C = TriangleIndex * 3 + 2;
-		}
-		else
-		{
-			A = Indices[TriangleIndex * 3 + 0];
-			B = Indices[TriangleIndex * 3 + 1];
-			C = Indices[TriangleIndex * 3 + 2];
-		}
-
-		if (!IsValidCSTriangleIndex(A, EffectiveVertexCount)
-			|| !IsValidCSTriangleIndex(B, EffectiveVertexCount)
-			|| !IsValidCSTriangleIndex(C, EffectiveVertexCount)
-			|| VertexIDMap[A] == INDEX_NONE
-			|| VertexIDMap[B] == INDEX_NONE
-			|| VertexIDMap[C] == INDEX_NONE
-			|| A == B || B == C || A == C)
-		{
-			continue;
-		}
-
-		if (bSkipDegenerateTriangles && IsDegenerateCSTriangle(Vertices[A], Vertices[B], Vertices[C]))
-		{
-			continue;
-		}
-
-		if (bReverseOrientation)
-		{
-			// DynamicMeshComponent front-face rendering and the collected source-normal triangle
-			// buffer currently use opposite winding conventions. Keep this explicit conversion
-			// at the DynamicMesh boundary instead of changing the source triangle data.
-			Swap(B, C);
-		}
-
-		const int32 NewTriangleID = Mesh.AppendTriangle(UE::Geometry::FIndex3i(VertexIDMap[A], VertexIDMap[B], VertexIDMap[C]), 0);
-		if (NewTriangleID >= 0)
-		{
-			++AddedTriangles;
-		}
-	}
-
-	if (AddedTriangles == 0)
-	{
-		return OutMesh;
-	}
-
-	OutMesh->SetMesh(MoveTemp(Mesh));
-
-	if (bRecomputeNormals)
-	{
-		FGeometryScriptCalculateNormalsOptions CalculateOptions;
-		UGeometryScriptLibrary_MeshNormalsFunctions::RecomputeNormals(OutMesh, CalculateOptions);
-	}
-
-	return OutMesh;
-}
-
-void BuildBoxSceneLandscapeTrianglesInternal(UWorld* World,
+void CSMeshGenInternal::BuildBoxSceneLandscapeTrianglesInternal(UWorld* World,
 	const FBox& QueryBox,
 	const TArray<FVector>& ReferencePoints,
 	float ReferenceFilterDistance,
 	int32 MaxTriangles,
 	FCSTriangleMeshData& OutTriangleData,
-	const FTransform* WorldToLocalBoxTransform = nullptr,
-	const FVector* LocalBoxExtent = nullptr,
-	FName RequiredActorTag = NAME_None,
-	bool bSortComponentsByDistance = true)
+	const FTransform* WorldToLocalBoxTransform,
+	const FVector* LocalBoxExtent,
+	FName RequiredActorTag,
+	bool bSortComponentsByDistance)
 {
 	OutTriangleData = FCSTriangleMeshData();
 
@@ -2153,39 +1683,7 @@ void BuildBoxSceneLandscapeTrianglesInternal(UWorld* World,
 #endif
 }
 
-} // close anonymous namespace for member function definitions
-
-// Public static wrappers
-void AComputeShaderMeshGenerator::BuildBoxSceneLandscapeTriangles(UWorld* World,
-	const FBox& QueryBox,
-	const TArray<FVector>& InReferencePoints,
-	float InReferenceFilterDistance,
-	int32 MaxTriangles,
-	FCSTriangleMeshData& OutTriangleData)
-{
-	BuildBoxSceneLandscapeTrianglesInternal(World, QueryBox, InReferencePoints,
-		InReferenceFilterDistance, MaxTriangles, OutTriangleData);
-}
-
-void AComputeShaderMeshGenerator::BuildBoxSceneLandscapeTriangles(UWorld* World,
-	const FBox& QueryBox,
-	const TArray<FVector>& InReferencePoints,
-	float InReferenceFilterDistance,
-	int32 MaxTriangles,
-	FCSTriangleMeshData& OutTriangleData,
-	const FTransform* WorldToLocalBoxTransform,
-	const FVector* LocalBoxExtent,
-	FName RequiredActorTag,
-	bool bSortComponentsByDistance)
-{
-	BuildBoxSceneLandscapeTrianglesInternal(World, QueryBox, InReferencePoints,
-		InReferenceFilterDistance, MaxTriangles, OutTriangleData,
-		WorldToLocalBoxTransform, LocalBoxExtent, RequiredActorTag, bSortComponentsByDistance);
-}
-
-namespace { // reopen anonymous namespace
-
-void BuildBoxSceneTriangleRequestsInternal(UWorld* World,
+void CSMeshGenInternal::BuildBoxSceneTriangleRequestsInternal(UWorld* World,
 	const FBox& QueryBox,
 	int32 LODIndex,
 	TArray<FCSStaticMeshTriangleRequest>& OutRequests)
@@ -2214,7 +1712,14 @@ void BuildBoxSceneTriangleRequestsInternal(UWorld* World,
 			continue;
 		}
 
-		// override-aware 閺夋劘宸濆Σ鏂ょ窗section.MaterialIndex 缁便垹绱╂潻娑欐拱閺佹壆绮嶉妴淇玜me thread 閹靛秷鍏樼€瑰鍙忕拠鑽ょ矋娴犺埖娼楃拹銊ｂ偓?
+		// "Ref" 标签把网格标成参照体：进 winding 场但不切分、不输出。
+		// actor 与 component 两级都认，方便按整个 actor 或单个组件标注。
+		static const FName ReferenceTag(TEXT("Ref"));
+		const bool bReferenceMesh =
+			(SourceActor && SourceActor->ActorHasTag(ReferenceTag))
+			|| StaticMeshComponent->ComponentHasTag(ReferenceTag);
+
+		// override-aware 材质槽：section.MaterialIndex 索引进本数组。game thread 才能安全读组件材质。
 		TArray<TObjectPtr<UMaterialInterface>> ComponentMaterialSlots;
 		const int32 NumComponentMaterials = StaticMeshComponent->GetNumMaterials();
 		ComponentMaterialSlots.Reserve(NumComponentMaterials);
@@ -2241,6 +1746,7 @@ void BuildBoxSceneTriangleRequestsInternal(UWorld* World,
 				Request.WorldBounds = QueryBox;
 				Request.SourceActor = SourceActor;
 				Request.SourceComponent = StaticMeshComponent;
+				Request.bIsReference = bReferenceMesh;
 				Request.MaterialSlots = ComponentMaterialSlots;
 			}
 			continue;
@@ -2259,9 +1765,9 @@ void BuildBoxSceneTriangleRequestsInternal(UWorld* World,
 		Request.WorldBounds = QueryBox;
 		Request.SourceActor = SourceActor;
 		Request.SourceComponent = StaticMeshComponent;
+		Request.bIsReference = bReferenceMesh;
 		Request.MaterialSlots = MoveTemp(ComponentMaterialSlots);
 	}
-}
 }
 
 // -----------------------------------------------------------------------------
@@ -2279,9 +1785,7 @@ void AComputeShaderMeshGenerator::BuildBoxSceneTriangleRequests(UWorld* World,
 // Core System - RDG Extraction
 // -----------------------------------------------------------------------------
 
-namespace
-{
-FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
+FCSStaticMeshTriangleRDGOutput CSMeshGenInternal::AddResolvedStaticMeshTrianglesToRDGInternal(
 	FRDGBuilder& GraphBuilder,
 	FRHICommandListImmediate& RHICmdList,
 	const TArray<FResolvedStaticMeshTriangleRequest>& ResolvedRequests,
@@ -2291,13 +1795,13 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 	int32 MaxTriangles,
 	const FCSTriangleMeshData* InitialTriangleData,
 	const TCHAR* DebugName,
-	const FCSNaniteSourceTriangleData* NaniteTriangles = nullptr)
+	const FCSNaniteSourceTriangleData* NaniteTriangles)
 {
 	FCSStaticMeshTriangleRDGOutput Output;
 
 	const uint64 InitialTriangleCount = InitialTriangleData ? uint64(FMath::Max(0, GetTriangleMeshDataTriangleCount(*InitialTriangleData))) : 0ull;
-	// Nanite 閸忋劎绮忛懞鍌涚爱娑撳顫楃拋鈥冲弳閹顔愰柌蹇ョ窗TotalTriangleCount 閸欘亜鎯?render-resolve 娑撳顫楅敍瀛╝nite 娑撳顫楅崡鏇犲閸︺劍顒濈槐顖氬閿?
-	// 娣囨繆鐦?soup buffer 鐏忓搫顕憰鍡欐磰 render + landscape(initial) + Nanite 娑撳鈧懍绠ｉ崪宀嬬礄濞嗙姴鏄傜€甸晲绱扮憗浣稿鏉堟挸鍤敍澶堚偓?
+	// Nanite 全细节源三角计入总容量：TotalTriangleCount 只含 render-resolve 三角，Nanite 三角单独在此累加。
+	// 保证 soup buffer 尺寸覆盖 render + landscape(initial) + Nanite 三者之和（欠尺寸会裁剪输出）。
 	const uint64 NaniteTriangleCount = NaniteTriangles ? uint64(FMath::Max(0, NaniteTriangles->NumTriangles)) : 0ull;
 	const uint64 CombinedTriangleCount = FMath::Min<uint64>(TotalTriangleCount + InitialTriangleCount + NaniteTriangleCount, uint64(TNumericLimits<int32>::Max()));
 	if (CombinedTriangleCount == 0)
@@ -2311,38 +1815,21 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 	Output.MaxTriangles = TriangleCapacity;
 	Output.MaxVertices = VertexCapacity;
 
-	Output.TriangleVertices = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), VertexCapacity),
-		TEXT("CS.StaticMeshTriangles.Vertices"));
-	Output.TriangleVerticesUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.TriangleVertices, PF_A32B32G32R32F));
-	Output.TriangleVerticesSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.TriangleVertices, PF_A32B32G32R32F));
-	AddClearUAVPass(GraphBuilder, Output.TriangleVerticesUAV, 0.0f);
+	CSHelper::CreateClearedTypedBuffer(GraphBuilder, Output.TriangleVertices, Output.TriangleVerticesUAV, Output.TriangleVerticesSRV, sizeof(FVector4f), VertexCapacity, PF_A32B32G32R32F, TEXT("CS.StaticMeshTriangles.Vertices"), 0.0f);
 
-	Output.TriangleNormals = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), VertexCapacity),
-		TEXT("CS.StaticMeshTriangles.Normals"));
-	Output.TriangleNormalsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.TriangleNormals, PF_A32B32G32R32F));
-	Output.TriangleNormalsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.TriangleNormals, PF_A32B32G32R32F));
-	AddClearUAVPass(GraphBuilder, Output.TriangleNormalsUAV, 0.0f);
+	CSHelper::CreateClearedTypedBuffer(GraphBuilder, Output.TriangleNormals, Output.TriangleNormalsUAV, Output.TriangleNormalsSRV, sizeof(FVector4f), VertexCapacity, PF_A32B32G32R32F, TEXT("CS.StaticMeshTriangles.Normals"), 0.0f);
 
-	Output.TriangleCounter = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1),
-		TEXT("CS.StaticMeshTriangles.Counter"));
-	Output.TriangleCounterUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.TriangleCounter, PF_R32_UINT));
-	Output.TriangleCounterSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.TriangleCounter, PF_R32_UINT));
-	AddClearUAVPass(GraphBuilder, Output.TriangleCounterUAV, 0u);
+	CSHelper::CreateClearedTypedBuffer(GraphBuilder, Output.TriangleCounter, Output.TriangleCounterUAV, Output.TriangleCounterSRV, sizeof(uint32), 1, PF_R32_UINT, TEXT("CS.StaticMeshTriangles.Counter"), 0u);
 
-	// 濮?triangle 娑撯偓娑擃亝娼楃拹?id閿涘牅绗屾い鍓佸仯楠炲疇顢戦敍灞惧瘻 triangle 缁便垹绱╅敍澶堚偓鍌烆暕濞撳懏鍨?CS_NO_MATERIAL_ID閿?
-	// GPU extract 閸欘亜顕?static mesh 娑撳顫楅崘娆戞埂鐎?registry id閿涘苯婀磋ぐ?閺堫亜鍟撻崗銉ф畱娑撳顫楅懛顏勫З娣囨繃瀵旈弮鐘虫綏鐠愩劊鈧?
-	Output.TriangleMaterialIds = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), TriangleCapacity),
-		TEXT("CS.StaticMeshTriangles.MaterialIds"));
-	Output.TriangleMaterialIdsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.TriangleMaterialIds, PF_R32_UINT));
-	Output.TriangleMaterialIdsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.TriangleMaterialIds, PF_R32_UINT));
-	AddClearUAVPass(GraphBuilder, Output.TriangleMaterialIdsUAV, CS_NO_MATERIAL_ID);
+	// 每 triangle 一个材质 id（与顶点平行，按 triangle 索引）。预清成 CS_NO_MATERIAL_ID。
+	// GPU extract 只对 static mesh 三角写真实 registry id，地形/未写入的三角自动保持无材质。
+	CSHelper::CreateClearedTypedBuffer(GraphBuilder, Output.TriangleMaterialIds, Output.TriangleMaterialIdsUAV, Output.TriangleMaterialIdsSRV, sizeof(uint32), TriangleCapacity, PF_R32_UINT, TEXT("CS.StaticMeshTriangles.MaterialIds"), CS_NO_MATERIAL_ID);
 
-	// 濮?vertex 娑撯偓娑?UV0閿涘牅绗屾い鍓佸仯楠炲疇顢戦敍? per triangle閿涘鈧倿顣╁〒鍛灇 (0,0)閿涙PU extract 閸欘亜顕?static mesh
-	// 妞ゅ墎鍋ｉ崘娆戞埂鐎?UV閿涙稑婀磋ぐ?閺堫亜鍟撻崗?閺?UV 閻ㄥ嫭绨懛顏勫З娣囨繃瀵?(0,0)閵嗕揪F_G32R32F 閸栧綊鍘?shader Buffer<float2>閵?
+	// 逐三角参照标志。清成 0：未写入的槽位（含地形）都按普通网格处理，参照体必须显式标注。
+	CSHelper::CreateClearedTypedBuffer(GraphBuilder, Output.TriangleReferenceFlags, Output.TriangleReferenceFlagsUAV, Output.TriangleReferenceFlagsSRV, sizeof(uint32), TriangleCapacity, PF_R32_UINT, TEXT("CS.StaticMeshTriangles.ReferenceFlags"), 0u);
+
+	// 每 vertex 一组 UV0（与顶点平行，3 per triangle）。预清成 (0,0)：GPU extract 只对 static mesh
+	// 顶点写真实 UV；地形/未写入 UV 的源自动保持 (0,0)。PF_G32R32F 匹配 shader Buffer<float2>。
 	// 逐角点、按通道交错：容量 = 顶点容量 * 通道数。通道数由源模型决定（见 NumUVChannels）。
 	Output.NumUVChannels = FMath::Clamp(
 		NaniteTriangles ? NaniteTriangles->NumUVChannels : 1, 1, FCSGpuMeshCPUData::MaxTexCoordChannels);
@@ -2492,13 +1979,13 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 		}
 		Output.ReferencedIndexBufferSRVs.Add(IndexBufferSRV);
 
-		// UV0 閻╁瓨甯寸拠缁樼爱 mesh 閻?tex-coord SRV閿涘牅绗?position 鐠囩粯纭舵稉鈧懛杈剧礆閵嗗倹妫?UV 閻?mesh 閳?缂?dummy + NumTexCoords=0閵?
+		// UV0 直接读源 mesh 的 tex-coord SRV（与 position 读法一致）。无 UV 的 mesh 侧绑 dummy + NumTexCoords=0。
 		FRHIShaderResourceView* TexCoordSRV = Request.LODResource->VertexBuffers.StaticMeshVertexBuffer.GetTexCoordsSRV();
 		const uint32 RequestNumTexCoords = TexCoordSRV ? Request.LODResource->VertexBuffers.StaticMeshVertexBuffer.GetNumTexCoords() : 0u;
 		if (!TexCoordSRV || RequestNumTexCoords == 0u) TexCoordSRV = GCSDummyTexCoordVertexBuffer.ShaderResourceViewRHI.GetReference();
 
-		// 娑撳﹣绱堕張?request 閻?per-triangle 閺夋劘宸?id閿涘湐uffer<uint>閿涘矂鏆辨惔?== 濠ф劒绗佺憴鎺撴殶閿涘鈧?
-		// TriToMaterial 閺堫亜锝為敍鍫濆従鐎瑰啳鐨熼悽銊︽煙閿涘妞傞敍宀勨偓鈧崠鏍﹁礋閸?CS_NO_MATERIAL_ID閿涘矁顢戞稉铏圭搼娴犺渹绨弮鐘虫綏鐠愩劏鎷烽煪顏傗偓?
+		// 上传本 request 的 per-triangle 材质 id（Buffer<uint>，长度 == 源三角数）。
+		// TriToMaterial 未填（其它调用方）时，退化为全 CS_NO_MATERIAL_ID，行为等价于无材质追踪。
 		const int32 RequestTriangleCount = FMath::Max(1, Request.TriangleCount);
 		FRDGBufferRef TriToMaterialBuffer = GraphBuilder.CreateBuffer(
 			FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), RequestTriangleCount),
@@ -2520,6 +2007,7 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 		PassParameters->RW_OutTriangleNormals = Output.TriangleNormalsUAV;
 		PassParameters->RW_TriangleCounter = Output.TriangleCounterUAV;
 		PassParameters->RW_OutTriangleMaterialIds = Output.TriangleMaterialIdsUAV;
+		PassParameters->RW_OutTriangleReferenceFlags = Output.TriangleReferenceFlagsUAV;
 		PassParameters->RW_OutTriangleUVs = Output.TriangleUVsUAV;
 		PassParameters->CSNumUVChannels = uint32(Output.NumUVChannels);
 		PassParameters->LocalToWorld = Request.LocalToWorld;
@@ -2543,15 +2031,15 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 			[PassParameters, TriangleShader, TriangleCount = Request.TriangleCount, IndexBufferSRV](FRHIComputeCommandList& InRHICmdList)
 			{
 				(void)IndexBufferSRV;
-				// wrapped閿涙瓖riangleCount 閸欘垵鎻弫鎵娑撳浄绱?65535*64=4.19M閿涘绱濋棁鈧?2D 閸栧懓锛欓柆鍨帳 GroupCount.X 鐡掑﹪妾?ensure閿涘澃hader 缁?GetUnWrappedDispatchThreadId 鏉╂ê甯敍?
+				// wrapped：TriangleCount 可达数百万（65535*64=4.19M），需要 2D 包裹避免 GroupCount.X 越限 ensure（shader 侧 GetUnWrappedDispatchThreadId 还原）
 				FComputeShaderUtils::Dispatch(InRHICmdList, TriangleShader, *PassParameters, FComputeShaderUtils::GetGroupCountWrapped(FMath::Max(1, int32(TriangleCount)), 64));
 			});
 	}
 
-	// Nanite 閸忋劎绮忛懞鍌涚爱娑撳顫楅敍姘瑐娴肩姴鍑￠崣妯诲床閸掗绗橀悾宀€鈹栭梻瀵告畱濠ф劒绗佺憴鎺炵礄妞ゅ墎鍋?+ UV0 + 閺夋劘宸?id閿涘绱濋悽?AppendSourceTrianglesCS
-	// 閸樼喎鐡欐潻钘夊鏉╂稐绗傞棃?extract 瀹告彃鍟撻崗銉ф畱閸氬奔绔?soup閿涘牆鍙℃禍?RW_TriangleCounter閿涘鈧倷缍呯純顔兼躬 CPU 缁旑垰鍑￠幐?request bounds
-	// 缁鐡敍灞炬櫊鏉╂瑩鍣?bUseBounds=0閿涙稑寮懓鍐仯鏉╁洦鎶ゆ禒宥呮躬 GPU 缁旑垱澧界悰灞间簰鐎靛綊缍?render 閹绘劕褰囩捄顖氱窞閵嗗倸锛愰弰搴℃躬 extract 瀵邦亞骞嗘稊瀣倵閿?
-	// 娓氭繆绂?RW_TriangleCounter 娴?RDG 閼奉亜濮╅幎濠冩拱 pass 閹烘帒婀幍鈧張?extract pass 娑斿鎮楅敍鍫ｆ嫹閸旂娀銆庢惔蹇庣瑝瑜板崬鎼烽張鈧紒?soup 閸愬懎顔愰敍澶堚偓?
+	// Nanite 全细节源三角：上传已变换到世界空间的源三角（顶点 + UV0 + 材质 id），由 AppendSourceTrianglesCS
+	// 原子追加进上面 extract 已写入的同一 soup（共享 RW_TriangleCounter）。位置在 CPU 端已按 request bounds
+	// 粗筛，故这里 bUseBounds=0；参考点过滤仍在 GPU 端执行以对齐 render 提取路径。声明在 extract 循环之后，
+	// 依赖 RW_TriangleCounter 与 RDG 自动把本 pass 排在所有 extract pass 之后（追加顺序不影响最终 soup 内容）。
 	if (NaniteTriangles && NaniteTriangles->NumTriangles > 0)
 	{
 		const int32 NaniteTriCount = NaniteTriangles->NumTriangles;
@@ -2601,6 +2089,18 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 		FMemory::Memcpy(NaniteMaterialUpload, NaniteTriangles->MaterialIds.GetData(), NaniteTriCount * sizeof(uint32));
 		GraphBuilder.QueueBufferUpload(NaniteMaterialBuffer, NaniteMaterialUpload, NaniteTriCount * sizeof(uint32));
 
+		// 参照标志与材质 id 同为 per-triangle uint，走同一套上传。
+		FRDGBufferRef NaniteReferenceBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), FMath::Max(1, NaniteTriCount)),
+			TEXT("CS.StaticMeshTriangles.SourceReferenceFlags"));
+		uint32* NaniteReferenceUpload = GraphBuilder.AllocPODArray<uint32>(FMath::Max(1, NaniteTriCount));
+		FMemory::Memzero(NaniteReferenceUpload, FMath::Max(1, NaniteTriCount) * sizeof(uint32));
+		if (NaniteTriangles->ReferenceFlags.Num() >= NaniteTriCount)
+		{
+			FMemory::Memcpy(NaniteReferenceUpload, NaniteTriangles->ReferenceFlags.GetData(), NaniteTriCount * sizeof(uint32));
+		}
+		GraphBuilder.QueueBufferUpload(NaniteReferenceBuffer, NaniteReferenceUpload, FMath::Max(1, NaniteTriCount) * sizeof(uint32));
+
 		TShaderMapRef<FAppendSourceTrianglesCS> AppendShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 		FAppendSourceTrianglesCS::FParameters* AppendParameters = GraphBuilder.AllocParameters<FAppendSourceTrianglesCS::FParameters>();
 		AppendParameters->SourceTriangleVertices = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(NaniteVertexBuffer, PF_A32B32G32R32F));
@@ -2610,11 +2110,13 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 		AppendParameters->SourceTriangleTangents = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(NaniteTangentBuffer, PF_A32B32G32R32F));
 		AppendParameters->SourceTriangleBiTangents = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(NaniteBiTangentBuffer, PF_A32B32G32R32F));
 		AppendParameters->SourceTriangleMaterialIds = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(NaniteMaterialBuffer, PF_R32_UINT));
+		AppendParameters->SourceTriangleReferenceFlags = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(NaniteReferenceBuffer, PF_R32_UINT));
 		AppendParameters->ReferencePoints = ReferencePointSRV;
 		AppendParameters->RW_OutTriangleVertices = Output.TriangleVerticesUAV;
 		AppendParameters->RW_OutTriangleNormals = Output.TriangleNormalsUAV;
 		AppendParameters->RW_TriangleCounter = Output.TriangleCounterUAV;
 		AppendParameters->RW_OutTriangleMaterialIds = Output.TriangleMaterialIdsUAV;
+		AppendParameters->RW_OutTriangleReferenceFlags = Output.TriangleReferenceFlagsUAV;
 		AppendParameters->RW_OutTriangleUVs = Output.TriangleUVsUAV;
 		AppendParameters->CSNumUVChannels = uint32(Output.NumUVChannels);
 		AppendParameters->RW_OutTriangleColors = Output.TriangleColorsUAV;
@@ -2625,7 +2127,7 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 		AppendParameters->TriangleCount = uint32(NaniteTriCount);
 		AppendParameters->TriangleCapacity = TriangleCapacity;
 		AppendParameters->ReferenceCount = uint32(ReferencePoints.Num());
-		AppendParameters->bUseBounds = 0u; // CPU 缁旑垰鍑￠幐?request bounds 缁鐡?
+		AppendParameters->bUseBounds = 0u; // CPU 端已按 request bounds 粗筛
 		AppendParameters->bUseReferenceFilter = ReferencePoints.Num() > 0 ? 1u : 0u;
 		AppendParameters->ReferenceFilterDistanceSq = ReferenceFilterDistance > 0.0f
 			? ReferenceFilterDistance * ReferenceFilterDistance
@@ -2637,512 +2139,13 @@ FCSStaticMeshTriangleRDGOutput AddResolvedStaticMeshTrianglesToRDGInternal(
 			ERDGPassFlags::Compute,
 			[AppendParameters, AppendShader, NaniteTriCount](FRHIComputeCommandList& InRHICmdList)
 			{
-				// 娑?extract 閻╃鎮撻惃鍕瘶鐟?dispatch閿涙瓊anite 濠ф劒绗佺憴鎺戝讲鏉堢偓鏆熼惂鍙ョ閵?
+				// 与 extract 完全一致的包裹 dispatch：Nanite 源三角可达数百万
 				FComputeShaderUtils::Dispatch(InRHICmdList, AppendShader, *AppendParameters, FComputeShaderUtils::GetGroupCountWrapped(FMath::Max(1, NaniteTriCount), 64));
 			});
 	}
 
 	return Output;
 }
-
-FCSStaticMeshTriangleRDGOutput AddStaticMeshTrianglesToRDGInternal(
-	FRDGBuilder& GraphBuilder,
-	FRHICommandListImmediate& RHICmdList,
-	const TArray<FCSStaticMeshTriangleRequest>& Requests,
-	const TArray<FVector>& ReferencePoints,
-	float ReferenceFilterDistance,
-	int32 MaxTriangles,
-	const FCSTriangleMeshData* InitialTriangleData,
-	const TCHAR* DebugName,
-	const AActor* ExcludedActor,
-	const TArray<FName>& ExcludedActorTags,
-	bool bNaniteOnlyFallbackMesh = true)
-{
-	TArray<FResolvedStaticMeshTriangleRequest> ResolvedRequests;
-	const uint64 TotalTriangleCount = ResolveStaticMeshTriangleRequests(
-		Requests,
-		ExcludedActor,
-		ExcludedActorTags,
-		bNaniteOnlyFallbackMesh,
-		ResolvedRequests);
-
-	return AddResolvedStaticMeshTrianglesToRDGInternal(
-		GraphBuilder,
-		RHICmdList,
-		ResolvedRequests,
-		TotalTriangleCount,
-		ReferencePoints,
-		ReferenceFilterDistance,
-		MaxTriangles,
-		InitialTriangleData,
-		DebugName);
-}
-
-bool ReadbackResolvedStaticMeshTriangleRequestSync(
-	const FResolvedStaticMeshTriangleRequest& Request,
-	const TArray<FVector>& ReferencePoints,
-	float ReferenceFilterDistance,
-	int32 MaxTriangles,
-	FCSTriangleMeshData& OutTriangleData)
-{
-	OutTriangleData = FCSTriangleMeshData();
-
-	const int32 RequestTriangleCount = FMath::Max(0, Request.TriangleCount);
-	if (RequestTriangleCount <= 0 || MaxTriangles <= 0)
-	{
-		return true;
-	}
-
-	const int32 BatchTriangleCapacity = FMath::Min(RequestTriangleCount, MaxTriangles);
-	const uint64 BatchVertexCapacity64 = uint64(BatchTriangleCapacity) * 3ull;
-	const uint64 BatchVertexReadbackBytes64 = BatchVertexCapacity64 * sizeof(FVector4f);
-	if (BatchVertexCapacity64 > uint64(TNumericLimits<int32>::Max()) || BatchVertexReadbackBytes64 > uint64(TNumericLimits<uint32>::Max()))
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneTrianglesFromGPU] Batch readback request too large. Triangles=%d"), BatchTriangleCapacity);
-		return false;
-	}
-
-	const int32 BatchVertexCapacity = int32(BatchVertexCapacity64);
-	const uint32 BatchVertexReadbackBytes = uint32(BatchVertexReadbackBytes64);
-	const uint32 CounterReadbackBytes = sizeof(uint32);
-
-	FRHIGPUBufferReadback* VertexReadback = new FRHIGPUBufferReadback(TEXT("BoxSceneTriangles_BatchVertexReadback"));
-	FRHIGPUBufferReadback* NormalReadback = new FRHIGPUBufferReadback(TEXT("BoxSceneTriangles_BatchNormalReadback"));
-	FRHIGPUBufferReadback* CounterReadback = new FRHIGPUBufferReadback(TEXT("BoxSceneTriangles_BatchCounterReadback"));
-	bool bRenderWorkQueued = false;
-	bool bHasGPUOutput = false;
-
-	ENQUEUE_RENDER_COMMAND(GetBoxSceneTrianglesBatchGPU)(
-		[Request, ReferencePoints, ReferenceFilterDistance, BatchTriangleCapacity, VertexReadback, NormalReadback, CounterReadback, CounterReadbackBytes,
-		 &bRenderWorkQueued, &bHasGPUOutput](FRHICommandListImmediate& RHICmdList)
-		{
-			FRDGBuilder GraphBuilder(RHICmdList);
-
-			TArray<FResolvedStaticMeshTriangleRequest> BatchRequests;
-			BatchRequests.Add(Request);
-			FCSStaticMeshTriangleRDGOutput TriangleOutput = AddResolvedStaticMeshTrianglesToRDGInternal(
-				GraphBuilder,
-				RHICmdList,
-				BatchRequests,
-				uint64(FMath::Max(0, Request.TriangleCount)),
-				ReferencePoints,
-				ReferenceFilterDistance,
-				BatchTriangleCapacity,
-				nullptr,
-				TEXT("CS.BoxSceneTriangles.Batch"));
-
-			if (TriangleOutput.TriangleVertices && TriangleOutput.TriangleNormals && TriangleOutput.TriangleCounter)
-			{
-				const uint32 VertexReadbackBytes = uint32(uint64(TriangleOutput.MaxVertices) * sizeof(FVector4f));
-				AddEnqueueCopyPass(GraphBuilder, VertexReadback, TriangleOutput.TriangleVertices, VertexReadbackBytes);
-				AddEnqueueCopyPass(GraphBuilder, NormalReadback, TriangleOutput.TriangleNormals, VertexReadbackBytes);
-				AddEnqueueCopyPass(GraphBuilder, CounterReadback, TriangleOutput.TriangleCounter, CounterReadbackBytes);
-				bHasGPUOutput = true;
-			}
-
-			GraphBuilder.Execute();
-			bRenderWorkQueued = true;
-		});
-
-	FlushRenderingCommands();
-
-	if (!bRenderWorkQueued || !bHasGPUOutput)
-	{
-		delete VertexReadback;
-		delete NormalReadback;
-		delete CounterReadback;
-		return bRenderWorkQueued;
-	}
-
-	TArray<FVector4f> VertexData;
-	TArray<FVector4f> NormalData;
-	VertexData.SetNumZeroed(BatchVertexCapacity);
-	NormalData.SetNumZeroed(BatchVertexCapacity);
-	uint32 TriangleCount = 0;
-	bool bReadbackSucceeded = false;
-
-	ENQUEUE_RENDER_COMMAND(GetBoxSceneTrianglesBatchReadback)(
-		[VertexReadback, NormalReadback, CounterReadback, BatchVertexReadbackBytes, CounterReadbackBytes,
-		 &VertexData, &NormalData, &TriangleCount, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList)
-		{
-			if (!VertexReadback || !NormalReadback || !CounterReadback)
-			{
-				return;
-			}
-
-			if (!VertexReadback->IsReady() || !NormalReadback->IsReady() || !CounterReadback->IsReady())
-			{
-				RHICmdList.SubmitAndBlockUntilGPUIdle();
-			}
-
-			if (!VertexReadback->IsReady() || !NormalReadback->IsReady() || !CounterReadback->IsReady())
-			{
-				UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneTrianglesFromGPU] Batch GPU readback was not ready after flush."));
-				delete VertexReadback;
-				delete NormalReadback;
-				delete CounterReadback;
-				return;
-			}
-
-			if (VertexReadback->GetGPUSizeBytes() < BatchVertexReadbackBytes ||
-				NormalReadback->GetGPUSizeBytes() < BatchVertexReadbackBytes ||
-				CounterReadback->GetGPUSizeBytes() < CounterReadbackBytes)
-			{
-				UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneTrianglesFromGPU] Batch GPU readback size mismatch. Vertex=%llu/%u Normal=%llu/%u Counter=%llu/%u"),
-					VertexReadback->GetGPUSizeBytes(),
-					BatchVertexReadbackBytes,
-					NormalReadback->GetGPUSizeBytes(),
-					BatchVertexReadbackBytes,
-					CounterReadback->GetGPUSizeBytes(),
-					CounterReadbackBytes);
-				delete VertexReadback;
-				delete NormalReadback;
-				delete CounterReadback;
-				return;
-			}
-
-			bool bLockedAll = true;
-			if (const FVector4f* VertexPtr = static_cast<const FVector4f*>(VertexReadback->Lock(BatchVertexReadbackBytes)))
-			{
-				FMemory::Memcpy(VertexData.GetData(), VertexPtr, BatchVertexReadbackBytes);
-				VertexReadback->Unlock();
-			}
-			else
-			{
-				bLockedAll = false;
-			}
-
-			if (const FVector4f* NormalPtr = static_cast<const FVector4f*>(NormalReadback->Lock(BatchVertexReadbackBytes)))
-			{
-				FMemory::Memcpy(NormalData.GetData(), NormalPtr, BatchVertexReadbackBytes);
-				NormalReadback->Unlock();
-			}
-			else
-			{
-				bLockedAll = false;
-			}
-
-			if (const uint32* CounterPtr = static_cast<const uint32*>(CounterReadback->Lock(CounterReadbackBytes)))
-			{
-				TriangleCount = *CounterPtr;
-				CounterReadback->Unlock();
-			}
-			else
-			{
-				bLockedAll = false;
-			}
-
-			delete VertexReadback;
-			delete NormalReadback;
-			delete CounterReadback;
-			bReadbackSucceeded = bLockedAll;
-		});
-
-	FlushRenderingCommands();
-
-	if (!bReadbackSucceeded)
-	{
-		return false;
-	}
-
-	const int32 SafeTriangleCount = FMath::Clamp<int32>(int32(TriangleCount), 0, BatchTriangleCapacity);
-	const int32 EffectiveVertexCount = FMath::Clamp(SafeTriangleCount * 3, 0, VertexData.Num());
-	if (EffectiveVertexCount <= 0)
-	{
-		return true;
-	}
-
-	OutTriangleData.Vertices.Reserve(EffectiveVertexCount);
-	OutTriangleData.VertexNormals.Reserve(EffectiveVertexCount);
-	for (int32 VertexIndex = 0; VertexIndex < EffectiveVertexCount; ++VertexIndex)
-	{
-		const FVector4f& Vertex = VertexData[VertexIndex];
-		OutTriangleData.Vertices.Add(FVector(Vertex.X, Vertex.Y, Vertex.Z));
-
-		const FVector4f& Normal = NormalData[VertexIndex];
-		OutTriangleData.VertexNormals.Add(FVector(Normal.X, Normal.Y, Normal.Z));
-	}
-
-	OutTriangleData.VertexCount = EffectiveVertexCount;
-	OutTriangleData.IndexCount = 0;
-	return true;
-}
-
-FCSSurfaceVoxelRDGOutput AddTriangleSurfaceVoxelsToRDGInternal(
-	FRDGBuilder& GraphBuilder,
-	const FCSStaticMeshTriangleRDGOutput& TriangleOutput,
-	FVector VoxelOrigin,
-	float VoxelSize,
-	float SurfaceThickness,
-	int32 MaxVoxels,
-	int32 HashSlotCount,
-	int32 BlurIterations,
-	int32 InBlurRadius,
-	const TCHAR* DebugName)
-{
-	FCSSurfaceVoxelRDGOutput Output;
-	if (!TriangleOutput.TriangleVertices
-		|| !TriangleOutput.TriangleNormals
-		|| !TriangleOutput.TriangleCounter
-		|| TriangleOutput.MaxTriangles == 0
-		|| MaxVoxels <= 0)
-	{
-		return Output;
-	}
-
-	const float SafeVoxelSize = FMath::Max(VoxelSize, UE_KINDA_SMALL_NUMBER);
-	const float SafeSurfaceThickness = SurfaceThickness > 0.0f ? SurfaceThickness : SafeVoxelSize * 0.5f;
-	const uint32 VoxelCapacity = uint32(FMath::Max(1, MaxVoxels));
-	const uint32 SafeHashSlotCount = GetSurfaceVoxelHashSlotCount(MaxVoxels, HashSlotCount);
-
-	Output.MaxVoxels = VoxelCapacity;
-	Output.HashSlotCount = SafeHashSlotCount;
-	Output.VoxelSize = SafeVoxelSize;
-	Output.VoxelOrigin = VoxelOrigin;
-
-	Output.VoxelPositions = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), VoxelCapacity),
-		TEXT("CS.SurfaceVoxels.Positions"));
-	Output.VoxelPositionsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.VoxelPositions, PF_A32B32G32R32F));
-	Output.VoxelPositionsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelPositions, PF_A32B32G32R32F));
-	AddClearUAVPass(GraphBuilder, Output.VoxelPositionsUAV, 0.0f);
-
-	Output.VoxelNormals = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), VoxelCapacity),
-		TEXT("CS.SurfaceVoxels.Normals"));
-	Output.VoxelNormalsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.VoxelNormals, PF_A32B32G32R32F));
-	Output.VoxelNormalsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelNormals, PF_A32B32G32R32F));
-	AddClearUAVPass(GraphBuilder, Output.VoxelNormalsUAV, 0.0f);
-
-	Output.VoxelCounter = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 2),
-		TEXT("CS.SurfaceVoxels.Counter"));
-	Output.VoxelCounterUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.VoxelCounter, PF_R32_UINT));
-	Output.VoxelCounterSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelCounter, PF_R32_UINT));
-	AddClearUAVPass(GraphBuilder, Output.VoxelCounterUAV, 0u);
-
-	Output.VoxelHashSlots = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), SafeHashSlotCount),
-		TEXT("CS.SurfaceVoxels.HashSlots"));
-	Output.VoxelHashSlotsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.VoxelHashSlots, PF_R32_UINT));
-	AddClearUAVPass(GraphBuilder, Output.VoxelHashSlotsUAV, 0u);
-
-	Output.VoxelHashIndices = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), SafeHashSlotCount),
-		TEXT("CS.SurfaceVoxels.HashIndices"));
-	Output.VoxelHashIndicesUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.VoxelHashIndices, PF_R32_UINT));
-	AddClearUAVPass(GraphBuilder, Output.VoxelHashIndicesUAV, 0u);
-
-	Output.VoxelNormalSums = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(int32), VoxelCapacity * 4u),
-		TEXT("CS.SurfaceVoxels.NormalSums"));
-	Output.VoxelNormalSumsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.VoxelNormalSums, PF_R32_SINT));
-	Output.VoxelNormalSumsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelNormalSums, PF_R32_SINT));
-	AddClearUAVPass(GraphBuilder, Output.VoxelNormalSumsUAV, 0u);
-
-	Output.VoxelNormalCounts = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), VoxelCapacity),
-		TEXT("CS.SurfaceVoxels.NormalCounts"));
-	Output.VoxelNormalCountsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.VoxelNormalCounts, PF_R32_UINT));
-	Output.VoxelNormalCountsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelNormalCounts, PF_R32_UINT));
-	AddClearUAVPass(GraphBuilder, Output.VoxelNormalCountsUAV, 0u);
-
-	// ResinRattan port: target-position accumulation buffers
-	Output.VoxelTargetPositions = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), VoxelCapacity),
-		TEXT("CS.SurfaceVoxels.TargetPositions"));
-	Output.VoxelTargetPositionsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.VoxelTargetPositions, PF_A32B32G32R32F));
-	Output.VoxelTargetPositionsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.VoxelTargetPositions, PF_A32B32G32R32F));
-	AddClearUAVPass(GraphBuilder, Output.VoxelTargetPositionsUAV, 0.0f);
-
-	Output.VoxelTargetOffsetSums = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(int32), VoxelCapacity * 4u),
-		TEXT("CS.SurfaceVoxels.TargetOffsetSums"));
-	Output.VoxelTargetOffsetSumsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.VoxelTargetOffsetSums, PF_R32_SINT));
-	AddClearUAVPass(GraphBuilder, Output.VoxelTargetOffsetSumsUAV, 0u);
-
-	Output.VoxelTargetWeightSums = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), VoxelCapacity),
-		TEXT("CS.SurfaceVoxels.TargetWeightSums"));
-	Output.VoxelTargetWeightSumsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.VoxelTargetWeightSums, PF_R32_UINT));
-	AddClearUAVPass(GraphBuilder, Output.VoxelTargetWeightSumsUAV, 0u);
-
-	Output.VoxelCells = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(int32) * 4, VoxelCapacity),
-		TEXT("CS.SurfaceVoxels.Cells"));
-	Output.VoxelCellsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.VoxelCells, PF_R32G32B32A32_UINT));
-	AddClearUAVPass(GraphBuilder, Output.VoxelCellsUAV, 0u);
-
-	// Blur output buffers (allocated even if blur is disabled to simplify lifetime)
-	Output.BlurredVoxelNormals = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), VoxelCapacity),
-		TEXT("CS.SurfaceVoxels.BlurredNormals"));
-	Output.BlurredVoxelNormalsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.BlurredVoxelNormals, PF_A32B32G32R32F));
-	Output.BlurredVoxelNormalsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.BlurredVoxelNormals, PF_A32B32G32R32F));
-	AddClearUAVPass(GraphBuilder, Output.BlurredVoxelNormalsUAV, 0.0f);
-
-	Output.BlurredVoxelTargetPositions = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), VoxelCapacity),
-		TEXT("CS.SurfaceVoxels.BlurredTargetPositions"));
-	Output.BlurredVoxelTargetPositionsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Output.BlurredVoxelTargetPositions, PF_A32B32G32R32F));
-	Output.BlurredVoxelTargetPositionsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Output.BlurredVoxelTargetPositions, PF_A32B32G32R32F));
-	AddClearUAVPass(GraphBuilder, Output.BlurredVoxelTargetPositionsUAV, 0.0f);
-
-	FRDGBufferSRVRef TriangleVerticesSRV = TriangleOutput.TriangleVerticesSRV;
-	if (!TriangleVerticesSRV)
-	{
-		TriangleVerticesSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(TriangleOutput.TriangleVertices, PF_A32B32G32R32F));
-	}
-
-	FRDGBufferSRVRef TriangleNormalsSRV = TriangleOutput.TriangleNormalsSRV;
-	if (!TriangleNormalsSRV)
-	{
-		TriangleNormalsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(TriangleOutput.TriangleNormals, PF_A32B32G32R32F));
-	}
-
-	FRDGBufferSRVRef TriangleCounterSRV = TriangleOutput.TriangleCounterSRV;
-	if (!TriangleCounterSRV)
-	{
-		TriangleCounterSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(TriangleOutput.TriangleCounter, PF_R32_UINT));
-	}
-
-	TShaderMapRef<FTriangleSurfaceVoxelsCS> VoxelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-	FTriangleSurfaceVoxelsCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FTriangleSurfaceVoxelsCS::FParameters>();
-	PassParameters->TriangleVertices = TriangleVerticesSRV;
-	PassParameters->TriangleNormals = TriangleNormalsSRV;
-	PassParameters->SurfaceTriangleCounter = TriangleCounterSRV;
-	PassParameters->RW_OutVoxelPositions = Output.VoxelPositionsUAV;
-	PassParameters->RW_OutVoxelNormals = Output.VoxelNormalsUAV;
-	PassParameters->RW_SurfaceVoxelCounter = Output.VoxelCounterUAV;
-	PassParameters->RW_SurfaceVoxelHashSlots = Output.VoxelHashSlotsUAV;
-	PassParameters->RW_SurfaceVoxelHashIndices = Output.VoxelHashIndicesUAV;
-	PassParameters->RW_SurfaceVoxelNormalSums = Output.VoxelNormalSumsUAV;
-	PassParameters->RW_SurfaceVoxelNormalCounts = Output.VoxelNormalCountsUAV;
-	PassParameters->RW_OutVoxelTargetPositions = Output.VoxelTargetPositionsUAV;
-	PassParameters->RW_SurfaceVoxelTargetOffsetSums = Output.VoxelTargetOffsetSumsUAV;
-	PassParameters->RW_SurfaceVoxelTargetWeightSums = Output.VoxelTargetWeightSumsUAV;
-	PassParameters->RW_OutVoxelCells = Output.VoxelCellsUAV;
-	PassParameters->SurfaceVoxelOrigin = FVector3f(VoxelOrigin);
-	PassParameters->SurfaceVoxelSize = SafeVoxelSize;
-	PassParameters->SurfaceThickness = SafeSurfaceThickness;
-	PassParameters->SurfaceTriangleCount = TriangleOutput.MaxTriangles;
-	PassParameters->SurfaceVoxelCapacity = VoxelCapacity;
-	PassParameters->SurfaceVoxelHashSlotCount = SafeHashSlotCount;
-
-	GraphBuilder.AddPass(
-		RDG_EVENT_NAME("%s.TriangleSurfaceVoxels", DebugName),
-		PassParameters,
-		ERDGPassFlags::Compute,
-		[PassParameters, VoxelShader, TriangleCapacity = TriangleOutput.MaxTriangles](FRHIComputeCommandList& InRHICmdList)
-		{
-			FComputeShaderUtils::Dispatch(
-				InRHICmdList,
-				VoxelShader,
-				*PassParameters,
-				FComputeShaderUtils::GetGroupCount(FIntVector(int32(TriangleCapacity), 1, 1), 64));
-		});
-
-	TShaderMapRef<FFinalizeSurfaceVoxelNormalsCS> FinalizeNormalsShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-	FFinalizeSurfaceVoxelNormalsCS::FParameters* FinalizeParameters = GraphBuilder.AllocParameters<FFinalizeSurfaceVoxelNormalsCS::FParameters>();
-	FinalizeParameters->SurfaceVoxelNormalSums = Output.VoxelNormalSumsSRV;
-	FinalizeParameters->SurfaceVoxelNormalCounts = Output.VoxelNormalCountsSRV;
-	FinalizeParameters->RW_SurfaceVoxelTargetOffsetSums = Output.VoxelTargetOffsetSumsUAV;
-	FinalizeParameters->RW_SurfaceVoxelTargetWeightSums = Output.VoxelTargetWeightSumsUAV;
-	FinalizeParameters->RW_OutVoxelPositions = Output.VoxelPositionsUAV;
-	FinalizeParameters->RW_OutVoxelNormals = Output.VoxelNormalsUAV;
-	FinalizeParameters->RW_OutVoxelTargetPositions = Output.VoxelTargetPositionsUAV;
-	FinalizeParameters->SurfaceVoxelCapacity = VoxelCapacity;
-	FinalizeParameters->SurfaceVoxelSize = SafeVoxelSize;
-	GraphBuilder.AddPass(
-		RDG_EVENT_NAME("%s.FinalizeSurfaceVoxelNormals", DebugName),
-		FinalizeParameters,
-		ERDGPassFlags::Compute,
-		[FinalizeParameters, FinalizeNormalsShader, VoxelCapacity](FRHIComputeCommandList& InRHICmdList)
-		{
-			FComputeShaderUtils::Dispatch(
-				InRHICmdList,
-				FinalizeNormalsShader,
-				*FinalizeParameters,
-				FComputeShaderUtils::GetGroupCount(FIntVector(int32(VoxelCapacity), 1, 1), 64));
-		});
-
-	// Blur pass (ported from ResinRattan) 閳?only executes when BlurIterations > 0
-	{
-		const uint32 BlurIters = uint32(FMath::Max(0, BlurIterations));
-		if (BlurIters > 0u)
-		{
-			const uint32 BlurRadius = uint32(FMath::Max(1, InBlurRadius));
-			int32 CurrentNormalsIdx = 0; // 0 = VoxelNormals, 1 = BlurredVoxelNormals
-			int32 CurrentTargetsIdx = 0; // 0 = VoxelTargetPositions, 1 = BlurredVoxelTargetPositions
-
-			TShaderMapRef<FBlurSurfaceVoxelsCS> BlurShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-
-			for (uint32 Iter = 0u; Iter < BlurIters; ++Iter)
-			{
-				const bool bReadFromOriginal = (CurrentNormalsIdx == 0);
-				FRDGBufferUAVRef SrcNormalsUAV = bReadFromOriginal ? Output.VoxelNormalsUAV : Output.BlurredVoxelNormalsUAV;
-				FRDGBufferUAVRef SrcTargetsUAV = bReadFromOriginal ? Output.VoxelTargetPositionsUAV : Output.BlurredVoxelTargetPositionsUAV;
-				FRDGBufferUAVRef DstNormalsUAV = bReadFromOriginal ? Output.BlurredVoxelNormalsUAV : Output.VoxelNormalsUAV;
-				FRDGBufferUAVRef DstTargetsUAV = bReadFromOriginal ? Output.BlurredVoxelTargetPositionsUAV : Output.VoxelTargetPositionsUAV;
-
-				FBlurSurfaceVoxelsCS::FParameters* BlurParameters = GraphBuilder.AllocParameters<FBlurSurfaceVoxelsCS::FParameters>();
-				BlurParameters->RW_SurfaceVoxelCounter = Output.VoxelCounterUAV;
-				BlurParameters->RW_OutVoxelNormals = SrcNormalsUAV;
-				BlurParameters->RW_OutVoxelTargetPositions = SrcTargetsUAV;
-				BlurParameters->RW_OutVoxelCells = Output.VoxelCellsUAV;
-				BlurParameters->RW_SurfaceVoxelHashSlots = Output.VoxelHashSlotsUAV;
-				BlurParameters->RW_SurfaceVoxelHashIndices = Output.VoxelHashIndicesUAV;
-				BlurParameters->RW_BlurredVoxelNormals = DstNormalsUAV;
-				BlurParameters->RW_BlurredVoxelTargetPositions = DstTargetsUAV;
-				BlurParameters->SurfaceVoxelCapacity = VoxelCapacity;
-				BlurParameters->SurfaceVoxelHashSlotCount = SafeHashSlotCount;
-				BlurParameters->SurfaceVoxelBlurRadius = BlurRadius;
-
-				GraphBuilder.AddPass(
-					RDG_EVENT_NAME("%s.BlurSurfaceVoxels_Iter_%u", DebugName, Iter),
-					BlurParameters,
-					ERDGPassFlags::Compute,
-					[BlurParameters, BlurShader, VoxelCapacity](FRHIComputeCommandList& InRHICmdList)
-					{
-						FComputeShaderUtils::Dispatch(
-							InRHICmdList,
-							BlurShader,
-							*BlurParameters,
-							FComputeShaderUtils::GetGroupCount(FIntVector(int32(VoxelCapacity), 1, 1), 64));
-					});
-
-				// Flip ping-pong for next iteration
-				CurrentNormalsIdx = 1 - CurrentNormalsIdx;
-				CurrentTargetsIdx = 1 - CurrentTargetsIdx;
-			}
-
-			// After the last blur, the "current" buffers hold the final result.
-			// Make VoxelNormals/VoxelTargetPositions point to the final output so
-			// downstream readback uses the blurred data.
-			{
-				const bool bFinalIsOriginal = (CurrentNormalsIdx == 0);
-				if (!bFinalIsOriginal)
-				{
-					Output.VoxelNormals = Output.BlurredVoxelNormals;
-					Output.VoxelNormalsSRV = Output.BlurredVoxelNormalsSRV;
-					Output.VoxelNormalsUAV = Output.BlurredVoxelNormalsUAV;
-					Output.VoxelTargetPositions = Output.BlurredVoxelTargetPositions;
-					Output.VoxelTargetPositionsSRV = Output.BlurredVoxelTargetPositionsSRV;
-					Output.VoxelTargetPositionsUAV = Output.BlurredVoxelTargetPositionsUAV;
-				}
-			}
-		}
-	}
-
-	return Output;
-}
-}
-
-// -----------------------------------------------------------------------------
-// Core System - Public GPU Extraction
-// -----------------------------------------------------------------------------
-
-
 
 // -----------------------------------------------------------------------------
 // PrepareBoxSceneTriangles / AddPreparedBoxSceneTrianglesToRDG
@@ -3156,10 +2159,10 @@ struct FCSBoxScenePreparedDataImpl
 	TArray<FVector> ReferencePoints;
 	float ReferenceFilterDistance = 0.0f;
 	int32 SafeMaxTriangles = 1;
-	// 閸樺鍣搁弶鎰窛鐞涱煉绱皊oup 閺夋劘宸?buffer 闁插瞼娈?id 缁便垹绱╂潻娑欐拱鐞涖劊鈧繂ObjectPtr 閹镐焦婀佸鍝勭穿閻㈩煉绱濇穱婵婄槈 readback 閸撳秳绗夌悮?GC閵?
+	// 去重材质表：soup 材质 buffer 里的 id 索引进本表。TObjectPtr 持有强引用，保证 readback 前不被 GC。
 	TArray<TObjectPtr<UMaterialInterface>> MaterialRegistry;
-	// Nanite 缂冩垶鐗搁惃鍕弿缂佸棜濡┃鎰瑏鐟欐帪绱檈ditor MeshDescription 閹绘劕褰囬敍瀵僶rld-space + UV0 + 閺夋劘宸?id閿涘鈧?
-	// game thread 閸?PrepareBoxSceneTriangles 闁插苯锝為崗鍜冪礉render thread 閸?AddPreparedBoxSceneTrianglesToRDG 鏉╄棄濮炴潻?soup閵?
+	// Nanite 网格的全细节源三角（editor MeshDescription 提取，world-space + UV0 + 材质 id）。
+	// game thread 在 PrepareBoxSceneTriangles 里填充，render thread 在 AddPreparedBoxSceneTrianglesToRDG 追加进 soup。
 	FCSNaniteSourceTriangleData NaniteTriangles;
 };
 
@@ -3375,77 +2378,12 @@ FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPUFilt
 		[VertexReadback, NormalReadback, CounterReadback, ActualVertexReadbackBytes, CounterReadbackBytes,
 		 &VertexData, &NormalData, &TriangleCount, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList)
 		{
-			if (!VertexReadback || !NormalReadback || !CounterReadback)
-			{
-				return;
-			}
-
-			if (!VertexReadback->IsReady() || !NormalReadback->IsReady() || !CounterReadback->IsReady())
-			{
-				RHICmdList.SubmitAndBlockUntilGPUIdle();
-			}
-
-			if (!VertexReadback->IsReady() || !NormalReadback->IsReady() || !CounterReadback->IsReady())
-			{
-				UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneTrianglesFromGPUFiltered] GPU readback was not ready after flush."));
-				delete VertexReadback;
-				delete NormalReadback;
-				delete CounterReadback;
-				return;
-			}
-
-			if (VertexReadback->GetGPUSizeBytes() < ActualVertexReadbackBytes ||
-				NormalReadback->GetGPUSizeBytes() < ActualVertexReadbackBytes ||
-				CounterReadback->GetGPUSizeBytes() < CounterReadbackBytes)
-			{
-				UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneTrianglesFromGPUFiltered] GPU readback size mismatch. Vertex=%llu/%u Normal=%llu/%u Counter=%llu/%u"),
-					VertexReadback->GetGPUSizeBytes(),
-					ActualVertexReadbackBytes,
-					NormalReadback->GetGPUSizeBytes(),
-					ActualVertexReadbackBytes,
-					CounterReadback->GetGPUSizeBytes(),
-					CounterReadbackBytes);
-				delete VertexReadback;
-				delete NormalReadback;
-				delete CounterReadback;
-				return;
-			}
-
-			bool bLockedAll = true;
-			if (const FVector4f* VertexPtr = static_cast<const FVector4f*>(VertexReadback->Lock(ActualVertexReadbackBytes)))
-			{
-				FMemory::Memcpy(VertexData.GetData(), VertexPtr, ActualVertexReadbackBytes);
-				VertexReadback->Unlock();
-			}
-			else
-			{
-				bLockedAll = false;
-			}
-
-			if (const FVector4f* NormalPtr = static_cast<const FVector4f*>(NormalReadback->Lock(ActualVertexReadbackBytes)))
-			{
-				FMemory::Memcpy(NormalData.GetData(), NormalPtr, ActualVertexReadbackBytes);
-				NormalReadback->Unlock();
-			}
-			else
-			{
-				bLockedAll = false;
-			}
-
-			if (const uint32* CounterPtr = static_cast<const uint32*>(CounterReadback->Lock(CounterReadbackBytes)))
-			{
-				TriangleCount = *CounterPtr;
-				CounterReadback->Unlock();
-			}
-			else
-			{
-				bLockedAll = false;
-			}
-
-			delete VertexReadback;
-			delete NormalReadback;
-			delete CounterReadback;
-			bReadbackSucceeded = bLockedAll;
+			const FCSMeshGenReadbackSpec Specs[] = {
+				{ VertexReadback, VertexData.GetData(), ActualVertexReadbackBytes },
+				{ NormalReadback, NormalData.GetData(), ActualVertexReadbackBytes },
+				{ CounterReadback, &TriangleCount, CounterReadbackBytes },
+			};
+			bReadbackSucceeded = CSMeshGen_DrainReadbacks(RHICmdList, Specs, TEXT("GetBoxSceneTrianglesFromGPUFiltered"));
 		});
 
 	FlushRenderingCommands();
@@ -3893,118 +2831,17 @@ void AComputeShaderMeshGenerator::BuildBoxSceneFilteredSurfaceVoxels(float Voxel
 		[PositionReadback, NormalReadback, TargetPositionReadback, CellReadback, CounterReadback, ActualVoxelReadbackBytes, ActualVoxelCellReadbackBytes, CounterReadbackBytes,
 		 &PositionData, &NormalData, &TargetPositionData, &CellData, &VoxelCount, &DroppedVoxelCount, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList)
 		{
-			if (!PositionReadback || !NormalReadback || !TargetPositionReadback || !CellReadback || !CounterReadback)
-			{
-				return;
-			}
-
-			if (!PositionReadback->IsReady()
-				|| !NormalReadback->IsReady()
-				|| !TargetPositionReadback->IsReady()
-				|| !CellReadback->IsReady()
-				|| !CounterReadback->IsReady())
-			{
-				RHICmdList.SubmitAndBlockUntilGPUIdle();
-			}
-
-			if (!PositionReadback->IsReady()
-				|| !NormalReadback->IsReady()
-				|| !TargetPositionReadback->IsReady()
-				|| !CellReadback->IsReady()
-				|| !CounterReadback->IsReady())
-			{
-				UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneFilteredSurfaceVoxels] GPU readback was not ready after flush."));
-				delete PositionReadback;
-				delete NormalReadback;
-				delete TargetPositionReadback;
-				delete CellReadback;
-				delete CounterReadback;
-				return;
-			}
-
-			if (PositionReadback->GetGPUSizeBytes() < ActualVoxelReadbackBytes ||
-				NormalReadback->GetGPUSizeBytes() < ActualVoxelReadbackBytes ||
-				TargetPositionReadback->GetGPUSizeBytes() < ActualVoxelReadbackBytes ||
-				CellReadback->GetGPUSizeBytes() < ActualVoxelCellReadbackBytes ||
-				CounterReadback->GetGPUSizeBytes() < CounterReadbackBytes)
-			{
-				UE_LOG(LogTemp, Warning, TEXT("[GetBoxSceneFilteredSurfaceVoxels] GPU readback size mismatch. Position=%llu/%u Normal=%llu/%u Target=%llu/%u Cell=%llu/%u Counter=%llu/%u"),
-					PositionReadback->GetGPUSizeBytes(),
-					ActualVoxelReadbackBytes,
-					NormalReadback->GetGPUSizeBytes(),
-					ActualVoxelReadbackBytes,
-					TargetPositionReadback->GetGPUSizeBytes(),
-					ActualVoxelReadbackBytes,
-					CellReadback->GetGPUSizeBytes(),
-					ActualVoxelCellReadbackBytes,
-					CounterReadback->GetGPUSizeBytes(),
-					CounterReadbackBytes);
-				delete PositionReadback;
-				delete NormalReadback;
-				delete TargetPositionReadback;
-				delete CellReadback;
-				delete CounterReadback;
-				return;
-			}
-
-			bool bLockedAll = true;
-			if (const FVector4f* PositionPtr = static_cast<const FVector4f*>(PositionReadback->Lock(ActualVoxelReadbackBytes)))
-			{
-				FMemory::Memcpy(PositionData.GetData(), PositionPtr, ActualVoxelReadbackBytes);
-				PositionReadback->Unlock();
-			}
-			else
-			{
-				bLockedAll = false;
-			}
-
-			if (const FVector4f* NormalPtr = static_cast<const FVector4f*>(NormalReadback->Lock(ActualVoxelReadbackBytes)))
-			{
-				FMemory::Memcpy(NormalData.GetData(), NormalPtr, ActualVoxelReadbackBytes);
-				NormalReadback->Unlock();
-			}
-			else
-			{
-				bLockedAll = false;
-			}
-
-			if (const FVector4f* TargetPositionPtr = static_cast<const FVector4f*>(TargetPositionReadback->Lock(ActualVoxelReadbackBytes)))
-			{
-				FMemory::Memcpy(TargetPositionData.GetData(), TargetPositionPtr, ActualVoxelReadbackBytes);
-				TargetPositionReadback->Unlock();
-			}
-			else
-			{
-				bLockedAll = false;
-			}
-
-			if (const FIntVector4* CellPtr = static_cast<const FIntVector4*>(CellReadback->Lock(ActualVoxelCellReadbackBytes)))
-			{
-				FMemory::Memcpy(CellData.GetData(), CellPtr, ActualVoxelCellReadbackBytes);
-				CellReadback->Unlock();
-			}
-			else
-			{
-				bLockedAll = false;
-			}
-
-			if (const uint32* CounterPtr = static_cast<const uint32*>(CounterReadback->Lock(CounterReadbackBytes)))
-			{
-				VoxelCount = CounterPtr[0];
-				DroppedVoxelCount = CounterPtr[1];
-				CounterReadback->Unlock();
-			}
-			else
-			{
-				bLockedAll = false;
-			}
-
-			delete PositionReadback;
-			delete NormalReadback;
-			delete TargetPositionReadback;
-			delete CellReadback;
-			delete CounterReadback;
-			bReadbackSucceeded = bLockedAll;
+			uint32 LocalCounters[2] = { 0, 0 };
+			const FCSMeshGenReadbackSpec Specs[] = {
+				{ PositionReadback, PositionData.GetData(), ActualVoxelReadbackBytes },
+				{ NormalReadback, NormalData.GetData(), ActualVoxelReadbackBytes },
+				{ TargetPositionReadback, TargetPositionData.GetData(), ActualVoxelReadbackBytes },
+				{ CellReadback, CellData.GetData(), ActualVoxelCellReadbackBytes },
+				{ CounterReadback, LocalCounters, CounterReadbackBytes },
+			};
+			bReadbackSucceeded = CSMeshGen_DrainReadbacks(RHICmdList, Specs, TEXT("GetBoxSceneFilteredSurfaceVoxels"));
+			VoxelCount = LocalCounters[0];
+			DroppedVoxelCount = LocalCounters[1];
 		});
 
 	FlushRenderingCommands();
@@ -4155,15 +2992,18 @@ void AComputeShaderMeshGenerator::ClearGeneratedDataTextureCache()
 	ClearSurfaceVoxelTextureData();
 }
 
-int32 AComputeShaderMeshGenerator::DrawDebugLastSurfaceVoxelDirections(
-	const FCSDebugLastVoxelDirectionOptions& Options)
+namespace
 {
-	if (!MeshGeneratorDebugComponent || !LastSurfaceVoxelGPUBuffers.IsValid()) return 0;
+// 两个 DrawDebug*VoxelDirections 入口的共同体：两个 Options USTRUCT（Last/Box）字段同名同义，
+// 仅入口守卫不同（缓存有效性 vs 现场准备），故用 duck-typed 模板吃掉公共部分。
+template <typename TOptions>
+int32 CSMeshGen_DrawVoxelDirections(UCSMeshGeneratorDebugComponent* DebugComponent, const FCSSurfaceVoxelGPUBuffers& Buffers, const TOptions& Options)
+{
 	const float EffectiveDirectionLength = Options.DirectionLength > 0.0f
 		? Options.DirectionLength
-		: FMath::Max(LastSurfaceVoxelGPUBuffers.VoxelSize, UE_KINDA_SMALL_NUMBER);
-	return MeshGeneratorDebugComponent->SetDirectionSource(
-		LastSurfaceVoxelGPUBuffers,
+		: FMath::Max(Buffers.VoxelSize, UE_KINDA_SMALL_NUMBER);
+	return DebugComponent->SetDirectionSource(
+		Buffers,
 		EffectiveDirectionLength,
 		Options.DirectionColor,
 		Options.bDrawPoints,
@@ -4172,23 +3012,20 @@ int32 AComputeShaderMeshGenerator::DrawDebugLastSurfaceVoxelDirections(
 		Options.Duration,
 		Options.bPersistentLines);
 }
+} // namespace
+
+int32 AComputeShaderMeshGenerator::DrawDebugLastSurfaceVoxelDirections(
+	const FCSDebugLastVoxelDirectionOptions& Options)
+{
+	if (!MeshGeneratorDebugComponent || !LastSurfaceVoxelGPUBuffers.IsValid()) return 0;
+	return CSMeshGen_DrawVoxelDirections(MeshGeneratorDebugComponent, LastSurfaceVoxelGPUBuffers, Options);
+}
 
 int32 AComputeShaderMeshGenerator::DrawDebugBoxSceneSurfaceVoxelDirections(
 	const FCSDebugBoxVoxelDirectionOptions& Options)
 {
 	if (!MeshGeneratorDebugComponent || !PrepareBoxSceneSurfaceVoxelsGPU(Options.VoxelSize)) return 0;
-	const float EffectiveDirectionLength = Options.DirectionLength > 0.0f
-		? Options.DirectionLength
-		: FMath::Max(LastSurfaceVoxelGPUBuffers.VoxelSize, UE_KINDA_SMALL_NUMBER);
-	return MeshGeneratorDebugComponent->SetDirectionSource(
-		LastSurfaceVoxelGPUBuffers,
-		EffectiveDirectionLength,
-		Options.DirectionColor,
-		Options.bDrawPoints,
-		Options.PointColor,
-		Options.MaxDirectionsToDraw,
-		Options.Duration,
-		Options.bPersistentLines);
+	return CSMeshGen_DrawVoxelDirections(MeshGeneratorDebugComponent, LastSurfaceVoxelGPUBuffers, Options);
 }
 
 UTextureRenderTarget2D* AComputeShaderMeshGenerator::GetOrCreateGeneratedDataRenderTarget(
@@ -4235,12 +3072,8 @@ UTextureRenderTarget2D* AComputeShaderMeshGenerator::GetOrCreateGeneratedDataRen
 
 void AComputeShaderMeshGenerator::StoreTriangleTextureData(const FCSTriangleMeshData& TriangleData, float ReferenceFilterDistance, FBox SourceWorldBounds)
 {
-	const int32 EffectiveVertexCount = TriangleData.VertexCount >= 0
-		? FMath::Clamp(TriangleData.VertexCount, 0, TriangleData.Vertices.Num())
-		: TriangleData.Vertices.Num();
-	const int32 EffectiveIndexCount = TriangleData.IndexCount >= 0
-		? FMath::Clamp(TriangleData.IndexCount, 0, TriangleData.Indices.Num())
-		: TriangleData.Indices.Num();
+	const int32 EffectiveVertexCount = GetEffectiveVertexCount(TriangleData);
+	const int32 EffectiveIndexCount = GetEffectiveIndexCount(TriangleData);
 	const int32 TriangleCount = EffectiveIndexCount >= 3
 		? EffectiveIndexCount / 3
 		: EffectiveVertexCount / 3;
@@ -4393,7 +3226,7 @@ void AComputeShaderMeshGenerator::StoreSurfaceVoxelTextureData(const FCSSurfaceV
 		FVector Target = SurfaceVoxelData.TargetPositions.IsValidIndex(VoxelIndex)
 			? SurfaceVoxelData.TargetPositions[VoxelIndex]
 			: Position;
-		if (!IsFiniteCSVertex(Target))
+		if (!IsFiniteVector(Target))
 		{
 			Target = Position;
 		}
@@ -4436,43 +3269,19 @@ void AComputeShaderMeshGenerator::StoreSurfaceVoxelTextureData(const FCSSurfaceV
 
 void AComputeShaderMeshGenerator::ClearTriangleTextureData()
 {
-	if (LastTriangleTextureData.TriangleVertexRT)
-	{
-		LastTriangleTextureData.TriangleVertexRT->ReleaseResource();
-	}
-	if (LastTriangleTextureData.TriangleNormalRT)
-	{
-		LastTriangleTextureData.TriangleNormalRT->ReleaseResource();
-	}
-	if (LastTriangleTextureData.TriangleMetaRT)
-	{
-		LastTriangleTextureData.TriangleMetaRT->ReleaseResource();
-	}
+	CSMeshGen_ReleaseRT(LastTriangleTextureData.TriangleVertexRT);
+	CSMeshGen_ReleaseRT(LastTriangleTextureData.TriangleNormalRT);
+	CSMeshGen_ReleaseRT(LastTriangleTextureData.TriangleMetaRT);
 	LastTriangleTextureData = FCSMeshGeneratorTriangleTextureDataHandle();
 }
 
 void AComputeShaderMeshGenerator::ClearSurfaceVoxelTextureData()
 {
-	if (LastSurfaceVoxelTextureData.VoxelPositionRT)
-	{
-		LastSurfaceVoxelTextureData.VoxelPositionRT->ReleaseResource();
-	}
-	if (LastSurfaceVoxelTextureData.VoxelNormalRT)
-	{
-		LastSurfaceVoxelTextureData.VoxelNormalRT->ReleaseResource();
-	}
-	if (LastSurfaceVoxelTextureData.VoxelTargetRT)
-	{
-		LastSurfaceVoxelTextureData.VoxelTargetRT->ReleaseResource();
-	}
-	if (LastSurfaceVoxelTextureData.VoxelCellRT)
-	{
-		LastSurfaceVoxelTextureData.VoxelCellRT->ReleaseResource();
-	}
-	if (LastSurfaceVoxelTextureData.VoxelMetaRT)
-	{
-		LastSurfaceVoxelTextureData.VoxelMetaRT->ReleaseResource();
-	}
+	CSMeshGen_ReleaseRT(LastSurfaceVoxelTextureData.VoxelPositionRT);
+	CSMeshGen_ReleaseRT(LastSurfaceVoxelTextureData.VoxelNormalRT);
+	CSMeshGen_ReleaseRT(LastSurfaceVoxelTextureData.VoxelTargetRT);
+	CSMeshGen_ReleaseRT(LastSurfaceVoxelTextureData.VoxelCellRT);
+	CSMeshGen_ReleaseRT(LastSurfaceVoxelTextureData.VoxelMetaRT);
 	LastSurfaceVoxelTextureData = FCSMeshGeneratorSurfaceVoxelTextureDataHandle();
 	LastSurfaceVoxelData = FCSSurfaceVoxelData();
 }
@@ -4524,7 +3333,7 @@ UDynamicMesh* AComputeShaderMeshGenerator::SurfaceVoxelsToOpenDynamicMesh(float 
 	for (int32 VoxelIndex = 0; VoxelIndex < EffectiveVoxelCount; ++VoxelIndex)
 	{
 		const FVector& Position = SurfaceVoxels.Positions[VoxelIndex];
-		if (!IsFiniteCSVertex(Position))
+		if (!IsFiniteVector(Position))
 		{
 			continue;
 		}
@@ -4581,7 +3390,6 @@ UDynamicMesh* AComputeShaderMeshGenerator::SurfaceVoxelsToOpenDynamicMesh(float 
 		FGeometryScriptCalculateNormalsOptions CalculateOptions;
 		UGeometryScriptLibrary_MeshNormalsFunctions::RecomputeNormals(OutMesh, CalculateOptions);
 	}
-	SetGeneratedDynamicMesh(OutMesh);
 	return OutMesh;
 }
 
@@ -4612,7 +3420,7 @@ UDynamicMesh* AComputeShaderMeshGenerator::SurfaceVoxelsToVDBMesh(float VoxelSiz
 	for (int32 Index = 0; Index < EffectiveVoxelCount; ++Index)
 	{
 		const FVector& Position = SurfaceVoxels.Positions[Index];
-		if (!IsFiniteCSVertex(Position))
+		if (!IsFiniteVector(Position))
 		{
 			continue;
 		}
@@ -4647,7 +3455,6 @@ UDynamicMesh* AComputeShaderMeshGenerator::SurfaceVoxelsToVDBMesh(float VoxelSiz
 		UGeometryScriptLibrary_MeshNormalsFunctions::RecomputeNormals(OutMesh, CalculateOptions);
 	}
 
-	SetGeneratedDynamicMesh(OutMesh);
 	return OutMesh;
 }
 
@@ -4658,7 +3465,7 @@ UDynamicMesh* AComputeShaderMeshGenerator::GetBoxSceneTrianglesFilteredToDynamic
 {
 	FCSTriangleMeshData TriangleData = GetBoxSceneTrianglesFromGPUFiltered(ReferenceFilterDistance);
 	NormalizeTriangleMeshDataWinding(TriangleData);
-	UDynamicMesh* OutMesh = BuildDynamicMeshFromCSTriangleData(
+	UDynamicMesh* OutMesh = CSMeshBuild::BuildDynamicMeshFromCSTriangleData(
 		TriangleData.Vertices,
 		TriangleData.Indices,
 		TriangleData.VertexNormals,
@@ -4667,11 +3474,10 @@ UDynamicMesh* AComputeShaderMeshGenerator::GetBoxSceneTrianglesFilteredToDynamic
 		bReverseOrientation,
 		bSkipDegenerateTriangles,
 		bRecomputeNormals);
-	SetGeneratedDynamicMesh(OutMesh);
 	return OutMesh;
 }
 
-void AComputeShaderMeshGenerator::SpawnDebugSurfaceTrianglesDynamicMeshActor(float LifetimeSeconds)
+void AComputeShaderMeshGenerator::DrawDebugBoxSceneSurfaceTrianglesGPU(float LifetimeSeconds)
 {
 	UWorld* World = GetWorld();
 	if (!World || !DebugTriangleComponent) return;
@@ -4694,6 +3500,11 @@ void AComputeShaderMeshGenerator::SpawnDebugSurfaceTrianglesDynamicMeshActor(flo
 			&AComputeShaderMeshGenerator::ClearDebugTriangleComponent, LifetimeSeconds, false);
 }
 
+void AComputeShaderMeshGenerator::SpawnDebugSurfaceTrianglesDynamicMeshActor(float LifetimeSeconds)
+{
+	DrawDebugBoxSceneSurfaceTrianglesGPU(LifetimeSeconds);
+}
+
 void AComputeShaderMeshGenerator::ClearDebugTriangleComponent()
 {
 	if (UWorld* World = GetWorld()) World->GetTimerManager().ClearTimer(DebugTriangleClearTimerHandle);
@@ -4704,19 +3515,6 @@ void AComputeShaderMeshGenerator::ClearMeshGeneratorGPUDebug()
 {
 	if (MeshGeneratorDebugComponent) MeshGeneratorDebugComponent->ClearDebug();
 	ClearDebugTriangleComponent();
-}
-
-bool AComputeShaderMeshGenerator::SetGeneratedDynamicMesh(UDynamicMesh* NewMesh, float BoundsScale)
-{
-	UDynamicMeshComponent* MeshComponent = GetDynamicMeshComponent();
-	if (!MeshComponent || !NewMesh)
-	{
-		return false;
-	}
-
-	MeshComponent->SetDynamicMesh(NewMesh);
-	RefreshDynamicMeshComponentCullingBounds(BoundsScale);
-	return true;
 }
 
 bool AComputeShaderMeshGenerator::SubmitBoxSceneTrianglesToRenderPipeline(UMaterialInterface* Material, int32 MaxDirectTriangles, float ReferenceFilterDistance)
@@ -4833,36 +3631,6 @@ UStaticMesh* AComputeShaderMeshGenerator::SaveDirectGPUMeshToStaticMesh(
 #endif
 }
 
-void AComputeShaderMeshGenerator::RefreshDynamicMeshComponentCullingBounds(float BoundsScale)
-{
-	UDynamicMeshComponent* MeshComponent = GetDynamicMeshComponent();
-	if (!MeshComponent)
-	{
-		return;
-	}
-
-	const float SafeBoundsScale = FMath::Max(
-		BoundsScale > 0.0f ? BoundsScale : DynamicMeshCullBoundsScale,
-		1.0f);
-
-	// DynamicMeshComponent is attached under SceneRoot in this actor.  If it uses
-	// the attach parent's tiny bounds, the mesh is culled when the actor/root
-	// origin leaves the view, even if the generated DynamicMesh is still visible.
-	MeshComponent->bUseAttachParentBound = false;
-	MeshComponent->bNeverDistanceCull = true;
-	MeshComponent->bAllowCullDistanceVolume = false;
-	MeshComponent->SetCachedMaxDrawDistance(0.0f);
-	MeshComponent->SetBoundsScale(SafeBoundsScale);
-
-	// Rebuild render proxy + recompute DynamicMeshComponent LocalBounds from the
-	// actual mesh. This fixes stale bounds after replacing or editing UDynamicMesh
-	// data through Blueprint/GeometryScript paths.
-	MeshComponent->NotifyMeshUpdated();
-	MeshComponent->UpdateBounds();
-	MeshComponent->MarkRenderTransformDirty();
-	MeshComponent->MarkRenderStateDirty();
-}
-
 // -----------------------------------------------------------------------------
 // Core System - Lifecycle
 // -----------------------------------------------------------------------------
@@ -4955,14 +3723,6 @@ AComputeShaderMeshGenerator::AComputeShaderMeshGenerator(const FObjectInitialize
 		ExistingRoot->SetupAttachment(SceneRoot);
 	}
 
-	DynamicMeshComponent = CreateDefaultSubobject<UDynamicMeshComponent>(TEXT("DynamicMeshComponent"));
-	DynamicMeshComponent->SetupAttachment(SceneRoot);
-	DynamicMeshComponent->bUseAttachParentBound = false;
-	DynamicMeshComponent->bNeverDistanceCull = true;
-	DynamicMeshComponent->bAllowCullDistanceVolume = false;
-	DynamicMeshComponent->SetCachedMaxDrawDistance(0.0f);
-	DynamicMeshComponent->SetBoundsScale(DynamicMeshCullBoundsScale);
-
 	GeneratorBounds = CreateDefaultSubobject<UBoxComponent>(TEXT("GeneratorBounds"));
 #if WITH_EDITOR
 	GeneratorBounds->SetIsVisualizationComponent(true);
@@ -4985,18 +3745,6 @@ AComputeShaderMeshGenerator::AComputeShaderMeshGenerator(const FObjectInitialize
 	DebugTriangleComponent->SetupAttachment(SceneRoot);
 }
 
-void AComputeShaderMeshGenerator::OnConstruction(const FTransform& Transform)
-{
-	Super::OnConstruction(Transform);
-	RefreshDynamicMeshComponentCullingBounds();
-}
-
-void AComputeShaderMeshGenerator::PostRegisterAllComponents()
-{
-	Super::PostRegisterAllComponents();
-	RefreshDynamicMeshComponentCullingBounds();
-}
-
 void AComputeShaderMeshGenerator::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	ClearMeshGeneratorGPUDebug();
@@ -5005,807 +3753,8 @@ void AComputeShaderMeshGenerator::EndPlay(const EEndPlayReason::Type EndPlayReas
 	Super::EndPlay(EndPlayReason);
 }
 
-void AMeshGeneratorBrushCache::EndPlay(const EEndPlayReason::Type EndPlayReason)
-{
-	ClearMeshGeneratorCache();
-	Super::EndPlay(EndPlayReason);
-}
-
 // -----------------------------------------------------------------------------
-// Brush System
-// -----------------------------------------------------------------------------
-
-void AMeshGeneratorBrushCache::StartInstanceBrush()
-{
-#if WITH_EDITOR
-	if (!InstanceBrushMesh)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[AComputeShaderMeshGenerator::StartInstanceBrush] InstanceBrushMesh is not set. Actor=%s"),
-			*GetNameSafe(this));
-	}
-
-	if (OnInstanceBrushEditorRequest.IsBound())
-	{
-		OnInstanceBrushEditorRequest.Broadcast(this);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[AComputeShaderMeshGenerator::StartInstanceBrush] No editor brush handler is registered. Actor=%s"),
-			*GetNameSafe(this));
-	}
-#endif
-}
-
-UHierarchicalInstancedStaticMeshComponent* AMeshGeneratorBrushCache::FindPaintComponent(UStaticMesh* Mesh) const
-{
-	if (!Mesh)
-	{
-		return nullptr;
-	}
-
-	for (const FCSInstancePaintComponentSlot& Slot : PaintedInstanceComponents)
-	{
-		if (Slot.Mesh == Mesh && Slot.Component)
-		{
-			return Slot.Component;
-		}
-	}
-
-	return nullptr;
-}
-
-UHierarchicalInstancedStaticMeshComponent* AMeshGeneratorBrushCache::GetOrCreatePaintComponent(UStaticMesh* Mesh)
-{
-	if (!Mesh)
-	{
-		return nullptr;
-	}
-
-	if (UHierarchicalInstancedStaticMeshComponent* ExistingComponent = FindPaintComponent(Mesh))
-	{
-		return ExistingComponent;
-	}
-
-	const FName BaseName(*FString::Printf(TEXT("PaintedInstances_%s"), *Mesh->GetName()));
-	const FName ComponentName = MakeUniqueObjectName(this, UHierarchicalInstancedStaticMeshComponent::StaticClass(), BaseName);
-	UHierarchicalInstancedStaticMeshComponent* NewComponent = NewObject<UHierarchicalInstancedStaticMeshComponent>(this, ComponentName, RF_Transactional);
-	if (!NewComponent)
-	{
-		return nullptr;
-	}
-
-	NewComponent->SetStaticMesh(Mesh);
-	NewComponent->SetMobility(EComponentMobility::Static);
-	NewComponent->SetupAttachment(SceneRoot ? SceneRoot.Get() : GetRootComponent());
-	AddInstanceComponent(NewComponent);
-	NewComponent->RegisterComponent();
-
-	FCSInstancePaintComponentSlot& NewSlot = PaintedInstanceComponents.AddDefaulted_GetRef();
-	NewSlot.Mesh = Mesh;
-	NewSlot.Component = NewComponent;
-
-#if WITH_EDITOR
-	MarkPackageDirty();
-#endif
-
-	return NewComponent;
-}
-
-int32 AMeshGeneratorBrushCache::CommitPaintInstances(const TArray<FTransform>& WorldTransforms, UStaticMesh* Mesh)
-{
-	if (!Mesh || WorldTransforms.IsEmpty())
-	{
-		return 0;
-	}
-
-	UHierarchicalInstancedStaticMeshComponent* PaintComponent = GetOrCreatePaintComponent(Mesh);
-	if (!PaintComponent)
-	{
-		return 0;
-	}
-
-	const int32 PreviousInstanceCount = PaintComponent->GetInstanceCount();
-	PaintComponent->AddInstances(WorldTransforms, false, true, false);
-	PaintComponent->MarkRenderStateDirty();
-
-#if WITH_EDITOR
-	MarkPackageDirty();
-#endif
-
-	return PaintComponent->GetInstanceCount() - PreviousInstanceCount;
-}
-
-bool AMeshGeneratorBrushCache::IsInstanceBrushPointAllowed(const FVector& WorldPosition) const
-{
-	if (!bInstanceBrushUseGeneratorBounds)
-	{
-		return true;
-	}
-
-	const FBox Bounds = GetGeneratorBoundsWorldBox();
-	return Bounds.IsValid && Bounds.IsInsideOrOn(WorldPosition);
-}
-
-// -----------------------------------------------------------------------------
-// Dirty Cache System - Public API
-// -----------------------------------------------------------------------------
-
-FCSMeshGeneratorTriangleCacheHandle AMeshGeneratorBrushCache::EnsureTriangleCache(const FCSMeshGeneratorTriangleCacheRequest& Request)
-{
-	FCSMeshGeneratorTriangleCacheRequest NormalizedRequest = Request;
-	NormalizedRequest.RequestId = NormalizeRequestId(Request.RequestId);
-	NormalizedRequest.CachedReferencePoints = ReferencePoints;
-
-	const FBox InputWorldBounds = GetGeneratorBoundsWorldBox();
-	if (!InputWorldBounds.IsValid || !FMath::IsFinite(VoxelGridSettings.VoxelSize) || VoxelGridSettings.VoxelSize <= CSGeneratorMinVoxelSize)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[AComputeShaderMeshGenerator::EnsureTriangleCache] Invalid bounds or voxel size. Actor=%s Request=%s"),
-			*GetNameSafe(this),
-			*NormalizedRequest.RequestId.ToString());
-		return GetTriangleCacheHandle();
-	}
-
-	const bool bNeedsFullRebuild = NormalizedRequest.bForceFullRebuild || DoesInputRequireFullRebuild(InputWorldBounds) || !HasValidCacheResources();
-	if (bNeedsFullRebuild)
-	{
-		ResetCacheRuntime(false);
-		RebuildCacheResources(InputWorldBounds);
-		++CacheState.CacheGeneration;
-		RebuildRequestActiveCellsFromLastRequests();
-	}
-
-	if (!HasValidCacheResources())
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[AComputeShaderMeshGenerator::EnsureTriangleCache] Cache resources are invalid after rebuild. Actor=%s Request=%s"),
-			*GetNameSafe(this),
-			*NormalizedRequest.RequestId.ToString());
-		return GetTriangleCacheHandle();
-	}
-
-	TSet<FCSMeshGeneratorVoxelKey> RequestCells;
-	const float RequestActivationRadius = NormalizedRequest.ActivationRadiusOverride > 0.0f
-		? NormalizedRequest.ActivationRadiusOverride
-		: VoxelGridSettings.ActivationRadius;
-	BuildActiveCellsFromReferencePoints(NormalizedRequest.CachedReferencePoints, RequestActivationRadius, RequestCells);
-
-	const FName SafeRequestId = NormalizedRequest.RequestId;
-	const bool bPersistentInterest = NormalizedRequest.bPersistentInterest;
-	if (bPersistentInterest)
-	{
-		RequestActiveCells.FindOrAdd(SafeRequestId) = MoveTemp(RequestCells);
-		LastRequests.FindOrAdd(SafeRequestId) = MoveTemp(NormalizedRequest);
-	}
-	else
-	{
-		RequestActiveCells.FindOrAdd(SafeRequestId) = RequestCells;
-	}
-
-	TSet<FCSMeshGeneratorVoxelKey> NewUnionActiveCells;
-	BuildUnionActiveCells(NewUnionActiveCells);
-
-	DiffActiveCells(NewUnionActiveCells);
-	ReleasePagesForCells(CacheState.CellsToDeactivate);
-	AllocatePagesForCells(CacheState.CellsToActivate);
-	CacheState.DirtyCells.Append(CacheState.CellsToActivate);
-
-	DispatchDirtyVoxelTriangleCacheUpdate();
-
-	CacheState.ActiveCells = MoveTemp(NewUnionActiveCells);
-
-	if (!bPersistentInterest)
-	{
-		RequestActiveCells.Remove(SafeRequestId);
-	}
-
-	return GetTriangleCacheHandle();
-}
-
-FCSMeshGeneratorTriangleCacheHandle AMeshGeneratorBrushCache::EnsureTriangleCacheByBox(
-	FName RequestId,
-	bool bForceFullRebuild)
-{
-	FCSMeshGeneratorTriangleCacheRequest Request;
-	Request.RequestId = RequestId;
-	Request.bForceFullRebuild = bForceFullRebuild;
-	return EnsureTriangleCache(Request);
-}
-
-FCSMeshGeneratorTriangleCacheHandle AMeshGeneratorBrushCache::EnsureTriangleCacheByBox(
-	FName RequestId,
-	const FVector& BoxCenter,
-	const FVector& BoxExtent,
-	bool bForceFullRebuild)
-{
-	if (GeneratorBounds)
-	{
-		GeneratorBounds->SetWorldLocation(BoxCenter);
-
-		const FVector SafeWorldExtent(
-			FMath::Max(0.0, BoxExtent.X),
-			FMath::Max(0.0, BoxExtent.Y),
-			FMath::Max(0.0, BoxExtent.Z));
-		const FVector ComponentScale = GeneratorBounds->GetComponentTransform().GetScale3D().GetAbs();
-		const FVector SafeComponentScale(
-			FMath::Max(UE_KINDA_SMALL_NUMBER, ComponentScale.X),
-			FMath::Max(UE_KINDA_SMALL_NUMBER, ComponentScale.Y),
-			FMath::Max(UE_KINDA_SMALL_NUMBER, ComponentScale.Z));
-		GeneratorBounds->SetBoxExtent(
-			FVector(
-				SafeWorldExtent.X / SafeComponentScale.X,
-				SafeWorldExtent.Y / SafeComponentScale.Y,
-				SafeWorldExtent.Z / SafeComponentScale.Z),
-			true);
-	}
-
-	return EnsureTriangleCacheByBox(RequestId, bForceFullRebuild);
-}
-
-void AMeshGeneratorBrushCache::UpdateMeshGeneratorCacheByBox(
-	bool bForceFullRebuild)
-{
-	EnsureTriangleCacheByBox(CSGeneratorDefaultRequestId, bForceFullRebuild);
-}
-
-void AMeshGeneratorBrushCache::ReleaseTriangleCacheRequest(FName RequestId)
-{
-	const FName SafeRequestId = NormalizeRequestId(RequestId);
-	if (!RequestActiveCells.Contains(SafeRequestId) && !LastRequests.Contains(SafeRequestId))
-	{
-		return;
-	}
-
-	RequestActiveCells.Remove(SafeRequestId);
-	LastRequests.Remove(SafeRequestId);
-
-	TSet<FCSMeshGeneratorVoxelKey> NewUnionActiveCells;
-	BuildUnionActiveCells(NewUnionActiveCells);
-
-	DiffActiveCells(NewUnionActiveCells);
-	ReleasePagesForCells(CacheState.CellsToDeactivate);
-	CacheState.ActiveCells = MoveTemp(NewUnionActiveCells);
-}
-
-void AMeshGeneratorBrushCache::ClearMeshGeneratorCache()
-{
-	ResetCacheRuntime(true);
-	++CacheState.CacheGeneration;
-}
-
-void AMeshGeneratorBrushCache::MarkAllActiveVoxelsDirty()
-{
-	CacheState.DirtyCells.Append(CacheState.ActiveCells);
-}
-
-FCSMeshGeneratorTriangleCacheHandle AMeshGeneratorBrushCache::GetTriangleCacheHandle() const
-{
-	FCSMeshGeneratorTriangleCacheHandle Handle;
-	Handle.bValid = HasValidCacheResources() && CacheState.CachedWorldBounds.IsValid;
-	Handle.CacheGeneration = int32(FMath::Min<uint32>(CacheState.CacheGeneration, uint32(TNumericLimits<int32>::Max())));
-	Handle.CachedWorldBounds = CacheState.CachedWorldBounds;
-	Handle.GridSize = CacheState.GridSize;
-	Handle.VoxelSize = CacheState.CachedVoxelSize;
-	Handle.ActiveVoxelCount = CacheState.ActiveCells.Num();
-	Handle.DirtyVoxelCount = CacheState.DirtyCells.Num();
-	Handle.VoxelMetaRT = VoxelMetaRT;
-	Handle.TriangleVertexRT = TriangleVertexRT;
-	Handle.TriangleNormalRT = TriangleNormalRT;
-	return Handle;
-}
-
-// -----------------------------------------------------------------------------
-// Debug System
-// -----------------------------------------------------------------------------
-
-int32 AMeshGeneratorBrushCache::DrawDebugActiveVoxels(
-	const FCSDebugActiveVoxelOptions& Options) const
-{
-	UWorld* World = GetWorld();
-	if (!World || !CacheState.CachedWorldBounds.IsValid || CacheState.CachedVoxelSize <= CSGeneratorMinVoxelSize)
-	{
-		return 0;
-	}
-
-	const TSet<FCSMeshGeneratorVoxelKey>* CellsToDraw = &CacheState.ActiveCells;
-	if (!Options.RequestId.IsNone())
-	{
-		CellsToDraw = RequestActiveCells.Find(NormalizeRequestId(Options.RequestId));
-		if (!CellsToDraw)
-		{
-			return 0;
-		}
-	}
-
-	if (CellsToDraw->IsEmpty())
-	{
-		return 0;
-	}
-
-	const float SafeDuration = FMath::Max(0.0f, Options.Duration);
-	const float SafeThickness = FMath::Max(0.0f, Options.Thickness);
-	const int32 DrawLimit = Options.MaxVoxelsToDraw > 0 ? Options.MaxVoxelsToDraw : TNumericLimits<int32>::Max();
-	const FColor LineColor = Options.DebugColor.ToFColor(true);
-
-	int32 DrawnCount = 0;
-	for (const FCSMeshGeneratorVoxelKey& Cell : *CellsToDraw)
-	{
-		if (DrawnCount >= DrawLimit)
-		{
-			break;
-		}
-
-		const FBox CellBounds = GetCellWorldBounds(Cell);
-		if (!CellBounds.IsValid)
-		{
-			continue;
-		}
-
-		DrawDebugBox(
-			World,
-			CellBounds.GetCenter(),
-			CellBounds.GetExtent(),
-			LineColor,
-			Options.bPersistentLines,
-			SafeDuration,
-			0,
-			SafeThickness);
-		++DrawnCount;
-	}
-
-	if (Options.bDrawCacheBounds)
-	{
-		DrawDebugBox(
-			World,
-			CacheState.CachedWorldBounds.GetCenter(),
-			CacheState.CachedWorldBounds.GetExtent(),
-			FColor::White,
-			Options.bPersistentLines,
-			SafeDuration,
-			0,
-			FMath::Max(1.0f, SafeThickness));
-	}
-
-	return DrawnCount;
-}
-
-// -----------------------------------------------------------------------------
-// Dirty Cache System - Internals
-// -----------------------------------------------------------------------------
-
-bool AMeshGeneratorBrushCache::DoesInputRequireFullRebuild(const FBox& InputWorldBounds) const
-{
-	const float SafeVoxelSize = FMath::Max(VoxelGridSettings.VoxelSize, CSGeneratorMinVoxelSize);
-	const int32 SafeMaxActiveVoxels = FMath::Max(1, VoxelGridSettings.MaxActiveVoxels);
-	const int32 SafeMaxTrianglesPerVoxel = FMath::Max(1, VoxelGridSettings.MaxTrianglesPerVoxel);
-	const int32 SafeMaxTextureDimension = FMath::Max(CSGeneratorMinTextureDimension, VoxelGridSettings.MaxCacheTextureDimension);
-
-	if (!CacheState.CachedWorldBounds.IsValid)
-	{
-		return true;
-	}
-
-	if (!AreBoundsCompatible(CacheState.CachedWorldBounds, InputWorldBounds))
-	{
-		return true;
-	}
-
-	if (!FMath::IsNearlyEqual(CacheState.CachedVoxelSize, SafeVoxelSize, KINDA_SMALL_NUMBER))
-	{
-		return true;
-	}
-
-	if (CacheState.GridSize != ComputeGridSize(InputWorldBounds))
-	{
-		return true;
-	}
-
-	if (CacheState.CachedMaxActiveVoxels != SafeMaxActiveVoxels ||
-		CacheState.CachedMaxTrianglesPerVoxel != SafeMaxTrianglesPerVoxel ||
-		CacheState.CachedLODIndex != VoxelGridSettings.LODIndex ||
-		CacheState.CachedMaxTextureDimension != SafeMaxTextureDimension)
-	{
-		return true;
-	}
-
-	return false;
-}
-
-void AMeshGeneratorBrushCache::RebuildCacheResources(const FBox& InputWorldBounds)
-{
-	CacheState.CachedWorldBounds = InputWorldBounds;
-	CacheState.CachedVoxelSize = FMath::Max(VoxelGridSettings.VoxelSize, CSGeneratorMinVoxelSize);
-	CacheState.GridSize = ComputeGridSize(InputWorldBounds);
-	CacheState.CachedMaxActiveVoxels = FMath::Max(1, VoxelGridSettings.MaxActiveVoxels);
-	CacheState.CachedMaxTrianglesPerVoxel = FMath::Max(1, VoxelGridSettings.MaxTrianglesPerVoxel);
-	CacheState.CachedLODIndex = VoxelGridSettings.LODIndex;
-	CacheState.CachedMaxTextureDimension = FMath::Max(CSGeneratorMinTextureDimension, VoxelGridSettings.MaxCacheTextureDimension);
-
-	InitializeFreePages();
-	CreateCacheRenderTargets();
-}
-
-void AMeshGeneratorBrushCache::BuildActiveCellsFromReferencePoints(
-	float ActivationRadius,
-	TSet<FCSMeshGeneratorVoxelKey>& OutCells) const
-{
-	BuildActiveCellsFromReferencePoints(ReferencePoints, ActivationRadius, OutCells);
-}
-
-void AMeshGeneratorBrushCache::BuildActiveCellsFromReferencePoints(
-	const TArray<FVector>& InReferencePoints,
-	float ActivationRadius,
-	TSet<FCSMeshGeneratorVoxelKey>& OutCells) const
-{
-	OutCells.Reset();
-	if (!CacheState.CachedWorldBounds.IsValid || CacheState.GridSize.X <= 0 || CacheState.GridSize.Y <= 0 || CacheState.GridSize.Z <= 0)
-	{
-		return;
-	}
-
-	const float SafeVoxelSize = FMath::Max(CacheState.CachedVoxelSize, CSGeneratorMinVoxelSize);
-	const float SafeActivationRadius = FMath::Max(ActivationRadius, 0.0f);
-	const int32 RadiusInCells = FMath::Max(0, FMath::CeilToInt(SafeActivationRadius / SafeVoxelSize));
-	const double ActivationRadiusSq = double(SafeActivationRadius) * double(SafeActivationRadius);
-
-	for (const FVector& Point : InReferencePoints)
-	{
-		if (!IsFiniteCSGeneratorVector(Point) || !CacheState.CachedWorldBounds.IsInsideOrOn(Point))
-		{
-			continue;
-		}
-
-		const FIntVector CenterCell = WorldPositionToCell(Point);
-		for (int32 Z = CenterCell.Z - RadiusInCells; Z <= CenterCell.Z + RadiusInCells; ++Z)
-		{
-			if (Z < 0 || Z >= CacheState.GridSize.Z)
-			{
-				continue;
-			}
-
-			for (int32 Y = CenterCell.Y - RadiusInCells; Y <= CenterCell.Y + RadiusInCells; ++Y)
-			{
-				if (Y < 0 || Y >= CacheState.GridSize.Y)
-				{
-					continue;
-				}
-
-				for (int32 X = CenterCell.X - RadiusInCells; X <= CenterCell.X + RadiusInCells; ++X)
-				{
-					if (X < 0 || X >= CacheState.GridSize.X)
-					{
-						continue;
-					}
-
-					const FCSMeshGeneratorVoxelKey Cell(X, Y, Z);
-					const FBox CellBounds = GetCellWorldBounds(Cell);
-					const FVector ClosestPoint = CellBounds.GetClosestPointTo(Point);
-					const double DistSq = FVector::DistSquared(ClosestPoint, Point);
-					if (RadiusInCells == 0 || DistSq <= ActivationRadiusSq)
-					{
-						OutCells.Add(Cell);
-						if (OutCells.Num() >= FMath::Max(1, VoxelGridSettings.MaxActiveVoxels))
-						{
-							return;
-						}
-					}
-				}
-			}
-		}
-	}
-}
-
-void AMeshGeneratorBrushCache::BuildUnionActiveCells(TSet<FCSMeshGeneratorVoxelKey>& OutCells) const
-{
-	OutCells.Reset();
-	const int32 MaxActiveVoxels = FMath::Max(1, VoxelGridSettings.MaxActiveVoxels);
-	for (const TPair<FName, TSet<FCSMeshGeneratorVoxelKey>>& Pair : RequestActiveCells)
-	{
-		for (const FCSMeshGeneratorVoxelKey& Cell : Pair.Value)
-		{
-			OutCells.Add(Cell);
-			if (OutCells.Num() >= MaxActiveVoxels)
-			{
-				return;
-			}
-		}
-	}
-}
-
-void AMeshGeneratorBrushCache::DiffActiveCells(const TSet<FCSMeshGeneratorVoxelKey>& NewActiveCells)
-{
-	CacheState.CellsToActivate.Reset();
-	CacheState.CellsToDeactivate.Reset();
-	CacheState.DirtyCells.Reset();
-
-	for (const FCSMeshGeneratorVoxelKey& Cell : NewActiveCells)
-	{
-		if (!CacheState.ActiveCells.Contains(Cell))
-		{
-			CacheState.CellsToActivate.Add(Cell);
-		}
-	}
-
-	for (const FCSMeshGeneratorVoxelKey& Cell : CacheState.ActiveCells)
-	{
-		if (!NewActiveCells.Contains(Cell))
-		{
-			CacheState.CellsToDeactivate.Add(Cell);
-		}
-	}
-}
-
-void AMeshGeneratorBrushCache::AllocatePagesForCells(const TSet<FCSMeshGeneratorVoxelKey>& Cells)
-{
-	for (const FCSMeshGeneratorVoxelKey& Cell : Cells)
-	{
-		if (CacheState.CellToPage.Contains(Cell))
-		{
-			continue;
-		}
-
-		if (CacheState.FreePages.IsEmpty())
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[AComputeShaderMeshGenerator] Triangle cache page capacity exhausted. Actor=%s MaxActiveVoxels=%d"),
-				*GetNameSafe(this),
-				CacheState.CachedMaxActiveVoxels);
-			break;
-		}
-
-		const int32 PageIndex = CacheState.FreePages.Pop(EAllowShrinking::No);
-		CacheState.CellToPage.Add(Cell, PageIndex);
-	}
-}
-
-void AMeshGeneratorBrushCache::ReleasePagesForCells(const TSet<FCSMeshGeneratorVoxelKey>& Cells)
-{
-	for (const FCSMeshGeneratorVoxelKey& Cell : Cells)
-	{
-		int32 PageIndex = INDEX_NONE;
-		if (CacheState.CellToPage.RemoveAndCopyValue(Cell, PageIndex) && PageIndex != INDEX_NONE)
-		{
-			if (!CacheState.FreePages.Contains(PageIndex))
-			{
-				CacheState.FreePages.Add(PageIndex);
-			}
-		}
-	}
-}
-
-void AMeshGeneratorBrushCache::DispatchDirtyVoxelTriangleCacheUpdate()
-{
-	if (CacheState.DirtyCells.IsEmpty())
-	{
-		return;
-	}
-
-	FBox DirtyWorldBounds(ForceInit);
-	for (const FCSMeshGeneratorVoxelKey& DirtyCell : CacheState.DirtyCells)
-	{
-		DirtyWorldBounds += GetCellWorldBounds(DirtyCell);
-	}
-
-	if (!DirtyWorldBounds.IsValid)
-	{
-		CacheState.DirtyCells.Reset();
-		return;
-	}
-
-	DirtyWorldBounds = DirtyWorldBounds.ExpandBy(FMath::Max(CacheState.CachedVoxelSize, CSGeneratorMinVoxelSize) * 0.5f);
-
-	TArray<FCSStaticMeshTriangleRequest> SceneTriangleRequests;
-	BuildBoxSceneTriangleRequestsInternal(
-		GetWorld(),
-		DirtyWorldBounds,
-		CacheState.CachedLODIndex,
-		SceneTriangleRequests);
-
-	TArray<FVector> CacheReferencePoints;
-	for (const TPair<FName, FCSMeshGeneratorTriangleCacheRequest>& Pair : LastRequests)
-	{
-		CacheReferencePoints.Append(Pair.Value.CachedReferencePoints);
-	}
-
-	const int32 DirtyCellCount = CacheState.DirtyCells.Num();
-	TArray<FCSMeshGeneratorDirtyVoxelPage> DirtyPageData;
-	DirtyPageData.Reserve(DirtyCellCount);
-	for (const FCSMeshGeneratorVoxelKey& DirtyCell : CacheState.DirtyCells)
-	{
-		const int32* PageIndex = CacheState.CellToPage.Find(DirtyCell);
-		if (!PageIndex || *PageIndex < 0)
-		{
-			continue;
-		}
-
-		FCSMeshGeneratorDirtyVoxelPage& DirtyPage = DirtyPageData.AddDefaulted_GetRef();
-		DirtyPage.X = uint32(FMath::Max(0, DirtyCell.X));
-		DirtyPage.Y = uint32(FMath::Max(0, DirtyCell.Y));
-		DirtyPage.Z = uint32(FMath::Max(0, DirtyCell.Z));
-		DirtyPage.PageIndex = uint32(*PageIndex);
-	}
-
-	if (DirtyPageData.IsEmpty() || !VoxelMetaRT || !TriangleVertexRT || !TriangleNormalRT)
-	{
-		CacheState.DirtyCells.Reset();
-		return;
-	}
-	const int32 DirtyPageCountForLog = DirtyPageData.Num();
-
-	const int64 RequestedTriangleCapacity = int64(FMath::Max(1, DirtyCellCount)) * int64(FMath::Max(1, CacheState.CachedMaxTrianglesPerVoxel));
-	const int32 MaxTrianglesForDirtyCells = int32(FMath::Clamp<int64>(RequestedTriangleCapacity, 1, int64(TNumericLimits<int32>::Max())));
-	const float ReferenceFilterDistance = FMath::Max(0.0f, VoxelGridSettings.ActivationRadius);
-	TArray<FResolvedStaticMeshTriangleRequest> ResolvedRequests;
-	const uint64 TotalStaticMeshTriangleCount = ResolveStaticMeshTriangleRequests(
-		SceneTriangleRequests,
-		this,
-		ExcludedActorTags,
-		true,
-		ResolvedRequests);
-
-	FCSTriangleMeshData LandscapeTriangleData;
-	BuildBoxSceneLandscapeTrianglesInternal(
-		GetWorld(),
-		DirtyWorldBounds,
-		CacheReferencePoints,
-		ReferenceFilterDistance,
-		MaxTrianglesForDirtyCells,
-		LandscapeTriangleData);
-
-	const uint32 CacheGeneration = CacheState.CacheGeneration;
-	const FIntVector GridSize = CacheState.GridSize;
-	const FVector CacheWorldMin = CacheState.CachedWorldBounds.Min;
-	const float CachedVoxelSize = FMath::Max(CacheState.CachedVoxelSize, CSGeneratorMinVoxelSize);
-	const uint32 MaxTrianglesPerVoxel = uint32(FMath::Max(1, CacheState.CachedMaxTrianglesPerVoxel));
-	const uint32 MetaTextureWidth = uint32(FMath::Max(1, VoxelMetaRT->SizeX));
-	const uint32 MetaTextureHeight = uint32(FMath::Max(1, VoxelMetaRT->SizeY));
-	const uint32 TriangleVertexTextureWidth = uint32(FMath::Max(1, TriangleVertexRT->SizeX));
-	const uint32 TriangleVertexTextureHeight = uint32(FMath::Max(1, TriangleVertexRT->SizeY));
-	const uint32 TriangleNormalTextureWidth = uint32(FMath::Max(1, TriangleNormalRT->SizeX));
-	const uint32 TriangleNormalTextureHeight = uint32(FMath::Max(1, TriangleNormalRT->SizeY));
-	FTextureRenderTargetResource* VoxelMetaResource = VoxelMetaRT->GameThread_GetRenderTargetResource();
-	FTextureRenderTargetResource* TriangleVertexResource = TriangleVertexRT->GameThread_GetRenderTargetResource();
-	FTextureRenderTargetResource* TriangleNormalResource = TriangleNormalRT->GameThread_GetRenderTargetResource();
-
-	ENQUEUE_RENDER_COMMAND(CSMeshGeneratorUpdateDirtyVoxelTriangleCache)(
-		[ResolvedRequests = MoveTemp(ResolvedRequests),
-		 TotalStaticMeshTriangleCount,
-		 ReferencePoints = MoveTemp(CacheReferencePoints),
-		 LandscapeTriangleData = MoveTemp(LandscapeTriangleData),
-		 DirtyPageData = MoveTemp(DirtyPageData),
-		 VoxelMetaResource,
-		 TriangleVertexResource,
-		 TriangleNormalResource,
-		 ReferenceFilterDistance,
-		 MaxTrianglesForDirtyCells,
-		 CacheGeneration,
-		 GridSize,
-		 CacheWorldMin,
-		 CachedVoxelSize,
-		 MaxTrianglesPerVoxel,
-		 MetaTextureWidth,
-		 MetaTextureHeight,
-		 TriangleVertexTextureWidth,
-		 TriangleVertexTextureHeight,
-		 TriangleNormalTextureWidth,
-		 TriangleNormalTextureHeight](FRHICommandListImmediate& RHICmdList)
-		{
-			FRDGBuilder GraphBuilder(RHICmdList);
-
-			FRDGTextureRef VoxelMetaTexture = RegisterRenderTargetTexture(GraphBuilder, VoxelMetaResource, TEXT("CS.MeshGenerator.VoxelMetaRT"));
-			FRDGTextureRef TriangleVertexTexture = RegisterRenderTargetTexture(GraphBuilder, TriangleVertexResource, TEXT("CS.MeshGenerator.TriangleVertexRT"));
-			FRDGTextureRef TriangleNormalTexture = RegisterRenderTargetTexture(GraphBuilder, TriangleNormalResource, TEXT("CS.MeshGenerator.TriangleNormalRT"));
-			if (!VoxelMetaTexture || !TriangleVertexTexture || !TriangleNormalTexture || DirtyPageData.IsEmpty())
-			{
-				GraphBuilder.Execute();
-				return;
-			}
-
-			FRDGTextureUAVRef VoxelMetaUAV = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(VoxelMetaTexture));
-			FRDGTextureUAVRef TriangleVertexUAV = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(TriangleVertexTexture));
-			FRDGTextureUAVRef TriangleNormalUAV = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(TriangleNormalTexture));
-
-			const uint32 DirtyPageCount = uint32(DirtyPageData.Num());
-			FRDGBufferRef DirtyPageBuffer = GraphBuilder.CreateBuffer(
-				FRDGBufferDesc::CreateBufferDesc(sizeof(FCSMeshGeneratorDirtyVoxelPage), DirtyPageData.Num()),
-				TEXT("CS.MeshGenerator.DirtyVoxelPages"));
-			FCSMeshGeneratorDirtyVoxelPage* DirtyPageUploadData = GraphBuilder.AllocPODArray<FCSMeshGeneratorDirtyVoxelPage>(DirtyPageData.Num());
-			FMemory::Memcpy(DirtyPageUploadData, DirtyPageData.GetData(), DirtyPageData.Num() * sizeof(FCSMeshGeneratorDirtyVoxelPage));
-			GraphBuilder.QueueBufferUpload(DirtyPageBuffer, DirtyPageUploadData, DirtyPageData.Num() * sizeof(FCSMeshGeneratorDirtyVoxelPage));
-			FRDGBufferSRVRef DirtyPageSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(DirtyPageBuffer, PF_R32G32B32A32_UINT));
-
-			TShaderMapRef<FClearDirtyVoxelCacheCS> ClearShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-			FClearDirtyVoxelCacheCS::FParameters* ClearParameters = GraphBuilder.AllocParameters<FClearDirtyVoxelCacheCS::FParameters>();
-			ClearParameters->DirtyVoxelPages = DirtyPageSRV;
-			ClearParameters->RW_VoxelMetaTexture = VoxelMetaUAV;
-			ClearParameters->RW_TriangleVertexTexture = TriangleVertexUAV;
-			ClearParameters->RW_TriangleNormalTexture = TriangleNormalUAV;
-			ClearParameters->DirtyVoxelCount = DirtyPageCount;
-			ClearParameters->CacheGeneration = CacheGeneration;
-			ClearParameters->MaxTrianglesPerVoxel = MaxTrianglesPerVoxel;
-			ClearParameters->MetaTextureWidth = MetaTextureWidth;
-			ClearParameters->MetaTextureHeight = MetaTextureHeight;
-			ClearParameters->TriangleVertexTextureWidth = TriangleVertexTextureWidth;
-			ClearParameters->TriangleVertexTextureHeight = TriangleVertexTextureHeight;
-			ClearParameters->TriangleNormalTextureWidth = TriangleNormalTextureWidth;
-			ClearParameters->TriangleNormalTextureHeight = TriangleNormalTextureHeight;
-			GraphBuilder.AddPass(
-				RDG_EVENT_NAME("CS.MeshGenerator.ClearDirtyVoxelCache"),
-				ClearParameters,
-				ERDGPassFlags::Compute,
-				[ClearParameters, ClearShader, DirtyPageCount](FRHIComputeCommandList& InRHICmdList)
-				{
-					FComputeShaderUtils::Dispatch(InRHICmdList, ClearShader, *ClearParameters, FComputeShaderUtils::GetGroupCount(FIntVector(int32(DirtyPageCount), 1, 1), 64));
-				});
-
-			const FCSTriangleMeshData* InitialTriangleData = GetTriangleMeshDataTriangleCount(LandscapeTriangleData) > 0 ? &LandscapeTriangleData : nullptr;
-			if (!ResolvedRequests.IsEmpty() || InitialTriangleData)
-			{
-				FCSStaticMeshTriangleRDGOutput TriangleOutput = AddResolvedStaticMeshTrianglesToRDGInternal(
-					GraphBuilder,
-					RHICmdList,
-					ResolvedRequests,
-					TotalStaticMeshTriangleCount,
-					ReferencePoints,
-					ReferenceFilterDistance,
-					MaxTrianglesForDirtyCells,
-					InitialTriangleData,
-					TEXT("CS.MeshGenerator.DirtyStaticMeshTriangles"));
-
-				if (TriangleOutput.TriangleVertices && TriangleOutput.TriangleNormals && TriangleOutput.TriangleCounter && TriangleOutput.MaxTriangles > 0)
-				{
-					TShaderMapRef<FScatterTrianglesToVoxelCacheCS> ScatterShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-					FScatterTrianglesToVoxelCacheCS::FParameters* ScatterParameters = GraphBuilder.AllocParameters<FScatterTrianglesToVoxelCacheCS::FParameters>();
-					ScatterParameters->TriangleVertices = TriangleOutput.TriangleVerticesSRV
-						? TriangleOutput.TriangleVerticesSRV
-						: GraphBuilder.CreateSRV(FRDGBufferSRVDesc(TriangleOutput.TriangleVertices, PF_A32B32G32R32F));
-					ScatterParameters->TriangleNormals = TriangleOutput.TriangleNormalsSRV
-						? TriangleOutput.TriangleNormalsSRV
-						: GraphBuilder.CreateSRV(FRDGBufferSRVDesc(TriangleOutput.TriangleNormals, PF_A32B32G32R32F));
-					ScatterParameters->SurfaceTriangleCounter = TriangleOutput.TriangleCounterSRV
-						? TriangleOutput.TriangleCounterSRV
-						: GraphBuilder.CreateSRV(FRDGBufferSRVDesc(TriangleOutput.TriangleCounter, PF_R32_UINT));
-					ScatterParameters->DirtyVoxelPages = DirtyPageSRV;
-					ScatterParameters->RW_VoxelMetaTexture = VoxelMetaUAV;
-					ScatterParameters->RW_TriangleVertexTexture = TriangleVertexUAV;
-					ScatterParameters->RW_TriangleNormalTexture = TriangleNormalUAV;
-					ScatterParameters->SurfaceTriangleCount = TriangleOutput.MaxTriangles;
-					ScatterParameters->DirtyVoxelCount = DirtyPageCount;
-					ScatterParameters->CacheGeneration = CacheGeneration;
-					ScatterParameters->GridSizeX = uint32(FMath::Max(0, GridSize.X));
-					ScatterParameters->GridSizeY = uint32(FMath::Max(0, GridSize.Y));
-					ScatterParameters->GridSizeZ = uint32(FMath::Max(0, GridSize.Z));
-					ScatterParameters->MaxTrianglesPerVoxel = MaxTrianglesPerVoxel;
-					ScatterParameters->MetaTextureWidth = MetaTextureWidth;
-					ScatterParameters->MetaTextureHeight = MetaTextureHeight;
-					ScatterParameters->TriangleVertexTextureWidth = TriangleVertexTextureWidth;
-					ScatterParameters->TriangleVertexTextureHeight = TriangleVertexTextureHeight;
-					ScatterParameters->TriangleNormalTextureWidth = TriangleNormalTextureWidth;
-					ScatterParameters->TriangleNormalTextureHeight = TriangleNormalTextureHeight;
-					ScatterParameters->CacheWorldMin = FVector3f(CacheWorldMin);
-					ScatterParameters->CacheVoxelSize = CachedVoxelSize;
-					GraphBuilder.AddPass(
-						RDG_EVENT_NAME("CS.MeshGenerator.ScatterTrianglesToVoxelCache"),
-						ScatterParameters,
-						ERDGPassFlags::Compute,
-						[ScatterParameters, ScatterShader, DirtyPageCount](FRHIComputeCommandList& InRHICmdList)
-						{
-							FComputeShaderUtils::Dispatch(InRHICmdList, ScatterShader, *ScatterParameters, FComputeShaderUtils::GetGroupCount(FIntVector(int32(DirtyPageCount), 1, 1), 64));
-						});
-				}
-			}
-
-			GraphBuilder.Execute();
-		});
-
-	UE_LOG(LogTemp, Verbose, TEXT("[AComputeShaderMeshGenerator] Dirty voxel triangle cache update queued. Actor=%s Dirty=%d Pages=%d Generation=%u"),
-		*GetNameSafe(this),
-		DirtyCellCount,
-		DirtyPageCountForLog,
-		CacheState.CacheGeneration);
-
-	CacheState.DirtyCells.Reset();
-}
-
-// -----------------------------------------------------------------------------
-// Dirty Cache System - Utilities
+// Generator bounds helper（BrushCache 缓存实现已归位 MeshGeneratorBrushCache.cpp）
 // -----------------------------------------------------------------------------
 
 FBox AComputeShaderMeshGenerator::GetGeneratorBoundsWorldBox() const
@@ -5825,173 +3774,9 @@ FBox AComputeShaderMeshGenerator::GetGeneratorBoundsWorldBox() const
 	return FBox(GeneratorBounds->GetComponentLocation() - SafeExtent, GeneratorBounds->GetComponentLocation() + SafeExtent);
 }
 
-FIntVector AMeshGeneratorBrushCache::ComputeGridSize(const FBox& InputWorldBounds) const
-{
-	if (!InputWorldBounds.IsValid)
-	{
-		return FIntVector::ZeroValue;
-	}
-
-	const FVector BoundsSize = InputWorldBounds.GetSize();
-	const float SafeVoxelSize = FMath::Max(VoxelGridSettings.VoxelSize, CSGeneratorMinVoxelSize);
-	return FIntVector(
-		FMath::Max(1, FMath::CeilToInt(BoundsSize.X / SafeVoxelSize)),
-		FMath::Max(1, FMath::CeilToInt(BoundsSize.Y / SafeVoxelSize)),
-		FMath::Max(1, FMath::CeilToInt(BoundsSize.Z / SafeVoxelSize)));
-}
-
-FCSMeshGeneratorVoxelKey AMeshGeneratorBrushCache::WorldPositionToCell(FVector WorldPosition) const
-{
-	const float SafeVoxelSize = FMath::Max(CacheState.CachedVoxelSize, CSGeneratorMinVoxelSize);
-	const FVector Local = (WorldPosition - CacheState.CachedWorldBounds.Min) / SafeVoxelSize;
-	const FIntVector RawCell(
-		FMath::FloorToInt(Local.X),
-		FMath::FloorToInt(Local.Y),
-		FMath::FloorToInt(Local.Z));
-
-	return FCSMeshGeneratorVoxelKey(
-		FMath::Clamp(RawCell.X, 0, FMath::Max(0, CacheState.GridSize.X - 1)),
-		FMath::Clamp(RawCell.Y, 0, FMath::Max(0, CacheState.GridSize.Y - 1)),
-		FMath::Clamp(RawCell.Z, 0, FMath::Max(0, CacheState.GridSize.Z - 1)));
-}
-
-FBox AMeshGeneratorBrushCache::GetCellWorldBounds(const FCSMeshGeneratorVoxelKey& Cell) const
-{
-	const float SafeVoxelSize = FMath::Max(CacheState.CachedVoxelSize, CSGeneratorMinVoxelSize);
-	const FVector Min = CacheState.CachedWorldBounds.Min + FVector(Cell.X, Cell.Y, Cell.Z) * SafeVoxelSize;
-	return FBox(Min, Min + FVector(SafeVoxelSize));
-}
-
-void AMeshGeneratorBrushCache::ReleaseCacheResources()
-{
-	ReleaseRTAndNull(VoxelMetaRT);
-	ReleaseRTAndNull(TriangleVertexRT);
-	ReleaseRTAndNull(TriangleNormalRT);
-}
-
-void AMeshGeneratorBrushCache::ResetCacheRuntime(bool bClearRequests)
-{
-	ReleaseCacheResources();
-
-	CacheState.CachedWorldBounds = FBox(ForceInit);
-	CacheState.GridSize = FIntVector::ZeroValue;
-	CacheState.CachedVoxelSize = 0.0f;
-	CacheState.CachedMaxActiveVoxels = 0;
-	CacheState.CachedMaxTrianglesPerVoxel = 0;
-	CacheState.CachedLODIndex = 0;
-	CacheState.CachedMaxTextureDimension = 0;
-	CacheState.ActiveCells.Empty();
-	CacheState.CellsToActivate.Empty();
-	CacheState.CellsToDeactivate.Empty();
-	CacheState.DirtyCells.Empty();
-	CacheState.CellToPage.Empty();
-	CacheState.FreePages.Empty();
-
-	if (bClearRequests)
-	{
-		RequestActiveCells.Empty();
-		LastRequests.Empty();
-	}
-	else
-	{
-		RequestActiveCells.Empty();
-	}
-}
-
-void AMeshGeneratorBrushCache::InitializeFreePages()
-{
-	CacheState.FreePages.Reset();
-	CacheState.FreePages.Reserve(CacheState.CachedMaxActiveVoxels);
-	for (int32 PageIndex = CacheState.CachedMaxActiveVoxels - 1; PageIndex >= 0; --PageIndex)
-	{
-		CacheState.FreePages.Add(PageIndex);
-	}
-}
-
-void AMeshGeneratorBrushCache::CreateCacheRenderTargets()
-{
-	ReleaseCacheResources();
-
-	const int32 MaxActiveVoxels = FMath::Max(1, CacheState.CachedMaxActiveVoxels);
-	const int32 MaxTrianglesPerVoxel = FMath::Max(1, CacheState.CachedMaxTrianglesPerVoxel);
-	const int32 MaxDimension = FMath::Max(CSGeneratorMinTextureDimension, CacheState.CachedMaxTextureDimension);
-	const int64 TotalTriangleSlots = int64(MaxActiveVoxels) * int64(MaxTrianglesPerVoxel);
-	const int64 TotalVertexPixels = TotalTriangleSlots * 3ll;
-	const int64 TotalNormalPixels = TotalTriangleSlots;
-
-	const int32 MetaWidth = FMath::Min(MaxDimension, FMath::Max(CSGeneratorDefaultTextureDimension, MaxActiveVoxels));
-	const int32 MetaHeight = FMath::Max(CSGeneratorDefaultTextureDimension, CeilDivInt64ToInt32(MaxActiveVoxels, MetaWidth));
-
-	const int32 VertexWidth = FMath::Min<int32>(MaxDimension, FMath::Max<int64>(CSGeneratorDefaultTextureDimension, FMath::Min<int64>(TotalVertexPixels, MaxDimension)));
-	const int32 VertexHeight = FMath::Max(CSGeneratorDefaultTextureDimension, CeilDivInt64ToInt32(TotalVertexPixels, VertexWidth));
-
-	const int32 NormalWidth = FMath::Min<int32>(MaxDimension, FMath::Max<int64>(CSGeneratorDefaultTextureDimension, FMath::Min<int64>(TotalNormalPixels, MaxDimension)));
-	const int32 NormalHeight = FMath::Max(CSGeneratorDefaultTextureDimension, CeilDivInt64ToInt32(TotalNormalPixels, NormalWidth));
-
-	VoxelMetaRT = NewObject<UTextureRenderTarget2D>(
-		this,
-		MakeUniqueObjectName(this, UTextureRenderTarget2D::StaticClass(), TEXT("CSMeshGenerator_VoxelMetaRT")),
-		RF_Transient);
-	TriangleVertexRT = NewObject<UTextureRenderTarget2D>(
-		this,
-		MakeUniqueObjectName(this, UTextureRenderTarget2D::StaticClass(), TEXT("CSMeshGenerator_TriangleVertexRT")),
-		RF_Transient);
-	TriangleNormalRT = NewObject<UTextureRenderTarget2D>(
-		this,
-		MakeUniqueObjectName(this, UTextureRenderTarget2D::StaticClass(), TEXT("CSMeshGenerator_TriangleNormalRT")),
-		RF_Transient);
-
-	InitCacheRT(VoxelMetaRT, MetaWidth, MetaHeight);
-	InitCacheRT(TriangleVertexRT, VertexWidth, VertexHeight);
-	InitCacheRT(TriangleNormalRT, NormalWidth, NormalHeight);
-}
-
-void AMeshGeneratorBrushCache::RebuildRequestActiveCellsFromLastRequests()
-{
-	RequestActiveCells.Empty();
-	for (const TPair<FName, FCSMeshGeneratorTriangleCacheRequest>& Pair : LastRequests)
-	{
-		const FCSMeshGeneratorTriangleCacheRequest& Request = Pair.Value;
-		if (!Request.bPersistentInterest)
-		{
-			continue;
-		}
-
-		const float RequestActivationRadius = Request.ActivationRadiusOverride > 0.0f
-			? Request.ActivationRadiusOverride
-			: VoxelGridSettings.ActivationRadius;
-
-		TSet<FCSMeshGeneratorVoxelKey> RebuiltCells;
-		BuildActiveCellsFromReferencePoints(Request.CachedReferencePoints, RequestActivationRadius, RebuiltCells);
-		RequestActiveCells.Add(Pair.Key, MoveTemp(RebuiltCells));
-	}
-}
-
-bool AMeshGeneratorBrushCache::HasValidCacheResources() const
-{
-	return IsValidCacheRT(VoxelMetaRT) && IsValidCacheRT(TriangleVertexRT) && IsValidCacheRT(TriangleNormalRT);
-}
-
-bool AMeshGeneratorBrushCache::AreBoundsCompatible(const FBox& A, const FBox& B) const
-{
-	if (!A.IsValid || !B.IsValid)
-	{
-		return false;
-	}
-
-	const float Tolerance = FMath::Max(0.0f, VoxelGridSettings.BoundsTolerance);
-	const double ToleranceSq = double(Tolerance) * double(Tolerance);
-	return FVector::DistSquared(A.GetCenter(), B.GetCenter()) <= ToleranceSq
-		&& FVector::DistSquared(A.GetExtent(), B.GetExtent()) <= ToleranceSq;
-}
-
-FName AMeshGeneratorBrushCache::NormalizeRequestId(FName RequestId) const
-{
-	return RequestId.IsNone() ? CSGeneratorDefaultRequestId : RequestId;
-}
 
 // -----------------------------------------------------------------------------
-// Triangle Soup 閳?Heightmap RDG pass
+// Triangle Soup → Heightmap RDG pass
 // -----------------------------------------------------------------------------
 
 void AComputeShaderMeshGenerator::RasterizeTriangleSoupToHeightmapRDG(
@@ -6088,22 +3873,11 @@ void AComputeShaderMeshGenerator::RasterizeIndexedMeshToHeightmapRDG(
 	FCSStaticMeshTriangleRDGOutput Soup;
 	Soup.MaxTriangles = TriangleCapacity;
 	Soup.MaxVertices = TriangleCapacity * 3u;
-	Soup.TriangleVertices = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), TriangleCapacity * 3u), TEXT("IdxMeshHM.Soup.Verts"));
-	Soup.TriangleVerticesUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Soup.TriangleVertices, PF_A32B32G32R32F));
-	Soup.TriangleVerticesSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Soup.TriangleVertices, PF_A32B32G32R32F));
-	AddClearUAVPass(GraphBuilder, Soup.TriangleVerticesUAV, 0.0f);
+	CSHelper::CreateClearedTypedBuffer(GraphBuilder, Soup.TriangleVertices, Soup.TriangleVerticesUAV, Soup.TriangleVerticesSRV, sizeof(FVector4f), TriangleCapacity * 3u, PF_A32B32G32R32F, TEXT("IdxMeshHM.Soup.Verts"), 0.0f);
 
-	Soup.TriangleNormals = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), TriangleCapacity * 3u), TEXT("IdxMeshHM.Soup.Normals"));
-	Soup.TriangleNormalsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Soup.TriangleNormals, PF_A32B32G32R32F));
-	AddClearUAVPass(GraphBuilder, Soup.TriangleNormalsUAV, 0.0f);
+	CSHelper::CreateClearedTypedBuffer(GraphBuilder, Soup.TriangleNormals, Soup.TriangleNormalsUAV, sizeof(FVector4f), TriangleCapacity * 3u, PF_A32B32G32R32F, TEXT("IdxMeshHM.Soup.Normals"), 0.0f);
 
-	Soup.TriangleCounter = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1), TEXT("IdxMeshHM.Soup.Counter"));
-	Soup.TriangleCounterUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Soup.TriangleCounter, PF_R32_UINT));
-	Soup.TriangleCounterSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Soup.TriangleCounter, PF_R32_UINT));
-	AddClearUAVPass(GraphBuilder, Soup.TriangleCounterUAV, 0u);
+	CSHelper::CreateClearedTypedBuffer(GraphBuilder, Soup.TriangleCounter, Soup.TriangleCounterUAV, Soup.TriangleCounterSRV, sizeof(uint32), 1, PF_R32_UINT, TEXT("IdxMeshHM.Soup.Counter"), 0u);
 
 	// Dummy reference-point buffer (filter disabled).
 	FRDGBufferRef RefBuf = GraphBuilder.CreateBuffer(
@@ -6113,25 +3887,21 @@ void AComputeShaderMeshGenerator::RasterizeIndexedMeshToHeightmapRDG(
 	GraphBuilder.QueueBufferUpload(RefBuf, RefData, sizeof(FVector4f));
 	FRDGBufferSRVRef RefSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(RefBuf, PF_A32B32G32R32F));
 
-	// Heightmap 鐠侯垰绶炴稉宥堟嫹闊亝娼楃拹顭掔礉娴?shader 閸欏倹鏆熻箛鍛淬€忕紒鎴濈暰閿涙氨绮版稉鈧稉顏勫弿 CS_NO_MATERIAL_ID 閻ㄥ嫯绶崗?+
-	// 娑撯偓娑擃亙娑鍐暏閻ㄥ嫯绶崙?material buffer閵?
+	// Heightmap 路径不追踪材质，但 shader 参数必须绑定：给一个全 CS_NO_MATERIAL_ID 的输入 +
+	// 一个丢弃用的输出 material buffer。
 	FRDGBufferRef TriToMaterialBuf = GraphBuilder.CreateBuffer(
 		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), TriangleCapacity), TEXT("IdxMeshHM.Soup.TriToMaterial"));
 	uint32* TriToMaterialData = GraphBuilder.AllocPODArray<uint32>(TriangleCapacity);
 	for (uint32 FillIndex = 0; FillIndex < TriangleCapacity; ++FillIndex) TriToMaterialData[FillIndex] = CS_NO_MATERIAL_ID;
 	GraphBuilder.QueueBufferUpload(TriToMaterialBuf, TriToMaterialData, TriangleCapacity * sizeof(uint32));
 
-	FRDGBufferRef MaterialIdsBuf = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), TriangleCapacity), TEXT("IdxMeshHM.Soup.MaterialIds"));
-	FRDGBufferUAVRef MaterialIdsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(MaterialIdsBuf, PF_R32_UINT));
-	AddClearUAVPass(GraphBuilder, MaterialIdsUAV, CS_NO_MATERIAL_ID);
+	FRDGBufferRef MaterialIdsBuf; FRDGBufferUAVRef MaterialIdsUAV;
+	CSHelper::CreateClearedTypedBuffer(GraphBuilder, MaterialIdsBuf, MaterialIdsUAV, sizeof(uint32), TriangleCapacity, PF_R32_UINT, TEXT("IdxMeshHM.Soup.MaterialIds"), CS_NO_MATERIAL_ID);
 
-	// Heightmap 鐠侯垰绶炴稉宥堟嫹闊?UV閿涘奔绲?shader 閸欏倹鏆熻箛鍛淬€忕紒鎴濈暰閿涙俺绶崗銉х拨 dummy tex-coord SRV閿涘湤umTexCoords=0
-	// 娴?shader 娑撳秶婀″锝堫嚢閸欐牭绱氶敍宀冪翻閸戣櫣绮︽稉鈧稉顏冩丢瀵啰鏁ら惃?UV buffer閵?
-	FRDGBufferRef UVsBuf = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector2f), TriangleCapacity * 3u), TEXT("IdxMeshHM.Soup.UVs"));
-	FRDGBufferUAVRef UVsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(UVsBuf, PF_G32R32F));
-	AddClearUAVPass(GraphBuilder, UVsUAV, 0.0f);
+	// Heightmap 路径不追踪 UV，但 shader 参数必须绑定：输入绑 dummy tex-coord SRV（NumTexCoords=0
+	// 让 shader 不真正读取），输出绑一个丢弃用的 UV buffer。
+	FRDGBufferRef UVsBuf; FRDGBufferUAVRef UVsUAV;
+	CSHelper::CreateClearedTypedBuffer(GraphBuilder, UVsBuf, UVsUAV, sizeof(FVector2f), TriangleCapacity * 3u, PF_G32R32F, TEXT("IdxMeshHM.Soup.UVs"), 0.0f);
 
 	TShaderMapRef<FExtractStaticMeshTrianglesCS> ExtractCS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 	auto* EP = GraphBuilder.AllocParameters<FExtractStaticMeshTrianglesCS::FParameters>();
@@ -6163,541 +3933,10 @@ void AComputeShaderMeshGenerator::RasterizeIndexedMeshToHeightmapRDG(
 	GraphBuilder.AddPass(RDG_EVENT_NAME("IdxMeshHM.Extract"), EP, ERDGPassFlags::Compute,
 		[EP, ExtractCS, TriangleCapacity](FRHIComputeCommandList& CmdList)
 		{
-			// wrapped閿涙矮绗?ExtractStaticMeshTrianglesCS 閻?GetUnWrappedDispatchThreadId 闁板秴顨滈敍鍫濄亣缂冩垶鐗?TriangleCapacity 閸?>4.19M閿?
+			// wrapped：与 ExtractStaticMeshTrianglesCS 的 GetUnWrappedDispatchThreadId 配套（大网格 TriangleCapacity 可 >4.19M）
 			FComputeShaderUtils::Dispatch(CmdList, ExtractCS, *EP,
 				FComputeShaderUtils::GetGroupCountWrapped(FMath::Max(1, int32(TriangleCapacity)), 64));
 		});
 
 	RasterizeTriangleSoupToHeightmapRDG(GraphBuilder, Soup, OutHeightmap, WorldBounds, CameraHeight);
-}
-
-void AComputeShaderMeshGenerator::ConvertLandscapeHeightmapToDepthRDG(
-	FRDGBuilder& GraphBuilder,
-	FRDGTextureRef LandscapeG16Texture,
-	FRDGTextureRef OutputHeightmap,
-	float CameraHeight,
-	float LandscapeScaleZ,
-	float LandscapeOriginZ)
-{
-	if (!LandscapeG16Texture || !OutputHeightmap) return;
-
-	FIntPoint TexSize(OutputHeightmap->Desc.Extent.X, OutputHeightmap->Desc.Extent.Y);
-
-	TShaderMapRef<FLandscapeG16ToDepthCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-	auto* PassParams = GraphBuilder.AllocParameters<FLandscapeG16ToDepthCS::FParameters>();
-	PassParams->T_LandscapeRGBA = GraphBuilder.CreateSRV(FRDGTextureSRVDesc(LandscapeG16Texture));
-	PassParams->RW_HeightmapFloat = GraphBuilder.CreateUAV(OutputHeightmap);
-	PassParams->LHM_CameraHeight = CameraHeight;
-	PassParams->LHM_LandscapeScaleZ = LandscapeScaleZ;
-	PassParams->LHM_LandscapeOriginZ = LandscapeOriginZ;
-	PassParams->LHM_TextureSize = TexSize;
-
-	FIntVector GroupCount(
-		FMath::DivideAndRoundUp(TexSize.X, 8),
-		FMath::DivideAndRoundUp(TexSize.Y, 8),
-		1);
-	FComputeShaderUtils::AddPass(
-		GraphBuilder,
-		RDG_EVENT_NAME("LandscapeG16ToDepth"),
-		ERDGPassFlags::Compute,
-		CS,
-		PassParams,
-		GroupCount);
-}
-
-bool AComputeShaderMeshGenerator::CaptureLandscapeHeightmap(UTextureRenderTarget2D* OutRT, bool bOutputWorldHeight)
-{
-	const FBox Box = GetGeneratorBoundsWorldBox();
-	if (!Box.IsValid) return false;
-	const FVector Center = Box.GetCenter();
-	const FVector Extent = Box.GetExtent();
-	const float CaptureExtent = FMath::Max(Extent.X, Extent.Y);
-	const float CameraHeight = Center.Z + Extent.Z;
-
-	if (OutRT == nullptr)
-	{
-		UWorld* World = GetWorld();
-		if (!World) return false;
-
-		constexpr int32 GridSize = 32;
-		const float WorldSize = CaptureExtent * 2.0f;
-		const float StepSize = WorldSize / GridSize;
-
-		const float TraceTop    = CameraHeight + 100000.0f;
-		const float TraceBottom = Center.Z - Extent.Z - 100000.0f;
-
-		FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(LandscapeHeightDD), false);
-		QueryParams.AddIgnoredActor(this);
-
-		int32 HitCount = 0;
-		const double TraceStart = FPlatformTime::Seconds();
-		for (int32 Y = 0; Y < GridSize; ++Y)
-		{
-			for (int32 X = 0; X < GridSize; ++X)
-			{
-				const float WorldX = Center.X - CaptureExtent + (X + 0.5f) * StepSize;
-				const float WorldY = Center.Y - CaptureExtent + (Y + 0.5f) * StepSize;
-
-				FHitResult Hit;
-				if (World->LineTraceSingleByChannel(Hit,
-					FVector(WorldX, WorldY, TraceTop),
-					FVector(WorldX, WorldY, TraceBottom),
-					ECC_WorldStatic, QueryParams)
-					&& Hit.GetActor() && Hit.GetActor()->IsA<ALandscapeProxy>())
-				{
-					DrawDebugPoint(World, Hit.ImpactPoint + FVector(0,0,10), 8.0f, FColor::Green, false, 15.0f);
-					++HitCount;
-				}
-			}
-		}
-		const double TraceMs = (FPlatformTime::Seconds() - TraceStart) * 1000.0;
-		UE_LOG(LogTemp, Log, TEXT("[CaptureLandscapeHeightmap] DD mode: %d/%d landscape hits, %.2f ms, Center=(%.0f,%.0f,%.0f) Extent=%.0f"),
-			HitCount, GridSize * GridSize, TraceMs, Center.X, Center.Y, Center.Z, CaptureExtent);
-		return HitCount > 0;
-	}
-
-	const bool bResult = bOutputWorldHeight
-		? CaptureLandscapeHeightmapGPU(Center, CaptureExtent, OutRT)
-		: CaptureLandscapeHeightmapToDepth(Center, CaptureExtent, CameraHeight, OutRT);
-
-	return bResult;
-}
-
-bool AComputeShaderMeshGenerator::CaptureLandscapeHeightmapToDepth(
-	FVector WorldCenter,
-	float CaptureExtent,
-	float CameraHeight,
-	UTextureRenderTarget2D* OutDepthRT)
-{
-	if (!OutDepthRT) return false;
-
-	UWorld* World = GetWorld();
-	if (!World) return false;
-
-	TArray<ALandscape*> Landscapes;
-	for (TActorIterator<ALandscape> It(World); It; ++It)
-	{
-		if (IsValid(*It))
-		{
-			Landscapes.Add(*It);
-		}
-	}
-	if (Landscapes.IsEmpty()) return false;
-
-	const int32 TexSize = OutDepthRT->SizeX;
-
-	// Pre-clear output to very large depth so min-merge works across multiple landscapes.
-	// The shader writes min(existing, newDepth), so existing must start high.
-	FTextureRenderTargetResource* R_Depth = OutDepthRT->GameThread_GetRenderTargetResource();
-	ENQUEUE_RENDER_COMMAND(ClearDepthToMax)(
-	[R_Depth](FRHICommandListImmediate& RHICmdList)
-	{
-		FRDGBuilder GraphBuilder(RHICmdList);
-		FRDGTextureRef RDG = RegisterExternalTexture(
-			GraphBuilder, R_Depth->GetRenderTargetTexture(), TEXT("DepthClear"));
-		AddClearRenderTargetPass(GraphBuilder, RDG, FLinearColor(1e10f, 0, 0, 1));
-		GraphBuilder.Execute();
-	});
-
-	FTransform AreaTransform(FQuat::Identity, WorldCenter, FVector::OneVector);
-	FBox2D Extents(FVector2D(-CaptureExtent, -CaptureExtent), FVector2D(CaptureExtent, CaptureExtent));
-
-	TArray<UTextureRenderTarget2D*> TempRTs;
-	bool bAnySuccess = false;
-
-	for (ALandscape* Landscape : Landscapes)
-	{
-		UTextureRenderTarget2D* TempRT = NewObject<UTextureRenderTarget2D>(GetTransientPackage());
-		TempRT->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
-		TempRT->bCanCreateUAV = false;
-		TempRT->ClearColor = FLinearColor(0.5f, 0, 0, 0);
-		TempRT->InitAutoFormat(TexSize, TexSize);
-		TempRT->UpdateResourceImmediate(true);
-
-		if (!Landscape->RenderHeightmap(AreaTransform, Extents, TempRT))
-		{
-			TempRT->MarkAsGarbage();
-			continue;
-		}
-
-		const float LandscapeScaleZ = Landscape->GetActorScale3D().Z;
-		const float LandscapeOriginZ = Landscape->GetActorLocation().Z;
-
-		FTextureRenderTargetResource* R_RGBA = TempRT->GameThread_GetRenderTargetResource();
-
-		ENQUEUE_RENDER_COMMAND(LandscapeRGBAToDepth)(
-		[this, R_RGBA, R_Depth, CameraHeight, LandscapeScaleZ, LandscapeOriginZ, TexSize](FRHICommandListImmediate& RHICmdList)
-		{
-			FRDGBuilder GraphBuilder(RHICmdList);
-
-			FRDGTextureRef RDG_RGBA = RegisterExternalTexture(GraphBuilder, R_RGBA->GetRenderTargetTexture(), TEXT("LandscapeRGBA_RT"));
-			FRDGTextureRef RDG_Depth = RegisterExternalTexture(GraphBuilder, R_Depth->GetRenderTargetTexture(), TEXT("DepthOutput_RT"));
-
-			ConvertLandscapeHeightmapToDepthRDG(
-				GraphBuilder, RDG_RGBA, RDG_Depth,
-				CameraHeight, LandscapeScaleZ, LandscapeOriginZ);
-
-			GraphBuilder.Execute();
-		});
-
-		TempRTs.Add(TempRT);
-		bAnySuccess = true;
-	}
-
-	FlushRenderingCommands();
-
-	for (UTextureRenderTarget2D* TempRT : TempRTs)
-	{
-		TempRT->MarkAsGarbage();
-	}
-
-	return bAnySuccess;
-}
-
-void AComputeShaderMeshGenerator::ConvertLandscapeHeightmapToNormalHeightRDG(
-	FRDGBuilder& GraphBuilder,
-	FRDGTextureRef LandscapeG16Texture,
-	FRDGTextureRef OutputNormalHeight,
-	float LandscapeScaleZ,
-	float LandscapeOriginZ,
-	FVector2f TexelWorldSize,
-	bool bMergeByMaxZ)
-{
-	if (!LandscapeG16Texture || !OutputNormalHeight) return;
-
-	FIntPoint TexSize(OutputNormalHeight->Desc.Extent.X, OutputNormalHeight->Desc.Extent.Y);
-
-	TShaderMapRef<FLandscapeG16ToNormalHeightCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-	auto* PassParams = GraphBuilder.AllocParameters<FLandscapeG16ToNormalHeightCS::FParameters>();
-	PassParams->T_LandscapeRGBA = GraphBuilder.CreateSRV(FRDGTextureSRVDesc(LandscapeG16Texture));
-	PassParams->RW_HeightmapFloat = GraphBuilder.CreateUAV(OutputNormalHeight);
-	PassParams->LHM_LandscapeScaleZ = LandscapeScaleZ;
-	PassParams->LHM_LandscapeOriginZ = LandscapeOriginZ;
-	PassParams->LHM_TextureSize = TexSize;
-	PassParams->LHM_TexelWorldSize = TexelWorldSize;
-	PassParams->LHM_MergeByMaxZ = bMergeByMaxZ ? 1u : 0u;
-
-	FIntVector GroupCount(
-		FMath::DivideAndRoundUp(TexSize.X, 8),
-		FMath::DivideAndRoundUp(TexSize.Y, 8),
-		1);
-	FComputeShaderUtils::AddPass(
-		GraphBuilder,
-		RDG_EVENT_NAME("LandscapeG16ToNormalHeight"),
-		ERDGPassFlags::Compute,
-		CS,
-		PassParams,
-		GroupCount);
-}
-
-bool AComputeShaderMeshGenerator::CaptureLandscapeHeightmapGPU(
-	FVector WorldCenter,
-	float CaptureExtent,
-	UTextureRenderTarget2D* OutNormalHeightRT)
-{
-	if (!OutNormalHeightRT) return false;
-
-	UWorld* World = GetWorld();
-	if (!World) return false;
-
-	TArray<ALandscape*> Landscapes;
-	for (TActorIterator<ALandscape> It(World); It; ++It)
-	{
-		if (IsValid(*It))
-		{
-			Landscapes.Add(*It);
-		}
-	}
-	if (Landscapes.IsEmpty()) return false;
-
-	const int32 TexSize = OutNormalHeightRT->SizeX;
-	const bool bMultipleLandscapes = Landscapes.Num() > 1;
-
-	// Pre-clear output: Normal=(0,0,1) up, Height=-1e10 (very low 閳?any real terrain wins merge)
-	FTextureRenderTargetResource* R_Out = OutNormalHeightRT->GameThread_GetRenderTargetResource();
-	if (bMultipleLandscapes)
-	{
-		ENQUEUE_RENDER_COMMAND(ClearNormalHeightToMin)(
-		[R_Out](FRHICommandListImmediate& RHICmdList)
-		{
-			FRDGBuilder GraphBuilder(RHICmdList);
-			FRDGTextureRef RDG = RegisterExternalTexture(
-				GraphBuilder, R_Out->GetRenderTargetTexture(), TEXT("NHClear"));
-			AddClearRenderTargetPass(GraphBuilder, RDG, FLinearColor(0, 0, 1, -1e10f));
-			GraphBuilder.Execute();
-		});
-	}
-
-	FTransform AreaTransform(FQuat::Identity, WorldCenter, FVector::OneVector);
-	FBox2D Extents(FVector2D(-CaptureExtent, -CaptureExtent), FVector2D(CaptureExtent, CaptureExtent));
-	const FVector2f CapturedTexelWorldSize(
-		(CaptureExtent * 2.0f) / TexSize,
-		(CaptureExtent * 2.0f) / TexSize);
-
-	TArray<UTextureRenderTarget2D*> TempRTs;
-	bool bAnySuccess = false;
-
-	for (ALandscape* Landscape : Landscapes)
-	{
-		UTextureRenderTarget2D* TempRT = NewObject<UTextureRenderTarget2D>(GetTransientPackage());
-		TempRT->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
-		TempRT->bCanCreateUAV = false;
-		TempRT->ClearColor = FLinearColor(0.5f, 0, 0, 0);
-		TempRT->InitAutoFormat(TexSize, TexSize);
-		TempRT->UpdateResourceImmediate(true);
-
-		if (!Landscape->RenderHeightmap(AreaTransform, Extents, TempRT))
-		{
-			TempRT->MarkAsGarbage();
-			continue;
-		}
-
-		const float LandscapeScaleZ = Landscape->GetActorScale3D().Z;
-		const float LandscapeOriginZ = Landscape->GetActorLocation().Z;
-		const bool bMerge = bMultipleLandscapes;
-
-		FTextureRenderTargetResource* R_RGBA = TempRT->GameThread_GetRenderTargetResource();
-
-		ENQUEUE_RENDER_COMMAND(LandscapeRGBAToNormalHeight)(
-		[this, R_RGBA, R_Out, LandscapeScaleZ, LandscapeOriginZ, CapturedTexelWorldSize, TexSize, bMerge](FRHICommandListImmediate& RHICmdList)
-		{
-			FRDGBuilder GraphBuilder(RHICmdList);
-
-			FRDGTextureRef RDG_RGBA = RegisterExternalTexture(GraphBuilder, R_RGBA->GetRenderTargetTexture(), TEXT("LandscapeRGBA_RT"));
-			FRDGTextureRef RDG_Out = RegisterExternalTexture(GraphBuilder, R_Out->GetRenderTargetTexture(), TEXT("NormalHeightOutput_RT"));
-
-			ConvertLandscapeHeightmapToNormalHeightRDG(
-				GraphBuilder, RDG_RGBA, RDG_Out,
-				LandscapeScaleZ, LandscapeOriginZ, CapturedTexelWorldSize, bMerge);
-
-			GraphBuilder.Execute();
-		});
-
-		TempRTs.Add(TempRT);
-		bAnySuccess = true;
-	}
-
-	FlushRenderingCommands();
-
-	for (UTextureRenderTarget2D* TempRT : TempRTs)
-	{
-		TempRT->MarkAsGarbage();
-	}
-
-	return bAnySuccess;
-}
-
-bool AComputeShaderMeshGenerator::RenderLandscapeToNormalHeightRT(
-	ALandscape* Landscape,
-	FVector WorldCenter,
-	FVector WorldExtentXY,
-	UTextureRenderTarget2D* OutNormalHeightRT)
-{
-	if (!Landscape || !OutNormalHeightRT) return false;
-
-	const int32 TexSizeX = OutNormalHeightRT->SizeX;
-	const int32 TexSizeY = OutNormalHeightRT->SizeY;
-	if (TexSizeX < 4 || TexSizeY < 4) return false;
-
-	const float ExtX = FMath::Abs(WorldExtentXY.X);
-	const float ExtY = FMath::Abs(WorldExtentXY.Y);
-	if (ExtX < 1.0f || ExtY < 1.0f) return false;
-
-	UTextureRenderTarget2D* TempRT = NewObject<UTextureRenderTarget2D>(GetTransientPackage());
-	TempRT->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
-	TempRT->bCanCreateUAV = false;
-	TempRT->ClearColor = FLinearColor(0.5f, 0, 0, 0);
-	TempRT->InitAutoFormat(TexSizeX, TexSizeY);
-	TempRT->UpdateResourceImmediate(true);
-
-	FTransform AreaTransform(FQuat::Identity, WorldCenter, FVector::OneVector);
-	FBox2D Extents(FVector2D(-ExtX, -ExtY), FVector2D(ExtX, ExtY));
-
-	if (!Landscape->RenderHeightmap(AreaTransform, Extents, TempRT))
-	{
-		TempRT->MarkAsGarbage();
-		return false;
-	}
-
-	const float LandscapeScaleZ = Landscape->GetActorScale3D().Z;
-	const float LandscapeOriginZ = Landscape->GetActorLocation().Z;
-	const FVector2f TexelWorldSize(
-		(ExtX * 2.0f) / TexSizeX,
-		(ExtY * 2.0f) / TexSizeY);
-
-	FTextureRenderTargetResource* R_RGBA = TempRT->GameThread_GetRenderTargetResource();
-	FTextureRenderTargetResource* R_Out = OutNormalHeightRT->GameThread_GetRenderTargetResource();
-
-	ENQUEUE_RENDER_COMMAND(LandscapeRGBAToNormalHeight_Static)(
-	[R_RGBA, R_Out, LandscapeScaleZ, LandscapeOriginZ, TexelWorldSize, TexSizeX, TexSizeY](FRHICommandListImmediate& RHICmdList)
-	{
-		FRDGBuilder GraphBuilder(RHICmdList);
-
-		FRDGTextureRef RDG_RGBA = RegisterExternalTexture(GraphBuilder, R_RGBA->GetRenderTargetTexture(), TEXT("LandscapeRGBA_RT"));
-		FRDGTextureRef RDG_Out = RegisterExternalTexture(GraphBuilder, R_Out->GetRenderTargetTexture(), TEXT("NormalHeight_RT"));
-
-		FIntPoint TexSize(TexSizeX, TexSizeY);
-		TShaderMapRef<FLandscapeG16ToNormalHeightCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-		auto* PassParams = GraphBuilder.AllocParameters<FLandscapeG16ToNormalHeightCS::FParameters>();
-		PassParams->T_LandscapeRGBA = GraphBuilder.CreateSRV(FRDGTextureSRVDesc(RDG_RGBA));
-		PassParams->RW_HeightmapFloat = GraphBuilder.CreateUAV(RDG_Out);
-		PassParams->LHM_LandscapeScaleZ = LandscapeScaleZ;
-		PassParams->LHM_LandscapeOriginZ = LandscapeOriginZ;
-		PassParams->LHM_TextureSize = TexSize;
-		PassParams->LHM_TexelWorldSize = TexelWorldSize;
-		PassParams->LHM_MergeByMaxZ = 0u;
-
-		FIntVector GroupCount(
-			FMath::DivideAndRoundUp(TexSize.X, 8),
-			FMath::DivideAndRoundUp(TexSize.Y, 8),
-			1);
-		FComputeShaderUtils::AddPass(
-			GraphBuilder,
-			RDG_EVENT_NAME("LandscapeG16ToNormalHeight"),
-			ERDGPassFlags::Compute,
-			CS,
-			PassParams,
-			GroupCount);
-
-		GraphBuilder.Execute();
-	});
-
-	FlushRenderingCommands();
-
-	TempRT->MarkAsGarbage();
-	return true;
-}
-
-FCSTriangleMeshData AComputeShaderMeshGenerator::CaptureLandscapeTrianglesGPU(int32 TextureSize)
-{
-	FCSTriangleMeshData Result;
-
-	const FBox Box = GetGeneratorBoundsWorldBox();
-	if (!Box.IsValid) return Result;
-
-	UWorld* World = GetWorld();
-	if (!World) return Result;
-
-	const FVector Center = Box.GetCenter();
-	const FVector Extent = Box.GetExtent();
-	const float CaptureExtent = FMath::Max(Extent.X, Extent.Y);
-	TextureSize = FMath::Clamp(TextureSize, 4, 2048);
-
-	TArray<ALandscape*> Landscapes;
-	for (TActorIterator<ALandscape> It(World); It; ++It)
-	{
-		if (IsValid(*It))
-			Landscapes.Add(*It);
-	}
-	if (Landscapes.IsEmpty()) return Result;
-
-	ALandscape* Landscape = Landscapes[0];
-
-	UTextureRenderTarget2D* TempRT = NewObject<UTextureRenderTarget2D>(GetTransientPackage());
-	TempRT->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
-	TempRT->bCanCreateUAV = false;
-	TempRT->ClearColor = FLinearColor(0.5f, 0, 0, 0);
-	TempRT->InitAutoFormat(TextureSize, TextureSize);
-	TempRT->UpdateResourceImmediate(true);
-
-	FTransform AreaTransform(FQuat::Identity, Center, FVector::OneVector);
-	FBox2D AreaExtents(FVector2D(-CaptureExtent, -CaptureExtent), FVector2D(CaptureExtent, CaptureExtent));
-
-	if (!Landscape->RenderHeightmap(AreaTransform, AreaExtents, TempRT))
-	{
-		TempRT->MarkAsGarbage();
-		return Result;
-	}
-
-	const float LandscapeScaleZ = Landscape->GetActorScale3D().Z;
-	const float LandscapeOriginZ = Landscape->GetActorLocation().Z;
-	const FVector2f TexelWorldSize(
-		(CaptureExtent * 2.0f) / TextureSize,
-		(CaptureExtent * 2.0f) / TextureSize);
-	const FVector2f WorldOriginXY(
-		float(Center.X - CaptureExtent),
-		float(Center.Y - CaptureExtent));
-
-	const int32 GridCells = TextureSize - 1;
-	const int32 TotalVerts = GridCells * GridCells * 6;
-	const uint32 ReadbackBytes = uint32(int64(TotalVerts) * sizeof(FVector4f));
-
-	FTextureRenderTargetResource* R_RGBA = TempRT->GameThread_GetRenderTargetResource();
-
-	FRHIGPUBufferReadback* VertReadback = new FRHIGPUBufferReadback(TEXT("LandscapeTriangles_VertReadback"));
-	bool bRenderWorkQueued = false;
-
-	ENQUEUE_RENDER_COMMAND(LandscapeToTriangles)(
-	[R_RGBA, LandscapeScaleZ, LandscapeOriginZ, TexelWorldSize, WorldOriginXY,
-	 TextureSize, GridCells, TotalVerts, ReadbackBytes, VertReadback,
-	 &bRenderWorkQueued](FRHICommandListImmediate& RHICmdList)
-	{
-		FRDGBuilder GraphBuilder(RHICmdList);
-
-		FRDGTextureRef RDG_RGBA = RegisterExternalTexture(
-			GraphBuilder, R_RGBA->GetRenderTargetTexture(), TEXT("LandscapeRGBA_Tri"));
-
-		FRDGBufferRef TriBuffer = GraphBuilder.CreateBuffer(
-			FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), TotalVerts),
-			TEXT("LandscapeTriVerts"));
-
-		TShaderMapRef<FLandscapeHeightmapToTrianglesCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-		auto* Params = GraphBuilder.AllocParameters<FLandscapeHeightmapToTrianglesCS::FParameters>();
-		Params->T_LandscapeRGBA = GraphBuilder.CreateSRV(FRDGTextureSRVDesc(RDG_RGBA));
-		Params->RW_TriangleVerts = GraphBuilder.CreateUAV(TriBuffer);
-		Params->LHM_LandscapeScaleZ = LandscapeScaleZ;
-		Params->LHM_LandscapeOriginZ = LandscapeOriginZ;
-		Params->LHM_TextureSize = FIntPoint(TextureSize, TextureSize);
-		Params->LHM_WorldOriginXY = WorldOriginXY;
-		Params->LHM_TexelWorldSize = TexelWorldSize;
-
-		FIntVector GroupCount(
-			FMath::DivideAndRoundUp(GridCells, 8),
-			FMath::DivideAndRoundUp(GridCells, 8),
-			1);
-		FComputeShaderUtils::AddPass(
-			GraphBuilder, RDG_EVENT_NAME("LandscapeHeightmapToTriangles"),
-			ERDGPassFlags::Compute, CS, Params, GroupCount);
-
-		AddEnqueueCopyPass(GraphBuilder, VertReadback, TriBuffer, ReadbackBytes);
-
-		GraphBuilder.Execute();
-		bRenderWorkQueued = true;
-	});
-
-	FlushRenderingCommands();
-
-	if (bRenderWorkQueued)
-	{
-		ENQUEUE_RENDER_COMMAND(LandscapeTrianglesReadback)(
-		[VertReadback, ReadbackBytes, TotalVerts, &Result](FRHICommandListImmediate& RHICmdList)
-		{
-			if (!VertReadback->IsReady())
-				RHICmdList.SubmitAndBlockUntilGPUIdle();
-
-			if (VertReadback->IsReady() && VertReadback->GetGPUSizeBytes() >= ReadbackBytes)
-			{
-				if (const FVector4f* SrcData = static_cast<const FVector4f*>(VertReadback->Lock(ReadbackBytes)))
-				{
-					Result.Vertices.SetNumUninitialized(TotalVerts);
-					for (int32 i = 0; i < TotalVerts; ++i)
-						Result.Vertices[i] = FVector(SrcData[i].X, SrcData[i].Y, SrcData[i].Z);
-					Result.VertexCount = TotalVerts;
-					VertReadback->Unlock();
-				}
-			}
-			delete VertReadback;
-		});
-		FlushRenderingCommands();
-	}
-	else
-	{
-		delete VertReadback;
-	}
-
-	TempRT->MarkAsGarbage();
-
-	UE_LOG(LogTemp, Log, TEXT("[CaptureLandscapeTrianglesGPU] %d verts (%d tris), TexSize=%d, Center=(%.0f,%.0f) Extent=%.0f"),
-		Result.VertexCount, Result.VertexCount / 3, TextureSize, Center.X, Center.Y, CaptureExtent);
-	return Result;
 }

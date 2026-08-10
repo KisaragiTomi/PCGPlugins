@@ -8,9 +8,8 @@ class UDynamicMesh;
 // Shared CS-triangle -> UDynamicMesh builder
 //
 // Single source of truth for turning CPU-side CS triangle data (triangle soup or
-// indexed) into a UDynamicMesh. This logic used to be duplicated verbatim as a
-// file-local copy in both ComputeShaderMeshGenerator.cpp and GeometryGenerate.cpp;
-// both now call this one exported implementation.
+// indexed) into a UDynamicMesh. Callers: ComputeShaderMeshGenerator.cpp and
+// GeometryGenerate.cpp.
 // -----------------------------------------------------------------------------
 namespace CSMeshBuild
 {

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "ComputeShaderGenerateHepler.h"
+#include "ComputeShaderGenerateHelper.h"
 #include "MeshGeneratorBrushCache.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Components/BoxComponent.h"

@@ -5,7 +5,7 @@
 #include "RenderGraphUtils.h"
 #include "GlobalShader.h"
 #include "ShaderParameterStruct.h"
-#include "ComputeShaderGenerateHepler.h"
+#include "ComputeShaderGenerateHelper.h"
 
 #ifndef NUM_THREADS_PER_GROUP_DIMENSION_Z
 #define NUM_THREADS_PER_GROUP_DIMENSION_Z 1

@@ -12,7 +12,7 @@
 #include "RenderGraphBuilder.h"
 #include "RHIGPUReadback.h"
 #include "RenderTargetPool.h"
-#include "ComputeShaderGenerateHepler.h"
+#include "ComputeShaderGenerateHelper.h"
 #include "EngineUtils.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/StaticMesh.h"
@@ -131,7 +131,7 @@ void UCSAssetProcess::CalculateMeshHeight(AStaticMeshActor* InMeshActor,  UTextu
 			FGeneralFunctionShader::FParameters* PassParameters = GraphBuilder.AllocParameters<FGeneralFunctionShader::FParameters>();
 			auto GroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(NewTextureTarget->GetSizeXY().X, NewTextureTarget->GetSizeXY().Y, 1), FComputeShaderUtils::kGolden2DGroupSize);
 			
-			FRDGTextureRef TmpTexture_ProcssTexture = CSHepler::ConvertToUVATexture(NewTextureTarget, GraphBuilder);
+			FRDGTextureRef TmpTexture_ProcssTexture = CSHelper::ConvertToUVATexture(NewTextureTarget, GraphBuilder);
 			FRDGTextureRef ProcssTexture = RegisterExternalTexture(GraphBuilder, NewTextureTarget->GetRenderTargetTexture(), TEXT("Input_RT"));
 			
 			PassParameters->T_ProcssTexture0 = ProcssTexture;

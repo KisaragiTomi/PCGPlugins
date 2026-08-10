@@ -1,7 +1,7 @@
 #include "ComputeShaderSceneCapture.h"
 
 #include "ClearQuad.h"
-#include "ComputeShaderGenerateHepler.h"
+#include "ComputeShaderGenerateHelper.h"
 #include "GlobalShader.h"
 #include "MaterialShader.h"
 #include "ShaderParameterStruct.h"
@@ -9,7 +9,6 @@
 #include "RenderGraphUtils.h"
 #include "RenderGraphBuilder.h"
 #include "RenderTargetPool.h"
-#include "ComputeShaderGenerateHepler.h"
 #include "EngineUtils.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/StaticMeshActor.h"

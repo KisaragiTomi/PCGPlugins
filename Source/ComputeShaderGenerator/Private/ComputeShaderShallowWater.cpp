@@ -1,5 +1,5 @@
 #include "ComputeShaderShallowWater.h"
-#include "ComputeShaderGenerateHepler.h"
+#include "ComputeShaderGenerateHelper.h"
 #include "EngineUtils.h"
 #include "Engine/StaticMesh.h"
 #include "GlobalShader.h"
@@ -188,7 +188,7 @@ int32 ComputeDispatchExpandPixels(int32 Iteration, int32 TextureResolution)
 }
 
 
-using namespace CSHepler;
+using namespace CSHelper;
 ACSShallowWaterCapture::ACSShallowWaterCapture(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {

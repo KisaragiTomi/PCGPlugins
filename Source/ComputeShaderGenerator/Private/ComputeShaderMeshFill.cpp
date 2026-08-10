@@ -2,7 +2,8 @@
 
 #include "ClearQuad.h"
 #include "ComputeShaderBasicFunction.h"
-#include "ComputeShaderGenerateHepler.h"
+#include "ComputeShaderGenerateHelper.h"
+#include "CSRangeGeneratorActor.h"
 #include "GlobalShader.h"
 #include "MaterialShader.h"
 
@@ -10,7 +11,6 @@
 #include "RenderGraphUtils.h"
 #include "RenderGraphBuilder.h"
 #include "RenderTargetPool.h"
-#include "ComputeShaderGenerateHepler.h"
 #include "EngineUtils.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/StaticMesh.h"
@@ -35,7 +35,7 @@ DECLARE_CYCLE_STAT(TEXT("CS Tatal"), STAT_CSGenerate_Tatal, STATGROUP_CSGenerate
 /// </summary>
 ///
 
-using namespace CSHepler;
+using namespace CSHelper;
 using namespace UE::Geometry;
 
 

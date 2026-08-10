@@ -19,7 +19,7 @@
 #include "RHIGPUReadback.h"
 #include "ShaderParameterStruct.h"
 #include "ComputeShaderBasicFunction.h"
-#include "ComputeShaderGenerateHepler.h"
+#include "ComputeShaderGenerateHelper.h"
 #include "Engine/Level.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
@@ -31,7 +31,6 @@
 #include "GeometryScript/MeshPrimitiveFunctions.h"
 #include "GeometryGeneral.h"
 #include "DynamicMesh/MeshTransforms.h"
-#include "ComputeShaderGenerateHepler.h"
 #include "GlobalShader.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
@@ -2251,16 +2250,6 @@ static bool BuildVineTargetBucketBuffers(
 	return true;
 }
 
-// ============================================================================
-// CPU 接力：在 GPU 跑完 N/A/P/FP 之后，由 CPU 执行 RS/B/FT/C 四个 pass。
-// 全部用 float（FVector3f/4f）以与 shader 行为对齐。逻辑逐 pass 对照 VVVoxel.usf。
-// ============================================================================
-
-// 方式 A 截断函数：GPU 只跑 N→A→P→FP（voxel 依赖段），回读 noised + FP 投影后的
-// surface target/normal，供 CPU 接力执行 RS/B/FT/C。不创建顶点/UV/索引缓冲。
-
-// GPU dispatch for voxel-based vine visualization.
-// Surface projection samples FCSSurfaceVoxelData on the GPU.
 // Trip A: merge the per-source GPU SC outputs into one contiguous VisVine batch on
 // the GPU (no CPU round-trip). Point positions (.w = final scale) and CurveU are
 // copied verbatim into each source's destination slice; PathPointMeta (Prev/Next/
@@ -2309,9 +2298,9 @@ static bool ConcatenateVineSCGPUBuffers(const TArray<TSharedPtr<FVineSCGPUBuffer
 		{
 			FRDGBuilder GraphBuilder(RHICmdList);
 
-			CSHepler::FRDGStructuredBufferRefs DstPoints = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), TotalPoints, TEXT("VineConcat.PathPoints"), true, true);
-			CSHepler::FRDGStructuredBufferRefs DstMeta = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FIntVector4), TotalPoints, TEXT("VineConcat.PathPointMeta"), true, true);
-			CSHepler::FRDGStructuredBufferRefs DstSeg = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FIntVector4), TotalSegments, TEXT("VineConcat.SegmentMeta"), true, true);
+			CSHelper::FRDGStructuredBufferRefs DstPoints = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), TotalPoints, TEXT("VineConcat.PathPoints"), true, true);
+			CSHelper::FRDGStructuredBufferRefs DstMeta = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FIntVector4), TotalPoints, TEXT("VineConcat.PathPointMeta"), true, true);
+			CSHelper::FRDGStructuredBufferRefs DstSeg = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FIntVector4), TotalSegments, TEXT("VineConcat.SegmentMeta"), true, true);
 
 			TShaderMapRef<FConcatOffsetInt4CS> ConcatShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 
@@ -2445,15 +2434,12 @@ struct FVineMeshPassInputs
 };
 
 // Outputs: the three transient mesh buffers are created by the caller (so the readback
-// copies can stay caller-side); their UAVs are bound here. GeometrySurfaceTargetBufferPtr
-// receives the final surface-target RDG buffer so the caller can keep its SurfaceTarget
-// readback copy in its original position among the four copies.
+// copies can stay caller-side); their UAVs are bound here.
 struct FVineMeshPassOutputs
 {
 	FRDGBufferUAVRef OutVerticesUAV = nullptr;
 	FRDGBufferUAVRef OutUVsUAV = nullptr;
 	FRDGBufferUAVRef OutIndicesUAV = nullptr;
-	FRDGBufferRef* GeometrySurfaceTargetBufferPtr = nullptr;
 	FRDGBufferRef* DebugCenterSourceBufferPtr = nullptr;
 	FRDGBufferRef* SegmentMetaBufferPtr = nullptr;
 
@@ -2525,15 +2511,15 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	const uint32 SafeNoiseIterations = In.SafeNoiseIterations;
 	const EVisVineGPUDebugStage DebugStage = In.DebugStage;
 
-	CSHepler::FRDGStructuredBufferRefs PathPointBuffer;
-	CSHepler::FRDGStructuredBufferRefs PathPointAxisBuffer;
-	CSHepler::FRDGStructuredBufferRefs PathPointMetaBuffer;
-	CSHepler::FRDGStructuredBufferRefs SegmentMetaBuffer;
+	CSHelper::FRDGStructuredBufferRefs PathPointBuffer;
+	CSHelper::FRDGStructuredBufferRefs PathPointAxisBuffer;
+	CSHelper::FRDGStructuredBufferRefs PathPointMetaBuffer;
+	CSHelper::FRDGStructuredBufferRefs SegmentMetaBuffer;
 	if (bUseGPULines)
 	{
 		auto RegisterSRVOnly = [&GraphBuilder](const TRefCountPtr<FRDGPooledBuffer>& Pooled, const TCHAR* Name)
 		{
-			CSHepler::FRDGStructuredBufferRefs Refs;
+			CSHelper::FRDGStructuredBufferRefs Refs;
 			Refs.Buffer = GraphBuilder.RegisterExternalBuffer(Pooled, Name);
 			Refs.SRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Refs.Buffer));
 			return Refs;
@@ -2542,23 +2528,23 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 		PathPointMetaBuffer = RegisterSRVOnly(GPULineMeta, TEXT("VVVoxel.PathPointMeta.GPU"));
 		SegmentMetaBuffer = RegisterSRVOnly(GPULineSeg, TEXT("VVVoxel.SegmentMeta.GPU"));
 		// The GPU SC path carries no per-point axis; zero-fill (matches BuildVVGPUInput's empty axes).
-		PathPointAxisBuffer = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointAxes.Zero"), true, true);
+		PathPointAxisBuffer = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointAxes.Zero"), true, true);
 		AddClearUAVPass(GraphBuilder, PathPointAxisBuffer.UAV, 0u);
 	}
 	else
 	{
-		PathPointBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, PathPoints, TEXT("VVVoxel.PathPoints"));
-		PathPointAxisBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, PathPointAxes, TEXT("VVVoxel.PathPointAxes"));
-		PathPointMetaBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, PathPointMeta, TEXT("VVVoxel.PathPointMeta"));
-		SegmentMetaBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, SegmentMeta, TEXT("VVVoxel.SegmentMeta"));
+		PathPointBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, PathPoints, TEXT("VVVoxel.PathPoints"));
+		PathPointAxisBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, PathPointAxes, TEXT("VVVoxel.PathPointAxes"));
+		PathPointMetaBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, PathPointMeta, TEXT("VVVoxel.PathPointMeta"));
+		SegmentMetaBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, SegmentMeta, TEXT("VVVoxel.SegmentMeta"));
 	}
 	if (Out.SegmentMetaBufferPtr) *Out.SegmentMetaBufferPtr = SegmentMetaBuffer.Buffer;
 	// Trip B: register the GPU-resident producer voxel buffers + rebuild the vine hash
 	// on the GPU (no readback/re-upload); otherwise upload the CPU arrays as before.
-	CSHepler::FRDGStructuredBufferRefs VoxelCellsBuffer;
-	CSHepler::FRDGStructuredBufferRefs VoxelHashSlotsBuffer;
-	CSHepler::FRDGStructuredBufferRefs VoxelNormalsBuffer;
-	CSHepler::FRDGStructuredBufferRefs VoxelTargetPositionsBuffer;
+	CSHelper::FRDGStructuredBufferRefs VoxelCellsBuffer;
+	CSHelper::FRDGStructuredBufferRefs VoxelHashSlotsBuffer;
+	CSHelper::FRDGStructuredBufferRefs VoxelNormalsBuffer;
+	CSHelper::FRDGStructuredBufferRefs VoxelTargetPositionsBuffer;
 	if (bUseGPUVoxels)
 	{
 		// The producer's voxel buffers are typed (vertex-buffer) pooled buffers, but the
@@ -2568,14 +2554,14 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 		auto RegVox = [&GraphBuilder, VoxCopyCount](const TRefCountPtr<FRDGPooledBuffer>& Pooled, uint32 BytesPerElem, const TCHAR* Name)
 		{
 			FRDGBufferRef Src = GraphBuilder.RegisterExternalBuffer(Pooled, Name);
-			CSHepler::FRDGStructuredBufferRefs Dst = CSHepler::CreateStructuredBuffer(GraphBuilder, BytesPerElem, VoxCopyCount, Name, false, true);
+			CSHelper::FRDGStructuredBufferRefs Dst = CSHelper::CreateStructuredBuffer(GraphBuilder, BytesPerElem, VoxCopyCount, Name, false, true);
 			AddCopyBufferPass(GraphBuilder, Dst.Buffer, 0, Src, 0, uint64(BytesPerElem) * VoxCopyCount);
 			return Dst;
 		};
 		VoxelCellsBuffer = RegVox(GPUVoxCells, sizeof(FIntVector4), TEXT("VVVoxel.VoxelCells.GPU"));
 		VoxelNormalsBuffer = RegVox(GPUVoxNormals, sizeof(FVector4f), TEXT("VVVoxel.VoxelNormals.GPU"));
 		VoxelTargetPositionsBuffer = RegVox(GPUVoxTargets, sizeof(FVector4f), TEXT("VVVoxel.VoxelTargetPositions.GPU"));
-		VoxelHashSlotsBuffer = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(uint32), GpuVoxelHashSlotCountPow2, TEXT("VVVoxel.VoxelHashSlots.GPU"), true, true);
+		VoxelHashSlotsBuffer = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(uint32), GpuVoxelHashSlotCountPow2, TEXT("VVVoxel.VoxelHashSlots.GPU"), true, true);
 		AddClearUAVPass(GraphBuilder, VoxelHashSlotsBuffer.UAV, 0u);
 		{
 			FVVBuildVoxelHashCS::FParameters* HP = GraphBuilder.AllocParameters<FVVBuildVoxelHashCS::FParameters>();
@@ -2589,25 +2575,25 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	}
 	else
 	{
-		VoxelCellsBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, GPUVoxelCells, TEXT("VVVoxel.VoxelCells"));
-		VoxelHashSlotsBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, GPUVoxelHashSlots, TEXT("VVVoxel.VoxelHashSlots"));
-		VoxelNormalsBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, GPUVoxelNormals, TEXT("VVVoxel.VoxelNormals"));
-		VoxelTargetPositionsBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, GPUVoxelTargetPositions, TEXT("VVVoxel.VoxelTargetPositions"));
+		VoxelCellsBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, GPUVoxelCells, TEXT("VVVoxel.VoxelCells"));
+		VoxelHashSlotsBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, GPUVoxelHashSlots, TEXT("VVVoxel.VoxelHashSlots"));
+		VoxelNormalsBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, GPUVoxelNormals, TEXT("VVVoxel.VoxelNormals"));
+		VoxelTargetPositionsBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, GPUVoxelTargetPositions, TEXT("VVVoxel.VoxelTargetPositions"));
 	}
-	const CSHepler::FRDGStructuredBufferRefs TargetBucketRangesBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, TargetBuckets.Ranges, TEXT("VVVoxel.TargetBucketRanges"));
-	const CSHepler::FRDGStructuredBufferRefs TargetBucketRangeCountsBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, TargetBuckets.RangeCounts, TEXT("VVVoxel.TargetBucketRangeCounts"));
-	const CSHepler::FRDGStructuredBufferRefs TargetBucketVoxelIndicesBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, TargetBuckets.VoxelIndices, TEXT("VVVoxel.TargetBucketVoxelIndices"));
-	const CSHepler::FRDGStructuredBufferRefs TargetBucketHashSlotsBuffer = CSHepler::CreateUploadedStructuredBuffer(GraphBuilder, TargetBuckets.HashSlots, TEXT("VVVoxel.TargetBucketHashSlots"));
-	CSHepler::FRDGStructuredBufferRefs PathPointTangentA = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointTangentsA"), true, true);
-	CSHepler::FRDGStructuredBufferRefs PathPointNormalA = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointNormalsA"), true, true);
-	CSHepler::FRDGStructuredBufferRefs PathPointFrameNormalA = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointFrameNormalsA"), true, true);
-	CSHepler::FRDGStructuredBufferRefs PathPointSurfaceTargetA = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointSurfaceTargetsA"), true, true);
-	CSHepler::FRDGStructuredBufferRefs PathPointSurfaceNormalA = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointSurfaceNormalsA"), true, true);
-	CSHepler::FRDGStructuredBufferRefs PathPointSurfaceTargetB = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointSurfaceTargetsB"), true, true);
-	CSHepler::FRDGStructuredBufferRefs PathPointSurfaceNormalB = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointSurfaceNormalsB"), true, true);
+	const CSHelper::FRDGStructuredBufferRefs TargetBucketRangesBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, TargetBuckets.Ranges, TEXT("VVVoxel.TargetBucketRanges"));
+	const CSHelper::FRDGStructuredBufferRefs TargetBucketRangeCountsBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, TargetBuckets.RangeCounts, TEXT("VVVoxel.TargetBucketRangeCounts"));
+	const CSHelper::FRDGStructuredBufferRefs TargetBucketVoxelIndicesBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, TargetBuckets.VoxelIndices, TEXT("VVVoxel.TargetBucketVoxelIndices"));
+	const CSHelper::FRDGStructuredBufferRefs TargetBucketHashSlotsBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, TargetBuckets.HashSlots, TEXT("VVVoxel.TargetBucketHashSlots"));
+	CSHelper::FRDGStructuredBufferRefs PathPointTangentA = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointTangentsA"), true, true);
+	CSHelper::FRDGStructuredBufferRefs PathPointNormalA = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointNormalsA"), true, true);
+	CSHelper::FRDGStructuredBufferRefs PathPointFrameNormalA = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointFrameNormalsA"), true, true);
+	CSHelper::FRDGStructuredBufferRefs PathPointSurfaceTargetA = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointSurfaceTargetsA"), true, true);
+	CSHelper::FRDGStructuredBufferRefs PathPointSurfaceNormalA = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointSurfaceNormalsA"), true, true);
+	CSHelper::FRDGStructuredBufferRefs PathPointSurfaceTargetB = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointSurfaceTargetsB"), true, true);
+	CSHelper::FRDGStructuredBufferRefs PathPointSurfaceNormalB = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointSurfaceNormalsB"), true, true);
 
 	// GPU noise loop output (voxel projection + CurlNoise). Downstream passes read this as the geometry source.
-	CSHepler::FRDGStructuredBufferRefs PathPointNoisedBuffer = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointsNoised"), true, true);
+	CSHelper::FRDGStructuredBufferRefs PathPointNoisedBuffer = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointsNoised"), true, true);
 
 	TShaderMapRef<FVVVoxelNoiseCS> NoiseShader(GetGlobalShaderMap(FeatureLevel));
 	FVVVoxelNoiseCS::FParameters* NoiseParameters = GraphBuilder.AllocParameters<FVVVoxelNoiseCS::FParameters>();
@@ -2745,10 +2731,10 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	// uniform arc-length spacing first (B -> A), so the path smoothing ping-pong below
 	// refines evenly-spaced points. Endpoints stay anchored. Read/Write pointers track the
 	// latest buffer; each pass swaps them so downstream always reads the freshest result.
-	CSHepler::FRDGStructuredBufferRefs* ReadSurfaceTarget = &PathPointSurfaceTargetB;
-	CSHepler::FRDGStructuredBufferRefs* ReadSurfaceNormal = &PathPointSurfaceNormalB;
-	CSHepler::FRDGStructuredBufferRefs* WriteSurfaceTarget = &PathPointSurfaceTargetA;
-	CSHepler::FRDGStructuredBufferRefs* WriteSurfaceNormal = &PathPointSurfaceNormalA;
+	CSHelper::FRDGStructuredBufferRefs* ReadSurfaceTarget = &PathPointSurfaceTargetB;
+	CSHelper::FRDGStructuredBufferRefs* ReadSurfaceNormal = &PathPointSurfaceNormalB;
+	CSHelper::FRDGStructuredBufferRefs* WriteSurfaceTarget = &PathPointSurfaceTargetA;
+	CSHelper::FRDGStructuredBufferRefs* WriteSurfaceNormal = &PathPointSurfaceNormalA;
 	if (bResampleSurface)
 	{
 		TShaderMapRef<FVVVoxelResampleSurfaceCS> ResampleSurfaceShader(GetGlobalShaderMap(FeatureLevel));
@@ -2814,8 +2800,8 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	}
 
 	// After resample + smoothing ping-pong, Read* points to the final geometry buffers.
-	const CSHepler::FRDGStructuredBufferRefs* GeometrySurfaceTargetBuffer = ReadSurfaceTarget;
-	const CSHepler::FRDGStructuredBufferRefs* GeometrySurfaceNormalBuffer = ReadSurfaceNormal;
+	const CSHelper::FRDGStructuredBufferRefs* GeometrySurfaceTargetBuffer = ReadSurfaceTarget;
+	const CSHelper::FRDGStructuredBufferRefs* GeometrySurfaceNormalBuffer = ReadSurfaceNormal;
 
 	// B stage center line is the smoothed geometry target.
 	if (Out.DebugCenterSourceBufferPtr && DebugStage == EVisVineGPUDebugStage::Smooth) *Out.DebugCenterSourceBufferPtr = GeometrySurfaceTargetBuffer->Buffer;
@@ -2843,8 +2829,8 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 		});
 
 	// Parallel-transport frame output (A buffers) is the final axis frame used for mesh build.
-	CSHepler::FRDGStructuredBufferRefs& FinalTangentsForBuild = PathPointTangentA;
-	CSHepler::FRDGStructuredBufferRefs& FinalFrameNormalsForBuild = PathPointFrameNormalA;
+	CSHelper::FRDGStructuredBufferRefs& FinalTangentsForBuild = PathPointTangentA;
+	CSHelper::FRDGStructuredBufferRefs& FinalFrameNormalsForBuild = PathPointFrameNormalA;
 
 	FVVVoxelCS::FPermutationDomain PermVec;
 	PermVec.Set<FVVVoxelCS::FBaseStreams>(Out.bBaseStreams);
@@ -2949,10 +2935,10 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 			FRDGBufferSRVRef VineUVPositionSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(PositionBuffer, PF_R32_FLOAT));
 
 			// Graph-lifetime scratch: one entry per output point.
-			CSHepler::FRDGStructuredBufferRefs VineUVCenters = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), VineUVPointCount, TEXT("VineUV.Centers"), true, true);
-			CSHepler::FRDGStructuredBufferRefs VineUVRingCirc = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(float), VineUVPointCount, TEXT("VineUV.RingCirc"), true, true);
-			CSHepler::FRDGStructuredBufferRefs VineUVSegLen = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(float), VineUVPointCount, TEXT("VineUV.SegLen"), true, true);
-			CSHepler::FRDGStructuredBufferRefs VineUVCurveV = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(float), VineUVPointCount, TEXT("VineUV.CurveV"), true, true);
+			CSHelper::FRDGStructuredBufferRefs VineUVCenters = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), VineUVPointCount, TEXT("VineUV.Centers"), true, true);
+			CSHelper::FRDGStructuredBufferRefs VineUVRingCirc = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(float), VineUVPointCount, TEXT("VineUV.RingCirc"), true, true);
+			CSHelper::FRDGStructuredBufferRefs VineUVSegLen = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(float), VineUVPointCount, TEXT("VineUV.SegLen"), true, true);
+			CSHelper::FRDGStructuredBufferRefs VineUVCurveV = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(float), VineUVPointCount, TEXT("VineUV.CurveV"), true, true);
 
 			// V1: ring center + circumference for every output point.
 			{
@@ -3004,9 +2990,6 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 			}
 		}
 	}
-
-	// Publish the final surface-target buffer for the caller-side SurfaceTarget readback copy.
-	if (Out.GeometrySurfaceTargetBufferPtr) *Out.GeometrySurfaceTargetBufferPtr = GeometrySurfaceTargetBuffer->Buffer;
 }
 
 // Shared CPU-prep for the vine mesh pass graph: repacks the surface voxels into GPU-upload
@@ -3336,7 +3319,6 @@ static bool DispatchVVGPU_Voxel(
 	TArray<FVector4f>& OutVertices,
 	TArray<FVector2f>& OutUVs,
 	TArray<uint32>& OutIndices,
-	TArray<FVector4f>* OutSurfaceTargets = nullptr,
 	EVisVineGPUDebugStage DebugStage = EVisVineGPUDebugStage::Smooth,
 	const FVineSCGPUBuffers* GPULines = nullptr,
 	const FCSSurfaceVoxelGPUBuffers* GPUVoxels = nullptr)
@@ -3378,8 +3360,7 @@ static bool DispatchVVGPU_Voxel(
 	const uint64 VertexReadbackBytes64 = uint64(OutputVertexCount) * sizeof(FVector4f);
 	const uint64 UVReadbackBytes64 = uint64(OutputVertexCount) * sizeof(FVector2f);
 	const uint64 IndexReadbackBytes64 = uint64(OutputIndexCount) * sizeof(uint32);
-	const uint64 SurfaceTargetReadbackBytes64 = uint64(PathPointCount) * sizeof(FVector4f);
-	if (VertexReadbackBytes64 > MAX_uint32 || UVReadbackBytes64 > MAX_uint32 || IndexReadbackBytes64 > MAX_uint32 || SurfaceTargetReadbackBytes64 > MAX_uint32)
+	if (VertexReadbackBytes64 > MAX_uint32 || UVReadbackBytes64 > MAX_uint32 || IndexReadbackBytes64 > MAX_uint32)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU_Voxel] Output is too large for readback. Vertices=%u Indices=%u"), OutputVertexCount, OutputIndexCount);
 		return false;
@@ -3388,17 +3369,15 @@ static bool DispatchVVGPU_Voxel(
 	const uint32 VertexReadbackBytes = uint32(VertexReadbackBytes64);
 	const uint32 UVReadbackBytes = uint32(UVReadbackBytes64);
 	const uint32 IndexReadbackBytes = uint32(IndexReadbackBytes64);
-	const uint32 SurfaceTargetReadbackBytes = uint32(SurfaceTargetReadbackBytes64);
 	FRHIGPUBufferReadback* VertexReadback = new FRHIGPUBufferReadback(TEXT("VVVoxel_VertexReadback"));
 	FRHIGPUBufferReadback* UVReadback = new FRHIGPUBufferReadback(TEXT("VVVoxel_UVReadback"));
 	FRHIGPUBufferReadback* IndexReadback = new FRHIGPUBufferReadback(TEXT("VVVoxel_IndexReadback"));
-	FRHIGPUBufferReadback* SurfaceTargetReadback = new FRHIGPUBufferReadback(TEXT("VVVoxel_SurfaceTargetReadback"));
 	bool bRenderWorkQueued = false;
 
 	const double EnqueueAndFlushStartSeconds = FPlatformTime::Seconds();
 	ENQUEUE_RENDER_COMMAND(VVVoxelGPU)(
-		[Bundle, VertexReadback, UVReadback, IndexReadback, SurfaceTargetReadback,
-		 VertexReadbackBytes, UVReadbackBytes, IndexReadbackBytes, SurfaceTargetReadbackBytes,
+		[Bundle, VertexReadback, UVReadback, IndexReadback,
+		 VertexReadbackBytes, UVReadbackBytes, IndexReadbackBytes,
 		 OutputVertexCount, OutputIndexCount,
 		 &bRenderWorkQueued](FRHICommandListImmediate& RHICmdList)
 		{
@@ -3407,9 +3386,9 @@ static bool DispatchVVGPU_Voxel(
 			// The bundle (captured by value) owns every array the pass graph reads. Create the three
 			// transient output buffers here (caller-owned so the readback copies below can reference
 			// them), then run the shared vine-mesh pass graph fed from the bundle.
-			const CSHepler::FRDGStructuredBufferRefs OutVertexBuffer = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), OutputVertexCount, TEXT("VVVoxel.OutVertices"), true, true);
-			const CSHepler::FRDGStructuredBufferRefs OutUVBuffer = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(FVector2f), OutputVertexCount, TEXT("VVVoxel.OutUVs"), true, true);
-			const CSHepler::FRDGStructuredBufferRefs OutIndexBuffer = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(uint32), OutputIndexCount, TEXT("VVVoxel.OutIndices"), true, true);
+			const CSHelper::FRDGStructuredBufferRefs OutVertexBuffer = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), OutputVertexCount, TEXT("VVVoxel.OutVertices"), true, true);
+			const CSHelper::FRDGStructuredBufferRefs OutUVBuffer = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector2f), OutputVertexCount, TEXT("VVVoxel.OutUVs"), true, true);
+			const CSHelper::FRDGStructuredBufferRefs OutIndexBuffer = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(uint32), OutputIndexCount, TEXT("VVVoxel.OutIndices"), true, true);
 
 			// Legacy readback path: bBaseStreams stays false (default), so the shader writes the three
 			// transient StructuredBuffer UAVs below — byte-identical to before. The readback-only
@@ -3419,19 +3398,16 @@ static bool DispatchVVGPU_Voxel(
 			// plumbing explicit at the legacy dispatch (bBaseStreams=false => the V passes never run).
 			In.UVLengthScale = Bundle.UVLengthScale;
 
-			FRDGBufferRef GeometrySurfaceTargetBufferForReadback = nullptr;
 			FVineMeshPassOutputs Out;
 			Out.OutVerticesUAV = OutVertexBuffer.UAV;
 			Out.OutUVsUAV = OutUVBuffer.UAV;
 			Out.OutIndicesUAV = OutIndexBuffer.UAV;
-			Out.GeometrySurfaceTargetBufferPtr = &GeometrySurfaceTargetBufferForReadback;
 
 			AddVineMeshPasses(GraphBuilder, GMaxRHIFeatureLevel, In, Out);
 
 			AddEnqueueCopyPass(GraphBuilder, VertexReadback, OutVertexBuffer.Buffer, VertexReadbackBytes);
 			AddEnqueueCopyPass(GraphBuilder, UVReadback, OutUVBuffer.Buffer, UVReadbackBytes);
 			AddEnqueueCopyPass(GraphBuilder, IndexReadback, OutIndexBuffer.Buffer, IndexReadbackBytes);
-			AddEnqueueCopyPass(GraphBuilder, SurfaceTargetReadback, GeometrySurfaceTargetBufferForReadback, SurfaceTargetReadbackBytes);
 			GraphBuilder.Execute();
 			bRenderWorkQueued = true;
 		});
@@ -3444,29 +3420,24 @@ static bool DispatchVVGPU_Voxel(
 		delete VertexReadback;
 		delete UVReadback;
 		delete IndexReadback;
-		delete SurfaceTargetReadback;
 		return false;
 	}
 
 	OutVertices.SetNumZeroed(OutputVertexCount);
 	OutUVs.SetNumZeroed(OutputVertexCount);
 	OutIndices.SetNumZeroed(OutputIndexCount);
-	if (OutSurfaceTargets)
-	{
-		OutSurfaceTargets->SetNumZeroed(PathPointCount);
-	}
 	bool bReadbackSucceeded = false;
 
 	const double ReadbackFlushStartSeconds = FPlatformTime::Seconds();
 	ENQUEUE_RENDER_COMMAND(VVVoxelGPUReadback)(
-		[VertexReadback, UVReadback, IndexReadback, SurfaceTargetReadback, VertexReadbackBytes, UVReadbackBytes, IndexReadbackBytes, SurfaceTargetReadbackBytes, &OutVertices, &OutUVs, &OutIndices, OutSurfaceTargets, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList)
+		[VertexReadback, UVReadback, IndexReadback, VertexReadbackBytes, UVReadbackBytes, IndexReadbackBytes, &OutVertices, &OutUVs, &OutIndices, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList)
 		{
-			if (!VertexReadback || !UVReadback || !IndexReadback || !SurfaceTargetReadback)
+			if (!VertexReadback || !UVReadback || !IndexReadback)
 			{
 				return;
 			}
 
-			if (!VertexReadback->IsReady() || !UVReadback->IsReady() || !IndexReadback->IsReady() || !SurfaceTargetReadback->IsReady())
+			if (!VertexReadback->IsReady() || !UVReadback->IsReady() || !IndexReadback->IsReady())
 			{
 				RHICmdList.SubmitAndBlockUntilGPUIdle();
 			}
@@ -3502,23 +3473,9 @@ static bool DispatchVVGPU_Voxel(
 				bLockedAll = false;
 			}
 
-			if (OutSurfaceTargets)
-			{
-				if (const FVector4f* SurfaceTargetPtr = static_cast<const FVector4f*>(SurfaceTargetReadback->Lock(SurfaceTargetReadbackBytes)))
-				{
-					FMemory::Memcpy(OutSurfaceTargets->GetData(), SurfaceTargetPtr, SurfaceTargetReadbackBytes);
-					SurfaceTargetReadback->Unlock();
-				}
-				else
-				{
-					bLockedAll = false;
-				}
-			}
-
 			delete VertexReadback;
 			delete UVReadback;
 			delete IndexReadback;
-			delete SurfaceTargetReadback;
 			bReadbackSucceeded = bLockedAll;
 		});
 
@@ -3570,107 +3527,6 @@ static FVector GetVineOutputProfileCenter(
 		Center += FVector(Vertex.X, Vertex.Y, Vertex.Z);
 	}
 	return Center / double(ProfileCount);
-}
-
-static void LogVineGPUProjectionStats(
-	const TCHAR* Label,
-	const TArray<FVector4f>& PathPoints,
-	const TArray<FVector4f>& SurfaceTargets,
-	const TArray<FVector4f>& OutputVertices,
-	uint32 ProfileCount,
-	float VinesOffset)
-{
-	const int32 OutputPointCount = ProfileCount > 0u ? OutputVertices.Num() / int32(ProfileCount) : 0;
-	const int32 PointCount = FMath::Min(FMath::Min(PathPoints.Num(), SurfaceTargets.Num()), OutputPointCount);
-	if (PointCount <= 0)
-	{
-		return;
-	}
-
-	int32 HitCount = 0;
-	int32 NeighborHitCount = 0;
-	int32 LocalHitCount = 0;
-	int32 BucketHitCount = 0;
-	int32 FailCount = 0;
-	int32 UnknownModeCount = 0;
-	double ProjectionDistanceSum = 0.0;
-	double ProjectionDistanceMax = 0.0;
-	double FinalTargetDistanceSum = 0.0;
-	double FinalTargetDistanceMin = TNumericLimits<double>::Max();
-	double FinalTargetDistanceMax = 0.0;
-	double FinalOffsetErrorSum = 0.0;
-	double FinalOffsetErrorMax = 0.0;
-
-	for (int32 PointIndex = 0; PointIndex < PointCount; ++PointIndex)
-	{
-		const FVector4f& PackedTarget = SurfaceTargets[PointIndex];
-		const int32 SampleMode = FMath::RoundToInt(PackedTarget.W);
-		if (SampleMode <= 0)
-		{
-			++FailCount;
-			continue;
-		}
-
-		switch (SampleMode)
-		{
-		case 1:
-			++NeighborHitCount;
-			break;
-		case 2:
-			++LocalHitCount;
-			break;
-		case 3:
-			++BucketHitCount;
-			break;
-		default:
-			++UnknownModeCount;
-			break;
-		}
-
-		const FVector Query(PathPoints[PointIndex].X, PathPoints[PointIndex].Y, PathPoints[PointIndex].Z);
-		const FVector Target(PackedTarget.X, PackedTarget.Y, PackedTarget.Z);
-		if (!IsFiniteVineVector(Query) || !IsFiniteVineVector(Target))
-		{
-			continue;
-		}
-
-		const FVector Center = GetVineOutputProfileCenter(OutputVertices, PointIndex, ProfileCount);
-		if (!IsFiniteVineVector(Center))
-		{
-			continue;
-		}
-
-		++HitCount;
-		const double ProjectionDistance = FVector::Dist(Query, Target);
-		const double FinalTargetDistance = FVector::Dist(Center, Target);
-		const double FinalOffsetError = FMath::Abs(FinalTargetDistance - double(VinesOffset));
-		ProjectionDistanceSum += ProjectionDistance;
-		ProjectionDistanceMax = FMath::Max(ProjectionDistanceMax, ProjectionDistance);
-		FinalTargetDistanceSum += FinalTargetDistance;
-		FinalTargetDistanceMin = FMath::Min(FinalTargetDistanceMin, FinalTargetDistance);
-		FinalTargetDistanceMax = FMath::Max(FinalTargetDistanceMax, FinalTargetDistance);
-		FinalOffsetErrorSum += FinalOffsetError;
-		FinalOffsetErrorMax = FMath::Max(FinalOffsetErrorMax, FinalOffsetError);
-	}
-
-	UE_LOG(LogTemp, Display,
-		TEXT("[VisVineGPUProjectionStats] %s sampleHits=%d/%d modes(neighbor=%d local=%d bucket=%d fail=%d unknown=%d) projectionDist(avg=%.3f max=%.3f) finalToTarget(avg=%.3f min=%.3f max=%.3f expectedOffset=%.3f offsetError(avg=%.3f max=%.3f)"),
-		Label ? Label : TEXT("unknown"),
-		HitCount,
-		PointCount,
-		NeighborHitCount,
-		LocalHitCount,
-		BucketHitCount,
-		FailCount,
-		UnknownModeCount,
-		HitCount > 0 ? ProjectionDistanceSum / double(HitCount) : 0.0,
-		ProjectionDistanceMax,
-		HitCount > 0 ? FinalTargetDistanceSum / double(HitCount) : 0.0,
-		HitCount > 0 ? FinalTargetDistanceMin : 0.0,
-		FinalTargetDistanceMax,
-		VinesOffset,
-		HitCount > 0 ? FinalOffsetErrorSum / double(HitCount) : 0.0,
-		FinalOffsetErrorMax);
 }
 
 static void RecomputeVineOutputUVsFromGeneratedLength(
@@ -4107,6 +3963,14 @@ static bool ResolveVineReferenceComponent(
 AVineContainer::AVineContainer(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)	
 {
+	DynamicMeshComponent = CreateDefaultSubobject<UDynamicMeshComponent>(TEXT("DynamicMeshComponent"));
+	DynamicMeshComponent->SetupAttachment(GetRootComponent());
+	DynamicMeshComponent->bUseAttachParentBound = false;
+	DynamicMeshComponent->bNeverDistanceCull = true;
+	DynamicMeshComponent->bAllowCullDistanceVolume = false;
+	DynamicMeshComponent->SetCachedMaxDrawDistance(0.0f);
+	DynamicMeshComponent->SetBoundsScale(DynamicMeshCullBoundsScale);
+
 	UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
 	GrowTarget = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("GrowTarget"));
 	GrowTarget->SetStaticMesh(Mesh);
@@ -4141,8 +4005,42 @@ AVineContainer::AVineContainer(const FObjectInitializer& ObjectInitializer)
 void AVineContainer::OnConstruction(const FTransform& Transform)
 {
 	Super::OnConstruction(Transform);
+	RefreshDynamicMeshComponentCullingBounds();
 	// ApplyVineReferenceComponentsHiddenInGame(this);
 	// RebuildDisplayInstancesFromTransformArrays();
+}
+
+void AVineContainer::PostRegisterAllComponents()
+{
+	Super::PostRegisterAllComponents();
+	RefreshDynamicMeshComponentCullingBounds();
+}
+
+void AVineContainer::RefreshDynamicMeshComponentCullingBounds(float BoundsScale)
+{
+	UDynamicMeshComponent* MeshComponent = GetDynamicMeshComponent();
+	if (!MeshComponent) return;
+
+	const float SafeBoundsScale = FMath::Max(
+		BoundsScale > 0.0f ? BoundsScale : DynamicMeshCullBoundsScale,
+		1.0f);
+
+	// DynamicMeshComponent is attached under the actor root. If it uses the attach
+	// parent's tiny bounds, the mesh is culled when the actor/root origin leaves the
+	// view, even if the generated DynamicMesh is still visible.
+	MeshComponent->bUseAttachParentBound = false;
+	MeshComponent->bNeverDistanceCull = true;
+	MeshComponent->bAllowCullDistanceVolume = false;
+	MeshComponent->SetCachedMaxDrawDistance(0.0f);
+	MeshComponent->SetBoundsScale(SafeBoundsScale);
+
+	// Rebuild render proxy + recompute LocalBounds from the actual mesh. This fixes
+	// stale bounds after replacing or editing UDynamicMesh data through
+	// Blueprint/GeometryScript paths.
+	MeshComponent->NotifyMeshUpdated();
+	MeshComponent->UpdateBounds();
+	MeshComponent->MarkRenderTransformDirty();
+	MeshComponent->MarkRenderStateDirty();
 }
 
 void AVineContainer::RebuildDisplayInstancesFromTransformArrays()
@@ -4308,7 +4206,6 @@ bool AVineContainer::VisVineGPUInternal()
 	TArray<FVector4f> OutVertices;
 	TArray<FVector2f> OutUVs;
 	TArray<uint32> OutIndices;
-	TArray<FVector4f> SurfaceTargets;
 	const EVisVineGPUDebugStage DebugStage = SplineDebug.DebugStage;
 	const bool bWantStageDraw = SplineDebug.bDrawDebugLines && DebugStage != EVisVineGPUDebugStage::None;
 
@@ -4340,7 +4237,6 @@ bool AVineContainer::VisVineGPUInternal()
 		OutVertices,
 		OutUVs,
 		OutIndices,
-		&SurfaceTargets,
 		DebugStage,
 		&ConcatenatedGPULines,
 		LastSurfaceVoxelGPUBuffers.IsValid() ? &LastSurfaceVoxelGPUBuffers : nullptr))
@@ -4400,16 +4296,6 @@ bool AVineContainer::VisVineGPUInternal()
 			UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] GPU-resident vine leaf input was invalid; leaf not rebuilt."));
 		}
 	}
-
-	LogVineGPUProjectionStats(
-		TEXT("tube"),
-		PathPoints,
-		SurfaceTargets,
-		OutVertices,
-		uint32(FMath::Max(VV.VisVineGPUTubeSegments, 3)),
-		// VinesOffset 已在 Pass FP 写入 SurfaceTarget，扫掠中心与最终中心线应几乎重合，
-		// 故期望偏移为 0（仅余 TinyJitter）。
-		0.0f);
 
 	// The selected center-line stage is rendered directly from GPU buffers by VineGpuMesh.
 	// Clear any persistent CPU DrawDebug lines left by an older generation.

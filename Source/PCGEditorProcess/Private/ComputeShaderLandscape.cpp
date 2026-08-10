@@ -6,7 +6,7 @@
 #include "RenderGraphResources.h"
 #include "RenderGraphUtils.h"
 #include "RenderGraphBuilder.h"
-#include "ComputeShaderGenerateHepler.h"
+#include "ComputeShaderGenerateHelper.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/StaticMeshActor.h"
 #include "Kismet/KismetRenderingLibrary.h"
@@ -150,15 +150,14 @@ public:
 
 IMPLEMENT_GLOBAL_SHADER(FCSLandscape, "/Plugin/PCGPlugins/Shaders/Private/CSLandscape.usf", "CSLandscapeFunction", SF_Compute);
 
-using namespace CSHepler;
+using namespace CSHelper;
 
 ACSLandscape::ACSLandscape()
 {
 	// Reuse the inherited AComputeShaderMeshGenerator components instead of creating duplicates.
-	// SceneComponent/Box/VisMesh are kept as aliases so the existing capture code is unchanged.
+	// SceneComponent/Box are kept as aliases so the existing capture code is unchanged.
 	SceneComponent = SceneRoot;
 	Box = GeneratorBounds;
-	VisMesh = DynamicMeshComponent;
 
 	// Restore the interactive capture-box behaviour (base marks GeneratorBounds as a fixed viz component).
 	Box->SetBoxExtent(FVector(50, 50, 50));

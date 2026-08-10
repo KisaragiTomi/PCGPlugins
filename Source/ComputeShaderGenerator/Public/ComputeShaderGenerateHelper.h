@@ -14,7 +14,6 @@
 #include "Components/BoxComponent.h"
 #include "ComputeShaderSceneCapture.h"
 
-#include "ComputeShaderGenerateHepler.generated.h"
 
 // ConvertToUAVRWBuffer(GraphBuilder, TRDGB_##Name, RDGUAVB_##Name, Name, EPixelFormat::PF_A32B32G32R32F, TEXT("UAV_SourceData"));
 #define CREATE_UAVB(Format, Name) \
@@ -68,22 +67,47 @@ FRDGTextureRef RDG_##Name = RegisterExternalTexture(GraphBuilder, R_##Name->GetR
 PassParameters->T_##Name = RDG_##Name;
 
 #define CREATE_RDG_STRUCTURED_UPLOAD_SRV(Name, ElementType, ArrayData, DebugName) \
-CSHepler::FRDGStructuredBufferRefs Name##Refs = CSHepler::CreateUploadedStructuredBuffer<ElementType>(GraphBuilder, ArrayData, DebugName, false, true); \
+CSHelper::FRDGStructuredBufferRefs Name##Refs = CSHelper::CreateUploadedStructuredBuffer<ElementType>(GraphBuilder, ArrayData, DebugName, false, true); \
 FRDGBufferRef Name##Buffer = Name##Refs.Buffer; \
 FRDGBufferSRVRef Name##SRV = Name##Refs.SRV;
 
 #define CREATE_RDG_STRUCTURED_UAV_SRV(Name, ElementType, ElementCount, DebugName) \
-CSHepler::FRDGStructuredBufferRefs Name##Refs = CSHepler::CreateStructuredBuffer(GraphBuilder, sizeof(ElementType), ElementCount, DebugName, true, true); \
+CSHelper::FRDGStructuredBufferRefs Name##Refs = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(ElementType), ElementCount, DebugName, true, true); \
 FRDGBufferRef Name##Buffer = Name##Refs.Buffer; \
 FRDGBufferUAVRef Name##UAV = Name##Refs.UAV; \
 FRDGBufferSRVRef Name##SRV = Name##Refs.SRV;
 
 
+// --- Shader 声明样板宏（模块内原有 ~29 份手写副本收敛于此；变体声明保持手写） ---
+
+// SM5 门槛的 ShouldCompilePermutation。
+#define CSGEN_SHADER_PERM_SM5() \
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters) \
+	{ \
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5); \
+	}
+
+// 恒真 ShouldCompilePermutation（平台无关的工具/后处理 shader）。
+#define CSGEN_SHADER_PERM_ALWAYS() \
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters) \
+	{ \
+		return true; \
+	}
+
+// SM5 + THREADGROUPSIZE_X（一维 compute 的标准组合）。
+#define CSGEN_SHADER_PERM_SM5_GROUPSIZE_X(SizeX) \
+	CSGEN_SHADER_PERM_SM5() \
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment) \
+	{ \
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment); \
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), SizeX); \
+	}
+
 DECLARE_STATS_GROUP(TEXT("CSTest"), STATGROUP_CSTest, STATCAT_Advanced);
 
 using namespace UE::Geometry;
 
-namespace CSHepler
+namespace CSHelper
 {
 	struct FRDGStructuredBufferRefs
 	{
@@ -183,6 +207,39 @@ namespace CSHepler
 		return 4096;
 	}
 
+	// --- typed buffer "四连招"（Create→UAV→SRV→ClearUAV）收敛为一次调用 ---
+	// 清零值的重载按 0u / 0.0f 自动分派；无 SRV 需求用双 out-param 重载。
+
+	inline void CreateClearedTypedBuffer(FRDGBuilder& GraphBuilder, FRDGBufferRef& OutBuffer, FRDGBufferUAVRef& OutUAV, FRDGBufferSRVRef& OutSRV, uint32 BytesPerElement, uint32 NumElements, EPixelFormat Format, const TCHAR* Name, uint32 ClearValue)
+	{
+		OutBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(BytesPerElement, NumElements), Name);
+		OutUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OutBuffer, Format));
+		OutSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(OutBuffer, Format));
+		AddClearUAVPass(GraphBuilder, OutUAV, ClearValue);
+	}
+
+	inline void CreateClearedTypedBuffer(FRDGBuilder& GraphBuilder, FRDGBufferRef& OutBuffer, FRDGBufferUAVRef& OutUAV, FRDGBufferSRVRef& OutSRV, uint32 BytesPerElement, uint32 NumElements, EPixelFormat Format, const TCHAR* Name, float ClearValue)
+	{
+		OutBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(BytesPerElement, NumElements), Name);
+		OutUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OutBuffer, Format));
+		OutSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(OutBuffer, Format));
+		AddClearUAVPass(GraphBuilder, OutUAV, ClearValue);
+	}
+
+	inline void CreateClearedTypedBuffer(FRDGBuilder& GraphBuilder, FRDGBufferRef& OutBuffer, FRDGBufferUAVRef& OutUAV, uint32 BytesPerElement, uint32 NumElements, EPixelFormat Format, const TCHAR* Name, uint32 ClearValue)
+	{
+		OutBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(BytesPerElement, NumElements), Name);
+		OutUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OutBuffer, Format));
+		AddClearUAVPass(GraphBuilder, OutUAV, ClearValue);
+	}
+
+	inline void CreateClearedTypedBuffer(FRDGBuilder& GraphBuilder, FRDGBufferRef& OutBuffer, FRDGBufferUAVRef& OutUAV, uint32 BytesPerElement, uint32 NumElements, EPixelFormat Format, const TCHAR* Name, float ClearValue)
+	{
+		OutBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(BytesPerElement, NumElements), Name);
+		OutUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OutBuffer, Format));
+		AddClearUAVPass(GraphBuilder, OutUAV, ClearValue);
+	}
+
 	inline void CreateRWBuffer(FRDGBuilder& GraphBuilder, FRDGBufferRef& RDGBuffer, FRDGBufferUAVRef& RDGUAVBuffer, uint32 NumElements, uint32 BytesPerElement, EPixelFormat Format = PF_A16B16G16R16, const TCHAR* Name = TEXT("UAV_Buffer"))
 	{
 		if (NumElements == 0 || BytesPerElement == 0) return;
@@ -202,111 +259,3 @@ namespace CSHepler
 
 				
 }
-
-
-UCLASS()
-class COMPUTESHADERGENERATOR_API ACSInstanceContainer : public AActor
-{
-	GENERATED_BODY()
-public:
-	
-	ACSInstanceContainer(const FObjectInitializer& ObjectInitializer)
-	{
-		Instances = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("Instances"));
-	}
-	UPROPERTY(BlueprintReadWrite, Category = "CubeAttrib")
-	UInstancedStaticMeshComponent* Instances;
-};
-
-UCLASS()
-class COMPUTESHADERGENERATOR_API ACSRangeGenerator : public AActor
-{
-	GENERATED_BODY()
-public:
-	ACSRangeGenerator();
-
-	USceneComponent* SceneComponent;
-	
-	// UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader")
-	UBoxComponent* Box;
-
-	UBoxComponent* CollisionBox;
-
-	UPROPERTY(BlueprintReadWrite, Category = "ComputeShader")
-	UInstancedStaticMeshComponent* Instances;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader")
-	FIntVector DivdeCount = FIntVector(10, 10, 10);
-	
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader")
-	float CaptureSize = 1024;
-	
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader")
-	float MaxDepth = 10000;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader")
-	int32 GeneratorCount = 0;
-	
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader")
-	int32 MultGenerateCount = 0;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader")
-	bool DoGenerate = false;
-
-	
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader")
-	UStaticMesh* CollisionMesh;
-
-	UPROPERTY(BlueprintReadWrite, Category = "ComputeShader")
-	TArray<AActor*> ActorsInBox;
-
-	UPROPERTY(BlueprintReadWrite, Category = "ComputeShader")
-	TArray<FTransform> StoreCaptureTransforms;
-
-	
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader")
-	TArray<ACSGenerateCaptureScene*> CaptureSceneGenerators;
-
-	virtual void OnConstruction(const FTransform& Transform) override;
-
-	virtual void Tick(float DeltaTime) override;
-
-	virtual void GenerateInternal();
-
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	void Generate();
-
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	TArray<FTransform> GenerateTransformsCount();
-
-	virtual TArray<FTransform> GenerateTransformsInternal();
-
-
-};
-
-UCLASS()
-class COMPUTESHADERGENERATOR_API ACSBoxRangeGenerator : public ACSRangeGenerator
-{
-	GENERATED_BODY()
-public:
-	
-	ACSBoxRangeGenerator();
-
-	
-	virtual TArray<FTransform> GenerateTransformsInternal() override;
-};
-
-
-UCLASS()
-class COMPUTESHADERGENERATOR_API ACSPlaneRangeGenerator : public ACSRangeGenerator
-{
-	GENERATED_BODY()
-public:
-	
-	ACSPlaneRangeGenerator();
-
-	virtual void Tick(float DeltaTime) override;
-	
-	virtual TArray<FTransform> GenerateTransformsInternal() override;
-};
-

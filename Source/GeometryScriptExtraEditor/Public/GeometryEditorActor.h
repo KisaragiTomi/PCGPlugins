@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Components/DynamicMeshComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Curves/CurveLinearColor.h"
 #include "GeometryScript/GeometryScriptTypes.h"
@@ -214,8 +215,25 @@ class GEOMETRYSCRIPTEXTRAEDITOR_API AVineContainer : public AMeshGeneratorBrushC
 public:
 	AVineContainer(const FObjectInitializer& ObjectInitializer);
 	virtual void OnConstruction(const FTransform& Transform) override;
+	virtual void PostRegisterAllComponents() override;
 
 	// ---- References ----
+
+	// Legacy CPU vine path: the generated UDynamicMesh is rendered through this component. The
+	// generator base class (AComputeShaderMeshGenerator) intentionally owns no DynamicMeshComponent
+	// (it only returns meshes), so the vine actor keeps its own.
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GrowReference")
+	TObjectPtr<UDynamicMeshComponent> DynamicMeshComponent;
+
+	/** Returns the DynamicMeshComponent owned by this actor. */
+	UDynamicMeshComponent* GetDynamicMeshComponent() const { return DynamicMeshComponent; }
+
+	/** Updates DynamicMeshComponent culling settings after geometry or bounds-scale changes. */
+	UFUNCTION(BlueprintCallable, Category = "GrowReference")
+	void RefreshDynamicMeshComponentCullingBounds(float BoundsScale = -1.0f);
+
+	UPROPERTY(BlueprintReadOnly, Category = "GrowReference", meta = (ClampMin = "1.0"))
+	float DynamicMeshCullBoundsScale = 10.0f;
 
 	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
 	UInstancedStaticMeshComponent* GrowTarget;

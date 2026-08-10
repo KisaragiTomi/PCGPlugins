@@ -19,7 +19,8 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelCavityScanBlocks, "/Plugin/PCGPlugins/Shaders/Priv
 IMPLEMENT_GLOBAL_SHADER(FVoxelCavityScanBlockSums, "/Plugin/PCGPlugins/Shaders/Private/VoxelCavitySpan.usf", "ScanBlockSumsCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelCavityAddOffsets, "/Plugin/PCGPlugins/Shaders/Private/VoxelCavitySpan.usf", "AddOffsetsCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelCavityEmit, "/Plugin/PCGPlugins/Shaders/Private/VoxelCavitySpan.usf", "EmitCavityCS", SF_Compute);
-#include "ComputeShaderGenerateHepler.h"
+#include "ComputeShaderGenerateHelper.h"
+#include "CSRangeGeneratorActor.h"
 #include "GlobalShader.h"
 #include "MaterialShader.h"
 #include "ShaderParameterStruct.h"
@@ -27,7 +28,6 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelCavityEmit, "/Plugin/PCGPlugins/Shaders/Private/Vo
 #include "RenderGraphUtils.h"
 #include "RenderGraphBuilder.h"
 #include "RenderTargetPool.h"
-#include "ComputeShaderGenerateHepler.h"
 #include "EngineUtils.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/StaticMeshActor.h"
@@ -47,7 +47,7 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelCavityEmit, "/Plugin/PCGPlugins/Shaders/Private/Vo
 #include "SceneView.h"
 #include "GDFSampleService.h"
 
-using namespace CSHepler;
+using namespace CSHelper;
 using namespace FImageCoreUtils;
 
 DECLARE_CYCLE_STAT(TEXT("CS Execute"), STAT_CSTest_Execute, STATGROUP_CSTest)
@@ -1255,7 +1255,7 @@ void UComputeShaderBasicFunction::Test(UTexture2DArray* InArray, UTexture2D* InT
 			
 			FIntVector GroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(TestArray->GetSizeX(), TestArray->GetSizeY(), 1), 32);
 			
-			FRDGTextureRef TmpTexture_DebugView = CSHepler::ConvertToUVATexture(DebugView, GraphBuilder);
+			FRDGTextureRef TmpTexture_DebugView = CSHelper::ConvertToUVATexture(DebugView, GraphBuilder);
 			FRDGTextureRef DebugViewTexture = RegisterExternalTexture(GraphBuilder, DebugView->GetRenderTargetTexture(), TEXT("DebugView_RT"));
 			FRDGTextureRef TextureArray = RegisterExternalTexture(GraphBuilder, TestArray->GetResource()->GetTextureRHI(), TEXT("Input_TA"));
 

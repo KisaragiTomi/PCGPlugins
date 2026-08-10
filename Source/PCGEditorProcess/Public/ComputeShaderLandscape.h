@@ -104,9 +104,6 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LandscapeData|Realtime|Debug")
 	bool bShowDebugView = false;
 
-	UPROPERTY( BlueprintReadWrite, Category = "LandscapeData")
-	UDynamicMeshComponent* VisMesh;
-
 	ACSLandscape();
 
 	virtual void OnConstruction(const FTransform& Transform) override;

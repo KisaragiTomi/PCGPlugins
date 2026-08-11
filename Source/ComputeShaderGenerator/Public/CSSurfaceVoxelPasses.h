@@ -29,7 +29,10 @@ struct FCSSurfaceVoxelPassInputsImpl;
  *
  * 内部类型（FResolvedStaticMeshTriangleRequest 等）住在 ComputeShaderGenerator 的 Private
  * 头里，所以这里走 PIMPL：别的模块能持有、移动、传递这个 bundle，但看不到内部类型。
- * 只可移动不可拷贝 —— 里面是可能几十万条的三角形请求数组，拷贝一律是意外。
+ *
+ * Impl 用 TSharedPtr 而非 TUniquePtr：这个 bundle 从准备好到被 AddCSSurfaceVoxelPasses 读完
+ * 全程只读，而它要跟着 FVineBuildInput 一路传到场景代理（代理是按值持有的），沿途会被拷贝。
+ * 共享同一份 impl 既让拷贝保持合法，又避免把几十万条三角形请求真的复制一遍。
  */
 struct COMPUTESHADERGENERATOR_API FCSSurfaceVoxelPassInputs
 {
@@ -37,8 +40,8 @@ struct COMPUTESHADERGENERATOR_API FCSSurfaceVoxelPassInputs
 	~FCSSurfaceVoxelPassInputs();
 	FCSSurfaceVoxelPassInputs(FCSSurfaceVoxelPassInputs&& Other);
 	FCSSurfaceVoxelPassInputs& operator=(FCSSurfaceVoxelPassInputs&& Other);
-	FCSSurfaceVoxelPassInputs(const FCSSurfaceVoxelPassInputs&) = delete;
-	FCSSurfaceVoxelPassInputs& operator=(const FCSSurfaceVoxelPassInputs&) = delete;
+	FCSSurfaceVoxelPassInputs(const FCSSurfaceVoxelPassInputs& Other);
+	FCSSurfaceVoxelPassInputs& operator=(const FCSSurfaceVoxelPassInputs& Other);
 
 	/** 有可体素化的几何（静态网格请求或地形三角形至少有一样）且体素尺寸合法。 */
 	bool IsValid() const;
@@ -48,8 +51,11 @@ struct COMPUTESHADERGENERATOR_API FCSSurfaceVoxelPassInputs
 	/** 体素化所覆盖的世界包围盒。 */
 	FBox GetWorldBounds() const;
 	float GetVoxelSize() const;
+	/** 体素 buffer 的分配容量（= MaxVoxels）。真实数量只有 GPU 的 Counter[0] 知道，所以下游
+	 *  一律按这个容量分配、按 Counter 取用 —— 与 FCSSurfaceVoxelGPUBuffers::VoxelCapacity 同义。 */
+	uint32 GetVoxelCapacity() const;
 
-	TUniquePtr<FCSSurfaceVoxelPassInputsImpl> Impl;
+	TSharedPtr<FCSSurfaceVoxelPassInputsImpl> Impl;
 };
 
 /**

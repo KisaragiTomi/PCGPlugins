@@ -35,6 +35,7 @@
 #include "CSGpuMeshComponent.h"
 #include "CSGpuMeshTypes.h"
 #include "CSMeshBuild.h"
+#include "CSSurfaceVoxelPasses.h"
 #include "Materials/MaterialInterface.h"
 #include "MeshDescription.h"
 #include "MeshDescriptionToDynamicMesh.h"
@@ -2019,8 +2020,12 @@ FCSStaticMeshTriangleRDGOutput CSMeshGenInternal::AddResolvedStaticMeshTriangles
 		PassParameters->TriangleCapacity = TriangleCapacity;
 		PassParameters->NumTexCoords = RequestNumTexCoords;
 		PassParameters->bUseBounds = Request.WorldBounds.IsValid ? 1u : 0u;
-		PassParameters->bUseReferenceFilter = ReferencePoints.Num() > 0 ? 1u : 0u;
-		PassParameters->ReferenceFilterDistanceSq = ReferenceFilterDistance > 0.0f
+		// 距离 <= 0 表示“不按参考点剔除”，此时必须把开关也关掉。只把阈值设成 FLT_MAX 的话，
+		// shader 里那个循环仍会对每个三角形遍历全部参考点求最近距离（没有 early-out），再无条件
+		// 通过 —— 代价照付、一个不剔。开关置 0 才能让它直接 return true。
+		const bool bReferenceFilterActive = ReferencePoints.Num() > 0 && ReferenceFilterDistance > 0.0f;
+		PassParameters->bUseReferenceFilter = bReferenceFilterActive ? 1u : 0u;
+		PassParameters->ReferenceFilterDistanceSq = bReferenceFilterActive
 			? ReferenceFilterDistance * ReferenceFilterDistance
 			: TNumericLimits<float>::Max();
 
@@ -2128,8 +2133,10 @@ FCSStaticMeshTriangleRDGOutput CSMeshGenInternal::AddResolvedStaticMeshTriangles
 		AppendParameters->TriangleCapacity = TriangleCapacity;
 		AppendParameters->ReferenceCount = uint32(ReferencePoints.Num());
 		AppendParameters->bUseBounds = 0u; // CPU 端已按 request bounds 粗筛
-		AppendParameters->bUseReferenceFilter = ReferencePoints.Num() > 0 ? 1u : 0u;
-		AppendParameters->ReferenceFilterDistanceSq = ReferenceFilterDistance > 0.0f
+		// 同 Extract：距离 <= 0 时把开关一并关掉，否则那个无 early-out 的最近距离循环会白跑。
+		const bool bNaniteReferenceFilterActive = ReferencePoints.Num() > 0 && ReferenceFilterDistance > 0.0f;
+		AppendParameters->bUseReferenceFilter = bNaniteReferenceFilterActive ? 1u : 0u;
+		AppendParameters->ReferenceFilterDistanceSq = bNaniteReferenceFilterActive
 			? ReferenceFilterDistance * ReferenceFilterDistance
 			: TNumericLimits<float>::Max();
 
@@ -2425,6 +2432,277 @@ void AComputeShaderMeshGenerator::GetBoxSceneFilteredSurfaceVoxels(float VoxelSi
 	TArray<FVector>& OutNormals)
 {
 	BuildBoxSceneFilteredSurfaceVoxels(VoxelSize, ReferenceFilterDistance, OutPositions, OutNormals, true);
+}
+
+// ===========================================================================
+// 表面体素的记录式接口（声明见 Public/CSSurfaceVoxelPasses.h）
+//
+// 与下面的 PrepareBoxSceneSurfaceVoxelsGPU 走同一套 shader、同一套参数，区别只在于
+// 谁拥有那张 RDG 图：旧接口自己开三张图再 Flush，这里只往调用者的图里记录，让体素能和
+// 下游 pass 合并进同一张图。两条路径共存，旧接口的行为一个字节都没动。
+// ===========================================================================
+
+struct FCSSurfaceVoxelPassInputsImpl
+{
+	TArray<FResolvedStaticMeshTriangleRequest> ResolvedRequests;
+	FCSTriangleMeshData LandscapeTriangleData;
+	TArray<FVector> ReferencePoints;
+	uint64 TotalStaticMeshTriangleCount = 0;
+	float FilterDistance = 0.0f;
+	float VoxelSize = 0.0f;
+	FVector VoxelOrigin = FVector::ZeroVector;
+	FBox WorldBounds = FBox(ForceInit);
+	int32 MaxTriangles = 0;
+	int32 MaxVoxels = 0;
+	int32 BlurIterations = 0;
+	int32 BlurRadius = 1;
+	bool bHasLandscapeTriangles = false;
+};
+
+FCSSurfaceVoxelPassInputs::FCSSurfaceVoxelPassInputs() : Impl(MakeShared<FCSSurfaceVoxelPassInputsImpl>()) {}
+FCSSurfaceVoxelPassInputs::~FCSSurfaceVoxelPassInputs() = default;
+FCSSurfaceVoxelPassInputs::FCSSurfaceVoxelPassInputs(FCSSurfaceVoxelPassInputs&& Other) = default;
+FCSSurfaceVoxelPassInputs& FCSSurfaceVoxelPassInputs::operator=(FCSSurfaceVoxelPassInputs&& Other) = default;
+FCSSurfaceVoxelPassInputs::FCSSurfaceVoxelPassInputs(const FCSSurfaceVoxelPassInputs& Other) = default;
+FCSSurfaceVoxelPassInputs& FCSSurfaceVoxelPassInputs::operator=(const FCSSurfaceVoxelPassInputs& Other) = default;
+
+bool FCSSurfaceVoxelPassInputs::IsValid() const
+{
+	if (!Impl.IsValid() || Impl->VoxelSize <= UE_KINDA_SMALL_NUMBER) return false;
+	return Impl->ResolvedRequests.Num() > 0 || Impl->bHasLandscapeTriangles;
+}
+
+FVector FCSSurfaceVoxelPassInputs::GetVoxelOrigin() const { return Impl.IsValid() ? Impl->VoxelOrigin : FVector::ZeroVector; }
+FBox FCSSurfaceVoxelPassInputs::GetWorldBounds() const { return Impl.IsValid() ? Impl->WorldBounds : FBox(ForceInit); }
+float FCSSurfaceVoxelPassInputs::GetVoxelSize() const { return Impl.IsValid() ? Impl->VoxelSize : 0.0f; }
+uint32 FCSSurfaceVoxelPassInputs::GetVoxelCapacity() const { return Impl.IsValid() ? uint32(FMath::Max(1, Impl->MaxVoxels)) : 0u; }
+
+bool AddCSSurfaceVoxelPasses(FRDGBuilder& GraphBuilder, const FCSSurfaceVoxelPassInputs& In, FCSSurfaceVoxelPassOutputs& Out)
+{
+	Out = FCSSurfaceVoxelPassOutputs();
+	if (!In.IsValid()) return false;
+
+	const FCSSurfaceVoxelPassInputsImpl& P = *In.Impl;
+	const uint32 VoxCap = uint32(FMath::Max(1, P.MaxVoxels));
+	const uint32 HashSlotCount = GetSurfaceVoxelHashSlotCount(P.MaxVoxels, 0);
+	const float SafeVoxelSize = FMath::Max(P.VoxelSize, UE_KINDA_SMALL_NUMBER);
+	const float SafeSurfaceThickness = SafeVoxelSize * 0.5f;
+
+	// 全部是图内 transient buffer。旧路径必须用 AllocatePooledBuffer 是因为结果要跨图活到
+	// 下一张图；这里下游就在同一张图里，交给 RDG 自己管生命周期即可。
+	auto MakeBuf = [&GraphBuilder](uint32 BytesPerElement, uint32 NumElements, const TCHAR* Name)
+	{
+		return GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(BytesPerElement, NumElements), Name);
+	};
+	FRDGBufferRef Positions = MakeBuf(sizeof(FVector4f), VoxCap, TEXT("CS.SV.Positions"));
+	FRDGBufferRef Normals = MakeBuf(sizeof(FVector4f), VoxCap, TEXT("CS.SV.Normals"));
+	FRDGBufferRef Counter = MakeBuf(sizeof(uint32), 2, TEXT("CS.SV.Counter"));
+	FRDGBufferRef HashSlots = MakeBuf(sizeof(uint32), HashSlotCount, TEXT("CS.SV.HashSlots"));
+	FRDGBufferRef HashIndices = MakeBuf(sizeof(uint32), HashSlotCount, TEXT("CS.SV.HashIndices"));
+	FRDGBufferRef NormalSums = MakeBuf(sizeof(int32), VoxCap * 4u, TEXT("CS.SV.NormalSums"));
+	FRDGBufferRef NormalCounts = MakeBuf(sizeof(uint32), VoxCap, TEXT("CS.SV.NormalCounts"));
+	FRDGBufferRef TargetPositions = MakeBuf(sizeof(FVector4f), VoxCap, TEXT("CS.SV.TargetPositions"));
+	FRDGBufferRef TargetOffsetSums = MakeBuf(sizeof(int32), VoxCap * 4u, TEXT("CS.SV.TargetOffsetSums"));
+	FRDGBufferRef TargetWeightSums = MakeBuf(sizeof(uint32), VoxCap, TEXT("CS.SV.TargetWeightSums"));
+	FRDGBufferRef Cells = MakeBuf(sizeof(int32) * 4, VoxCap, TEXT("CS.SV.Cells"));
+	FRDGBufferRef BlurredNormals = MakeBuf(sizeof(FVector4f), VoxCap, TEXT("CS.SV.BlurredNormals"));
+	FRDGBufferRef BlurredTargets = MakeBuf(sizeof(FVector4f), VoxCap, TEXT("CS.SV.BlurredTargets"));
+
+	// ---- 清零（原 InitGraph）----
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Positions, PF_A32B32G32R32F)), 0.0f);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Normals, PF_A32B32G32R32F)), 0.0f);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Counter, PF_R32_UINT)), 0u);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(HashSlots, PF_R32_UINT)), 0u);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(HashIndices, PF_R32_UINT)), 0u);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(NormalSums, PF_R32_SINT)), 0u);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(NormalCounts, PF_R32_UINT)), 0u);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(TargetPositions, PF_A32B32G32R32F)), 0.0f);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(TargetOffsetSums, PF_R32_SINT)), 0u);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(TargetWeightSums, PF_R32_UINT)), 0u);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Cells, PF_R32G32B32A32_UINT)), 0u);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(BlurredNormals, PF_A32B32G32R32F)), 0.0f);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(BlurredTargets, PF_A32B32G32R32F)), 0.0f);
+
+	// ---- 分批体素化（原 BatchGraph×N）----
+	// 分批保留：每批的三角形临时 buffer 只被本批的体素化 pass 引用，RDG 的 transient
+	// allocator 会在批次间复用同一块显存，所以峰值仍是「一批」而不是「全部」。批次之间
+	// 通过写同一组 UAV 形成依赖，RDG 自动串行化，语义与原来的逐图 Execute 一致。
+	const int32 BatchTriangleCap = FMath::Min(FMath::Max(1, P.MaxTriangles), 500000);
+	const FCSTriangleMeshData* InitialTriangleData = P.bHasLandscapeTriangles ? &P.LandscapeTriangleData : nullptr;
+
+	TArray<TArray<FResolvedStaticMeshTriangleRequest>> Batches;
+	{
+		TArray<FResolvedStaticMeshTriangleRequest> CurrentBatch;
+		int64 CurrentBatchTriCount = 0;
+		for (int32 i = 0; i < P.ResolvedRequests.Num(); ++i)
+		{
+			if (CurrentBatchTriCount + P.ResolvedRequests[i].TriangleCount > int64(BatchTriangleCap) && CurrentBatch.Num() > 0)
+			{
+				Batches.Add(MoveTemp(CurrentBatch));
+				CurrentBatch.Reset();
+				CurrentBatchTriCount = 0;
+			}
+			CurrentBatch.Add(P.ResolvedRequests[i]);
+			CurrentBatchTriCount += P.ResolvedRequests[i].TriangleCount;
+		}
+		if (CurrentBatch.Num() > 0) Batches.Add(MoveTemp(CurrentBatch));
+	}
+	// 只有地形三角形、没有任何静态网格请求时，仍需要跑一批把地形喂进去。
+	if (Batches.Num() == 0 && InitialTriangleData) Batches.AddDefaulted();
+
+	TShaderMapRef<FTriangleSurfaceVoxelsCS> VoxelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	for (int32 BatchIdx = 0; BatchIdx < Batches.Num(); ++BatchIdx)
+	{
+		const TArray<FResolvedStaticMeshTriangleRequest>& Batch = Batches[BatchIdx];
+		uint64 BatchTriCount = 0;
+		for (const FResolvedStaticMeshTriangleRequest& Req : Batch) BatchTriCount += Req.TriangleCount;
+
+		const FCSTriangleMeshData* BatchInitData = (BatchIdx == 0) ? InitialTriangleData : nullptr;
+		FCSStaticMeshTriangleRDGOutput TriOut = CSMeshGenInternal::AddResolvedStaticMeshTrianglesToRDGInternal(
+			GraphBuilder, GraphBuilder.RHICmdList, Batch, BatchTriCount, P.ReferencePoints, P.FilterDistance,
+			BatchTriangleCap, BatchInitData, TEXT("CS.FilteredSV.Batch.Tri"), nullptr);
+		if (!TriOut.TriangleVertices || !TriOut.TriangleNormals || !TriOut.TriangleCounter || TriOut.MaxTriangles <= 0) continue;
+
+		FRDGBufferSRVRef TriVertsSRV = TriOut.TriangleVerticesSRV ? TriOut.TriangleVerticesSRV : GraphBuilder.CreateSRV(FRDGBufferSRVDesc(TriOut.TriangleVertices, PF_A32B32G32R32F));
+		FRDGBufferSRVRef TriNormsSRV = TriOut.TriangleNormalsSRV ? TriOut.TriangleNormalsSRV : GraphBuilder.CreateSRV(FRDGBufferSRVDesc(TriOut.TriangleNormals, PF_A32B32G32R32F));
+		FRDGBufferSRVRef TriCounterSRV = TriOut.TriangleCounterSRV ? TriOut.TriangleCounterSRV : GraphBuilder.CreateSRV(FRDGBufferSRVDesc(TriOut.TriangleCounter, PF_R32_UINT));
+
+		FTriangleSurfaceVoxelsCS::FParameters* VP = GraphBuilder.AllocParameters<FTriangleSurfaceVoxelsCS::FParameters>();
+		VP->TriangleVertices = TriVertsSRV;
+		VP->TriangleNormals = TriNormsSRV;
+		VP->SurfaceTriangleCounter = TriCounterSRV;
+		VP->RW_OutVoxelPositions = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Positions, PF_A32B32G32R32F));
+		VP->RW_OutVoxelNormals = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Normals, PF_A32B32G32R32F));
+		VP->RW_SurfaceVoxelCounter = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Counter, PF_R32_UINT));
+		VP->RW_SurfaceVoxelHashSlots = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(HashSlots, PF_R32_UINT));
+		VP->RW_SurfaceVoxelHashIndices = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(HashIndices, PF_R32_UINT));
+		VP->RW_SurfaceVoxelNormalSums = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(NormalSums, PF_R32_SINT));
+		VP->RW_SurfaceVoxelNormalCounts = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(NormalCounts, PF_R32_UINT));
+		VP->RW_OutVoxelTargetPositions = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(TargetPositions, PF_A32B32G32R32F));
+		VP->RW_SurfaceVoxelTargetOffsetSums = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(TargetOffsetSums, PF_R32_SINT));
+		VP->RW_SurfaceVoxelTargetWeightSums = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(TargetWeightSums, PF_R32_UINT));
+		VP->RW_OutVoxelCells = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Cells, PF_R32G32B32A32_UINT));
+		VP->SurfaceVoxelOrigin = FVector3f(P.VoxelOrigin);
+		VP->SurfaceVoxelSize = SafeVoxelSize;
+		VP->SurfaceThickness = SafeSurfaceThickness;
+		VP->SurfaceTriangleCount = TriOut.MaxTriangles;
+		VP->SurfaceVoxelCapacity = VoxCap;
+		VP->SurfaceVoxelHashSlotCount = HashSlotCount;
+
+		GraphBuilder.AddPass(
+			RDG_EVENT_NAME("CS.FusedSV.Batch%d.Voxelize", BatchIdx), VP, ERDGPassFlags::Compute,
+			[VP, VoxelShader, TriCap = TriOut.MaxTriangles](FRHIComputeCommandList& Cmd)
+			{
+				FComputeShaderUtils::Dispatch(Cmd, VoxelShader, *VP, FComputeShaderUtils::GetGroupCount(FIntVector(int32(TriCap), 1, 1), 64));
+			});
+	}
+
+	// ---- finalize + blur（原 FinalGraph）----
+	FRDGBufferUAVRef PositionsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Positions, PF_A32B32G32R32F));
+	FRDGBufferUAVRef NormalsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Normals, PF_A32B32G32R32F));
+	FRDGBufferUAVRef TargetPositionsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(TargetPositions, PF_A32B32G32R32F));
+
+	TShaderMapRef<FFinalizeSurfaceVoxelNormalsCS> FinalizeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FFinalizeSurfaceVoxelNormalsCS::FParameters* FP = GraphBuilder.AllocParameters<FFinalizeSurfaceVoxelNormalsCS::FParameters>();
+	FP->SurfaceVoxelNormalSums = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(NormalSums, PF_R32_SINT));
+	FP->SurfaceVoxelNormalCounts = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(NormalCounts, PF_R32_UINT));
+	FP->RW_SurfaceVoxelTargetOffsetSums = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(TargetOffsetSums, PF_R32_SINT));
+	FP->RW_SurfaceVoxelTargetWeightSums = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(TargetWeightSums, PF_R32_UINT));
+	FP->RW_OutVoxelPositions = PositionsUAV;
+	FP->RW_OutVoxelNormals = NormalsUAV;
+	FP->RW_OutVoxelTargetPositions = TargetPositionsUAV;
+	FP->SurfaceVoxelCapacity = VoxCap;
+	FP->SurfaceVoxelSize = SafeVoxelSize;
+	GraphBuilder.AddPass(
+		RDG_EVENT_NAME("CS.FusedSV.FinalizeNormals"), FP, ERDGPassFlags::Compute,
+		[FP, FinalizeShader, VoxCap](FRHIComputeCommandList& Cmd)
+		{
+			FComputeShaderUtils::Dispatch(Cmd, FinalizeShader, *FP, FComputeShaderUtils::GetGroupCount(FIntVector(int32(VoxCap), 1, 1), 64));
+		});
+
+	const uint32 BlurIters = uint32(FMath::Max(0, P.BlurIterations));
+	if (BlurIters > 0u)
+	{
+		FRDGBufferUAVRef BlurNormalsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(BlurredNormals, PF_A32B32G32R32F));
+		FRDGBufferUAVRef BlurTargetsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(BlurredTargets, PF_A32B32G32R32F));
+		FRDGBufferUAVRef CounterUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Counter, PF_R32_UINT));
+		FRDGBufferUAVRef CellsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Cells, PF_R32G32B32A32_UINT));
+		FRDGBufferUAVRef HashSlotsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(HashSlots, PF_R32_UINT));
+		FRDGBufferUAVRef HashIndicesUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(HashIndices, PF_R32_UINT));
+		const uint32 BlurRadius = uint32(FMath::Max(1, P.BlurRadius));
+		TShaderMapRef<FBlurSurfaceVoxelsCS> BlurShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		for (uint32 Iter = 0u; Iter < BlurIters; ++Iter)
+		{
+			// 乒乓：偶数轮从原 buffer 读、写进 blur buffer，奇数轮反过来。
+			const bool bReadFromOriginal = (Iter % 2u) == 0u;
+			FBlurSurfaceVoxelsCS::FParameters* BP = GraphBuilder.AllocParameters<FBlurSurfaceVoxelsCS::FParameters>();
+			BP->RW_SurfaceVoxelCounter = CounterUAV;
+			BP->RW_OutVoxelNormals = bReadFromOriginal ? NormalsUAV : BlurNormalsUAV;
+			BP->RW_BlurredVoxelNormals = bReadFromOriginal ? BlurNormalsUAV : NormalsUAV;
+			BP->RW_OutVoxelTargetPositions = bReadFromOriginal ? TargetPositionsUAV : BlurTargetsUAV;
+			BP->RW_BlurredVoxelTargetPositions = bReadFromOriginal ? BlurTargetsUAV : TargetPositionsUAV;
+			BP->RW_OutVoxelCells = CellsUAV;
+			BP->RW_SurfaceVoxelHashSlots = HashSlotsUAV;
+			BP->RW_SurfaceVoxelHashIndices = HashIndicesUAV;
+			BP->SurfaceVoxelCapacity = VoxCap;
+			BP->SurfaceVoxelHashSlotCount = HashSlotCount;
+			BP->SurfaceVoxelBlurRadius = BlurRadius;
+			GraphBuilder.AddPass(
+				RDG_EVENT_NAME("CS.FusedSV.Blur%d", Iter), BP, ERDGPassFlags::Compute,
+				[BP, BlurShader, VoxCap](FRHIComputeCommandList& Cmd)
+				{
+					FComputeShaderUtils::Dispatch(Cmd, BlurShader, *BP, FComputeShaderUtils::GetGroupCount(FIntVector(int32(VoxCap), 1, 1), 64));
+				});
+		}
+	}
+
+	// blur 跑了奇数轮时，最终数据停在 blur buffer 里 —— 与旧路径同样的判定。
+	const bool bFinalDataInBlurBuffers = BlurIters > 0u && (BlurIters & 1u) != 0u;
+	Out.Positions = Positions;
+	Out.Normals = bFinalDataInBlurBuffers ? BlurredNormals : Normals;
+	Out.TargetPositions = bFinalDataInBlurBuffers ? BlurredTargets : TargetPositions;
+	Out.Cells = Cells;
+	Out.Counter = Counter;
+	Out.HashSlots = HashSlots;
+	Out.HashIndices = HashIndices;
+	Out.VoxelCapacity = VoxCap;
+	Out.HashSlotCount = HashSlotCount;
+	Out.VoxelSize = SafeVoxelSize;
+	Out.VoxelOrigin = P.VoxelOrigin;
+	Out.WorldBounds = P.WorldBounds;
+	Out.bValid = true;
+	return true;
+}
+
+bool AComputeShaderMeshGenerator::PrepareSurfaceVoxelPassInputs(float VoxelSize, float ReferenceFilterDistance, FCSSurfaceVoxelPassInputs& OutInputs)
+{
+	OutInputs = FCSSurfaceVoxelPassInputs();
+	FCSSurfaceVoxelPassInputsImpl& P = *OutInputs.Impl;
+
+	UWorld* World = GetWorld();
+	if (!World) return false;
+	const FBox QueryBox = GetGeneratorBoundsWorldBox();
+	if (!QueryBox.IsValid) return false;
+
+	P.VoxelSize = FMath::Max(VoxelSize, UE_KINDA_SMALL_NUMBER);
+	P.VoxelOrigin = QueryBox.Min;
+	P.WorldBounds = QueryBox;
+	P.MaxTriangles = FMath::Max(1, MaxTriangles);
+	P.MaxVoxels = FMath::Max(1, MaxVoxels);
+	P.BlurIterations = FMath::Max(0, SurfaceVoxelBlurIterations);
+	P.BlurRadius = FMath::Max(1, SurfaceVoxelBlurRadius);
+	P.ReferencePoints = ReferencePoints;
+	P.FilterDistance = P.ReferencePoints.IsEmpty() ? 0.0f : FMath::Max(0.0f, ReferenceFilterDistance);
+
+	TArray<FCSStaticMeshTriangleRequest> Requests;
+	BuildBoxSceneTriangleRequests(World, QueryBox, Requests);
+	BuildBoxSceneLandscapeTrianglesInternal(World, QueryBox, P.ReferencePoints, P.FilterDistance, P.MaxTriangles, P.LandscapeTriangleData);
+	P.bHasLandscapeTriangles = GetTriangleMeshDataTriangleCount(P.LandscapeTriangleData) > 0;
+	if (Requests.IsEmpty() && !P.bHasLandscapeTriangles) return false;
+
+	P.TotalStaticMeshTriangleCount = CSMeshGenInternal::ResolveStaticMeshTriangleRequests(
+		Requests, this, ExcludedActorTags, true, P.ResolvedRequests);
+	return OutInputs.IsValid();
 }
 
 bool AComputeShaderMeshGenerator::PrepareBoxSceneSurfaceVoxelsGPU(float VoxelSize, float ReferenceFilterDistance)

@@ -733,6 +733,13 @@ public:
 	 *  in FCSSurfaceVoxelGPUBuffers::Counter and is consumed by downstream compute/indirect draws. */
 	bool PrepareBoxSceneSurfaceVoxelsGPU(float VoxelSize, float ReferenceFilterDistance = 0.0f);
 
+	/** 只做体素化的 CPU 侧准备（收集并解析三角形请求、地形三角形、参数），不 dispatch 任何东西。
+	 *  产出的 bundle 交给 AddCSSurfaceVoxelPasses 往调用者自己的 RDG 图里记录，于是体素能和下游
+	 *  pass 合并进同一张图，省掉 PrepareBoxSceneSurfaceVoxelsGPU 那条路上的独立图与
+	 *  FlushRenderingCommands。要 pooled buffer 或 CPU 回读的调用者仍应走旧接口。
+	 *  返回 false 表示范围内没有可体素化的几何。 */
+	bool PrepareSurfaceVoxelPassInputs(float VoxelSize, float ReferenceFilterDistance, struct FCSSurfaceVoxelPassInputs& OutInputs);
+
 	/** Synchronously voxelizes the bounded scene surface and reads the voxels back to the CPU by
 	 *  running the RDG surface-voxel pass on the render thread and blocking via FlushRenderingCommands.
 	 *  Keeps all triangles within the generator bounds (no reference-point filtering). Refreshes the

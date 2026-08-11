@@ -1354,6 +1354,12 @@ struct FVineBuildInput
 	uint32 GPUVoxCount = 0u;
 	uint32 GpuVoxelHashSlotCountPow2 = 0u;
 
+	// Fused surface-voxel inputs. When set, the voxels are built inside the leaf's own graph
+	// (AddCSSurfaceVoxelPasses) instead of arriving as pooled buffers from a separate graph, so
+	// the GPUVox* pooled refs above stay null and the pass graph reads the in-graph refs instead.
+	bool bUseFusedVoxels = false;
+	FCSSurfaceVoxelPassInputs SurfaceVoxelInputs;
+
 	// Scalars / counts (every value the pass graph reads).
 	FVector3f VoxelOrigin = FVector3f::ZeroVector;
 	float VoxelSize = 0.0f;
@@ -2377,6 +2383,12 @@ struct FVineMeshPassInputs
 	TRefCountPtr<FRDGPooledBuffer> GPUVoxNormals;
 	TRefCountPtr<FRDGPooledBuffer> GPUVoxTargets;
 	TRefCountPtr<FRDGPooledBuffer> GPUVoxCounter;
+	// 融合路径下体素就在本图里产出，直接给图内 ref；非空时优先于上面的 pooled ref。
+	// 两者是同一份数据的两种到达方式，下游只认解析后的结果。
+	FRDGBufferRef GPUVoxCellsRDG = nullptr;
+	FRDGBufferRef GPUVoxNormalsRDG = nullptr;
+	FRDGBufferRef GPUVoxTargetsRDG = nullptr;
+	FRDGBufferRef GPUVoxCounterRDG = nullptr;
 	uint32 GPUVoxCount = 0u;
 	uint32 GpuVoxelHashSlotCountPow2 = 0u;
 	const TArray<FIntVector4>* GPUVoxelCells = nullptr;
@@ -2587,16 +2599,18 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 		// vine shader reads structured buffers, so copy each into a fresh structured buffer
 		// (GPU byte copy, no CPU round-trip) and bind a structured SRV.
 		const uint32 VoxCopyCount = FMath::Max(GPUVoxCount, 1u);
-		auto RegVox = [&GraphBuilder, VoxCopyCount](const TRefCountPtr<FRDGPooledBuffer>& Pooled, uint32 BytesPerElem, const TCHAR* Name)
+		// 源可能来自两条路：融合路径下体素就在本图里（直接用图内 ref），旧路径下是另一张图
+		// extract 出来的 pooled buffer（需要 register）。两者之后的处理完全一样。
+		auto RegVox = [&GraphBuilder, VoxCopyCount](FRDGBufferRef Rdg, const TRefCountPtr<FRDGPooledBuffer>& Pooled, uint32 BytesPerElem, const TCHAR* Name)
 		{
-			FRDGBufferRef Src = GraphBuilder.RegisterExternalBuffer(Pooled, Name);
+			FRDGBufferRef Src = Rdg ? Rdg : GraphBuilder.RegisterExternalBuffer(Pooled, Name);
 			CSHelper::FRDGStructuredBufferRefs Dst = CSHelper::CreateStructuredBuffer(GraphBuilder, BytesPerElem, VoxCopyCount, Name, false, true);
 			AddCopyBufferPass(GraphBuilder, Dst.Buffer, 0, Src, 0, uint64(BytesPerElem) * VoxCopyCount);
 			return Dst;
 		};
-		VoxelCellsBuffer = RegVox(GPUVoxCells, sizeof(FIntVector4), TEXT("VVVoxel.VoxelCells.GPU"));
-		VoxelNormalsBuffer = RegVox(GPUVoxNormals, sizeof(FVector4f), TEXT("VVVoxel.VoxelNormals.GPU"));
-		VoxelTargetPositionsBuffer = RegVox(GPUVoxTargets, sizeof(FVector4f), TEXT("VVVoxel.VoxelTargetPositions.GPU"));
+		VoxelCellsBuffer = RegVox(In.GPUVoxCellsRDG, GPUVoxCells, sizeof(FIntVector4), TEXT("VVVoxel.VoxelCells.GPU"));
+		VoxelNormalsBuffer = RegVox(In.GPUVoxNormalsRDG, GPUVoxNormals, sizeof(FVector4f), TEXT("VVVoxel.VoxelNormals.GPU"));
+		VoxelTargetPositionsBuffer = RegVox(In.GPUVoxTargetsRDG, GPUVoxTargets, sizeof(FVector4f), TEXT("VVVoxel.VoxelTargetPositions.GPU"));
 		VoxelHashSlotsBuffer = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(uint32), GpuVoxelHashSlotCountPow2, TEXT("VVVoxel.VoxelHashSlots.GPU"), true, true);
 		AddClearUAVPass(GraphBuilder, VoxelHashSlotsBuffer.UAV, 0u);
 		{
@@ -2605,7 +2619,8 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 			// The real voxel count only exists on the GPU; the hash build reads it from here so the
 			// capacity slack never enters the table.
 			HP->HashBuildCounter = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(
-				GraphBuilder.RegisterExternalBuffer(In.GPUVoxCounter, TEXT("VVVoxel.VoxelCounter.GPU")), PF_R32_UINT));
+				In.GPUVoxCounterRDG ? In.GPUVoxCounterRDG
+					: GraphBuilder.RegisterExternalBuffer(In.GPUVoxCounter, TEXT("VVVoxel.VoxelCounter.GPU")), PF_R32_UINT));
 			HP->RW_HashBuildSlots = VoxelHashSlotsBuffer.UAV;
 			HP->HashBuildVoxelCount = GPUVoxCount;
 			HP->HashBuildSlotCount = GpuVoxelHashSlotCountPow2;
@@ -3068,6 +3083,9 @@ static FVineBuildInput VineLeaf_BuildVineBuildInput(
 	EVisVineGPUDebugStage DebugStage,
 	const FVineFusedSCInputs* GPULines,
 	const FCSSurfaceVoxelGPUBuffers* GPUVoxels,
+	// 融合体素输入。非空且有效时优先于 GPUVoxels：体素改在叶子自己的图里现算，
+	// 省掉独立图、pooled extract 与 FlushRenderingCommands。会被 MoveTemp 进 bundle。
+	FCSSurfaceVoxelPassInputs* FusedVoxels,
 	double* OutBuildVoxelUploadMs = nullptr,
 	double* OutBuildHashMs = nullptr,
 	double* OutBuildTargetBucketsMs = nullptr)
@@ -3095,9 +3113,15 @@ static FVineBuildInput VineLeaf_BuildVineBuildInput(
 	B.DebugStage = DebugStage;
 
 	const bool bUseGPULines = (GPULines != nullptr && GPULines->IsValid());
-	const bool bUseGPUVoxels = (GPUVoxels != nullptr && GPUVoxels->IsValid());
+	// 融合体素优先：有效时体素在叶子自己的图里现算，pooled 那条路整条不走。
+	const bool bUseFusedVoxels = (FusedVoxels != nullptr && FusedVoxels->IsValid());
+	const bool bUseGPUVoxels = bUseFusedVoxels || (GPUVoxels != nullptr && GPUVoxels->IsValid());
+	const uint32 FusedVoxelCapacity = bUseFusedVoxels ? FusedVoxels->GetVoxelCapacity() : 0u;
+	const int32 VoxelCapacityForHash = bUseFusedVoxels
+		? int32(FusedVoxelCapacity)
+		: (GPUVoxels != nullptr ? GPUVoxels->VoxelCapacity : 0);
 	const uint32 GpuVoxelHashSlotCountPow2 = bUseGPUVoxels
-		? FMath::RoundUpToPowerOfTwo(uint32(FMath::Max(GPUVoxels->VoxelCapacity * 2, 16))) : 0u;
+		? FMath::RoundUpToPowerOfTwo(uint32(FMath::Max(VoxelCapacityForHash * 2, 16))) : 0u;
 	// On the fused path these are CAPACITIES, not counts: the SC solve runs inside the leaf's graph
 	// and its compact counts stay in VRAM, so every buffer and stream downstream is allocated for
 	// the worst case and drawn from the GPU counts instead.
@@ -3131,22 +3155,33 @@ static FVineBuildInput VineLeaf_BuildVineBuildInput(
 		return B; // bValid stays false (silent count early-out)
 	}
 
-	const uint32 VoxelCount = bUseGPUVoxels ? uint32(GPUVoxels->VoxelCapacity) : uint32(VoxelData.Cells.Num());
+	// 融合路径下体素还没跑，容量是 CPU 侧就知道的 MaxVoxels；旧路径下取 pooled 的容量。
+	// 两条路这里都是「容量」而非真实数量 —— 真实数量只有 GPU 的 Counter[0] 知道。
+	const uint32 VoxelCount = bUseFusedVoxels ? FusedVoxelCapacity
+		: (bUseGPUVoxels ? uint32(GPUVoxels->VoxelCapacity) : uint32(VoxelData.Cells.Num()));
 	if (VoxelCount == 0)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU_Voxel] No voxel data available."));
 		return B; // bValid stays false
 	}
 	B.VoxelCount = VoxelCount;
-	B.VoxelOrigin = bUseGPUVoxels ? FVector3f(GPUVoxels->VoxelOrigin) : FVector3f(VoxelData.VoxelOrigin);
-	B.VoxelSize = bUseGPUVoxels ? GPUVoxels->VoxelSize : float(VoxelData.VoxelSize);
+	B.VoxelOrigin = bUseFusedVoxels ? FVector3f(FusedVoxels->GetVoxelOrigin())
+		: (bUseGPUVoxels ? FVector3f(GPUVoxels->VoxelOrigin) : FVector3f(VoxelData.VoxelOrigin));
+	B.VoxelSize = bUseFusedVoxels ? FusedVoxels->GetVoxelSize()
+		: (bUseGPUVoxels ? GPUVoxels->VoxelSize : float(VoxelData.VoxelSize));
 
 	if (bUseGPUVoxels)
 	{
-		B.GPUVoxCells = GPUVoxels->Cells;
-		B.GPUVoxNormals = GPUVoxels->Normals;
-		B.GPUVoxTargets = GPUVoxels->TargetPositions;
-		B.GPUVoxCounter = GPUVoxels->Counter;
+		// 融合路径把 pooled ref 留空 —— 图内 buffer 要等 BuildGeometry 记录 pass 时才存在。
+		B.bUseFusedVoxels = bUseFusedVoxels;
+		if (bUseFusedVoxels) B.SurfaceVoxelInputs = MoveTemp(*FusedVoxels);
+		else
+		{
+			B.GPUVoxCells = GPUVoxels->Cells;
+			B.GPUVoxNormals = GPUVoxels->Normals;
+			B.GPUVoxTargets = GPUVoxels->TargetPositions;
+			B.GPUVoxCounter = GPUVoxels->Counter;
+		}
 		B.GPUVoxCount = VoxelCount;
 		B.GPUVoxelHashSlotCount = GpuVoxelHashSlotCountPow2;
 		B.TargetBucketOrigin = B.VoxelOrigin;
@@ -3155,7 +3190,7 @@ static FVineBuildInput VineLeaf_BuildVineBuildInput(
 		// skip the bucket lookup, but the bindings still have to exist or parameter validation
 		// kills the render thread, so give them the one-element dummies.
 		EnsureVineTargetBucketDummyBuffers(B.TargetBuckets);
-		B.LocalBounds = GPUVoxels->WorldBounds;
+		B.LocalBounds = bUseFusedVoxels ? B.SurfaceVoxelInputs.GetWorldBounds() : GPUVoxels->WorldBounds;
 		if (!B.LocalBounds.IsValid)
 		{
 			const FVector Origin(B.VoxelOrigin);
@@ -3463,6 +3498,25 @@ protected:
 		FRDGBufferRef CountersBuf = GraphBuilder.RegisterExternalBuffer(GetStreamBuffer(ECSGpuStreamRole::MeshCounters));
 
 		FVineMeshPassInputs In = VineLeaf_MakePassInputs(Input);
+
+		// 表面体素也记录进这张图。放在 SC 求解之前：求解要投影到表面，读的就是这里产出的
+		// 体素。同图内靠 UAV 依赖自动定序，不需要中间 Execute，也不需要把结果 extract 成
+		// pooled buffer 再 register 回来。
+		if (Input.bUseFusedVoxels)
+		{
+			FCSSurfaceVoxelPassOutputs VoxelOut;
+			if (!AddCSSurfaceVoxelPasses(GraphBuilder, Input.SurfaceVoxelInputs, VoxelOut))
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[VineMesh] 融合体素 pass 记录失败（范围内没有可体素化的几何）。"));
+				PublishEmptyDraw();
+				return;
+			}
+			In.GPUVoxCellsRDG = VoxelOut.Cells;
+			In.GPUVoxNormalsRDG = VoxelOut.Normals;
+			In.GPUVoxTargetsRDG = VoxelOut.TargetPositions;
+			In.GPUVoxCounterRDG = VoxelOut.Counter;
+		}
+
 		if (Input.bUseGPULines)
 		{
 			// Solve + concat straight into this graph; the results stay transient and the counts
@@ -4004,7 +4058,10 @@ bool AVineContainer::VisVineGPUInternal()
 			EmptySurfaceVoxelData,
 			bWantStageDraw ? DebugStage : EVisVineGPUDebugStage::None,
 			&FusedSCInputs,
-			LastSurfaceVoxelGPUBuffers.IsValid() ? &LastSurfaceVoxelGPUBuffers : nullptr);
+			LastSurfaceVoxelGPUBuffers.IsValid() ? &LastSurfaceVoxelGPUBuffers : nullptr,
+			// GenerateVineGPU 备好的融合体素输入。有效时叶子在自己的图里现算体素，
+			// 上面那个 pooled 参数就用不上了；会被 MoveTemp 进 bundle，故本次消费后即失效。
+			PendingSurfaceVoxelInputs.IsValid() ? &PendingSurfaceVoxelInputs : nullptr);
 		if (!LeafInput.bValid)
 		{
 			UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] Vine build input was invalid; nothing generated."));
@@ -4200,9 +4257,30 @@ bool AVineContainer::GenerateVines(float ExtrudeScale, bool Result)
 
 	SurfaceVoxelBlurIterations = FMath::Max(0, VV.GenerateVineVoxelNormalBlurIterations);
 
-	// 3. Prepare GPU surface voxel cache inputs.
+	// 3~5 步（三角形缓存 / 表面体素 / 建网格）全部收进 GenerateVineGPU，在那里合并成一张 RDG 图。
+	return GenerateVineGPU(Bounds);
+}
+
+// 藤蔓生成的 GPU 段：三角形缓存 -> 表面体素 -> 空间殖民求解 -> concat -> 建网格。
+//
+// 这些以前是 4 张 RDG 图外加一次 FlushRenderingCommands：EnsureTriangleCache 之后
+// PrepareBoxSceneSurfaceVoxelsGPU 自己开三张图（清零 / 分批体素化 / finalize+blur），把结果
+// extract 成 pooled buffer，然后阻塞 game thread —— 而藤蔓这条路传的是 bReadbackToCPU=false，
+// 没有任何数据要回读，那次 flush 纯粹是为了让 CPU 能读一个 IsValid()。
+//
+// 现在这里只做 CPU 侧准备，体素的 pass 由叶子的 FVineMeshSceneProxy::BuildGeometry 记录进它
+// 自己那张图，和 SC 求解、建网格合并执行：没有中间 Execute，没有 pooled extract，也没有 flush。
+// 分批仍然保留（见 AddCSSurfaceVoxelPasses），显存行为不变。
+bool AVineContainer::GenerateVineGPU(const FBox& Bounds)
+{
+	GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVineGPU.Total"));
+	const FVector Center = Bounds.GetCenter();
+	const FVector Extent = Bounds.GetExtent();
+
+	// 1. 三角形缓存：纯 CPU / 组件操作，只是把 GeneratorBounds 摆到这一批藤蔓的包围盒上，
+	//    后面的体素查询范围（GetGeneratorBoundsWorldBox）就是从它读的。
 	{
-		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.EnsureTriangleCache"));
+		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVineGPU.EnsureTriangleCache"));
 		VoxelGridSettings.VoxelSize = SC.VoxelSize;
 		VoxelGridSettings.ActivationRadius = SC.VoxelSize * 8.0f;
 		FCSMeshGeneratorTriangleCacheHandle TriangleCacheHandle = EnsureTriangleCacheByBox(
@@ -4213,12 +4291,25 @@ bool AVineContainer::GenerateVines(float ExtrudeScale, bool Result)
 		(void)TriangleCacheHandle;
 	}
 
-	// Retain the voxel buffers for GPU consumers. The valid count stays in Counter[0].
+	// 2. 体素：只做 CPU 侧准备（收集并解析三角形请求、地形三角形、参数），不 dispatch。
+	//    产出的 bundle 一路带到叶子的图里由 AddCSSurfaceVoxelPasses 记录。
+	//
+	// 参考点剔除距离。三个三角形展开 pass（Extract / FilterInitialTriangleSoup /
+	// AppendNaniteSource）本来就是边展开边按参考点剔除、原子追加出紧凑 soup 的，但这里以前传
+	// 0 —— 而 0 会让 ReferenceFilterDistanceSq 取 FLT_MAX，同时 bUseReferenceFilter 仍是 1
+	// （ReferencePoints 是非空的 target 列表）。结果是每个三角形对全部 target 跑一遍无 early-out
+	// 的最近距离循环，然后无条件通过：代价照付，一个不剔。给个真实距离这层剔除才真正生效。
+	//
+	// ReferencePoints 就是 target 位置，藤蔓中心线不会长到离 target 更远的地方，所以按生长影响
+	// 半径的倍数取即可。下限压着体素投影的 ActivationRadius(= VoxelSize*8)：剔除范围一旦小于
+	// 投影搜索范围，边界处就会找不到吸附目标，中心线会飘离表面。
+	const float SurfaceTriangleFilterDistance = FMath::Max(SC.InfluenceRadius * 2.0f, SC.VoxelSize * 8.0f);
 	{
-		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.PrepareBoxSceneSurfaceVoxelsGPU"));
-		if (!PrepareBoxSceneSurfaceVoxelsGPU(SC.VoxelSize))
+		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVineGPU.PrepareSurfaceVoxelInputs"));
+		PendingSurfaceVoxelInputs = FCSSurfaceVoxelPassInputs();
+		if (!PrepareSurfaceVoxelPassInputs(SC.VoxelSize, SurfaceTriangleFilterDistance, PendingSurfaceVoxelInputs))
 		{
-			UE_LOG(LogTemp, Warning, TEXT("[GenerateVines] Failed to prepare GPU surface voxels on %s."), *GetActorNameOrLabel());
+			UE_LOG(LogTemp, Warning, TEXT("[GenerateVineGPU] 范围内没有可体素化的几何，%s 无法生成藤蔓。"), *GetActorNameOrLabel());
 			return false;
 		}
 	}
@@ -4226,7 +4317,7 @@ bool AVineContainer::GenerateVines(float ExtrudeScale, bool Result)
 	// Cache generation bounds for subsequent GPU visualization.
 	InstanceBound = Bounds;
 
-	// 4. SpaceColonization 不再在这里跑：它已经和 concat、建网格合并进 VisVine 的那张 RDG 图，
+	// 3. SpaceColonization 不再在这里跑：它已经和 concat、建网格合并进 VisVine 的那张 RDG 图，
 	// 由 VisVine() 自行从当前的 source/target transforms 准备输入。这些 CPU 线数组随之作废
 	// （GPU 路径从不填充它们），保持清空以匹配旧行为。
 	TubeLines.Reset();
@@ -4234,24 +4325,29 @@ bool AVineContainer::GenerateVines(float ExtrudeScale, bool Result)
 	TubeLinePointScales.Reset();
 	TubeLinePointAxes.Reset();
 
+	// 体素调试线画的是 LastSurfaceVoxelGPUBuffers，那是旧 pooled 路径的产物；融合路径下体素
+	// 只活在叶子的图里，没有 pooled 副本可画。要用这个调试就得走旧接口单独跑一次体素。
 	if (GPUProjectionDebug.bDrawGPUProjectionVoxelDebugPoints && GPUProjectionDebug.GPUProjectionVoxelDebugDuration > 0.0f)
 	{
-		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.DrawGPUProjectionVoxelDebugPoints"));
-		FCSDebugLastVoxelDirectionOptions DebugOptions;
-		DebugOptions.DirectionLength = SC.VoxelSize;
-		DebugOptions.DirectionColor = GPUProjectionDebug.GPUProjectionVoxelTargetColor;
-		DebugOptions.Duration = GPUProjectionDebug.GPUProjectionVoxelDebugDuration;
-		DebugOptions.bPersistentLines = GPUProjectionDebug.bGPUProjectionVoxelDebugPointsPersistent;
-		DebugOptions.bDrawPoints = true;
-		DebugOptions.PointColor = GPUProjectionDebug.GPUProjectionVoxelCenterColor;
-		DebugOptions.PointSize = GPUProjectionDebug.GPUProjectionVoxelCenterPointSize;
-		DebugOptions.MaxDirectionsToDraw = GPUProjectionDebug.GPUProjectionVoxelDebugPointLimit;
-		DrawDebugLastSurfaceVoxelDirections(DebugOptions);
+		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVineGPU.DrawGPUProjectionVoxelDebugPoints"));
+		if (PrepareBoxSceneSurfaceVoxelsGPU(SC.VoxelSize))
+		{
+			FCSDebugLastVoxelDirectionOptions DebugOptions;
+			DebugOptions.DirectionLength = SC.VoxelSize;
+			DebugOptions.DirectionColor = GPUProjectionDebug.GPUProjectionVoxelTargetColor;
+			DebugOptions.Duration = GPUProjectionDebug.GPUProjectionVoxelDebugDuration;
+			DebugOptions.bPersistentLines = GPUProjectionDebug.bGPUProjectionVoxelDebugPointsPersistent;
+			DebugOptions.bDrawPoints = true;
+			DebugOptions.PointColor = GPUProjectionDebug.GPUProjectionVoxelCenterColor;
+			DebugOptions.PointSize = GPUProjectionDebug.GPUProjectionVoxelCenterPointSize;
+			DebugOptions.MaxDirectionsToDraw = GPUProjectionDebug.GPUProjectionVoxelDebugPointLimit;
+			DrawDebugLastSurfaceVoxelDirections(DebugOptions);
+		}
 	}
 
-	// 5. 可视化：把这一批藤蔓交给 GPU leaf。结果只存在于它的常驻 stream 里，没有 CPU 网格可返回。
+	// 4. 可视化：把这一批藤蔓交给 GPU leaf。结果只存在于它的常驻 stream 里，没有 CPU 网格可返回。
 	{
-		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.VisVine"));
+		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVineGPU.VisVine"));
 		return VisVine();
 	}
 }

@@ -8,6 +8,8 @@
 #include "GeometryScript/GeometryScriptTypes.h"
 #include "MeshGeneratorBrushCache.h"
 #include "ComputeShaderDebugParams.h"
+// PendingSurfaceVoxelInputs 是按值持有的成员，必须是完整类型，不能只前向声明。
+#include "CSSurfaceVoxelPasses.h"
 #include "InstancedFoliageActor.h"
 #include "FoliageType.h"
 
@@ -311,6 +313,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
 	bool GenerateVines(float ExtrudeScale = 50, bool Result = true);
 
+	/** 藤蔓生成的 GPU 段：三角形缓存 -> 表面体素 -> 空间殖民求解 -> concat -> 建网格，
+	 *  全部合并进叶子的那一张 RDG 图。以前这里是 4 张图外加一次 FlushRenderingCommands，
+	 *  而藤蔓这条路根本不回读数据，那次阻塞是白等的。
+	 *  Bounds 为这一批 source/target 的世界包围盒，同时决定体素化范围。 */
+	bool GenerateVineGPU(const FBox& Bounds);
+
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
 	void Clean();
 
@@ -374,6 +382,11 @@ public:
 
 private:
 	bool VisVineGPUInternal();
+
+	// GenerateVineGPU 备好、等着交给叶子那张图的体素输入。不是 UPROPERTY：里面是 PIMPL 持有的
+	// 三角形请求数组，且只在一次生成内有效 —— VisVineGPUInternal 会把它 MoveTemp 进 build
+	// bundle，消费后即失效，所以每次 GenerateVineGPU 都重新准备。
+	FCSSurfaceVoxelPassInputs PendingSurfaceVoxelInputs;
 
 	// One-shot data upgrade for packages saved while this actor still owned a UDynamicMeshComponent.
 	// That component used to hold the vine surface material on slot 0, so dropping it would silently

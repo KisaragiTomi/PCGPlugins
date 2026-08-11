@@ -64,11 +64,10 @@ class FVVVoxelCS : public FGlobalShader
 	DECLARE_GLOBAL_SHADER(FVVVoxelCS);
 	SHADER_USE_PARAMETER_STRUCT(FVVVoxelCS, FGlobalShader);
 
-	// When set, emit the vine mesh into the GPU-resident base streams (positions/tangents/
-	// texcoords/colors/indices + indirect args + counters) instead of the legacy transient
-	// StructuredBuffers. The legacy path (false) stays byte-identical.
-	class FBaseStreams : SHADER_PERMUTATION_BOOL("VINE_OUTPUT_BASESTREAMS");
-	using FPermutationDomain = TShaderPermutationDomain<FBaseStreams>;
+	// 藤蔓网格只往 GPU 常驻 base stream（positions/tangents/texcoords/colors/indices + indirect
+	// args + counters）里写。以前另有一条写三个瞬时 StructuredBuffer 再回读的老路，由
+	// VINE_OUTPUT_BASESTREAMS permutation 二选一；回读整条废弃后那半边永远不会被选中，
+	// permutation 连同它的一整套 shader 排列一起删掉了。
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPoints)
@@ -83,14 +82,7 @@ class FVVVoxelCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VoxelHashSlots)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelNormals)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelTargetPositions)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, TargetBucketRanges)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, TargetBucketRangeCounts)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, TargetBucketVoxelIndices)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, TargetBucketHashSlots)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_OutVertices)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float2>, RW_OutUVs)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_OutIndices)
-		// Base-stream outputs (only bound/referenced when the FBaseStreams permutation is set).
+		// Base-stream outputs：藤蔓网格唯一的输出目标。
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, RWPositions)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>,  RWTangents)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, RWTexCoords)
@@ -110,11 +102,6 @@ class FVVVoxelCS : public FGlobalShader
 		SHADER_PARAMETER(float, VoxelSize)
 		SHADER_PARAMETER(uint32, VoxelCount)
 		SHADER_PARAMETER(uint32, VoxelHashSlotCount)
-		SHADER_PARAMETER(FVector3f, TargetBucketOrigin)
-		SHADER_PARAMETER(float, TargetBucketSize)
-		SHADER_PARAMETER(uint32, TargetBucketCount)
-		SHADER_PARAMETER(uint32, TargetBucketHashSlotCount)
-		SHADER_PARAMETER(uint32, TargetBucketSearchRadius)
 		SHADER_PARAMETER(float, VinesOffset)
 		SHADER_PARAMETER(float, TinyZJitterStrength)
 		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
@@ -403,10 +390,6 @@ class FVVVoxelBuildAxesCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VoxelHashSlots)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelNormals)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelTargetPositions)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, TargetBucketRanges)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, TargetBucketRangeCounts)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, TargetBucketVoxelIndices)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, TargetBucketHashSlots)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_PathPointTangents)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_PathPointNormals)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_PathPointSurfaceTargets)
@@ -416,11 +399,6 @@ class FVVVoxelBuildAxesCS : public FGlobalShader
 		SHADER_PARAMETER(float, VoxelSize)
 		SHADER_PARAMETER(uint32, VoxelCount)
 		SHADER_PARAMETER(uint32, VoxelHashSlotCount)
-		SHADER_PARAMETER(FVector3f, TargetBucketOrigin)
-		SHADER_PARAMETER(float, TargetBucketSize)
-		SHADER_PARAMETER(uint32, TargetBucketCount)
-		SHADER_PARAMETER(uint32, TargetBucketHashSlotCount)
-		SHADER_PARAMETER(uint32, TargetBucketSearchRadius)
 		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -546,21 +524,12 @@ class FVVVoxelNoiseCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VoxelHashSlots)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelNormals)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelTargetPositions)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, TargetBucketRanges)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, TargetBucketRangeCounts)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, TargetBucketVoxelIndices)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, TargetBucketHashSlots)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_PathPointsNoised)
 		SHADER_PARAMETER(uint32, PathPointCount)
 		SHADER_PARAMETER(FVector3f, VoxelOrigin)
 		SHADER_PARAMETER(float, VoxelSize)
 		SHADER_PARAMETER(uint32, VoxelCount)
 		SHADER_PARAMETER(uint32, VoxelHashSlotCount)
-		SHADER_PARAMETER(FVector3f, TargetBucketOrigin)
-		SHADER_PARAMETER(float, TargetBucketSize)
-		SHADER_PARAMETER(uint32, TargetBucketCount)
-		SHADER_PARAMETER(uint32, TargetBucketHashSlotCount)
-		SHADER_PARAMETER(uint32, TargetBucketSearchRadius)
 		SHADER_PARAMETER(float, CurlNoiseStrength)
 		SHADER_PARAMETER(float, CurlNoiseFrequency)
 		SHADER_PARAMETER(uint32, NoiseIterations)
@@ -624,10 +593,6 @@ class FVVVoxelFinalProjectCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VoxelHashSlots)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelNormals)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelTargetPositions)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, TargetBucketRanges)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, TargetBucketRangeCounts)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, TargetBucketVoxelIndices)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, TargetBucketHashSlots)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_PathPointSurfaceTargets)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_PathPointSurfaceNormals)
 		SHADER_PARAMETER(uint32, PathPointCount)
@@ -635,11 +600,6 @@ class FVVVoxelFinalProjectCS : public FGlobalShader
 		SHADER_PARAMETER(float, VoxelSize)
 		SHADER_PARAMETER(uint32, VoxelCount)
 		SHADER_PARAMETER(uint32, VoxelHashSlotCount)
-		SHADER_PARAMETER(FVector3f, TargetBucketOrigin)
-		SHADER_PARAMETER(float, TargetBucketSize)
-		SHADER_PARAMETER(uint32, TargetBucketCount)
-		SHADER_PARAMETER(uint32, TargetBucketHashSlotCount)
-		SHADER_PARAMETER(uint32, TargetBucketSearchRadius)
 		SHADER_PARAMETER(float, VinesOffset)
 		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
@@ -1305,32 +1265,12 @@ struct FVineFusedSCInputs
 	}
 };
 
-// Target-position spatial acceleration buffers for the vine surface projection. Global scope
-// (matches FVineFusedSCInputs) so the self-owning FVineBuildInput bundle below can embed it and
-// still be named from the leaf's public header via a forward declaration.
-struct FVineTargetBucketBuffers
-{
-	TArray<FIntVector4> Ranges;
-	TArray<uint32> RangeCounts;
-	TArray<uint32> VoxelIndices;
-	TArray<uint32> HashSlots;
-	uint32 HashSlotCount = 0u;
-	uint32 BucketCount = 0u;
-	uint32 MaxBucketItemCount = 0u;
-	float BucketSize = 0.0f;
-	uint32 SearchRadius = 4u;
-};
-
 // Self-owning CPU-prep bundle consumed by the GPU-resident leaf (UVineMeshComponent /
-// FVineMeshSceneProxy)：所有标量 pass 参数、目标桶表、融合的 SC / 体素输入、VineWorldToLocal
+// FVineMeshSceneProxy)：所有标量 pass 参数、融合的 SC / 体素输入、VineWorldToLocal
 // 与一个保守的世界包围盒。Copyable + movable。由 AVineContainer::GenerateVineGPU 填好，直接作为
 // AddVineMeshPasses 的输入（图内那几个 RDG ref 另走 FVineMeshGraphRefs）。
 struct FVineBuildInput
 {
-	// 目标桶：融合路径下体素留在 GPU 上，桶没人建，这里只是一元素 dummy（绑定必须存在）。
-	FVineTargetBucketBuffers TargetBuckets;
-	FVector3f TargetBucketOrigin = FVector3f::ZeroVector;
-
 	// 融合的空间殖民输入：线几何在叶子自己的图里求解 + concat，紧凑计数不出显存。
 	FVineFusedSCInputs FusedSC;
 	uint32 GPUVoxCount = 0u;
@@ -1365,8 +1305,7 @@ struct FVineBuildInput
 	float PerlinNoiseStrength = 0.0f;
 	float PerlinNoiseFrequency = 0.0f;
 	uint32 SafeNoiseIterations = 0u;
-	// Raw VV.UVLengthScale for the base-stream axial-V GPU passes (max()'d in the scan). Unused on
-	// the legacy readback path (bBaseStreams=false), where V is recomputed on the CPU instead.
+	// Raw VV.UVLengthScale for the base-stream axial-V GPU passes (max()'d in the scan).
 	float UVLengthScale = 1.0f;
 	EVisVineGPUDebugStage DebugStage = EVisVineGPUDebugStage::Smooth;
 	FLinearColor DebugLineColor = FLinearColor(0.0f, 1.0f, 0.35f, 1.0f);
@@ -2137,28 +2076,6 @@ static void RefreshFoliageType(UWorld* World, UFoliageType* InFoliageType)
 	}
 }
 
-// FVineTargetBucketBuffers is defined at global scope above (moved so FVineBuildInput can embed it).
-
-static void EnsureVineTargetBucketDummyBuffers(FVineTargetBucketBuffers& Buffers)
-{
-	if (Buffers.Ranges.Num() == 0)
-	{
-		Buffers.Ranges.Add(FIntVector4(0, 0, 0, 0));
-	}
-	if (Buffers.RangeCounts.Num() == 0)
-	{
-		Buffers.RangeCounts.Add(0u);
-	}
-	if (Buffers.VoxelIndices.Num() == 0)
-	{
-		Buffers.VoxelIndices.Add(0u);
-	}
-	if (Buffers.HashSlots.Num() == 0)
-	{
-		Buffers.HashSlots.Add(0u);
-	}
-}
-
 // Dispatch-arg slots VineDispatchArgsCS publishes, one uint3 each, in this order.
 enum : uint32
 {
@@ -2188,20 +2105,13 @@ struct FVineMeshGraphRefs
 	FRDGBufferRef VoxCounter = nullptr;
 };
 
-// Outputs: the three transient mesh buffers are created by the caller (so the readback
-// copies can stay caller-side); their UAVs are bound here.
+// Outputs：叶子那七条常驻 GPU stream 的 UAV，由调用方（FVineMeshSceneProxy::BuildGeometry）
+// 从组件持有的 pooled buffer 注册而来。
 struct FVineMeshPassOutputs
 {
-	FRDGBufferUAVRef OutVerticesUAV = nullptr;
-	FRDGBufferUAVRef OutUVsUAV = nullptr;
-	FRDGBufferUAVRef OutIndicesUAV = nullptr;
 	FRDGBufferRef* DebugCenterSourceBufferPtr = nullptr;
 	FRDGBufferRef* SegmentMetaBufferPtr = nullptr;
 
-	// When true, pass#8 selects the FVVVoxelCS::FBaseStreams permutation and emits into the
-	// GPU-resident base streams below instead of the three legacy UAVs above. Default false
-	// keeps the legacy path byte-identical; no current caller sets this.
-	bool bBaseStreams = false;
 	FRDGBufferUAVRef PositionUAV = nullptr;
 	FRDGBufferUAVRef TangentUAV = nullptr;
 	FRDGBufferUAVRef TexCoordUAV = nullptr;
@@ -2221,8 +2131,6 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	// Local aliases so the moved graph body below reads exactly as the original.
 	const uint32 GPUVoxCount = In.GPUVoxCount;
 	const uint32 GpuVoxelHashSlotCountPow2 = In.GpuVoxelHashSlotCountPow2;
-	const FVineTargetBucketBuffers& TargetBuckets = In.TargetBuckets;
-	const FVector3f TargetBucketOrigin = In.TargetBucketOrigin;
 	const FVector3f VoxelOrigin = In.VoxelOrigin;
 	const float VoxelSize = In.VoxelSize;
 	const uint32 VoxelCount = In.VoxelCount;
@@ -2337,10 +2245,6 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 		TShaderMapRef<FVVBuildVoxelHashCS> HashShader(GetGlobalShaderMap(FeatureLevel));
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VVVoxel.BuildVoxelHash"), HashShader, HP, FComputeShaderUtils::GetGroupCount(FMath::Max(GPUVoxCount, 1u), 64));
 	}
-	const CSHelper::FRDGStructuredBufferRefs TargetBucketRangesBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, TargetBuckets.Ranges, TEXT("VVVoxel.TargetBucketRanges"));
-	const CSHelper::FRDGStructuredBufferRefs TargetBucketRangeCountsBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, TargetBuckets.RangeCounts, TEXT("VVVoxel.TargetBucketRangeCounts"));
-	const CSHelper::FRDGStructuredBufferRefs TargetBucketVoxelIndicesBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, TargetBuckets.VoxelIndices, TEXT("VVVoxel.TargetBucketVoxelIndices"));
-	const CSHelper::FRDGStructuredBufferRefs TargetBucketHashSlotsBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, TargetBuckets.HashSlots, TEXT("VVVoxel.TargetBucketHashSlots"));
 	CSHelper::FRDGStructuredBufferRefs PathPointTangentA = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointTangentsA"), true, true);
 	CSHelper::FRDGStructuredBufferRefs PathPointNormalA = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointNormalsA"), true, true);
 	CSHelper::FRDGStructuredBufferRefs PathPointFrameNormalA = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointFrameNormalsA"), true, true);
@@ -2359,21 +2263,12 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	NoiseParameters->VoxelHashSlots = VoxelHashSlotsBuffer.SRV;
 	NoiseParameters->VoxelNormals = VoxelNormalsBuffer.SRV;
 	NoiseParameters->VoxelTargetPositions = VoxelTargetPositionsBuffer.SRV;
-	NoiseParameters->TargetBucketRanges = TargetBucketRangesBuffer.SRV;
-	NoiseParameters->TargetBucketRangeCounts = TargetBucketRangeCountsBuffer.SRV;
-	NoiseParameters->TargetBucketVoxelIndices = TargetBucketVoxelIndicesBuffer.SRV;
-	NoiseParameters->TargetBucketHashSlots = TargetBucketHashSlotsBuffer.SRV;
 	NoiseParameters->RW_PathPointsNoised = PathPointNoisedBuffer.UAV;
 	NoiseParameters->PathPointCount = PathPointCount;
 	NoiseParameters->VoxelOrigin = VoxelOrigin;
 	NoiseParameters->VoxelSize = VoxelSize;
 	NoiseParameters->VoxelCount = VoxelCount;
 	NoiseParameters->VoxelHashSlotCount = GPUVoxelHashSlotCount;
-	NoiseParameters->TargetBucketOrigin = TargetBucketOrigin;
-	NoiseParameters->TargetBucketSize = TargetBuckets.BucketSize;
-	NoiseParameters->TargetBucketCount = TargetBuckets.BucketCount;
-	NoiseParameters->TargetBucketHashSlotCount = TargetBuckets.HashSlotCount;
-	NoiseParameters->TargetBucketSearchRadius = TargetBuckets.SearchRadius;
 	NoiseParameters->CurlNoiseStrength = CurlNoiseStrength;
 	NoiseParameters->CurlNoiseFrequency = CurlNoiseFrequency;
 	NoiseParameters->NoiseIterations = SafeNoiseIterations;
@@ -2391,10 +2286,6 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	BuildAxesParameters->VoxelHashSlots = VoxelHashSlotsBuffer.SRV;
 	BuildAxesParameters->VoxelNormals = VoxelNormalsBuffer.SRV;
 	BuildAxesParameters->VoxelTargetPositions = VoxelTargetPositionsBuffer.SRV;
-	BuildAxesParameters->TargetBucketRanges = TargetBucketRangesBuffer.SRV;
-	BuildAxesParameters->TargetBucketRangeCounts = TargetBucketRangeCountsBuffer.SRV;
-	BuildAxesParameters->TargetBucketVoxelIndices = TargetBucketVoxelIndicesBuffer.SRV;
-	BuildAxesParameters->TargetBucketHashSlots = TargetBucketHashSlotsBuffer.SRV;
 	BuildAxesParameters->RW_PathPointTangents = PathPointTangentA.UAV;
 	BuildAxesParameters->RW_PathPointNormals = PathPointNormalA.UAV;
 	BuildAxesParameters->RW_PathPointSurfaceTargets = PathPointSurfaceTargetA.UAV;
@@ -2404,11 +2295,6 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	BuildAxesParameters->VoxelSize = VoxelSize;
 	BuildAxesParameters->VoxelCount = VoxelCount;
 	BuildAxesParameters->VoxelHashSlotCount = GPUVoxelHashSlotCount;
-	BuildAxesParameters->TargetBucketOrigin = TargetBucketOrigin;
-	BuildAxesParameters->TargetBucketSize = TargetBuckets.BucketSize;
-	BuildAxesParameters->TargetBucketCount = TargetBuckets.BucketCount;
-	BuildAxesParameters->TargetBucketHashSlotCount = TargetBuckets.HashSlotCount;
-	BuildAxesParameters->TargetBucketSearchRadius = TargetBuckets.SearchRadius;
 	BuildAxesParameters->VineDispatchArgs = DispatchArgsBuffer;
 
 	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VVVoxel.BuildAxes"), BuildAxesShader, BuildAxesParameters,
@@ -2439,10 +2325,6 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	FinalProjectParameters->VoxelHashSlots = VoxelHashSlotsBuffer.SRV;
 	FinalProjectParameters->VoxelNormals = VoxelNormalsBuffer.SRV;
 	FinalProjectParameters->VoxelTargetPositions = VoxelTargetPositionsBuffer.SRV;
-	FinalProjectParameters->TargetBucketRanges = TargetBucketRangesBuffer.SRV;
-	FinalProjectParameters->TargetBucketRangeCounts = TargetBucketRangeCountsBuffer.SRV;
-	FinalProjectParameters->TargetBucketVoxelIndices = TargetBucketVoxelIndicesBuffer.SRV;
-	FinalProjectParameters->TargetBucketHashSlots = TargetBucketHashSlotsBuffer.SRV;
 	FinalProjectParameters->RW_PathPointSurfaceTargets = PathPointSurfaceTargetB.UAV;
 	FinalProjectParameters->RW_PathPointSurfaceNormals = PathPointSurfaceNormalB.UAV;
 	FinalProjectParameters->PathPointCount = PathPointCount;
@@ -2450,11 +2332,6 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	FinalProjectParameters->VoxelSize = VoxelSize;
 	FinalProjectParameters->VoxelCount = VoxelCount;
 	FinalProjectParameters->VoxelHashSlotCount = GPUVoxelHashSlotCount;
-	FinalProjectParameters->TargetBucketOrigin = TargetBucketOrigin;
-	FinalProjectParameters->TargetBucketSize = TargetBuckets.BucketSize;
-	FinalProjectParameters->TargetBucketCount = TargetBuckets.BucketCount;
-	FinalProjectParameters->TargetBucketHashSlotCount = TargetBuckets.HashSlotCount;
-	FinalProjectParameters->TargetBucketSearchRadius = TargetBuckets.SearchRadius;
 	FinalProjectParameters->VinesOffset = VinesOffset;
 	FinalProjectParameters->VineDispatchArgs = DispatchArgsBuffer;
 
@@ -2554,9 +2431,7 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	CSHelper::FRDGStructuredBufferRefs& FinalTangentsForBuild = PathPointTangentA;
 	CSHelper::FRDGStructuredBufferRefs& FinalFrameNormalsForBuild = PathPointFrameNormalA;
 
-	FVVVoxelCS::FPermutationDomain PermVec;
-	PermVec.Set<FVVVoxelCS::FBaseStreams>(Out.bBaseStreams);
-	TShaderMapRef<FVVVoxelCS> ComputeShader(GetGlobalShaderMap(FeatureLevel), PermVec);
+	TShaderMapRef<FVVVoxelCS> ComputeShader(GetGlobalShaderMap(FeatureLevel));
 	FVVVoxelCS::FParameters* Parameters = GraphBuilder.AllocParameters<FVVVoxelCS::FParameters>();
 	Parameters->PathPoints = PathPointNoisedBuffer.SRV;
 	Parameters->PathPointMeta = PathPointMetaBuffer.SRV;
@@ -2570,35 +2445,12 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	Parameters->VoxelHashSlots = VoxelHashSlotsBuffer.SRV;
 	Parameters->VoxelNormals = VoxelNormalsBuffer.SRV;
 	Parameters->VoxelTargetPositions = VoxelTargetPositionsBuffer.SRV;
-	Parameters->TargetBucketRanges = TargetBucketRangesBuffer.SRV;
-	Parameters->TargetBucketRangeCounts = TargetBucketRangeCountsBuffer.SRV;
-	Parameters->TargetBucketVoxelIndices = TargetBucketVoxelIndicesBuffer.SRV;
-	Parameters->TargetBucketHashSlots = TargetBucketHashSlotsBuffer.SRV;
-	if (Out.bBaseStreams)
-	{
-		// Base-stream permutation: the HLSL #if references only these; leave the legacy UAVs null.
-		Parameters->RWPositions = Out.PositionUAV;
-		Parameters->RWTangents = Out.TangentUAV;
-		Parameters->RWTexCoords = Out.TexCoordUAV;
-		Parameters->RWColors = Out.ColorUAV;
-		Parameters->RWBaseIndices = Out.IndexUAV;
-		Parameters->VineWorldToLocal = Out.VineWorldToLocal;
-		Parameters->RW_OutVertices = nullptr;
-		Parameters->RW_OutUVs = nullptr;
-		Parameters->RW_OutIndices = nullptr;
-	}
-	else
-	{
-		// Legacy path (byte-identical): only the three StructuredBuffer UAVs are referenced.
-		Parameters->RW_OutVertices = Out.OutVerticesUAV;
-		Parameters->RW_OutUVs = Out.OutUVsUAV;
-		Parameters->RW_OutIndices = Out.OutIndicesUAV;
-		Parameters->RWPositions = nullptr;
-		Parameters->RWTangents = nullptr;
-		Parameters->RWTexCoords = nullptr;
-		Parameters->RWColors = nullptr;
-		Parameters->RWBaseIndices = nullptr;
-	}
+	Parameters->RWPositions = Out.PositionUAV;
+	Parameters->RWTangents = Out.TangentUAV;
+	Parameters->RWTexCoords = Out.TexCoordUAV;
+	Parameters->RWColors = Out.ColorUAV;
+	Parameters->RWBaseIndices = Out.IndexUAV;
+	Parameters->VineWorldToLocal = Out.VineWorldToLocal;
 	Parameters->VineMeshCounts = LineCountsSRV;
 	Parameters->PathPointCount = PathPointCount;
 	Parameters->SegmentCount = SegmentCount;
@@ -2612,11 +2464,6 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	Parameters->VoxelSize = VoxelSize;
 	Parameters->VoxelCount = VoxelCount;
 	Parameters->VoxelHashSlotCount = GPUVoxelHashSlotCount;
-	Parameters->TargetBucketOrigin = TargetBucketOrigin;
-	Parameters->TargetBucketSize = TargetBuckets.BucketSize;
-	Parameters->TargetBucketCount = TargetBuckets.BucketCount;
-	Parameters->TargetBucketHashSlotCount = TargetBuckets.HashSlotCount;
-	Parameters->TargetBucketSearchRadius = TargetBuckets.SearchRadius;
 	Parameters->VinesOffset = VinesOffset;
 	Parameters->TinyZJitterStrength = TinyZJitterStrength;
 	Parameters->VineDispatchArgs = DispatchArgsBuffer;
@@ -2629,10 +2476,9 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	// Recompute the correct V on the GPU straight from the base-stream Position buffer
 	// it just filled, and overwrite it. The identity leaf makes RWPositions local==world, so the ring centers,
 	// circumferences and segment lengths match the CPU (which runs on world-space output
-	// verts) to float precision. The legacy readback path (bBaseStreams==false) skips this
-	// entirely (V stays 0 here and is recomputed on the CPU after readback, as before).
+	// verts) to float precision.
 	// ------------------------------------------------------------------------
-	if (Out.bBaseStreams && ProfileCount > 0u && OutputVertexCount > 0u)
+	if (ProfileCount > 0u && OutputVertexCount > 0u)
 	{
 		const uint32 VineUVPointCount = OutputVertexCount / ProfileCount; // == CPU Vertices.Num()/ProfileCount
 		if (VineUVPointCount > 0u)
@@ -2913,7 +2759,6 @@ protected:
 		}
 
 		FVineMeshPassOutputs Out;
-		Out.bBaseStreams = true;
 		Out.PositionUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(PositionBuf, PF_R32_FLOAT));
 		Out.TangentUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(TangentBuf, PF_R32_UINT));
 		Out.TexCoordUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(TexCoordBuf, PF_R32_FLOAT));
@@ -3669,12 +3514,6 @@ bool AVineContainer::GenerateVineGPU(float ExtrudeScale, bool Result)
 		LeafInput.VoxelSize = PendingSurfaceVoxelInputs.GetVoxelSize();
 		LeafInput.GpuVoxelHashSlotCountPow2 = FMath::RoundUpToPowerOfTwo(uint32(FMath::Max(int32(VoxelCapacity) * 2, 16)));
 		LeafInput.GPUVoxelHashSlotCount = LeafInput.GpuVoxelHashSlotCountPow2;
-		LeafInput.TargetBucketOrigin = LeafInput.VoxelOrigin;
-		// 体素留在 GPU 上，target-position 桶就没人建了，而零长度上传会得到空 SRV。
-		// TargetBucketCount == 0 已经让 shader 跳过桶查找，但绑定本身必须存在，否则参数校验
-		// 会打死渲染线程 —— 所以给它们一元素的 dummy。
-		EnsureVineTargetBucketDummyBuffers(LeafInput.TargetBuckets);
-
 		// 渲染包围盒取体素化范围；退化时按体素尺寸给个最小盒，免得 indirect draw 被视锥剔掉。
 		LeafInput.LocalBounds = PendingSurfaceVoxelInputs.GetWorldBounds();
 		if (!LeafInput.LocalBounds.IsValid)

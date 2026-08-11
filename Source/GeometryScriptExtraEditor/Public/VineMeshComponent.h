@@ -7,7 +7,7 @@
 class UMaterialInterface;
 class UStaticMesh;
 
-// Self-owning CPU-prep bundle produced by the shared vine helper (VineLeaf_BuildVineBuildInput).
+// Self-owning CPU-prep bundle filled by AVineContainer::GenerateVineGPU.
 // Defined at global scope in GeometryEditorActor.cpp — same forward-declaration pattern as
 // FVineFusedSCInputs. Held here through a TUniquePtr (PIMPL) so this public header stays free of
 // the internal RDG / voxel types the bundle owns.

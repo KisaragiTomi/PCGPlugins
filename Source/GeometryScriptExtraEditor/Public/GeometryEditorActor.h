@@ -241,7 +241,7 @@ public:
 	UInstancedStaticMeshComponent* TubeVineSource;
 
 	// The vine: renders the tube mesh directly through the render pipeline (persistent GPU streams +
-	// indirect draw). Fed by VisVineGPUInternal via SetBuildInput. Kept at an identity world
+	// indirect draw). Fed by GenerateVineGPU via SetBuildInput. Kept at an identity world
 	// transform (vine renders in world space).
 	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
 	UVineMeshComponent* VineGpuMesh;
@@ -313,11 +313,14 @@ public:
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
 	bool GenerateVines(float ExtrudeScale = 50, bool Result = true);
 
-	/** 藤蔓生成的 GPU 段：三角形缓存 -> 表面体素 -> 空间殖民求解 -> concat -> 建网格，
-	 *  全部合并进叶子的那一张 RDG 图。以前这里是 4 张图外加一次 FlushRenderingCommands，
-	 *  而藤蔓这条路根本不回读数据，那次阻塞是白等的。
-	 *  Bounds 为这一批 source/target 的世界包围盒，同时决定体素化范围。 */
-	bool GenerateVineGPU(const FBox& Bounds);
+	/** 藤蔓生成的唯一实现，VisVine / GenerateVines 都转调这里，所以签名与它们保持一致
+	 *  （两个参数是老接口的遗留，Content 里的 BP 节点还连着，C++ 侧不读）。
+	 *  source/target transforms、生成包围盒、三角形剔除参考点全部自己就地取，不依赖调用者。
+	 *  表面体素化 -> 空间殖民求解 -> concat -> 建网格，全部记录进叶子的同一张 RDG 图，整段只有
+	 *  一次 GPU 提交。以前这里是 4 张图外加一次 FlushRenderingCommands，而藤蔓这条路根本不回读
+	 *  数据，那次阻塞是白等的。 */
+	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
+	bool GenerateVineGPU(float ExtrudeScale = 50, bool Result = true);
 
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
 	void Clean();
@@ -381,11 +384,12 @@ public:
 	int32 DrawDebugCachedSurfaceTriangles(float Duration = 5.0f);
 
 private:
-	bool VisVineGPUInternal();
+	/** 这一批藤蔓的世界包围盒：source 与 target 位置的并集外扩 50。 */
+	static FBox ComputeVineGenerationBounds(const TArray<FTransform>& SourceTransforms, const TArray<FTransform>& TargetTransforms);
 
 	// GenerateVineGPU 备好、等着交给叶子那张图的体素输入。不是 UPROPERTY：里面是 PIMPL 持有的
-	// 三角形请求数组，且只在一次生成内有效 —— VisVineGPUInternal 会把它 MoveTemp 进 build
-	// bundle，消费后即失效，所以每次 GenerateVineGPU 都重新准备。
+	// 三角形请求数组，且只在一次生成内有效 —— 同一个函数里就会把它 MoveTemp 进 build bundle，
+	// 消费后即失效，所以每次 GenerateVineGPU 都重新准备。
 	FCSSurfaceVoxelPassInputs PendingSurfaceVoxelInputs;
 
 	// One-shot data upgrade for packages saved while this actor still owned a UDynamicMeshComponent.

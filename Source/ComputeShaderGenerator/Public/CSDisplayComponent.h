@@ -18,6 +18,7 @@ enum class ECSDisplayMode : uint8
 	TriangleSoup,     // 场景三角汤：标准 stream 集 + DrawIndexedIndirect
 	VoxelDirections,  // 体素方向线 + 中心点：position-only 顶点工厂 + 双次 indirect draw
 	VoxelQuads,       // 体素孤立面片
+	PointArrows,      // 点集箭头网格：走标准 stream 集，可用真材质、可回读存盘
 };
 
 /** 体素显示请求的渲染线程快照（原 FCSMeshGeneratorDebugData）。 */
@@ -42,6 +43,29 @@ struct FCSDisplayVoxelData
 	bool IsValid() const
 	{
 		return Positions.IsValid() && Normals.IsValid() && Counter.IsValid() && VoxelCapacity > 0;
+	}
+};
+
+/**
+ * 点集箭头显示请求的渲染线程快照。每个点展开成一个沿其法线朝向的箭头（柱身 + 锥头），
+ * 位置与方向由同一个形状表达，不再需要"点 + 单独方向线"两次绘制。
+ */
+struct FCSDisplayPointArrowData
+{
+	TRefCountPtr<FRDGPooledBuffer> Positions; // float4，xyz = 世界位置
+	TRefCountPtr<FRDGPooledBuffer> Normals;   // float4，xyz = 世界法线（箭头指向）
+	TRefCountPtr<FRDGPooledBuffer> Counter;   // uint2，[0] = 有效点数
+	int32 MaxArrowsToDraw = 0;                // 容量上限（决定 GPU buffer 大小）
+	float ArrowLength = 25.0f;                // 箭头总长
+	float ShaftRadius = 1.5f;                 // 柱身方形截面半边长
+	float HeadRadius = 4.0f;                  // 锥体底面半径
+	float HeadFraction = 0.35f;               // 锥头占总长比例
+	FLinearColor ArrowColor = FLinearColor::Yellow;
+	FBox WorldBounds = FBox(ForceInit);
+
+	bool IsValid() const
+	{
+		return Positions.IsValid() && Normals.IsValid() && Counter.IsValid() && MaxArrowsToDraw > 0;
 	}
 };
 
@@ -104,6 +128,16 @@ public:
 		int32 MaxDirectionsToDraw,
 		float Lifetime = -1.0f);
 
+	/** 把一组点画成箭头网格（每点一个沿其法线朝向的箭头）。
+	 *  走标准 stream 集，因此用的是 MeshMaterial 而非一帧调试材质，并可经
+	 *  SaveRenderedMeshToStaticMesh 存成资产。返回提交的箭头容量。 */
+	int32 ShowPointArrows(
+		const FCSGpuDebugPooledSource& Source,
+		int32 MaxArrowsToDraw,
+		float ArrowLength,
+		FLinearColor ArrowColor,
+		float Lifetime = -1.0f);
+
 	/** 每个有效体素一片朝向法线的孤立面片。 */
 	bool ShowVoxelQuads(
 		const FCSSurfaceVoxelGPUBuffers& Source,
@@ -125,8 +159,11 @@ public:
 protected:
 	//~ UCSGpuMeshComponent interface
 	virtual UMaterialInterface* GetRenderMaterial() const override { return MeshMaterial; }
-	/** 只有三角汤模式的代理才是 FCSGpuMeshSceneProxy；其余模式必须挡住回读。 */
-	virtual bool IsGpuMeshProxyActive() const override { return Mode == ECSDisplayMode::TriangleSoup; }
+	/** 三角汤与点箭头都走 FCSGpuMeshSceneProxy 基座，可回读；体素调试模式必须挡住。 */
+	virtual bool IsGpuMeshProxyActive() const override
+	{
+		return Mode == ECSDisplayMode::TriangleSoup || Mode == ECSDisplayMode::PointArrows;
+	}
 
 private:
 	void SubmitVoxelData(FCSDisplayVoxelData&& InData, float Lifetime);
@@ -140,6 +177,9 @@ private:
 
 	// 体素源
 	FCSDisplayVoxelData PendingVoxelData;
+
+	// 点箭头源
+	FCSDisplayPointArrowData PendingArrowData;
 
 	FTimerHandle ClearTimerHandle;
 };

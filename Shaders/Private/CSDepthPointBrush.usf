@@ -1,0 +1,242 @@
+// 点笔刷的深度缓冲采样：在屏幕空间散点，用可见表面的深度还原世界位置与法线。
+//
+// 为什么不再在 3D 里投射线：笔刷是个**球**，球缘的采样射线起点几乎与表面齐平，很容易钻进
+// 网格，第一个命中就落在内表面上。改成只从深度缓冲取样之后，一个采样点能落到的地方必然是
+// 当前视角真正看得见的表面 —— 背面和内表面根本不存在于深度缓冲里，无需再做背面剔除。
+//
+// 球依旧是球：候选点在笔刷投影出的屏幕圆盘里散布，还原出世界位置后再用球做一次距离剔除，
+// 于是屏幕圆盘只是个廉价的候选发生器，接受与否仍由 3D 球决定。
+//
+// 法线取自深度的邻域差分（重建位置的叉积），不读 GBuffer —— UE 5.7 可能开着 Substrate，
+// GBuffer 布局会变。
+
+#include "/Engine/Private/Common.ush"
+
+#ifndef CS_DEPTH_BRUSH_GROUP_SIZE
+#define CS_DEPTH_BRUSH_GROUP_SIZE 256
+#endif
+
+Texture2D        SceneDepthTexture;
+
+RWBuffer<float4> RWPositions; // xyz = 世界位置
+RWBuffer<float4> RWNormals;   // xyz = 世界法线
+RWBuffer<uint>   RWCounter;   // [0] = 已写入点数，[1] = 容量
+
+float3 TranslatedBrushCentre; // 笔刷中心（translated world），与深度还原共用一套坐标
+float3 BrushCentreWorld;      // 同一个中心的世界坐标，用来把 brush-local 结果搬回世界
+float3 PaintBoundsMin;
+float3 PaintBoundsMax;
+float  BrushRadius;
+float  MinSpacingSq;
+uint   SampleCount;
+uint   PointCapacity;
+uint   RandomSeed;
+uint   bUsePaintBounds;
+
+groupshared uint   GBaseCount;
+groupshared float3 GCandidatePosition[CS_DEPTH_BRUSH_GROUP_SIZE];
+groupshared uint   GCandidateValid[CS_DEPTH_BRUSH_GROUP_SIZE];
+
+uint HashUint(uint Value)
+{
+	Value ^= Value >> 17;
+	Value *= 0xed5ad4bbu;
+	Value ^= Value >> 11;
+	Value *= 0xac4c1b51u;
+	Value ^= Value >> 15;
+	Value *= 0x31848babu;
+	Value ^= Value >> 14;
+	return Value;
+}
+
+/** [0,1) 均匀随机，State 每次前进一步。 */
+float RandNext(inout uint State)
+{
+	State = HashUint(State);
+	return float(State >> 8) * (1.0f / 16777216.0f);
+}
+
+/** clip -> buffer 像素坐标。含 ViewRectMin，与 SceneDepthTexture 的寻址是同一套。 */
+float2 ClipToPixelPos(float4 Clip)
+{
+	const float2 Ndc = Clip.xy / Clip.w;
+	return (Ndc * float2(0.5f, -0.5f) + 0.5f) * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy;
+}
+
+float LoadDeviceZ(int2 PixelPos, int2 RectMin, int2 RectMax)
+{
+	// 越界读会取到别的视图的深度，直接当成天空丢掉。
+	if (any(PixelPos < RectMin) || any(PixelPos > RectMax)) return 0.0f;
+	return SceneDepthTexture.Load(int3(PixelPos, 0)).r;
+}
+
+/**
+ * 一条采样：在屏幕圆盘里取一个像素，读深度，还原世界位置与法线。
+ * 返回 false 表示这条采样落空（天空、球外、绘制盒外、或落在轮廓边上法线不可信）。
+ */
+bool TryFindSurface(uint Lane, out float3 OutWorldPosition, out float3 OutWorldNormal)
+{
+	OutWorldPosition = 0.0f;
+	OutWorldNormal = float3(0.0f, 0.0f, 1.0f);
+
+	// 笔刷球 -> 屏幕圆盘：中心投一次，再投一个沿视图右方向偏移一个半径的点，两者的像素
+	// 距离就是屏幕半径。这样写透视和正交都成立，不必分别处理。
+	const float4 CentreClip = mul(float4(TranslatedBrushCentre, 1.0f), View.TranslatedWorldToClip);
+	const float4 EdgeClip = mul(float4(TranslatedBrushCentre + View.ViewRight * BrushRadius, 1.0f), View.TranslatedWorldToClip);
+	if (CentreClip.w <= 0.0f || EdgeClip.w <= 0.0f) return false; // 笔刷在相机背后
+
+	const float2 CentrePixel = ClipToPixelPos(CentreClip);
+
+	// 透视下球的轮廓圆比"过球心的截面"大，差距按 d/sqrt(d²-R²)；相机贴近笔刷时不补这一下
+	// 圆盘就兜不住球缘。相机进到球里就铺满视口，剩下的交给后面的 3D 球剔除。正交视图的
+	// d 远大于 R，这个系数自然退化成 1。
+	const float CentreDistance = length(TranslatedBrushCentre - View.TranslatedWorldCameraOrigin);
+	const float MaxScreenRadius = length(View.ViewSizeAndInvSize.xy);
+	const float SilhouetteScale = (CentreDistance > BrushRadius)
+		? CentreDistance * rsqrt(CentreDistance * CentreDistance - BrushRadius * BrushRadius)
+		: MaxScreenRadius;
+	const float ScreenRadius = min(length(ClipToPixelPos(EdgeClip) - CentrePixel) * SilhouetteScale, MaxScreenRadius);
+	if (ScreenRadius <= 0.0f) return false;
+
+	// 圆盘内均匀取点：半径取 sqrt 才是面积均匀的，否则会全挤在圆心。
+	uint RngState = HashUint(RandomSeed + HashUint(Lane * 747796405u + 1u));
+	const float SampleRadius = ScreenRadius * sqrt(RandNext(RngState));
+	const float SampleAngle = 2.0f * PI * RandNext(RngState);
+	const float2 SamplePixel = CentrePixel + SampleRadius * float2(cos(SampleAngle), sin(SampleAngle));
+
+	const int2 RectMin = int2(View.ViewRectMin.xy);
+	const int2 RectMax = RectMin + int2(View.ViewSizeAndInvSize.xy) - 1;
+	const int2 PixelPos = int2(floor(SamplePixel));
+
+	const float DeviceZ = LoadDeviceZ(PixelPos, RectMin, RectMax);
+	if (DeviceZ <= 0.0f) return false; // reversed-Z 下远平面/天空是 0
+
+	const float2 PixelCentre = float2(PixelPos) + 0.5f;
+	const float3 SurfaceTW = SvPositionToTranslatedWorld(float4(PixelCentre, DeviceZ, 1.0f));
+
+	// 屏幕圆盘只是候选发生器，真正的接受条件仍是 3D 球。
+	const float3 BrushLocal = SurfaceTW - TranslatedBrushCentre;
+	if (dot(BrushLocal, BrushLocal) > BrushRadius * BrushRadius) return false;
+
+	// ── 邻域差分求法线 ──
+	// 每个轴上取"深度连续"的一侧：跨过轮廓边的邻居会把前后两个面接成一个假斜面，
+	// 用 2% 视深度作为连续性阈值把它挡掉；两侧都不连续就丢掉这条采样。
+	const float CentreSceneDepth = ConvertFromDeviceZ(DeviceZ);
+	const float ContinuityThreshold = 0.02f * CentreSceneDepth;
+
+	const float ZRight = LoadDeviceZ(PixelPos + int2(1, 0), RectMin, RectMax);
+	const float ZLeft  = LoadDeviceZ(PixelPos + int2(-1, 0), RectMin, RectMax);
+	const float ZDown  = LoadDeviceZ(PixelPos + int2(0, 1), RectMin, RectMax);
+	const float ZUp    = LoadDeviceZ(PixelPos + int2(0, -1), RectMin, RectMax);
+
+	const float DeltaRight = (ZRight > 0.0f) ? abs(ConvertFromDeviceZ(ZRight) - CentreSceneDepth) : ContinuityThreshold;
+	const float DeltaLeft  = (ZLeft  > 0.0f) ? abs(ConvertFromDeviceZ(ZLeft)  - CentreSceneDepth) : ContinuityThreshold;
+	const float DeltaDown  = (ZDown  > 0.0f) ? abs(ConvertFromDeviceZ(ZDown)  - CentreSceneDepth) : ContinuityThreshold;
+	const float DeltaUp    = (ZUp    > 0.0f) ? abs(ConvertFromDeviceZ(ZUp)    - CentreSceneDepth) : ContinuityThreshold;
+
+	const bool bUseRight = DeltaRight < DeltaLeft;
+	const bool bUseDown = DeltaDown < DeltaUp;
+	const float ZX = bUseRight ? ZRight : ZLeft;
+	const float ZY = bUseDown ? ZDown : ZUp;
+	if (ZX <= 0.0f || ZY <= 0.0f) return false;
+	if (min(DeltaRight, DeltaLeft) >= ContinuityThreshold) return false;
+	if (min(DeltaDown, DeltaUp) >= ContinuityThreshold) return false;
+
+	const float2 OffsetX = bUseRight ? float2(1.0f, 0.0f) : float2(-1.0f, 0.0f);
+	const float2 OffsetY = bUseDown ? float2(0.0f, 1.0f) : float2(0.0f, -1.0f);
+	const float3 NeighbourX = SvPositionToTranslatedWorld(float4(PixelCentre + OffsetX, ZX, 1.0f));
+	const float3 NeighbourY = SvPositionToTranslatedWorld(float4(PixelCentre + OffsetY, ZY, 1.0f));
+
+	// 统一到 +x / +y 屏幕方向，叉积的朝向才是确定的。
+	const float3 dPdx = (NeighbourX - SurfaceTW) * (bUseRight ? 1.0f : -1.0f);
+	const float3 dPdy = (NeighbourY - SurfaceTW) * (bUseDown ? 1.0f : -1.0f);
+
+	float3 Normal = cross(dPdy, dPdx);
+	const float NormalLength = length(Normal);
+	if (NormalLength <= 0.0f) return false;
+	Normal /= NormalLength;
+
+	// 深度缓冲里的表面一定朝着相机，用这一点定叉积的符号，省得去猜投影的手性。
+	if (dot(Normal, View.TranslatedWorldCameraOrigin - SurfaceTW) < 0.0f) Normal = -Normal;
+
+	// brush-local 加回中心：全程不碰绝对世界坐标，float 精度只需覆盖笔刷本身。
+	const float3 WorldPosition = BrushLocal + BrushCentreWorld;
+	const bool bOutsidePaintBounds = any(WorldPosition < PaintBoundsMin) || any(WorldPosition > PaintBoundsMax);
+	if (bUsePaintBounds != 0 && bOutsidePaintBounds) return false;
+
+	OutWorldPosition = WorldPosition;
+	OutWorldNormal = Normal;
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// 只发一个线程组：间距剔除要看同批次里别的候选，跨组就没法在不排序的情况下做到。
+// 一次 stroke update 的候选数本来就只有几十个，一个组绰绰有余。
+// -----------------------------------------------------------------------------
+[numthreads(CS_DEPTH_BRUSH_GROUP_SIZE, 1, 1)]
+void DepthBrushSampleCS(uint3 GroupThreadId : SV_GroupThreadID)
+{
+	const uint Lane = GroupThreadId.x;
+
+	// 在任何 append 之前读一次计数，就是本批次稳定的"已提交点"基线。
+	if (Lane == 0) GBaseCount = min(RWCounter[0], PointCapacity);
+	GroupMemoryBarrierWithGroupSync();
+
+	const uint BaseCount = GBaseCount;
+
+	float3 WorldPosition = 0.0f;
+	float3 WorldNormal = float3(0.0f, 0.0f, 1.0f);
+	bool bValid = false;
+	if (Lane < SampleCount) bValid = TryFindSurface(Lane, WorldPosition, WorldNormal);
+
+	// 与已提交点的间距：线性扫描。点集上限是 MaxPointCount，笔刷交互一次只跑一个组，
+	// 代价可接受，换来的是不需要任何空间结构或回读。
+	if (bValid && MinSpacingSq > 0.0f)
+	{
+		for (uint Index = 0; Index < BaseCount; ++Index)
+		{
+			const float3 Delta = RWPositions[Index].xyz - WorldPosition;
+			if (dot(Delta, Delta) < MinSpacingSq)
+			{
+				bValid = false;
+				break;
+			}
+		}
+	}
+
+	GCandidatePosition[Lane] = WorldPosition;
+	GCandidateValid[Lane] = bValid ? 1u : 0u;
+	GroupMemoryBarrierWithGroupSync();
+
+	// 同批次内的间距：只看下标更小的候选，且用的是它们**剔除前**的有效位。这比严格的贪心
+	// 稍微保守（可能多丢一两个点），换来的是不必在组内串行传播剔除结果。
+	if (bValid && MinSpacingSq > 0.0f)
+	{
+		for (uint Other = 0; Other < Lane; ++Other)
+		{
+			if (GCandidateValid[Other] == 0) continue;
+			const float3 Delta = GCandidatePosition[Other] - WorldPosition;
+			if (dot(Delta, Delta) < MinSpacingSq)
+			{
+				bValid = false;
+				break;
+			}
+		}
+	}
+
+	if (bValid)
+	{
+		uint WriteIndex = 0;
+		InterlockedAdd(RWCounter[0], 1u, WriteIndex);
+		if (WriteIndex < PointCapacity)
+		{
+			RWPositions[WriteIndex] = float4(WorldPosition, 1.0f);
+			RWNormals[WriteIndex] = float4(WorldNormal, 0.0f);
+		}
+		else
+		{
+			// 满了就把自己那一格加回去；计数一旦到达容量就不会再降到容量以下，索引不会重发。
+			InterlockedAdd(RWCounter[0], uint(-1));
+		}
+	}
+}

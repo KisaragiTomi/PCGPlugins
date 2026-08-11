@@ -5,6 +5,7 @@
 
 class AActor;
 class FEditorViewportClient;
+class FSceneViewStateInterface;
 class FViewport;
 class UMaterialInstanceDynamic;
 class UStaticMeshComponent;
@@ -27,6 +28,12 @@ struct FCSBrushSettings
 	float PreviewLifetime = 0.1f;
 	FColor PreviewColor = FColor::Cyan;
 	bool bExitAfterCommit = false;
+
+	/** Drop hits whose surface faces the same way the ray travels, i.e. the ray struck a back face
+	 *  from inside the geometry. The brush sphere is a volume: near its rim a sample ray starts
+	 *  level with the surface and can enter the mesh, and this is what keeps the resulting hit off
+	 *  the inside wall. No slope restriction — placement is orientation-agnostic by design. */
+	bool bRejectBackFaces = true;
 };
 
 /**
@@ -41,6 +48,9 @@ struct FCSBrushSettings
  * settings, and what to do with a finished stroke. Committing is the only place a leaf touches
  * its target's data, so a stroke never costs more than a few traces regardless of what the leaf
  * ultimately builds.
+ *
+ * A leaf that does not sample on the CPU at all overrides SamplePendingPoints and leaves the
+ * pending set empty; the stroke lifecycle, the brush sphere and the preview are unaffected.
  */
 class FCSBrushEdModeBase : public FEdMode
 {
@@ -74,8 +84,14 @@ protected:
 	/** Brush knobs for this stroke, normally forwarded from the target actor's properties. */
 	virtual FCSBrushSettings GetBrushSettings() const = 0;
 
-	/** Hands a finished stroke to the target. Called once on mouse-up, never during the drag. */
+	/** Hands a finished stroke to the target. Called once on mouse-up, never during the drag.
+	 *  Samples is what SamplePendingPoints collected, so a leaf that samples on the GPU gets an
+	 *  empty array and commits whatever its own pass already wrote. */
 	virtual void CommitSamples(const TArray<FCSBrushSample>& Samples) = 0;
+
+	/** Collects this update's samples. The default traces the world and fills the pending set;
+	 *  called once when the stroke starts and again on every mouse-move while it is held. */
+	virtual void SamplePendingPoints();
 
 	/** Drops the leaf's target. Called from Exit so a deactivated mode holds nothing of the level. */
 	virtual void ClearBrushTarget() = 0;
@@ -95,6 +111,15 @@ protected:
 	void CancelStroke();
 	void ExitTemporaryMode();
 
+	/** Where the cursor ray met a surface, and whether that hit is current. The sample disc — CPU
+	 *  or GPU — is centred there. */
+	bool IsBrushTraceValid() const { return bBrushTraceValid; }
+	const FVector& GetBrushLocation() const { return BrushLocation; }
+
+	/** Identifies the viewport the brush is being dragged in. A leaf that samples off the rendered
+	 *  frame needs it to pick the right one out of the several the editor renders. */
+	FSceneViewStateInterface* GetBrushViewState() const { return BrushViewState; }
+
 private:
 	void CreateBrushComponent();
 	void DestroyBrushComponent();
@@ -102,10 +127,10 @@ private:
 	bool UpdateBrushTraceFromMouse(FEditorViewportClient* ViewportClient, FViewport* Viewport, int32 MouseX, int32 MouseY);
 	bool TraceBrushRay(FEditorViewportClient* ViewportClient, const FVector& RayOrigin, const FVector& RayDirection);
 	bool TraceCandidatePoint(const FVector& Start, const FVector& End, FHitResult& OutHit) const;
+	bool IsSurfacePaintable(const FHitResult& Hit, const FVector& TraceDirection, const FCSBrushSettings& Settings) const;
 	void BeginStroke();
 	void UpdateStroke();
 	void CommitStroke();
-	void SamplePendingPoints();
 	bool IsCandidatePointAllowed(const FVector& Location, float MinSpacing) const;
 	bool IsTooCloseToPending(const FVector& Location, float MinSpacingSq) const;
 	void GetRandomVectorInBrush(float BrushRadius, FVector& OutStart, FVector& OutEnd) const;
@@ -116,6 +141,7 @@ private:
 
 	bool bBrushTraceValid = false;
 	bool bStrokeActive = false;
+	FSceneViewStateInterface* BrushViewState = nullptr;
 	FVector BrushLocation = FVector::ZeroVector;
 	FVector BrushNormal = FVector::UpVector;
 	FVector BrushTraceDirection = FVector::ForwardVector;

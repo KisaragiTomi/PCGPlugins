@@ -15,7 +15,7 @@
 
 FCSGpuMeshSceneProxy::FCSGpuMeshSceneProxy(const UPrimitiveComponent* Component, UMaterialInterface* InMaterial, const char* DebugName)
 	: FPrimitiveSceneProxy(Component)
-	, VertexFactory(GetScene().GetFeatureLevel(), DebugName)
+	, VertexFactoryDebugName(DebugName)
 	, Material(InMaterial)
 {
 	if (!Material) Material = UMaterial::GetDefaultMaterial(MD_Surface);
@@ -49,7 +49,11 @@ void FCSGpuMeshSceneProxy::DestroyRenderThreadResources()
 {
 	// Release the vertex factory before the buffers it streams from (matches the
 	// original per-proxy teardown order).
-	VertexFactory.ReleaseResource();
+	if (VertexFactory)
+	{
+		VertexFactory->ReleaseResource();
+		VertexFactory.Reset();
+	}
 	ReleaseGpuGeometry();
 	FPrimitiveSceneProxy::DestroyRenderThreadResources();
 }
@@ -57,10 +61,10 @@ void FCSGpuMeshSceneProxy::DestroyRenderThreadResources()
 void FCSGpuMeshSceneProxy::GetDynamicMeshElements(const TArray<const FSceneView*>& Views,
 	const FSceneViewFamily& ViewFamily, uint32 VisibilityMap, FMeshElementCollector& Collector) const
 {
-	if (!DrawDesc.bValid || DrawDesc.IndexBuffer == nullptr) return;
+	if (!DrawDesc.bValid || DrawDesc.IndexBuffer == nullptr || !VertexFactory) return;
 
 	FMaterialRenderProxy* MaterialProxy = Material->GetRenderProxy();
-	SubmitGpuBufferDraw(*this, Views, VisibilityMap, Collector, VertexFactory, *MaterialProxy,
+	SubmitGpuBufferDraw(*this, Views, VisibilityMap, Collector, *VertexFactory, *MaterialProxy,
 		*DrawDesc.IndexBuffer, PT_TriangleList, DrawDesc.NumPrimitives, DrawDesc.MaxVertexIndex,
 		bBatchCastShadow, DrawDesc.IndirectArgsBuffer, DrawDesc.IndirectArgsOffset);
 }
@@ -146,7 +150,7 @@ void FCSGpuMeshSceneProxy::AddStream(const FCSGpuStreamDesc& Desc)
 	Streams.Add(MoveTemp(Runtime));
 }
 
-void FCSGpuMeshSceneProxy::AddStandardTriangleStreams()
+void FCSGpuMeshSceneProxy::AddStandardTriangleStreams(uint32 NumIndirectDraws)
 {
 	{
 		FCSGpuStreamDesc D;
@@ -219,7 +223,7 @@ void FCSGpuMeshSceneProxy::AddStandardTriangleStreams()
 		D.DebugName = TEXT("CSGpuMesh.IndirectArgs");
 		D.Role = ECSGpuStreamRole::IndirectArgs;
 		D.BytesPerElement = sizeof(uint32);
-		D.ElementsPerUnit = 5;
+		D.ElementsPerUnit = 5 * FMath::Max(NumIndirectDraws, 1u);
 		D.CountSource = ECSGpuCountSource::Fixed;
 		D.SrvFormat = PF_Unknown;
 		D.VfType = VET_None;
@@ -255,6 +259,17 @@ TRefCountPtr<FRDGPooledBuffer> FCSGpuMeshSceneProxy::GetStreamBuffer(ECSGpuStrea
 	return S ? S->Pooled : TRefCountPtr<FRDGPooledBuffer>();
 }
 
+FRHIShaderResourceView* FCSGpuMeshSceneProxy::GetStreamSRV(ECSGpuStreamRole Role, uint8 Index) const
+{
+	const FCSGpuStreamRuntime* S = FindStream(Role, Index);
+	return S ? S->SRV.GetReference() : nullptr;
+}
+
+TUniquePtr<FLocalVertexFactory> FCSGpuMeshSceneProxy::CreateVertexFactory(ERHIFeatureLevel::Type InFeatureLevel, const char* InDebugName) const
+{
+	return MakeUnique<FLocalVertexFactory>(InFeatureLevel, InDebugName);
+}
+
 void FCSGpuMeshSceneProxy::GetMeshReadbackDescs(TArray<FCSGpuStreamDesc>& OutDescs) const
 {
 	OutDescs.Reset();
@@ -279,6 +294,9 @@ void FCSGpuMeshSceneProxy::AllocateStreamsAndBindVF(FRHICommandListBase& RHICmdL
 {
 	const uint32 VertUnits = FMath::Max(VertexCapacity, 1u);
 	const uint32 IdxUnits = FMath::Max(IndexCapacity, 1u);
+
+	// Leaf-selected vertex factory; created here (not in the ctor) so the virtual dispatch works.
+	if (!VertexFactory) VertexFactory = CreateVertexFactory(GetScene().GetFeatureLevel(), VertexFactoryDebugName);
 
 	FLocalVertexFactory::FDataType Data;
 
@@ -363,8 +381,10 @@ void FCSGpuMeshSceneProxy::AllocateStreamsAndBindVF(FRHICommandListBase& RHICmdL
 		}
 	}
 
-	VertexFactory.SetData(RHICmdList, Data);
-	VertexFactory.InitResource(RHICmdList);
+	OnStreamsAllocated(RHICmdList);
+
+	VertexFactory->SetData(RHICmdList, Data);
+	VertexFactory->InitResource(RHICmdList);
 
 	DrawDesc.FirstIndex = 0;
 	DrawDesc.MinVertexIndex = 0;

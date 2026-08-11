@@ -59,11 +59,13 @@ bool FCSPointBrushBufferAutomationTest::RunTest(const FString& Parameters)
 	if (!TestNotNull(TEXT("Point debug component"), Debug)) return false;
 	TestFalse(TEXT("A fresh actor holds no GPU buffer"), BrushActor->HasPointBuffer());
 
-	// --- committing a stroke: the CPU array is the truth, the GPU buffer is rebuilt from it.
+	// --- adding points through the CPU API: the array is seeded into a cap-sized GPU buffer, whose
+	// tail is the room the depth brush's compute pass appends into.
 	TestEqual(TEXT("Every painted point was accepted"), BrushActor->AppendBrushPoints(MakeTestBrushPoints(8)), 8);
 	TestEqual(TEXT("Painted points are stored on the actor"), BrushActor->GetBrushPointCount(), 8);
 	TestTrue(TEXT("Committing built the GPU buffer"), BrushActor->HasPointBuffer());
-	TestEqual(TEXT("GPU capacity matches the painted count"), BrushActor->GetPointBuffers().Capacity, 8);
+	TestEqual(TEXT("GPU capacity is the point cap, not the painted count"),
+		BrushActor->GetPointBuffers().Capacity, BrushActor->MaxPointCount);
 
 	FlushRenderingCommands();
 	TestNotNull(TEXT("Painted points produced a debug proxy"), Debug->SceneProxy);
@@ -73,7 +75,6 @@ bool FCSPointBrushBufferAutomationTest::RunTest(const FString& Parameters)
 	BrushActor->AppendBrushPoints(MakeTestBrushPoints(4));
 	FlushRenderingCommands();
 	TestEqual(TEXT("Second stroke appends to the same point set"), BrushActor->GetBrushPointCount(), 12);
-	TestEqual(TEXT("GPU capacity tracks the grown point set"), BrushActor->GetPointBuffers().Capacity, 12);
 	TestNotNull(TEXT("Second stroke still has a debug proxy"), Debug->SceneProxy);
 
 	// --- the point cap is a hard limit, not a suggestion.

@@ -1,0 +1,247 @@
+// Two-level GPU culling + LOD selection for UCSGpuInstancedMeshComponent — the GPU half of
+// what UHierarchicalInstancedStaticMeshComponent does on the game thread.
+//
+//   ClusterCullCS   coarse level: one thread per Morton-ordered cluster, sphere vs frustum and
+//                   max draw distance, result is a 0/1 flag per cluster.
+//   InstanceCullCS  fine level: one thread per instance, skipped outright if its cluster was
+//                   rejected; survivors pick a LOD from their screen size and are compacted
+//                   with an atomic into that LOD's region of the visible-instance buffers.
+//   BuildArgsCS     one DrawIndexedIndirect arg set per LOD, instance count straight from the
+//                   compaction counters — the visible set never reaches the CPU.
+//
+// Everything runs in COMPONENT-LOCAL space: the frustum planes and the view origin are
+// transformed on the CPU (in double precision, which also sidesteps LWC in the shader) and
+// distances are converted to world units with ComponentScale. Instance transforms are written
+// in the exact layout LocalVertexFactory.ush's GetInstanceTransform() expects, so the draw needs
+// no shader changes at all.
+
+#include "/Engine/Public/Platform.ush"
+
+#define CS_INSTANCED_MAX_LODS 4
+
+// ── source ───────────────────────────────────────────────────────────────────
+// 5 float4 per instance: [0..2] rows of the instance-to-component 3x3 (.w = 0),
+// [3] origin.xyz + per-instance random in .w, [4] cull sphere centre.xyz + radius in .w.
+Buffer<float4> SrcInstances;
+Buffer<uint>   SrcInstanceCount;  // [0] = live instance count (CPU path writes the array size)
+Buffer<float4> SrcClusterBounds;  // centre.xyz + radius per cluster
+
+// ── outputs ──────────────────────────────────────────────────────────────────
+RWBuffer<uint>   RWClusterVisible; // 1 per cluster
+RWBuffer<float4> RWVisTransforms;  // 3 per visible slot
+RWBuffer<float4> RWVisOrigins;     // 1 per visible slot
+RWBuffer<float4> RWVisLightmap;    // 1 per visible slot (always 0 — no baked lighting here)
+RWBuffer<uint>   RWLodCounters;    // 1 per LOD, compaction cursor
+RWBuffer<uint>   RWIndirectArgs;   // 5 uints per LOD
+
+// ── view / config ────────────────────────────────────────────────────────────
+float4 FrustumPlanes[6];      // component-local, normalised: outside when dot(N, C) - W > R
+float3 ViewOriginLocal;
+float  ComponentScale;        // local unit -> world unit (largest axis scale)
+float  ScreenMultiple;        // 0.5 * max(ProjMatrix[0][0], ProjMatrix[1][1])
+float4 LodScreenSizes;        // per-LOD switch thresholds, already multiplied by the user scale
+uint4  LodIndexCount;
+uint4  LodFirstIndex;
+uint4  LodBaseVertex;
+uint   NumLods;
+uint   NumClusters;
+uint   ClusterSize;           // instances per cluster (0 => no cluster level)
+uint   MaxInstancesPerLod;    // stride of one LOD's region in the visible buffers
+uint   MaxSourceInstances;    // capacity of SrcInstances, guards a stale GPU counter
+float  MaxDrawDistanceSq;     // world units squared; 0 disables the distance cull
+uint   bFrustumCull;
+uint   bLodSelect;
+
+float GetLodScreenSize(uint Lod)
+{
+	return (Lod == 0) ? LodScreenSizes.x : ((Lod == 1) ? LodScreenSizes.y : ((Lod == 2) ? LodScreenSizes.z : LodScreenSizes.w));
+}
+
+uint GetLodIndexCount(uint Lod)
+{
+	return (Lod == 0) ? LodIndexCount.x : ((Lod == 1) ? LodIndexCount.y : ((Lod == 2) ? LodIndexCount.z : LodIndexCount.w));
+}
+
+uint GetLodFirstIndex(uint Lod)
+{
+	return (Lod == 0) ? LodFirstIndex.x : ((Lod == 1) ? LodFirstIndex.y : ((Lod == 2) ? LodFirstIndex.z : LodFirstIndex.w));
+}
+
+uint GetLodBaseVertex(uint Lod)
+{
+	return (Lod == 0) ? LodBaseVertex.x : ((Lod == 1) ? LodBaseVertex.y : ((Lod == 2) ? LodBaseVertex.z : LodBaseVertex.w));
+}
+
+/** Sphere vs the six local-space frustum planes. Conservative: a sphere straddling a plane stays. */
+bool SphereInFrustum(float3 Centre, float Radius)
+{
+	bool bInside = true;
+	UNROLL
+	for (uint i = 0; i < 6; ++i)
+	{
+		bInside = bInside && (dot(FrustumPlanes[i].xyz, Centre) - FrustumPlanes[i].w <= Radius);
+	}
+	return bInside;
+}
+
+/** Shared reject for both levels. Distance is measured in world units so the component's own
+ *  scale does not silently change the cull radius. */
+bool PassesViewTests(float3 Centre, float Radius)
+{
+	if (MaxDrawDistanceSq > 0.0f)
+	{
+		const float DistWorldSq = dot(Centre - ViewOriginLocal, Centre - ViewOriginLocal) * (ComponentScale * ComponentScale);
+		// Subtracting the radius would keep huge instances alive forever; match HISM and test the centre.
+		if (DistWorldSq > MaxDrawDistanceSq) return false;
+	}
+	if (bFrustumCull != 0 && !SphereInFrustum(Centre, Radius)) return false;
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// Point cloud -> instance rows
+//
+// Lets a producer that owns a (world position, world normal) point buffer drive the instanced
+// display without knowing this layout: one instance per point, +Z aligned to the normal. Runs
+// ahead of the cull every frame, so an appending producer (the depth-sampling point brush) needs
+// no readback and no notification — whatever is in the buffer this frame gets packed this frame.
+// -----------------------------------------------------------------------------
+
+Buffer<float4> SrcPointPositions;
+Buffer<float4> SrcPointNormals;
+RWBuffer<float4> RWPackedInstances;
+
+float4x4 WorldToComponent;    // point positions are world-space; instance rows are component-space
+float3   BaseSphereCentre;    // base mesh bounds centre, component space, unscaled
+float    BaseSphereRadius;
+float    PointInstanceScale;
+
+/** Deterministic 0..1 per instance, matching what the CPU path puts in Origin.w. */
+float InstanceRandom(uint Index)
+{
+	uint H = Index * 747796405u + 2891336453u;
+	H = ((H >> ((H >> 28) + 4u)) ^ H) * 277803737u;
+	H = (H >> 22) ^ H;
+	return float(H & 0xFFFFFFu) / float(0x1000000u);
+}
+
+[numthreads(64, 1, 1)]
+void PackPointInstancesCS(uint3 Id : SV_DispatchThreadID)
+{
+	const uint Instance = Id.x;
+	if (Instance >= MaxSourceInstances) return;
+
+	// Past the live count the rows are stale, but the cull never reads them: it stops at
+	// SrcInstanceCount[0] too. Leaving them alone is cheaper than clearing.
+	if (Instance >= min(SrcInstanceCount[0], MaxSourceInstances)) return;
+
+	const float3 WorldPosition = SrcPointPositions[Instance].xyz;
+	const float3 WorldNormal = SrcPointNormals[Instance].xyz;
+
+	const float3 Origin = mul(float4(WorldPosition, 1.0f), WorldToComponent).xyz;
+	float3 Z = mul(float4(WorldNormal, 0.0f), WorldToComponent).xyz;
+	const float ZLength = length(Z);
+	Z = (ZLength > 1e-6f) ? (Z / ZLength) : float3(0.0f, 0.0f, 1.0f);
+
+	// Any tangent perpendicular to Z will do — a point carries no roll.
+	const float3 Helper = (abs(Z.z) < 0.99f) ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+	const float3 X = normalize(cross(Helper, Z));
+	const float3 Y = cross(Z, X);
+
+	const float Scale = max(PointInstanceScale, 1e-6f);
+	const uint Base = Instance * 5u;
+
+	// Rows of the instance-to-component 3x3, exactly what LocalVertexFactory.ush's
+	// GetInstanceTransform() reconstructs. Row 0's .w is hitproxy/selection — must stay 0.
+	RWPackedInstances[Base + 0u] = float4(X * Scale, 0.0f);
+	RWPackedInstances[Base + 1u] = float4(Y * Scale, 0.0f);
+	RWPackedInstances[Base + 2u] = float4(Z * Scale, 0.0f);
+	RWPackedInstances[Base + 3u] = float4(Origin, InstanceRandom(Instance));
+
+	// Cull sphere: the base mesh's bounds sphere carried through this instance's transform.
+	const float3 SphereCentre = Origin + (X * BaseSphereCentre.x + Y * BaseSphereCentre.y + Z * BaseSphereCentre.z) * Scale;
+	RWPackedInstances[Base + 4u] = float4(SphereCentre, BaseSphereRadius * Scale);
+}
+
+// -----------------------------------------------------------------------------
+// Coarse level
+// -----------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void ClusterCullCS(uint3 Id : SV_DispatchThreadID)
+{
+	const uint Cluster = Id.x;
+	if (Cluster >= NumClusters) return;
+
+	const float4 Bounds = SrcClusterBounds[Cluster];
+	RWClusterVisible[Cluster] = PassesViewTests(Bounds.xyz, Bounds.w) ? 1u : 0u;
+}
+
+// -----------------------------------------------------------------------------
+// Fine level: per-instance cull + LOD select + compaction.
+// Dispatched over the source capacity, not the live count: the count can be GPU-decided
+// (a scatter pass wrote it) and the surplus threads exit on the first compare, which is
+// far cheaper than a round trip or a separate indirect-dispatch-args pass.
+// -----------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void InstanceCullCS(uint3 Id : SV_DispatchThreadID)
+{
+	const uint Instance = Id.x;
+	const uint Count = min(SrcInstanceCount[0], MaxSourceInstances);
+	if (Instance >= Count) return;
+
+	// Coarse rejection. Clusters are contiguous fixed-size runs of the Morton-sorted order, so
+	// the cluster index is pure arithmetic — no per-instance cluster id to store or load.
+	if (ClusterSize > 0u && NumClusters > 0u)
+	{
+		const uint Cluster = min(Instance / ClusterSize, NumClusters - 1u);
+		if (RWClusterVisible[Cluster] == 0u) return;
+	}
+
+	const uint Base = Instance * 5u;
+	const float4 Sphere = SrcInstances[Base + 4u];
+	if (!PassesViewTests(Sphere.xyz, Sphere.w)) return;
+
+	uint Lod = 0u;
+	if (bLodSelect != 0 && NumLods > 1u)
+	{
+		const float DistWorld = max(length(Sphere.xyz - ViewOriginLocal) * ComponentScale, 1.0f);
+		const float ScreenSize = 2.0f * ScreenMultiple * (Sphere.w * ComponentScale) / DistWorld;
+
+		// Thresholds decrease with LOD index, so the last one the instance is smaller than wins.
+		for (uint i = 1u; i < NumLods; ++i)
+		{
+			if (ScreenSize < GetLodScreenSize(i)) Lod = i;
+		}
+	}
+
+	uint Slot;
+	InterlockedAdd(RWLodCounters[Lod], 1u, Slot);
+	if (Slot >= MaxInstancesPerLod) return; // capacity is NumInstances per LOD, so this cannot fire
+
+	const uint Dst = Lod * MaxInstancesPerLod + Slot;
+	RWVisTransforms[Dst * 3u + 0u] = SrcInstances[Base + 0u];
+	RWVisTransforms[Dst * 3u + 1u] = SrcInstances[Base + 1u];
+	RWVisTransforms[Dst * 3u + 2u] = SrcInstances[Base + 2u];
+	RWVisOrigins[Dst] = SrcInstances[Base + 3u];
+	RWVisLightmap[Dst] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+// -----------------------------------------------------------------------------
+// One DrawIndexedIndirect arg set per LOD
+// -----------------------------------------------------------------------------
+[numthreads(CS_INSTANCED_MAX_LODS, 1, 1)]
+void BuildArgsCS(uint3 Id : SV_DispatchThreadID)
+{
+	const uint Lod = Id.x;
+	if (Lod >= CS_INSTANCED_MAX_LODS) return;
+
+	const uint Args = Lod * 5u;
+	const bool bActive = Lod < NumLods;
+	const uint Visible = bActive ? min(RWLodCounters[Lod], MaxInstancesPerLod) : 0u;
+
+	RWIndirectArgs[Args + 0u] = bActive ? GetLodIndexCount(Lod) : 0u; // IndexCountPerInstance
+	RWIndirectArgs[Args + 1u] = Visible;                              // InstanceCount
+	RWIndirectArgs[Args + 2u] = bActive ? GetLodFirstIndex(Lod) : 0u; // StartIndexLocation
+	RWIndirectArgs[Args + 3u] = bActive ? GetLodBaseVertex(Lod) : 0u; // BaseVertexLocation
+	RWIndirectArgs[Args + 4u] = 0u;                                   // StartInstanceLocation
+}

@@ -1,5 +1,6 @@
 #include "CSDisplayComponent.h"
 
+#include "CSDisplayPointArrowSceneProxy.h"
 #include "CSDisplayTriangleSceneProxy.h"
 #include "CSDisplayVoxelSceneProxy.h"
 #include "CSGpuDebugDraw.h"
@@ -101,6 +102,52 @@ int32 UCSDisplayComponent::ShowVoxelDirections(
 		MaxDirectionsToDraw, Lifetime);
 }
 
+int32 UCSDisplayComponent::ShowPointArrows(
+	const FCSGpuDebugPooledSource& Source,
+	int32 MaxArrowsToDraw,
+	float ArrowLength,
+	FLinearColor ArrowColor,
+	float Lifetime)
+{
+	if (!Source.IsValid())
+	{
+		ClearDisplay();
+		return 0;
+	}
+
+	FCSDisplayPointArrowData NewData;
+	NewData.Positions = Source.Positions;
+	NewData.Normals = Source.Normals;
+	NewData.Counter = Source.Counter;
+	NewData.MaxArrowsToDraw = MaxArrowsToDraw > 0
+		? FMath::Min(MaxArrowsToDraw, Source.Capacity)
+		: Source.Capacity;
+	NewData.ArrowLength = FMath::Max(ArrowLength, UE_KINDA_SMALL_NUMBER);
+	// 柱身/锥头比例按总长派生，调用方只需给一个长度就能得到形状合理的箭头。
+	NewData.ShaftRadius = NewData.ArrowLength * 0.06f;
+	NewData.HeadRadius = NewData.ArrowLength * 0.16f;
+	NewData.HeadFraction = 0.35f;
+	NewData.ArrowColor = ArrowColor;
+	NewData.WorldBounds = Source.WorldBounds;
+
+	// 切换到箭头模式：清掉其它两种源，保持"一个实例一次显示一种"的约定。
+	PendingPrepared = FCSBoxScenePreparedData();
+	PendingVertexCapacity = 0;
+	PendingVoxelData = FCSDisplayVoxelData();
+	PendingArrowData = MoveTemp(NewData);
+	Mode = ECSDisplayMode::PointArrows;
+
+	// 箭头会沿法线伸出总长，包围盒需按此外扩，否则会被过早剔除。
+	LocalBounds = PendingArrowData.WorldBounds.IsValid
+		? PendingArrowData.WorldBounds.ExpandBy(PendingArrowData.ArrowLength)
+		: FBox(FVector(-100.0), FVector(100.0));
+
+	RecreateRenderState_Concurrent();
+	UpdateBounds();
+	ScheduleClear(Lifetime);
+	return PendingArrowData.MaxArrowsToDraw;
+}
+
 bool UCSDisplayComponent::ShowVoxelQuads(
 	const FCSSurfaceVoxelGPUBuffers& Source,
 	float QuadScale,
@@ -137,6 +184,7 @@ void UCSDisplayComponent::ClearDisplay()
 	PendingPrepared = FCSBoxScenePreparedData();
 	PendingVertexCapacity = 0;
 	PendingVoxelData = FCSDisplayVoxelData();
+	PendingArrowData = FCSDisplayPointArrowData();
 	LocalBounds = FBox(ForceInit);
 	RecreateRenderState_Concurrent();
 	UpdateBounds();
@@ -151,6 +199,10 @@ FPrimitiveSceneProxy* UCSDisplayComponent::CreateSceneProxy()
 	case ECSDisplayMode::TriangleSoup:
 		if (!PendingPrepared.IsValid() || !PendingPrepared.HasAnyTriangles() || PendingVertexCapacity == 0) return nullptr;
 		return new FCSDisplayTriangleSceneProxy(this, PendingPrepared, PendingVertexCapacity);
+
+	case ECSDisplayMode::PointArrows:
+		if (!PendingArrowData.IsValid()) return nullptr;
+		return new FCSDisplayPointArrowSceneProxy(this, PendingArrowData);
 
 	case ECSDisplayMode::VoxelDirections:
 	case ECSDisplayMode::VoxelQuads:
@@ -182,6 +234,7 @@ void UCSDisplayComponent::SubmitVoxelData(FCSDisplayVoxelData&& InData, float Li
 {
 	PendingPrepared = FCSBoxScenePreparedData();
 	PendingVertexCapacity = 0;
+	PendingArrowData = FCSDisplayPointArrowData();
 	Mode = InData.Mode;
 	PendingVoxelData = MoveTemp(InData);
 	RecreateRenderState_Concurrent();

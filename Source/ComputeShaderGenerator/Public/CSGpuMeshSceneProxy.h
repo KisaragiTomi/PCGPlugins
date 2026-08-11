@@ -147,14 +147,35 @@ protected:
 
 	/** Register the standard triangle-mesh set: Position / TangentBasis / TexCoord0 /
 	 *  Color / Index / IndirectArgs + the MeshCounters carrier. Call after setting the
-	 *  capacities; leaves may AddStream(...) extra buffers before or after. */
-	void AddStandardTriangleStreams();
+	 *  capacities; leaves may AddStream(...) extra buffers before or after.
+	 *  NumIndirectDraws > 1 sizes the IndirectArgs buffer for that many DrawIndexedIndirect
+	 *  arg sets (5 uints each) so a leaf can issue one draw per LOD out of one buffer. */
+	void AddStandardTriangleStreams(uint32 NumIndirectDraws = 1);
 
 	/** Pooled buffer for a registered stream (for BuildGeometry to register external / dispatch). */
 	TRefCountPtr<FRDGPooledBuffer> GetStreamBuffer(ECSGpuStreamRole Role, uint8 Index = 0) const;
 
-	// Shared vertex factory; configured by the base from the registered streams.
-	FLocalVertexFactory VertexFactory;
+	/** SRV of a registered stream (only streams whose desc set SrvFormat have one). */
+	FRHIShaderResourceView* GetStreamSRV(ECSGpuStreamRole Role, uint8 Index = 0) const;
+
+	// -------------------------------------------------------------------------
+	// Vertex-factory hooks
+	// -------------------------------------------------------------------------
+
+	/** Create the vertex factory this proxy draws with. Called on the render thread from
+	 *  InitGpuGeometry, so leaves can return an FLocalVertexFactory subclass with extra
+	 *  streams (the instanced leaf returns one that manual-fetches per-instance transforms). */
+	virtual TUniquePtr<FLocalVertexFactory> CreateVertexFactory(ERHIFeatureLevel::Type InFeatureLevel, const char* InDebugName) const;
+
+	/** Called after every stream's pooled buffer + SRV exists but before the vertex factory is
+	 *  given its data and initialised — the one point where a leaf can hand its own SRVs to
+	 *  the vertex factory it created. */
+	virtual void OnStreamsAllocated(FRHICommandListBase& RHICmdList) {}
+
+	// Shared vertex factory; created by CreateVertexFactory() and configured by the base from
+	// the registered streams. Heap-held so leaves can substitute a subclass.
+	TUniquePtr<FLocalVertexFactory> VertexFactory;
+	const char* VertexFactoryDebugName = "FCSGpuMeshSceneProxy";
 
 	UMaterialInterface* Material = nullptr;
 	FMaterialRelevance MaterialRelevance;

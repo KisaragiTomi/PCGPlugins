@@ -1,5 +1,6 @@
 #include "CSPointBrushEdMode.h"
 
+#include "CSDepthBrushSampleService.h"
 #include "CSPointBrushActor.h"
 
 const FEditorModeID FCSPointBrushEdMode::EM_CSPointBrush = TEXT("CSPointBrushEdMode");
@@ -25,47 +26,58 @@ FCSBrushSettings FCSPointBrushEdMode::GetBrushSettings() const
 	Settings.TraceRadius = Target->TraceRadius;
 	Settings.MinSpacing = Target->MinSpacing;
 	Settings.SamplesPerMouseMove = Target->SamplesPerMouseMove;
-	Settings.PreviewPointSize = Target->PreviewPointSize;
-	Settings.PreviewLifetime = Target->PreviewLifetime;
-	Settings.PreviewColor = Target->PreviewPointColor;
 	Settings.bExitAfterCommit = Target->bExitAfterCommit;
 	return Settings;
 }
 
-void FCSPointBrushEdMode::CommitSamples(const TArray<FCSBrushSample>& Samples)
+void FCSPointBrushEdMode::SamplePendingPoints()
 {
 	ACSPointBrushActor* Target = TargetActor.Get();
-	if (!Target) return;
+	if (!Target || !IsBrushTraceValid()) return;
 
-	TArray<FCSBrushPoint> Points;
-	Points.Reserve(Samples.Num());
-	for (const FCSBrushSample& Sample : Samples)
+	// The pass appends into this buffer from the render thread, so it has to exist — and be big
+	// enough — before the request goes out.
+	if (!Target->EnsureGpuPointBuffer()) return;
+
+	const FCSBrushSettings Settings = GetBrushSettings();
+	const FVector BrushCentre = GetBrushLocation();
+	const float BrushRadius = FMath::Max(1.0f, Settings.Radius);
+	const int32 SampleCount = FMath::Max(1, Settings.SamplesPerMouseMove);
+
+	FCSDepthBrushSampleRequest Request;
+	Request.Output = Target->GetPointBuffers();
+	Request.ViewState = GetBrushViewState();
+	Request.BrushCentre = BrushCentre;
+	Request.BrushRadius = BrushRadius;
+	Request.MinSpacing = Settings.MinSpacing;
+	Request.SampleCount = SampleCount;
+	Request.RandomSeed = ++SampleSequence;
+	Request.PaintBounds = Target->bUsePaintBounds ? Target->GetPaintBoundsWorldBox() : FBox(ForceInit);
+
+	// Fired once the pass is in the frame's graph, so the display rebuild that follows is ordered
+	// behind it on the render thread and picks up the points this update just added.
+	Request.OnDispatched = [WeakTarget = TWeakObjectPtr<ACSPointBrushActor>(Target)]()
 	{
-		FCSBrushPoint& Point = Points.AddDefaulted_GetRef();
-		Point.Position = Sample.Location;
-		Point.Normal = Sample.Normal;
-	}
+		if (ACSPointBrushActor* RefreshTarget = WeakTarget.Get()) RefreshTarget->RefreshDebugDraw();
+	};
 
-	const int32 AddedCount = Target->AppendBrushPoints(Points);
-	UE_LOG(LogTemp, Log, TEXT("[CSPointBrush] Added %d points to %s (total %d)."),
-		AddedCount, *GetNameSafe(Target), Target->GetBrushPointCount());
+	FCSDepthBrushSampleService::Get().EnqueueSample(MoveTemp(Request));
+
+	// The GPU decides how many candidates survive; the CPU only gets to know the ceiling, which is
+	// what the arrow geometry and the draw bounds are sized from.
+	Target->NotifyGpuPointsRequested(SampleCount, BrushCentre, BrushRadius);
+}
+
+void FCSPointBrushEdMode::CommitSamples(const TArray<FCSBrushSample>& /*Samples*/)
+{
+	// Sampling already appended everything; committing is only about making sure the display shows
+	// the last update even if its dispatch callback was dropped with the request.
+	if (ACSPointBrushActor* Target = TargetActor.Get()) Target->RefreshDebugDraw();
 }
 
 void FCSPointBrushEdMode::ClearBrushTarget()
 {
 	TargetActor.Reset();
-}
-
-bool FCSPointBrushEdMode::IsTooCloseToCommitted(const FVector& Location, float MinSpacingSq) const
-{
-	const ACSPointBrushActor* Target = TargetActor.Get();
-	if (!Target) return false;
-
-	for (const FCSBrushPoint& Point : Target->PaintedPoints)
-	{
-		if (FVector::DistSquared(Point.Position, Location) < MinSpacingSq) return true;
-	}
-	return false;
 }
 
 bool FCSPointBrushEdMode::IsPointAllowed(const FVector& Location) const

@@ -209,8 +209,13 @@ bool FCSBrushEdModeBase::UpdateBrushTraceFromMouse(FEditorViewportClient* Viewpo
 	if (!ViewportClient || !Viewport)
 	{
 		bBrushTraceValid = false;
+		BrushViewState = nullptr;
 		return false;
 	}
+
+	// Recorded here rather than at stroke start: this is the one place that knows which viewport
+	// the cursor is over, and the brush follows the cursor across viewports.
+	BrushViewState = ViewportClient->ViewState.GetReference();
 
 	FSceneViewFamilyContext ViewFamily(FSceneViewFamily::ConstructionValues(
 		ViewportClient->Viewport,
@@ -238,10 +243,13 @@ bool FCSBrushEdModeBase::TraceBrushRay(FEditorViewportClient* ViewportClient, co
 	const FVector TraceStart = RayOrigin;
 	const FVector TraceEnd = RayOrigin + RayDirection * HALF_WORLD_MAX;
 	FHitResult Hit;
-	if (!TraceCandidatePoint(TraceStart, TraceEnd, Hit) || !IsPointAllowed(Hit.Location)) return false;
+	if (!TraceCandidatePoint(TraceStart, TraceEnd, Hit) || !IsPointAllowed(Hit.ImpactPoint)) return false;
 
-	BrushLocation = Hit.Location;
-	BrushNormal = Hit.Normal.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
+	// The cursor hit is deliberately NOT run through the surface filters: the sphere stays visible
+	// on a surface that cannot be painted so the user can see why nothing lands there. BrushNormal
+	// orients the sample disc, so it has to be the real surface normal, not the sweep normal.
+	BrushLocation = Hit.ImpactPoint;
+	BrushNormal = Hit.ImpactNormal.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
 	bBrushTraceValid = true;
 	return true;
 }
@@ -271,6 +279,19 @@ bool FCSBrushEdModeBase::TraceCandidatePoint(const FVector& Start, const FVector
 		true);
 }
 
+bool FCSBrushEdModeBase::IsSurfacePaintable(const FHitResult& Hit, const FVector& TraceDirection, const FCSBrushSettings& Settings) const
+{
+	if (!Settings.bRejectBackFaces) return true;
+
+	// ImpactNormal is the normal of the triangle actually struck; Hit.Normal is the sweep normal,
+	// which for a non-zero TraceRadius points along the sweep rather than along the surface.
+	const FVector SurfaceNormal = Hit.ImpactNormal.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
+
+	// A ray only leaves geometry through a face pointing back at it. A face pointing the same way
+	// the ray travels was hit from behind, so the sample sits on the inside of the mesh.
+	return FVector::DotProduct(SurfaceNormal, TraceDirection) <= 0.0;
+}
+
 void FCSBrushEdModeBase::BeginStroke()
 {
 	CancelStroke();
@@ -287,7 +308,9 @@ void FCSBrushEdModeBase::UpdateStroke()
 
 void FCSBrushEdModeBase::CommitStroke()
 {
-	if (!PendingSamples.IsEmpty()) CommitSamples(PendingSamples);
+	// Called unconditionally: a leaf that samples on the GPU has nothing in the pending set and
+	// still needs to know the stroke ended.
+	CommitSamples(PendingSamples);
 
 	const bool bExitAfterCommit = GetBrushTargetActor() && GetBrushSettings().bExitAfterCommit;
 	CancelStroke();
@@ -320,11 +343,14 @@ void FCSBrushEdModeBase::SamplePendingPoints()
 
 		FHitResult Hit;
 		if (!TraceCandidatePoint(Start, End, Hit)) continue;
-		if (!IsCandidatePointAllowed(Hit.Location, Settings.MinSpacing)) continue;
+		if (!IsSurfacePaintable(Hit, (End - Start).GetSafeNormal(), Settings)) continue;
+		// ImpactPoint is on the surface; Hit.Location is the sweep centre, which floats a
+		// TraceRadius above it.
+		if (!IsCandidatePointAllowed(Hit.ImpactPoint, Settings.MinSpacing)) continue;
 
 		FCSBrushSample& Sample = PendingSamples.AddDefaulted_GetRef();
-		Sample.Location = Hit.Location;
-		Sample.Normal = Hit.Normal.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
+		Sample.Location = Hit.ImpactPoint;
+		Sample.Normal = Hit.ImpactNormal.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
 	}
 }
 

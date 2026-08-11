@@ -37,7 +37,7 @@ FCSBrushSettings FCSInstanceBrushEdMode::GetBrushSettings() const
 void FCSInstanceBrushEdMode::CommitSamples(const TArray<FCSBrushSample>& Samples)
 {
 	AMeshGeneratorBrushCache* Target = TargetActor.Get();
-	if (!Target || !Target->InstanceBrushMesh) return;
+	if (Samples.IsEmpty() || !Target || !Target->InstanceBrushMesh) return;
 
 	TArray<FTransform> Transforms;
 	Transforms.Reserve(Samples.Num());

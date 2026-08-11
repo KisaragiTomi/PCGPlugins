@@ -1813,6 +1813,14 @@ FCSStaticMeshTriangleRDGOutput CSMeshGenInternal::AddResolvedStaticMeshTriangles
 	const int32 CombinedTriangleCountInt = int32(CombinedTriangleCount);
 	const uint32 TriangleCapacity = uint32(FMath::Clamp(MaxTriangles > 0 ? MaxTriangles : CombinedTriangleCountInt, 1, CombinedTriangleCountInt));
 	const uint32 VertexCapacity = TriangleCapacity * 3u;
+	// 容量不够时超出的三角形会被 shader 里的原子追加直接丢弃 —— 表面上只是「这块几何没被体素化」，
+	// 下游看到的是残缺的表面，很容易被误判成生成器逻辑出错。所以这里必须出声，不能静默截断。
+	if (TriangleCapacity < uint32(CombinedTriangleCountInt))
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[%s] 三角形容量不足：本次 %d 个三角形，容量只有 %u（MaxTriangles=%d），超出的会被丢弃，表面将不完整。请调大 MaxTriangles。"),
+			DebugName ? DebugName : TEXT("CS.StaticMeshTriangles"), CombinedTriangleCountInt, TriangleCapacity, MaxTriangles);
+	}
 	Output.MaxTriangles = TriangleCapacity;
 	Output.MaxVertices = VertexCapacity;
 

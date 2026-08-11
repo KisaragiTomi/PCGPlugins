@@ -9,17 +9,17 @@ class UStaticMesh;
 
 // Self-owning CPU-prep bundle produced by the shared vine helper (VineLeaf_BuildVineBuildInput).
 // Defined at global scope in GeometryEditorActor.cpp — same forward-declaration pattern as
-// FVineSCGPUBuffers. Held here through a TUniquePtr (PIMPL) so this public header stays free of
+// FVineFusedSCInputs. Held here through a TUniquePtr (PIMPL) so this public header stays free of
 // the internal RDG / voxel types the bundle owns.
 struct FVineBuildInput;
 
 /**
- * Renders a GPU-generated vine mesh directly through the render pipeline, in parallel with the
- * existing UDynamicMesh vine path (M1). The owning AVineContainer feeds it the same CPU-prep
- * bundle that drives the legacy DispatchVVGPU_Voxel readback path; here the shared vine compute
- * passes emit straight into the base-owned persistent GPU streams (positions/tangents/texcoords/
- * colors/indices + indirect args + counters) and the result is drawn every frame — vertex/index
- * data never returns to the CPU (except an explicit save-to-StaticMesh).
+ * Renders a GPU-generated vine mesh directly through the render pipeline. This IS the vine — the
+ * older UDynamicMesh path it once ran beside is gone. The owning AVineContainer feeds it a CPU-prep
+ * bundle; the shared vine compute passes then emit straight into the base-owned persistent GPU
+ * streams (positions/tangents/texcoords/colors/indices + indirect args + counters) and the result
+ * is drawn every frame — vertex/index data never returns to the CPU (except an explicit
+ * save-to-StaticMesh).
  *
  * All the generic GPU-mesh draw plumbing lives in UCSGpuMeshComponent / FCSGpuMeshSceneProxy;
  * this leaf only adds the vine material and the build-input hand-off. The mesh renders in world
@@ -41,8 +41,11 @@ public:
 	// the bundle is complete. Standard UE PIMPL pattern.
 	UVineMeshComponent(FVTableHelper& Helper);
 
-	/** Material used for the whole vine surface. Null falls back to the default surface material. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Vine")
+	/** Material used for the whole vine surface. Null falls back to the default surface material.
+	 *  Transient mirror, not the place to author it: AVineContainer::VineMaterial owns the
+	 *  assignment and pushes it down here (on load, on edit and on every generation), so a value
+	 *  written straight onto the component would be overwritten and never saved. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadWrite, Transient, Category = "Vine")
 	TObjectPtr<UMaterialInterface> VineMaterial;
 
 	/** Hand the component a new GPU-prep bundle (moved) and kick a synchronous proxy rebuild. */

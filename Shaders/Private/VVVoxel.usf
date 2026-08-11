@@ -35,8 +35,6 @@ RWBuffer<uint>  RWTangents;     // 2 packed 8888 SNORM / vertex (TangentX, Tange
 RWBuffer<float> RWTexCoords;    // 2 floats / vertex
 RWBuffer<uint>  RWColors;       // packed / vertex
 RWBuffer<uint>  RWBaseIndices;
-RWBuffer<uint>  RWIndirectArgs; // DrawIndexedIndirect: 5 uints
-RWBuffer<uint>  RWMeshCounters; // [0]=vertexCount [1]=indexCount (CPU readback carrier)
 float4x4 VineWorldToLocal;
 #else
 RWStructuredBuffer<float4> RW_OutVertices;
@@ -51,10 +49,16 @@ uint PackSnorm8888(float4 V)
 	return (uint(I.x) & 0xFF) | ((uint(I.y) & 0xFF) << 8) | ((uint(I.z) & 0xFF) << 16) | ((uint(I.w) & 0xFF) << 24);
 }
 
+// PathPointCount / SegmentCount / OutputVertexCount / OutputIndexCount are the CPU-side
+// ALLOCATION CAPACITIES, not the real geometry size: the compact counts are decided on the GPU
+// (space colonization -> concat prefix sum) and only ever land in VineMeshCounts. They survive
+// purely as range guards so a thread launched past the real count cannot walk off a buffer.
 uint PathPointCount;
 uint SegmentCount;
 uint OutputVertexCount;
 uint OutputIndexCount;
+// [0]=lineCount [1]=pointCount [2]=segmentCount, written by the concat prefix sum.
+StructuredBuffer<uint> VineMeshCounts;
 uint ProfileCount;
 uint bTube;
 float CircleScale;
@@ -146,6 +150,7 @@ int FindVoxelIndexForCell(int3 QueryCell)
 // linear probe, slot stores voxelIndex+1 (0 = empty). RW_HashBuildSlots must be cleared to
 // 0 before this dispatch. HashBuildSlotCount must be a power of two.
 StructuredBuffer<int4> HashBuildCells;
+Buffer<uint> HashBuildCounter; // producer's uint2: [0] = valid voxel count, [1] = dropped count
 RWStructuredBuffer<uint> RW_HashBuildSlots;
 uint HashBuildVoxelCount;
 uint HashBuildSlotCount;
@@ -154,7 +159,11 @@ uint HashBuildSlotCount;
 void BuildVineVoxelHashCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
     uint i = DispatchThreadId.x;
-    if (i >= HashBuildVoxelCount || HashBuildSlotCount == 0u)
+    // HashBuildVoxelCount is the producer's CAPACITY; only [0, Counter[0]) holds real voxels. The
+    // slack all carries the same zeroed cell, so inserting it would pile every slack thread onto
+    // one hash slot and turn this linear-probe insert into O(slack^2) atomics — enough to trip TDR
+    // on its own — besides poisoning cell (0,0,0) with a bogus hit for every later lookup.
+    if (i >= min(HashBuildCounter[0], HashBuildVoxelCount) || HashBuildSlotCount == 0u)
     {
         return;
     }
@@ -1288,18 +1297,25 @@ void BuildVVVoxelCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
     uint Index = DispatchThreadId.x;
 
-    if (Index < OutputVertexCount && ProfileCount > 0u)
+    // Real (GPU-decided) sizes, clamped by the allocation capacities so a stale or overflowing
+    // count can never index past the buffers. The dispatch is already sized from these counts,
+    // so the guards below only absorb the group-size round-up.
+    uint RealPointCount = min(VineMeshCounts[1], PathPointCount);
+    uint RealSegmentCount = min(VineMeshCounts[2], SegmentCount);
+    uint RealVertexCount = RealPointCount * ProfileCount;
+
+    if (Index < RealVertexCount && ProfileCount > 0u)
     {
         uint PointIndex = Index / ProfileCount;
         uint ProfileIndex = Index - PointIndex * ProfileCount;
-        if (PointIndex < PathPointCount)
+        if (PointIndex < RealPointCount)
         {
             float4 PackedPoint = PathPoints[PointIndex];
             int4 Meta = PathPointMeta[PointIndex];
             uint PrevIndex = (uint)max(Meta.x, 0);
             uint NextIndex = (uint)max(Meta.y, 0);
-            PrevIndex = min(PrevIndex, PathPointCount - 1u);
-            NextIndex = min(NextIndex, PathPointCount - 1u);
+            PrevIndex = min(PrevIndex, RealPointCount - 1u);
+            NextIndex = min(NextIndex, RealPointCount - 1u);
 
             // V (mesh texture coordinate along the tube) is recomputed on the CPU from the
             // output tube circumference by RecomputeVineOutputUVsFromGeneratedLength, so the
@@ -1360,16 +1376,6 @@ void BuildVVVoxelCS(uint3 DispatchThreadId : SV_DispatchThreadID)
             RW_OutUVs[Index] = float2(U, V);
 #endif
         }
-
-#if VINE_OUTPUT_BASESTREAMS
-        // Only thread 0 publishes the fixed vine mesh counts / indirect draw args once.
-        if (Index == 0u)
-        {
-            RWMeshCounters[0] = OutputVertexCount; RWMeshCounters[1] = OutputIndexCount;
-            RWIndirectArgs[0] = OutputIndexCount; RWIndirectArgs[1] = 1u;
-            RWIndirectArgs[2] = 0u; RWIndirectArgs[3] = 0u; RWIndirectArgs[4] = 0u;
-        }
-#endif
     }
 
     // Index target is chosen once here; index values / winding below are identical either way.
@@ -1379,12 +1385,12 @@ void BuildVVVoxelCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 #define OUT_INDEX(i) RW_OutIndices[i]
 #endif
 
-    if (Index < SegmentCount && ProfileCount > 0u)
+    if (Index < RealSegmentCount && ProfileCount > 0u)
     {
         int4 Segment = SegmentMeta[Index];
         uint APoint = (uint)max(Segment.x, 0);
         uint BPoint = (uint)max(Segment.y, 0);
-        if (APoint >= PathPointCount || BPoint >= PathPointCount)
+        if (APoint >= RealPointCount || BPoint >= RealPointCount)
         {
             return;
         }
@@ -1484,7 +1490,7 @@ void ApplyVVPerlinNoiseCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 //   V1 VineUVCentersCS (PointCount threads):  ring center + circumference
 //   V2 VineUVSegLenCS  (SegmentCount threads): per-segment axial length; SegLen is
 //        cleared to -1 first, and -1 marks a line boundary (V resets there)
-//   V3 VineUVScanCS    (single thread):        serial prefix scan with reset -> CurveV
+//   V3 three-kernel segmented prefix sum -> CurveV (see the V3 block below)
 //   V4 VineUVWriteCS   (OutputVertexCount thr): broadcast CurveV[P] to every ring vert
 // The base-stream leaf is an identity transform, so RWPositions is local==world and
 // the distances/perimeters match the CPU (which runs on world-space output verts).
@@ -1496,10 +1502,19 @@ StructuredBuffer<float4> VineUV_Centers;      // ring centers (xyz) written by V
 StructuredBuffer<float>  VineUV_RingCirc;     // ring circumferences written by V1
 StructuredBuffer<float>  VineUV_SegLen;       // per-point forward axial length (-1 = line boundary)
 StructuredBuffer<float>  VineUV_CurveV;       // prefix-scanned V per point written by V3
+StructuredBuffer<uint>   VineUV_Counts;       // same GPU counts as VineMeshCounts (V3 range bound)
+StructuredBuffer<uint>   VineUV_ScanFlags;     // V3a: per-point block-local head prefix-OR
+StructuredBuffer<float>  VineUV_ScanBlockSum;  // V3a: per-block segmented reduction
+StructuredBuffer<uint>   VineUV_ScanBlockFlag; // V3a: per-block "contains a line head"
+StructuredBuffer<float>  VineUV_ScanBlockCarry;// V3b: per-block exclusive carry-in
 RWStructuredBuffer<float4> RW_VineUV_Centers;
 RWStructuredBuffer<float>  RW_VineUV_RingCirc;
 RWStructuredBuffer<float>  RW_VineUV_SegLen;
 RWStructuredBuffer<float>  RW_VineUV_CurveV;
+RWStructuredBuffer<uint>   RW_VineUV_ScanFlags;
+RWStructuredBuffer<float>  RW_VineUV_ScanBlockSum;
+RWStructuredBuffer<uint>   RW_VineUV_ScanBlockFlag;
+RWStructuredBuffer<float>  RW_VineUV_ScanBlockCarry;
 RWBuffer<float>            RW_VineUV_TexCoords; // same buffer as base-stream RWTexCoords
 uint  VineUV_PointCount;
 uint  VineUV_ProfileCount;
@@ -1565,38 +1580,173 @@ void VineUVSegLenCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     RW_VineUV_SegLen[A] = length(CB - CA);
 }
 
-// V3: serial prefix scan (single thread). CurveV[0]=0; walk P=1..N-1 accumulating
-// (axial / avgCircumference) * LengthScale, resetting to 0 at any line boundary
-// (SegLen[P-1] < 0). Prev tracks CurveV[P-1]. Byte-for-byte the CPU accumulation.
-[numthreads(1, 1, 1)]
-void VineUVScanCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+// ---------------------------------------------------------------------------
+// V3: CurveV is a SEGMENTED INCLUSIVE PREFIX SUM, not a per-line reduction and not a
+// distance-to-endpoint. Written out:
+//   Inc[P]  = (SegLen[P-1] / max(avg(RingCirc[P-1], RingCirc[P]), 1e-4)) * LengthScale
+//   Head[P] = (P == 0) || (SegLen[P-1] < 0)          // -1 == no segment enters P
+//   CurveV  = inclusive scan of Inc, restarted at every Head
+// Head points contribute nothing (Inc[Head] is defined as 0), so a head's CurveV is
+// exactly the 0.0 the old serial loop stored there — the two forms agree element for
+// element, only the float summation ORDER differs.
+//
+// Three kernels replace the old [numthreads(1,1,1)] loop, the standard two-level scan:
+//   V3a VineUVScanBlockCS        per-block segmented Hillis-Steele in LDS, plus the
+//                                block aggregate (tail sum, contains-a-head)
+//   V3b VineUVScanBlockOffsetsCS one block scans all block aggregates into an exclusive
+//                                carry-in per block; loops in tiles, so one launch covers
+//                                any block count without a third level
+//   V3c VineUVScanApplyCS        adds the carry-in back, skipping points whose block-local
+//                                value already closed on a head
+// The segmented combine is (v,f) x (v',f') -> (f' ? v' : v+v', f|f'): once a lane's window
+// contains a head, its value is final and later steps must not fold in older lanes.
+//
+// N still comes from the GPU count buffer, never from VineUV_PointCount (that is the
+// VV.MaxVinePointCount allocation capacity). V3a/V3c are DispatchIndirect'd off the same
+// point-count arg slot the other per-point kernels use, so the block partition here is
+// identical to theirs; V3b is a fixed 1x1x1 launch whose tile loop is bounded by N.
+// ---------------------------------------------------------------------------
+#ifndef VINE_UV_SCAN_BLOCK
+#define VINE_UV_SCAN_BLOCK 64   // must equal the C++ VineMeshGroupSize; see the C++ ModifyCompilationEnvironment
+#endif
+
+// LDS budget: 64*4 (float) + 64*4 (uint) + 4 = 516 bytes, far under the 16 KB Vulkan floor.
+groupshared float VineUVScan_Val[VINE_UV_SCAN_BLOCK];
+groupshared uint  VineUVScan_Flag[VINE_UV_SCAN_BLOCK];
+groupshared float VineUVScan_TileCarry; // V3b only: running carry across tile iterations
+
+// In-place segmented inclusive Hillis-Steele over VineUVScan_Val / VineUVScan_Flag.
+// Every lane must call this (the barriers are group-wide), so callers pad out-of-range lanes
+// with the combine identity (0, 0) instead of returning early.
+void VineUVScan_SegmentedScanLDS(uint Lane)
 {
-    if (DispatchThreadId.x != 0u)
+    [unroll]
+    for (uint Offset = 1u; Offset < (uint)VINE_UV_SCAN_BLOCK; Offset <<= 1u)
     {
-        return;
-    }
-    uint N = VineUV_PointCount;
-    if (N == 0u)
-    {
-        return;
-    }
-    float LengthScale = max(VineUV_LengthScale, 1.0e-8f);
-    RW_VineUV_CurveV[0] = 0.0f;
-    float Prev = 0.0f; // == CurveV[P-1]
-    for (uint P = 1u; P < N; ++P)
-    {
-        float Axial = VineUV_SegLen[P - 1u];
-        if (Axial < 0.0f)
+        float Addend = 0.0f;
+        uint NewFlag = VineUVScan_Flag[Lane];
+        if (Lane >= Offset)
         {
-            RW_VineUV_CurveV[P] = 0.0f; // segment break -> V resets, next run starts at 0
-            Prev = 0.0f;
-            continue;
+            // Only lanes that have NOT yet absorbed a head keep accumulating.
+            if (VineUVScan_Flag[Lane] == 0u) Addend = VineUVScan_Val[Lane - Offset];
+            NewFlag = VineUVScan_Flag[Lane] | VineUVScan_Flag[Lane - Offset];
         }
-        float AvgCirc = max((VineUV_RingCirc[P - 1u] + VineUV_RingCirc[P]) * 0.5f, 1.0e-4f);
-        float V = Prev + (Axial / AvgCirc) * LengthScale;
-        RW_VineUV_CurveV[P] = V;
-        Prev = V;
+        GroupMemoryBarrierWithGroupSync(); // all reads of the previous step done before overwriting
+        VineUVScan_Val[Lane] += Addend;
+        VineUVScan_Flag[Lane] = NewFlag;
+        GroupMemoryBarrierWithGroupSync();
     }
+    // Post-condition: Flag[Lane] == OR of Head over [0, Lane] inside the block, because the
+    // final step spans the whole block. That is exactly the "value already final" predicate.
+}
+
+// V3a: block-local segmented scan + the block aggregate the cross-block pass consumes.
+[numthreads(VINE_UV_SCAN_BLOCK, 1, 1)]
+void VineUVScanBlockCS(uint3 DispatchThreadId : SV_DispatchThreadID, uint GroupIndex : SV_GroupIndex, uint3 GroupId : SV_GroupID)
+{
+    uint N = min(VineUV_Counts[1], VineUV_PointCount);
+    uint P = DispatchThreadId.x;
+
+    // Tail lanes of the last block stay at the identity (0, 0). Hillis-Steele only ever reads
+    // LOWER lanes, so they cannot corrupt valid lanes, and being non-heads with value 0 they
+    // let lane BLOCK-1 carry the last VALID lane's aggregate unchanged.
+    float Val = 0.0f;
+    uint Flag = 0u;
+    if (P < N)
+    {
+        if (P == 0u) Flag = 1u; // buffer start is a line head by definition
+        else
+        {
+            float Axial = VineUV_SegLen[P - 1u];
+            if (Axial < 0.0f) Flag = 1u; // -1 marker: no segment enters P, so V restarts here
+            else
+            {
+                float AvgCirc = max((VineUV_RingCirc[P - 1u] + VineUV_RingCirc[P]) * 0.5f, 1.0e-4f);
+                Val = (Axial / AvgCirc) * max(VineUV_LengthScale, 1.0e-8f);
+            }
+        }
+    }
+
+    VineUVScan_Val[GroupIndex] = Val;
+    VineUVScan_Flag[GroupIndex] = Flag;
+    GroupMemoryBarrierWithGroupSync();
+
+    VineUVScan_SegmentedScanLDS(GroupIndex);
+
+    if (P < N)
+    {
+        RW_VineUV_CurveV[P] = VineUVScan_Val[GroupIndex];   // block-local partial; V3c finishes it
+        RW_VineUV_ScanFlags[P] = VineUVScan_Flag[GroupIndex]; // 1 => already final, V3c skips it
+    }
+    // Aggregate write stays outside the P < N guard: in the last block lane BLOCK-1 is a tail
+    // lane, yet it is the lane holding the aggregate.
+    if (GroupIndex == (uint)VINE_UV_SCAN_BLOCK - 1u)
+    {
+        RW_VineUV_ScanBlockSum[GroupId.x] = VineUVScan_Val[GroupIndex];
+        RW_VineUV_ScanBlockFlag[GroupId.x] = VineUVScan_Flag[GroupIndex];
+    }
+}
+
+// V3b: exclusive segmented scan over the block aggregates -> per-block carry-in.
+// One block, walked in tiles of VINE_UV_SCAN_BLOCK with a running carry, so a single 1x1x1
+// launch covers any block count (4096 blocks at the 262144-point capacity = 64 tiles) without
+// needing a third level or a second indirect arg slot.
+[numthreads(VINE_UV_SCAN_BLOCK, 1, 1)]
+void VineUVScanBlockOffsetsCS(uint GroupIndex : SV_GroupIndex)
+{
+    uint N = min(VineUV_Counts[1], VineUV_PointCount);
+    uint BlockCount = (N + (uint)VINE_UV_SCAN_BLOCK - 1u) / (uint)VINE_UV_SCAN_BLOCK;
+
+    if (GroupIndex == 0u) VineUVScan_TileCarry = 0.0f; // carry-in of block 0 is 0
+    GroupMemoryBarrierWithGroupSync();
+
+    // BlockCount is uniform, so every lane runs the same iteration count and the barriers stay
+    // in uniform control flow.
+    for (uint Base = 0u; Base < BlockCount; Base += (uint)VINE_UV_SCAN_BLOCK)
+    {
+        uint TileCount = min((uint)VINE_UV_SCAN_BLOCK, BlockCount - Base);
+        uint B = Base + GroupIndex;
+        VineUVScan_Val[GroupIndex] = (GroupIndex < TileCount) ? VineUV_ScanBlockSum[B] : 0.0f;
+        VineUVScan_Flag[GroupIndex] = (GroupIndex < TileCount) ? VineUV_ScanBlockFlag[B] : 0u;
+        GroupMemoryBarrierWithGroupSync();
+
+        VineUVScan_SegmentedScanLDS(GroupIndex);
+
+        // Carry-in of block B is the INCLUSIVE value at block B-1: either the previous tile's
+        // running carry (lane 0) or lane-1's scanned value, folded with the running carry only
+        // when lane-1 saw no head.
+        float TileCarry = VineUVScan_TileCarry;
+        if (GroupIndex < TileCount)
+        {
+            float Carry = TileCarry;
+            if (GroupIndex > 0u)
+            {
+                uint Prev = GroupIndex - 1u;
+                Carry = (VineUVScan_Flag[Prev] != 0u) ? VineUVScan_Val[Prev] : (TileCarry + VineUVScan_Val[Prev]);
+            }
+            RW_VineUV_ScanBlockCarry[B] = Carry;
+        }
+        GroupMemoryBarrierWithGroupSync(); // every lane read TileCarry before lane 0 replaces it
+
+        if (GroupIndex == 0u)
+        {
+            uint Last = TileCount - 1u; // last VALID lane, not BLOCK-1: the tile may be partial
+            VineUVScan_TileCarry = (VineUVScan_Flag[Last] != 0u) ? VineUVScan_Val[Last] : (TileCarry + VineUVScan_Val[Last]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+// V3c: fold the block carry-in back into the points whose block-local run never hit a head.
+[numthreads(VINE_UV_SCAN_BLOCK, 1, 1)]
+void VineUVScanApplyCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint P = DispatchThreadId.x;
+    if (P >= min(VineUV_Counts[1], VineUV_PointCount)) return;
+    if (VineUV_ScanFlags[P] != 0u) return; // a head at or before P inside its block: value is final
+    // Block index derived from P rather than SV_GroupID, so this stays correct even if this pass
+    // is ever launched with a different group size than V3a.
+    RW_VineUV_CurveV[P] += VineUV_ScanBlockCarry[P / (uint)VINE_UV_SCAN_BLOCK];
 }
 
 // V4: broadcast the per-point V to all ProfileCount ring vertices, overwriting the 0
@@ -1612,5 +1762,65 @@ void VineUVWriteCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     uint P = Index / VineUV_ProfileCount;
     float V = (P < VineUV_PointCount) ? VineUV_CurveV[P] : 0.0f;
     RW_VineUV_TexCoords[Index * 2u + 1u] = V;
+}
+
+// ============================================================================
+// Stage E - VineDispatchArgsCS: turn the GPU-decided counts into every downstream
+// dispatch/draw argument, so nothing in the vine mesh graph is sized by the CPU.
+// ============================================================================
+// Buffers are allocated at VV.MaxVinePointCount capacity, so a direct capacity-sized dispatch
+// would run the voxel-bucket kernels — and the axial-V scan — over ~262k points no matter how
+// short the vines actually are. Four DispatchIndirect arg sets are published instead,
+// one per thread-count flavour the graph needs:
+//   slot 0: point count            (noise / axes / projection / resample / smooth / frame,
+//                                   plus VineUV.Centers / ScanBlock / ScanApply)
+//   slot 1: segment count          (VineUV.SegLen)
+//   slot 2: max(vertex, segment)   (BuildVVVoxelCS, whose two halves are indexed differently)
+//   slot 3: vertex count           (VineUV.Write)
+// The indirect DRAW args and the CPU-readback mesh counters are published here too: this kernel
+// always runs (a fixed 1x1x1 direct dispatch), so a zero-length vine still writes a well-formed
+// zero-index draw instead of leaving whatever the previous build left behind.
+StructuredBuffer<uint> VineArgs_Counts;       // [0]=lineCount [1]=pointCount [2]=segmentCount
+RWBuffer<uint> RW_VineArgs_Dispatch;          // 4 x uint3 DispatchIndirect arg sets
+RWBuffer<uint> RW_VineArgs_DrawIndirect;      // DrawIndexedIndirect: 5 uints
+RWBuffer<uint> RW_VineArgs_MeshCounters;      // [0]=vertexCount [1]=indexCount
+uint VineArgs_PointCapacity;
+uint VineArgs_SegmentCapacity;
+uint VineArgs_ProfileCount;
+uint VineArgs_bTube;
+uint VineArgs_GroupSize;
+
+void VineArgs_WriteDispatch(uint Slot, uint ThreadCount, uint GroupSize)
+{
+    RW_VineArgs_Dispatch[Slot * 3u + 0u] = (ThreadCount + GroupSize - 1u) / GroupSize;
+    RW_VineArgs_Dispatch[Slot * 3u + 1u] = 1u;
+    RW_VineArgs_Dispatch[Slot * 3u + 2u] = 1u;
+}
+
+[numthreads(1, 1, 1)]
+void VineDispatchArgsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (DispatchThreadId.x != 0u)
+    {
+        return;
+    }
+    uint GroupSize = max(VineArgs_GroupSize, 1u);
+    uint Points = min(VineArgs_Counts[1], VineArgs_PointCapacity);
+    uint Segments = min(VineArgs_Counts[2], VineArgs_SegmentCapacity);
+    uint Vertices = Points * VineArgs_ProfileCount;
+    uint Indices = (VineArgs_bTube != 0u) ? (Segments * VineArgs_ProfileCount * 6u) : (Segments * 6u);
+
+    VineArgs_WriteDispatch(0u, Points, GroupSize);
+    VineArgs_WriteDispatch(1u, Segments, GroupSize);
+    VineArgs_WriteDispatch(2u, max(Vertices, Segments), GroupSize);
+    VineArgs_WriteDispatch(3u, Vertices, GroupSize);
+
+    RW_VineArgs_MeshCounters[0] = Vertices;
+    RW_VineArgs_MeshCounters[1] = Indices;
+    RW_VineArgs_DrawIndirect[0] = Indices; // IndexCountPerInstance
+    RW_VineArgs_DrawIndirect[1] = 1u;      // InstanceCount
+    RW_VineArgs_DrawIndirect[2] = 0u;      // StartIndexLocation
+    RW_VineArgs_DrawIndirect[3] = 0u;      // BaseVertexLocation
+    RW_VineArgs_DrawIndirect[4] = 0u;      // StartInstanceLocation
 }
 

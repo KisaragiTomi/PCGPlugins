@@ -3,7 +3,6 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Components/DynamicMeshComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Curves/CurveLinearColor.h"
 #include "GeometryScript/GeometryScriptTypes.h"
@@ -179,6 +178,18 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options, meta = (ClampMin = "3"))
 	int32 VisVineGPUTubeSegments = 3;
 
+	// 整批藤蔓（全部源共用）的路径点上限，同时也是 GPU buffer 的分配容量。真实点数只有 GPU
+	// 知道，所以下游一律按这个上限分配、按 GPU 计数绘制；调大只是多占显存，不改变结果。
+	// 每源容量取 min(TargetCount × (SC_MAX_BACKTRACK+1), 本值 / 源数量)，所以在目标数很少时
+	// 仍按更紧的理论界分配，不会浪费。
+	//
+	// 默认值必须覆盖“常见源数 × 理论界”，否则每源份额会低于理论界，EmitSpaceColonizationLinesCS
+	// 会在回溯途中撞上容量直接 break —— 藤蔓被悄悄截短，表现为莫名其妙变稀变短。
+	// 参考：980 个 target 的理论界是 980×101 ≈ 99K，1M 可以喂满 10 个源；旧实现每源独立按理论界
+	// 分配（硬顶 4M），不除源数，所以这里给低了就是纯回归。被截断时会打 Warning 并给出建议值。
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options, meta = (ClampMin = "1024"))
+	int32 MaxVinePointCount = 1048576;
+
 };
 
 USTRUCT()
@@ -201,11 +212,10 @@ struct FVineLinePointAxisData
 
 // VisVine debug parameter structs moved to ComputeShaderDebugParams.h
 
-// Trip A (GPU line hand-off): the space-colonization solve's fully-prepped output
-// buffers, kept GPU-resident (pooled) so VisVine can consume them directly instead
-// of the CPU round-trip (readback -> re-trace -> BuildVVGPUInput re-derive).
-// Defined in GeometryEditorActor.cpp (holds RDG pooled-buffer refs).
-struct FVineSCGPUBuffers;
+// CPU-prepped inputs for the space-colonization solve. The solve is recorded into the vine mesh
+// RDG graph and its output never leaves the GPU, so this bundle is the whole hand-off.
+// Defined in GeometryEditorActor.cpp.
+struct FVineFusedSCInputs;
 
 UCLASS()
 class GEOMETRYSCRIPTEXTRAEDITOR_API AVineContainer : public AMeshGeneratorBrushCache
@@ -214,26 +224,13 @@ class GEOMETRYSCRIPTEXTRAEDITOR_API AVineContainer : public AMeshGeneratorBrushC
 
 public:
 	AVineContainer(const FObjectInitializer& ObjectInitializer);
-	virtual void OnConstruction(const FTransform& Transform) override;
+	virtual void PostLoad() override;
 	virtual void PostRegisterAllComponents() override;
+#if WITH_EDITOR
+	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
 
 	// ---- References ----
-
-	// Legacy CPU vine path: the generated UDynamicMesh is rendered through this component. The
-	// generator base class (AComputeShaderMeshGenerator) intentionally owns no DynamicMeshComponent
-	// (it only returns meshes), so the vine actor keeps its own.
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GrowReference")
-	TObjectPtr<UDynamicMeshComponent> DynamicMeshComponent;
-
-	/** Returns the DynamicMeshComponent owned by this actor. */
-	UDynamicMeshComponent* GetDynamicMeshComponent() const { return DynamicMeshComponent; }
-
-	/** Updates DynamicMeshComponent culling settings after geometry or bounds-scale changes. */
-	UFUNCTION(BlueprintCallable, Category = "GrowReference")
-	void RefreshDynamicMeshComponentCullingBounds(float BoundsScale = -1.0f);
-
-	UPROPERTY(BlueprintReadOnly, Category = "GrowReference", meta = (ClampMin = "1.0"))
-	float DynamicMeshCullBoundsScale = 10.0f;
 
 	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
 	UInstancedStaticMeshComponent* GrowTarget;
@@ -241,12 +238,18 @@ public:
 	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
 	UInstancedStaticMeshComponent* TubeVineSource;
 
-	// M1 GPU-resident vine leaf: renders the tube vine mesh directly through the render pipeline
-	// (base persistent GPU streams + indirect draw), in PARALLEL with the legacy UDynamicMesh path
-	// for side-by-side comparison. Fed by VisVineGPUInternal via SetBuildInput from the same shared
-	// FVineBuildInput bundle. Kept at an identity world transform (vine renders in world space).
+	// The vine: renders the tube mesh directly through the render pipeline (persistent GPU streams +
+	// indirect draw). Fed by VisVineGPUInternal via SetBuildInput. Kept at an identity world
+	// transform (vine renders in world space).
 	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
 	UVineMeshComponent* VineGpuMesh;
+
+	// Single source of truth for the vine surface material. It used to live on slot 0 of a
+	// UDynamicMeshComponent this actor owned; that component is gone, so the assignment lives on the
+	// actor and is pushed down to VineGpuMesh (never read back). Leaving it empty is fine — the
+	// scene proxy falls back to the engine default surface material.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GrowReference")
+	TObjectPtr<UMaterialInterface> VineMaterial;
 
 	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
 	UFoliageType* TargetType;
@@ -284,16 +287,10 @@ public:
 	FBox InstanceBound;
 
 	UPROPERTY(Transient)
-	TObjectPtr<AStaticMeshActor> GeneratedStaticMeshActor;
-
-	UPROPERTY(Transient)
 	TObjectPtr<AActor> DebugVineSplineActor;
 
 	UPROPERTY(Transient)
 	TArray<FGeometryScriptPolyPath> TubeLines;
-
-	UPROPERTY(Transient)
-	TArray<float> TubeLineSourceScales;
 
 	UPROPERTY(Transient)
 	TArray<FVector> TubeLineSourceLocations;
@@ -304,18 +301,15 @@ public:
 	UPROPERTY(Transient)
 	TArray<FVineLinePointAxisData> TubeLinePointAxes;
 
-	// Trip A: per-source GPU-resident SC output buffers, parallel to TubeLines.
-	// Populated by the tube SC loop, consumed by the VisVine GPU path to skip the
-	// line-data CPU round-trip. Not a UPROPERTY (holds render resources, transient).
-	TArray<TSharedPtr<FVineSCGPUBuffers>> TubeLineGPUBuffers;
-
 	// ---- Core Operations ----
 
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
 	bool VisVine();
 
+	/** Returns whether a vine batch was handed to the GPU leaf. The vine has no CPU-side mesh to
+	 *  return: geometry only ever exists as VineGpuMesh's GPU streams. */
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
-	UDynamicMesh* GenerateVines(float ExtrudeScale = 50, bool Result = true);
+	bool GenerateVines(float ExtrudeScale = 50, bool Result = true);
 
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
 	void Clean();
@@ -345,18 +339,24 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "VineActions")
 	void SaveStaticmesh();
 
-	UFUNCTION(BlueprintCallable, Category = "VineActions")
-	void ClearAttachedStaticMeshActors();
+protected:
+	//~ AComputeShaderMeshGenerator interface
+	/** 沿用"标签优先"的资产基名（基类默认用 GetName()），保证已烘好的资产名不变。 */
+	virtual FString GetResultAssetBaseName() const override;
+
+public:
 
 	// ---- SpaceColonization ----
 
+	/** Deprecated entry point: the solve runs on the GPU inside the vine mesh graph and produces
+	 *  no CPU line results, so this always returns an empty array. Use GenerateVines / VisVine. */
 	UFUNCTION(BlueprintCallable, Category = "SpaceColonization")
 	TArray<FSpaceColonizationLineResult> SpaceColonizationWithScales(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, bool bUseComputeShader = false);
 
-	// Non-reflected worker: same as SpaceColonizationWithScales but can also export the
-	// GPU-resident prepped buffers (Trip A). FVineSCGPUBuffers isn't a USTRUCT, so this
-	// cannot be a UFUNCTION. The BlueprintCallable version above forwards here with nullptr.
-	TArray<FSpaceColonizationLineResult> SpaceColonizationWithScalesInternal(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, FVineSCGPUBuffers* OutGPUBuffers);
+	// Non-reflected worker (FVineFusedSCInputs isn't a USTRUCT): prepares the CPU side of the
+	// fused space-colonization solve. Dispatches nothing; the passes are recorded into the vine
+	// mesh graph by FVineMeshSceneProxy::BuildGeometry.
+	bool PrepareVineFusedSCInputs(const TArray<FTransform>& SourceTransforms, const TArray<FTransform>& TargetTransforms, FVineFusedSCInputs& OutInputs);
 
 	// ---- Debug ----
 
@@ -374,6 +374,20 @@ public:
 
 private:
 	bool VisVineGPUInternal();
+
+	// One-shot data upgrade for packages saved while this actor still owned a UDynamicMeshComponent.
+	// That component used to hold the vine surface material on slot 0, so dropping it would silently
+	// strand the artist's assignment. See MigrateLegacyVineMaterial() for how the removed subobject
+	// is still read back.
+	void MigrateLegacyVineMaterial();
+
+	/** Pushes VineMaterial down to the GPU leaf, the one direction the assignment ever travels. */
+	void ApplyVineMaterialToLeaf();
+
+	// Set when MigrateLegacyVineMaterial() actually moved a material. MarkPackageDirty is refused
+	// while a package is loading, so the dirty flag has to be re-issued from
+	// PostRegisterAllComponents — that is what turns the upgrade into a save the user can commit.
+	bool bPendingLegacyVineMaterialDirty = false;
 
 	void DrawDebugVineCenterLines(
 		const TArray<FVector4f>& CenterPoints,

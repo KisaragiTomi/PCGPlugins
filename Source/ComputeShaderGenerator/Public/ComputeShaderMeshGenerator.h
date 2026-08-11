@@ -17,6 +17,7 @@ class ALandscape;
 class UCSDisplayComponent;
 class UHierarchicalInstancedStaticMeshComponent;
 class UMaterialInterface;
+class AStaticMeshActor;
 class UStaticMesh;
 class UStaticMeshComponent;
 
@@ -840,7 +841,20 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh")
 	FString BuildResultAssetPath(const FString& NameSuffix = TEXT(""));
 
-protected:
+	/**
+	 * 生成一个承载 Mesh 的结果 StaticMeshActor，挂在本 actor 下。
+	 *
+	 * 生成器把结果存成 StaticMesh 后，通常还要在关卡里放一个挂在自己身上的
+	 * StaticMeshActor 来承载它。这套生命周期对所有生成器都一样，故收在基类：
+	 * **先清掉上一次生成的结果**，再打标签 / 设网格 / 按世界变换挂接 / 命名 / 标脏。
+	 * 清场只认结果标签，用户自己挂上来的 actor 不受影响。
+	 *
+	 * InActorLabel 为空时用资产名。返回生成的 actor，失败返回 nullptr。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh")
+	AStaticMeshActor* SpawnAttachedResultActor(UStaticMesh* Mesh, const FString& InActorLabel);
+
+
 	// -------------------------------------------------------------------------
 	// Result asset naming policy (子类覆写点)
 	// -------------------------------------------------------------------------

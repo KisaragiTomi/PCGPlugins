@@ -23,8 +23,11 @@
 #include "Engine/Level.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
+#include "Components/PrimitiveComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/SplineComponent.h"
+#include "Materials/MaterialInterface.h"
+#include "UObject/UObjectHash.h"
 #include "DrawDebugHelpers.h"
 #include "GeometryScript/MeshBasicEditFunctions.h"
 #include "GeometryScript/MeshNormalsFunctions.h"
@@ -93,8 +96,7 @@ class FVVVoxelCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, RWTexCoords)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>,  RWColors)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>,  RWBaseIndices)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>,  RWIndirectArgs)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>,  RWMeshCounters)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VineMeshCounts)
 		SHADER_PARAMETER(FMatrix44f, VineWorldToLocal)
 		SHADER_PARAMETER(uint32, PathPointCount)
 		SHADER_PARAMETER(uint32, SegmentCount)
@@ -115,6 +117,7 @@ class FVVVoxelCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, TargetBucketSearchRadius)
 		SHADER_PARAMETER(float, VinesOffset)
 		SHADER_PARAMETER(float, TinyZJitterStrength)
+		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -131,10 +134,44 @@ class FVVVoxelCS : public FGlobalShader
 
 IMPLEMENT_GLOBAL_SHADER(FVVVoxelCS, "/Plugin/PCGPlugins/Shaders/Private/VVVoxel.usf", "BuildVVVoxelCS", SF_Compute);
 
+// Stage E: publishes the four DispatchIndirect arg sets, the DrawIndexedIndirect args and the
+// mesh counters straight from the GPU-decided counts. Runs once, as a direct 1x1x1 dispatch,
+// before every other vine mesh pass (which are all DispatchIndirect'd from its output).
+class FVineDispatchArgsCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FVineDispatchArgsCS);
+	SHADER_USE_PARAMETER_STRUCT(FVineDispatchArgsCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VineArgs_Counts)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_VineArgs_Dispatch)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_VineArgs_DrawIndirect)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_VineArgs_MeshCounters)
+		SHADER_PARAMETER(uint32, VineArgs_PointCapacity)
+		SHADER_PARAMETER(uint32, VineArgs_SegmentCapacity)
+		SHADER_PARAMETER(uint32, VineArgs_ProfileCount)
+		SHADER_PARAMETER(uint32, VineArgs_bTube)
+		SHADER_PARAMETER(uint32, VineArgs_GroupSize)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FVineDispatchArgsCS, "/Plugin/PCGPlugins/Shaders/Private/VVVoxel.usf", "VineDispatchArgsCS", SF_Compute);
+
+// Thread-group size shared by every vine mesh kernel (their ModifyCompilationEnvironment all set
+// THREADGROUPSIZE_X to this); VineDispatchArgsCS divides the GPU counts by it. The axial-V
+// segmented scan below also partitions points into blocks of exactly this size, which is what
+// lets it reuse the per-point indirect arg slot instead of publishing its own.
+static constexpr uint32 VineMeshGroupSize = 64u;
+
 // ============================================================================
-// Base-stream axial-V (mesh UV.y) GPU passes — port of the CPU
-// RecomputeVineOutputUVsFromGeneratedLength, dispatched only on the base-stream
-// path (see AddVineMeshPasses). Four kernels over scratch structured buffers.
+// Base-stream axial-V (mesh UV.y) GPU passes. Six kernels over scratch structured buffers,
+// dispatched from AddVineMeshPasses. These replaced an equivalent CPU pass that ran after a
+// vertex readback; the vine no longer reads vertices back, so this is the only axial-V path.
 // VineUV_-prefixed names keep them unique in the unity build.
 // ============================================================================
 class FVineUVCentersCS : public FGlobalShader
@@ -148,6 +185,7 @@ class FVineUVCentersCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, RW_VineUV_RingCirc)
 		SHADER_PARAMETER(uint32, VineUV_PointCount)
 		SHADER_PARAMETER(uint32, VineUV_ProfileCount)
+		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -175,6 +213,7 @@ class FVineUVSegLenCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, RW_VineUV_SegLen)
 		SHADER_PARAMETER(uint32, VineUV_PointCount)
 		SHADER_PARAMETER(uint32, VineUV_SegmentCount)
+		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -191,17 +230,34 @@ class FVineUVSegLenCS : public FGlobalShader
 
 IMPLEMENT_GLOBAL_SHADER(FVineUVSegLenCS, "/Plugin/PCGPlugins/Shaders/Private/VVVoxel.usf", "VineUVSegLenCS", SF_Compute);
 
-class FVineUVScanCS : public FGlobalShader
+// V3a/V3b/V3c: the axial-V segmented prefix sum. CurveV is an inclusive scan of the per-point
+// normalized axial step, restarted at every line head (SegLen[P-1] < 0), so it parallelizes as
+// the textbook two-level scan: per-block scan + block aggregate, scan the aggregates, add back.
+// It replaced a [numthreads(1,1,1)] serial loop that walked every point one at a time.
+// All three set VINE_UV_SCAN_BLOCK from VineMeshGroupSize so V3a's block partition matches the
+// per-point indirect arg slot it is dispatched from.
+static void VineUVScanModifyEnvironment(FShaderCompilerEnvironment& OutEnvironment)
 {
-	DECLARE_GLOBAL_SHADER(FVineUVScanCS);
-	SHADER_USE_PARAMETER_STRUCT(FVineUVScanCS, FGlobalShader);
+	OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), VineMeshGroupSize);
+	OutEnvironment.SetDefine(TEXT("VINE_UV_SCAN_BLOCK"), VineMeshGroupSize);
+}
+
+class FVineUVScanBlockCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FVineUVScanBlockCS);
+	SHADER_USE_PARAMETER_STRUCT(FVineUVScanBlockCS, FGlobalShader);
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, VineUV_SegLen)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, VineUV_RingCirc)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VineUV_Counts)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, RW_VineUV_CurveV)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_VineUV_ScanFlags)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, RW_VineUV_ScanBlockSum)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_VineUV_ScanBlockFlag)
 		SHADER_PARAMETER(uint32, VineUV_PointCount)
 		SHADER_PARAMETER(float, VineUV_LengthScale)
+		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -212,11 +268,66 @@ class FVineUVScanCS : public FGlobalShader
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
 	{
 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+		VineUVScanModifyEnvironment(OutEnvironment);
 	}
 };
 
-IMPLEMENT_GLOBAL_SHADER(FVineUVScanCS, "/Plugin/PCGPlugins/Shaders/Private/VVVoxel.usf", "VineUVScanCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVineUVScanBlockCS, "/Plugin/PCGPlugins/Shaders/Private/VVVoxel.usf", "VineUVScanBlockCS", SF_Compute);
+
+class FVineUVScanBlockOffsetsCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FVineUVScanBlockOffsetsCS);
+	SHADER_USE_PARAMETER_STRUCT(FVineUVScanBlockOffsetsCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, VineUV_ScanBlockSum)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VineUV_ScanBlockFlag)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VineUV_Counts)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, RW_VineUV_ScanBlockCarry)
+		SHADER_PARAMETER(uint32, VineUV_PointCount)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		VineUVScanModifyEnvironment(OutEnvironment);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FVineUVScanBlockOffsetsCS, "/Plugin/PCGPlugins/Shaders/Private/VVVoxel.usf", "VineUVScanBlockOffsetsCS", SF_Compute);
+
+class FVineUVScanApplyCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FVineUVScanApplyCS);
+	SHADER_USE_PARAMETER_STRUCT(FVineUVScanApplyCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VineUV_ScanFlags)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, VineUV_ScanBlockCarry)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VineUV_Counts)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, RW_VineUV_CurveV)
+		SHADER_PARAMETER(uint32, VineUV_PointCount)
+		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		VineUVScanModifyEnvironment(OutEnvironment);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FVineUVScanApplyCS, "/Plugin/PCGPlugins/Shaders/Private/VVVoxel.usf", "VineUVScanApplyCS", SF_Compute);
 
 class FVineUVWriteCS : public FGlobalShader
 {
@@ -229,6 +340,7 @@ class FVineUVWriteCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, VineUV_OutputVertexCount)
 		SHADER_PARAMETER(uint32, VineUV_ProfileCount)
 		SHADER_PARAMETER(uint32, VineUV_PointCount)
+		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -257,6 +369,7 @@ public:
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, HashBuildCells)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, HashBuildCounter)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_HashBuildSlots)
 		SHADER_PARAMETER(uint32, HashBuildVoxelCount)
 		SHADER_PARAMETER(uint32, HashBuildSlotCount)
@@ -307,6 +420,7 @@ class FVVVoxelBuildAxesCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, TargetBucketCount)
 		SHADER_PARAMETER(uint32, TargetBucketHashSlotCount)
 		SHADER_PARAMETER(uint32, TargetBucketSearchRadius)
+		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -340,6 +454,7 @@ class FVVVoxelResampleSurfaceCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_PathPointSurfaceNormals)
 		SHADER_PARAMETER(uint32, PathPointCount)
 		SHADER_PARAMETER(float, ResampleTargetDistance)
+		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -371,6 +486,7 @@ class FVVVoxelBuildParallelTransportFrameCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_PathPointTangents)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_PathPointFrameNormals)
 		SHADER_PARAMETER(uint32, PathPointCount)
+		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -400,6 +516,7 @@ class FVVVoxelPerlinNoiseCS : public FGlobalShader
 		SHADER_PARAMETER(float, PerlinNoiseStrength)
 		SHADER_PARAMETER(float, PerlinNoiseFrequency)
 		SHADER_PARAMETER(uint32, PathPointCount)
+		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -446,6 +563,7 @@ class FVVVoxelNoiseCS : public FGlobalShader
 		SHADER_PARAMETER(float, CurlNoiseStrength)
 		SHADER_PARAMETER(float, CurlNoiseFrequency)
 		SHADER_PARAMETER(uint32, NoiseIterations)
+		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -476,6 +594,7 @@ class FVVVoxelSmoothPathCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, PathPointCount)
 		SHADER_PARAMETER(int32, SmoothPathKernelRadius)
 		SHADER_PARAMETER(float, SmoothPathAngleStrength)
+		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -521,6 +640,7 @@ class FVVVoxelFinalProjectCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, TargetBucketHashSlotCount)
 		SHADER_PARAMETER(uint32, TargetBucketSearchRadius)
 		SHADER_PARAMETER(float, VinesOffset)
+		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -1037,7 +1157,29 @@ class FSpaceColonizationScatterCS : public FGlobalShader
 	}
 };
 
-// Trip A concat: offset one source's int4 meta/segment records by a point base into
+// Concat prefix sum: turns the per-source compact counts (GPU-only) into per-source destination
+// bases plus the batch totals that drive every downstream dispatch.
+class FConcatPrefixSumCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FConcatPrefixSumCS);
+	SHADER_USE_PARAMETER_STRUCT(FConcatPrefixSumCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ConcatSourceCounts)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_ConcatBases)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, RW_ConcatTotals)
+		SHADER_PARAMETER(uint32, ConcatSourceCount)
+		SHADER_PARAMETER(uint32, ConcatPointCapacity)
+		SHADER_PARAMETER(uint32, ConcatSegmentCapacity)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+
+// Concat: offset one source's int4 meta/segment records by its GPU-computed point base into
 // the concatenated destination. Serves both PathPointMeta and SegmentMeta.
 class FConcatOffsetInt4CS : public FGlobalShader
 {
@@ -1046,11 +1188,39 @@ class FConcatOffsetInt4CS : public FGlobalShader
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, ConcatSrcInt4)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ConcatBases)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<int4>, RW_ConcatDstInt4)
-		SHADER_PARAMETER(uint32, ConcatCount)
-		SHADER_PARAMETER(uint32, ConcatDstBase)
-		SHADER_PARAMETER(int32, ConcatOffsetValue)
+		SHADER_PARAMETER(uint32, ConcatSourceIndex)
+		SHADER_PARAMETER(uint32, ConcatRecordKind)
+		SHADER_PARAMETER(uint32, ConcatCapacity)
 		SHADER_PARAMETER(FIntVector4, ConcatOffsetMask)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 64);
+	}
+};
+
+// Concat: relocate one source's float4 path points to their GPU-computed destination base.
+class FConcatCopyFloat4CS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FConcatCopyFloat4CS);
+	SHADER_USE_PARAMETER_STRUCT(FConcatCopyFloat4CS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, ConcatSrcFloat4)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ConcatBases)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, RW_ConcatDstFloat4)
+		SHADER_PARAMETER(uint32, ConcatSourceIndex)
+		SHADER_PARAMETER(uint32, ConcatRecordKind)
+		SHADER_PARAMETER(uint32, ConcatCapacity)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -1083,34 +1253,59 @@ IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationPrefixResampleCS, "/Plugin/PCGPlugins/
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationEmitResampleCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "EmitResampleSpaceColonizationCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationCurveCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "CurveSpaceColonizationCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSpaceColonizationScatterCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "ScatterSpaceColonizationCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FConcatPrefixSumCS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "ConcatPrefixSumCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FConcatOffsetInt4CS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "ConcatOffsetInt4CS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FConcatCopyFloat4CS, "/Plugin/PCGPlugins/Shaders/Private/SpaceColonizationQueue.usf", "ConcatCopyFloat4CS", SF_Compute);
 
 
-// Trip A: the SC solve's fully-prepped output kept GPU-resident (pooled), so the
-// VisVine voxel path can consume it directly instead of reading it back to CPU,
-// re-tracing the lines, and re-deriving path points a third time on the CPU.
-// Buffer layout matches BuildVVGPUInput's output exactly:
-//   PathPoints      float4(xyz, finalScale = CurveScale * pointScale)
-//   PathPointMeta   int4(Prev, Next, Base, Count)
-//   SegmentMeta     int4(A, B, 0, 0)
-// PointCount/SegmentCount/LineCount are the post-resample compact counts
-// (NewCounts[1]/[2]/[0]); the pooled buffers are over-allocated to the worst-case
-// capacity, so only [0, PointCount)/[0, SegmentCount) hold valid data.
-// Defined at global scope (matches the header forward declaration; must not land
-// inside the anonymous namespace below or the member-function signatures won't match).
-struct FVineSCGPUBuffers
+// One space-colonization source's CPU-prepped inputs. The solve itself is recorded into the vine
+// mesh graph, so nothing here is a GPU resource — just the arrays the SC passes upload.
+struct FVineSCPreparedSource
 {
-	TRefCountPtr<FRDGPooledBuffer> PathPoints;
-	TRefCountPtr<FRDGPooledBuffer> PathPointMeta;
-	TRefCountPtr<FRDGPooledBuffer> SegmentMeta;
-	int32 PointCount = 0;
-	int32 SegmentCount = 0;
-	int32 LineCount = 0;
-	bool IsValid() const { return PathPoints.IsValid() && PointCount > 0 && SegmentCount > 0; }
+	// Single entry: xyz = world location, w = the source transform's scale. Kept as an array
+	// because the SC pass uploads it as a structured buffer.
+	TArray<FVector4f> SourcePositions;
+	// Per target; 1.0 everywhere except the target nearest this source, which carries its scale.
+	TArray<float> StartSourceScales;
+	// This source's share of the batch-wide VV.MaxVinePointCount, and the SC buffers' capacity.
+	uint32 PointCapacity = 0u;
+};
+
+// Everything the fused space-colonization + concat passes need, prepped on the game thread and
+// carried inside FVineBuildInput. Replaces the old per-source pooled buffer hand-off: the solve
+// now runs inside FVineMeshSceneProxy::BuildGeometry's single graph, so its output never has to
+// outlive a graph and its counts never come back to the CPU.
+// Defined at global scope (matches the header forward declaration; must not land inside the
+// anonymous namespace below or the member-function signatures won't match).
+struct FVineFusedSCInputs
+{
+	TArray<FVineSCPreparedSource> Sources;
+	TArray<FVector4f> InitialTargetPositions; // xyz = world location, w = target transform scale
+	TArray<float> TargetPointScales;
+	TArray<float> CurveLUT;                   // baked VV.CurveControl.G, drives the tube taper
+
+	int32 Iteration = 0;
+	int32 Activetime = 0;
+	float RandGrow = 0.0f;
+	float Seed = 0.0f;
+	float InfluenceRadius = 0.0f;
+	int32 BackGrowCount = 0;
+	int32 ForkTaperForkOrdinal = 0;
+	float ResampleLength = 1.0f;
+	float ScatterDistance = 0.0f;
+
+	// Concat destination capacity == sum of the per-source point capacities. Segments track points.
+	uint32 TotalPointCapacity = 0u;
+	uint32 TotalSegmentCapacity = 0u;
+
+	bool IsValid() const
+	{
+		return Sources.Num() > 0 && InitialTargetPositions.Num() > 0 && TotalPointCapacity > 0u;
+	}
 };
 
 // Target-position spatial acceleration buffers for the vine surface projection. Global scope
-// (matches FVineSCGPUBuffers) so the self-owning FVineBuildInput bundle below can embed it and
+// (matches FVineFusedSCInputs) so the self-owning FVineBuildInput bundle below can embed it and
 // still be named from the leaf's public header via a forward declaration.
 struct FVineTargetBucketBuffers
 {
@@ -1125,8 +1320,8 @@ struct FVineTargetBucketBuffers
 	uint32 SearchRadius = 4u;
 };
 
-// Self-owning CPU-prep bundle shared by the legacy readback dispatch (DispatchVVGPU_Voxel) and
-// the GPU-resident leaf (UVineMeshComponent / FVineMeshSceneProxy). It OWNS every CPU array that
+// Self-owning CPU-prep bundle consumed by the GPU-resident leaf (UVineMeshComponent /
+// FVineMeshSceneProxy). It OWNS every CPU array that
 // FVineMeshPassInputs' raw pointers reference (so those pointers stay valid for the lifetime of
 // the bundle), the pooled GPU line/voxel refs, all scalar pass parameters, VineWorldToLocal, and
 // a conservative world-space bounds. Copyable + movable. Produced by VineLeaf_BuildVineBuildInput
@@ -1147,11 +1342,10 @@ struct FVineBuildInput
 	FVineTargetBucketBuffers TargetBuckets;
 	FVector3f TargetBucketOrigin = FVector3f::ZeroVector;
 
-	// GPU-resident inputs (pooled refs kept alive by the bundle).
+	// Fused space-colonization inputs. When valid, the line geometry is solved and concatenated
+	// inside the leaf's own graph instead of arriving as pooled buffers.
 	bool bUseGPULines = false;
-	TRefCountPtr<FRDGPooledBuffer> GPULinePoints;
-	TRefCountPtr<FRDGPooledBuffer> GPULineMeta;
-	TRefCountPtr<FRDGPooledBuffer> GPULineSeg;
+	FVineFusedSCInputs FusedSC;
 	bool bUseGPUVoxels = false;
 	TRefCountPtr<FRDGPooledBuffer> GPUVoxCells;
 	TRefCountPtr<FRDGPooledBuffer> GPUVoxNormals;
@@ -1199,32 +1393,12 @@ struct FVineBuildInput
 	// Conservative world-space bounds for the leaf (renders at identity transform => world == local).
 	FBox LocalBounds = FBox(ForceInit);
 
-	// False when the inputs cannot produce a mesh (zero counts / no voxels); mirrors the early
-	// returns of DispatchVVGPU_Voxel.
+	// False when the inputs cannot produce a mesh (zero counts / no voxels).
 	bool bValid = false;
 };
 
 namespace
 {
-static const FName VineGeneratedStaticMeshActorTag(TEXT("VineGeneratedStaticMeshActor"));
-
-static bool IsVineGeneratedStaticMeshActor(const AActor* Actor)
-{
-	return Actor && Actor->Tags.Contains(VineGeneratedStaticMeshActorTag);
-}
-
-static void TransformDynamicMeshToLocalSpace(UDynamicMesh* Mesh, const FTransform& LocalToWorld)
-{
-	if (!Mesh || LocalToWorld.Equals(FTransform::Identity))
-	{
-		return;
-	}
-
-	Mesh->EditMesh([&](FDynamicMesh3& EditMesh)
-	{
-		MeshTransforms::ApplyTransformInverse(EditMesh, FTransformSRT3d(LocalToWorld), true);
-	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
-}
 
 static FGeometryScriptPolyPath ClonePolyPath(const FGeometryScriptPolyPath& Source)
 {
@@ -1295,90 +1469,6 @@ static void ApplyVVSCPointOffset(FGeometryScriptPolyPath& Line, const FVector& S
 	{
 		Point += GetVVSCPointOffset(SourceLocation, Point);
 	}
-}
-
-static void LogVineSCStageTargetTransformMatch(
-	const TCHAR* Label,
-	const TArray<FGeometryScriptPolyPath>& Lines,
-	const TArray<FTransform>& TargetTransforms)
-{
-	TArray<FVector> TargetLocations;
-	TargetLocations.Reserve(TargetTransforms.Num());
-	for (const FTransform& TargetTransform : TargetTransforms)
-	{
-		TargetLocations.Add(TargetTransform.GetLocation());
-	}
-
-	constexpr double MatchTolerance = 0.5;
-	int32 PointCount = 0;
-	int32 MatchCount = 0;
-	double TotalNearestDistance = 0.0;
-	double MaxNearestDistance = 0.0;
-	FString Samples;
-
-	for (const FGeometryScriptPolyPath& Line : Lines)
-	{
-		if (!Line.Path.IsValid())
-		{
-			continue;
-		}
-
-		for (const FVector& Point : *Line.Path)
-		{
-			double NearestDistance = TNumericLimits<double>::Max();
-			int32 NearestTargetIndex = INDEX_NONE;
-			for (int32 TargetIndex = 0; TargetIndex < TargetLocations.Num(); ++TargetIndex)
-			{
-				const double Distance = FVector::Dist(Point, TargetLocations[TargetIndex]);
-				if (Distance < NearestDistance)
-				{
-					NearestDistance = Distance;
-					NearestTargetIndex = TargetIndex;
-				}
-			}
-
-			if (NearestDistance <= MatchTolerance)
-			{
-				++MatchCount;
-			}
-			if (NearestDistance < TNumericLimits<double>::Max())
-			{
-				TotalNearestDistance += NearestDistance;
-				MaxNearestDistance = FMath::Max(MaxNearestDistance, NearestDistance);
-			}
-
-			if (PointCount < 6)
-			{
-				if (!Samples.IsEmpty())
-				{
-					Samples += TEXT(" | ");
-				}
-				Samples += FString::Printf(
-					TEXT("#%d Point=(%.2f, %.2f, %.2f) NearestTarget=%d Dist=%.4f"),
-					PointCount,
-					Point.X,
-					Point.Y,
-					Point.Z,
-					NearestTargetIndex,
-					NearestDistance);
-			}
-			++PointCount;
-		}
-	}
-
-	const bool bAllPointsMatchTargetTransforms = PointCount > 0 && MatchCount == PointCount;
-	const double AverageNearestDistance = PointCount > 0 ? TotalNearestDistance / double(PointCount) : 0.0;
-	UE_LOG(LogTemp, Display,
-		TEXT("[VineSCStageTargetTransformCheck][%s] Lines=%d Targets=%d Points=%d Matches=%d AllPointsMatchTargetTransforms=%s AvgNearestDist=%.4f MaxNearestDist=%.4f Samples=%s"),
-		Label,
-		Lines.Num(),
-		TargetTransforms.Num(),
-		PointCount,
-		MatchCount,
-		bAllPointsMatchTargetTransforms ? TEXT("true") : TEXT("false"),
-		AverageNearestDistance,
-		MaxNearestDistance,
-		Samples.IsEmpty() ? TEXT("none") : *Samples);
 }
 
 static bool IsFiniteVector(const FVector& Vector)
@@ -2250,130 +2340,17 @@ static bool BuildVineTargetBucketBuffers(
 	return true;
 }
 
-// Trip A: merge the per-source GPU SC outputs into one contiguous VisVine batch on
-// the GPU (no CPU round-trip). Point positions (.w = final scale) and CurveU are
-// copied verbatim into each source's destination slice; PathPointMeta (Prev/Next/
-// Base) and SegmentMeta (A/B) point indices are offset by the source's destination
-// point base so they address the concatenated array. Produces one pooled buffer set
-// equivalent to BuildVVGPUInput's output over all sources' lines.
-static bool ConcatenateVineSCGPUBuffers(const TArray<TSharedPtr<FVineSCGPUBuffers>>& Sources, FVineSCGPUBuffers& OutConcat)
+// Dispatch-arg slots VineDispatchArgsCS publishes, one uint3 each, in this order.
+enum : uint32
 {
-	OutConcat = FVineSCGPUBuffers();
+	VineArgSlot_Points = 0u,             // one thread per path point
+	VineArgSlot_Segments = 1u,           // one thread per segment
+	VineArgSlot_VerticesOrSegments = 2u, // BuildVVVoxelCS: its two halves index differently
+	VineArgSlot_Vertices = 3u,           // one thread per output vertex
+	VineArgSlotCount = 4u,
+};
 
-	TArray<TRefCountPtr<FRDGPooledBuffer>> SrcPoints, SrcMeta, SrcSeg;
-	TArray<uint32> SrcPointCounts, SrcSegCounts, DstPointBases, DstSegBases;
-	uint32 TotalPoints = 0;
-	uint32 TotalSegments = 0;
-	for (const TSharedPtr<FVineSCGPUBuffers>& S : Sources)
-	{
-		if (!S.IsValid() || !S->IsValid()) continue;
-		SrcPoints.Add(S->PathPoints);
-		SrcMeta.Add(S->PathPointMeta);
-		SrcSeg.Add(S->SegmentMeta);
-		SrcPointCounts.Add(uint32(S->PointCount));
-		SrcSegCounts.Add(uint32(S->SegmentCount));
-		DstPointBases.Add(TotalPoints);
-		DstSegBases.Add(TotalSegments);
-		TotalPoints += uint32(S->PointCount);
-		TotalSegments += uint32(S->SegmentCount);
-	}
-	if (TotalPoints == 0 || TotalSegments == 0)
-	{
-		return false;
-	}
-
-	const int32 NumSrc = SrcPoints.Num();
-
-	TRefCountPtr<FRDGPooledBuffer> OutPathPoints;
-	TRefCountPtr<FRDGPooledBuffer> OutMeta;
-	TRefCountPtr<FRDGPooledBuffer> OutSeg;
-	bool bConcatOK = false;
-
-	ENQUEUE_RENDER_COMMAND(ConcatVineSCBuffers)(
-		[SrcPoints = MoveTemp(SrcPoints), SrcMeta = MoveTemp(SrcMeta), SrcSeg = MoveTemp(SrcSeg),
-		 SrcPointCounts = MoveTemp(SrcPointCounts), SrcSegCounts = MoveTemp(SrcSegCounts),
-		 DstPointBases = MoveTemp(DstPointBases), DstSegBases = MoveTemp(DstSegBases),
-		 NumSrc, TotalPoints, TotalSegments,
-		 &OutPathPoints, &OutMeta, &OutSeg, &bConcatOK](FRHICommandListImmediate& RHICmdList)
-		{
-			FRDGBuilder GraphBuilder(RHICmdList);
-
-			CSHelper::FRDGStructuredBufferRefs DstPoints = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), TotalPoints, TEXT("VineConcat.PathPoints"), true, true);
-			CSHelper::FRDGStructuredBufferRefs DstMeta = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FIntVector4), TotalPoints, TEXT("VineConcat.PathPointMeta"), true, true);
-			CSHelper::FRDGStructuredBufferRefs DstSeg = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FIntVector4), TotalSegments, TEXT("VineConcat.SegmentMeta"), true, true);
-
-			TShaderMapRef<FConcatOffsetInt4CS> ConcatShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-
-			for (int32 s = 0; s < NumSrc; ++s)
-			{
-				const uint32 PtCount = SrcPointCounts[s];
-				const uint32 SgCount = SrcSegCounts[s];
-				const uint32 DstPtBase = DstPointBases[s];
-				const uint32 DstSgBase = DstSegBases[s];
-				if (PtCount == 0u)
-				{
-					continue;
-				}
-
-				FRDGBufferRef SrcPtBuf = GraphBuilder.RegisterExternalBuffer(SrcPoints[s], TEXT("VineConcat.SrcPathPoints"));
-				FRDGBufferRef SrcMtBuf = GraphBuilder.RegisterExternalBuffer(SrcMeta[s], TEXT("VineConcat.SrcMeta"));
-
-				// Positions: 16-byte float4, verbatim byte copy works.
-				AddCopyBufferPass(GraphBuilder, DstPoints.Buffer, uint64(DstPtBase) * sizeof(FVector4f), SrcPtBuf, 0, uint64(PtCount) * sizeof(FVector4f));
-				// CurveU is uploaded whole (float4) above from the aggregated CPU array; no per-source copy.
-
-				// Meta: offset Prev/Next/Base by the point base, keep Count.
-				{
-					FConcatOffsetInt4CS::FParameters* P = GraphBuilder.AllocParameters<FConcatOffsetInt4CS::FParameters>();
-					P->ConcatSrcInt4 = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SrcMtBuf));
-					P->RW_ConcatDstInt4 = DstMeta.UAV;
-					P->ConcatCount = PtCount;
-					P->ConcatDstBase = DstPtBase;
-					P->ConcatOffsetValue = int32(DstPtBase);
-					P->ConcatOffsetMask = FIntVector4(1, 1, 1, 0);
-					GraphBuilder.AddPass(RDG_EVENT_NAME("VineConcat.Meta"), P, ERDGPassFlags::Compute,
-						[P, ConcatShader, PtCount](FRHIComputeCommandList& InRHICmdList)
-						{ FComputeShaderUtils::Dispatch(InRHICmdList, ConcatShader, *P, FComputeShaderUtils::GetGroupCount(FIntVector(PtCount, 1, 1), 64)); });
-				}
-
-				// Segments: offset A/B by the point base.
-				if (SgCount > 0u)
-				{
-					FRDGBufferRef SrcSgBuf = GraphBuilder.RegisterExternalBuffer(SrcSeg[s], TEXT("VineConcat.SrcSeg"));
-					FConcatOffsetInt4CS::FParameters* P = GraphBuilder.AllocParameters<FConcatOffsetInt4CS::FParameters>();
-					P->ConcatSrcInt4 = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SrcSgBuf));
-					P->RW_ConcatDstInt4 = DstSeg.UAV;
-					P->ConcatCount = SgCount;
-					P->ConcatDstBase = DstSgBase;
-					P->ConcatOffsetValue = int32(DstPtBase);
-					P->ConcatOffsetMask = FIntVector4(1, 1, 0, 0);
-					GraphBuilder.AddPass(RDG_EVENT_NAME("VineConcat.Seg"), P, ERDGPassFlags::Compute,
-						[P, ConcatShader, SgCount](FRHIComputeCommandList& InRHICmdList)
-						{ FComputeShaderUtils::Dispatch(InRHICmdList, ConcatShader, *P, FComputeShaderUtils::GetGroupCount(FIntVector(SgCount, 1, 1), 64)); });
-				}
-			}
-
-			OutPathPoints = GraphBuilder.ConvertToExternalBuffer(DstPoints.Buffer);
-			OutMeta = GraphBuilder.ConvertToExternalBuffer(DstMeta.Buffer);
-			OutSeg = GraphBuilder.ConvertToExternalBuffer(DstSeg.Buffer);
-			GraphBuilder.Execute();
-			bConcatOK = true;
-		});
-
-	FlushRenderingCommands();
-
-	if (!bConcatOK)
-	{
-		return false;
-	}
-	OutConcat.PathPoints = MoveTemp(OutPathPoints);
-	OutConcat.PathPointMeta = MoveTemp(OutMeta);
-	OutConcat.SegmentMeta = MoveTemp(OutSeg);
-	OutConcat.PointCount = int32(TotalPoints);
-	OutConcat.SegmentCount = int32(TotalSegments);
-	OutConcat.LineCount = 0;
-	return true;
-}
+static constexpr uint32 VineArgOffset(uint32 Slot) { return Slot * 3u * uint32(sizeof(uint32)); }
 
 // Aggregated inputs for the shared vine-mesh RDG pass graph (AddVineMeshPasses).
 // Every value the graph body reads is threaded through here so the pass sequence
@@ -2382,10 +2359,15 @@ static bool ConcatenateVineSCGPUBuffers(const TArray<TSharedPtr<FVineSCGPUBuffer
 // synchronous AddVineMeshPasses call.
 struct FVineMeshPassInputs
 {
+	// GPU-resident line geometry recorded earlier into the SAME graph by the fused SC + concat
+	// passes. Null on the CPU-array fallback below.
 	bool bUseGPULines = false;
-	TRefCountPtr<FRDGPooledBuffer> GPULinePoints;
-	TRefCountPtr<FRDGPooledBuffer> GPULineMeta;
-	TRefCountPtr<FRDGPooledBuffer> GPULineSeg;
+	FRDGBufferRef GPULinePoints = nullptr;
+	FRDGBufferRef GPULineMeta = nullptr;
+	FRDGBufferRef GPULineSeg = nullptr;
+	// [0]=lineCount [1]=pointCount [2]=segmentCount. GPU-decided; drives every dispatch below.
+	// Null on the CPU-array fallback, where the counts are uploaded from the array sizes.
+	FRDGBufferRef LineCountsBuffer = nullptr;
 	const TArray<FVector4f>* PathPoints = nullptr;
 	const TArray<FVector4f>* PathPointAxes = nullptr;
 	const TArray<FIntVector4>* PathPointMeta = nullptr;
@@ -2458,16 +2440,15 @@ struct FVineMeshPassOutputs
 };
 
 // Records the full vine-mesh RDG pass graph (buffer registration + scratch buffers +
-// the eight compute passes) into GraphBuilder. Behavior-identical extraction of the
-// graph body formerly inlined in DispatchVVGPU_Voxel; the caller still owns the output
-// buffers, the readback copies and GraphBuilder.Execute().
+// the eight compute passes) into GraphBuilder. The caller owns the output buffers and
+// GraphBuilder.Execute().
 static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type FeatureLevel, const FVineMeshPassInputs& In, const FVineMeshPassOutputs& Out)
 {
 	// Local aliases so the moved graph body below reads exactly as the original.
 	const bool bUseGPULines = In.bUseGPULines;
-	const TRefCountPtr<FRDGPooledBuffer>& GPULinePoints = In.GPULinePoints;
-	const TRefCountPtr<FRDGPooledBuffer>& GPULineMeta = In.GPULineMeta;
-	const TRefCountPtr<FRDGPooledBuffer>& GPULineSeg = In.GPULineSeg;
+	FRDGBufferRef GPULinePoints = In.GPULinePoints;
+	FRDGBufferRef GPULineMeta = In.GPULineMeta;
+	FRDGBufferRef GPULineSeg = In.GPULineSeg;
 	const TArray<FVector4f>& PathPoints = *In.PathPoints;
 	const TArray<FVector4f>& PathPointAxes = *In.PathPointAxes;
 	const TArray<FIntVector4>& PathPointMeta = *In.PathPointMeta;
@@ -2511,22 +2492,77 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	const uint32 SafeNoiseIterations = In.SafeNoiseIterations;
 	const EVisVineGPUDebugStage DebugStage = In.DebugStage;
 
+	// ------------------------------------------------------------------------
+	// Stage E: every pass below is DispatchIndirect'd from GPU-decided counts.
+	// PathPointCount / SegmentCount / OutputVertexCount / OutputIndexCount are now the CPU
+	// ALLOCATION CAPACITIES (VV.MaxVinePointCount-derived), so dispatching directly from them
+	// would run the voxel-bucket kernels — and the axial-V scan — over a quarter of a
+	// million slots regardless of how short the vines are. LineCountsBuffer carries the compact
+	// counts the fused SC + concat produced; VineDispatchArgsCS turns them into dispatch args.
+	// ------------------------------------------------------------------------
+	FRDGBufferRef LineCountsBuffer = In.LineCountsBuffer;
+	if (!LineCountsBuffer)
+	{
+		// CPU-array fallback: the capacities ARE the real counts, so publish them as-is.
+		TArray<uint32> CpuCounts;
+		CpuCounts.Add(0u);
+		CpuCounts.Add(PathPointCount);
+		CpuCounts.Add(SegmentCount);
+		CpuCounts.Add(0u);
+		LineCountsBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, CpuCounts, TEXT("VineMesh.LineCounts.CPU"), false, true).Buffer;
+	}
+	FRDGBufferSRVRef LineCountsSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(LineCountsBuffer));
+
+	// Four uint3 arg sets: [0] points, [1] segments, [2] max(vertices, segments), [3] vertices.
+	FRDGBufferRef DispatchArgsBuffer = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateIndirectDesc(sizeof(uint32), VineArgSlotCount * 3u), TEXT("VineMesh.DispatchArgs"));
+	{
+		// The legacy (non base-stream) path owns no persistent indirect-draw / counter buffers;
+		// hand the kernel scratch ones so a single code path publishes every argument.
+		FRDGBufferUAVRef DrawIndirectUAV = Out.IndirectArgsUAV;
+		if (!DrawIndirectUAV)
+		{
+			FRDGBufferRef Scratch = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateIndirectDesc(sizeof(uint32), 5), TEXT("VineMesh.DrawArgs.Scratch"));
+			DrawIndirectUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Scratch, PF_R32_UINT));
+		}
+		FRDGBufferUAVRef CountersUAV = Out.MeshCountersUAV;
+		if (!CountersUAV)
+		{
+			FRDGBufferRef Scratch = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 2), TEXT("VineMesh.MeshCounters.Scratch"));
+			CountersUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Scratch, PF_R32_UINT));
+		}
+
+		FVineDispatchArgsCS::FParameters* ArgsParameters = GraphBuilder.AllocParameters<FVineDispatchArgsCS::FParameters>();
+		ArgsParameters->VineArgs_Counts = LineCountsSRV;
+		ArgsParameters->RW_VineArgs_Dispatch = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(DispatchArgsBuffer, PF_R32_UINT));
+		ArgsParameters->RW_VineArgs_DrawIndirect = DrawIndirectUAV;
+		ArgsParameters->RW_VineArgs_MeshCounters = CountersUAV;
+		ArgsParameters->VineArgs_PointCapacity = PathPointCount;
+		ArgsParameters->VineArgs_SegmentCapacity = SegmentCount;
+		ArgsParameters->VineArgs_ProfileCount = ProfileCount;
+		ArgsParameters->VineArgs_bTube = bTube ? 1u : 0u;
+		ArgsParameters->VineArgs_GroupSize = VineMeshGroupSize;
+		TShaderMapRef<FVineDispatchArgsCS> ArgsShader(GetGlobalShaderMap(FeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VVVoxel.DispatchArgs"), ArgsShader, ArgsParameters, FIntVector(1, 1, 1));
+	}
+
 	CSHelper::FRDGStructuredBufferRefs PathPointBuffer;
 	CSHelper::FRDGStructuredBufferRefs PathPointAxisBuffer;
 	CSHelper::FRDGStructuredBufferRefs PathPointMetaBuffer;
 	CSHelper::FRDGStructuredBufferRefs SegmentMetaBuffer;
 	if (bUseGPULines)
 	{
-		auto RegisterSRVOnly = [&GraphBuilder](const TRefCountPtr<FRDGPooledBuffer>& Pooled, const TCHAR* Name)
+		// Produced earlier in this same graph, so they need an SRV view and nothing else.
+		auto ViewSRVOnly = [&GraphBuilder](FRDGBufferRef Buffer)
 		{
 			CSHelper::FRDGStructuredBufferRefs Refs;
-			Refs.Buffer = GraphBuilder.RegisterExternalBuffer(Pooled, Name);
-			Refs.SRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Refs.Buffer));
+			Refs.Buffer = Buffer;
+			Refs.SRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Buffer));
 			return Refs;
 		};
-		PathPointBuffer = RegisterSRVOnly(GPULinePoints, TEXT("VVVoxel.PathPoints.GPU"));
-		PathPointMetaBuffer = RegisterSRVOnly(GPULineMeta, TEXT("VVVoxel.PathPointMeta.GPU"));
-		SegmentMetaBuffer = RegisterSRVOnly(GPULineSeg, TEXT("VVVoxel.SegmentMeta.GPU"));
+		PathPointBuffer = ViewSRVOnly(GPULinePoints);
+		PathPointMetaBuffer = ViewSRVOnly(GPULineMeta);
+		SegmentMetaBuffer = ViewSRVOnly(GPULineSeg);
 		// The GPU SC path carries no per-point axis; zero-fill (matches BuildVVGPUInput's empty axes).
 		PathPointAxisBuffer = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), PathPointCount, TEXT("VVVoxel.PathPointAxes.Zero"), true, true);
 		AddClearUAVPass(GraphBuilder, PathPointAxisBuffer.UAV, 0u);
@@ -2566,6 +2602,10 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 		{
 			FVVBuildVoxelHashCS::FParameters* HP = GraphBuilder.AllocParameters<FVVBuildVoxelHashCS::FParameters>();
 			HP->HashBuildCells = VoxelCellsBuffer.SRV;
+			// The real voxel count only exists on the GPU; the hash build reads it from here so the
+			// capacity slack never enters the table.
+			HP->HashBuildCounter = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(
+				GraphBuilder.RegisterExternalBuffer(In.GPUVoxCounter, TEXT("VVVoxel.VoxelCounter.GPU")), PF_R32_UINT));
 			HP->RW_HashBuildSlots = VoxelHashSlotsBuffer.UAV;
 			HP->HashBuildVoxelCount = GPUVoxCount;
 			HP->HashBuildSlotCount = GpuVoxelHashSlotCountPow2;
@@ -2620,15 +2660,10 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	NoiseParameters->CurlNoiseStrength = CurlNoiseStrength;
 	NoiseParameters->CurlNoiseFrequency = CurlNoiseFrequency;
 	NoiseParameters->NoiseIterations = SafeNoiseIterations;
+	NoiseParameters->VineDispatchArgs = DispatchArgsBuffer;
 
-	GraphBuilder.AddPass(
-		RDG_EVENT_NAME("VVVoxel.ApplyNoise"),
-		NoiseParameters,
-		ERDGPassFlags::Compute,
-		[NoiseParameters, NoiseShader, PathPointCount](FRHIComputeCommandList& InRHICmdList)
-		{
-			FComputeShaderUtils::Dispatch(InRHICmdList, NoiseShader, *NoiseParameters, FComputeShaderUtils::GetGroupCount(FIntVector(PathPointCount, 1, 1), 64));
-	});
+	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VVVoxel.ApplyNoise"), NoiseShader, NoiseParameters,
+		DispatchArgsBuffer, VineArgOffset(VineArgSlot_Points));
 
 	TShaderMapRef<FVVVoxelBuildAxesCS> BuildAxesShader(GetGlobalShaderMap(FeatureLevel));
 	FVVVoxelBuildAxesCS::FParameters* BuildAxesParameters = GraphBuilder.AllocParameters<FVVVoxelBuildAxesCS::FParameters>();
@@ -2657,15 +2692,10 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	BuildAxesParameters->TargetBucketCount = TargetBuckets.BucketCount;
 	BuildAxesParameters->TargetBucketHashSlotCount = TargetBuckets.HashSlotCount;
 	BuildAxesParameters->TargetBucketSearchRadius = TargetBuckets.SearchRadius;
+	BuildAxesParameters->VineDispatchArgs = DispatchArgsBuffer;
 
-	GraphBuilder.AddPass(
-		RDG_EVENT_NAME("VVVoxel.BuildAxes"),
-		BuildAxesParameters,
-		ERDGPassFlags::Compute,
-		[BuildAxesParameters, BuildAxesShader, PathPointCount](FRHIComputeCommandList& InRHICmdList)
-		{
-			FComputeShaderUtils::Dispatch(InRHICmdList, BuildAxesShader, *BuildAxesParameters, FComputeShaderUtils::GetGroupCount(FIntVector(PathPointCount, 1, 1), 64));
-	});
+	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VVVoxel.BuildAxes"), BuildAxesShader, BuildAxesParameters,
+		DispatchArgsBuffer, VineArgOffset(VineArgSlot_Points));
 
 	TShaderMapRef<FVVVoxelPerlinNoiseCS> PerlinNoiseShader(GetGlobalShaderMap(FeatureLevel));
 	FVVVoxelPerlinNoiseCS::FParameters* PerlinNoiseParameters = GraphBuilder.AllocParameters<FVVVoxelPerlinNoiseCS::FParameters>();
@@ -2675,15 +2705,10 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	PerlinNoiseParameters->PerlinNoiseStrength = PerlinNoiseStrength;
 	PerlinNoiseParameters->PerlinNoiseFrequency = PerlinNoiseFrequency;
 	PerlinNoiseParameters->PathPointCount = PathPointCount;
+	PerlinNoiseParameters->VineDispatchArgs = DispatchArgsBuffer;
 
-	GraphBuilder.AddPass(
-		RDG_EVENT_NAME("VVVoxel.PerlinNoise"),
-		PerlinNoiseParameters,
-		ERDGPassFlags::Compute,
-		[PerlinNoiseParameters, PerlinNoiseShader, PathPointCount](FRHIComputeCommandList& InRHICmdList)
-		{
-			FComputeShaderUtils::Dispatch(InRHICmdList, PerlinNoiseShader, *PerlinNoiseParameters, FComputeShaderUtils::GetGroupCount(FIntVector(PathPointCount, 1, 1), 64));
-	});
+	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VVVoxel.PerlinNoise"), PerlinNoiseShader, PerlinNoiseParameters,
+		DispatchArgsBuffer, VineArgOffset(VineArgSlot_Points));
 
 	// ===== Pass FP: Final surface projection (now runs before smoothing) =====
 	// PerlinNoise left its result in the A buffers. Project those points back onto the
@@ -2714,15 +2739,10 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	FinalProjectParameters->TargetBucketHashSlotCount = TargetBuckets.HashSlotCount;
 	FinalProjectParameters->TargetBucketSearchRadius = TargetBuckets.SearchRadius;
 	FinalProjectParameters->VinesOffset = VinesOffset;
+	FinalProjectParameters->VineDispatchArgs = DispatchArgsBuffer;
 
-	GraphBuilder.AddPass(
-		RDG_EVENT_NAME("VVVoxel.FinalProject"),
-		FinalProjectParameters,
-		ERDGPassFlags::Compute,
-		[FinalProjectParameters, FinalProjectShader, PathPointCount](FRHIComputeCommandList& InRHICmdList)
-		{
-			FComputeShaderUtils::Dispatch(InRHICmdList, FinalProjectShader, *FinalProjectParameters, FComputeShaderUtils::GetGroupCount(FIntVector(PathPointCount, 1, 1), 64));
-		});
+	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VVVoxel.FinalProject"), FinalProjectShader, FinalProjectParameters,
+		DispatchArgsBuffer, VineArgOffset(VineArgSlot_Points));
 
 	if (Out.DebugCenterSourceBufferPtr && DebugStage == EVisVineGPUDebugStage::FinalProject) *Out.DebugCenterSourceBufferPtr = PathPointSurfaceTargetB.Buffer;
 
@@ -2747,15 +2767,10 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 		ResampleParams->RW_PathPointSurfaceNormals = WriteSurfaceNormal->UAV;
 		ResampleParams->PathPointCount = PathPointCount;
 		ResampleParams->ResampleTargetDistance = ResampleTargetDistance;
+		ResampleParams->VineDispatchArgs = DispatchArgsBuffer;
 
-		GraphBuilder.AddPass(
-			RDG_EVENT_NAME("VVVoxel.ResampleSurface"),
-			ResampleParams,
-			ERDGPassFlags::Compute,
-			[ResampleParams, ResampleSurfaceShader, PathPointCount](FRHIComputeCommandList& InRHICmdList)
-			{
-				FComputeShaderUtils::Dispatch(InRHICmdList, ResampleSurfaceShader, *ResampleParams, FComputeShaderUtils::GetGroupCount(FIntVector(PathPointCount, 1, 1), 64));
-			});
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VVVoxel.ResampleSurface"), ResampleSurfaceShader, ResampleParams,
+			DispatchArgsBuffer, VineArgOffset(VineArgSlot_Points));
 
 		Swap(ReadSurfaceTarget, WriteSurfaceTarget);
 		Swap(ReadSurfaceNormal, WriteSurfaceNormal);
@@ -2785,15 +2800,10 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 		SmoothParameters->PathPointCount = PathPointCount;
 		SmoothParameters->SmoothPathKernelRadius = IterationKernelRadius;
 		SmoothParameters->SmoothPathAngleStrength = SafePostProjectionSmoothAngleStrength;
+		SmoothParameters->VineDispatchArgs = DispatchArgsBuffer;
 
-		GraphBuilder.AddPass(
-			RDG_EVENT_NAME("VVVoxel.SmoothPath%d", SmoothIterationIndex),
-			SmoothParameters,
-			ERDGPassFlags::Compute,
-			[SmoothParameters, SmoothPathShader, PathPointCount](FRHIComputeCommandList& InRHICmdList)
-			{
-				FComputeShaderUtils::Dispatch(InRHICmdList, SmoothPathShader, *SmoothParameters, FComputeShaderUtils::GetGroupCount(FIntVector(PathPointCount, 1, 1), 64));
-			});
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VVVoxel.SmoothPath%d", SmoothIterationIndex), SmoothPathShader, SmoothParameters,
+			DispatchArgsBuffer, VineArgOffset(VineArgSlot_Points));
 
 		Swap(ReadSurfaceTarget, WriteSurfaceTarget);
 		Swap(ReadSurfaceNormal, WriteSurfaceNormal);
@@ -2818,15 +2828,10 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	BuildTangentsParams->RW_PathPointTangents = PathPointTangentA.UAV;
 	BuildTangentsParams->RW_PathPointFrameNormals = PathPointFrameNormalA.UAV;
 	BuildTangentsParams->PathPointCount = PathPointCount;
+	BuildTangentsParams->VineDispatchArgs = DispatchArgsBuffer;
 
-	GraphBuilder.AddPass(
-		RDG_EVENT_NAME("VVVoxel.BuildParallelTransportFrame"),
-		BuildTangentsParams,
-		ERDGPassFlags::Compute,
-		[BuildTangentsParams, BuildTangentsFromSurfaceShader, PathPointCount](FRHIComputeCommandList& InRHICmdList)
-		{
-			FComputeShaderUtils::Dispatch(InRHICmdList, BuildTangentsFromSurfaceShader, *BuildTangentsParams, FComputeShaderUtils::GetGroupCount(FIntVector(PathPointCount, 1, 1), 64));
-		});
+	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VVVoxel.BuildParallelTransportFrame"), BuildTangentsFromSurfaceShader, BuildTangentsParams,
+		DispatchArgsBuffer, VineArgOffset(VineArgSlot_Points));
 
 	// Parallel-transport frame output (A buffers) is the final axis frame used for mesh build.
 	CSHelper::FRDGStructuredBufferRefs& FinalTangentsForBuild = PathPointTangentA;
@@ -2860,8 +2865,6 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 		Parameters->RWTexCoords = Out.TexCoordUAV;
 		Parameters->RWColors = Out.ColorUAV;
 		Parameters->RWBaseIndices = Out.IndexUAV;
-		Parameters->RWIndirectArgs = Out.IndirectArgsUAV;
-		Parameters->RWMeshCounters = Out.MeshCountersUAV;
 		Parameters->VineWorldToLocal = Out.VineWorldToLocal;
 		Parameters->RW_OutVertices = nullptr;
 		Parameters->RW_OutUVs = nullptr;
@@ -2878,9 +2881,8 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 		Parameters->RWTexCoords = nullptr;
 		Parameters->RWColors = nullptr;
 		Parameters->RWBaseIndices = nullptr;
-		Parameters->RWIndirectArgs = nullptr;
-		Parameters->RWMeshCounters = nullptr;
 	}
+	Parameters->VineMeshCounts = LineCountsSRV;
 	Parameters->PathPointCount = PathPointCount;
 	Parameters->SegmentCount = SegmentCount;
 	Parameters->OutputVertexCount = OutputVertexCount;
@@ -2900,26 +2902,15 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	Parameters->TargetBucketSearchRadius = TargetBuckets.SearchRadius;
 	Parameters->VinesOffset = VinesOffset;
 	Parameters->TinyZJitterStrength = TinyZJitterStrength;
+	Parameters->VineDispatchArgs = DispatchArgsBuffer;
 
-	const uint32 DispatchCount = FMath::Max(OutputVertexCount, SegmentCount);
-	GraphBuilder.AddPass(
-		RDG_EVENT_NAME("VVVoxelCS"),
-		Parameters,
-		ERDGPassFlags::Compute,
-		[Parameters, ComputeShader, DispatchCount](FRHIComputeCommandList& RHICmdList)
-		{
-			const uint32 GroupCountX = FMath::DivideAndRoundUp(DispatchCount, 64u);
-			SetComputePipelineState(RHICmdList, ComputeShader.GetComputeShader());
-			SetShaderParameters(RHICmdList, ComputeShader, ComputeShader.GetComputeShader(), *Parameters);
-			RHICmdList.DispatchComputeShader(GroupCountX, 1, 1);
-			UnsetShaderUAVs(RHICmdList, ComputeShader, ComputeShader.GetComputeShader());
-		});
+	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VVVoxelCS"), ComputeShader, Parameters,
+		DispatchArgsBuffer, VineArgOffset(VineArgSlot_VerticesOrSegments));
 
 	// ------------------------------------------------------------------------
 	// Base-stream axial V: pass#8 (BuildVVVoxelCS) wrote RWTexCoords[Index*2+1] = 0.
 	// Recompute the correct V on the GPU straight from the base-stream Position buffer
-	// it just filled, reproducing the CPU RecomputeVineOutputUVsFromGeneratedLength, and
-	// overwrite it. The identity leaf makes RWPositions local==world, so the ring centers,
+	// it just filled, and overwrite it. The identity leaf makes RWPositions local==world, so the ring centers,
 	// circumferences and segment lengths match the CPU (which runs on world-space output
 	// verts) to float precision. The legacy readback path (bBaseStreams==false) skips this
 	// entirely (V stays 0 here and is recomputed on the CPU after readback, as before).
@@ -2940,6 +2931,17 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 			CSHelper::FRDGStructuredBufferRefs VineUVSegLen = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(float), VineUVPointCount, TEXT("VineUV.SegLen"), true, true);
 			CSHelper::FRDGStructuredBufferRefs VineUVCurveV = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(float), VineUVPointCount, TEXT("VineUV.CurveV"), true, true);
 
+			// Two-level segmented-scan scratch. RDG needs an element count at graph-build time, so
+			// these are sized off the CPU capacity like every other vine buffer; the passes filling
+			// them are still bounded by the GPU point count. VineUVPointCount == PathPointCount
+			// (OutputVertexCount is PathPointCount * ProfileCount), so V3a's block partition lines up
+			// exactly with the VineArgSlot_Points arg set it dispatches from.
+			const uint32 VineUVScanBlockCount = FMath::DivideAndRoundUp(VineUVPointCount, VineMeshGroupSize);
+			CSHelper::FRDGStructuredBufferRefs VineUVScanFlags = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(uint32), VineUVPointCount, TEXT("VineUV.ScanFlags"), true, true);
+			CSHelper::FRDGStructuredBufferRefs VineUVScanBlockSum = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(float), VineUVScanBlockCount, TEXT("VineUV.ScanBlockSum"), true, true);
+			CSHelper::FRDGStructuredBufferRefs VineUVScanBlockFlag = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(uint32), VineUVScanBlockCount, TEXT("VineUV.ScanBlockFlag"), true, true);
+			CSHelper::FRDGStructuredBufferRefs VineUVScanBlockCarry = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(float), VineUVScanBlockCount, TEXT("VineUV.ScanBlockCarry"), true, true);
+
 			// V1: ring center + circumference for every output point.
 			{
 				FVineUVCentersCS::FParameters* VP = GraphBuilder.AllocParameters<FVineUVCentersCS::FParameters>();
@@ -2948,8 +2950,10 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 				VP->RW_VineUV_RingCirc = VineUVRingCirc.UAV;
 				VP->VineUV_PointCount = VineUVPointCount;
 				VP->VineUV_ProfileCount = ProfileCount;
+				VP->VineDispatchArgs = DispatchArgsBuffer;
 				TShaderMapRef<FVineUVCentersCS> Shader(GetGlobalShaderMap(FeatureLevel));
-				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VineUV.Centers"), Shader, VP, FComputeShaderUtils::GetGroupCount(VineUVPointCount, 64));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VineUV.Centers"), Shader, VP,
+					DispatchArgsBuffer, VineArgOffset(VineArgSlot_Points));
 			}
 
 			// V2: clear SegLen to -1 (line-boundary marker), then scatter per-segment axial length.
@@ -2961,20 +2965,57 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 				VP->RW_VineUV_SegLen = VineUVSegLen.UAV;
 				VP->VineUV_PointCount = VineUVPointCount;
 				VP->VineUV_SegmentCount = SegmentCount;
+				VP->VineDispatchArgs = DispatchArgsBuffer;
 				TShaderMapRef<FVineUVSegLenCS> Shader(GetGlobalShaderMap(FeatureLevel));
-				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VineUV.SegLen"), Shader, VP, FComputeShaderUtils::GetGroupCount(FMath::Max(SegmentCount, 1u), 64));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VineUV.SegLen"), Shader, VP,
+					DispatchArgsBuffer, VineArgOffset(VineArgSlot_Segments));
 			}
 
-			// V3: serial prefix scan with per-line reset -> CurveV (single thread, one group).
+			// V3: segmented prefix sum with per-line reset -> CurveV, as a two-level parallel scan.
+			// V3a: block-local segmented scan + per-block aggregate (indirect, one thread per point).
 			{
-				FVineUVScanCS::FParameters* VP = GraphBuilder.AllocParameters<FVineUVScanCS::FParameters>();
+				FVineUVScanBlockCS::FParameters* VP = GraphBuilder.AllocParameters<FVineUVScanBlockCS::FParameters>();
 				VP->VineUV_SegLen = VineUVSegLen.SRV;
 				VP->VineUV_RingCirc = VineUVRingCirc.SRV;
+				VP->VineUV_Counts = LineCountsSRV;
 				VP->RW_VineUV_CurveV = VineUVCurveV.UAV;
+				VP->RW_VineUV_ScanFlags = VineUVScanFlags.UAV;
+				VP->RW_VineUV_ScanBlockSum = VineUVScanBlockSum.UAV;
+				VP->RW_VineUV_ScanBlockFlag = VineUVScanBlockFlag.UAV;
 				VP->VineUV_PointCount = VineUVPointCount;
 				VP->VineUV_LengthScale = In.UVLengthScale; // raw; the shader applies max(.,1e-8)
-				TShaderMapRef<FVineUVScanCS> Shader(GetGlobalShaderMap(FeatureLevel));
-				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VineUV.Scan"), Shader, VP, FIntVector(1, 1, 1));
+				VP->VineDispatchArgs = DispatchArgsBuffer;
+				TShaderMapRef<FVineUVScanBlockCS> Shader(GetGlobalShaderMap(FeatureLevel));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VineUV.ScanBlock"), Shader, VP,
+					DispatchArgsBuffer, VineArgOffset(VineArgSlot_Points));
+			}
+
+			// V3b: scan the block aggregates into a per-block carry-in. A fixed 1x1x1 launch is
+			// correct here: the kernel is a single block that walks the aggregates in tiles, and its
+			// loop bound comes from the same GPU count buffer, not from the CPU capacity.
+			{
+				FVineUVScanBlockOffsetsCS::FParameters* VP = GraphBuilder.AllocParameters<FVineUVScanBlockOffsetsCS::FParameters>();
+				VP->VineUV_ScanBlockSum = VineUVScanBlockSum.SRV;
+				VP->VineUV_ScanBlockFlag = VineUVScanBlockFlag.SRV;
+				VP->VineUV_Counts = LineCountsSRV;
+				VP->RW_VineUV_ScanBlockCarry = VineUVScanBlockCarry.UAV;
+				VP->VineUV_PointCount = VineUVPointCount;
+				TShaderMapRef<FVineUVScanBlockOffsetsCS> Shader(GetGlobalShaderMap(FeatureLevel));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VineUV.ScanBlockOffsets"), Shader, VP, FIntVector(1, 1, 1));
+			}
+
+			// V3c: fold the carry-in back into the points whose block-local run saw no line head.
+			{
+				FVineUVScanApplyCS::FParameters* VP = GraphBuilder.AllocParameters<FVineUVScanApplyCS::FParameters>();
+				VP->VineUV_ScanFlags = VineUVScanFlags.SRV;
+				VP->VineUV_ScanBlockCarry = VineUVScanBlockCarry.SRV;
+				VP->VineUV_Counts = LineCountsSRV;
+				VP->RW_VineUV_CurveV = VineUVCurveV.UAV;
+				VP->VineUV_PointCount = VineUVPointCount;
+				VP->VineDispatchArgs = DispatchArgsBuffer;
+				TShaderMapRef<FVineUVScanApplyCS> Shader(GetGlobalShaderMap(FeatureLevel));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VineUV.ScanApply"), Shader, VP,
+					DispatchArgsBuffer, VineArgOffset(VineArgSlot_Points));
 			}
 
 			// V4: broadcast CurveV[P] into the V of every ring vertex (overwrites pass#8's 0).
@@ -2985,8 +3026,10 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 				VP->VineUV_OutputVertexCount = OutputVertexCount;
 				VP->VineUV_ProfileCount = ProfileCount;
 				VP->VineUV_PointCount = VineUVPointCount;
+				VP->VineDispatchArgs = DispatchArgsBuffer;
 				TShaderMapRef<FVineUVWriteCS> Shader(GetGlobalShaderMap(FeatureLevel));
-				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VineUV.Write"), Shader, VP, FComputeShaderUtils::GetGroupCount(OutputVertexCount, 64));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VineUV.Write"), Shader, VP,
+					DispatchArgsBuffer, VineArgOffset(VineArgSlot_Vertices));
 			}
 		}
 	}
@@ -2995,10 +3038,8 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 // Shared CPU-prep for the vine mesh pass graph: repacks the surface voxels into GPU-upload
 // arrays, builds the voxel hash + target-position buckets, derives the output vertex/index counts
 // and the sanitized scalar parameters, and captures the GPU-resident line/voxel pooled refs.
-// Produces a self-owning FVineBuildInput consumed by BOTH DispatchVVGPU_Voxel (legacy readback
-// path) and FVineMeshSceneProxy (GPU-resident leaf) — a behavior-identical extraction of the CPU
-// work formerly inlined at the top of DispatchVVGPU_Voxel. On failure it returns bValid=false,
-// mirroring the dispatch's early returns (including the same warning log). The optional out-params
+// Produces a self-owning FVineBuildInput consumed by FVineMeshSceneProxy (the GPU-resident leaf).
+// On failure it returns bValid=false, with the same warning log. The optional out-params
 // report the same per-phase timings the dispatch logs.
 static FVineBuildInput VineLeaf_BuildVineBuildInput(
 	const TArray<FVector4f>& PathPoints,
@@ -3025,7 +3066,7 @@ static FVineBuildInput VineLeaf_BuildVineBuildInput(
 	int32 NoiseIterations,
 	const FCSSurfaceVoxelData& VoxelData,
 	EVisVineGPUDebugStage DebugStage,
-	const FVineSCGPUBuffers* GPULines,
+	const FVineFusedSCInputs* GPULines,
 	const FCSSurfaceVoxelGPUBuffers* GPUVoxels,
 	double* OutBuildVoxelUploadMs = nullptr,
 	double* OutBuildHashMs = nullptr,
@@ -3057,8 +3098,12 @@ static FVineBuildInput VineLeaf_BuildVineBuildInput(
 	const bool bUseGPUVoxels = (GPUVoxels != nullptr && GPUVoxels->IsValid());
 	const uint32 GpuVoxelHashSlotCountPow2 = bUseGPUVoxels
 		? FMath::RoundUpToPowerOfTwo(uint32(FMath::Max(GPUVoxels->VoxelCapacity * 2, 16))) : 0u;
-	const uint32 PathPointCount = bUseGPULines ? uint32(GPULines->PointCount) : uint32(PathPoints.Num());
-	const uint32 SegmentCount = bUseGPULines ? uint32(GPULines->SegmentCount) : uint32(SegmentMeta.Num());
+	// On the fused path these are CAPACITIES, not counts: the SC solve runs inside the leaf's graph
+	// and its compact counts stay in VRAM, so every buffer and stream downstream is allocated for
+	// the worst case and drawn from the GPU counts instead.
+	if (bUseGPULines) B.FusedSC = *GPULines;
+	const uint32 PathPointCount = bUseGPULines ? GPULines->TotalPointCapacity : uint32(PathPoints.Num());
+	const uint32 SegmentCount = bUseGPULines ? GPULines->TotalSegmentCapacity : uint32(SegmentMeta.Num());
 	const uint32 ProfileCount = bTube ? FMath::Max(TubeProfileCount, 3u) : 2u;
 	const uint32 OutputVertexCount = PathPointCount * ProfileCount;
 	const uint32 OutputIndexCount = bTube ? SegmentCount * ProfileCount * 6u : SegmentCount * 6u;
@@ -3083,7 +3128,7 @@ static FVineBuildInput VineLeaf_BuildVineBuildInput(
 		|| OutputVertexCount == 0
 		|| OutputIndexCount == 0)
 	{
-		return B; // bValid stays false (silent, mirrors DispatchVVGPU_Voxel's count early return)
+		return B; // bValid stays false (silent count early-out)
 	}
 
 	const uint32 VoxelCount = bUseGPUVoxels ? uint32(GPUVoxels->VoxelCapacity) : uint32(VoxelData.Cells.Num());
@@ -3098,9 +3143,6 @@ static FVineBuildInput VineLeaf_BuildVineBuildInput(
 
 	if (bUseGPUVoxels)
 	{
-		B.GPULinePoints = bUseGPULines ? GPULines->PathPoints : nullptr;
-		B.GPULineMeta = bUseGPULines ? GPULines->PathPointMeta : nullptr;
-		B.GPULineSeg = bUseGPULines ? GPULines->SegmentMeta : nullptr;
 		B.GPUVoxCells = GPUVoxels->Cells;
 		B.GPUVoxNormals = GPUVoxels->Normals;
 		B.GPUVoxTargets = GPUVoxels->TargetPositions;
@@ -3108,6 +3150,11 @@ static FVineBuildInput VineLeaf_BuildVineBuildInput(
 		B.GPUVoxCount = VoxelCount;
 		B.GPUVoxelHashSlotCount = GpuVoxelHashSlotCountPow2;
 		B.TargetBucketOrigin = B.VoxelOrigin;
+		// This path never builds the target-position buckets (the voxels stay on the GPU), and a
+		// zero-length upload yields a null SRV. TargetBucketCount == 0 already makes the shaders
+		// skip the bucket lookup, but the bindings still have to exist or parameter validation
+		// kills the render thread, so give them the one-element dummies.
+		EnsureVineTargetBucketDummyBuffers(B.TargetBuckets);
 		B.LocalBounds = GPUVoxels->WorldBounds;
 		if (!B.LocalBounds.IsValid)
 		{
@@ -3213,11 +3260,8 @@ static FVineBuildInput VineLeaf_BuildVineBuildInput(
 	}
 	if (OutBuildTargetBucketsMs) *OutBuildTargetBucketsMs = (FPlatformTime::Seconds() - BuildTargetBucketsStartSeconds) * 1000.0;
 
-	// Capture the GPU-resident line / voxel buffers (null on the CPU-array paths). On the GPU-voxel
+	// Capture the GPU-resident voxel buffers (null on the CPU-array path). On the GPU-voxel
 	// path the vine hash is rebuilt on the GPU, so bind the pow2 slot count.
-	B.GPULinePoints = bUseGPULines ? GPULines->PathPoints : nullptr;
-	B.GPULineMeta = bUseGPULines ? GPULines->PathPointMeta : nullptr;
-	B.GPULineSeg = bUseGPULines ? GPULines->SegmentMeta : nullptr;
 	B.GPUVoxCells = bUseGPUVoxels ? GPUVoxels->Cells : nullptr;
 	B.GPUVoxNormals = bUseGPUVoxels ? GPUVoxels->Normals : nullptr;
 	B.GPUVoxTargets = bUseGPUVoxels ? GPUVoxels->TargetPositions : nullptr;
@@ -3242,10 +3286,9 @@ static FVineBuildInput VineLeaf_BuildVineBuildInput(
 static FVineMeshPassInputs VineLeaf_MakePassInputs(const FVineBuildInput& B)
 {
 	FVineMeshPassInputs In;
+	// GPULine* / LineCountsBuffer are RDG refs the caller fills in after recording the producing
+	// passes into its own graph; only the CPU-side values travel through the bundle.
 	In.bUseGPULines = B.bUseGPULines;
-	In.GPULinePoints = B.GPULinePoints;
-	In.GPULineMeta = B.GPULineMeta;
-	In.GPULineSeg = B.GPULineSeg;
 	In.PathPoints = &B.PathPoints;
 	In.PathPointAxes = &B.PathPointAxes;
 	In.PathPointMeta = &B.PathPointMeta;
@@ -3254,6 +3297,7 @@ static FVineMeshPassInputs VineLeaf_MakePassInputs(const FVineBuildInput& B)
 	In.GPUVoxCells = B.GPUVoxCells;
 	In.GPUVoxNormals = B.GPUVoxNormals;
 	In.GPUVoxTargets = B.GPUVoxTargets;
+	In.GPUVoxCounter = B.GPUVoxCounter;
 	In.GPUVoxCount = B.GPUVoxCount;
 	In.GpuVoxelHashSlotCountPow2 = B.GpuVoxelHashSlotCountPow2;
 	In.GPUVoxelCells = &B.GPUVoxelCells;
@@ -3292,425 +3336,34 @@ static FVineMeshPassInputs VineLeaf_MakePassInputs(const FVineBuildInput& B)
 	return In;
 }
 
-static bool DispatchVVGPU_Voxel(
-	const TArray<FVector4f>& PathPoints,
-	const TArray<FVector4f>& PathPointAxes,
-	const TArray<FIntVector4>& PathPointMeta,
-	const TArray<FIntVector4>& SegmentMeta,
-	bool bTube,
-	uint32 TubeProfileCount,
-	float CircleScale,
-	float LineScale,
-	float UVLengthScale,
-	float VinesOffset,
-	float TinyZJitterStrength,
-	int32 PostProjectionSmoothIterations,
-	int32 PostProjectionSmoothKernelRadius,
-	int32 PostProjectionSmallSmoothIterations,
-	float PostProjectionSmoothAngleStrength,
-	bool bResampleSurface,
-	float ResampleTargetDistance,
-	float CurlNoiseStrength,
-	float CurlNoiseFrequency,
-	float PerlinNoiseStrength,
-	float PerlinNoiseFrequency,
-	int32 NoiseIterations,
-	const FCSSurfaceVoxelData& VoxelData,
-	TArray<FVector4f>& OutVertices,
-	TArray<FVector2f>& OutUVs,
-	TArray<uint32>& OutIndices,
-	EVisVineGPUDebugStage DebugStage = EVisVineGPUDebugStage::Smooth,
-	const FVineSCGPUBuffers* GPULines = nullptr,
-	const FCSSurfaceVoxelGPUBuffers* GPUVoxels = nullptr)
+}
+
+// Concatenated line geometry produced inside the leaf's own graph by the fused SC passes. All
+// four are graph-lifetime transients — nothing has to survive GraphBuilder.Execute() any more.
+struct FVineFusedSCOutputs
 {
-	const double DispatchTotalStartSeconds = FPlatformTime::Seconds();
-	double BuildVoxelUploadMs = 0.0;
-	double BuildHashMs = 0.0;
-	double BuildTargetBucketsMs = 0.0;
-	double EnqueueAndFlushMs = 0.0;
-	double ReadbackFlushMs = 0.0;
+	FRDGBufferRef PathPoints = nullptr;
+	FRDGBufferRef PathPointMeta = nullptr;
+	FRDGBufferRef SegmentMeta = nullptr;
+	FRDGBufferRef Counts = nullptr; // [0]=lineCount [1]=pointCount [2]=segmentCount
+};
 
-	OutVertices.Reset();
-	OutUVs.Reset();
-	OutIndices.Reset();
-
-	// Shared CPU-prep (voxel repack + hash + target buckets + counts + sanitized scalars + GPU
-	// line/voxel pooled refs). Identical to the leaf's prep; the returned bundle owns every array
-	// the pass graph reads. bValid=false reproduces the original early returns (zero counts / no
-	// voxels), including the same warning logs, so the legacy readback path's behavior is unchanged.
-	FVineBuildInput Bundle = VineLeaf_BuildVineBuildInput(
-		PathPoints, PathPointAxes, PathPointMeta, SegmentMeta,
-		bTube, TubeProfileCount, CircleScale, LineScale, UVLengthScale, VinesOffset, TinyZJitterStrength,
-		PostProjectionSmoothIterations, PostProjectionSmoothKernelRadius, PostProjectionSmallSmoothIterations, PostProjectionSmoothAngleStrength,
-		bResampleSurface, ResampleTargetDistance, CurlNoiseStrength, CurlNoiseFrequency, PerlinNoiseStrength, PerlinNoiseFrequency, NoiseIterations,
-		VoxelData, DebugStage, GPULines, GPUVoxels,
-		&BuildVoxelUploadMs, &BuildHashMs, &BuildTargetBucketsMs);
-	if (!Bundle.bValid)
-	{
-		return false;
-	}
-
-	// Locals the readback path / timing log still need (read from the shared bundle).
-	const uint32 PathPointCount = Bundle.PathPointCount;
-	const uint32 VoxelCount = Bundle.VoxelCount;
-	const uint32 OutputVertexCount = Bundle.OutputVertexCount;
-	const uint32 OutputIndexCount = Bundle.OutputIndexCount;
-	const FVineTargetBucketBuffers& TargetBuckets = Bundle.TargetBuckets;
-
-	const uint64 VertexReadbackBytes64 = uint64(OutputVertexCount) * sizeof(FVector4f);
-	const uint64 UVReadbackBytes64 = uint64(OutputVertexCount) * sizeof(FVector2f);
-	const uint64 IndexReadbackBytes64 = uint64(OutputIndexCount) * sizeof(uint32);
-	if (VertexReadbackBytes64 > MAX_uint32 || UVReadbackBytes64 > MAX_uint32 || IndexReadbackBytes64 > MAX_uint32)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU_Voxel] Output is too large for readback. Vertices=%u Indices=%u"), OutputVertexCount, OutputIndexCount);
-		return false;
-	}
-
-	const uint32 VertexReadbackBytes = uint32(VertexReadbackBytes64);
-	const uint32 UVReadbackBytes = uint32(UVReadbackBytes64);
-	const uint32 IndexReadbackBytes = uint32(IndexReadbackBytes64);
-	FRHIGPUBufferReadback* VertexReadback = new FRHIGPUBufferReadback(TEXT("VVVoxel_VertexReadback"));
-	FRHIGPUBufferReadback* UVReadback = new FRHIGPUBufferReadback(TEXT("VVVoxel_UVReadback"));
-	FRHIGPUBufferReadback* IndexReadback = new FRHIGPUBufferReadback(TEXT("VVVoxel_IndexReadback"));
-	bool bRenderWorkQueued = false;
-
-	const double EnqueueAndFlushStartSeconds = FPlatformTime::Seconds();
-	ENQUEUE_RENDER_COMMAND(VVVoxelGPU)(
-		[Bundle, VertexReadback, UVReadback, IndexReadback,
-		 VertexReadbackBytes, UVReadbackBytes, IndexReadbackBytes,
-		 OutputVertexCount, OutputIndexCount,
-		 &bRenderWorkQueued](FRHICommandListImmediate& RHICmdList)
-		{
-			FRDGBuilder GraphBuilder(RHICmdList);
-
-			// The bundle (captured by value) owns every array the pass graph reads. Create the three
-			// transient output buffers here (caller-owned so the readback copies below can reference
-			// them), then run the shared vine-mesh pass graph fed from the bundle.
-			const CSHelper::FRDGStructuredBufferRefs OutVertexBuffer = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), OutputVertexCount, TEXT("VVVoxel.OutVertices"), true, true);
-			const CSHelper::FRDGStructuredBufferRefs OutUVBuffer = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector2f), OutputVertexCount, TEXT("VVVoxel.OutUVs"), true, true);
-			const CSHelper::FRDGStructuredBufferRefs OutIndexBuffer = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(uint32), OutputIndexCount, TEXT("VVVoxel.OutIndices"), true, true);
-
-			// Legacy readback path: bBaseStreams stays false (default), so the shader writes the three
-			// transient StructuredBuffer UAVs below — byte-identical to before. The readback-only
-			// fields are set here (they are not part of the shared bundle).
-			FVineMeshPassInputs In = VineLeaf_MakePassInputs(Bundle);
-			// Already set by VineLeaf_MakePassInputs from the bundle; restated to make the LengthScale
-			// plumbing explicit at the legacy dispatch (bBaseStreams=false => the V passes never run).
-			In.UVLengthScale = Bundle.UVLengthScale;
-
-			FVineMeshPassOutputs Out;
-			Out.OutVerticesUAV = OutVertexBuffer.UAV;
-			Out.OutUVsUAV = OutUVBuffer.UAV;
-			Out.OutIndicesUAV = OutIndexBuffer.UAV;
-
-			AddVineMeshPasses(GraphBuilder, GMaxRHIFeatureLevel, In, Out);
-
-			AddEnqueueCopyPass(GraphBuilder, VertexReadback, OutVertexBuffer.Buffer, VertexReadbackBytes);
-			AddEnqueueCopyPass(GraphBuilder, UVReadback, OutUVBuffer.Buffer, UVReadbackBytes);
-			AddEnqueueCopyPass(GraphBuilder, IndexReadback, OutIndexBuffer.Buffer, IndexReadbackBytes);
-			GraphBuilder.Execute();
-			bRenderWorkQueued = true;
-		});
-
-	FlushRenderingCommands();
-	EnqueueAndFlushMs = (FPlatformTime::Seconds() - EnqueueAndFlushStartSeconds) * 1000.0;
-
-	if (!bRenderWorkQueued)
-	{
-		delete VertexReadback;
-		delete UVReadback;
-		delete IndexReadback;
-		return false;
-	}
-
-	OutVertices.SetNumZeroed(OutputVertexCount);
-	OutUVs.SetNumZeroed(OutputVertexCount);
-	OutIndices.SetNumZeroed(OutputIndexCount);
-	bool bReadbackSucceeded = false;
-
-	const double ReadbackFlushStartSeconds = FPlatformTime::Seconds();
-	ENQUEUE_RENDER_COMMAND(VVVoxelGPUReadback)(
-		[VertexReadback, UVReadback, IndexReadback, VertexReadbackBytes, UVReadbackBytes, IndexReadbackBytes, &OutVertices, &OutUVs, &OutIndices, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList)
-		{
-			if (!VertexReadback || !UVReadback || !IndexReadback)
-			{
-				return;
-			}
-
-			if (!VertexReadback->IsReady() || !UVReadback->IsReady() || !IndexReadback->IsReady())
-			{
-				RHICmdList.SubmitAndBlockUntilGPUIdle();
-			}
-
-			bool bLockedAll = true;
-			if (const FVector4f* VertexPtr = static_cast<const FVector4f*>(VertexReadback->Lock(VertexReadbackBytes)))
-			{
-				FMemory::Memcpy(OutVertices.GetData(), VertexPtr, VertexReadbackBytes);
-				VertexReadback->Unlock();
-			}
-			else
-			{
-				bLockedAll = false;
-			}
-
-			if (const FVector2f* UVPtr = static_cast<const FVector2f*>(UVReadback->Lock(UVReadbackBytes)))
-			{
-				FMemory::Memcpy(OutUVs.GetData(), UVPtr, UVReadbackBytes);
-				UVReadback->Unlock();
-			}
-			else
-			{
-				bLockedAll = false;
-			}
-
-			if (const uint32* IndexPtr = static_cast<const uint32*>(IndexReadback->Lock(IndexReadbackBytes)))
-			{
-				FMemory::Memcpy(OutIndices.GetData(), IndexPtr, IndexReadbackBytes);
-				IndexReadback->Unlock();
-			}
-			else
-			{
-				bLockedAll = false;
-			}
-
-			delete VertexReadback;
-			delete UVReadback;
-			delete IndexReadback;
-			bReadbackSucceeded = bLockedAll;
-		});
-
-	FlushRenderingCommands();
-	ReadbackFlushMs = (FPlatformTime::Seconds() - ReadbackFlushStartSeconds) * 1000.0;
-	UE_LOG(LogTemp, Display,
-		TEXT("[VisVineGPUDispatchTiming] %s total=%.3f ms buildVoxelUpload=%.3f ms buildHash=%.3f ms buildTargetBuckets=%.3f ms enqueueAndFlush=%.3f ms readbackFlush=%.3f ms pathPoints=%u voxels=%u targetBuckets=%u targetBucketSize=%.3f targetSearchRadius=%u targetSearchCoverage=%.3f targetBucketAvgItems=%.3f targetBucketMaxItems=%u outVerts=%u outIndices=%u"),
-		bTube ? TEXT("tube") : TEXT("plane"),
-		(FPlatformTime::Seconds() - DispatchTotalStartSeconds) * 1000.0,
-		BuildVoxelUploadMs,
-		BuildHashMs,
-		BuildTargetBucketsMs,
-		EnqueueAndFlushMs,
-		ReadbackFlushMs,
-		PathPointCount,
-		VoxelCount,
-		TargetBuckets.BucketCount,
-		TargetBuckets.BucketSize,
-		TargetBuckets.SearchRadius,
-		TargetBuckets.BucketSize * float(TargetBuckets.SearchRadius),
-		TargetBuckets.BucketCount > 0u ? double(TargetBuckets.VoxelIndices.Num()) / double(TargetBuckets.BucketCount) : 0.0,
-		TargetBuckets.MaxBucketItemCount,
-		OutputVertexCount,
-		OutputIndexCount);
-	return bReadbackSucceeded;
-}
-
-static FVector GetVineOutputProfileCenter(
-	const TArray<FVector4f>& Vertices,
-	int32 PointIndex,
-	uint32 ProfileCount)
-{
-	FVector Center = FVector::ZeroVector;
-	if (ProfileCount == 0)
-	{
-		return Center;
-	}
-
-	const int32 BaseIndex = PointIndex * int32(ProfileCount);
-	for (uint32 ProfileIndex = 0; ProfileIndex < ProfileCount; ++ProfileIndex)
-	{
-		const int32 VertexIndex = BaseIndex + int32(ProfileIndex);
-		if (!Vertices.IsValidIndex(VertexIndex))
-		{
-			continue;
-		}
-
-		const FVector4f& Vertex = Vertices[VertexIndex];
-		Center += FVector(Vertex.X, Vertex.Y, Vertex.Z);
-	}
-	return Center / double(ProfileCount);
-}
-
-static void RecomputeVineOutputUVsFromGeneratedLength(
-	const TArray<FVector4f>& Vertices,
-	const TArray<FVector4f>& PathPoints,
-	const TArray<FIntVector4>& SegmentMeta,
-	uint32 ProfileCount,
-	const FVV& VV,
-	TArray<FVector2f>& UVs)
-{
-	if (ProfileCount == 0 || Vertices.Num() == 0 || UVs.Num() != Vertices.Num())
-	{
-		return;
-	}
-
-	const int32 PointCount = Vertices.Num() / int32(ProfileCount);
-	if (PointCount <= 0)
-	{
-		return;
-	}
-
-	TArray<float> SegmentLengths;
-	TArray<float> PointScales;
-	SegmentLengths.Init(-1.0f, FMath::Max(PointCount - 1, 0));
-	PointScales.SetNumUninitialized(PointCount);
-	for (int32 PointIndex = 0; PointIndex < PointCount; ++PointIndex)
-	{
-		PointScales[PointIndex] = PathPoints.IsValidIndex(PointIndex) ? PathPoints[PointIndex].W : 1.0f;
-	}
-
-	for (const FIntVector4& Segment : SegmentMeta)
-	{
-		const int32 APoint = Segment.X;
-		const int32 BPoint = Segment.Y;
-		if (!PointScales.IsValidIndex(APoint) || !PointScales.IsValidIndex(BPoint) || BPoint != APoint + 1 || !SegmentLengths.IsValidIndex(APoint))
-		{
-			continue;
-		}
-
-		const FVector ACenter = GetVineOutputProfileCenter(Vertices, APoint, ProfileCount);
-		const FVector BCenter = GetVineOutputProfileCenter(Vertices, BPoint, ProfileCount);
-		SegmentLengths[APoint] = float(FVector::Dist(ACenter, BCenter));
-	}
-
-	// 每个 path point 的真实环向周长（多边形闭合周长，cm）。直接用输出顶点几何，
-	// 自动包含 CircleScale 与 per-point Scale，无需再读参数。
-	TArray<float> RingCircumference;
-	RingCircumference.SetNumZeroed(PointCount);
-	for (int32 PointIndex = 0; PointIndex < PointCount; ++PointIndex)
-	{
-		const int32 BaseIndex = PointIndex * int32(ProfileCount);
-		float Perimeter = 0.0f;
-		for (uint32 ProfileIndex = 0; ProfileIndex < ProfileCount; ++ProfileIndex)
-		{
-			const int32 CurrIndex = BaseIndex + int32(ProfileIndex);
-			const int32 NextIndex = BaseIndex + int32((ProfileIndex + 1u) % ProfileCount);
-			if (!Vertices.IsValidIndex(CurrIndex) || !Vertices.IsValidIndex(NextIndex))
-			{
-				continue;
-			}
-			const FVector4f& C = Vertices[CurrIndex];
-			const FVector4f& N = Vertices[NextIndex];
-			Perimeter += float(FVector::Dist(FVector(C.X, C.Y, C.Z), FVector(N.X, N.Y, N.Z)));
-		}
-		RingCircumference[PointIndex] = Perimeter;
-	}
-
-	// V 以“局部周长”为单位累加：藤蔓每沿轴向走过一整圈周长，V 就 +1，正好与环向
-	// U 的 0→1 对齐 → 方格各向同性。粗藤蔓周长大 V 走得慢（纹理疏），细藤蔓周长小
-	// V 走得快（纹理密），scale 自动兼顾。UVLengthScale 退化为整体倍率微调。
-	const float LengthScale = FMath::Max(VV.UVLengthScale, 1.0e-8f);
-	TArray<float> GeneratedCurveU;
-	GeneratedCurveU.SetNumZeroed(PointCount);
-	for (int32 PointIndex = 1; PointIndex < PointCount; ++PointIndex)
-	{
-		const float AxialLength = SegmentLengths.IsValidIndex(PointIndex - 1) ? SegmentLengths[PointIndex - 1] : -1.0f;
-		if (AxialLength < 0.0f)
-		{
-			// 段断开：V 重置，新的一段从 0 重新累加。
-			GeneratedCurveU[PointIndex] = 0.0f;
-			continue;
-		}
-
-		const float PrevCirc = RingCircumference.IsValidIndex(PointIndex - 1) ? RingCircumference[PointIndex - 1] : 0.0f;
-		const float CurrCirc = RingCircumference.IsValidIndex(PointIndex) ? RingCircumference[PointIndex] : 0.0f;
-		const float AvgCirc = FMath::Max((PrevCirc + CurrCirc) * 0.5f, 1.0e-4f);
-		GeneratedCurveU[PointIndex] = GeneratedCurveU[PointIndex - 1] + (AxialLength / AvgCirc) * LengthScale;
-	}
-
-	for (int32 PointIndex = 0; PointIndex < PointCount; ++PointIndex)
-	{
-		const float V = GeneratedCurveU.IsValidIndex(PointIndex) ? GeneratedCurveU[PointIndex] : 0.0f;
-		const int32 BaseIndex = PointIndex * int32(ProfileCount);
-		for (uint32 ProfileIndex = 0; ProfileIndex < ProfileCount; ++ProfileIndex)
-		{
-			const int32 VertexIndex = BaseIndex + int32(ProfileIndex);
-			if (UVs.IsValidIndex(VertexIndex))
-			{
-				UVs[VertexIndex].Y = V;
-			}
-		}
-	}
-}
-
-static UDynamicMesh* BuildDynamicMeshFromGPUVineOutput(
-	UObject* Outer,
-	const TArray<FVector4f>& Vertices,
-	const TArray<FVector2f>& UVs,
-	const TArray<uint32>& Indices,
-	int32 MaterialID,
-	bool bRecomputeNormals)
-{
-	if (Vertices.Num() == 0 || UVs.Num() != Vertices.Num() || Indices.Num() < 3)
-	{
-		return nullptr;
-	}
-
-	UDynamicMesh* OutMesh = NewObject<UDynamicMesh>(Outer);
-	if (!OutMesh)
-	{
-		return nullptr;
-	}
-
-	FDynamicMesh3 Mesh;
-	Mesh.EnableAttributes();
-	Mesh.Attributes()->EnableMaterialID();
-	Mesh.Attributes()->SetNumUVLayers(1);
-
-	// Append vertices (position only at this stage)
-	for (const FVector4f& Vertex : Vertices)
-	{
-		Mesh.AppendVertex(FVector3d(Vertex.X, Vertex.Y, Vertex.Z));
-	}
-
-	// Append triangles and set per-triangle UVs via the UV overlay
-	UE::Geometry::FDynamicMeshUVOverlay* UVOverlay = Mesh.Attributes()->GetUVLayer(0);
-
-	// Pre-create UV elements for each vertex (shared UV per vertex)
-	TArray<int32> UVElementIDs;
-	UVElementIDs.SetNum(Vertices.Num());
-	for (int32 i = 0; i < Vertices.Num(); ++i)
-	{
-		UVElementIDs[i] = UVOverlay->AppendElement(UVs[i]);
-	}
-
-	for (int32 Index = 0; Index + 2 < Indices.Num(); Index += 3)
-	{
-		const int32 A = int32(Indices[Index + 0]);
-		const int32 B = int32(Indices[Index + 1]);
-		const int32 C = int32(Indices[Index + 2]);
-		if (A < 0 || B < 0 || C < 0 || A >= Vertices.Num() || B >= Vertices.Num() || C >= Vertices.Num() || A == B || B == C || A == C)
-		{
-			continue;
-		}
-
-		const int32 TriangleID = Mesh.AppendTriangle(A, C, B);
-		if (TriangleID >= 0)
-		{
-			Mesh.Attributes()->GetMaterialID()->SetNewValue(TriangleID, MaterialID);
-			UVOverlay->SetTriangle(TriangleID, UE::Geometry::FIndex3i(UVElementIDs[A], UVElementIDs[C], UVElementIDs[B]));
-		}
-	}
-
-	OutMesh->SetMesh(MoveTemp(Mesh));
-	if (bRecomputeNormals)
-	{
-		FGeometryScriptCalculateNormalsOptions CalculateOptions;
-		UGeometryScriptLibrary_MeshNormalsFunctions::RecomputeNormals(OutMesh, CalculateOptions);
-	}
-	return OutMesh;
-}
-}
+// Records the whole space-colonization solve (once per source) plus the GPU prefix sum and concat
+// into GraphBuilder. Defined below, next to the SC shader helpers it needs.
+static bool AddVineFusedSCConcatPasses(FRDGBuilder& GraphBuilder, const FVineFusedSCInputs& SC, FVineFusedSCOutputs& Out);
 
 // ============================================================================
-// GPU-resident vine leaf (M1): UVineMeshComponent + FVineMeshSceneProxy.
-// Runs in PARALLEL with the legacy UDynamicMesh path — it consumes the same shared
-// FVineBuildInput bundle and drives AddVineMeshPasses with the base-stream permutation, so the
-// vine mesh is built + drawn entirely on the GPU (no readback). The implementation lives here in
+// GPU-resident vine leaf: UVineMeshComponent + FVineMeshSceneProxy. This IS the vine.
+// It consumes the shared FVineBuildInput bundle and drives AddVineMeshPasses with the base-stream
+// permutation, so the vine mesh is built + drawn entirely on the GPU (no readback). The
+// implementation lives here in
 // GeometryEditorActor.cpp so it can see the file-local AddVineMeshPasses / FVineMeshPassInputs /
 // FVineMeshPassOutputs / VineLeaf_MakePassInputs without exposing them in a header.
 // ============================================================================
 
-// Scene proxy: registers the base standard-triangle streams sized to the CPU-known output counts,
-// then records the shared vine pass graph into an FRDGBuilder writing straight into those streams.
+// Scene proxy: registers the base standard-triangle streams at the batch-wide capacity (the real
+// counts only exist on the GPU), then records the space colonization solve, the concat and the
+// shared vine pass graph into ONE FRDGBuilder writing straight into those streams.
 class FVineMeshSceneProxy final : public FCSGpuMeshSceneProxy
 {
 public:
@@ -3765,7 +3418,10 @@ protected:
 	virtual void RegisterStreams() override
 	{
 		// The vine tube is a triangle soup (no shared vertices), so index capacity tracks the
-		// vertex capacity via the standard set; both come from the CPU-known counts in the bundle.
+		// vertex capacity via the standard set. Both are CAPACITIES derived from
+		// VV.MaxVinePointCount: the real counts are decided by the space colonization solve that
+		// now runs inside BuildGeometry, and asking for them here would be circular. The indirect
+		// draw reads the real index count VineDispatchArgsCS publishes.
 		VertexCapacity = FMath::Max(Input.OutputVertexCount, 64u);
 		IndexCapacity = FMath::Max(Input.OutputIndexCount, 192u);
 		AddStandardTriangleStreams();
@@ -3773,10 +3429,28 @@ protected:
 
 	virtual void BuildGeometry(FRHICommandListBase& RHICmdList) override
 	{
-		if (!Input.bValid || Input.OutputVertexCount == 0u || Input.OutputIndexCount == 0u) return;
-
 		FRHICommandListImmediate& RHICmdListImmediate = FRHICommandListExecutor::GetImmediateCommandList();
 		FRDGBuilder GraphBuilder(RHICmdListImmediate, RDG_EVENT_NAME("VineMesh.Build"));
+
+		// The base marks DrawDesc valid as soon as an index buffer exists, so every bail-out below
+		// still has to publish a zero-index draw: the pooled allocator hands back whatever the last
+		// owner left in the indirect args, and the index buffer is now capacity-sized.
+		auto PublishEmptyDraw = [this, &GraphBuilder]()
+		{
+			FRDGBufferRef ArgsBuf = GraphBuilder.RegisterExternalBuffer(GetStreamBuffer(ECSGpuStreamRole::IndirectArgs));
+			FRDGBufferRef ZeroCountersBuf = GraphBuilder.RegisterExternalBuffer(GetStreamBuffer(ECSGpuStreamRole::MeshCounters));
+			AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(ArgsBuf, PF_R32_UINT)), 0u);
+			AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(ZeroCountersBuf, PF_R32_UINT)), 0u);
+			GraphBuilder.SetBufferAccessFinal(ArgsBuf, ERHIAccess::IndirectArgs);
+			GraphBuilder.SetBufferAccessFinal(ZeroCountersBuf, ERHIAccess::CopySrc);
+			GraphBuilder.Execute();
+		};
+
+		if (!Input.bValid || Input.OutputVertexCount == 0u || Input.OutputIndexCount == 0u)
+		{
+			PublishEmptyDraw();
+			return;
+		}
 
 		// Register the seven base-owned persistent streams and build typed UAVs matching the
 		// shader's RWBuffer<float>/RWBuffer<uint> declarations (same formats the road path uses).
@@ -3789,6 +3463,21 @@ protected:
 		FRDGBufferRef CountersBuf = GraphBuilder.RegisterExternalBuffer(GetStreamBuffer(ECSGpuStreamRole::MeshCounters));
 
 		FVineMeshPassInputs In = VineLeaf_MakePassInputs(Input);
+		if (Input.bUseGPULines)
+		{
+			// Solve + concat straight into this graph; the results stay transient and the counts
+			// never leave the GPU.
+			FVineFusedSCOutputs Lines;
+			if (!AddVineFusedSCConcatPasses(GraphBuilder, Input.FusedSC, Lines))
+			{
+				PublishEmptyDraw();
+				return;
+			}
+			In.GPULinePoints = Lines.PathPoints;
+			In.GPULineMeta = Lines.PathPointMeta;
+			In.GPULineSeg = Lines.SegmentMeta;
+			In.LineCountsBuffer = Lines.Counts;
+		}
 
 		FVineMeshPassOutputs Out;
 		Out.bBaseStreams = true;
@@ -3963,14 +3652,6 @@ static bool ResolveVineReferenceComponent(
 AVineContainer::AVineContainer(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)	
 {
-	DynamicMeshComponent = CreateDefaultSubobject<UDynamicMeshComponent>(TEXT("DynamicMeshComponent"));
-	DynamicMeshComponent->SetupAttachment(GetRootComponent());
-	DynamicMeshComponent->bUseAttachParentBound = false;
-	DynamicMeshComponent->bNeverDistanceCull = true;
-	DynamicMeshComponent->bAllowCullDistanceVolume = false;
-	DynamicMeshComponent->SetCachedMaxDrawDistance(0.0f);
-	DynamicMeshComponent->SetBoundsScale(DynamicMeshCullBoundsScale);
-
 	UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
 	GrowTarget = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("GrowTarget"));
 	GrowTarget->SetStaticMesh(Mesh);
@@ -3987,10 +3668,10 @@ AVineContainer::AVineContainer(const FObjectInitializer& ObjectInitializer)
 	TubeVineSource->SetHiddenInGame(true);
 	TubeVineSource->SetupAttachment(GetRootComponent(), TEXT("TubePoints"));
 
-	// M1 GPU-resident vine leaf, mounted in parallel with the DynamicMesh path. The vine geometry
-	// is emitted in world space, so keep this component at an identity WORLD transform regardless of
-	// where the actor is placed: mark the transform absolute (ignore the parent) and leave it at
-	// identity. VineWorldToLocal is Identity to match (see FVineMeshSceneProxy::BuildGeometry).
+	// The GPU-resident vine leaf. The vine geometry is emitted in world space, so keep this
+	// component at an identity WORLD transform regardless of where the actor is placed: mark the
+	// transform absolute (ignore the parent) and leave it at identity. VineWorldToLocal is Identity
+	// to match (see FVineMeshSceneProxy::BuildGeometry).
 	VineGpuMesh = CreateDefaultSubobject<UVineMeshComponent>(TEXT("VineMesh"));
 	VineGpuMesh->SetupAttachment(GetRootComponent());
 	VineGpuMesh->SetUsingAbsoluteLocation(true);
@@ -4002,45 +3683,79 @@ AVineContainer::AVineContainer(const FObjectInitializer& ObjectInitializer)
 	RebuildDisplayInstancesFromTransformArrays();
 }
 
-void AVineContainer::OnConstruction(const FTransform& Transform)
+void AVineContainer::PostLoad()
 {
-	Super::OnConstruction(Transform);
-	RefreshDynamicMeshComponentCullingBounds();
-	// ApplyVineReferenceComponentsHiddenInGame(this);
-	// RebuildDisplayInstancesFromTransformArrays();
+	Super::PostLoad();
+	MigrateLegacyVineMaterial();
+	ApplyVineMaterialToLeaf();
 }
 
 void AVineContainer::PostRegisterAllComponents()
 {
 	Super::PostRegisterAllComponents();
-	RefreshDynamicMeshComponentCullingBounds();
+
+	// MarkPackageDirty refuses to do anything while the editor is still loading the package, so the
+	// upgrade below is re-flagged here, once the level is up, to surface it as an unsaved change.
+	if (bPendingLegacyVineMaterialDirty)
+	{
+		bPendingLegacyVineMaterialDirty = false;
+		MarkPackageDirty();
+	}
 }
 
-void AVineContainer::RefreshDynamicMeshComponentCullingBounds(float BoundsScale)
+#if WITH_EDITOR
+void AVineContainer::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
-	UDynamicMeshComponent* MeshComponent = GetDynamicMeshComponent();
-	if (!MeshComponent) return;
+	Super::PostEditChangeProperty(PropertyChangedEvent);
 
-	const float SafeBoundsScale = FMath::Max(
-		BoundsScale > 0.0f ? BoundsScale : DynamicMeshCullBoundsScale,
-		1.0f);
+	// Retargeting the surface material must show up without re-running a whole generation, so push
+	// it down and let the leaf rebuild its proxy against the new material.
+	const FName ChangedName = PropertyChangedEvent.GetPropertyName();
+	if (ChangedName == GET_MEMBER_NAME_CHECKED(AVineContainer, VineMaterial))
+	{
+		ApplyVineMaterialToLeaf();
+		if (VineGpuMesh) VineGpuMesh->MarkRenderStateDirty();
+	}
+}
+#endif
 
-	// DynamicMeshComponent is attached under the actor root. If it uses the attach
-	// parent's tiny bounds, the mesh is culled when the actor/root origin leaves the
-	// view, even if the generated DynamicMesh is still visible.
-	MeshComponent->bUseAttachParentBound = false;
-	MeshComponent->bNeverDistanceCull = true;
-	MeshComponent->bAllowCullDistanceVolume = false;
-	MeshComponent->SetCachedMaxDrawDistance(0.0f);
-	MeshComponent->SetBoundsScale(SafeBoundsScale);
+void AVineContainer::ApplyVineMaterialToLeaf()
+{
+	if (VineGpuMesh) VineGpuMesh->VineMaterial = VineMaterial;
+}
 
-	// Rebuild render proxy + recompute LocalBounds from the actual mesh. This fixes
-	// stale bounds after replacing or editing UDynamicMesh data through
-	// Blueprint/GeometryScript paths.
-	MeshComponent->NotifyMeshUpdated();
-	MeshComponent->UpdateBounds();
-	MeshComponent->MarkRenderTransformDirty();
-	MeshComponent->MarkRenderStateDirty();
+// Subobject name of the UDynamicMeshComponent this actor used to own. Levels and blueprints saved
+// before its removal still carry that subobject, and the linker recreates it as an orphan under the
+// actor (the property that used to point at it is simply skipped), so PostLoad can still read it.
+static const FName LegacyVineDynamicMeshComponentName(TEXT("DynamicMeshComponent"));
+
+void AVineContainer::MigrateLegacyVineMaterial()
+{
+	// A value already set means this actor was upgraded on an earlier load, inherited one from an
+	// upgraded blueprint CDO, or was authored after the removal — never clobber it.
+	if (VineMaterial) return;
+
+	UMaterialInterface* LegacyMaterial = nullptr;
+	ForEachObjectWithOuter(this, [&LegacyMaterial](UObject* Child)
+	{
+		if (LegacyMaterial || Child->GetFName() != LegacyVineDynamicMeshComponentName) return;
+		// GetMaterial is virtual on UPrimitiveComponent, so the orphan resolves its own slot 0
+		// (UBaseDynamicMeshComponent::BaseMaterials) without this module knowing the concrete type.
+		if (UPrimitiveComponent* LegacyComponent = Cast<UPrimitiveComponent>(Child)) LegacyMaterial = LegacyComponent->GetMaterial(0);
+	}, /*bIncludeNestedObjects*/ false);
+
+	if (!LegacyMaterial) return;
+
+	VineMaterial = LegacyMaterial;
+	// Commandlets are allowed to dirty on load; the editor is not, hence the deferred re-flag in
+	// PostRegisterAllComponents. Either way the migration is idempotent, so a package that never
+	// gets resaved simply migrates again on the next load rather than losing the assignment.
+	MarkPackageDirty();
+	bPendingLegacyVineMaterialDirty = true;
+	UE_LOG(LogTemp, Display,
+		TEXT("[VineContainer] Migrated legacy DynamicMeshComponent slot-0 material '%s' to AVineContainer::VineMaterial on %s. Save the owning package to persist it."),
+		*LegacyMaterial->GetPathName(),
+		*GetPathName());
 }
 
 void AVineContainer::RebuildDisplayInstancesFromTransformArrays()
@@ -4173,26 +3888,84 @@ bool AVineContainer::VisVineGPUInternal()
 	}
 	const FCSSurfaceVoxelData EmptySurfaceVoxelData;
 
-	// The GPU space-colonization output is the only path now: the per-source prepped lines are
-	// merged into one GPU-resident batch that DispatchVVGPU_Voxel consumes directly.
-	FVineSCGPUBuffers ConcatenatedGPULines;
-	if (TubeLineGPUBuffers.Num() == 0
-		|| !ConcatenateVineSCGPUBuffers(TubeLineGPUBuffers, ConcatenatedGPULines)
-		|| ConcatenatedGPULines.PointCount == 0)
+	// The space-colonization solve is recorded into the leaf's own graph, so all this side needs
+	// is its CPU-prepped inputs; the resulting counts stay on the GPU.
+	TArray<FTransform> SCSourceTransforms;
+	TArray<FTransform> SCTargetTransforms;
+	GetVineInstanceTransforms(TubeVineSource, SCSourceTransforms);
+	GetVineInstanceTransforms(GrowTarget, SCTargetTransforms);
+	FVineFusedSCInputs FusedSCInputs;
+	if (!PrepareVineFusedSCInputs(SCSourceTransforms, SCTargetTransforms, FusedSCInputs))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] No GPU-resident tube lines to visualize."));
+		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] No vine sources or targets to solve."));
 		return false;
 	}
 
-	// The prepped line geometry stays GPU-resident, so the CPU-side input arrays the shared helper
-	// takes are empty — it reads everything from ConcatenatedGPULines.
+	// The line geometry is produced on the GPU, so the CPU-side input arrays the shared helper
+	// takes are empty — it reads everything from FusedSCInputs.
 	TArray<FVector4f> PathPoints;
 	TArray<FVector4f> PathPointAxes;
 	TArray<FIntVector4> PathPointMeta;
 	TArray<FIntVector4> SegmentMeta;
 
-	UE_LOG(LogTemp, Display, TEXT("[VineSCFused] GPU-resident lines: points=%d segments=%d"),
-		ConcatenatedGPULines.PointCount, ConcatenatedGPULines.SegmentCount);
+	UE_LOG(LogTemp, Display, TEXT("[VineSCFused] sources=%d targets=%d pointCapacity=%u"),
+		FusedSCInputs.Sources.Num(), FusedSCInputs.InitialTargetPositions.Num(), FusedSCInputs.TotalPointCapacity);
+
+	// 粗细自查，替代随 CPU 回读一起删掉的旧 [VisVineThickness]。管子半径是
+	//   radius = 10 * CircleScale * CurveLUT(t) * targetScale * sourceScale
+	// 四个乘数全部在 CPU 侧就能拿到（GPU 只负责把它们乘起来），所以“藤蔓变细了”不用再靠猜 GPU
+	// 里的值：把每个乘数的分布打出来，是参数问题还是几何问题一眼就能分开。
+	{
+		auto ScaleStats = [](const TArray<float>& Values, float& OutMin, float& OutAvg, float& OutMax)
+		{
+			OutMin = 0.0f; OutAvg = 0.0f; OutMax = 0.0f;
+			if (Values.Num() == 0) return;
+			OutMin = TNumericLimits<float>::Max();
+			OutMax = TNumericLimits<float>::Lowest();
+			double Sum = 0.0;
+			for (float Value : Values)
+			{
+				OutMin = FMath::Min(OutMin, Value);
+				OutMax = FMath::Max(OutMax, Value);
+				Sum += Value;
+			}
+			OutAvg = float(Sum / Values.Num());
+		};
+
+		float TargetMin, TargetAvg, TargetMax;
+		ScaleStats(FusedSCInputs.TargetPointScales, TargetMin, TargetAvg, TargetMax);
+		float CurveMin, CurveAvg, CurveMax;
+		ScaleStats(FusedSCInputs.CurveLUT, CurveMin, CurveAvg, CurveMax);
+
+		// StartSourceScales 是 1.0 铺底的 per-target 数组，取不出源本身的缩放；SourcePositions[0].W
+		// 才是 GetSpaceColonizationTransformScale(SourceTransform) 的原值。
+		TArray<float> SourceScales;
+		SourceScales.Reserve(FusedSCInputs.Sources.Num());
+		for (const FVineSCPreparedSource& PreparedSource : FusedSCInputs.Sources)
+		{
+			if (PreparedSource.SourcePositions.Num() > 0) SourceScales.Add(PreparedSource.SourcePositions[0].W);
+		}
+		float SourceMin, SourceAvg, SourceMax;
+		ScaleStats(SourceScales, SourceMin, SourceAvg, SourceMax);
+
+		UE_LOG(LogTemp, Display,
+			TEXT("[VisVineThickness] CircleScale=%.4f profileCount=%u | targetScale[min=%.4f avg=%.4f max=%.4f n=%d] ")
+			TEXT("sourceScale[min=%.4f avg=%.4f max=%.4f n=%d] curveLUT[min=%.4f avg=%.4f max=%.4f] ")
+			TEXT("=> typicalRadius=%.4f"),
+			VV.CircleScale, uint32(FMath::Max(VV.VisVineGPUTubeSegments, 3)),
+			TargetMin, TargetAvg, TargetMax, FusedSCInputs.TargetPointScales.Num(),
+			SourceMin, SourceAvg, SourceMax, SourceScales.Num(),
+			CurveMin, CurveAvg, CurveMax,
+			10.0f * VV.CircleScale * CurveAvg * TargetAvg * SourceAvg);
+
+		// 空的 UCurveLinearColor 上 GetUnadjustedLinearColorValue().G 返回 0，会把整条藤蔓压成零
+		// 半径；曲线被误改成低幅度同样直接按比例变细。这两种都是“看起来变细”的常见真因。
+		if (CurveMax <= UE_KINDA_SMALL_NUMBER)
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[VisVineThickness] CurveControl 求值全为 0（曲线为空或未设关键帧），藤蔓半径会塌成 0。请检查 VV.CurveControl 的 G 通道。"));
+		}
+	}
 
 	const EVisVineGPUDebugStage DebugStage = SplineDebug.DebugStage;
 	const bool bWantStageDraw = SplineDebug.bDrawDebugLines && DebugStage != EVisVineGPUDebugStage::None;
@@ -4230,7 +4003,7 @@ bool AVineContainer::VisVineGPUInternal()
 			VV.VisVineGPUNoiseIterations,
 			EmptySurfaceVoxelData,
 			bWantStageDraw ? DebugStage : EVisVineGPUDebugStage::None,
-			&ConcatenatedGPULines,
+			&FusedSCInputs,
 			LastSurfaceVoxelGPUBuffers.IsValid() ? &LastSurfaceVoxelGPUBuffers : nullptr);
 		if (!LeafInput.bValid)
 		{
@@ -4241,9 +4014,9 @@ bool AVineContainer::VisVineGPUInternal()
 		LeafInput.DebugLineColor = SplineDebug.SplineColor;
 		LeafVertexCount = LeafInput.OutputVertexCount;
 		LeafIndexCount = LeafInput.OutputIndexCount;
-		// The vine surface material still lives on the container's DynamicMeshComponent slot 0,
-		// which is where the actor exposes it; mirror it onto the leaf that now does the drawing.
-		if (UDynamicMeshComponent* VineDMC = GetDynamicMeshComponent()) VineGpuMesh->VineMaterial = VineDMC->GetMaterial(0);
+		// The actor owns the material assignment; push it down before SetBuildInput so the proxy
+		// rebuilt in there already reads the current one.
+		ApplyVineMaterialToLeaf();
 		VineGpuMesh->SetBuildInput(MoveTemp(LeafInput));
 	}
 	const double BuildLeafMs = (FPlatformTime::Seconds() - BuildLeafStartSeconds) * 1000.0;
@@ -4263,47 +4036,13 @@ bool AVineContainer::VisVineGPUInternal()
 inline void AVineContainer::Clean()
 {
 	TubeLines.Empty();
-	TubeLineSourceScales.Empty();
 	TubeLineSourceLocations.Empty();
 	TubeLinePointScales.Empty();
 	TubeLinePointAxes.Empty();
 	CachedSurfaceTriangles = FCSTriangleMeshData();
 	ClearDebugVineSplineActor();
-	DynamicMeshComponent->GetDynamicMesh()->Reset();
 }
 
-void AVineContainer::ClearAttachedStaticMeshActors()
-{
-	TArray<AActor*> ActorsToDestroy;
-	if (GeneratedStaticMeshActor)
-	{
-		ActorsToDestroy.Add(GeneratedStaticMeshActor);
-	}
-
-	TArray<AActor*> AttachedActors;
-	GetAttachedActors(AttachedActors);
-	for (AActor* AttachedActor : AttachedActors)
-	{
-		if (IsVineGeneratedStaticMeshActor(AttachedActor))
-		{
-			ActorsToDestroy.AddUnique(AttachedActor);
-		}
-	}
-
-	for (AActor* ActorToDestroy : ActorsToDestroy)
-	{
-		if (!IsVineGeneratedStaticMeshActor(ActorToDestroy))
-		{
-			continue;
-		}
-
-		ActorToDestroy->Modify();
-		ActorToDestroy->Destroy();
-	}
-
-	GeneratedStaticMeshActor = nullptr;
-	MarkPackageDirty();
-}
 
 static const FName VineDebugSplineActorTag(TEXT("VineDebugSplineActor"));
 
@@ -4419,7 +4158,7 @@ void AVineContainer::DrawDebugVineCenterLines(
 		DrawnVineCount, StageName, Thickness, CenterPoints.Num());
 }
 
-UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result)
+bool AVineContainer::GenerateVines(float ExtrudeScale, bool Result)
 {
 	GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.Total"));
 	(void)ExtrudeScale;
@@ -4436,7 +4175,7 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result)
 
 	if (TargetCount == 0 || TubeSourceCount == 0)
 	{
-		return nullptr;
+		return false;
 	}
 
 	// 2. 计算 BoundingBox 并查找场景中重叠的 Actor
@@ -4480,76 +4219,20 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result)
 		if (!PrepareBoxSceneSurfaceVoxelsGPU(SC.VoxelSize))
 		{
 			UE_LOG(LogTemp, Warning, TEXT("[GenerateVines] Failed to prepare GPU surface voxels on %s."), *GetActorNameOrLabel());
-			return nullptr;
+			return false;
 		}
 	}
 	CachedSurfaceTriangles = FCSTriangleMeshData();
 	// Cache generation bounds for subsequent GPU visualization.
 	InstanceBound = Bounds;
 
-	// 如果只需要输出 Debug Mesh 或不需要最终结果
-	{
-		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.CreateContainerMesh"));
-		UDynamicMesh* ContainerMesh = NewObject<UDynamicMesh>(this);
-		GetDynamicMeshComponent()->SetDynamicMesh(ContainerMesh);
-	}
-
-	// 4. 执行 SpaceColonization
-	// Tube Lines
-	TArray<FGeometryScriptPolyPath> GeneratedTubeLines;
-	TArray<float> GeneratedTubeLineScales;
-	TArray<FVector> GeneratedTubeLineSourceLocations;
-	TArray<FVineLinePointScaleData> GeneratedTubeLinePointScales;
-	TArray<FVineLinePointAxisData> GeneratedTubeLinePointAxes;
-	// Trip A: per-source GPU-resident SC output, published to TubeLineGPUBuffers for VisVine.
-	TArray<TSharedPtr<FVineSCGPUBuffers>> GeneratedTubeLineGPUBuffers;
-	{
-		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.GenerateTubeLines"));
-		for (int32 i = 0; i < TubeSourceCount; i++)
-		{
-			TArray<FTransform> SCSourceTransform;
-			SCSourceTransform.Add(TubeSourceTransforms[i]);
-				TSharedPtr<FVineSCGPUBuffers> SourceGPUBuffers = MakeShared<FVineSCGPUBuffers>();
-				TArray<FSpaceColonizationLineResult> LinesFromSource = SpaceColonizationWithScalesInternal(
-					SCSourceTransform, TargetTransforms, SourceGPUBuffers.Get());
-				if (SourceGPUBuffers->IsValid())
-				{
-					GeneratedTubeLineGPUBuffers.Add(SourceGPUBuffers);
-				}
-			const float SourceScale = GetVineTransformScale(TubeSourceTransforms[i]);
-			for (FSpaceColonizationLineResult& LineResult : LinesFromSource)
-			{
-				GeneratedTubeLines.Add(LineResult.Path);
-				GeneratedTubeLineScales.Add(SourceScale);
-				GeneratedTubeLineSourceLocations.Add(TubeSourceTransforms[i].GetLocation());
-				FVineLinePointScaleData& ScaleData = GeneratedTubeLinePointScales.AddDefaulted_GetRef();
-				ScaleData.Values = MoveTemp(LineResult.PointScales);
-				FVineLinePointAxisData& AxisData = GeneratedTubeLinePointAxes.AddDefaulted_GetRef();
-				AxisData.Values = MoveTemp(LineResult.PointAxes);
-			}
-		}
-	}
-	TubeLines = GeneratedTubeLines;
-	TubeLineSourceScales = GeneratedTubeLineScales;
-	TubeLineSourceLocations = GeneratedTubeLineSourceLocations;
-	TubeLinePointScales = GeneratedTubeLinePointScales;
-	TubeLinePointAxes = GeneratedTubeLinePointAxes;
-	TubeLineGPUBuffers = MoveTemp(GeneratedTubeLineGPUBuffers);
-
-	{
-		int32 GPUSourceCount = TubeLineGPUBuffers.Num();
-		int32 GPUPointTotal = 0;
-		int32 GPUSegmentTotal = 0;
-		for (const TSharedPtr<FVineSCGPUBuffers>& Buffers : TubeLineGPUBuffers)
-		{
-			if (!Buffers.IsValid()) continue;
-			GPUPointTotal += Buffers->PointCount;
-			GPUSegmentTotal += Buffers->SegmentCount;
-		}
-		UE_LOG(LogTemp, Display, TEXT("[VineSCGPUHandoff] captured sources=%d totalPoints=%d totalSegments=%d (Trip A persist)"), GPUSourceCount, GPUPointTotal, GPUSegmentTotal);
-	}
-
-	LogVineSCStageTargetTransformMatch(TEXT("Tube"), TubeLines, TargetTransforms);
+	// 4. SpaceColonization 不再在这里跑：它已经和 concat、建网格合并进 VisVine 的那张 RDG 图，
+	// 由 VisVine() 自行从当前的 source/target transforms 准备输入。这些 CPU 线数组随之作废
+	// （GPU 路径从不填充它们），保持清空以匹配旧行为。
+	TubeLines.Reset();
+	TubeLineSourceLocations.Reset();
+	TubeLinePointScales.Reset();
+	TubeLinePointAxes.Reset();
 
 	if (GPUProjectionDebug.bDrawGPUProjectionVoxelDebugPoints && GPUProjectionDebug.GPUProjectionVoxelDebugDuration > 0.0f)
 	{
@@ -4566,15 +4249,11 @@ UDynamicMesh* AVineContainer::GenerateVines(float ExtrudeScale, bool Result)
 		DrawDebugLastSurfaceVoxelDirections(DebugOptions);
 	}
 
-	// 5. 可视化
+	// 5. 可视化：把这一批藤蔓交给 GPU leaf。结果只存在于它的常驻 stream 里，没有 CPU 网格可返回。
 	{
 		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.VisVine"));
-		VisVine();
+		return VisVine();
 	}
-
-
-
-	return GetDynamicMeshComponent() ? GetDynamicMeshComponent()->GetDynamicMesh() : nullptr;
 }
 
 void AVineContainer::FetchFoliage()
@@ -4588,15 +4267,21 @@ void AVineContainer::FetchFoliage()
 
 void AVineContainer::RevertFoliage()
 {
-	DynamicMeshComponent->SetHiddenInGame(true);
 	ExportTransformArrayToFoliage(TargetType);
 	ExportTransformArrayToFoliage(TubeType);
 
 }
 
+FString AVineContainer::GetResultAssetBaseName() const
+{
+	// 基类默认用 GetName()；藤蔓历史上一直用编辑器标签（用户可见的名字），
+	// 沿用之以免已烘好的资产改名。标签可能含空格等非法字符，故要 sanitize。
+	const FString Label = ObjectTools::SanitizeObjectName(GetActorNameOrLabel());
+	return Label.IsEmpty() ? Super::GetResultAssetBaseName() : Label;
+}
+
 void AVineContainer::GenerateVineAction()
 {
-	ClearAttachedStaticMeshActors();
 	ReferencePoints.Reset();
 
 	TArray<FTransform> TargetTransforms;
@@ -4624,22 +4309,7 @@ void AVineContainer::GenerateVineAction()
 		FLinearColor(0.0f, 0.66f, 1.0f, 1.0f),
 		2.0f);
 
-	UDynamicMesh* GeneratedMesh = GenerateVines( 50.0f, true);
-	if (!GeneratedMesh)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[VineContainer] GenerateVineAction produced no generated mesh on %s."), *GetActorNameOrLabel());
-		return;
-	}
-
-	UDynamicMeshComponent* MeshComponent = GetDynamicMeshComponent();
-	if (MeshComponent)
-	{
-		MeshComponent->SetHiddenInGame(false);
-		MeshComponent->NotifyMeshUpdated();
-		MeshComponent->UpdateBounds();
-		MeshComponent->MarkRenderTransformDirty();
-		MeshComponent->MarkRenderStateDirty();
-	}
+	if (!GenerateVines(50.0f, true)) UE_LOG(LogTemp, Warning, TEXT("[VineContainer] GenerateVineAction produced no vine on %s."), *GetActorNameOrLabel());
 }
 
 int32 AVineContainer::DrawDebugCachedVineSCStagePoints(float Duration)
@@ -4956,44 +4626,26 @@ void AVineContainer::SaveStaticmesh()
 		return;
 	}
 
-	// 编号的生成（含随 actor 存盘）统一由基类负责，见 AComputeShaderMeshGenerator。
-	EnsureGeneratorTimeCode();
-
-	ULevel* ActorLevel = GetLevel();
-	UPackage* LevelPackage = ActorLevel ? ActorLevel->GetOutermost() : nullptr;
-	if (!LevelPackage)
+	// 路径与编号统一由基类的结果资产命名策略产出（<关卡目录>/AutoResult/SM_<基名>_<编号>）；
+	// 基名沿用本类覆写的"标签优先"口径，故已烘好的资产名不变。
+	const FString AssetPathAndName = BuildResultAssetPath();
+	if (AssetPathAndName.IsEmpty())
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[VineContainer] SaveStaticmesh failed: %s has no level package."), *GetActorNameOrLabel());
+		UE_LOG(LogTemp, Warning, TEXT("[VineContainer] SaveStaticmesh failed: %s has no level content path."), *GetActorNameOrLabel());
 		return;
 	}
-
-	const FString LevelFolderPath = FPackageName::GetLongPackagePath(LevelPackage->GetName());
-	if (LevelFolderPath.IsEmpty())
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[VineContainer] SaveStaticmesh failed: empty level folder path for %s."), *GetActorNameOrLabel());
-		return;
-	}
-
-	const FString AssetFolderPath = UPackageTools::SanitizePackageName(LevelFolderPath / TEXT("AutoResult"));
-
-	const FString ActorName = ObjectTools::SanitizeObjectName(GetActorNameOrLabel());
-	FString AssetName = ObjectTools::SanitizeObjectName(FString::Printf(TEXT("%s_%s"), *ActorName, *LexToString(GeneratorTimeCode)));
-	if (!AssetName.StartsWith(TEXT("SM_")))
-	{
-		AssetName = FString(TEXT("SM_")) + AssetName;
-	}
-	const FString AssetPathAndName = UPackageTools::SanitizePackageName(AssetFolderPath / AssetName);
+	const FString AssetName = FPackageName::GetShortName(AssetPathAndName);
 
 	// The vine only ever exists as GPU streams now, so this is the one point where it comes back:
 	// the shared base reads the rendered streams once and converts them straight to a StaticMesh.
 	//
 	// The leaf itself is pinned to an identity world transform, so its own component transform is
 	// useless for the local-space bake. Pass the ACTOR transform instead — it is what the spawned
-	// StaticMeshActor below is placed at, so the asset ends up actor-local exactly like the mesh
-	// the DynamicMesh path used to store, rather than pinned to world coordinates.
+	// StaticMeshActor below is placed at, so the asset ends up actor-local rather than pinned to
+	// world coordinates.
 	UStaticMesh* NewStaticMesh = VineGpuMesh->SaveRenderedMeshToStaticMesh(
 		AssetPathAndName,
-		VineGpuMesh->VineMaterial,
+		VineMaterial,
 		GetActorTransform(),
 		true,
 		true,
@@ -5004,48 +4656,13 @@ void AVineContainer::SaveStaticmesh()
 		return;
 	}
 
-	ClearAttachedStaticMeshActors();
-
-	UWorld* World = GetWorld();
-	if (!World)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[VineContainer] Saved StaticMesh but could not spawn actor: invalid world on %s."), *GetActorNameOrLabel());
-		return;
-	}
-
-	FActorSpawnParameters SpawnParams;
-	SpawnParams.Owner = this;
-	SpawnParams.OverrideLevel = GetLevel();
-	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-#if WITH_EDITOR
-	SpawnParams.InitialActorLabel = AssetName;
-#endif
-
-	AStaticMeshActor* SpawnedStaticMeshActor = World->SpawnActor<AStaticMeshActor>(
-		AStaticMeshActor::StaticClass(),
-		GetActorTransform(),
-		SpawnParams);
-	if (!SpawnedStaticMeshActor)
+	// 清场 + 生成挂接结果 actor 的整套生命周期都在基类（清旧/打标签/设网格/挂接/命名/标脏）。
+	if (!SpawnAttachedResultActor(NewStaticMesh, AssetName))
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[VineContainer] Saved StaticMesh but could not spawn actor for %s."), *AssetPathAndName);
 		return;
 	}
 
-	SpawnedStaticMeshActor->Modify();
-	SpawnedStaticMeshActor->Tags.AddUnique(VineGeneratedStaticMeshActorTag);
-	if (UStaticMeshComponent* StaticMeshComponent = SpawnedStaticMeshActor->GetStaticMeshComponent())
-	{
-		StaticMeshComponent->SetMobility(EComponentMobility::Movable);
-		StaticMeshComponent->SetStaticMesh(NewStaticMesh);
-		StaticMeshComponent->UpdateBounds();
-		StaticMeshComponent->MarkRenderStateDirty();
-	}
-	SpawnedStaticMeshActor->AttachToActor(this, FAttachmentTransformRules::KeepWorldTransform);
-	SpawnedStaticMeshActor->SetActorLabel(AssetName);
-	SpawnedStaticMeshActor->MarkPackageDirty();
-	GeneratedStaticMeshActor = SpawnedStaticMeshActor;
-	MarkPackageDirty();
-	DynamicMeshComponent->SetHiddenInGame(true);
 	UE_LOG(LogTemp, Log, TEXT("[VineContainer] Created unsaved StaticMesh asset: %s"), *AssetPathAndName);
 }
 
@@ -5062,39 +4679,6 @@ struct FSpaceColonizationGPUState4
 };
 
 static_assert(sizeof(FSpaceColonizationGPUState4) == 16, "Space colonization GPU state must match HLSL int4.");
-
-// Doubles as the SC compute-shader validation switch. When true, the GPU queue path
-// collects the full per-iteration debug readbacks and emits the [SpaceColonizationStep]
-// logs so GPU output can be diffed against the CPU reference. When false (production),
-// the debug readbacks/copy-passes are compiled out via `if constexpr` and the GPU path
-// runs lean (only the Target/State0/State1 result readbacks remain).
-constexpr bool bSpaceColonizationStepLogs = false;
-constexpr int32 SpaceColonizationStepLogSampleCount = 6;
-constexpr uint32 SpaceColonizationInvalidProposalOwner = 0xffffffffu;
-
-// Mirrors HashUint/HashFloat01 in PCGMathCommon.ush; the CPU and GPU growth
-// gates must hash identically per (node, iteration, seed) to stay comparable.
-static uint32 SpaceColonizationHashUint(uint32 Value)
-{
-	Value ^= Value >> 16;
-	Value *= 0x7feb352du;
-	Value ^= Value >> 15;
-	Value *= 0x846ca68bu;
-	Value ^= Value >> 16;
-	return Value;
-}
-
-static float SpaceColonizationHashFloat01(uint32 Value)
-{
-	return float(SpaceColonizationHashUint(Value) & 0x00ffffffu) / 16777215.0f;
-}
-
-static float SpaceColonizationGrowRand(int32 PointIndex, int32 IterationIndex, float Seed)
-{
-	// D3D ftou clamps to [0, UINT_MAX]; match it so both paths hash the same seed bits.
-	const uint32 SeedBits = uint32(FMath::Clamp<double>(double(Seed) * 100000.0, 0.0, 4294967295.0));
-	return SpaceColonizationHashFloat01(uint32(PointIndex) * 1664525u + uint32(IterationIndex) * 1013904223u + SeedBits);
-}
 
 static float GetSpaceColonizationTransformScale(const FTransform& Transform)
 {
@@ -5137,1555 +4721,575 @@ static void BuildSpaceColonizationScaleLookups(
 	}
 }
 
-static float ResolveSpaceColonizationOutputScale(
-	int32 TargetIndex,
-	const TArray<FSpaceColonizationAttribute>& SCAttributes,
-	const TArray<float>& TargetPointScales,
-	const TArray<float>& StartSourceScales)
+// One solve's post-resample output. Graph-lifetime buffers over-allocated to the source's point
+// capacity; only [0, Counts[1]) / [0, Counts[2]) hold valid data, and those counts stay on the GPU.
+struct FVineSCPassOutputs
 {
-	const float TargetPointScale = TargetPointScales.IsValidIndex(TargetIndex) ? TargetPointScales[TargetIndex] : 1.0f;
-	const int32 StartId = SCAttributes.IsValidIndex(TargetIndex) ? SCAttributes[TargetIndex].Startid : -1;
-	const float SourcePointScale = StartSourceScales.IsValidIndex(StartId) ? StartSourceScales[StartId] : 1.0f;
-	return TargetPointScale * SourcePointScale;
-}
-
-struct FSpaceColonizationQueueDebugStats
-{
-	int32 TargetCount = 0;
-	int32 AttractorCount = 0;
-	int32 ActiveCount = 0;
-	int32 StartCount = 0;
-	int32 EndCount = 0;
-	int32 PreSetCount = 0;
-	int32 NextSetCount = 0;
-	int32 InvalidPreCount = 0;
-	int32 InvalidNextCount = 0;
-	int32 AssociateOwnerCount = 0;
-	int32 AssociateLinkCount = 0;
-	int32 MaxAssociateCount = 0;
-	int32 SpawnTotal = 0;
-	int32 SpawnMax = 0;
-	int32 BranchTotal = 0;
-	int32 BranchMax = 0;
-	FVector BoundsMin = FVector::ZeroVector;
-	FVector BoundsMax = FVector::ZeroVector;
-	FVector AveragePosition = FVector::ZeroVector;
+	FRDGBufferRef PathPoints = nullptr;    // float4(xyz, finalScale = CurveScale * pointScale)
+	FRDGBufferRef PathPointMeta = nullptr; // int4(Prev, Next, Base, Count)
+	FRDGBufferRef SegmentMeta = nullptr;   // int4(A, B, 0, 0)
+	FRDGBufferRef Counts = nullptr;        // [lineCount, points, segments, 0]
 };
 
-struct FSpaceColonizationGrowthDebugEvent
+// Records one space-colonization solve into GraphBuilder. Everything that used to wrap this pass
+// sequence — the render command, the two FlushRenderingCommands, the four-uint count readback and
+// the ConvertToExternalBuffer of the result — is gone: the caller records this into the vine mesh
+// graph, so the output stays transient and the counts never reach the CPU.
+static bool AddVineSCPasses(
+	FRDGBuilder& GraphBuilder,
+	const FVineFusedSCInputs& SC,
+	const FVineSCPreparedSource& Source,
+	FVineSCPassOutputs& Out)
 {
-	int32 SourceIndex = -1;
-	int32 TargetIndex = -1;
-	int32 AssociateCount = 0;
-	int32 ParentSpawnAfter = 0;
-	int32 ParentBranchAfter = 0;
-	double MoveDistance = 0.0;
-	FVector OldTargetPosition = FVector::ZeroVector;
-	FVector NewTargetPosition = FVector::ZeroVector;
-};
+	const TArray<FVector4f>& SourcePositions = Source.SourcePositions;
+	const TArray<FVector4f>& InitialTargetPositions = SC.InitialTargetPositions;
+	const TArray<float>& EmitTargetPointScales = SC.TargetPointScales;
+	const TArray<float>& EmitStartSourceScales = Source.StartSourceScales;
+	const TArray<float>& EmitCurveLUT = SC.CurveLUT;
 
-struct FSpaceColonizationCSIterationDebugSnapshot
-{
-	TArray<uint32> ResetProposalOwners;
-	TArray<uint32> ProposalOwners;
-	TArray<FVector4f> TargetPositions;
-	TArray<FSpaceColonizationGPUState4> State0;
-	TArray<FSpaceColonizationGPUState4> State1;
-	bool bResetReadbackSucceeded = false;
-	bool bProposalReadbackSucceeded = false;
-	bool bStateReadbackSucceeded = false;
-};
+	const int32 SourceCount = SourcePositions.Num();
+	const int32 TargetCount = InitialTargetPositions.Num();
+	if (SourceCount == 0 || TargetCount == 0) return false;
 
-struct FSpaceColonizationCSDebugData
-{
-	TArray<FVector4f> InitialTargetPositions;
-	TArray<FSpaceColonizationGPUState4> InitialState0;
-	TArray<FSpaceColonizationGPUState4> InitialState1;
-	TArray<uint32> NeighborCounts;
-	TArray<FSpaceColonizationCSIterationDebugSnapshot> IterationSnapshots;
-	bool bInitialReadbackSucceeded = false;
-	bool bNeighborReadbackSucceeded = false;
-};
+	// Iteration <= 0 still runs Init/MarkSources so the result matches the CPU path, which returns
+	// the marked queue even when the growth loop never runs.
+	const int32 IterationCount = FMath::Max(SC.Iteration, 0);
+	const int32 Activetime = SC.Activetime;
+	const float RandGrow = SC.RandGrow;
+	const float Seed = SC.Seed;
+	const float InfluenceRadius = SC.InfluenceRadius;
+	const int32 BackGrowCount = SC.BackGrowCount;
+	const int32 ForkTaperForkOrdinal = SC.ForkTaperForkOrdinal;
+	const float ResampleLength = SC.ResampleLength;
+	const float ScatterDistance = SC.ScatterDistance;
+	const uint32 CurveLUTSize = uint32(EmitCurveLUT.Num());
 
-static FString FormatSpaceColonizationVector(const FVector& Vector)
-{
-	return FString::Printf(TEXT("(%.2f, %.2f, %.2f)"), Vector.X, Vector.Y, Vector.Z);
-}
-
-static FSpaceColonizationQueueDebugStats BuildSpaceColonizationQueueDebugStats(
-	const TArray<FVector>& TargetLocations,
-	const TArray<FSpaceColonizationAttribute>& SCAttributes)
-{
-	FSpaceColonizationQueueDebugStats Stats;
-	Stats.TargetCount = FMath::Min(TargetLocations.Num(), SCAttributes.Num());
-	if (Stats.TargetCount <= 0)
+	// SC_MAX_NEIGHBORS_CAP in SpaceColonizationQueue.usf must stay >= this value.
+	const int32 MaxNeighborsPerTarget = FMath::Clamp(SpaceColonizationMaxNeighborsPerTarget, 1, TargetCount);
+	const uint64 NeighborIndexCount64 = uint64(TargetCount) * uint64(MaxNeighborsPerTarget);
+	if (NeighborIndexCount64 > uint64(TNumericLimits<uint32>::Max()))
 	{
-		return Stats;
+		UE_LOG(LogTemp, Warning, TEXT("[SpaceColonizationQueueCS] GPU request too large. TargetCount=%d MaxNeighbors=%d"), TargetCount, MaxNeighborsPerTarget);
+		return false;
 	}
+	const uint32 NeighborIndexCount = uint32(NeighborIndexCount64);
 
-	FVector BoundsMin(TNumericLimits<double>::Max(), TNumericLimits<double>::Max(), TNumericLimits<double>::Max());
-	FVector BoundsMax(-TNumericLimits<double>::Max(), -TNumericLimits<double>::Max(), -TNumericLimits<double>::Max());
-	FVector PositionSum = FVector::ZeroVector;
+	// Stage B2 emit-kernel output. Only [0,totalPoints) is written compactly; the rest is slack.
+	const uint32 PathPointCapacity = FMath::Max(1u, Source.PointCapacity);
+	const uint32 SegmentCapacity = PathPointCapacity;
+	// Resample can grow lines; keep a generous compact capacity for the post-resample set.
+	const uint32 PathPoint2Capacity = PathPointCapacity;
+	const uint32 Segment2Capacity = PathPointCapacity;
 
-	for (int32 Index = 0; Index < Stats.TargetCount; ++Index)
-	{
-		const FVector& Position = TargetLocations[Index];
-		const FSpaceColonizationAttribute& Attribute = SCAttributes[Index];
+	CREATE_RDG_STRUCTURED_UPLOAD_SRV(Source, FVector4f, SourcePositions, TEXT("SpaceColonizationQueue_SourcePositions"))
+	CREATE_RDG_STRUCTURED_UPLOAD_SRV(InitialTarget, FVector4f, InitialTargetPositions, TEXT("SpaceColonizationQueue_InitialTargetPositions"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(Target, FVector4f, TargetCount, TEXT("SpaceColonizationQueue_TargetPositions"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(State0, FSpaceColonizationGPUState4, TargetCount, TEXT("SpaceColonizationQueue_State0"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(State1, FSpaceColonizationGPUState4, TargetCount, TEXT("SpaceColonizationQueue_State1"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(NeighborCounts, uint32, TargetCount, TEXT("SpaceColonizationQueue_NeighborCounts"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(NeighborIndices, uint32, NeighborIndexCount, TEXT("SpaceColonizationQueue_NeighborIndices"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(ProposalOwners, uint32, TargetCount, TEXT("SpaceColonizationQueue_ProposalOwners"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(ProposalPositions, FVector4f, TargetCount, TEXT("SpaceColonizationQueue_ProposalPositions"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(Claims, uint32, TargetCount, TEXT("SpaceColonizationQueue_Claims"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(ClaimCounts, uint32, TargetCount, TEXT("SpaceColonizationQueue_ClaimCounts"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(ProposalTargets, uint32, TargetCount, TEXT("SpaceColonizationQueue_ProposalTargets"))
 
-		BoundsMin.X = FMath::Min(BoundsMin.X, Position.X);
-		BoundsMin.Y = FMath::Min(BoundsMin.Y, Position.Y);
-		BoundsMin.Z = FMath::Min(BoundsMin.Z, Position.Z);
-		BoundsMax.X = FMath::Max(BoundsMax.X, Position.X);
-		BoundsMax.Y = FMath::Max(BoundsMax.Y, Position.Y);
-		BoundsMax.Z = FMath::Max(BoundsMax.Z, Position.Z);
-		PositionSum += Position;
-
-		Stats.AttractorCount += Attribute.Attractor ? 1 : 0;
-		Stats.ActiveCount += Attribute.Attractor ? 0 : 1;
-		Stats.StartCount += Attribute.Startpt ? 1 : 0;
-		Stats.EndCount += Attribute.End ? 1 : 0;
-		Stats.PreSetCount += Attribute.PrePt != -1 ? 1 : 0;
-		Stats.NextSetCount += Attribute.NextPt != -1 ? 1 : 0;
-		Stats.InvalidPreCount += (Attribute.PrePt < -1 || Attribute.PrePt >= Stats.TargetCount) ? 1 : 0;
-		Stats.InvalidNextCount += (Attribute.NextPt < -1 || Attribute.NextPt >= Stats.TargetCount) ? 1 : 0;
-
-		const int32 AssociateCount = Attribute.Associates.Num();
-		Stats.AssociateOwnerCount += AssociateCount > 0 ? 1 : 0;
-		Stats.AssociateLinkCount += AssociateCount;
-		Stats.MaxAssociateCount = FMath::Max(Stats.MaxAssociateCount, AssociateCount);
-		Stats.SpawnTotal += Attribute.SpawnCount;
-		Stats.SpawnMax = FMath::Max(Stats.SpawnMax, Attribute.SpawnCount);
-		Stats.BranchTotal += Attribute.BranchCount;
-		Stats.BranchMax = FMath::Max(Stats.BranchMax, Attribute.BranchCount);
-	}
-
-	Stats.BoundsMin = BoundsMin;
-	Stats.BoundsMax = BoundsMax;
-	Stats.AveragePosition = PositionSum / double(Stats.TargetCount);
-	return Stats;
-}
-
-static FString BuildSpaceColonizationNodeSamples(
-	const TArray<FVector>& TargetLocations,
-	const TArray<FSpaceColonizationAttribute>& SCAttributes,
-	bool bEndSamples)
-{
-	const int32 TargetCount = FMath::Min(TargetLocations.Num(), SCAttributes.Num());
-	FString Samples;
-	int32 LoggedCount = 0;
-	for (int32 Index = 0; Index < TargetCount && LoggedCount < SpaceColonizationStepLogSampleCount; ++Index)
-	{
-		const FSpaceColonizationAttribute& Attribute = SCAttributes[Index];
-		const bool bUseSample = bEndSamples ? Attribute.End : !Attribute.Attractor;
-		if (!bUseSample)
+	TShaderMapRef<FSpaceColonizationQueueInitCS> InitShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FSpaceColonizationQueueInitCS::FParameters* InitParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueInitCS::FParameters>();
+	InitParameters->InitialTargetPositions = InitialTargetSRV;
+	InitParameters->RW_TargetPositions = TargetUAV;
+	InitParameters->RW_State0 = State0UAV;
+	InitParameters->RW_State1 = State1UAV;
+	InitParameters->TargetCount = uint32(TargetCount);
+	GraphBuilder.AddPass(
+		RDG_EVENT_NAME("SpaceColonizationQueue.Init"),
+		InitParameters,
+		ERDGPassFlags::Compute,
+		[InitParameters, InitShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
 		{
-			continue;
-		}
-
-		if (!Samples.IsEmpty())
-		{
-			Samples += TEXT(" | ");
-		}
-		Samples += FString::Printf(
-			TEXT("#%d Pos=%s Pre=%d Next=%d Spawn=%d Branch=%d End=%d Start=%d"),
-			Index,
-			*FormatSpaceColonizationVector(TargetLocations[Index]),
-			Attribute.PrePt,
-			Attribute.NextPt,
-			Attribute.SpawnCount,
-			Attribute.BranchCount,
-			Attribute.End ? 1 : 0,
-			Attribute.Startpt ? 1 : 0);
-		++LoggedCount;
-	}
-
-	return Samples.IsEmpty() ? TEXT("none") : Samples;
-}
-
-static FString BuildSpaceColonizationAssociateSamples(const TArray<FSpaceColonizationAttribute>& SCAttributes)
-{
-	FString Samples;
-	int32 LoggedCount = 0;
-	for (int32 Index = 0; Index < SCAttributes.Num() && LoggedCount < SpaceColonizationStepLogSampleCount; ++Index)
-	{
-		const TArray<int32>& Associates = SCAttributes[Index].Associates;
-		if (Associates.Num() == 0)
-		{
-			continue;
-		}
-
-		FString AssociateList;
-		const int32 AssociateSampleCount = FMath::Min(Associates.Num(), SpaceColonizationStepLogSampleCount);
-		for (int32 SampleIndex = 0; SampleIndex < AssociateSampleCount; ++SampleIndex)
-		{
-			if (!AssociateList.IsEmpty())
-			{
-				AssociateList += TEXT(",");
-			}
-			AssociateList += FString::FromInt(Associates[SampleIndex]);
-		}
-		if (Associates.Num() > AssociateSampleCount)
-		{
-			AssociateList += TEXT(",...");
-		}
-
-		if (!Samples.IsEmpty())
-		{
-			Samples += TEXT(" | ");
-		}
-		Samples += FString::Printf(TEXT("#%d<=[%s]"), Index, *AssociateList);
-		++LoggedCount;
-	}
-
-	return Samples.IsEmpty() ? TEXT("none") : Samples;
-}
-
-static void LogSpaceColonizationQueueState(
-	const TCHAR* Version,
-	const TCHAR* Phase,
-	int32 IterationIndex,
-	const TArray<FVector>& TargetLocations,
-	const TArray<FSpaceColonizationAttribute>& SCAttributes)
-{
-	if (!bSpaceColonizationStepLogs)
-	{
-		return;
-	}
-
-	const FSpaceColonizationQueueDebugStats Stats = BuildSpaceColonizationQueueDebugStats(TargetLocations, SCAttributes);
-	UE_LOG(LogTemp, Warning,
-		TEXT("[SpaceColonizationStep][%s][%s][Iter=%d] Targets=%d Attractors=%d Active=%d Start=%d End=%d Pre=%d Next=%d InvalidPre=%d InvalidNext=%d SpawnTotal=%d SpawnMax=%d BranchTotal=%d BranchMax=%d AssocOwners=%d AssocLinks=%d AssocMax=%d PosAvg=%s BoundsMin=%s BoundsMax=%s"),
-		Version,
-		Phase,
-		IterationIndex,
-		Stats.TargetCount,
-		Stats.AttractorCount,
-		Stats.ActiveCount,
-		Stats.StartCount,
-		Stats.EndCount,
-		Stats.PreSetCount,
-		Stats.NextSetCount,
-		Stats.InvalidPreCount,
-		Stats.InvalidNextCount,
-		Stats.SpawnTotal,
-		Stats.SpawnMax,
-		Stats.BranchTotal,
-		Stats.BranchMax,
-		Stats.AssociateOwnerCount,
-		Stats.AssociateLinkCount,
-		Stats.MaxAssociateCount,
-		*FormatSpaceColonizationVector(Stats.AveragePosition),
-		*FormatSpaceColonizationVector(Stats.BoundsMin),
-		*FormatSpaceColonizationVector(Stats.BoundsMax));
-
-	UE_LOG(LogTemp, Warning,
-		TEXT("[SpaceColonizationStep][%s][%s][Iter=%d][Samples] Active=%s | Ends=%s"),
-		Version,
-		Phase,
-		IterationIndex,
-		*BuildSpaceColonizationNodeSamples(TargetLocations, SCAttributes, false),
-		*BuildSpaceColonizationNodeSamples(TargetLocations, SCAttributes, true));
-}
-
-static void LogSpaceColonizationAssociates(
-	const TCHAR* Version,
-	const TCHAR* Phase,
-	int32 IterationIndex,
-	const TArray<FSpaceColonizationAttribute>& SCAttributes)
-{
-	if (!bSpaceColonizationStepLogs)
-	{
-		return;
-	}
-
-	int32 OwnerCount = 0;
-	int32 LinkCount = 0;
-	int32 MaxAssociateCount = 0;
-	for (const FSpaceColonizationAttribute& Attribute : SCAttributes)
-	{
-		const int32 AssociateCount = Attribute.Associates.Num();
-		OwnerCount += AssociateCount > 0 ? 1 : 0;
-		LinkCount += AssociateCount;
-		MaxAssociateCount = FMath::Max(MaxAssociateCount, AssociateCount);
-	}
-
-	UE_LOG(LogTemp, Warning,
-		TEXT("[SpaceColonizationStep][%s][%s][Iter=%d] AssocOwners=%d AssocLinks=%d AssocMax=%d Samples=%s"),
-		Version,
-		Phase,
-		IterationIndex,
-		OwnerCount,
-		LinkCount,
-		MaxAssociateCount,
-		*BuildSpaceColonizationAssociateSamples(SCAttributes));
-}
-
-static void LogSpaceColonizationGrowthEvents(
-	const TCHAR* Version,
-	const TCHAR* Phase,
-	int32 IterationIndex,
-	const TArray<FSpaceColonizationGrowthDebugEvent>& GrowthEvents)
-{
-	if (!bSpaceColonizationStepLogs)
-	{
-		return;
-	}
-
-	double TotalMoveDistance = 0.0;
-	double MaxMoveDistance = 0.0;
-	FString Samples;
-	const int32 SampleCount = FMath::Min(GrowthEvents.Num(), SpaceColonizationStepLogSampleCount);
-	for (int32 Index = 0; Index < GrowthEvents.Num(); ++Index)
-	{
-		const FSpaceColonizationGrowthDebugEvent& Event = GrowthEvents[Index];
-		TotalMoveDistance += Event.MoveDistance;
-		MaxMoveDistance = FMath::Max(MaxMoveDistance, Event.MoveDistance);
-		if (Index < SampleCount)
-		{
-			if (!Samples.IsEmpty())
-			{
-				Samples += TEXT(" | ");
-			}
-			Samples += FString::Printf(
-				TEXT("%d->%d Assoc=%d Move=%.2f Old=%s New=%s Spawn=%d Branch=%d"),
-				Event.SourceIndex,
-				Event.TargetIndex,
-				Event.AssociateCount,
-				Event.MoveDistance,
-				*FormatSpaceColonizationVector(Event.OldTargetPosition),
-				*FormatSpaceColonizationVector(Event.NewTargetPosition),
-				Event.ParentSpawnAfter,
-				Event.ParentBranchAfter);
-		}
-	}
-
-	UE_LOG(LogTemp, Warning,
-		TEXT("[SpaceColonizationStep][%s][%s][Iter=%d] GrowthCount=%d MoveTotal=%.2f MoveMax=%.2f Samples=%s"),
-		Version,
-		Phase,
-		IterationIndex,
-		GrowthEvents.Num(),
-		TotalMoveDistance,
-		MaxMoveDistance,
-		Samples.IsEmpty() ? TEXT("none") : *Samples);
-}
-
-static void LogSpaceColonizationInput(
-	const TCHAR* Version,
-	int32 SourceCount,
-	int32 TargetCount,
-	int32 Iteration,
-	int32 Activetime,
-	float RandGrow,
-	float Seed,
-	float InfluenceRadius,
-	bool bMultThread)
-{
-	if (!bSpaceColonizationStepLogs)
-	{
-		return;
-	}
-
-	UE_LOG(LogTemp, Warning,
-		TEXT("[SpaceColonizationStep][%s][Input] Sources=%d Targets=%d Iterations=%d Activetime=%d RandGrow=%.3f Seed=%.3f InfluenceRadius=%.3f MultThread=%s"),
-		Version,
-		SourceCount,
-		TargetCount,
-		Iteration,
-		Activetime,
-		RandGrow,
-		Seed,
-		InfluenceRadius,
-		bMultThread ? TEXT("true") : TEXT("false"));
-}
-
-static void ConvertSpaceColonizationGPUStateToAttributes(
-	const TArray<FVector4f>& TargetPositionData,
-	const TArray<FSpaceColonizationGPUState4>& State0Data,
-	const TArray<FSpaceColonizationGPUState4>& State1Data,
-	TArray<FVector>& OutTargetLocations,
-	TArray<FSpaceColonizationAttribute>& OutSCAttributes)
-{
-	const int32 TargetCount = FMath::Min(TargetPositionData.Num(), FMath::Min(State0Data.Num(), State1Data.Num()));
-	OutTargetLocations.SetNum(TargetCount);
-	OutSCAttributes.SetNum(TargetCount);
-	for (int32 Index = 0; Index < TargetCount; ++Index)
-	{
-		const FVector4f& Position = TargetPositionData[Index];
-		OutTargetLocations[Index] = FVector(Position.X, Position.Y, Position.Z);
-
-		const FSpaceColonizationGPUState4& State0 = State0Data[Index];
-		const FSpaceColonizationGPUState4& State1 = State1Data[Index];
-		FSpaceColonizationAttribute& Attribute = OutSCAttributes[Index];
-		Attribute.Attractor = State0.X != 0;
-		Attribute.End = State0.Y != 0;
-		Attribute.Startpt = State0.Z != 0;
-		Attribute.SpawnCount = State0.W;
-		Attribute.Startid = State1.X;
-		Attribute.PrePt = State1.Y;
-		Attribute.NextPt = State1.Z;
-		Attribute.BranchCount = State1.W;
-	}
-}
-
-static void LogSpaceColonizationProposalOwners(
-	const TCHAR* Version,
-	const TCHAR* Phase,
-	int32 IterationIndex,
-	const TArray<uint32>& ProposalOwners)
-{
-	if (!bSpaceColonizationStepLogs)
-	{
-		return;
-	}
-
-	int32 ProposalCount = 0;
-	FString Samples;
-	for (int32 TargetIndex = 0; TargetIndex < ProposalOwners.Num(); ++TargetIndex)
-	{
-		// Owners are encoded as ProposerIndex + 1; 0 means "no proposal".
-		const uint32 EncodedOwner = ProposalOwners[TargetIndex];
-		if (EncodedOwner == 0u) continue;
-
-		if (ProposalCount < SpaceColonizationStepLogSampleCount)
-		{
-			if (!Samples.IsEmpty())
-			{
-				Samples += TEXT(" | ");
-			}
-			Samples += FString::Printf(TEXT("%d<=%u"), TargetIndex, EncodedOwner - 1u);
-		}
-		++ProposalCount;
-	}
-
-	UE_LOG(LogTemp, Warning,
-		TEXT("[SpaceColonizationStep][%s][%s][Iter=%d] ProposalCount=%d Samples=%s"),
-		Version,
-		Phase,
-		IterationIndex,
-		ProposalCount,
-		Samples.IsEmpty() ? TEXT("none") : *Samples);
-}
-
-static void LogSpaceColonizationNeighborCounts(const TCHAR* Version, const TArray<uint32>& NeighborCounts)
-{
-	if (!bSpaceColonizationStepLogs)
-	{
-		return;
-	}
-
-	int32 NonZeroCount = 0;
-	uint32 TotalCount = 0;
-	uint32 MaxCount = 0;
-	FString Samples;
-	for (int32 Index = 0; Index < NeighborCounts.Num(); ++Index)
-	{
-		const uint32 Count = NeighborCounts[Index];
-		NonZeroCount += Count > 0 ? 1 : 0;
-		TotalCount += Count;
-		MaxCount = FMath::Max(MaxCount, Count);
-		if (Count > 0 && NonZeroCount <= SpaceColonizationStepLogSampleCount)
-		{
-			if (!Samples.IsEmpty())
-			{
-				Samples += TEXT(" | ");
-			}
-			Samples += FString::Printf(TEXT("#%d=%u"), Index, Count);
-		}
-	}
-
-	UE_LOG(LogTemp, Warning,
-		TEXT("[SpaceColonizationStep][%s][BuildNeighbors] Targets=%d NonZero=%d TotalNeighbors=%u MaxNeighbors=%u Samples=%s"),
-		Version,
-		NeighborCounts.Num(),
-		NonZeroCount,
-		TotalCount,
-		MaxCount,
-		Samples.IsEmpty() ? TEXT("none") : *Samples);
-}
-
-static void BuildSpaceColonizationCPUNeighbors(
-	const TArray<FVector>& InitialTargetLocations,
-	float InfluenceRadius,
-	int32 MaxNeighborsPerTarget,
-	TArray<uint32>& OutNeighborCounts,
-	TArray<int32>& OutNeighborIndices)
-{
-	struct FNeighborCandidate
-	{
-		int32 Index = -1;
-		double DistSq = 0.0;
-	};
-
-	const int32 TargetCount = InitialTargetLocations.Num();
-	const int32 SafeMaxNeighbors = FMath::Clamp(MaxNeighborsPerTarget, 1, FMath::Max(TargetCount, 1));
-	const float Radius = FMath::Max(InfluenceRadius, 1.0f);
-	const double RadiusSq = double(Radius) * double(Radius);
-
-	OutNeighborCounts.SetNumZeroed(TargetCount);
-	OutNeighborIndices.Init(-1, TargetCount * SafeMaxNeighbors);
-
-	for (int32 Index = 0; Index < TargetCount; ++Index)
-	{
-		const FVector& Center = InitialTargetLocations[Index];
-		TArray<FNeighborCandidate> Candidates;
-		Candidates.Reserve(SafeMaxNeighbors);
-		for (int32 Candidate = 0; Candidate < TargetCount; ++Candidate)
-		{
-			if (Candidate == Index)
-			{
-				continue;
-			}
-
-			const double DistSq = FVector::DistSquared(InitialTargetLocations[Candidate], Center);
-			if (DistSq > RadiusSq)
-			{
-				continue;
-			}
-
-			Candidates.Add(FNeighborCandidate{ Candidate, DistSq });
-		}
-
-		Candidates.Sort([](const FNeighborCandidate& A, const FNeighborCandidate& B)
-		{
-			return A.DistSq < B.DistSq;
+			FComputeShaderUtils::Dispatch(InRHICmdList, InitShader, *InitParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
 		});
 
-		const int32 Count = FMath::Min(Candidates.Num(), SafeMaxNeighbors);
-		for (int32 NeighborOffset = 0; NeighborOffset < Count; ++NeighborOffset)
+	TShaderMapRef<FSpaceColonizationQueueMarkSourcesCS> MarkSourcesShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FSpaceColonizationQueueMarkSourcesCS::FParameters* MarkParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueMarkSourcesCS::FParameters>();
+	MarkParameters->SourcePositions = SourceSRV;
+	MarkParameters->InitialTargetPositions = InitialTargetSRV;
+	MarkParameters->RW_TargetPositions = TargetUAV;
+	MarkParameters->RW_State0 = State0UAV;
+	MarkParameters->RW_State1 = State1UAV;
+	MarkParameters->SourceCount = uint32(SourceCount);
+	MarkParameters->TargetCount = uint32(TargetCount);
+	GraphBuilder.AddPass(
+		RDG_EVENT_NAME("SpaceColonizationQueue.MarkSources"),
+		MarkParameters,
+		ERDGPassFlags::Compute,
+		[MarkParameters, MarkSourcesShader, SourceCount](FRHIComputeCommandList& InRHICmdList)
 		{
-			OutNeighborIndices[Index * SafeMaxNeighbors + NeighborOffset] = Candidates[NeighborOffset].Index;
-		}
-		OutNeighborCounts[Index] = Count;
-	}
-}
+			FComputeShaderUtils::Dispatch(InRHICmdList, MarkSourcesShader, *MarkParameters, FComputeShaderUtils::GetGroupCount(FIntVector(SourceCount, 1, 1), 64));
+		});
 
-static void PopulateSpaceColonizationAssociatesFromNeighbors(
-	const TArray<FVector>& TargetLocations,
-	float InfluenceRadius,
-	const TArray<uint32>& NeighborCounts,
-	const TArray<int32>& NeighborIndices,
-	int32 MaxNeighborsPerTarget,
-	TArray<FSpaceColonizationAttribute>& SCAttributes)
-{
-	const int32 TargetCount = FMath::Min(TargetLocations.Num(), SCAttributes.Num());
-	const int32 SafeMaxNeighbors = FMath::Max(MaxNeighborsPerTarget, 1);
-	for (int32 AttractorIndex = 0; AttractorIndex < TargetCount; ++AttractorIndex)
+	TShaderMapRef<FSpaceColonizationQueueBuildNeighborsCS> BuildNeighborsShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FSpaceColonizationQueueBuildNeighborsCS::FParameters* BuildNeighborsParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueBuildNeighborsCS::FParameters>();
+	BuildNeighborsParameters->InitialTargetPositions = InitialTargetSRV;
+	BuildNeighborsParameters->RW_NeighborCounts = NeighborCountsUAV;
+	BuildNeighborsParameters->RW_NeighborIndices = NeighborIndicesUAV;
+	BuildNeighborsParameters->TargetCount = uint32(TargetCount);
+	BuildNeighborsParameters->MaxNeighbors = uint32(MaxNeighborsPerTarget);
+	BuildNeighborsParameters->InfluenceRadius = InfluenceRadius;
+	GraphBuilder.AddPass(
+		RDG_EVENT_NAME("SpaceColonizationQueue.BuildNeighbors"),
+		BuildNeighborsParameters,
+		ERDGPassFlags::Compute,
+		[BuildNeighborsParameters, BuildNeighborsShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
+		{
+			FComputeShaderUtils::Dispatch(InRHICmdList, BuildNeighborsShader, *BuildNeighborsParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
+		});
+
+	TShaderMapRef<FSpaceColonizationQueueResetProposalsCS> ResetProposalsShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	TShaderMapRef<FSpaceColonizationQueueClaimCS> ClaimShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	TShaderMapRef<FSpaceColonizationQueueProposeCS> ProposeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	TShaderMapRef<FSpaceColonizationQueueCommitParentsCS> CommitParentsShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	TShaderMapRef<FSpaceColonizationQueueCommitChildrenCS> CommitChildrenShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	for (int32 IterationIndex = 0; IterationIndex < IterationCount; ++IterationIndex)
 	{
-		if (!SCAttributes[AttractorIndex].Attractor)
-		{
-			continue;
-		}
-
-		int32 NearestSourceIndex = -1;
-		double NearestDistSq = TNumericLimits<double>::Max();
-		const uint32 NeighborCount = NeighborCounts.IsValidIndex(AttractorIndex)
-			? FMath::Min(NeighborCounts[AttractorIndex], uint32(SafeMaxNeighbors))
-			: 0u;
-		const int32 NeighborBase = AttractorIndex * SafeMaxNeighbors;
-		for (uint32 NeighborOffset = 0; NeighborOffset < NeighborCount; ++NeighborOffset)
-		{
-			const int32 NeighborIndex = NeighborIndices.IsValidIndex(NeighborBase + int32(NeighborOffset))
-				? NeighborIndices[NeighborBase + int32(NeighborOffset)]
-				: -1;
-			if (NeighborIndex < 0 || NeighborIndex >= TargetCount || SCAttributes[NeighborIndex].Attractor)
+		FSpaceColonizationQueueResetProposalsCS::FParameters* ResetParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueResetProposalsCS::FParameters>();
+		ResetParameters->RW_ProposalOwners = ProposalOwnersUAV;
+		ResetParameters->RW_ProposalPositions = ProposalPositionsUAV;
+		ResetParameters->RW_Claims = ClaimsUAV;
+		ResetParameters->RW_ClaimCounts = ClaimCountsUAV;
+		ResetParameters->RW_ProposalTargets = ProposalTargetsUAV;
+		ResetParameters->TargetCount = uint32(TargetCount);
+		GraphBuilder.AddPass(
+			RDG_EVENT_NAME("SpaceColonizationQueue.ResetProposals"),
+			ResetParameters,
+			ERDGPassFlags::Compute,
+			[ResetParameters, ResetProposalsShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
 			{
-				continue;
-			}
+				FComputeShaderUtils::Dispatch(InRHICmdList, ResetProposalsShader, *ResetParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
+			});
 
-			const double DistSq = FVector::DistSquared(TargetLocations[NeighborIndex], TargetLocations[AttractorIndex]);
-			if (DistSq < NearestDistSq)
+		FSpaceColonizationQueueClaimCS::FParameters* ClaimParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueClaimCS::FParameters>();
+		ClaimParameters->TargetPositions = TargetSRV;
+		ClaimParameters->State0 = State0SRV;
+		ClaimParameters->NeighborCounts = NeighborCountsSRV;
+		ClaimParameters->NeighborIndices = NeighborIndicesSRV;
+		ClaimParameters->RW_Claims = ClaimsUAV;
+		ClaimParameters->RW_ClaimCounts = ClaimCountsUAV;
+		ClaimParameters->TargetCount = uint32(TargetCount);
+		ClaimParameters->MaxNeighbors = uint32(MaxNeighborsPerTarget);
+		ClaimParameters->InfluenceRadius = InfluenceRadius;
+		GraphBuilder.AddPass(
+			RDG_EVENT_NAME("SpaceColonizationQueue.Claim"),
+			ClaimParameters,
+			ERDGPassFlags::Compute,
+			[ClaimParameters, ClaimShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
 			{
-				NearestDistSq = DistSq;
-				NearestSourceIndex = NeighborIndex;
-			}
-		}
+				FComputeShaderUtils::Dispatch(InRHICmdList, ClaimShader, *ClaimParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
+			});
 
-		if (NearestSourceIndex != -1 && FMath::Sqrt(float(NearestDistSq)) * 1.1f < InfluenceRadius)
+		FSpaceColonizationQueueProposeCS::FParameters* ProposeParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueProposeCS::FParameters>();
+		ProposeParameters->InitialTargetPositions = InitialTargetSRV;
+		ProposeParameters->TargetPositions = TargetSRV;
+		ProposeParameters->State0 = State0SRV;
+		ProposeParameters->State1 = State1SRV;
+		ProposeParameters->NeighborCounts = NeighborCountsSRV;
+		ProposeParameters->NeighborIndices = NeighborIndicesSRV;
+		ProposeParameters->Claims = ClaimsSRV;
+		ProposeParameters->ClaimCounts = ClaimCountsSRV;
+		ProposeParameters->RW_ProposalOwners = ProposalOwnersUAV;
+		ProposeParameters->RW_ProposalPositions = ProposalPositionsUAV;
+		ProposeParameters->RW_ProposalTargets = ProposalTargetsUAV;
+		ProposeParameters->TargetCount = uint32(TargetCount);
+		ProposeParameters->MaxNeighbors = uint32(MaxNeighborsPerTarget);
+		ProposeParameters->Iteration = uint32(IterationIndex);
+		// Negative Activetime round-trips through the uint32 cast; the shader
+		// recovers it via (int)Activetime, matching the CPU's unclamped gate.
+		ProposeParameters->Activetime = uint32(Activetime);
+		ProposeParameters->RandGrow = RandGrow;
+		ProposeParameters->Seed = Seed;
+		GraphBuilder.AddPass(
+			RDG_EVENT_NAME("SpaceColonizationQueue.Propose"),
+			ProposeParameters,
+			ERDGPassFlags::Compute,
+			[ProposeParameters, ProposeShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
+			{
+				FComputeShaderUtils::Dispatch(InRHICmdList, ProposeShader, *ProposeParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
+			});
+
+		// Parents commit first so children inherit the post-increment SpawnCount,
+		// matching the CPU sequential commit loop.
+		FSpaceColonizationQueueCommitParentsCS::FParameters* CommitParentsParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueCommitParentsCS::FParameters>();
+		CommitParentsParameters->ProposalTargets = ProposalTargetsSRV;
+		CommitParentsParameters->RW_State0 = State0UAV;
+		CommitParentsParameters->RW_State1 = State1UAV;
+		CommitParentsParameters->TargetCount = uint32(TargetCount);
+		GraphBuilder.AddPass(
+			RDG_EVENT_NAME("SpaceColonizationQueue.CommitParents"),
+			CommitParentsParameters,
+			ERDGPassFlags::Compute,
+			[CommitParentsParameters, CommitParentsShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
+			{
+				FComputeShaderUtils::Dispatch(InRHICmdList, CommitParentsShader, *CommitParentsParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
+			});
+
+		FSpaceColonizationQueueCommitChildrenCS::FParameters* CommitChildrenParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueCommitChildrenCS::FParameters>();
+		CommitChildrenParameters->InitialTargetPositions = InitialTargetSRV;
+		CommitChildrenParameters->ProposalOwners = ProposalOwnersSRV;
+		CommitChildrenParameters->ProposalPositions = ProposalPositionsSRV;
+		CommitChildrenParameters->RW_TargetPositions = TargetUAV;
+		CommitChildrenParameters->RW_State0 = State0UAV;
+		CommitChildrenParameters->RW_State1 = State1UAV;
+		CommitChildrenParameters->TargetCount = uint32(TargetCount);
+		GraphBuilder.AddPass(
+			RDG_EVENT_NAME("SpaceColonizationQueue.CommitChildren"),
+			CommitChildrenParameters,
+			ERDGPassFlags::Compute,
+			[CommitChildrenParameters, CommitChildrenShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
+			{
+				FComputeShaderUtils::Dispatch(InRHICmdList, CommitChildrenShader, *CommitChildrenParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
+			});
+	}
+
+	// ---- GPU vine line-building (Increment B, Stage B1: count + validate) ----
+	// Mirrors the CPU tracer: BranchOrder -> CountLines (End-gated, anti-web)
+	// -> PrefixSum. Emits only a validation counter for now; the CPU tracer
+	// still produces the actual lines downstream.
+	CREATE_RDG_STRUCTURED_UAV_SRV(BranchOrder, uint32, TargetCount, TEXT("SpaceColonizationQueue_BranchOrder"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(LineCounter, uint32, 1, TEXT("SpaceColonizationQueue_LineCounter"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(LineLength, uint32, TargetCount, TEXT("SpaceColonizationQueue_LineLength"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(NodeLineIndex, uint32, TargetCount, TEXT("SpaceColonizationQueue_NodeLineIndex"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(LineOffset, uint32, TargetCount, TEXT("SpaceColonizationQueue_LineOffset"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(LineCountsOut, uint32, 4, TEXT("SpaceColonizationQueue_LineCountsOut"))
+
+	AddClearUAVPass(GraphBuilder, LineCounterUAV, 0u);
+
+	TShaderMapRef<FSpaceColonizationBranchOrderCS> BranchOrderShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FSpaceColonizationBranchOrderCS::FParameters* BranchOrderParameters = GraphBuilder.AllocParameters<FSpaceColonizationBranchOrderCS::FParameters>();
+	BranchOrderParameters->State0 = State0SRV;
+	BranchOrderParameters->State1 = State1SRV;
+	BranchOrderParameters->RW_BranchOrder = BranchOrderUAV;
+	BranchOrderParameters->TargetCount = uint32(TargetCount);
+	GraphBuilder.AddPass(
+		RDG_EVENT_NAME("SpaceColonizationQueue.BranchOrder"),
+		BranchOrderParameters,
+		ERDGPassFlags::Compute,
+		[BranchOrderParameters, BranchOrderShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
 		{
-			SCAttributes[NearestSourceIndex].Associates.Add(AttractorIndex);
-		}
-	}
-}
+			FComputeShaderUtils::Dispatch(InRHICmdList, BranchOrderShader, *BranchOrderParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
+		});
 
-static bool FindSpaceColonizationNearestAttractorFromNeighbors(
-	int32 SourceIndex,
-	const TArray<FVector>& TargetLocations,
-	const TArray<FSpaceColonizationAttribute>& SCAttributes,
-	const TArray<uint32>& NeighborCounts,
-	const TArray<int32>& NeighborIndices,
-	int32 MaxNeighborsPerTarget,
-	int32& OutNearAttractorIndex,
-	float& OutNearestDistance)
-{
-	OutNearAttractorIndex = -1;
-	OutNearestDistance = 0.0f;
-
-	const int32 TargetCount = FMath::Min(TargetLocations.Num(), SCAttributes.Num());
-	if (SourceIndex < 0 || SourceIndex >= TargetCount)
-	{
-		return false;
-	}
-
-	const int32 SafeMaxNeighbors = FMath::Max(MaxNeighborsPerTarget, 1);
-	const uint32 NeighborCount = NeighborCounts.IsValidIndex(SourceIndex)
-		? FMath::Min(NeighborCounts[SourceIndex], uint32(SafeMaxNeighbors))
-		: 0u;
-	const int32 NeighborBase = SourceIndex * SafeMaxNeighbors;
-	double NearestDistSq = TNumericLimits<double>::Max();
-	for (uint32 NeighborOffset = 0; NeighborOffset < NeighborCount; ++NeighborOffset)
-	{
-		const int32 NeighborIndex = NeighborIndices.IsValidIndex(NeighborBase + int32(NeighborOffset))
-			? NeighborIndices[NeighborBase + int32(NeighborOffset)]
-			: -1;
-		if (NeighborIndex < 0 || NeighborIndex >= TargetCount || !SCAttributes[NeighborIndex].Attractor)
+	TShaderMapRef<FSpaceColonizationCountLinesCS> CountLinesShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FSpaceColonizationCountLinesCS::FParameters* CountLinesParameters = GraphBuilder.AllocParameters<FSpaceColonizationCountLinesCS::FParameters>();
+	CountLinesParameters->State0 = State0SRV;
+	CountLinesParameters->State1 = State1SRV;
+	CountLinesParameters->BranchOrder = BranchOrderSRV;
+	CountLinesParameters->RW_LineCounter = LineCounterUAV;
+	CountLinesParameters->RW_LineLength = LineLengthUAV;
+	CountLinesParameters->RW_NodeLineIndex = NodeLineIndexUAV;
+	CountLinesParameters->TargetCount = uint32(TargetCount);
+	CountLinesParameters->BackGrowCount = BackGrowCount;
+	CountLinesParameters->ForkTaperForkOrdinal = ForkTaperForkOrdinal;
+	GraphBuilder.AddPass(
+		RDG_EVENT_NAME("SpaceColonizationQueue.CountLines"),
+		CountLinesParameters,
+		ERDGPassFlags::Compute,
+		[CountLinesParameters, CountLinesShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
 		{
-			continue;
-		}
+			FComputeShaderUtils::Dispatch(InRHICmdList, CountLinesShader, *CountLinesParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
+		});
 
-		const double DistSq = FVector::DistSquared(TargetLocations[NeighborIndex], TargetLocations[SourceIndex]);
-		if (DistSq < NearestDistSq)
+	TShaderMapRef<FSpaceColonizationPrefixSumLinesCS> PrefixSumShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FSpaceColonizationPrefixSumLinesCS::FParameters* PrefixSumParameters = GraphBuilder.AllocParameters<FSpaceColonizationPrefixSumLinesCS::FParameters>();
+	PrefixSumParameters->LineCounter = LineCounterSRV;
+	PrefixSumParameters->LineLength = LineLengthSRV;
+	PrefixSumParameters->RW_LineOffset = LineOffsetUAV;
+	PrefixSumParameters->RW_LineCountsOut = LineCountsOutUAV;
+	PrefixSumParameters->TargetCount = uint32(TargetCount);
+	GraphBuilder.AddPass(
+		RDG_EVENT_NAME("SpaceColonizationQueue.PrefixSumLines"),
+		PrefixSumParameters,
+		ERDGPassFlags::Compute,
+		[PrefixSumParameters, PrefixSumShader](FRHIComputeCommandList& InRHICmdList)
 		{
-			NearestDistSq = DistSq;
-			OutNearAttractorIndex = NeighborIndex;
-		}
-	}
+			FComputeShaderUtils::Dispatch(InRHICmdList, PrefixSumShader, *PrefixSumParameters, FIntVector(1, 1, 1));
+		});
+	// (LineCounts readback moved to after the resample; see the NewCounts copy below.)
 
-	if (OutNearAttractorIndex == -1)
+	// ---- Stage B2: emit the flat PathPoints/Meta/Segment layout ----
+	CREATE_RDG_STRUCTURED_UPLOAD_SRV(TargetPointScales, float, EmitTargetPointScales, TEXT("SpaceColonizationQueue_TargetPointScales"))
+	CREATE_RDG_STRUCTURED_UPLOAD_SRV(StartSourceScales, float, EmitStartSourceScales, TEXT("SpaceColonizationQueue_StartSourceScales"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(PathPoints, FVector4f, PathPointCapacity, TEXT("SpaceColonizationQueue_PathPoints"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(PathPointMeta, FIntVector4, PathPointCapacity, TEXT("SpaceColonizationQueue_PathPointMeta"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(SegmentMeta, FIntVector4, SegmentCapacity, TEXT("SpaceColonizationQueue_SegmentMeta"))
+
+	TShaderMapRef<FSpaceColonizationEmitLinesCS> EmitLinesShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FSpaceColonizationEmitLinesCS::FParameters* EmitLinesParameters = GraphBuilder.AllocParameters<FSpaceColonizationEmitLinesCS::FParameters>();
+	EmitLinesParameters->TargetPositions = TargetSRV;
+	EmitLinesParameters->State0 = State0SRV;
+	EmitLinesParameters->State1 = State1SRV;
+	EmitLinesParameters->BranchOrder = BranchOrderSRV;
+	EmitLinesParameters->TargetPointScales = TargetPointScalesSRV;
+	EmitLinesParameters->StartSourceScales = StartSourceScalesSRV;
+	EmitLinesParameters->NodeLineIndex = NodeLineIndexSRV;
+	EmitLinesParameters->LineOffset = LineOffsetSRV;
+	EmitLinesParameters->RW_PathPoints = PathPointsUAV;
+	EmitLinesParameters->RW_PathPointMeta = PathPointMetaUAV;
+	EmitLinesParameters->RW_SegmentMeta = SegmentMetaUAV;
+	EmitLinesParameters->TargetCount = uint32(TargetCount);
+	EmitLinesParameters->BackGrowCount = BackGrowCount;
+	EmitLinesParameters->ForkTaperForkOrdinal = ForkTaperForkOrdinal;
+	EmitLinesParameters->PathPointCapacity = PathPointCapacity;
+	EmitLinesParameters->SegmentCapacity = SegmentCapacity;
+	GraphBuilder.AddPass(
+		RDG_EVENT_NAME("SpaceColonizationQueue.EmitLines"),
+		EmitLinesParameters,
+		ERDGPassFlags::Compute,
+		[EmitLinesParameters, EmitLinesShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
+		{
+			FComputeShaderUtils::Dispatch(InRHICmdList, EmitLinesShader, *EmitLinesParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
+		});
+
+	// ---- Stage B3 (prep port): scatter (ApplyVVSCPointOffset) BEFORE smooth ----
+	// Jitters the raw emitted points +/-ScatterDistance in place so the arc-length
+	// change flows into resample exactly like the CPU path. Skipped when disabled.
+	if (ScatterDistance > 0.0f)
 	{
-		return false;
+		TShaderMapRef<FSpaceColonizationScatterCS> ScatterShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FSpaceColonizationScatterCS::FParameters* ScatterParameters = GraphBuilder.AllocParameters<FSpaceColonizationScatterCS::FParameters>();
+		ScatterParameters->RW_ScatterPoints = PathPointsUAV;
+		ScatterParameters->ScatterCounts = LineCountsOutSRV;
+		ScatterParameters->ScatterSource = SourceSRV;
+		ScatterParameters->ScatterDistance = ScatterDistance;
+		GraphBuilder.AddPass(
+			RDG_EVENT_NAME("SpaceColonizationQueue.Scatter"),
+			ScatterParameters,
+			ERDGPassFlags::Compute,
+			[ScatterParameters, ScatterShader, PathPointCapacity](FRHIComputeCommandList& InRHICmdList)
+			{
+				FComputeShaderUtils::Dispatch(InRHICmdList, ScatterShader, *ScatterParameters, FComputeShaderUtils::GetGroupCount(FIntVector(int32(PathPointCapacity), 1, 1), 64));
+			});
 	}
 
-	OutNearestDistance = FMath::Sqrt(float(NearestDistSq));
+	// ---- Stage B3 (prep port): pre-projection SmoothLine(3) as 3 ping-pong Jacobi passes ----
+	CREATE_RDG_STRUCTURED_UAV_SRV(SmoothA, FVector4f, PathPointCapacity, TEXT("SpaceColonizationQueue_SmoothA"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(SmoothB, FVector4f, PathPointCapacity, TEXT("SpaceColonizationQueue_SmoothB"))
+	TShaderMapRef<FSpaceColonizationSmoothLinesCS> SmoothShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	auto AddSmoothPass = [&](FRDGBufferSRVRef InPoints, FRDGBufferUAVRef OutPoints)
+	{
+		FSpaceColonizationSmoothLinesCS::FParameters* SmoothParameters = GraphBuilder.AllocParameters<FSpaceColonizationSmoothLinesCS::FParameters>();
+		SmoothParameters->SmoothInPoints = InPoints;
+		SmoothParameters->SmoothMeta = PathPointMetaSRV;
+		SmoothParameters->SmoothCounts = LineCountsOutSRV;
+		SmoothParameters->RW_SmoothOutPoints = OutPoints;
+		GraphBuilder.AddPass(
+			RDG_EVENT_NAME("SpaceColonizationQueue.SmoothLines"),
+			SmoothParameters,
+			ERDGPassFlags::Compute,
+			[SmoothParameters, SmoothShader, PathPointCapacity](FRHIComputeCommandList& InRHICmdList)
+			{
+				FComputeShaderUtils::Dispatch(InRHICmdList, SmoothShader, *SmoothParameters, FComputeShaderUtils::GetGroupCount(FIntVector(int32(PathPointCapacity), 1, 1), 64));
+			});
+	};
+	AddSmoothPass(PathPointsSRV, SmoothAUAV); // iter 1: raw emit -> A
+	AddSmoothPass(SmoothASRV, SmoothBUAV);    // iter 2: A -> B
+	AddSmoothPass(SmoothBSRV, SmoothAUAV);    // iter 3: B -> A (result)
+
+	// ---- Stage B3 (prep port): pre-projection ResamppleByLength (count-changing) ----
+	CREATE_RDG_STRUCTURED_UAV_SRV(NewLineLength, uint32, TargetCount, TEXT("SpaceColonizationQueue_NewLineLength"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(NewSegLength, uint32, TargetCount, TEXT("SpaceColonizationQueue_NewSegLength"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(NewLineOffset, uint32, TargetCount, TEXT("SpaceColonizationQueue_NewLineOffset"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(NewSegOffset, uint32, TargetCount, TEXT("SpaceColonizationQueue_NewSegOffset"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(NewCounts, uint32, 4, TEXT("SpaceColonizationQueue_NewCounts"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(PathPoints2, FVector4f, PathPoint2Capacity, TEXT("SpaceColonizationQueue_PathPoints2"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(PathPointMeta2, FIntVector4, PathPoint2Capacity, TEXT("SpaceColonizationQueue_PathPointMeta2"))
+	CREATE_RDG_STRUCTURED_UAV_SRV(SegmentMeta2, FIntVector4, Segment2Capacity, TEXT("SpaceColonizationQueue_SegmentMeta2"))
+	{
+		TShaderMapRef<FSpaceColonizationCountResampleCS> CountResampleShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FSpaceColonizationCountResampleCS::FParameters* P = GraphBuilder.AllocParameters<FSpaceColonizationCountResampleCS::FParameters>();
+		P->ResampleInPoints = SmoothASRV;
+		P->ResampleLineOffset = LineOffsetSRV;
+		P->ResampleLineLength = LineLengthSRV;
+		P->ResampleLineCount = LineCountsOutSRV;
+		P->RW_NewLineLength = NewLineLengthUAV;
+		P->RW_NewSegLength = NewSegLengthUAV;
+		P->ResampleLength = ResampleLength;
+		GraphBuilder.AddPass(RDG_EVENT_NAME("SpaceColonizationQueue.CountResample"), P, ERDGPassFlags::Compute,
+			[P, CountResampleShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
+			{ FComputeShaderUtils::Dispatch(InRHICmdList, CountResampleShader, *P, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64)); });
+	}
+	{
+		TShaderMapRef<FSpaceColonizationPrefixResampleCS> PrefixResampleShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FSpaceColonizationPrefixResampleCS::FParameters* P = GraphBuilder.AllocParameters<FSpaceColonizationPrefixResampleCS::FParameters>();
+		P->ResampleLineCount = LineCountsOutSRV;
+		P->NewLineLength = NewLineLengthSRV;
+		P->NewSegLength = NewSegLengthSRV;
+		P->RW_NewLineOffset = NewLineOffsetUAV;
+		P->RW_NewSegOffset = NewSegOffsetUAV;
+		P->RW_NewCounts = NewCountsUAV;
+		P->TargetCount = uint32(TargetCount);
+		GraphBuilder.AddPass(RDG_EVENT_NAME("SpaceColonizationQueue.PrefixResample"), P, ERDGPassFlags::Compute,
+			[P, PrefixResampleShader](FRHIComputeCommandList& InRHICmdList)
+			{ FComputeShaderUtils::Dispatch(InRHICmdList, PrefixResampleShader, *P, FIntVector(1, 1, 1)); });
+	}
+	{
+		TShaderMapRef<FSpaceColonizationEmitResampleCS> EmitResampleShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FSpaceColonizationEmitResampleCS::FParameters* P = GraphBuilder.AllocParameters<FSpaceColonizationEmitResampleCS::FParameters>();
+		P->ResampleInPoints = SmoothASRV;
+		P->ResampleLineOffset = LineOffsetSRV;
+		P->ResampleLineLength = LineLengthSRV;
+		P->ResampleLineCount = LineCountsOutSRV;
+		P->NewLineOffset = NewLineOffsetSRV;
+		P->NewSegOffset = NewSegOffsetSRV;
+		P->RW_PathPoints2 = PathPoints2UAV;
+		P->RW_PathPointMeta2 = PathPointMeta2UAV;
+		P->RW_SegmentMeta2 = SegmentMeta2UAV;
+		P->ResampleLength = ResampleLength;
+		P->PathPoint2Capacity = PathPoint2Capacity;
+		P->Segment2Capacity = Segment2Capacity;
+		GraphBuilder.AddPass(RDG_EVENT_NAME("SpaceColonizationQueue.EmitResample"), P, ERDGPassFlags::Compute,
+			[P, EmitResampleShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
+			{ FComputeShaderUtils::Dispatch(InRHICmdList, EmitResampleShader, *P, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64)); });
+	}
+	// ---- Stage B3 (prep port): CurveScale (final tube thickness written to .w) ----
+	CREATE_RDG_STRUCTURED_UPLOAD_SRV(CurveLUT, float, EmitCurveLUT, TEXT("SpaceColonizationQueue_CurveLUT"))
+	{
+		TShaderMapRef<FSpaceColonizationCurveCS> CurveShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FSpaceColonizationCurveCS::FParameters* P = GraphBuilder.AllocParameters<FSpaceColonizationCurveCS::FParameters>();
+		P->CurveLUT = CurveLUTSRV;
+		P->CurveLineOffset = NewLineOffsetSRV;
+		P->CurveLineLength = NewLineLengthSRV;
+		P->CurveLineCount = NewCountsSRV;
+		P->RW_CurvePoints = PathPoints2UAV;
+		P->CurveLUTSize = CurveLUTSize;
+		GraphBuilder.AddPass(RDG_EVENT_NAME("SpaceColonizationQueue.CurveScale"), P, ERDGPassFlags::Compute,
+			[P, CurveShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
+			{ FComputeShaderUtils::Dispatch(InRHICmdList, CurveShader, *P, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64)); });
+	}
+	Out.PathPoints = PathPoints2Buffer;
+	Out.PathPointMeta = PathPointMeta2Buffer;
+	Out.SegmentMeta = SegmentMeta2Buffer;
+	Out.Counts = NewCountsBuffer;
 	return true;
-}
-
-static void LogSpaceColonizationCSDebugData(const FSpaceColonizationCSDebugData& DebugData)
-{
-	if (!bSpaceColonizationStepLogs)
-	{
-		return;
-	}
-
-	TArray<FVector> TargetLocations;
-	TArray<FSpaceColonizationAttribute> SCAttributes;
-	if (DebugData.bInitialReadbackSucceeded)
-	{
-		ConvertSpaceColonizationGPUStateToAttributes(
-			DebugData.InitialTargetPositions,
-			DebugData.InitialState0,
-			DebugData.InitialState1,
-			TargetLocations,
-			SCAttributes);
-		LogSpaceColonizationQueueState(TEXT("CS"), TEXT("AfterMarkSources"), -1, TargetLocations, SCAttributes);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[SpaceColonizationStep][CS][AfterMarkSources] Readback failed."));
-	}
-
-	if (DebugData.bNeighborReadbackSucceeded)
-	{
-		LogSpaceColonizationNeighborCounts(TEXT("CS"), DebugData.NeighborCounts);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[SpaceColonizationStep][CS][BuildNeighbors] Readback failed."));
-	}
-
-	for (int32 IterationIndex = 0; IterationIndex < DebugData.IterationSnapshots.Num(); ++IterationIndex)
-	{
-		const FSpaceColonizationCSIterationDebugSnapshot& Snapshot = DebugData.IterationSnapshots[IterationIndex];
-		if (Snapshot.bResetReadbackSucceeded)
-		{
-			LogSpaceColonizationProposalOwners(TEXT("CS"), TEXT("AfterResetProposals"), IterationIndex, Snapshot.ResetProposalOwners);
-		}
-		else
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[SpaceColonizationStep][CS][AfterResetProposals][Iter=%d] Readback failed."), IterationIndex);
-		}
-
-		if (Snapshot.bProposalReadbackSucceeded)
-		{
-			LogSpaceColonizationProposalOwners(TEXT("CS"), TEXT("AfterProposeGrowth"), IterationIndex, Snapshot.ProposalOwners);
-		}
-		else
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[SpaceColonizationStep][CS][AfterProposeGrowth][Iter=%d] Readback failed."), IterationIndex);
-		}
-
-		if (Snapshot.bStateReadbackSucceeded)
-		{
-			ConvertSpaceColonizationGPUStateToAttributes(
-				Snapshot.TargetPositions,
-				Snapshot.State0,
-				Snapshot.State1,
-				TargetLocations,
-				SCAttributes);
-			LogSpaceColonizationQueueState(TEXT("CS"), TEXT("AfterCommitGrowth"), IterationIndex, TargetLocations, SCAttributes);
-		}
-		else
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[SpaceColonizationStep][CS][AfterCommitGrowth][Iter=%d] Readback failed."), IterationIndex);
-		}
-	}
-}
-
-template <typename ElementType>
-static bool LockSpaceColonizationReadbackToArray(
-	FRHIGPUBufferReadback* Readback,
-	uint32 ReadbackBytes,
-	int32 ElementCount,
-	TArray<ElementType>& OutData)
-{
-	OutData.SetNumZeroed(ElementCount);
-	if (ElementCount <= 0)
-	{
-		return true;
-	}
-
-	if (!Readback)
-	{
-		return false;
-	}
-
-	if (const ElementType* ReadbackPtr = static_cast<const ElementType*>(Readback->Lock(ReadbackBytes)))
-	{
-		FMemory::Memcpy(OutData.GetData(), ReadbackPtr, ReadbackBytes);
-		Readback->Unlock();
-		return true;
-	}
-
-	return false;
-}
-
-static void DeleteSpaceColonizationReadbackArray(TArray<FRHIGPUBufferReadback*>& Readbacks)
-{
-	for (FRHIGPUBufferReadback*& Readback : Readbacks)
-	{
-		delete Readback;
-		Readback = nullptr;
-	}
-	Readbacks.Reset();
-}
-
-static void DeleteSpaceColonizationCSReadbacks(
-	FRHIGPUBufferReadback*& LineCountsReadback,
-	FRHIGPUBufferReadback*& InitialTargetDebugReadback,
-	FRHIGPUBufferReadback*& InitialState0DebugReadback,
-	FRHIGPUBufferReadback*& InitialState1DebugReadback,
-	FRHIGPUBufferReadback*& NeighborCountsDebugReadback,
-	TArray<FRHIGPUBufferReadback*>& ResetProposalOwnerDebugReadbacks,
-	TArray<FRHIGPUBufferReadback*>& ProposalOwnerDebugReadbacks,
-	TArray<FRHIGPUBufferReadback*>& IterationTargetDebugReadbacks,
-	TArray<FRHIGPUBufferReadback*>& IterationState0DebugReadbacks,
-	TArray<FRHIGPUBufferReadback*>& IterationState1DebugReadbacks)
-{
-	delete LineCountsReadback;
-	delete InitialTargetDebugReadback;
-	delete InitialState0DebugReadback;
-	delete InitialState1DebugReadback;
-	delete NeighborCountsDebugReadback;
-	LineCountsReadback = nullptr;
-	InitialTargetDebugReadback = nullptr;
-	InitialState0DebugReadback = nullptr;
-	InitialState1DebugReadback = nullptr;
-	NeighborCountsDebugReadback = nullptr;
-	DeleteSpaceColonizationReadbackArray(ResetProposalOwnerDebugReadbacks);
-	DeleteSpaceColonizationReadbackArray(ProposalOwnerDebugReadbacks);
-	DeleteSpaceColonizationReadbackArray(IterationTargetDebugReadbacks);
-	DeleteSpaceColonizationReadbackArray(IterationState0DebugReadbacks);
-	DeleteSpaceColonizationReadbackArray(IterationState1DebugReadbacks);
-}
-
-static bool AreSpaceColonizationReadbacksReady(const TArray<FRHIGPUBufferReadback*>& Readbacks)
-{
-	for (FRHIGPUBufferReadback* Readback : Readbacks)
-	{
-		if (!Readback || !Readback->IsReady())
-		{
-			return false;
-		}
-	}
-	return true;
-}
-
-static bool AreSpaceColonizationCSReadbacksReady(
-	FRHIGPUBufferReadback* LineCountsReadback,
-	FRHIGPUBufferReadback* InitialTargetDebugReadback,
-	FRHIGPUBufferReadback* InitialState0DebugReadback,
-	FRHIGPUBufferReadback* InitialState1DebugReadback,
-	FRHIGPUBufferReadback* NeighborCountsDebugReadback,
-	const TArray<FRHIGPUBufferReadback*>& ResetProposalOwnerDebugReadbacks,
-	const TArray<FRHIGPUBufferReadback*>& ProposalOwnerDebugReadbacks,
-	const TArray<FRHIGPUBufferReadback*>& IterationTargetDebugReadbacks,
-	const TArray<FRHIGPUBufferReadback*>& IterationState0DebugReadbacks,
-	const TArray<FRHIGPUBufferReadback*>& IterationState1DebugReadbacks)
-{
-	const bool bResultReady = LineCountsReadback && LineCountsReadback->IsReady();
-	// Production collects no debug readbacks; only the line-counts buffer must be ready.
-	if constexpr (bSpaceColonizationStepLogs)
-	{
-		return bResultReady
-			&& InitialTargetDebugReadback && InitialTargetDebugReadback->IsReady()
-			&& InitialState0DebugReadback && InitialState0DebugReadback->IsReady()
-			&& InitialState1DebugReadback && InitialState1DebugReadback->IsReady()
-			&& NeighborCountsDebugReadback && NeighborCountsDebugReadback->IsReady()
-			&& AreSpaceColonizationReadbacksReady(ResetProposalOwnerDebugReadbacks)
-			&& AreSpaceColonizationReadbacksReady(ProposalOwnerDebugReadbacks)
-			&& AreSpaceColonizationReadbacksReady(IterationTargetDebugReadbacks)
-			&& AreSpaceColonizationReadbacksReady(IterationState0DebugReadbacks)
-			&& AreSpaceColonizationReadbacksReady(IterationState1DebugReadbacks);
-	}
-	else
-	{
-		return bResultReady;
-	}
-}
-
-static bool BuildSpaceColonizationQueueCSImpl(
-	const TArray<FTransform>& SourceTransforms,
-	const TArray<FTransform>& InTargetTransforms,
-	int32 Iteration,
-	int32 Activetime,
-	float RandGrow,
-	float Seed,
-	float InfluenceRadius,
-	int32 BackGrowCount,
-	int32 ForkTaperForkOrdinal,
-	float ResampleLength,
-	const TArray<float>& CurveLUT,
-	const TArray<float>& TargetPointScales,
-	const TArray<float>& StartSourceScales,
-	float ScatterDistance,
-	FVineSCGPUBuffers* OutGPUBuffers)
-{
-	GV_TIME_SCOPE(TEXT("SpaceColonizationCS.Queue.Total"));
-
-	const int32 SourceCount = SourceTransforms.Num();
-	const int32 TargetCount = InTargetTransforms.Num();
-	LogSpaceColonizationInput(TEXT("CS"), SourceCount, TargetCount, Iteration, Activetime, RandGrow, Seed, InfluenceRadius, false);
-	// Iteration <= 0 still runs Init/MarkSources so the result matches the CPU
-	// path, which returns the marked queue even when the growth loop never runs.
-	const int32 IterationCount = FMath::Max(Iteration, 0);
-	if (SourceCount == 0 || TargetCount == 0)
-	{
-		return false;
-	}
-
-	{
-		TArray<FVector4f> SourcePositions;
-		TArray<FVector4f> InitialTargetPositions;
-		{
-			GV_TIME_SCOPE(TEXT("SpaceColonizationCS.Queue.PreparePositions"));
-			SourcePositions.Reserve(SourceCount);
-			for (const FTransform& Transform : SourceTransforms)
-			{
-				const FVector Location = Transform.GetLocation();
-				SourcePositions.Add(FVector4f((FVector3f)Location, GetSpaceColonizationTransformScale(Transform)));
-			}
-
-			InitialTargetPositions.Reserve(TargetCount);
-			for (const FTransform& Transform : InTargetTransforms)
-			{
-				const FVector Location = Transform.GetLocation();
-				InitialTargetPositions.Add(FVector4f((FVector3f)Location, GetSpaceColonizationTransformScale(Transform)));
-			}
-		}
-
-		const uint64 TargetReadbackBytes64 = sizeof(FVector4f) * uint64(TargetCount);
-		const uint64 StateReadbackBytes64 = sizeof(FSpaceColonizationGPUState4) * uint64(TargetCount);
-		const uint64 UIntReadbackBytes64 = sizeof(uint32) * uint64(TargetCount);
-		// SC_MAX_NEIGHBORS_CAP in SpaceColonizationQueue.usf must stay >= this value.
-		const int32 MaxNeighborsPerTarget = FMath::Clamp(SpaceColonizationMaxNeighborsPerTarget, 1, TargetCount);
-		const uint64 NeighborIndexCount64 = uint64(TargetCount) * uint64(MaxNeighborsPerTarget);
-		if (TargetReadbackBytes64 > uint64(TNumericLimits<uint32>::Max()) ||
-			StateReadbackBytes64 > uint64(TNumericLimits<uint32>::Max()) ||
-			UIntReadbackBytes64 > uint64(TNumericLimits<uint32>::Max()) ||
-			NeighborIndexCount64 > uint64(TNumericLimits<uint32>::Max()))
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[SpaceColonizationQueueCS] GPU request too large. TargetCount=%d MaxNeighbors=%d"), TargetCount, MaxNeighborsPerTarget);
-			return false;
-		}
-
-		const uint32 TargetReadbackBytes = uint32(TargetReadbackBytes64);
-		const uint32 StateReadbackBytes = uint32(StateReadbackBytes64);
-		const uint32 UIntReadbackBytes = uint32(UIntReadbackBytes64);
-		const uint32 NeighborIndexCount = uint32(NeighborIndexCount64);
-		// The only result the CPU still needs: [lineCount, totalPoints, totalSegments, 0], which sizes
-		// the downstream VisVine buffers and dispatches. The growth state itself (target positions,
-		// per-node flags) stays on the GPU — nothing downstream reads it.
-		FRHIGPUBufferReadback* LineCountsReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_LineCounts"));
-		TArray<uint32> LineCountsData;
-		LineCountsData.SetNumZeroed(4);
-		const uint32 LineCountsReadbackBytes = uint32(sizeof(uint32) * 4);
-		// Stage B2 emit-kernel output. Buffer is over-allocated to the worst-case bound
-		// (each of <=TargetCount lines has <= SC_MAX_BACKTRACK+1 points); only [0,totalPoints)
-		// is written compactly.
-		constexpr int32 SpaceColonizationMaxBacktrack = 100;
-		const uint32 PathPointCapacity = uint32(FMath::Min<int64>(int64(TargetCount) * int64(SpaceColonizationMaxBacktrack + 1), 4000000));
-		const uint32 SegmentCapacity = PathPointCapacity;
-		// Resample can grow lines; keep a generous compact capacity for the post-resample set.
-		const uint32 PathPoint2Capacity = PathPointCapacity;
-		const uint32 Segment2Capacity = PathPointCapacity;
-		// Trip A: when requested, extract the prepped output buffers as pooled (external)
-		// RDG buffers inside the render command below so they outlive the graph and can be
-		// handed to VisVine. Assigned on the render thread; valid after FlushRenderingCommands.
-		const bool bExportGPUBuffers = (OutGPUBuffers != nullptr);
-		TRefCountPtr<FRDGPooledBuffer> ExportedPathPoints2;
-		TRefCountPtr<FRDGPooledBuffer> ExportedPathPointMeta2;
-		TRefCountPtr<FRDGPooledBuffer> ExportedSegmentMeta2;
-		TArray<float> EmitTargetPointScales = TargetPointScales;
-		TArray<float> EmitStartSourceScales = StartSourceScales;
-		TArray<float> EmitCurveLUT = CurveLUT;
-		const uint32 CurveLUTSize = uint32(CurveLUT.Num());
-		// Debug readbacks exist solely to feed the [SpaceColonizationStep] validation logs.
-		// In production (bSpaceColonizationStepLogs == false) they stay null and every
-		// debug copy-pass / lock below is compiled out, so the GPU path only pays for the
-		// four-uint line-counts readback.
-		FRHIGPUBufferReadback* InitialTargetDebugReadback = nullptr;
-		FRHIGPUBufferReadback* InitialState0DebugReadback = nullptr;
-		FRHIGPUBufferReadback* InitialState1DebugReadback = nullptr;
-		FRHIGPUBufferReadback* NeighborCountsDebugReadback = nullptr;
-		TArray<FRHIGPUBufferReadback*> ResetProposalOwnerDebugReadbacks;
-		TArray<FRHIGPUBufferReadback*> ProposalOwnerDebugReadbacks;
-		TArray<FRHIGPUBufferReadback*> IterationTargetDebugReadbacks;
-		TArray<FRHIGPUBufferReadback*> IterationState0DebugReadbacks;
-		TArray<FRHIGPUBufferReadback*> IterationState1DebugReadbacks;
-		FSpaceColonizationCSDebugData CSDebugData;
-		if constexpr (bSpaceColonizationStepLogs)
-		{
-			InitialTargetDebugReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_Debug_InitialTarget"));
-			InitialState0DebugReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_Debug_InitialState0"));
-			InitialState1DebugReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_Debug_InitialState1"));
-			NeighborCountsDebugReadback = new FRHIGPUBufferReadback(TEXT("SpaceColonizationQueue_Debug_NeighborCounts"));
-			ResetProposalOwnerDebugReadbacks.Reserve(IterationCount);
-			ProposalOwnerDebugReadbacks.Reserve(IterationCount);
-			IterationTargetDebugReadbacks.Reserve(IterationCount);
-			IterationState0DebugReadbacks.Reserve(IterationCount);
-			IterationState1DebugReadbacks.Reserve(IterationCount);
-			for (int32 IterationIndex = 0; IterationIndex < IterationCount; ++IterationIndex)
-			{
-				ResetProposalOwnerDebugReadbacks.Add(new FRHIGPUBufferReadback(*FString::Printf(TEXT("SpaceColonizationQueue_Debug_ResetOwners_%d"), IterationIndex)));
-				ProposalOwnerDebugReadbacks.Add(new FRHIGPUBufferReadback(*FString::Printf(TEXT("SpaceColonizationQueue_Debug_ProposalOwners_%d"), IterationIndex)));
-				IterationTargetDebugReadbacks.Add(new FRHIGPUBufferReadback(*FString::Printf(TEXT("SpaceColonizationQueue_Debug_Target_%d"), IterationIndex)));
-				IterationState0DebugReadbacks.Add(new FRHIGPUBufferReadback(*FString::Printf(TEXT("SpaceColonizationQueue_Debug_State0_%d"), IterationIndex)));
-				IterationState1DebugReadbacks.Add(new FRHIGPUBufferReadback(*FString::Printf(TEXT("SpaceColonizationQueue_Debug_State1_%d"), IterationIndex)));
-			}
-			CSDebugData.IterationSnapshots.SetNum(IterationCount);
-		}
-		bool bRenderWorkQueued = false;
-
-		{
-			GV_TIME_SCOPE(TEXT("SpaceColonizationCS.Queue.DispatchAndFlush"));
-			ENQUEUE_RENDER_COMMAND(SpaceColonizationQueueCS)(
-				[SourcePositions = MoveTemp(SourcePositions), InitialTargetPositions = MoveTemp(InitialTargetPositions),
-				 TargetReadbackBytes, StateReadbackBytes,
-				 UIntReadbackBytes, InitialTargetDebugReadback, InitialState0DebugReadback, InitialState1DebugReadback,
-				 NeighborCountsDebugReadback, ResetProposalOwnerDebugReadbacks, ProposalOwnerDebugReadbacks,
-				 IterationTargetDebugReadbacks, IterationState0DebugReadbacks, IterationState1DebugReadbacks,
-				 TargetCount, SourceCount, IterationCount, Activetime, RandGrow, Seed, InfluenceRadius,
-				 MaxNeighborsPerTarget, NeighborIndexCount, BackGrowCount, ForkTaperForkOrdinal,
-				 LineCountsReadback, LineCountsReadbackBytes,
-				 EmitTargetPointScales = MoveTemp(EmitTargetPointScales), EmitStartSourceScales = MoveTemp(EmitStartSourceScales),
-				 PathPointCapacity, SegmentCapacity,
-				 ResampleLength, PathPoint2Capacity, Segment2Capacity,
-				 EmitCurveLUT = MoveTemp(EmitCurveLUT), CurveLUTSize,
-				 ScatterDistance,
-				 bExportGPUBuffers, &ExportedPathPoints2, &ExportedPathPointMeta2, &ExportedSegmentMeta2,
-				 &bRenderWorkQueued](FRHICommandListImmediate& RHICmdList)
-				{
-					FRDGBuilder GraphBuilder(RHICmdList);
-
-					CREATE_RDG_STRUCTURED_UPLOAD_SRV(Source, FVector4f, SourcePositions, TEXT("SpaceColonizationQueue_SourcePositions"))
-					CREATE_RDG_STRUCTURED_UPLOAD_SRV(InitialTarget, FVector4f, InitialTargetPositions, TEXT("SpaceColonizationQueue_InitialTargetPositions"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(Target, FVector4f, TargetCount, TEXT("SpaceColonizationQueue_TargetPositions"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(State0, FSpaceColonizationGPUState4, TargetCount, TEXT("SpaceColonizationQueue_State0"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(State1, FSpaceColonizationGPUState4, TargetCount, TEXT("SpaceColonizationQueue_State1"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(NeighborCounts, uint32, TargetCount, TEXT("SpaceColonizationQueue_NeighborCounts"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(NeighborIndices, uint32, NeighborIndexCount, TEXT("SpaceColonizationQueue_NeighborIndices"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(ProposalOwners, uint32, TargetCount, TEXT("SpaceColonizationQueue_ProposalOwners"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(ProposalPositions, FVector4f, TargetCount, TEXT("SpaceColonizationQueue_ProposalPositions"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(Claims, uint32, TargetCount, TEXT("SpaceColonizationQueue_Claims"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(ClaimCounts, uint32, TargetCount, TEXT("SpaceColonizationQueue_ClaimCounts"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(ProposalTargets, uint32, TargetCount, TEXT("SpaceColonizationQueue_ProposalTargets"))
-
-					TShaderMapRef<FSpaceColonizationQueueInitCS> InitShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-					FSpaceColonizationQueueInitCS::FParameters* InitParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueInitCS::FParameters>();
-					InitParameters->InitialTargetPositions = InitialTargetSRV;
-					InitParameters->RW_TargetPositions = TargetUAV;
-					InitParameters->RW_State0 = State0UAV;
-					InitParameters->RW_State1 = State1UAV;
-					InitParameters->TargetCount = uint32(TargetCount);
-					GraphBuilder.AddPass(
-						RDG_EVENT_NAME("SpaceColonizationQueue.Init"),
-						InitParameters,
-						ERDGPassFlags::Compute,
-						[InitParameters, InitShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
-						{
-							FComputeShaderUtils::Dispatch(InRHICmdList, InitShader, *InitParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
-						});
-
-					TShaderMapRef<FSpaceColonizationQueueMarkSourcesCS> MarkSourcesShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-					FSpaceColonizationQueueMarkSourcesCS::FParameters* MarkParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueMarkSourcesCS::FParameters>();
-					MarkParameters->SourcePositions = SourceSRV;
-					MarkParameters->InitialTargetPositions = InitialTargetSRV;
-					MarkParameters->RW_TargetPositions = TargetUAV;
-					MarkParameters->RW_State0 = State0UAV;
-					MarkParameters->RW_State1 = State1UAV;
-					MarkParameters->SourceCount = uint32(SourceCount);
-					MarkParameters->TargetCount = uint32(TargetCount);
-					GraphBuilder.AddPass(
-						RDG_EVENT_NAME("SpaceColonizationQueue.MarkSources"),
-						MarkParameters,
-						ERDGPassFlags::Compute,
-						[MarkParameters, MarkSourcesShader, SourceCount](FRHIComputeCommandList& InRHICmdList)
-						{
-							FComputeShaderUtils::Dispatch(InRHICmdList, MarkSourcesShader, *MarkParameters, FComputeShaderUtils::GetGroupCount(FIntVector(SourceCount, 1, 1), 64));
-						});
-					if constexpr (bSpaceColonizationStepLogs)
-					{
-						AddEnqueueCopyPass(GraphBuilder, InitialTargetDebugReadback, TargetBuffer, TargetReadbackBytes);
-						AddEnqueueCopyPass(GraphBuilder, InitialState0DebugReadback, State0Buffer, StateReadbackBytes);
-						AddEnqueueCopyPass(GraphBuilder, InitialState1DebugReadback, State1Buffer, StateReadbackBytes);
-					}
-
-					TShaderMapRef<FSpaceColonizationQueueBuildNeighborsCS> BuildNeighborsShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-					FSpaceColonizationQueueBuildNeighborsCS::FParameters* BuildNeighborsParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueBuildNeighborsCS::FParameters>();
-					BuildNeighborsParameters->InitialTargetPositions = InitialTargetSRV;
-					BuildNeighborsParameters->RW_NeighborCounts = NeighborCountsUAV;
-					BuildNeighborsParameters->RW_NeighborIndices = NeighborIndicesUAV;
-					BuildNeighborsParameters->TargetCount = uint32(TargetCount);
-					BuildNeighborsParameters->MaxNeighbors = uint32(MaxNeighborsPerTarget);
-					BuildNeighborsParameters->InfluenceRadius = InfluenceRadius;
-					GraphBuilder.AddPass(
-						RDG_EVENT_NAME("SpaceColonizationQueue.BuildNeighbors"),
-						BuildNeighborsParameters,
-						ERDGPassFlags::Compute,
-						[BuildNeighborsParameters, BuildNeighborsShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
-						{
-							FComputeShaderUtils::Dispatch(InRHICmdList, BuildNeighborsShader, *BuildNeighborsParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
-						});
-					if constexpr (bSpaceColonizationStepLogs)
-					{
-						AddEnqueueCopyPass(GraphBuilder, NeighborCountsDebugReadback, NeighborCountsBuffer, UIntReadbackBytes);
-					}
-
-					TShaderMapRef<FSpaceColonizationQueueResetProposalsCS> ResetProposalsShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-					TShaderMapRef<FSpaceColonizationQueueClaimCS> ClaimShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-					TShaderMapRef<FSpaceColonizationQueueProposeCS> ProposeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-					TShaderMapRef<FSpaceColonizationQueueCommitParentsCS> CommitParentsShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-					TShaderMapRef<FSpaceColonizationQueueCommitChildrenCS> CommitChildrenShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-					for (int32 IterationIndex = 0; IterationIndex < IterationCount; ++IterationIndex)
-					{
-						FSpaceColonizationQueueResetProposalsCS::FParameters* ResetParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueResetProposalsCS::FParameters>();
-						ResetParameters->RW_ProposalOwners = ProposalOwnersUAV;
-						ResetParameters->RW_ProposalPositions = ProposalPositionsUAV;
-						ResetParameters->RW_Claims = ClaimsUAV;
-						ResetParameters->RW_ClaimCounts = ClaimCountsUAV;
-						ResetParameters->RW_ProposalTargets = ProposalTargetsUAV;
-						ResetParameters->TargetCount = uint32(TargetCount);
-						GraphBuilder.AddPass(
-							RDG_EVENT_NAME("SpaceColonizationQueue.ResetProposals"),
-							ResetParameters,
-							ERDGPassFlags::Compute,
-							[ResetParameters, ResetProposalsShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
-							{
-								FComputeShaderUtils::Dispatch(InRHICmdList, ResetProposalsShader, *ResetParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
-							});
-						if constexpr (bSpaceColonizationStepLogs)
-						{
-							AddEnqueueCopyPass(GraphBuilder, ResetProposalOwnerDebugReadbacks[IterationIndex], ProposalOwnersBuffer, UIntReadbackBytes);
-						}
-
-						FSpaceColonizationQueueClaimCS::FParameters* ClaimParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueClaimCS::FParameters>();
-						ClaimParameters->TargetPositions = TargetSRV;
-						ClaimParameters->State0 = State0SRV;
-						ClaimParameters->NeighborCounts = NeighborCountsSRV;
-						ClaimParameters->NeighborIndices = NeighborIndicesSRV;
-						ClaimParameters->RW_Claims = ClaimsUAV;
-						ClaimParameters->RW_ClaimCounts = ClaimCountsUAV;
-						ClaimParameters->TargetCount = uint32(TargetCount);
-						ClaimParameters->MaxNeighbors = uint32(MaxNeighborsPerTarget);
-						ClaimParameters->InfluenceRadius = InfluenceRadius;
-						GraphBuilder.AddPass(
-							RDG_EVENT_NAME("SpaceColonizationQueue.Claim"),
-							ClaimParameters,
-							ERDGPassFlags::Compute,
-							[ClaimParameters, ClaimShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
-							{
-								FComputeShaderUtils::Dispatch(InRHICmdList, ClaimShader, *ClaimParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
-							});
-
-						FSpaceColonizationQueueProposeCS::FParameters* ProposeParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueProposeCS::FParameters>();
-						ProposeParameters->InitialTargetPositions = InitialTargetSRV;
-						ProposeParameters->TargetPositions = TargetSRV;
-						ProposeParameters->State0 = State0SRV;
-						ProposeParameters->State1 = State1SRV;
-						ProposeParameters->NeighborCounts = NeighborCountsSRV;
-						ProposeParameters->NeighborIndices = NeighborIndicesSRV;
-						ProposeParameters->Claims = ClaimsSRV;
-						ProposeParameters->ClaimCounts = ClaimCountsSRV;
-						ProposeParameters->RW_ProposalOwners = ProposalOwnersUAV;
-						ProposeParameters->RW_ProposalPositions = ProposalPositionsUAV;
-						ProposeParameters->RW_ProposalTargets = ProposalTargetsUAV;
-						ProposeParameters->TargetCount = uint32(TargetCount);
-						ProposeParameters->MaxNeighbors = uint32(MaxNeighborsPerTarget);
-						ProposeParameters->Iteration = uint32(IterationIndex);
-						// Negative Activetime round-trips through the uint32 cast; the shader
-						// recovers it via (int)Activetime, matching the CPU's unclamped gate.
-						ProposeParameters->Activetime = uint32(Activetime);
-						ProposeParameters->RandGrow = RandGrow;
-						ProposeParameters->Seed = Seed;
-						GraphBuilder.AddPass(
-							RDG_EVENT_NAME("SpaceColonizationQueue.Propose"),
-							ProposeParameters,
-							ERDGPassFlags::Compute,
-							[ProposeParameters, ProposeShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
-							{
-								FComputeShaderUtils::Dispatch(InRHICmdList, ProposeShader, *ProposeParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
-							});
-						if constexpr (bSpaceColonizationStepLogs)
-						{
-							AddEnqueueCopyPass(GraphBuilder, ProposalOwnerDebugReadbacks[IterationIndex], ProposalOwnersBuffer, UIntReadbackBytes);
-						}
-
-						// Parents commit first so children inherit the post-increment SpawnCount,
-						// matching the CPU sequential commit loop.
-						FSpaceColonizationQueueCommitParentsCS::FParameters* CommitParentsParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueCommitParentsCS::FParameters>();
-						CommitParentsParameters->ProposalTargets = ProposalTargetsSRV;
-						CommitParentsParameters->RW_State0 = State0UAV;
-						CommitParentsParameters->RW_State1 = State1UAV;
-						CommitParentsParameters->TargetCount = uint32(TargetCount);
-						GraphBuilder.AddPass(
-							RDG_EVENT_NAME("SpaceColonizationQueue.CommitParents"),
-							CommitParentsParameters,
-							ERDGPassFlags::Compute,
-							[CommitParentsParameters, CommitParentsShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
-							{
-								FComputeShaderUtils::Dispatch(InRHICmdList, CommitParentsShader, *CommitParentsParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
-							});
-
-						FSpaceColonizationQueueCommitChildrenCS::FParameters* CommitChildrenParameters = GraphBuilder.AllocParameters<FSpaceColonizationQueueCommitChildrenCS::FParameters>();
-						CommitChildrenParameters->InitialTargetPositions = InitialTargetSRV;
-						CommitChildrenParameters->ProposalOwners = ProposalOwnersSRV;
-						CommitChildrenParameters->ProposalPositions = ProposalPositionsSRV;
-						CommitChildrenParameters->RW_TargetPositions = TargetUAV;
-						CommitChildrenParameters->RW_State0 = State0UAV;
-						CommitChildrenParameters->RW_State1 = State1UAV;
-						CommitChildrenParameters->TargetCount = uint32(TargetCount);
-						GraphBuilder.AddPass(
-							RDG_EVENT_NAME("SpaceColonizationQueue.CommitChildren"),
-							CommitChildrenParameters,
-							ERDGPassFlags::Compute,
-							[CommitChildrenParameters, CommitChildrenShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
-							{
-								FComputeShaderUtils::Dispatch(InRHICmdList, CommitChildrenShader, *CommitChildrenParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
-							});
-						if constexpr (bSpaceColonizationStepLogs)
-						{
-							AddEnqueueCopyPass(GraphBuilder, IterationTargetDebugReadbacks[IterationIndex], TargetBuffer, TargetReadbackBytes);
-							AddEnqueueCopyPass(GraphBuilder, IterationState0DebugReadbacks[IterationIndex], State0Buffer, StateReadbackBytes);
-							AddEnqueueCopyPass(GraphBuilder, IterationState1DebugReadbacks[IterationIndex], State1Buffer, StateReadbackBytes);
-						}
-					}
-
-					// ---- GPU vine line-building (Increment B, Stage B1: count + validate) ----
-					// Mirrors the CPU tracer: BranchOrder -> CountLines (End-gated, anti-web)
-					// -> PrefixSum. Emits only a validation counter for now; the CPU tracer
-					// still produces the actual lines downstream.
-					CREATE_RDG_STRUCTURED_UAV_SRV(BranchOrder, uint32, TargetCount, TEXT("SpaceColonizationQueue_BranchOrder"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(LineCounter, uint32, 1, TEXT("SpaceColonizationQueue_LineCounter"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(LineLength, uint32, TargetCount, TEXT("SpaceColonizationQueue_LineLength"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(NodeLineIndex, uint32, TargetCount, TEXT("SpaceColonizationQueue_NodeLineIndex"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(LineOffset, uint32, TargetCount, TEXT("SpaceColonizationQueue_LineOffset"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(LineCountsOut, uint32, 4, TEXT("SpaceColonizationQueue_LineCountsOut"))
-
-					AddClearUAVPass(GraphBuilder, LineCounterUAV, 0u);
-
-					TShaderMapRef<FSpaceColonizationBranchOrderCS> BranchOrderShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-					FSpaceColonizationBranchOrderCS::FParameters* BranchOrderParameters = GraphBuilder.AllocParameters<FSpaceColonizationBranchOrderCS::FParameters>();
-					BranchOrderParameters->State0 = State0SRV;
-					BranchOrderParameters->State1 = State1SRV;
-					BranchOrderParameters->RW_BranchOrder = BranchOrderUAV;
-					BranchOrderParameters->TargetCount = uint32(TargetCount);
-					GraphBuilder.AddPass(
-						RDG_EVENT_NAME("SpaceColonizationQueue.BranchOrder"),
-						BranchOrderParameters,
-						ERDGPassFlags::Compute,
-						[BranchOrderParameters, BranchOrderShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
-						{
-							FComputeShaderUtils::Dispatch(InRHICmdList, BranchOrderShader, *BranchOrderParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
-						});
-
-					TShaderMapRef<FSpaceColonizationCountLinesCS> CountLinesShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-					FSpaceColonizationCountLinesCS::FParameters* CountLinesParameters = GraphBuilder.AllocParameters<FSpaceColonizationCountLinesCS::FParameters>();
-					CountLinesParameters->State0 = State0SRV;
-					CountLinesParameters->State1 = State1SRV;
-					CountLinesParameters->BranchOrder = BranchOrderSRV;
-					CountLinesParameters->RW_LineCounter = LineCounterUAV;
-					CountLinesParameters->RW_LineLength = LineLengthUAV;
-					CountLinesParameters->RW_NodeLineIndex = NodeLineIndexUAV;
-					CountLinesParameters->TargetCount = uint32(TargetCount);
-					CountLinesParameters->BackGrowCount = BackGrowCount;
-					CountLinesParameters->ForkTaperForkOrdinal = ForkTaperForkOrdinal;
-					GraphBuilder.AddPass(
-						RDG_EVENT_NAME("SpaceColonizationQueue.CountLines"),
-						CountLinesParameters,
-						ERDGPassFlags::Compute,
-						[CountLinesParameters, CountLinesShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
-						{
-							FComputeShaderUtils::Dispatch(InRHICmdList, CountLinesShader, *CountLinesParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
-						});
-
-					TShaderMapRef<FSpaceColonizationPrefixSumLinesCS> PrefixSumShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-					FSpaceColonizationPrefixSumLinesCS::FParameters* PrefixSumParameters = GraphBuilder.AllocParameters<FSpaceColonizationPrefixSumLinesCS::FParameters>();
-					PrefixSumParameters->LineCounter = LineCounterSRV;
-					PrefixSumParameters->LineLength = LineLengthSRV;
-					PrefixSumParameters->RW_LineOffset = LineOffsetUAV;
-					PrefixSumParameters->RW_LineCountsOut = LineCountsOutUAV;
-					PrefixSumParameters->TargetCount = uint32(TargetCount);
-					GraphBuilder.AddPass(
-						RDG_EVENT_NAME("SpaceColonizationQueue.PrefixSumLines"),
-						PrefixSumParameters,
-						ERDGPassFlags::Compute,
-						[PrefixSumParameters, PrefixSumShader](FRHIComputeCommandList& InRHICmdList)
-						{
-							FComputeShaderUtils::Dispatch(InRHICmdList, PrefixSumShader, *PrefixSumParameters, FIntVector(1, 1, 1));
-						});
-					// (LineCounts readback moved to after the resample; see the NewCounts copy below.)
-
-					// ---- Stage B2: emit the flat PathPoints/Meta/Segment layout ----
-					CREATE_RDG_STRUCTURED_UPLOAD_SRV(TargetPointScales, float, EmitTargetPointScales, TEXT("SpaceColonizationQueue_TargetPointScales"))
-					CREATE_RDG_STRUCTURED_UPLOAD_SRV(StartSourceScales, float, EmitStartSourceScales, TEXT("SpaceColonizationQueue_StartSourceScales"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(PathPoints, FVector4f, PathPointCapacity, TEXT("SpaceColonizationQueue_PathPoints"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(PathPointMeta, FIntVector4, PathPointCapacity, TEXT("SpaceColonizationQueue_PathPointMeta"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(SegmentMeta, FIntVector4, SegmentCapacity, TEXT("SpaceColonizationQueue_SegmentMeta"))
-
-					TShaderMapRef<FSpaceColonizationEmitLinesCS> EmitLinesShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-					FSpaceColonizationEmitLinesCS::FParameters* EmitLinesParameters = GraphBuilder.AllocParameters<FSpaceColonizationEmitLinesCS::FParameters>();
-					EmitLinesParameters->TargetPositions = TargetSRV;
-					EmitLinesParameters->State0 = State0SRV;
-					EmitLinesParameters->State1 = State1SRV;
-					EmitLinesParameters->BranchOrder = BranchOrderSRV;
-					EmitLinesParameters->TargetPointScales = TargetPointScalesSRV;
-					EmitLinesParameters->StartSourceScales = StartSourceScalesSRV;
-					EmitLinesParameters->NodeLineIndex = NodeLineIndexSRV;
-					EmitLinesParameters->LineOffset = LineOffsetSRV;
-					EmitLinesParameters->RW_PathPoints = PathPointsUAV;
-					EmitLinesParameters->RW_PathPointMeta = PathPointMetaUAV;
-					EmitLinesParameters->RW_SegmentMeta = SegmentMetaUAV;
-					EmitLinesParameters->TargetCount = uint32(TargetCount);
-					EmitLinesParameters->BackGrowCount = BackGrowCount;
-					EmitLinesParameters->ForkTaperForkOrdinal = ForkTaperForkOrdinal;
-					EmitLinesParameters->PathPointCapacity = PathPointCapacity;
-					EmitLinesParameters->SegmentCapacity = SegmentCapacity;
-					GraphBuilder.AddPass(
-						RDG_EVENT_NAME("SpaceColonizationQueue.EmitLines"),
-						EmitLinesParameters,
-						ERDGPassFlags::Compute,
-						[EmitLinesParameters, EmitLinesShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
-						{
-							FComputeShaderUtils::Dispatch(InRHICmdList, EmitLinesShader, *EmitLinesParameters, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64));
-						});
-
-					// ---- Stage B3 (prep port): scatter (ApplyVVSCPointOffset) BEFORE smooth ----
-					// Jitters the raw emitted points +/-ScatterDistance in place so the arc-length
-					// change flows into resample exactly like the CPU path. Skipped when disabled.
-					if (ScatterDistance > 0.0f)
-					{
-						TShaderMapRef<FSpaceColonizationScatterCS> ScatterShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-						FSpaceColonizationScatterCS::FParameters* ScatterParameters = GraphBuilder.AllocParameters<FSpaceColonizationScatterCS::FParameters>();
-						ScatterParameters->RW_ScatterPoints = PathPointsUAV;
-						ScatterParameters->ScatterCounts = LineCountsOutSRV;
-						ScatterParameters->ScatterSource = SourceSRV;
-						ScatterParameters->ScatterDistance = ScatterDistance;
-						GraphBuilder.AddPass(
-							RDG_EVENT_NAME("SpaceColonizationQueue.Scatter"),
-							ScatterParameters,
-							ERDGPassFlags::Compute,
-							[ScatterParameters, ScatterShader, PathPointCapacity](FRHIComputeCommandList& InRHICmdList)
-							{
-								FComputeShaderUtils::Dispatch(InRHICmdList, ScatterShader, *ScatterParameters, FComputeShaderUtils::GetGroupCount(FIntVector(int32(PathPointCapacity), 1, 1), 64));
-							});
-					}
-
-					// ---- Stage B3 (prep port): pre-projection SmoothLine(3) as 3 ping-pong Jacobi passes ----
-					CREATE_RDG_STRUCTURED_UAV_SRV(SmoothA, FVector4f, PathPointCapacity, TEXT("SpaceColonizationQueue_SmoothA"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(SmoothB, FVector4f, PathPointCapacity, TEXT("SpaceColonizationQueue_SmoothB"))
-					TShaderMapRef<FSpaceColonizationSmoothLinesCS> SmoothShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-					auto AddSmoothPass = [&](FRDGBufferSRVRef InPoints, FRDGBufferUAVRef OutPoints)
-					{
-						FSpaceColonizationSmoothLinesCS::FParameters* SmoothParameters = GraphBuilder.AllocParameters<FSpaceColonizationSmoothLinesCS::FParameters>();
-						SmoothParameters->SmoothInPoints = InPoints;
-						SmoothParameters->SmoothMeta = PathPointMetaSRV;
-						SmoothParameters->SmoothCounts = LineCountsOutSRV;
-						SmoothParameters->RW_SmoothOutPoints = OutPoints;
-						GraphBuilder.AddPass(
-							RDG_EVENT_NAME("SpaceColonizationQueue.SmoothLines"),
-							SmoothParameters,
-							ERDGPassFlags::Compute,
-							[SmoothParameters, SmoothShader, PathPointCapacity](FRHIComputeCommandList& InRHICmdList)
-							{
-								FComputeShaderUtils::Dispatch(InRHICmdList, SmoothShader, *SmoothParameters, FComputeShaderUtils::GetGroupCount(FIntVector(int32(PathPointCapacity), 1, 1), 64));
-							});
-					};
-					AddSmoothPass(PathPointsSRV, SmoothAUAV); // iter 1: raw emit -> A
-					AddSmoothPass(SmoothASRV, SmoothBUAV);    // iter 2: A -> B
-					AddSmoothPass(SmoothBSRV, SmoothAUAV);    // iter 3: B -> A (result)
-
-					// ---- Stage B3 (prep port): pre-projection ResamppleByLength (count-changing) ----
-					CREATE_RDG_STRUCTURED_UAV_SRV(NewLineLength, uint32, TargetCount, TEXT("SpaceColonizationQueue_NewLineLength"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(NewSegLength, uint32, TargetCount, TEXT("SpaceColonizationQueue_NewSegLength"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(NewLineOffset, uint32, TargetCount, TEXT("SpaceColonizationQueue_NewLineOffset"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(NewSegOffset, uint32, TargetCount, TEXT("SpaceColonizationQueue_NewSegOffset"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(NewCounts, uint32, 4, TEXT("SpaceColonizationQueue_NewCounts"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(PathPoints2, FVector4f, PathPoint2Capacity, TEXT("SpaceColonizationQueue_PathPoints2"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(PathPointMeta2, FIntVector4, PathPoint2Capacity, TEXT("SpaceColonizationQueue_PathPointMeta2"))
-					CREATE_RDG_STRUCTURED_UAV_SRV(SegmentMeta2, FIntVector4, Segment2Capacity, TEXT("SpaceColonizationQueue_SegmentMeta2"))
-					{
-						TShaderMapRef<FSpaceColonizationCountResampleCS> CountResampleShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-						FSpaceColonizationCountResampleCS::FParameters* P = GraphBuilder.AllocParameters<FSpaceColonizationCountResampleCS::FParameters>();
-						P->ResampleInPoints = SmoothASRV;
-						P->ResampleLineOffset = LineOffsetSRV;
-						P->ResampleLineLength = LineLengthSRV;
-						P->ResampleLineCount = LineCountsOutSRV;
-						P->RW_NewLineLength = NewLineLengthUAV;
-						P->RW_NewSegLength = NewSegLengthUAV;
-						P->ResampleLength = ResampleLength;
-						GraphBuilder.AddPass(RDG_EVENT_NAME("SpaceColonizationQueue.CountResample"), P, ERDGPassFlags::Compute,
-							[P, CountResampleShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
-							{ FComputeShaderUtils::Dispatch(InRHICmdList, CountResampleShader, *P, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64)); });
-					}
-					{
-						TShaderMapRef<FSpaceColonizationPrefixResampleCS> PrefixResampleShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-						FSpaceColonizationPrefixResampleCS::FParameters* P = GraphBuilder.AllocParameters<FSpaceColonizationPrefixResampleCS::FParameters>();
-						P->ResampleLineCount = LineCountsOutSRV;
-						P->NewLineLength = NewLineLengthSRV;
-						P->NewSegLength = NewSegLengthSRV;
-						P->RW_NewLineOffset = NewLineOffsetUAV;
-						P->RW_NewSegOffset = NewSegOffsetUAV;
-						P->RW_NewCounts = NewCountsUAV;
-						P->TargetCount = uint32(TargetCount);
-						GraphBuilder.AddPass(RDG_EVENT_NAME("SpaceColonizationQueue.PrefixResample"), P, ERDGPassFlags::Compute,
-							[P, PrefixResampleShader](FRHIComputeCommandList& InRHICmdList)
-							{ FComputeShaderUtils::Dispatch(InRHICmdList, PrefixResampleShader, *P, FIntVector(1, 1, 1)); });
-					}
-					{
-						TShaderMapRef<FSpaceColonizationEmitResampleCS> EmitResampleShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-						FSpaceColonizationEmitResampleCS::FParameters* P = GraphBuilder.AllocParameters<FSpaceColonizationEmitResampleCS::FParameters>();
-						P->ResampleInPoints = SmoothASRV;
-						P->ResampleLineOffset = LineOffsetSRV;
-						P->ResampleLineLength = LineLengthSRV;
-						P->ResampleLineCount = LineCountsOutSRV;
-						P->NewLineOffset = NewLineOffsetSRV;
-						P->NewSegOffset = NewSegOffsetSRV;
-						P->RW_PathPoints2 = PathPoints2UAV;
-						P->RW_PathPointMeta2 = PathPointMeta2UAV;
-						P->RW_SegmentMeta2 = SegmentMeta2UAV;
-						P->ResampleLength = ResampleLength;
-						P->PathPoint2Capacity = PathPoint2Capacity;
-						P->Segment2Capacity = Segment2Capacity;
-						GraphBuilder.AddPass(RDG_EVENT_NAME("SpaceColonizationQueue.EmitResample"), P, ERDGPassFlags::Compute,
-							[P, EmitResampleShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
-							{ FComputeShaderUtils::Dispatch(InRHICmdList, EmitResampleShader, *P, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64)); });
-					}
-					// ---- Stage B3 (prep port): CurveScale (final tube thickness written to .w) ----
-					CREATE_RDG_STRUCTURED_UPLOAD_SRV(CurveLUT, float, EmitCurveLUT, TEXT("SpaceColonizationQueue_CurveLUT"))
-					{
-						TShaderMapRef<FSpaceColonizationCurveCS> CurveShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-						FSpaceColonizationCurveCS::FParameters* P = GraphBuilder.AllocParameters<FSpaceColonizationCurveCS::FParameters>();
-						P->CurveLUT = CurveLUTSRV;
-						P->CurveLineOffset = NewLineOffsetSRV;
-						P->CurveLineLength = NewLineLengthSRV;
-						P->CurveLineCount = NewCountsSRV;
-						P->RW_CurvePoints = PathPoints2UAV;
-						P->CurveLUTSize = CurveLUTSize;
-						GraphBuilder.AddPass(RDG_EVENT_NAME("SpaceColonizationQueue.CurveScale"), P, ERDGPassFlags::Compute,
-							[P, CurveShader, TargetCount](FRHIComputeCommandList& InRHICmdList)
-							{ FComputeShaderUtils::Dispatch(InRHICmdList, CurveShader, *P, FComputeShaderUtils::GetGroupCount(FIntVector(TargetCount, 1, 1), 64)); });
-					}
-
-					// Trip A: hand the prepped output to VisVine GPU-resident. Extract the four
-					// post-resample buffers as pooled (external) so they survive graph execution.
-					// Layout is byte-equivalent to BuildVVGPUInput's output.
-					if (bExportGPUBuffers)
-					{
-						ExportedPathPoints2 = GraphBuilder.ConvertToExternalBuffer(PathPoints2Buffer);
-						ExportedPathPointMeta2 = GraphBuilder.ConvertToExternalBuffer(PathPointMeta2Buffer);
-						ExportedSegmentMeta2 = GraphBuilder.ConvertToExternalBuffer(SegmentMeta2Buffer);
-					}
-
-					// The resampled counts (post-resample) drive the readback slice.
-					AddEnqueueCopyPass(GraphBuilder, LineCountsReadback, NewCountsBuffer, LineCountsReadbackBytes);
-					GraphBuilder.Execute();
-					bRenderWorkQueued = true;
-				});
-
-			FlushRenderingCommands();
-		}
-
-		if (!bRenderWorkQueued)
-		{
-			DeleteSpaceColonizationCSReadbacks(
-				LineCountsReadback,
-				InitialTargetDebugReadback,
-				InitialState0DebugReadback,
-				InitialState1DebugReadback,
-				NeighborCountsDebugReadback,
-				ResetProposalOwnerDebugReadbacks,
-				ProposalOwnerDebugReadbacks,
-				IterationTargetDebugReadbacks,
-				IterationState0DebugReadbacks,
-				IterationState1DebugReadbacks);
-			return false;
-		}
-
-		bool bReadbackSucceeded = false;
-
-		{
-			GV_TIME_SCOPE(TEXT("SpaceColonizationCS.Queue.ReadbackAndFlush"));
-			ENQUEUE_RENDER_COMMAND(SpaceColonizationQueueCSReadback)(
-				[InitialTargetDebugReadback, InitialState0DebugReadback, InitialState1DebugReadback,
-				 NeighborCountsDebugReadback, ResetProposalOwnerDebugReadbacks, ProposalOwnerDebugReadbacks, IterationTargetDebugReadbacks,
-				 IterationState0DebugReadbacks, IterationState1DebugReadbacks, TargetReadbackBytes, StateReadbackBytes, UIntReadbackBytes, LineCountsReadback, LineCountsReadbackBytes, &LineCountsData,
-				 TargetCount, &CSDebugData, &bReadbackSucceeded](FRHICommandListImmediate& RHICmdList) mutable
-				{
-					if (!LineCountsReadback)
-					{
-						return;
-					}
-
-					if (!AreSpaceColonizationCSReadbacksReady(
-						LineCountsReadback,
-						InitialTargetDebugReadback,
-						InitialState0DebugReadback,
-						InitialState1DebugReadback,
-						NeighborCountsDebugReadback,
-						ResetProposalOwnerDebugReadbacks,
-						ProposalOwnerDebugReadbacks,
-						IterationTargetDebugReadbacks,
-						IterationState0DebugReadbacks,
-						IterationState1DebugReadbacks))
-					{
-						RHICmdList.SubmitAndBlockUntilGPUIdle();
-					}
-
-					if (!AreSpaceColonizationCSReadbacksReady(
-						LineCountsReadback,
-						InitialTargetDebugReadback,
-						InitialState0DebugReadback,
-						InitialState1DebugReadback,
-						NeighborCountsDebugReadback,
-						ResetProposalOwnerDebugReadbacks,
-						ProposalOwnerDebugReadbacks,
-						IterationTargetDebugReadbacks,
-						IterationState0DebugReadbacks,
-						IterationState1DebugReadbacks))
-					{
-						UE_LOG(LogTemp, Warning, TEXT("[SpaceColonizationQueueCS] GPU readback was not ready after flush."));
-						DeleteSpaceColonizationCSReadbacks(
-							LineCountsReadback,
-							InitialTargetDebugReadback,
-							InitialState0DebugReadback,
-							InitialState1DebugReadback,
-							NeighborCountsDebugReadback,
-							ResetProposalOwnerDebugReadbacks,
-							ProposalOwnerDebugReadbacks,
-							IterationTargetDebugReadbacks,
-							IterationState0DebugReadbacks,
-							IterationState1DebugReadbacks);
-						return;
-					}
-
-					const bool bLockedAll =
-						LockSpaceColonizationReadbackToArray(LineCountsReadback, LineCountsReadbackBytes, 4, LineCountsData);
-
-					CSDebugData.bInitialReadbackSucceeded =
-						LockSpaceColonizationReadbackToArray(InitialTargetDebugReadback, TargetReadbackBytes, TargetCount, CSDebugData.InitialTargetPositions) &&
-						LockSpaceColonizationReadbackToArray(InitialState0DebugReadback, StateReadbackBytes, TargetCount, CSDebugData.InitialState0) &&
-						LockSpaceColonizationReadbackToArray(InitialState1DebugReadback, StateReadbackBytes, TargetCount, CSDebugData.InitialState1);
-					CSDebugData.bNeighborReadbackSucceeded =
-						LockSpaceColonizationReadbackToArray(NeighborCountsDebugReadback, UIntReadbackBytes, TargetCount, CSDebugData.NeighborCounts);
-
-					const int32 SnapshotCount = FMath::Min(CSDebugData.IterationSnapshots.Num(), IterationTargetDebugReadbacks.Num());
-					for (int32 IterationIndex = 0; IterationIndex < SnapshotCount; ++IterationIndex)
-					{
-						FSpaceColonizationCSIterationDebugSnapshot& Snapshot = CSDebugData.IterationSnapshots[IterationIndex];
-						Snapshot.bResetReadbackSucceeded = LockSpaceColonizationReadbackToArray(
-							ResetProposalOwnerDebugReadbacks[IterationIndex],
-							UIntReadbackBytes,
-							TargetCount,
-							Snapshot.ResetProposalOwners);
-						Snapshot.bProposalReadbackSucceeded = LockSpaceColonizationReadbackToArray(
-							ProposalOwnerDebugReadbacks[IterationIndex],
-							UIntReadbackBytes,
-							TargetCount,
-							Snapshot.ProposalOwners);
-						Snapshot.bStateReadbackSucceeded =
-							LockSpaceColonizationReadbackToArray(
-								IterationTargetDebugReadbacks[IterationIndex],
-								TargetReadbackBytes,
-								TargetCount,
-								Snapshot.TargetPositions) &&
-							LockSpaceColonizationReadbackToArray(
-								IterationState0DebugReadbacks[IterationIndex],
-								StateReadbackBytes,
-								TargetCount,
-								Snapshot.State0) &&
-							LockSpaceColonizationReadbackToArray(
-								IterationState1DebugReadbacks[IterationIndex],
-								StateReadbackBytes,
-								TargetCount,
-								Snapshot.State1);
-					}
-
-					DeleteSpaceColonizationCSReadbacks(
-						LineCountsReadback,
-						InitialTargetDebugReadback,
-						InitialState0DebugReadback,
-						InitialState1DebugReadback,
-						NeighborCountsDebugReadback,
-						ResetProposalOwnerDebugReadbacks,
-						ProposalOwnerDebugReadbacks,
-						IterationTargetDebugReadbacks,
-						IterationState0DebugReadbacks,
-						IterationState1DebugReadbacks);
-					bReadbackSucceeded = bLockedAll;
-				});
-
-			FlushRenderingCommands();
-		}
-
-		UE_LOG(LogTemp, Display, TEXT("[SpaceColonizationLinesCS] GPU lineCount=%u totalPoints=%u totalSegments=%u (Targets=%d)"),
-			LineCountsData.IsValidIndex(0) ? LineCountsData[0] : 0u,
-			LineCountsData.IsValidIndex(1) ? LineCountsData[1] : 0u,
-			LineCountsData.IsValidIndex(2) ? LineCountsData[2] : 0u,
-			TargetCount);
-
-		if (!bReadbackSucceeded)
-		{
-			return false;
-		}
-
-		// Trip A: publish the GPU-resident prepped buffers + their compact counts.
-		if (OutGPUBuffers)
-		{
-			OutGPUBuffers->PathPoints = MoveTemp(ExportedPathPoints2);
-			OutGPUBuffers->PathPointMeta = MoveTemp(ExportedPathPointMeta2);
-			OutGPUBuffers->SegmentMeta = MoveTemp(ExportedSegmentMeta2);
-			OutGPUBuffers->LineCount = LineCountsData.IsValidIndex(0) ? int32(LineCountsData[0]) : 0;
-			OutGPUBuffers->PointCount = LineCountsData.IsValidIndex(1) ? int32(LineCountsData[1]) : 0;
-			OutGPUBuffers->SegmentCount = LineCountsData.IsValidIndex(2) ? int32(LineCountsData[2]) : 0;
-		}
-
-		LogSpaceColonizationCSDebugData(CSDebugData);
-		return true;
-	}
-
 }
 
 } // anonymous namespace
+
+// Records the fused space-colonization + concat pipeline: one solve per source, a single-thread
+// prefix sum over their GPU-only counts, then a per-source relocate into one contiguous batch.
+// Every intermediate is graph-lifetime and no count ever reaches the CPU.
+static bool AddVineFusedSCConcatPasses(FRDGBuilder& GraphBuilder, const FVineFusedSCInputs& SC, FVineFusedSCOutputs& Out)
+{
+	if (!SC.IsValid()) return false;
+
+	struct FSolvedSource
+	{
+		FVineSCPassOutputs Buffers;
+		uint32 PointCapacity = 0u; // also the segment capacity; sizes this source's copy dispatches
+	};
+	TArray<FSolvedSource> Solved;
+	Solved.Reserve(SC.Sources.Num());
+	for (const FVineSCPreparedSource& Source : SC.Sources)
+	{
+		FVineSCPassOutputs SolvedBuffers;
+		if (!AddVineSCPasses(GraphBuilder, SC, Source, SolvedBuffers)) continue;
+		FSolvedSource& Entry = Solved.AddDefaulted_GetRef();
+		Entry.Buffers = SolvedBuffers;
+		Entry.PointCapacity = FMath::Max(1u, Source.PointCapacity);
+	}
+	if (Solved.Num() == 0) return false;
+
+	// Gather each source's four-uint count block into one buffer so a single thread can walk them.
+	const uint32 SourceSlotCount = uint32(Solved.Num()) * 4u;
+	FRDGBufferRef SourceCountsBuffer = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), SourceSlotCount), TEXT("VineConcat.SourceCounts"));
+	for (int32 SourceIndex = 0; SourceIndex < Solved.Num(); ++SourceIndex)
+	{
+		AddCopyBufferPass(GraphBuilder, SourceCountsBuffer, uint64(SourceIndex) * 4u * sizeof(uint32),
+			Solved[SourceIndex].Buffers.Counts, 0, 4u * sizeof(uint32));
+	}
+
+	FRDGBufferRef ConcatBasesBuffer = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), SourceSlotCount), TEXT("VineConcat.Bases"));
+	FRDGBufferRef ConcatTotalsBuffer = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 4u), TEXT("VineConcat.Totals"));
+	{
+		FConcatPrefixSumCS::FParameters* P = GraphBuilder.AllocParameters<FConcatPrefixSumCS::FParameters>();
+		P->ConcatSourceCounts = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SourceCountsBuffer));
+		P->RW_ConcatBases = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(ConcatBasesBuffer));
+		P->RW_ConcatTotals = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(ConcatTotalsBuffer));
+		P->ConcatSourceCount = uint32(Solved.Num());
+		P->ConcatPointCapacity = SC.TotalPointCapacity;
+		P->ConcatSegmentCapacity = SC.TotalSegmentCapacity;
+		TShaderMapRef<FConcatPrefixSumCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VineConcat.PrefixSum"), Shader, P, FIntVector(1, 1, 1));
+	}
+
+	CSHelper::FRDGStructuredBufferRefs DstPoints = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector4f), SC.TotalPointCapacity, TEXT("VineConcat.PathPoints"), true, true);
+	CSHelper::FRDGStructuredBufferRefs DstMeta = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FIntVector4), SC.TotalPointCapacity, TEXT("VineConcat.PathPointMeta"), true, true);
+	CSHelper::FRDGStructuredBufferRefs DstSeg = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FIntVector4), SC.TotalSegmentCapacity, TEXT("VineConcat.SegmentMeta"), true, true);
+	if (!DstPoints.UAV || !DstMeta.UAV || !DstSeg.UAV) return false;
+
+	// The batch is allocated for the worst case, so everything past the compact counts is slack.
+	// Zero it: PathPointMeta's Count field then reads 0 and SegmentMeta reads (0,0) for any thread
+	// the group-size round-up (or the capacity-sized debug line pass) lets touch a slack slot,
+	// instead of whatever the transient pool last left there.
+	AddClearUAVPass(GraphBuilder, DstPoints.UAV, 0u);
+	AddClearUAVPass(GraphBuilder, DstMeta.UAV, 0u);
+	AddClearUAVPass(GraphBuilder, DstSeg.UAV, 0u);
+
+	FRDGBufferSRVRef BasesSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(ConcatBasesBuffer));
+	TShaderMapRef<FConcatCopyFloat4CS> CopyShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	TShaderMapRef<FConcatOffsetInt4CS> OffsetShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	for (int32 SourceIndex = 0; SourceIndex < Solved.Num(); ++SourceIndex)
+	{
+		const FSolvedSource& Source = Solved[SourceIndex];
+		// Sized to the source's whole slice — its real count is GPU-only, and the kernels early-out
+		// on it. The slice is MaxVinePointCount/sources wide and the kernels are a load plus a
+		// store, so the wasted threads cost nothing measurable.
+		const FIntVector Groups = FComputeShaderUtils::GetGroupCount(FIntVector(int32(Source.PointCapacity), 1, 1), int32(VineMeshGroupSize));
+
+		{
+			FConcatCopyFloat4CS::FParameters* P = GraphBuilder.AllocParameters<FConcatCopyFloat4CS::FParameters>();
+			P->ConcatSrcFloat4 = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Source.Buffers.PathPoints));
+			P->ConcatBases = BasesSRV;
+			P->RW_ConcatDstFloat4 = DstPoints.UAV;
+			P->ConcatSourceIndex = uint32(SourceIndex);
+			P->ConcatRecordKind = 0u;
+			P->ConcatCapacity = SC.TotalPointCapacity;
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VineConcat.Points"), CopyShader, P, Groups);
+		}
+		{
+			// PathPointMeta int4(Prev, Next, Base, Count): the first three are point indices.
+			FConcatOffsetInt4CS::FParameters* P = GraphBuilder.AllocParameters<FConcatOffsetInt4CS::FParameters>();
+			P->ConcatSrcInt4 = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Source.Buffers.PathPointMeta));
+			P->ConcatBases = BasesSRV;
+			P->RW_ConcatDstInt4 = DstMeta.UAV;
+			P->ConcatSourceIndex = uint32(SourceIndex);
+			P->ConcatRecordKind = 0u;
+			P->ConcatCapacity = SC.TotalPointCapacity;
+			P->ConcatOffsetMask = FIntVector4(1, 1, 1, 0);
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VineConcat.Meta"), OffsetShader, P, Groups);
+		}
+		{
+			// SegmentMeta int4(A, B, 0, 0): both endpoints are point indices.
+			FConcatOffsetInt4CS::FParameters* P = GraphBuilder.AllocParameters<FConcatOffsetInt4CS::FParameters>();
+			P->ConcatSrcInt4 = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Source.Buffers.SegmentMeta));
+			P->ConcatBases = BasesSRV;
+			P->RW_ConcatDstInt4 = DstSeg.UAV;
+			P->ConcatSourceIndex = uint32(SourceIndex);
+			P->ConcatRecordKind = 1u;
+			P->ConcatCapacity = SC.TotalSegmentCapacity;
+			P->ConcatOffsetMask = FIntVector4(1, 1, 0, 0);
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VineConcat.Seg"), OffsetShader, P, Groups);
+		}
+	}
+
+	Out.PathPoints = DstPoints.Buffer;
+	Out.PathPointMeta = DstMeta.Buffer;
+	Out.SegmentMeta = DstSeg.Buffer;
+	Out.Counts = ConcatTotalsBuffer;
+	return true;
+}
 
 // ---- SpaceColonization member functions (moved from UGenerateVines, params from SC) ----
 
@@ -6697,57 +5301,95 @@ static TAutoConsoleVariable<float> CVarVineSCScatter(
 	TEXT("Vine GPU SC point-scatter distance in cm (ApplyVVSCPointOffset parity). 0 = off."),
 	ECVF_Default);
 
-TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, bool /*bUseComputeShader*/)
+TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales(TArray<FTransform> /*SourceTransforms*/, TArray<FTransform> /*TargetTransforms*/, bool /*bUseComputeShader*/)
 {
-	// The vine is fully GPU now; the legacy bUseComputeShader selector is ignored and the GPU
-	// path emits its line geometry directly into GPU buffers (there are no CPU line results).
-	return SpaceColonizationWithScalesInternal(MoveTemp(SourceTransforms), MoveTemp(TargetTransforms), nullptr);
+	// The solve now lives inside the vine mesh RDG graph (FVineMeshSceneProxy::BuildGeometry) and
+	// its output never leaves the GPU, so there is nothing to return here and nothing worth
+	// dispatching for a caller that only wants CPU lines. Kept so existing Blueprints still bind;
+	// use GenerateVines / VisVine instead.
+	return {};
 }
 
-TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScalesInternal(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, FVineSCGPUBuffers* OutGPUBuffers)
+// Prepares the CPU side of the fused space-colonization solve: source/target positions, the
+// per-source scale lookups, the baked taper LUT and each source's slice of the batch-wide point
+// cap. No GPU work is dispatched — the passes are recorded later, into the leaf's own graph.
+bool AVineContainer::PrepareVineFusedSCInputs(const TArray<FTransform>& SourceTransforms,
+	const TArray<FTransform>& TargetTransforms, FVineFusedSCInputs& OutInputs)
 {
-	GV_TIME_SCOPE(TEXT("SpaceColonization.TotalCS"));
-	TArray<float> TargetPointScales;
-	TArray<float> StartSourceScales;
-	BuildSpaceColonizationScaleLookups(SourceTransforms, TargetTransforms, TargetPointScales, StartSourceScales);
+	GV_TIME_SCOPE(TEXT("SpaceColonization.PrepareInputs"));
+	OutInputs = FVineFusedSCInputs();
+	const int32 SourceCount = SourceTransforms.Num();
+	const int32 TargetCount = TargetTransforms.Num();
+	if (SourceCount == 0 || TargetCount == 0) return false;
+
+	OutInputs.InitialTargetPositions.Reserve(TargetCount);
+	OutInputs.TargetPointScales.Reserve(TargetCount);
+	for (const FTransform& Transform : TargetTransforms)
+	{
+		const float TargetScale = GetSpaceColonizationTransformScale(Transform);
+		OutInputs.InitialTargetPositions.Add(FVector4f((FVector3f)Transform.GetLocation(), TargetScale));
+		OutInputs.TargetPointScales.Add(TargetScale);
+	}
+
 	// Ensure the profile curve exists BEFORE baking the LUT. On a first generate (CurveControl
 	// still null) the LUT would otherwise bake flat (EvaluateVineScale(null)=1.0) and the mesh
 	// would lose all thickness variation until the next generate rebuilt it.
-	if (VV.CurveControl == nullptr)
-	{
-		VV.CurveControl = NewObject<UCurveLinearColor>(this);
-	}
+	if (VV.CurveControl == nullptr) VV.CurveControl = NewObject<UCurveLinearColor>(this);
 	// Bake CurveControl.G into a LUT so the GPU CurveScale matches EvaluateVineScale.
-	TArray<float> CurveLUT;
 	{
 		const int32 LUTSize = 256;
-		CurveLUT.SetNumUninitialized(LUTSize);
+		OutInputs.CurveLUT.SetNumUninitialized(LUTSize);
 		for (int32 LUTIndex = 0; LUTIndex < LUTSize; ++LUTIndex)
 		{
-			CurveLUT[LUTIndex] = EvaluateVineScale(VV.CurveControl, LUTIndex, LUTSize);
+			OutInputs.CurveLUT[LUTIndex] = EvaluateVineScale(VV.CurveControl, LUTIndex, LUTSize);
 		}
 	}
-	// The GPU space-colonization pass emits the fully smoothed / resampled / scaled line geometry
-	// straight into OutGPUBuffers, which the fused VisVine path consumes. No CPU tree re-trace.
-	if (!BuildSpaceColonizationQueueCSImpl(
-		SourceTransforms,
-		TargetTransforms,
-		SC.Iteration,
-		SC.Activetime,
-		SC.RandGrow,
-		SC.Seed,
-		SC.InfluenceRadius,
-		SC.BackGrowCount,
-		SC.ForkTaperForkOrdinal,
-		FMath::Max(VV.ResampleLength, 0.01f),
-		CurveLUT,
-		TargetPointScales,
-		StartSourceScales,
-		FMath::Max(CVarVineSCScatter.GetValueOnGameThread(), 0.0f),
-		OutGPUBuffers))
+
+	OutInputs.Iteration = SC.Iteration;
+	OutInputs.Activetime = SC.Activetime;
+	OutInputs.RandGrow = SC.RandGrow;
+	OutInputs.Seed = SC.Seed;
+	OutInputs.InfluenceRadius = SC.InfluenceRadius;
+	OutInputs.BackGrowCount = SC.BackGrowCount;
+	OutInputs.ForkTaperForkOrdinal = SC.ForkTaperForkOrdinal;
+	OutInputs.ResampleLength = FMath::Max(VV.ResampleLength, 0.01f);
+	OutInputs.ScatterDistance = FMath::Max(CVarVineSCScatter.GetValueOnGameThread(), 0.0f);
+
+	// The point cap is batch-wide; every source that will be concatenated gets an equal share.
+	// Take the tighter of that share and the theoretical bound (each of <= TargetCount lines has
+	// <= SC_MAX_BACKTRACK+1 points), so a small target set still allocates small.
+	constexpr int32 SpaceColonizationMaxBacktrack = 100;
+	const uint32 PerSourceShare = uint32(FMath::Max(1, VV.MaxVinePointCount / SourceCount));
+	const uint32 TheoreticalPointBound = uint32(FMath::Min<int64>(int64(TargetCount) * int64(SpaceColonizationMaxBacktrack + 1), 4000000));
+	const uint32 PerSourceCapacity = FMath::Max(1u, FMath::Min(TheoreticalPointBound, PerSourceShare));
+	// Clamping here is not free: EmitSpaceColonizationLinesCS breaks out of its backtrack once it
+	// reaches PathPointCapacity, so lines are silently cut short and the vine just looks sparser /
+	// shorter with no other symptom. That must never be a Verbose-only message — at Verbose it is
+	// invisible by default and reads as "the generator changed behaviour on its own".
+	if (PerSourceCapacity < TheoreticalPointBound)
 	{
-		return {};
+		UE_LOG(LogTemp, Warning,
+			TEXT("[VineSC] Vine points truncated: per-source capacity %u < theoretical bound %u (%d sources sharing MaxVinePointCount=%d). ")
+			TEXT("Lines will be cut short. Raise MaxVinePointCount to at least %lld to restore the full solve."),
+			PerSourceCapacity, TheoreticalPointBound, SourceCount, VV.MaxVinePointCount,
+			int64(TheoreticalPointBound) * int64(SourceCount));
 	}
 
-	return {};
+	OutInputs.Sources.Reserve(SourceCount);
+	for (const FTransform& SourceTransform : SourceTransforms)
+	{
+		// The scale lookups are per source: StartSourceScales marks only the target nearest THIS
+		// source, so each solve gets its own array (TargetPointScales is shared and already built).
+		TArray<FTransform> SingleSource;
+		SingleSource.Add(SourceTransform);
+		TArray<float> UnusedTargetPointScales;
+		FVineSCPreparedSource& Prepared = OutInputs.Sources.AddDefaulted_GetRef();
+		BuildSpaceColonizationScaleLookups(SingleSource, TargetTransforms, UnusedTargetPointScales, Prepared.StartSourceScales);
+		Prepared.SourcePositions.Add(FVector4f((FVector3f)SourceTransform.GetLocation(), GetSpaceColonizationTransformScale(SourceTransform)));
+		Prepared.PointCapacity = PerSourceCapacity;
+	}
+
+	OutInputs.TotalPointCapacity = PerSourceCapacity * uint32(SourceCount);
+	OutInputs.TotalSegmentCapacity = OutInputs.TotalPointCapacity;
+	return true;
 }

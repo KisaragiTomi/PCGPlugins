@@ -1038,29 +1038,97 @@ void CurveSpaceColonizationCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     }
 }
 
-// ---- Trip A concat: merge per-source SC output into one VisVine batch on GPU ----
-// Copies one source's compact int4 records into the concatenated destination while
-// offsetting selected components by a point base, so the indices reference the
-// global (concatenated) point array. One kernel serves both record types:
+// ---- Concat: merge the per-source SC output into one VisVine batch, entirely on GPU ----
+// Every per-source compact count lives only in VRAM, so the destination offsets have to be a GPU
+// prefix sum: a CPU-side offset would need the counts read back, which is exactly the round trip
+// this pipeline exists to avoid. A per-source fixed-capacity slice is NOT an option either — the
+// segments would stop being globally contiguous, and the indirect draw's index count could no
+// longer be "total segments x profile x 6" without emitting degenerate triangles for every unused
+// slot.
+//
+// ConcatBases packs both halves of the answer, four uints per source:
+//   [0] point base   [1] segment base   [2] clamped point count   [3] clamped segment count
+// so the copy kernels below need nothing but a source index.
+StructuredBuffer<uint> ConcatSourceCounts;      // per source: SC's [lineCount, points, segments, 0]
+RWStructuredBuffer<uint> RW_ConcatBases;        // per source: [pointBase, segBase, points, segs]
+RWStructuredBuffer<uint> RW_ConcatTotals;       // [lineCount, totalPoints, totalSegments, 0]
+uint ConcatSourceCount;
+uint ConcatPointCapacity;
+uint ConcatSegmentCapacity;
+
+[numthreads(1, 1, 1)]
+void ConcatPrefixSumCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (DispatchThreadId.x != 0)
+    {
+        return;
+    }
+    uint LineAcc = 0u;
+    uint PointAcc = 0u;
+    uint SegAcc = 0u;
+    for (uint s = 0u; s < ConcatSourceCount; ++s)
+    {
+        uint Lines = ConcatSourceCounts[s * 4u + 0u];
+        uint Points = ConcatSourceCounts[s * 4u + 1u];
+        uint Segments = ConcatSourceCounts[s * 4u + 2u];
+        // Clamp to what is still free. The capacity is the CPU-side sum of the per-source slices,
+        // so this only bites if a source over-ran its own slice; truncating there is preferable to
+        // wrapping a base and scribbling over an earlier source's points.
+        Points = min(Points, ConcatPointCapacity - min(PointAcc, ConcatPointCapacity));
+        Segments = min(Segments, ConcatSegmentCapacity - min(SegAcc, ConcatSegmentCapacity));
+        RW_ConcatBases[s * 4u + 0u] = PointAcc;
+        RW_ConcatBases[s * 4u + 1u] = SegAcc;
+        RW_ConcatBases[s * 4u + 2u] = Points;
+        RW_ConcatBases[s * 4u + 3u] = Segments;
+        LineAcc += Lines;
+        PointAcc += Points;
+        SegAcc += Segments;
+    }
+    RW_ConcatTotals[0] = LineAcc;
+    RW_ConcatTotals[1] = PointAcc;
+    RW_ConcatTotals[2] = SegAcc;
+    RW_ConcatTotals[3] = 0u;
+}
+
+StructuredBuffer<uint> ConcatBases;
+uint ConcatSourceIndex;
+uint ConcatRecordKind;   // 0 = point records, 1 = segment records (selects base/count slot)
+uint ConcatCapacity;     // destination element capacity
+int4 ConcatOffsetMask;   // per-component multiplier for the point-base offset, 0 or 1
+
+// Copies one source's compact int4 records into the concatenated destination while offsetting the
+// selected components by that source's POINT base, so the indices reference the global point
+// array. One kernel serves both record types:
 //   PathPointMeta int4(Prev,Next,Base,Count) -> ConcatOffsetMask = (1,1,1,0)
 //   SegmentMeta   int4(A,B,0,0)              -> ConcatOffsetMask = (1,1,0,0)
-// PathPoints (float4) carries no indices and is copied verbatim on the host side
-// via AddCopyBufferPass.
 StructuredBuffer<int4> ConcatSrcInt4;
 RWStructuredBuffer<int4> RW_ConcatDstInt4;
-uint ConcatCount;        // number of records to copy from this source
-uint ConcatDstBase;      // destination start index (prefix sum of prior sources)
-int ConcatOffsetValue;   // point base to add to indexed components (destPointBase)
-int4 ConcatOffsetMask;   // per-component multiplier, 0 or 1
 
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
 void ConcatOffsetInt4CS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
     uint i = DispatchThreadId.x;
-    if (i >= ConcatCount) return;
+    if (i >= ConcatBases[ConcatSourceIndex * 4u + 2u + ConcatRecordKind]) return;
+    uint Dst = ConcatBases[ConcatSourceIndex * 4u + ConcatRecordKind] + i;
+    if (Dst >= ConcatCapacity) return;
     int4 V = ConcatSrcInt4[i];
-    V += ConcatOffsetMask * ConcatOffsetValue;
-    RW_ConcatDstInt4[ConcatDstBase + i] = V;
+    V += ConcatOffsetMask * (int)ConcatBases[ConcatSourceIndex * 4u + 0u];
+    RW_ConcatDstInt4[Dst] = V;
+}
+
+// Position records carry no indices, so this is a plain relocate. It cannot be a byte copy any
+// more: the destination offset is only known on the GPU.
+StructuredBuffer<float4> ConcatSrcFloat4;
+RWStructuredBuffer<float4> RW_ConcatDstFloat4;
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void ConcatCopyFloat4CS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint i = DispatchThreadId.x;
+    if (i >= ConcatBases[ConcatSourceIndex * 4u + 2u + ConcatRecordKind]) return;
+    uint Dst = ConcatBases[ConcatSourceIndex * 4u + ConcatRecordKind] + i;
+    if (Dst >= ConcatCapacity) return;
+    RW_ConcatDstFloat4[Dst] = ConcatSrcFloat4[i];
 }
 
 // ---- Scatter (Trip A parity port of ApplyVVSCPointOffset, GeometryEditorActor.cpp:1078) ----

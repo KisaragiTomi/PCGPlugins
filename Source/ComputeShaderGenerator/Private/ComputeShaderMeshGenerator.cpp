@@ -18,6 +18,7 @@
 #include "Engine/Engine.h"
 #include "Engine/Level.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/StaticMeshActor.h"
 #include "Engine/World.h"
 #include "Misc/PackageName.h"
 #include "UObject/Package.h"
@@ -3605,6 +3606,87 @@ FString AComputeShaderMeshGenerator::BuildResultAssetPath(const FString& NameSuf
 	return FString::Printf(TEXT("%s/SM_%s_%s%s"),
 		*ResultFolderPath, *GetResultAssetBaseName(), *GetResultAssetUniqueTag(), *NameSuffix);
 }
+
+// -----------------------------------------------------------------------------
+// 结果 StaticMeshActor 的生成 / 挂接 / 清理
+// -----------------------------------------------------------------------------
+
+namespace
+{
+// 结果 actor 的识别标签。清场只销毁带此标签的挂接 actor，用户自己挂的不受影响。
+const FName CSGeneratedResultActorTag(TEXT("CSGeneratedResultActor"));
+
+bool IsCSGeneratedResultActor(const AActor* Actor)
+{
+	return Actor && Actor->Tags.Contains(CSGeneratedResultActorTag);
+}
+}
+
+AStaticMeshActor* AComputeShaderMeshGenerator::SpawnAttachedResultActor(UStaticMesh* Mesh, const FString& InActorLabel)
+{
+	if (!Mesh)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[CSMeshGenerator] SpawnAttachedResultActor skipped: null mesh on %s."), *GetActorNameOrLabel());
+		return nullptr;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[CSMeshGenerator] SpawnAttachedResultActor failed: invalid world on %s."), *GetActorNameOrLabel());
+		return nullptr;
+	}
+
+	// 先清掉上一次的结果：挂接列表就是账本，按标签认领即可，调用方不必自己记账。
+	// 标签是唯一凭据——没有标签的挂接 actor 是用户自己放的，绝不能销毁。
+	TArray<AActor*> AttachedActors;
+	GetAttachedActors(AttachedActors);
+	for (AActor* AttachedActor : AttachedActors)
+	{
+		if (!IsCSGeneratedResultActor(AttachedActor)) continue;
+		AttachedActor->Modify();
+		AttachedActor->Destroy();
+	}
+
+	const FString EffectiveLabel = InActorLabel.IsEmpty() ? Mesh->GetName() : InActorLabel;
+
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.Owner = this;
+	SpawnParams.OverrideLevel = GetLevel();
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+#if WITH_EDITOR
+	SpawnParams.InitialActorLabel = EffectiveLabel;
+#endif
+
+	// 生成在本 actor 的变换上：资产按 actor 局部空间烘焙，二者对齐后网格才落在原位。
+	AStaticMeshActor* Spawned = World->SpawnActor<AStaticMeshActor>(
+		AStaticMeshActor::StaticClass(), GetActorTransform(), SpawnParams);
+	if (!Spawned)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[CSMeshGenerator] SpawnAttachedResultActor failed: could not spawn actor for %s."), *Mesh->GetPathName());
+		return nullptr;
+	}
+
+	Spawned->Modify();
+	Spawned->Tags.AddUnique(CSGeneratedResultActorTag);
+	if (UStaticMeshComponent* StaticMeshComponent = Spawned->GetStaticMeshComponent())
+	{
+		// 生成的结果要能跟着生成器一起移动，故必须是 Movable。
+		StaticMeshComponent->SetMobility(EComponentMobility::Movable);
+		StaticMeshComponent->SetStaticMesh(Mesh);
+		StaticMeshComponent->UpdateBounds();
+		StaticMeshComponent->MarkRenderStateDirty();
+	}
+	Spawned->AttachToActor(this, FAttachmentTransformRules::KeepWorldTransform);
+#if WITH_EDITOR
+	Spawned->SetActorLabel(EffectiveLabel);
+#endif
+	Spawned->MarkPackageDirty();
+
+	MarkPackageDirty();
+	return Spawned;
+}
+
 
 UStaticMesh* AComputeShaderMeshGenerator::SaveDirectGPUMeshToStaticMesh(
 	const FString& AssetPathAndName,

@@ -157,6 +157,7 @@ AVineContainer.GenerateVines()
 - **运行方式**：打开关卡 → 选中场景中的藤蔓 Actor → 设置 `GrowTarget`（生长目标实例）与源实例 → 调整视口叠加面板中的 `SC` / `VV` 参数（`Curl Noise Fre`、`Perlin Noise Fre`、`Circle Scale` 等）→ 通过视口叠加按钮（`Fetch Foliage` → `Generate Vine` → `Save Mesh`）或调用 `GenerateVineAction()` 生成藤蔓；`Save Mesh` / `SaveStaticmesh()` 可将结果烘焙为 StaticMesh。
 - **管线形态**：全程 GPU 常驻。表面体素（位置/法线/目标点场）由 `PrepareBoxSceneSurfaceVoxelsGPU` 建好后不回读；空间竞争的生长状态留在显存；藤蔓网格由 `UVineMeshComponent` 直接从 GPU 流绘制，不再经 `UDynamicMesh`。
 - **仅剩的 CPU 回读**（两处）：SC 之后的 4-uint 线段计数（用来给下游 VisVine 定 buffer 尺寸与 dispatch 规模），以及 `Save Mesh` 时对渲染流的一次性读取。
+- **详细状态与剩余计划**：[`Docs/VineGpuResidency.md`](Docs/VineGpuResidency.md)
 
 > 其它目录（如 `Content/ShallowWater/Material30`、`Content/TreeWindData`、`Content/GeneralTest` 等）为开发中/参考资产，不保证可直接运行。
 

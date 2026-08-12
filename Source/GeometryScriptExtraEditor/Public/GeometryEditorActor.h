@@ -50,12 +50,6 @@ public:
 	int32 ForkTaperForkOrdinal = 1;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options, meta = (ClampMin = "0"))
 	float InfluenceRadius = 200.0f;
-
-	// C++ 完全忽略这个开关（藤蔓已全 GPU），但 BP_VineSource 里有 Set 节点在写它 ——
-	// 删掉属性会让那个节点编译失败（实测 "In use pin SC Use Compute Shader no longer exists"）。
-	// 要清理得先在 BP 里删掉那个 Set 节点并重存资产，再删这里。
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
-	bool bUseComputeShader = true;
 };
 
 USTRUCT(BlueprintType)
@@ -139,11 +133,6 @@ public:
 	float UVLengthScale = 1.0f;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
 	UCurveLinearColor* CurveControl = nullptr;
-
-	// 同 FSpaceColonizationOptions::bUseComputeShader：C++ 忽略，但 BP_VineSource 有 Set 节点
-	// 在写它（"VV Use GPUMode"），删属性会打断该蓝图编译。清理顺序同上。
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
-	bool bUseGPUMode = true;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options, meta = (ClampMin = "0"))
 	int32 GenerateVineVoxelNormalBlurIterations = 0;

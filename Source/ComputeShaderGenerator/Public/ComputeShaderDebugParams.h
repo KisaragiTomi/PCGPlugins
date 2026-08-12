@@ -39,33 +39,6 @@ public:
 	FLinearColor GPUProjectionVoxelTargetColor = FLinearColor(1.0f, 0.0f, 0.1f, 1.0f);
 };
 
-USTRUCT(BlueprintType, meta = (DisplayName = "SC Stage Debug"))
-struct COMPUTESHADERGENERATOR_API FVisVineSCStageDebugOptions
-{
-	GENERATED_BODY()
-public:
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
-	bool bSCStageDrawTube = true;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "0.0"))
-	float SCStageDebugPointDuration = 5.0f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "0.0"))
-	float SCStageDebugPointSize = 8.0f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
-	bool bSCStageDebugPointsPersistent = false;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "0"))
-	int32 SCStageDebugPointLimit = 0;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
-	FLinearColor SCStageTubeDebugPointColor = FLinearColor(0.0f, 1.0f, 0.2f, 1.0f);
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
-	FLinearColor SCStagePlaneDebugPointColor = FLinearColor(0.1f, 0.55f, 1.0f, 1.0f);
-};
-
 USTRUCT(BlueprintType, meta = (DisplayName = "Surface Voxel Debug"))
 struct COMPUTESHADERGENERATOR_API FVisVineSurfaceVoxelDebugOptions
 {

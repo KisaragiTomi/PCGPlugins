@@ -1336,6 +1336,5 @@ void ACSShallowWaterCapture::BeginDestroy()
 
 void ACSShallowWaterCapture::ReleaseTransientRenderResources()
 {
-	ClearMeshGeneratorCache();
 	ClearGeneratedDataTextureCache();
 }

@@ -46,17 +46,6 @@ void SVineContainerViewportOverlay::Construct(const FArguments& InArgs)
 						.ColorAndOpacity(FLinearColor::White)
 					]
 
-					// Line count info
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(0.0f, 4.0f, 0.0f, 8.0f)
-					[
-						SNew(STextBlock)
-						.Text(this, &SVineContainerViewportOverlay::GetLineCountText)
-						.Font(FAppStyle::GetFontStyle("SmallFont"))
-						.ColorAndOpacity(FLinearColor(0.78f, 0.82f, 0.86f, 1.0f))
-					]
-
 					// Row: Fetch Foliage / Revert Foliage
 					+ SVerticalBox::Slot()
 					.AutoHeight()
@@ -138,18 +127,6 @@ FText SVineContainerViewportOverlay::GetActorLabelText() const
 	}
 
 	return LOCTEXT("MissingActor", "Vine Container");
-}
-
-FText SVineContainerViewportOverlay::GetLineCountText() const
-{
-	if (const AVineContainer* Container = VineContainer.Get())
-	{
-		return FText::Format(
-			LOCTEXT("LineCountFormat", "Tube {0}"),
-			FText::AsNumber(Container->TubeLines.Num()));
-	}
-
-	return FText::GetEmpty();
 }
 
 FReply SVineContainerViewportOverlay::OnFetchFoliageClicked()

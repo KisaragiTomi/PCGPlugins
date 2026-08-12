@@ -291,18 +291,6 @@ public:
 	UPROPERTY(Transient)
 	TObjectPtr<AActor> DebugVineSplineActor;
 
-	UPROPERTY(Transient)
-	TArray<FGeometryScriptPolyPath> TubeLines;
-
-	UPROPERTY(Transient)
-	TArray<FVector> TubeLineSourceLocations;
-
-	UPROPERTY(Transient)
-	TArray<FVineLinePointScaleData> TubeLinePointScales;
-
-	UPROPERTY(Transient)
-	TArray<FVineLinePointAxisData> TubeLinePointAxes;
-
 	// ---- Core Operations ----
 
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)

@@ -2560,10 +2560,6 @@ bool AVineContainer::VisVine()
 
 inline void AVineContainer::Clean()
 {
-	TubeLines.Empty();
-	TubeLineSourceLocations.Empty();
-	TubeLinePointScales.Empty();
-	TubeLinePointAxes.Empty();
 	CachedSurfaceTriangles = FCSTriangleMeshData();
 	ClearDebugVineSplineActor();
 }
@@ -2758,13 +2754,6 @@ bool AVineContainer::GenerateVineGPU(float ExtrudeScale, bool Result)
 		}
 	}
 
-	// SpaceColonization 不再在 CPU 上跑：它已经和 concat、建网格合并进叶子的那张 RDG 图，输入在
-	// 下面就地从当前的 source/target transforms 准备。这些 CPU 线数组随之作废（GPU 路径从不填充
-	// 它们），保持清空以匹配旧行为。
-	TubeLines.Reset();
-	TubeLineSourceLocations.Reset();
-	TubeLinePointScales.Reset();
-	TubeLinePointAxes.Reset();
 	CachedSurfaceTriangles = FCSTriangleMeshData();
 	InstanceBound = Bounds; // 供后续 GPU 可视化复用本次的生成范围
 
@@ -3027,72 +3016,16 @@ void AVineContainer::GenerateVineAction()
 
 int32 AVineContainer::DrawDebugCachedVineSCStagePoints(float Duration)
 {
-	UWorld* World = GetWorld();
-	if (!World)
-	{
-		return 0;
-	}
-
-	if (!SCStageDebug.bSCStageDrawTube)
-	{
-		return 0;
-	}
-
-	const float EffectiveDuration = Duration > 0.0f ? Duration : SCStageDebug.SCStageDebugPointDuration;
-	if (EffectiveDuration <= 0.0f)
-	{
-		return 0;
-	}
-
-	const float SafePointSize = FMath::Max(SCStageDebug.SCStageDebugPointSize, 0.0f);
-	const FColor DebugColor = SCStageDebug.SCStageTubeDebugPointColor.ToFColor(true);
-	const int32 PointLimit = SCStageDebug.SCStageDebugPointLimit;
-	const bool bHasLimit = PointLimit > 0;
-	int32 DrawnPointCount = 0;
-
-	for (const FGeometryScriptPolyPath& Line : TubeLines)
-	{
-		if (bHasLimit && DrawnPointCount >= PointLimit)
-		{
-			break;
-		}
-
-		if (!Line.Path.IsValid())
-		{
-			continue;
-		}
-
-		for (const FVector& Point : *Line.Path)
-		{
-			if (bHasLimit && DrawnPointCount >= PointLimit)
-			{
-				break;
-			}
-
-			DrawDebugPoint(World, Point, SafePointSize, DebugColor,
-				SCStageDebug.bSCStageDebugPointsPersistent,
-				EffectiveDuration,
-				0);
-			++DrawnPointCount;
-		}
-	}
-
-	if (DrawnPointCount == 0)
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[VineSCDebug] No cached SC-stage points on %s. Run GenerateVines before drawing cached SC-stage points."),
-			*GetActorNameOrLabel());
-	}
-	else
-	{
-		UE_LOG(LogTemp, Display,
-			TEXT("[VineSCDebug] Drew cached SC-stage points. TubeLines=%d Points=%d Duration=%.3f"),
-			TubeLines.Num(),
-			DrawnPointCount,
-			EffectiveDuration);
-	}
-
-	return DrawnPointCount;
+	// 空壳：它画的是 TubeLines —— CPU 侧的 SC 阶段点缓存。求解搬进叶子那张 RDG 图之后中心线
+	// 只存在于 GPU，那份缓存恒为空，这个节点已经连着好几个版本画不出任何东西；数组现已删除。
+	// 函数保留是因为 BP_VineSource 还连着它（删符号要刷 BP 节点）。
+	// 要看阶段点改用 SplineDebug.DebugStage + bDrawDebugLines，那条直接从 GPU buffer 画。
+	(void)Duration;
+	UE_LOG(LogTemp, Warning,
+		TEXT("[VineSCDebug] %s：CPU 侧 SC 阶段点缓存已随求解上 GPU 一并移除，此节点不再绘制任何东西。")
+		TEXT("请改用 SplineDebug.DebugStage + bDrawDebugLines（直接从 GPU buffer 绘制中心线）。"),
+		*GetActorNameOrLabel());
+	return 0;
 }
 
 int32 AVineContainer::DrawDebugVineSurfaceVoxelArrows(float Duration, bool bUseCachedVoxels)

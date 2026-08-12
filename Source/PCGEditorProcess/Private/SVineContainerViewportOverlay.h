@@ -17,7 +17,6 @@ public:
 
 private:
 	FText GetActorLabelText() const;
-	FText GetLineCountText() const;
 	FReply OnFetchFoliageClicked();
 	FReply OnRevertFoliageClicked();
 	FReply OnCleanAllClicked();

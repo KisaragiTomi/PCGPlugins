@@ -359,11 +359,6 @@ public:
 
 	// ---- SpaceColonization ----
 
-	/** Deprecated entry point: the solve runs on the GPU inside the vine mesh graph and produces
-	 *  no CPU line results, so this always returns an empty array. Use GenerateVines / VisVine. */
-	UFUNCTION(BlueprintCallable, Category = "SpaceColonization")
-	TArray<FSpaceColonizationLineResult> SpaceColonizationWithScales(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, bool bUseComputeShader = false);
-
 	// Non-reflected worker (FVineFusedSCInputs isn't a USTRUCT): prepares the CPU side of the
 	// fused space-colonization solve. Dispatches nothing; the passes are recorded into the vine
 	// mesh graph by FVineMeshSceneProxy::BuildGeometry.
@@ -379,9 +374,6 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "VineActions|Debug", meta = (DevelopmentOnly, DisplayName = "Draw Debug Vine Surface Voxel Arrows"))
 	int32 DrawDebugVineSurfaceVoxelArrows(float Duration = 5.0f, bool bUseCachedVoxels = false);
-
-	UFUNCTION(BlueprintCallable, Category = "VineActions|Debug", meta = (DevelopmentOnly, DisplayName = "Draw Debug Cached Surface Triangles"))
-	int32 DrawDebugCachedSurfaceTriangles(float Duration = 5.0f);
 
 private:
 	/** 这一批藤蔓的世界包围盒：source 与 target 位置的并集外扩 50。 */

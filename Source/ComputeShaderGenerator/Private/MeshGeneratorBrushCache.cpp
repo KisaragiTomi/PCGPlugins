@@ -361,27 +361,7 @@ FCSMeshGeneratorTriangleCacheHandle AMeshGeneratorBrushCache::EnsureTriangleCach
 	const FVector& BoxExtent,
 	bool bForceFullRebuild)
 {
-	if (GeneratorBounds)
-	{
-		GeneratorBounds->SetWorldLocation(BoxCenter);
-
-		const FVector SafeWorldExtent(
-			FMath::Max(0.0, BoxExtent.X),
-			FMath::Max(0.0, BoxExtent.Y),
-			FMath::Max(0.0, BoxExtent.Z));
-		const FVector ComponentScale = GeneratorBounds->GetComponentTransform().GetScale3D().GetAbs();
-		const FVector SafeComponentScale(
-			FMath::Max(UE_KINDA_SMALL_NUMBER, ComponentScale.X),
-			FMath::Max(UE_KINDA_SMALL_NUMBER, ComponentScale.Y),
-			FMath::Max(UE_KINDA_SMALL_NUMBER, ComponentScale.Z));
-		GeneratorBounds->SetBoxExtent(
-			FVector(
-				SafeWorldExtent.X / SafeComponentScale.X,
-				SafeWorldExtent.Y / SafeComponentScale.Y,
-				SafeWorldExtent.Z / SafeComponentScale.Z),
-			true);
-	}
-
+	SetGeneratorBoundsWorldBox(BoxCenter, BoxExtent);
 	return EnsureTriangleCacheByBox(RequestId, bForceFullRebuild);
 }
 

@@ -954,6 +954,10 @@ public:
 
 	/** Returns the current GeneratorBounds component as a valid world-space box when possible. */
 	FBox GetGeneratorBoundsWorldBox() const;
+	/** 只把 GeneratorBounds 盒子摆到给定的世界 center/extent 上 —— 后续所有以
+	 *  GetGeneratorBoundsWorldBox() 为查询范围的操作都靠它定位。不碰三角缓存：
+	 *  只需要查询范围、不消费缓存产出的调用方用这个，别去调 EnsureTriangleCacheByBox。 */
+	void SetGeneratorBoundsWorldBox(const FVector& BoxCenter, const FVector& BoxExtent);
 	/** Stores CPU triangle data into generated-data texture targets and updates LastTriangleTextureData. */
 	void StoreTriangleTextureData(const FCSTriangleMeshData& TriangleData, float ReferenceFilterDistance, FBox SourceWorldBounds = FBox(ForceInit));
 	/** Stores CPU surface-voxel data into generated-data texture targets and updates LastSurfaceVoxelTextureData. */

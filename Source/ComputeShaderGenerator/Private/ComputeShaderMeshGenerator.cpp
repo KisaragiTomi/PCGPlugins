@@ -4113,6 +4113,33 @@ void AComputeShaderMeshGenerator::EndPlay(const EEndPlayReason::Type EndPlayReas
 // Generator bounds helper（BrushCache 缓存实现已归位 MeshGeneratorBrushCache.cpp）
 // -----------------------------------------------------------------------------
 
+void AComputeShaderMeshGenerator::SetGeneratorBoundsWorldBox(const FVector& BoxCenter, const FVector& BoxExtent)
+{
+	if (!GeneratorBounds)
+	{
+		return;
+	}
+
+	GeneratorBounds->SetWorldLocation(BoxCenter);
+
+	// SetBoxExtent 吃的是组件本地 extent，所以要先除掉组件自身的缩放，世界范围才对得上。
+	const FVector SafeWorldExtent(
+		FMath::Max(0.0, BoxExtent.X),
+		FMath::Max(0.0, BoxExtent.Y),
+		FMath::Max(0.0, BoxExtent.Z));
+	const FVector ComponentScale = GeneratorBounds->GetComponentTransform().GetScale3D().GetAbs();
+	const FVector SafeComponentScale(
+		FMath::Max(UE_KINDA_SMALL_NUMBER, ComponentScale.X),
+		FMath::Max(UE_KINDA_SMALL_NUMBER, ComponentScale.Y),
+		FMath::Max(UE_KINDA_SMALL_NUMBER, ComponentScale.Z));
+	GeneratorBounds->SetBoxExtent(
+		FVector(
+			SafeWorldExtent.X / SafeComponentScale.X,
+			SafeWorldExtent.Y / SafeComponentScale.Y,
+			SafeWorldExtent.Z / SafeComponentScale.Z),
+		true);
+}
+
 FBox AComputeShaderMeshGenerator::GetGeneratorBoundsWorldBox() const
 {
 	if (!GeneratorBounds)

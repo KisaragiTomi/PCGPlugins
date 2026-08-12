@@ -2724,14 +2724,14 @@ bool AVineContainer::GenerateVineGPU(float ExtrudeScale, bool Result)
 	ReferencePoints.Reserve(TargetTransforms.Num());
 	for (const FTransform& TargetTransform : TargetTransforms) ReferencePoints.Add(TargetTransform.GetLocation());
 
-	// 把 GeneratorBounds 摆到这一批藤蔓的包围盒上。纯 CPU / 组件操作，不碰 GPU ——
-	// 后面体素的查询范围（GetGeneratorBoundsWorldBox）就是从它读的。
-	{
-		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVineGPU.EnsureTriangleCache"));
-		VoxelGridSettings.VoxelSize = SC.VoxelSize;
-		VoxelGridSettings.ActivationRadius = SC.VoxelSize * 8.0f;
-		EnsureTriangleCacheByBox(TEXT("VineGenerate"), Bounds.GetCenter(), Bounds.GetExtent(), false);
-	}
+	// 把 GeneratorBounds 摆到这一批藤蔓的包围盒上 —— 后面体素的查询范围
+	//（GetGeneratorBoundsWorldBox）就是从它读的。纯 CPU / 组件操作，不碰 GPU。
+	//
+	// 这里以前调的是 EnsureTriangleCacheByBox，但藤蔓只需要「盒子被摆好」这个副作用：
+	// 表面体素走的是 PrepareSurfaceVoxelPassInputs 自己的场景三角形收集，从不读脏页
+	// 三角缓存的任何产出（handle / 页 / 缓存纹理），而那次调用要为 980 个参考点各扫一遍
+	// 17³ 邻域并管理页分配，产出无人消费。改为只摆盒子。
+	SetGeneratorBoundsWorldBox(Bounds.GetCenter(), Bounds.GetExtent());
 
 	// 表面三角形的参考点剔除距离。三个三角形展开 pass（Extract / FilterInitialTriangleSoup /
 	// AppendNaniteSource）本来就是边展开边按参考点剔除、原子追加出紧凑 soup 的，但这里以前传 0
@@ -3089,12 +3089,8 @@ int32 AVineContainer::DrawDebugVineSurfaceVoxelArrows(float Duration, bool bUseC
 		}
 
 		VoxelGridSettings.VoxelSize = SafeVoxelSize;
-		VoxelGridSettings.ActivationRadius = SafeVoxelSize * 8.0f;
-		EnsureTriangleCacheByBox(
-			TEXT("VineDebugSurfaceVoxelArrows"),
-			Bounds.GetCenter(),
-			Bounds.GetExtent(),
-			false);
+		// 同 GenerateVineGPU：只需要查询范围被摆好，不消费三角缓存的产出。
+		SetGeneratorBoundsWorldBox(Bounds.GetCenter(), Bounds.GetExtent());
 		if (!PrepareBoxSceneSurfaceVoxelsGPU(SafeVoxelSize)) return 0;
 	}
 

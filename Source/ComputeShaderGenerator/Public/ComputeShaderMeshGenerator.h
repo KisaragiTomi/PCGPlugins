@@ -334,18 +334,13 @@ struct COMPUTESHADERGENERATOR_API FCSMeshGeneratorVoxelGridSettings
 {
 	GENERATED_BODY()
 
+	// 体素化的世界尺度，藤蔓等调用方每次生成前按自己的 SC.VoxelSize 覆盖。
 	float VoxelSize = 100.0f;
 
-	float ActivationRadius = 200.0f;
-
-	int32 MaxActiveVoxels = 4096;
-
-	int32 MaxTrianglesPerVoxel = 256;
-
+	// 收集场景三角形时用的 static mesh LOD。
 	int32 LODIndex = 0;
 
-	float BoundsTolerance = 1.0f;
-
+	// 生成数据纹理（StoreTriangleTextureData / StoreSurfaceVoxelTextureData）的边长上限。
 	int32 MaxCacheTextureDimension = 4096;
 };
 

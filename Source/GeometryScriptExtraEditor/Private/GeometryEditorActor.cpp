@@ -2738,8 +2738,8 @@ bool AVineContainer::GenerateVineGPU(float ExtrudeScale, bool Result)
 	// —— 而 0 只会把阈值设成 FLT_MAX，开关仍是 1（ReferencePoints 是非空的 target 列表），于是
 	// 每个三角形都对全部 target 跑一遍无 early-out 的最近距离循环再无条件通过：代价照付，一个
 	// 不剔。ReferencePoints 就是 target 位置，藤蔓中心线不会长到离 target 更远的地方，所以按生长
-	// 影响半径的倍数取即可；下限压着体素投影的 ActivationRadius(= VoxelSize*8)，剔除范围一旦小于
-	// 投影搜索范围，边界处就会找不到吸附目标，中心线会飘离表面。
+	// 影响半径的倍数取即可；下限压着体素投影的搜索半径（VoxelSize*8），剔除范围一旦小于投影
+	// 搜索范围，边界处就会找不到吸附目标，中心线会飘离表面。
 	const float SurfaceTriangleFilterDistance = FMath::Max(SC.InfluenceRadius * 2.0f, SC.VoxelSize * 8.0f);
 
 	// 备好体素输入：收集并解析三角形请求、地形三角形与参数，不 dispatch 任何 GPU 工作。产出的

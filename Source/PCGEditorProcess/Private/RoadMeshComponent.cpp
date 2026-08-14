@@ -2,20 +2,26 @@
 #include "RoadBuilderShaders.h"
 
 #include "CSMesh.h"
-#include "CSMeshOps.h"
 
 void URoadMeshComponent::SetBuildInput(const FRoadBuildInput& Input, const FTransform& InputToWorld)
 {
-	if (!RoadGpuMesh) RoadGpuMesh = NewObject<UCSMesh>(this);
+	// 几何挂在基类那一个 GpuMesh 上，组件不再另存一份指针：两个指向同一块几何的成员只会让
+	// 人记不住哪个才是当前的。失败路径先把它取到局部再解绑，见下。
+	UCSMesh* Mesh = GetGpuMesh();
+	if (!Mesh)
+	{
+		Mesh = NewObject<UCSMesh>(this);
+		SetGpuMesh(Mesh);
+	}
 
 	// One entry, not a section table: the whole road surface is one material, and
 	// BuildMaterialSections would sort the index buffer and grow the indirect args to split it
 	// into exactly one run. The table and MeshMaterial have different jobs — this is where the
 	// saved asset's material slot comes from, MeshMaterial is what the single draw batch uses.
-	RoadGpuMesh->SetMaterial(0, MeshMaterial);
+	Mesh->SetMaterial(0, MeshMaterial);
 
 	GeometryToWorld = InputToWorld;
-	if (!BuildRoadGeometryIntoMesh(RoadGpuMesh, Input, InputToWorld))
+	if (!BuildRoadGeometryIntoMesh(Mesh, Input, InputToWorld))
 	{
 		// Nothing was built, so what the mesh still holds is the *previous* road. Leaving it drawn
 		// next to splines it no longer matches is the worst outcome: it looks like a successful
@@ -24,44 +30,13 @@ void URoadMeshComponent::SetBuildInput(const FRoadBuildInput& Input, const FTran
 		//
 		// Unbind first, in that order: the proxy borrows the resident buffers, so freeing them
 		// while it is still bound leaves it drawing from an index buffer that no longer exists.
+		// Mesh 是解绑前取的局部：SetGpuMesh(nullptr) 之后基类成员已经为空，但同一个调用栈里
+		// 不会发生 GC，指针仍然有效，足够把这块分配还回去。
 		SetGpuMesh(nullptr);
-		const FCSMeshResident* Resident = RoadGpuMesh->GetResidentPtr();
-		if (Resident && Resident->IsAllocated()) RoadGpuMesh->ReleaseSync();
+		const FCSMeshResident* Resident = Mesh->GetResidentPtr();
+		if (Resident && Resident->IsAllocated()) Mesh->ReleaseSync();
 		return;
 	}
-	SetGpuMesh(RoadGpuMesh);
+	// 已经在上面绑过了；重绑一次是为了让 SetGpuMesh 的"同对象但重新分配过"分支去刷新代理。
+	SetGpuMesh(Mesh);
 }
-
-bool URoadMeshComponent::HasGeneratedGeometry() const
-{
-	// IsEmpty() answers from the game thread without touching the GPU, and reports non-empty when
-	// only the GPU knows the counts — which is always the road's case, since the emitted size
-	// depends on the junctions the build finds. That is deliberately not "the road definitely has
-	// triangles": the honest cheap answer is "there is an allocation holding a build's output", and
-	// paying a GPU stall to sharpen it would put one on every EnsureRoadGeometry() call.
-	return RoadGpuMesh && !RoadGpuMesh->IsEmpty();
-}
-
-#if WITH_EDITOR
-UStaticMesh* URoadMeshComponent::SaveToStaticMesh(const FString& AssetPathAndName, bool bReplaceExistingAsset, bool bSaveAsset)
-{
-	if (!RoadGpuMesh) return nullptr;
-
-	FCSMeshToStaticMeshOptions Options;
-	Options.AssetPath = AssetPathAndName.TrimStartAndEnd();
-	Options.bTransient = false; // this entry point's whole purpose is to produce an asset
-	Options.bReplaceExisting = bReplaceExistingAsset;
-	Options.bSaveToDisk = bSaveAsset;
-	// Bake back out of the space the geometry was built in, so the asset holds the same local-space
-	// positions the pre-UCSMesh path wrote and still reproduces the road when placed there.
-	// GetComponentTransform() would be wrong and quietly so: this component renders with an
-	// absolute transform, which makes its component transform identity, and baking with identity
-	// would freeze the road at its world coordinates.
-	Options.TargetTransform = GeometryToWorld;
-	Options.bBakeToLocalSpace = true;
-
-	// Reads the mesh object, not a scene proxy: a road that is hidden or not currently rendered
-	// saves exactly the same way.
-	return UCSMeshOps::CopyToStaticMesh(RoadGpuMesh, this, GetOwner(), Options);
-}
-#endif

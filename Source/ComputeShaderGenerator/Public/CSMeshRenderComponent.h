@@ -51,6 +51,36 @@ public:
 	UFUNCTION(BlueprintPure, Category = "CS GpuMesh")
 	UCSMesh* GetGpuMesh() const { return GpuMesh; }
 
+	/**
+	 * 这儿有没有几何——生成方在决定"要不要重跑一次生成"时问的那个问题。
+	 *
+	 * 问的是网格对象，因为几何归它所有。"有没有 scene proxy"从渲染状态重建变成重新绑定的那
+	 * 一刻起就不再是证据了。
+	 *
+	 * IsEmpty() 在 game thread 上就能答，不碰 GPU；当只有 GPU 知道计数时它报非空——这正是
+	 * 生成结果尺寸由 GPU 决定那些路径（藤蔓的 SC 求解、道路的路口数）的常态。所以它刻意不是
+	 * "确定有三角形"，而是"有一块装着某次生成产物的分配"：把它问准就得在每次调用上挂一次 GPU
+	 * 停顿，而这类调用每次关卡加载都会发生一遍。
+	 */
+	UFUNCTION(BlueprintPure, Category = "CS GpuMesh")
+	bool HasGeneratedGeometry() const;
+
+#if WITH_EDITOR
+	/**
+	 * 把当前绑定的这份几何存成 StaticMesh 资产。
+	 *
+	 * BakeSpace 是烘焙用的局部空间：常驻数据是世界空间的，资产按它烘回去，摆在那个变换上就能
+	 * 复现画面上的东西。生产方知道自己是在哪个空间里建的几何（道路是 spline 重采样时的那个
+	 * InputToWorld，藤蔓是 actor 变换），所以由调用方给。
+	 *
+	 * 不需要任何东西正在渲染这份几何——读的是网格对象，不是 scene proxy。
+	 * AssetPathAndName 留空则由落盘层兜底到当前关卡旁的 AutoResult 目录。
+	 * bSaveAsset=false（默认）只把资产标脏，留给手动保存。
+	 */
+	UStaticMesh* SaveToStaticMesh(const FTransform& BakeSpace, const FString& AssetPathAndName = TEXT(""),
+		bool bReplaceExistingAsset = true, bool bSaveAsset = false);
+#endif
+
 	//~ UPrimitiveComponent interface
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
 	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;

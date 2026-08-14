@@ -1,6 +1,7 @@
 #include "CSMeshRenderComponent.h"
 
 #include "CSMesh.h"
+#include "CSMeshOps.h"
 #include "CSMeshRenderSceneProxy.h"
 
 #include "Materials/MaterialInterface.h"
@@ -106,6 +107,33 @@ void UCSMeshRenderComponent::SetGpuMesh(UCSMesh* InMesh)
 	if (IsRegistered()) RecreateRenderState_Concurrent();
 	UpdateBounds();
 }
+
+bool UCSMeshRenderComponent::HasGeneratedGeometry() const
+{
+	return GpuMesh != nullptr && !GpuMesh->IsEmpty();
+}
+
+#if WITH_EDITOR
+UStaticMesh* UCSMeshRenderComponent::SaveToStaticMesh(const FTransform& BakeSpace,
+	const FString& AssetPathAndName, bool bReplaceExistingAsset, bool bSaveAsset)
+{
+	if (!GpuMesh) return nullptr;
+
+	FCSMeshToStaticMeshOptions Options;
+	Options.AssetPath = AssetPathAndName.TrimStartAndEnd();
+	Options.bTransient = false; // this entry point's whole purpose is to produce an asset
+	Options.bReplaceExisting = bReplaceExistingAsset;
+	Options.bSaveToDisk = bSaveAsset;
+	// 烘回 BakeSpace 的局部空间，资产摆在那个变换上就能复现画面上的东西。
+	// GetComponentTransform() 在这里是错的而且错得无声：本组件以绝对变换渲染，组件变换恒为单位，
+	// 按它烘等于把几何冻结在世界坐标上。
+	Options.TargetTransform = BakeSpace;
+	Options.bBakeToLocalSpace = true;
+
+	// 读的是网格对象而不是 scene proxy：隐藏的、或当前没在渲染的组件，存出来的东西完全一样。
+	return UCSMeshOps::CopyToStaticMesh(GpuMesh, this, GetOwner(), Options);
+}
+#endif
 
 FPrimitiveSceneProxy* UCSMeshRenderComponent::CreateSceneProxy()
 {

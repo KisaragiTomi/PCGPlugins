@@ -130,7 +130,7 @@ bool FRoadMeshSaveGPUAutomationTest::RunTest(const FString& Parameters)
 		*FGuid::NewGuid().ToString(EGuidFormats::Digits));
 
 	// Save via the road component's editor-only wrapper (delegates to the shared CSGpuMeshConvert).
-	UStaticMesh* SavedMesh = Road->SaveToStaticMesh(TestAssetPath, /*bReplace*/ true, /*bSaveAsset*/ false);
+	UStaticMesh* SavedMesh = Road->SaveToStaticMesh(Road->GetGeometryToWorld(), TestAssetPath, /*bReplace*/ true, /*bSaveAsset*/ false);
 	if (!TestNotNull(TEXT("StaticMesh created from road GPU buffers"), SavedMesh)) return false;
 	TestEqual(TEXT("The road's single material slot reaches the saved asset"), SavedMesh->GetStaticMaterials().Num(), 1);
 
@@ -164,7 +164,7 @@ bool FRoadMeshSaveGPUAutomationTest::RunTest(const FString& Parameters)
 	// replacing the same asset in place.
 	Road->UnregisterComponent();
 	FlushRenderingCommands();
-	UStaticMesh* SavedWithoutProxy = Road->SaveToStaticMesh(TestAssetPath, /*bReplace*/ true, /*bSaveAsset*/ false);
+	UStaticMesh* SavedWithoutProxy = Road->SaveToStaticMesh(Road->GetGeometryToWorld(), TestAssetPath, /*bReplace*/ true, /*bSaveAsset*/ false);
 	if (TestNotNull(TEXT("StaticMesh saved with nothing rendering the road"), SavedWithoutProxy))
 	{
 		const FMeshDescription* ProxylessDescription = SavedWithoutProxy->GetMeshDescription(0);

@@ -55,38 +55,13 @@ public:
 	 */
 	void SetBuildInput(const FRoadBuildInput& Input, const FTransform& InputToWorld);
 
-	/** Whether road geometry already exists here — the question ACSLandscapeRoad::EnsureRoadGeometry()
-	 *  asks before deciding to run a generation.
-	 *
-	 *  Asked of the mesh object, which is what owns the geometry: "is there a scene proxy" stopped
-	 *  being evidence of anything the moment a recreation became a rebind, and the input snapshot it
-	 *  used to consult is not kept any more. Note this answers about the geometry, not about whether
-	 *  it is currently on screen — the component owns its road mesh and separately binds it for
-	 *  drawing, so an inherited SetGpuMesh(nullptr) would stop the draw without losing the road. */
-	bool HasGeneratedGeometry() const;
-
 	/** The transform the current geometry was baked out of — the last InputToWorld handed to
-	 *  SetBuildInput. Place the saved StaticMesh here and it lands back on the drawn road. */
+	 *  SetBuildInput. Place the saved StaticMesh here and it lands back on the drawn road.
+	 *
+	 *  存盘走基类的 UCSMeshRenderComponent::SaveToStaticMesh，把这个变换作为 BakeSpace 传进去；
+	 *  道路这边没有自己的落盘实现，它和"存这个组件画的东西"没有任何区别。 */
 	const FTransform& GetGeometryToWorld() const { return GeometryToWorld; }
 
-#if WITH_EDITOR
-	/** Reads the road mesh back and saves it as a StaticMesh asset via the shared CSGpuMeshConvert
-	 *  path. The asset is baked into GetGeometryToWorld()'s local space, so it reproduces the road
-	 *  when placed on that transform — the same asset the pre-UCSMesh path produced, which wrote
-	 *  the raw (then already local-space) GPU positions.
-	 *
-	 *  Needs nothing to be rendering the mesh. Leave AssetPathAndName empty to default to an
-	 *  "AutoResult" folder next to the current level (/Game/.../AutoResult/SM_<owner>). The asset is
-	 *  marked dirty; bSaveAsset=false (default) leaves it unsaved for a manual Save. Editor only. */
-	UStaticMesh* SaveToStaticMesh(const FString& AssetPathAndName = TEXT(""), bool bReplaceExistingAsset = true,
-		bool bSaveAsset = false);
-#endif
-
 private:
-	/** The road geometry. Transient because GPU data does not survive a level reload; the property
-	 *  exists to hold the object against GC, not to serialize it. */
-	UPROPERTY(Transient)
-	TObjectPtr<UCSMesh> RoadGpuMesh;
-
 	FTransform GeometryToWorld = FTransform::Identity;
 };

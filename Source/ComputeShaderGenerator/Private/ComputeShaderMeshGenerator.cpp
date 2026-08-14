@@ -32,7 +32,7 @@
 #include "Landscape.h"
 #include "LandscapeComponent.h"
 #include "LandscapeProxy.h"
-#include "CSDisplayComponent.h"
+#include "CSPointArrowMesh.h"
 #include "CSGpuMeshComponent.h"
 #include "CSGpuMeshTypes.h"
 #include "CSMesh.h"
@@ -3082,42 +3082,93 @@ void AComputeShaderMeshGenerator::ClearGeneratedDataTextureCache()
 	ClearSurfaceVoxelTextureData();
 }
 
-namespace
-{
 // 两个 DrawDebug*VoxelDirections 入口的共同体：两个 Options USTRUCT（Last/Box）字段同名同义，
 // 仅入口守卫不同（缓存有效性 vs 现场准备），故用 duck-typed 模板吃掉公共部分。
-template <typename TOptions>
-int32 CSMeshGen_DrawVoxelDirections(UCSDisplayComponent* DisplayComponent, const FCSSurfaceVoxelGPUBuffers& Buffers, const TOptions& Options)
+//
+// Options.bDrawPoints / PointColor 不再有对应物：以前"点 + 方向线"是两次绘制，现在一个箭头
+// 同时表达位置和方向（见 CSPointArrowMesh.usf 的文件头）。字段留在 USTRUCT 里不动，免得打断
+// 已有蓝图连线，但它们不再影响画面。
+int32 AComputeShaderMeshGenerator::ShowDebugPointArrows(
+	const FCSGpuDebugPooledSource& Source, float ArrowLength, FLinearColor ArrowColor,
+	int32 MaxArrows, float Lifetime)
 {
-	const float EffectiveDirectionLength = Options.DirectionLength > 0.0f
-		? Options.DirectionLength
-		: FMath::Max(Buffers.VoxelSize, UE_KINDA_SMALL_NUMBER);
-	// Options 的 (Duration, bPersistentLines) 映射到统一的 Lifetime：
-	// 常驻 => -1；否则沿用 Duration（<=0 即一帧可视，与改动前逐字一致）。
-	const float Lifetime = Options.bPersistentLines ? -1.0f : Options.Duration;
-	return DisplayComponent->ShowVoxelDirections(
-		Buffers,
-		EffectiveDirectionLength,
-		Options.DirectionColor,
-		Options.bDrawPoints,
-		Options.PointColor,
-		Options.MaxDirectionsToDraw,
-		Lifetime);
+	if (!DisplayComponent || !Source.IsValid())
+	{
+		ClearDebugDisplay();
+		return 0;
+	}
+
+	FCSPointArrowBuildParams Params;
+	Params.Source = Source;
+	Params.MaxArrows = MaxArrows;
+	Params.ArrowLength = ArrowLength > 0.0f ? ArrowLength : FMath::Max(Source.ItemSize, UE_KINDA_SMALL_NUMBER);
+	Params.ArrowColor = ArrowColor;
+
+	if (!DebugDisplayMesh) DebugDisplayMesh = NewObject<UCSMesh>(this);
+	if (!BuildPointArrowGeometryIntoMesh(DebugDisplayMesh, Params))
+	{
+		ClearDebugDisplay();
+		return 0;
+	}
+
+	DisplayComponent->SetGpuMesh(DebugDisplayMesh);
+	ScheduleDebugDisplayClear(Lifetime);
+
+	// 报告的是"最多会画几个"，与代理时代同口径：真正画几个由 GPU 计数决定，问准它要一次 stall。
+	return MaxArrows > 0 ? FMath::Min(MaxArrows, Source.Capacity) : Source.Capacity;
 }
-} // namespace
+
+template <typename TOptions>
+int32 AComputeShaderMeshGenerator::DrawVoxelDirectionArrows(const TOptions& Options)
+{
+	FCSGpuDebugPooledSource Source;
+	Source.Positions = LastSurfaceVoxelGPUBuffers.Positions;
+	Source.Normals = LastSurfaceVoxelGPUBuffers.Normals;
+	Source.Counter = LastSurfaceVoxelGPUBuffers.Counter;
+	Source.Capacity = LastSurfaceVoxelGPUBuffers.VoxelCapacity;
+	Source.ItemSize = LastSurfaceVoxelGPUBuffers.VoxelSize;
+	Source.WorldBounds = LastSurfaceVoxelGPUBuffers.WorldBounds;
+
+	// (Duration, bPersistentLines) 的语义与改动前逐字一致：常驻 => 不排清除；Duration <= 0 =>
+	// 下一帧清除（一帧可视）。
+	return ShowDebugPointArrows(Source, Options.DirectionLength, Options.DirectionColor,
+		Options.MaxDirectionsToDraw, Options.bPersistentLines ? -1.0f : Options.Duration);
+}
+
+void AComputeShaderMeshGenerator::ClearDebugDisplay()
+{
+	if (UWorld* World = GetWorld()) World->GetTimerManager().ClearTimer(DebugDisplayClearHandle);
+	if (DisplayComponent) DisplayComponent->SetGpuMesh(nullptr);
+}
+
+void AComputeShaderMeshGenerator::ScheduleDebugDisplayClear(float Lifetime)
+{
+	UWorld* World = GetWorld();
+	if (!World) return;
+	World->GetTimerManager().ClearTimer(DebugDisplayClearHandle);
+	if (Lifetime < 0.0f) return; // 常驻
+	if (Lifetime == 0.0f)
+	{
+		DebugDisplayClearHandle = World->GetTimerManager().SetTimerForNextTick(
+			this, &AComputeShaderMeshGenerator::ClearDebugDisplay);
+		return;
+	}
+	World->GetTimerManager().SetTimer(DebugDisplayClearHandle, this,
+		&AComputeShaderMeshGenerator::ClearDebugDisplay, Lifetime, false);
+}
 
 int32 AComputeShaderMeshGenerator::DrawDebugLastSurfaceVoxelDirections(
 	const FCSDebugLastVoxelDirectionOptions& Options)
 {
 	if (!DisplayComponent || !LastSurfaceVoxelGPUBuffers.IsValid()) return 0;
-	return CSMeshGen_DrawVoxelDirections(DisplayComponent, LastSurfaceVoxelGPUBuffers, Options);
+	return DrawVoxelDirectionArrows(Options);
 }
 
 int32 AComputeShaderMeshGenerator::DrawDebugBoxSceneSurfaceVoxelDirections(
 	const FCSDebugBoxVoxelDirectionOptions& Options)
 {
 	if (!DisplayComponent || !PrepareBoxSceneSurfaceVoxelsGPU(Options.VoxelSize)) return 0;
-	return CSMeshGen_DrawVoxelDirections(DisplayComponent, LastSurfaceVoxelGPUBuffers, Options);
+	return DrawVoxelDirectionArrows(Options);
 }
 
 UTextureRenderTarget2D* AComputeShaderMeshGenerator::GetOrCreateGeneratedDataRenderTarget(
@@ -3379,18 +3430,6 @@ void AComputeShaderMeshGenerator::ClearSurfaceVoxelTextureData()
 }
 
 // -----------------------------------------------------------------------------
-// Debug System - GPU Output
-// -----------------------------------------------------------------------------
-
-bool AComputeShaderMeshGenerator::SurfaceVoxelsToIsolatedQuadsDebug(float VoxelSize,
-	bool bReverseOrientation)
-{
-	if (!DisplayComponent || !PrepareBoxSceneSurfaceVoxelsGPU(VoxelSize)) return false;
-	return DisplayComponent->ShowVoxelQuads(
-		LastSurfaceVoxelGPUBuffers, QuadScale, NormalOffsetScale, bReverseOrientation);
-}
-
-// -----------------------------------------------------------------------------
 // Core System - GPU Mesh Output
 //
 // 这里的出口一律产出 UCSMesh。要 UDynamicMesh 的调用方走 UCSMeshOps::CopyToDynamicMesh
@@ -3572,7 +3611,7 @@ void AComputeShaderMeshGenerator::SpawnDebugSurfaceTrianglesDynamicMeshActor(flo
 
 void AComputeShaderMeshGenerator::ClearMeshGeneratorGPUDebug()
 {
-	if (DisplayComponent) DisplayComponent->ClearDisplay();
+	ClearDebugDisplay();
 	// 三角汤迁到 UCSMesh 之前也归 DisplayComponent 管，清场一并抹掉它 —— 保持这条语义。
 	ClearDirectGPUMesh();
 }
@@ -3911,8 +3950,16 @@ AComputeShaderMeshGenerator::AComputeShaderMeshGenerator(const FObjectInitialize
 	GeneratorBounds->SetBoxExtent(FVector(500.0, 500.0, 500.0));
 	GeneratorBounds->SetupAttachment(SceneRoot);
 
-	DisplayComponent = CreateDefaultSubobject<UCSDisplayComponent>(TEXT("DisplayComponent"));
+	DisplayComponent = CreateDefaultSubobject<UCSMeshRenderComponent>(TEXT("DisplayComponent"));
 	DisplayComponent->SetupAttachment(SceneRoot);
+	// 箭头的颜色写在顶点色里（BuildPointArrowGeometryIntoMesh 打包 ArrowColor），所以默认材质
+	// 必须是读顶点色的那个，否则 DirectionColor 静默失效——代理时代颜色是逐次绘制的材质参数，
+	// 换成常驻几何后它变成了顶点属性。取不到就退回引擎调试材质（形状仍在，只是没颜色）。
+	if (GEngine)
+	{
+		UMaterialInterface* VertexColorMaterial = GEngine->VertexColorViewModeMaterial_ColorOnly;
+		DisplayComponent->MeshMaterial = VertexColorMaterial ? VertexColorMaterial : ToRawPtr(GEngine->DebugMeshMaterial);
+	}
 
 	// 常驻场景三角汤的画笔。自身不生成任何东西，只绑定 DirectGpuMesh；没绑网格时不建代理，
 	// 所以对没用过提交路径的 actor 是零成本。

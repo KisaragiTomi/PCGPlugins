@@ -21,7 +21,6 @@
 #include "ComputeShaderBasicFunction.h"
 #include "ComputeShaderGenerateHelper.h"
 #include "CSGpuDebugDraw.h"
-#include "CSDisplayComponent.h"
 #include "Engine/Level.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "Components/PrimitiveComponent.h"
@@ -43,7 +42,7 @@
 #include "Containers/Ticker.h"
 #include "Misc/App.h"
 #include "Misc/PackageName.h"
-#include "VineMeshComponent.h"
+#include "CSMeshRenderComponent.h"
 #include "CSMesh.h"
 #include "CSMeshOps.h"
 #include "CSGpuMeshComponent.h"
@@ -1368,7 +1367,7 @@ struct FVineBuildInput
 	FCSSurfaceVoxelPassInputs SurfaceVoxelInputs;
 
 	// 体素调试的唯一出口。非空时，融合体素 pass 记录完就把它的 position/normal/counter 三个
-	// RDG buffer extract 成 pooled，交给 UCSDisplayComponent 画。
+	// RDG buffer extract 成 pooled，交给 ShowDebugPointArrows 展开成箭头网格画。
 	//
 	// 为什么是 extract 而不是另跑一遍：融合图里的体素是 transient，图一 Execute 就没了，而调试
 	// 绘制要跨帧存活。以前这个需求是靠 PrepareBoxSceneSurfaceVoxelsGPU 走旧 pooled 路径「再算一遍」
@@ -3555,25 +3554,6 @@ static bool BuildVineGeometryIntoMesh(UCSMesh* Target, const FVineBuildInput& In
 	return true;
 }
 
-// ============================================================================
-// UVineMeshComponent: the renderer, and nothing else. Everything it does is inherited now —
-// UCSMeshRenderComponent binds a UCSMesh, draws it as one batch out of indirect arg set 0 with
-// MeshMaterial, and rebinds on the mesh's change event. What is left that is specific to the vine
-// is the one question its owner asks before deciding to run a generation.
-// ============================================================================
-
-bool UVineMeshComponent::HasGeneratedGeometry() const
-{
-	const UCSMesh* Mesh = GetGpuMesh();
-	// IsEmpty() answers from the game thread without touching the GPU, and reports non-empty while
-	// only the GPU knows the counts — which is the vine's normal state, since how far the space
-	// colonization solve grows is decided in VRAM. That is deliberately not "the vine definitely has
-	// triangles": the honest cheap answer is "there is an allocation holding a build's output", and
-	// sharpening it would put a GPU stall on every EnsureVineGeometry() call — including the one every
-	// level load schedules.
-	return Mesh != nullptr && !Mesh->IsEmpty();
-}
-
 // May this actor run a blocking vine generation right now? Every case below is one where the
 // generation would either write into something shared with all instances or burn a long GPU stall
 // (scene voxelization + the space colonization solve) for output nobody will ever look at.
@@ -3696,7 +3676,7 @@ AVineContainer::AVineContainer(const FObjectInitializer& ObjectInitializer)
 	// its resident set is world space by contract — so all that is left here is to pin the transform
 	// itself, which under the absolute flags IS the world transform. FVineBuildInput::VineWorldToLocal
 	// stays Identity to match; the two must move together or the mesh renders somewhere else.
-	VineGpuMesh = CreateDefaultSubobject<UVineMeshComponent>(TEXT("VineMesh"));
+	VineGpuMesh = CreateDefaultSubobject<UCSMeshRenderComponent>(TEXT("VineMesh"));
 	VineGpuMesh->SetupAttachment(GetRootComponent());
 	VineGpuMesh->SetRelativeTransform(FTransform::Identity);
 
@@ -4286,12 +4266,12 @@ bool AVineContainer::GenerateVineGPU()
 		const float Lifetime = GPUProjectionDebug.bGPUProjectionVoxelDebugPointsPersistent
 			? -1.0f
 			: GPUProjectionDebug.GPUProjectionVoxelDebugDuration;
-		const int32 Drawn = DisplayComponent->ShowVoxelDirections(
+		// 中心点那一路没有了：一个箭头同时表达位置和方向，GPUProjectionVoxelCenterColor 随之
+		// 不再有对应物（字段保留，免得打断已有蓝图连线）。
+		const int32 Drawn = ShowDebugPointArrows(
 			DebugVoxelSource,
 			DirectionLength,
 			GPUProjectionDebug.GPUProjectionVoxelTargetColor,
-			true,
-			GPUProjectionDebug.GPUProjectionVoxelCenterColor,
 			GPUProjectionDebug.GPUProjectionVoxelDebugPointLimit,
 			Lifetime);
 		UE_LOG(LogTemp, Display, TEXT("[VisVineGPU] 体素调试：容量 %d，提交绘制 %d。"),

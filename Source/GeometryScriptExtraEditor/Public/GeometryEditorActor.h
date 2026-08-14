@@ -17,7 +17,7 @@
 
 class AStaticMeshActor;
 class UCSMesh;
-class UVineMeshComponent;
+class UCSMeshRenderComponent;
 
 USTRUCT(BlueprintType, meta = (DisplayName = "SC Options"))
 struct GEOMETRYSCRIPTEXTRAEDITOR_API FSpaceColonizationOptions
@@ -180,7 +180,7 @@ public:
 	// VisVineGPUInternal writes the geometry into VineGeometry and then binds it here. Kept at an
 	// identity world transform (the vine renders in world space).
 	UPROPERTY(BlueprintReadWrite, Category = "GrowReference")
-	UVineMeshComponent* VineGpuMesh;
+	UCSMeshRenderComponent* VineGpuMesh;
 
 	// Single source of truth for the vine surface material. It used to live on slot 0 of a
 	// UDynamicMeshComponent this actor owned; that component is gone, so the assignment lives on the
@@ -242,7 +242,7 @@ public:
 	 *
 	 *  Nothing about a vine is serialized except its sources and targets, so restoring one means
 	 *  re-running the whole generation (voxels -> space colonization -> mesh); there is no cached
-	 *  bundle to re-push. Now that UVineMeshComponent draws a UCSMesh, a render-state recreation is
+	 *  bundle to re-push. Now that UCSMeshRenderComponent draws a UCSMesh, a render-state recreation is
 	 *  a rebind, which makes this the ONLY thing that regenerates the vine. */
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
 	bool EnsureVineGeometry();

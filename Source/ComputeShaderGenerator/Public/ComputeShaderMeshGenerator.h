@@ -15,9 +15,9 @@
 
 class AActor;
 class ALandscape;
-class UCSDisplayComponent;
 class UCSMesh;
 class UCSMeshRenderComponent;
+struct FCSGpuDebugPooledSource;
 class UHierarchicalInstancedStaticMeshComponent;
 class UMaterialInterface;
 class AStaticMeshActor;
@@ -438,13 +438,20 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator")
 	TObjectPtr<UBoxComponent> GeneratorBounds;
 
-	/** 统一的 GPU 内容显示组件：体素方向线/点、体素孤立面片，一个实例同时显示一种，
-	 *  生命周期由各显示入口的 Lifetime 决定。点集箭头已迁到 UCSMesh + UCSMeshRenderComponent，
-	 *  不再由本组件承担。
+	/** GPU 内容调试显示：体素方向以箭头网格画出，几何是一个 UCSMesh，绑在这个组件上。
 	 *  以绝对（世界原点）变换渲染，世界空间数据 1:1 画出。
-	 *  需要多组内容并存时，在本 Actor 上追加一个同类实例即可。 */
+	 *
+	 *  这里以前是 UCSDisplayComponent —— 一个自持 position-only 顶点工厂、按 PT_LineList /
+	 *  PT_PointList 直接 indirect 绘制的专用组件。它和点集箭头是同一件事的两种做法，而箭头那条
+	 *  （几何归 UCSMesh 所有）不会在每次渲染状态重建时重跑生成 compute，也能直接存盘，故统一到
+	 *  这条。代价是线被膨胀成了有体积的箭头，顶点量高一个数量级；调试规模上不成问题。 */
 	UPROPERTY(BlueprintReadOnly, Category = "CS Mesh Generator")
-	TObjectPtr<UCSDisplayComponent> DisplayComponent;
+	TObjectPtr<UCSMeshRenderComponent> DisplayComponent;
+
+	/** DisplayComponent 画的那份调试几何。Transient：GPU 数据不跨关卡加载，这个属性只是拿住对象
+	 *  不让 GC 收走，不参与序列化。 */
+	UPROPERTY(Transient)
+	TObjectPtr<UCSMesh> DebugDisplayMesh;
 
 	/**
 	 * SubmitBoxSceneTrianglesToRenderPipeline 提取出的常驻场景三角汤。
@@ -777,20 +784,31 @@ public:
 	// Debug System
 	// -------------------------------------------------------------------------
 
-	/** Draws an isolated quad at each surface voxel directly from retained GPU buffers. */
-	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh|Debug")
-	bool SurfaceVoxelsToIsolatedQuadsDebug(float VoxelSize = 10.0f,
-		bool bReverseOrientation = false);
-
-	/** Draws debug direction lines and optional points from the last retained GPU surface voxels. */
+	/** Draws a debug arrow at each surface voxel, oriented along its normal, from the last retained
+	 *  GPU surface voxels. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug", meta = (DevelopmentOnly))
 	int32 DrawDebugLastSurfaceVoxelDirections(
 		const FCSDebugLastVoxelDirectionOptions& Options = FCSDebugLastVoxelDirectionOptions());
 
-	/** Regenerates bounded scene surface voxels and draws their normals as debug direction lines. */
+	/** Regenerates bounded scene surface voxels and draws their normals as debug arrows. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug", meta = (DevelopmentOnly))
 	int32 DrawDebugBoxSceneSurfaceVoxelDirections(
 		const FCSDebugBoxVoxelDirectionOptions& Options);
+
+	/**
+	 * 把一组 GPU 常驻的点画成箭头（沿各自法线朝向），几何写进 DebugDisplayMesh、绑到
+	 * DisplayComponent。这是 UCSDisplayComponent::ShowVoxelDirections 的替代：一个箭头同时表达
+	 * 位置和方向，所以不再有独立的"点"通道。
+	 *
+	 * ArrowLength <= 0 时取 Source.ItemSize。Lifetime：<0 常驻，==0 下一帧清除，>0 按秒清除。
+	 * 返回"最多会画几个"——真正画几个由 GPU 计数决定。
+	 */
+	int32 ShowDebugPointArrows(const FCSGpuDebugPooledSource& Source, float ArrowLength,
+		FLinearColor ArrowColor, int32 MaxArrows, float Lifetime);
+
+	/** 解绑调试几何并取消待触发的自动清除。以前是 UCSDisplayComponent::ClearDisplay。 */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Generated Data|Debug")
+	void ClearDebugDisplay();
 
 	/** Extracts and draws bounded scene surface triangles through a dedicated GPU component. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Debug", meta = (DevelopmentOnly, DisplayName = "Draw GPU Surface Triangles"))
@@ -998,4 +1016,15 @@ private:
 	void ScheduleDirectMeshClear(float LifetimeSeconds);
 
 	FTimerHandle DirectMeshClearTimerHandle;
+
+	/** 两个 DrawDebug*VoxelDirections 的共同体：把 LastSurfaceVoxelGPUBuffers 展开成箭头几何、
+	 *  绑到 DisplayComponent 上、按 Options 排自动清除。两个 Options USTRUCT 字段同名同义，故用
+	 *  duck-typed 模板；定义在 .cpp 里，只有那两个入口实例化它。 */
+	template <typename TOptions>
+	int32 DrawVoxelDirectionArrows(const TOptions& Options);
+
+	/** ClearDebugDisplay 的定时器。语义沿用旧显示组件：<0 常驻，==0 下一帧清，>0 按秒清。 */
+	void ScheduleDebugDisplayClear(float Lifetime);
+
+	FTimerHandle DebugDisplayClearHandle;
 };

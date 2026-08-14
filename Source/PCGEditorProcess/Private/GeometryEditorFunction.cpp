@@ -3,41 +3,16 @@
 
 #include "GeometryEditorFunction.h"
 
-#include "PackageTools.h"
-#include "UDynamicMesh.h"
-#include "AssetRegistry/AssetRegistryModule.h"
-#include "AssetUtils/CreateStaticMeshUtil.h"
-
-
-using namespace UE::Geometry;
+#include "GeometryGeneral.h"
 
 UStaticMesh* UGeometryEditorFunction::CreateStaticMeshAsset(UDynamicMesh* TargetMesh, FString AssetPathAndName, TArray<UMaterialInterface*> Materials)
 {
-	if (TargetMesh->GetTriangleCount() == 0) return nullptr;
-	
-	UE::AssetUtils::FStaticMeshAssetOptions AssetOptions;
-	AssetPathAndName = UPackageTools::SanitizePackageName(AssetPathAndName);
-	AssetOptions.NewAssetPath = AssetPathAndName;
-	AssetOptions.NumSourceModels = 1;
-	AssetOptions.AssetMaterials = Materials;
-	AssetOptions.bEnableRecomputeNormals = false;
-	AssetOptions.bEnableRecomputeTangents = true;
-	AssetOptions.CollisionType = ECollisionTraceFlag::CTF_UseComplexAsSimple;
-	AssetOptions.NumMaterialSlots = Materials.Num();
-	
-	FDynamicMesh3 CopyMesh;
-	TargetMesh->ProcessMesh([&](const FDynamicMesh3& ReadMesh)
-	{
-		CopyMesh = ReadMesh;
-	});
-	AssetOptions.SourceMeshes.DynamicMeshes.Add(&CopyMesh);
-
-	UE::AssetUtils::FStaticMeshResults ResultData;
-	UE::AssetUtils::ECreateStaticMeshResult AssetResult = UE::AssetUtils::CreateStaticMeshAsset(AssetOptions, ResultData);
-	
-	UStaticMesh* NewStaticMesh = ResultData.StaticMesh;
-	NewStaticMesh->PostEditChange();
-	GEditor->EndTransaction();
-	FAssetRegistryModule::AssetCreated(NewStaticMesh);
-	return NewStaticMesh;
+	// 这里以前自己拼一份 UE::AssetUtils::FStaticMeshAssetOptions，与 UGeometryGeneral 那份逐字
+	// 重复（同样的 NumSourceModels / bEnableRecomputeNormals=false / bEnableRecomputeTangents /
+	// CTF_UseComplexAsSimple），却少了建目录、覆盖已有资产、标脏和可选落盘，另外还带三个缺陷：
+	//   - TargetMesh 为空时直接解引用
+	//   - 不检查 CreateStaticMeshAsset 的返回码就用 ResultData.StaticMesh
+	//   - 一次没有配对 BeginTransaction 的 GEditor->EndTransaction()
+	// 保留本入口只为不打断已有蓝图连线，实现统一到公用那条。
+	return UGeometryGeneral::SaveDynamicMeshToStaticMeshWithMaterials(TargetMesh, AssetPathAndName, Materials);
 }

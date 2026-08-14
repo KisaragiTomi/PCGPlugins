@@ -126,18 +126,5 @@ public:
 		bool bSaveAsset = false,
 		bool bEnableNanite = false);
 
-	/** Reads Component's rendered GPU mesh back to the CPU (one blocking readback) and saves it
-	 *  as a StaticMesh asset. The created asset is always marked dirty; bSaveAsset controls whether
-	 *  it is also written to disk (default false = leave it dirty for a manual/Save-All).
-	 *  Pass an empty AssetPathAndName to default the location to an "AutoResult" folder next to the
-	 *  current level (e.g. /Game/Maps/AutoResult/SM_<owner>). Returns the created mesh (possibly unsaved)
-	 *  or nullptr on any failure. */
-	UStaticMesh* SaveRenderedMeshToStaticMesh(
-		const FString& AssetPathAndName,
-		UMaterialInterface* Material,
-		const FTransform& ActorTransform,
-		bool bConvertToActorLocalSpace = true,
-		bool bReplaceExistingAsset = true,
-		bool bSaveAsset = false);
 #endif
 };

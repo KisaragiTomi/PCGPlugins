@@ -3823,24 +3823,17 @@ UStaticMesh* AComputeShaderMeshGenerator::SaveDirectGPUMeshToStaticMesh(
 	bool bConvertToActorLocalSpace)
 {
 #if WITH_EDITOR
-	if (!DirectGpuMesh) return nullptr;
+	if (!DirectGpuMesh || !DirectMeshRenderComponent) return nullptr;
 
 	// 空路径走本 actor 的稳定结果命名（覆盖上一次的结果），而不是让落盘层各自兜底。
 	// 仍留空（未存盘的地图）时交给落盘层的 AutoResult 兜底，与改动前一致。
 	FString EffectiveAssetPath = AssetPathAndName.TrimStartAndEnd();
 	if (EffectiveAssetPath.IsEmpty()) EffectiveAssetPath = BuildResultAssetPath();
 
-	FCSMeshToStaticMeshOptions Options;
-	Options.AssetPath = EffectiveAssetPath;
-	Options.bTransient = false; // 这个入口的语义就是产出资产
-	Options.bReplaceExisting = bReplaceExistingAsset;
-	Options.bSaveToDisk = bSaveAsset;
-	Options.TargetTransform = GetActorTransform();
-	Options.bBakeToLocalSpace = bConvertToActorLocalSpace;
-
-	// 直接读网格对象，不经组件/代理：网格没在被渲染也能存盘。材质槽由网格自己的材质表带出，
-	// 于是存出的资产保留逐槽材质，而不是整片场景压成一个槽。
-	return UCSMeshOps::CopyToStaticMesh(DirectGpuMesh, this, this, Options);
+	// 落盘本身没有任何"直接网格"特有的东西，走组件那条公用入口。烘焙空间用 actor 变换：
+	// 组件以绝对变换渲染，它自己的组件变换恒为单位，按它烘会把几何冻结在世界坐标上。
+	return DirectMeshRenderComponent->SaveToStaticMesh(
+		GetActorTransform(), EffectiveAssetPath, bReplaceExistingAsset, bSaveAsset, bConvertToActorLocalSpace);
 #else
 	return nullptr;
 #endif

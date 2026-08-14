@@ -2007,6 +2007,40 @@ UStaticMesh* UGeometryGeneral::SaveDynamicMeshToStaticMesh(
 	bool bSaveAsset,
 	bool bMarkPackageDirty)
 {
+	if (!TargetMesh || TargetMesh->GetTriangleCount() == 0) return nullptr;
+
+	// 槽位数按网格里出现过的最大材质 ID 定，再从组件逐槽取材质。这是本重载与
+	// SaveDynamicMeshToStaticMeshWithMaterials 的唯一区别——材质从哪来，落盘本身完全一样。
+	int32 NumMaterialSlots = 1;
+	TargetMesh->ProcessMesh([&NumMaterialSlots](const FDynamicMesh3& ReadMesh)
+	{
+		if (!ReadMesh.HasAttributes() || !ReadMesh.Attributes()->HasMaterialID()) return;
+		const UE::Geometry::FDynamicMeshMaterialAttribute* MaterialIDs = ReadMesh.Attributes()->GetMaterialID();
+		for (const int32 TriangleID : ReadMesh.TriangleIndicesItr())
+		{
+			NumMaterialSlots = FMath::Max(NumMaterialSlots, MaterialIDs->GetValue(TriangleID) + 1);
+		}
+	});
+
+	TArray<UMaterialInterface*> Materials;
+	Materials.Reserve(NumMaterialSlots);
+	for (int32 MaterialIndex = 0; MaterialIndex < NumMaterialSlots; ++MaterialIndex)
+	{
+		Materials.Add(MaterialSource ? MaterialSource->GetMaterial(MaterialIndex) : nullptr);
+	}
+
+	return SaveDynamicMeshToStaticMeshWithMaterials(
+		TargetMesh, AssetPathAndName, Materials, bReplaceExistingAsset, bSaveAsset, bMarkPackageDirty);
+}
+
+UStaticMesh* UGeometryGeneral::SaveDynamicMeshToStaticMeshWithMaterials(
+	UDynamicMesh* TargetMesh,
+	const FString& AssetPathAndName,
+	const TArray<UMaterialInterface*>& Materials,
+	bool bReplaceExistingAsset,
+	bool bSaveAsset,
+	bool bMarkPackageDirty)
+{
 	if (!TargetMesh || TargetMesh->GetTriangleCount() == 0 || AssetPathAndName.IsEmpty())
 	{
 		return nullptr;
@@ -2025,26 +2059,12 @@ UStaticMesh* UGeometryGeneral::SaveDynamicMeshToStaticMesh(
 	}
 
 	FDynamicMesh3 CopyMesh;
-	int32 NumMaterialSlots = 1;
-	TargetMesh->ProcessMesh([&](const FDynamicMesh3& ReadMesh)
+	TargetMesh->ProcessMesh([&CopyMesh](const FDynamicMesh3& ReadMesh)
 	{
 		CopyMesh = ReadMesh;
-		if (ReadMesh.HasAttributes() && ReadMesh.Attributes()->HasMaterialID())
-		{
-			const UE::Geometry::FDynamicMeshMaterialAttribute* MaterialIDs = ReadMesh.Attributes()->GetMaterialID();
-			for (const int32 TriangleID : ReadMesh.TriangleIndicesItr())
-			{
-				NumMaterialSlots = FMath::Max(NumMaterialSlots, MaterialIDs->GetValue(TriangleID) + 1);
-			}
-		}
 	});
 
-	TArray<UMaterialInterface*> Materials;
-	Materials.Reserve(NumMaterialSlots);
-	for (int32 MaterialIndex = 0; MaterialIndex < NumMaterialSlots; ++MaterialIndex)
-	{
-		Materials.Add(MaterialSource ? MaterialSource->GetMaterial(MaterialIndex) : nullptr);
-	}
+	const int32 NumMaterialSlots = FMath::Max(1, Materials.Num());
 
 	UE::AssetUtils::FStaticMeshAssetOptions AssetOptions;
 	AssetOptions.NewAssetPath = SanitizedAssetPathAndName;

@@ -131,11 +131,29 @@ public:
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static void CalculateOBBUpDir(TArray<FVector> OrientSpaceVertices, FVector& BoxUpDir);
 
+	/** 材质槽从 MaterialSource 组件按网格里出现过的最大材质 ID 逐槽取；其余与下面那个重载一致。 */
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static UStaticMesh* SaveDynamicMeshToStaticMesh(
 		UDynamicMesh* TargetMesh,
 		const FString& AssetPathAndName,
 		UMeshComponent* MaterialSource = nullptr,
+		bool bReplaceExistingAsset = true,
+		bool bSaveAsset = false,
+		bool bMarkPackageDirty = true);
+
+	/**
+	 * DynamicMesh 落盘成 StaticMesh 资产的唯一实现：建目录、按需删除已有资产、拷贝网格、
+	 * 建资产、标脏、可选写盘。材质槽由调用方直接给。
+	 *
+	 * UGeometryEditorFunction::CreateStaticMeshAsset 曾经自己拼一份 FStaticMeshAssetOptions，
+	 * 缺了建目录/覆盖/标脏/落盘，还带三个缺陷（TargetMesh 为空直接解引用、不检查返回码就用
+	 * ResultData.StaticMesh、一次没有配对 BeginTransaction 的 EndTransaction）。它现在转调这里。
+	 */
+	UFUNCTION(BlueprintCallable, Category = Generate)
+	static UStaticMesh* SaveDynamicMeshToStaticMeshWithMaterials(
+		UDynamicMesh* TargetMesh,
+		const FString& AssetPathAndName,
+		const TArray<UMaterialInterface*>& Materials,
 		bool bReplaceExistingAsset = true,
 		bool bSaveAsset = false,
 		bool bMarkPackageDirty = true);

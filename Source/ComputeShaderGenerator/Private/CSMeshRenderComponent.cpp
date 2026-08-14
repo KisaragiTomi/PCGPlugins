@@ -115,7 +115,7 @@ bool UCSMeshRenderComponent::HasGeneratedGeometry() const
 
 #if WITH_EDITOR
 UStaticMesh* UCSMeshRenderComponent::SaveToStaticMesh(const FTransform& BakeSpace,
-	const FString& AssetPathAndName, bool bReplaceExistingAsset, bool bSaveAsset)
+	const FString& AssetPathAndName, bool bReplaceExistingAsset, bool bSaveAsset, bool bBakeToLocalSpace)
 {
 	if (!GpuMesh) return nullptr;
 
@@ -128,7 +128,7 @@ UStaticMesh* UCSMeshRenderComponent::SaveToStaticMesh(const FTransform& BakeSpac
 	// GetComponentTransform() 在这里是错的而且错得无声：本组件以绝对变换渲染，组件变换恒为单位，
 	// 按它烘等于把几何冻结在世界坐标上。
 	Options.TargetTransform = BakeSpace;
-	Options.bBakeToLocalSpace = true;
+	Options.bBakeToLocalSpace = bBakeToLocalSpace;
 
 	// 读的是网格对象而不是 scene proxy：隐藏的、或当前没在渲染的组件，存出来的东西完全一样。
 	return UCSMeshOps::CopyToStaticMesh(GpuMesh, this, GetOwner(), Options);

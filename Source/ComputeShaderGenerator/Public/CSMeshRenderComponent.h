@@ -76,9 +76,10 @@ public:
 	 * 不需要任何东西正在渲染这份几何——读的是网格对象，不是 scene proxy。
 	 * AssetPathAndName 留空则由落盘层兜底到当前关卡旁的 AutoResult 目录。
 	 * bSaveAsset=false（默认）只把资产标脏，留给手动保存。
+	 * bBakeToLocalSpace=false 表示常驻数据本来就是局部空间的，别再变换（此时 BakeSpace 不参与）。
 	 */
 	UStaticMesh* SaveToStaticMesh(const FTransform& BakeSpace, const FString& AssetPathAndName = TEXT(""),
-		bool bReplaceExistingAsset = true, bool bSaveAsset = false);
+		bool bReplaceExistingAsset = true, bool bSaveAsset = false, bool bBakeToLocalSpace = true);
 #endif
 
 	//~ UPrimitiveComponent interface

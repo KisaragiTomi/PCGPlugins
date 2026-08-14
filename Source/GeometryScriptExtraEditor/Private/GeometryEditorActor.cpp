@@ -4416,27 +4416,20 @@ void AVineContainer::SaveStaticmesh()
 	}
 	const FString AssetName = FPackageName::GetShortName(AssetPathAndName);
 
-	// The vine only ever exists as GPU streams, so this is the one point where it comes back: one
-	// blocking readback of the mesh object, converted straight to a StaticMesh. Asked of VineGeometry and
-	// not of VineGpuMesh on purpose — the readback no longer needs a live scene proxy, so a vine that
-	// is hidden, unregistered or simply off-screen saves exactly the same way.
+	// 藤蔓只以 GPU 流的形式存在，这里是它唯一回到 CPU 的地方：一次阻塞回读，直接转成 StaticMesh。
+	// 走组件那条公用入口——落盘读的是网格对象而不是 scene proxy，所以藤蔓被隐藏、未注册或只是
+	// 不在屏幕上，存出来的东西完全一样。
 	//
-	// The renderer is pinned to an identity world transform, so its component transform is useless
-	// for the local-space bake. Bake out of the ACTOR transform instead — it is what the spawned
-	// StaticMeshActor below is placed at, so the asset ends up actor-local rather than frozen at
-	// world coordinates.
-	FCSMeshToStaticMeshOptions SaveOptions;
-	SaveOptions.AssetPath = AssetPathAndName;
-	SaveOptions.bTransient = false; // this entry point's whole purpose is to produce an asset
-	SaveOptions.bReplaceExisting = true;
-	SaveOptions.bSaveToDisk = true;
-	SaveOptions.TargetTransform = GetActorTransform();
-	SaveOptions.bBakeToLocalSpace = true;
-	// The single material slot comes from VineGeometry's own table, which ApplyVineMaterialToLeaf keeps
-	// equal to VineMaterial. The per-triangle ids the readback pairs with it are all zero because the
-	// build clears that stream — without which the pool's previous tenant decides how many slots this
-	// asset ends up with.
-	UStaticMesh* NewStaticMesh = UCSMeshOps::CopyToStaticMesh(VineGeometry, this, this, SaveOptions);
+	// 烘焙空间用 ACTOR 变换：渲染组件钉在单位世界变换上，它的组件变换对局部空间烘焙毫无用处。
+	// actor 变换正是下面 SpawnAttachedResultActor 摆放结果 actor 的位置，于是资产是 actor-local
+	// 的，而不是冻结在世界坐标上。
+	//
+	// 单个材质槽来自 VineGeometry 自己的材质表（ApplyVineMaterialToLeaf 保证它等于 VineMaterial）。
+	// 与之配对的逐三角 id 全是 0，因为构建会清掉那条流——不清的话，buffer 池上一位租客决定这个
+	// 资产最后有几个槽。
+	UStaticMesh* NewStaticMesh = VineGpuMesh
+		? VineGpuMesh->SaveToStaticMesh(GetActorTransform(), AssetPathAndName, /*bReplace*/ true, /*bSaveAsset*/ true)
+		: nullptr;
 	if (!NewStaticMesh)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[VineContainer] SaveStaticmesh failed: could not create %s (no rendered vine geometry?)."), *AssetPathAndName);

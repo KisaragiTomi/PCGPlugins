@@ -502,50 +502,6 @@ UStaticMesh* UCSGpuMeshComponent::SaveGpuMeshDataToStaticMesh(
 	return StaticMesh;
 }
 
-UStaticMesh* UCSGpuMeshComponent::SaveRenderedMeshToStaticMesh(
-	const FString& AssetPathAndName,
-	UMaterialInterface* Material,
-	const FTransform& ActorTransform,
-	bool bConvertToActorLocalSpace,
-	bool bReplaceExistingAsset,
-	bool bSaveAsset)
-{
-	// 这个函数只做两件事：把本组件的 GPU 网格回读到 CPU，然后交给公用转换入口。
-	// 路径校验、材质槽装配、绕序与退化面处理全部收敛在下面的 BuildStaticMesh 里，不再各写一份。
-	FCSGpuMeshCPUData MeshData;
-	if (!ReadbackMeshSync(MeshData))
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: GPU mesh readback returned no valid triangles."));
-		return nullptr;
-	}
-
-	// 调用方给的单材质仍然生效；组件回读若已带材质表则以它为准（多材质路径）。
-	if (MeshData.Materials.IsEmpty() && Material) MeshData.Materials.Add(Material);
-
-	FCSGpuMeshConvertOptions ConvertOptions;
-	ConvertOptions.TargetTransform = ActorTransform;
-	ConvertOptions.bBakeToLocalSpace = bConvertToActorLocalSpace;
-
-	FCSGpuMeshAssetOptions AssetOptions;
-	AssetOptions.AssetPath = AssetPathAndName.TrimStartAndEnd();
-	if (AssetOptions.AssetPath.IsEmpty())
-	{
-		AssetOptions.AssetPath = BuildDefaultResultAssetPath(GetOwner());
-		if (AssetOptions.AssetPath.IsEmpty())
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: no path given and could not derive a default 'result' folder from the current level (unsaved map?). Pass an explicit /Game/... path."));
-			return nullptr;
-		}
-		UE_LOG(LogTemp, Display, TEXT("[CSGpuMesh] No path given; defaulting to '%s' (result folder next to the current level)."), *AssetOptions.AssetPath);
-	}
-	AssetOptions.bReplaceExisting = bReplaceExistingAsset;
-	AssetOptions.bSaveToDisk = bSaveAsset;
-
-	return BuildStaticMesh(
-		this, GetOwner(), MeshData, TArray<UMaterialInterface*>(),
-		ConvertOptions, AssetOptions);
-}
-
 #endif // WITH_EDITOR
 
 

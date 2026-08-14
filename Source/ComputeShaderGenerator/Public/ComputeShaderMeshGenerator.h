@@ -547,10 +547,6 @@ public:
 	// by GetBoxSceneFilteredSurfaceVoxels. Not a UPROPERTY (holds render resources).
 	FCSSurfaceVoxelGPUBuffers LastSurfaceVoxelGPUBuffers;
 
-	/** Triangle surface data used by the CPU/BVH vine visualization path.
-	 *  Filled by GenerateVines(). */
-	FCSTriangleMeshData CachedSurfaceTriangles;
-
 	/** 结果资产名尾部的稳定编号（YYMMDDHHMM）。-1 表示尚未生成，首次保存时由
 	 *  EnsureGeneratorTimeCode() 赋值并随 actor 存盘，之后每次运行都复用。 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Generator|Mesh|Debug")

@@ -9,7 +9,7 @@
 #include "ComputeShaderShallowWater.h"
 #include "CSShallowWaterProcess.h"
 #include "GPUSkeletalTree.h"
-#include "VineContainerViewportOverlay.h"
+#include "ViewEditCategoryViewportOverlay.h"
 #include "Animation/Skeleton.h"
 #include "Editor.h"
 #include "EditorModeManager.h"
@@ -176,7 +176,7 @@ void FPCGEditorProcessModule::ShutdownModule()
 		PostEngineInitHandle.Reset();
 	}
 
-	VineContainerViewportOverlay.Reset();
+	ViewEditCategoryViewportOverlay.Reset();
 	AMeshGeneratorBrushCache::OnInstanceBrushEditorRequest.RemoveAll(this);
 	ACSPointBrushActor::OnPointBrushEditorRequest.RemoveAll(this);
 	AGPUSkeletalTree::OnGenerateTreeEditorRequest.Unbind();
@@ -226,8 +226,8 @@ void FPCGEditorProcessModule::InitializeEditorUI()
 		bPointBrushModeRegistered = true;
 	}
 
-	VineContainerViewportOverlay = MakeUnique<FVineContainerViewportOverlay>();
-	VineContainerViewportOverlay->Start();
+	ViewEditCategoryViewportOverlay = MakeUnique<FViewEditCategoryViewportOverlay>();
+	ViewEditCategoryViewportOverlay->Start();
 }
 
 void FPCGEditorProcessModule::StartInstanceBrush(AComputeShaderMeshGenerator* TargetActor)

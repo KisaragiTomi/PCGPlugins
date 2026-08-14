@@ -20,8 +20,9 @@
 #include "ShaderParameterStruct.h"
 #include "ComputeShaderBasicFunction.h"
 #include "ComputeShaderGenerateHelper.h"
+#include "CSGpuDebugDraw.h"
+#include "CSDisplayComponent.h"
 #include "Engine/Level.h"
-#include "Kismet/KismetSystemLibrary.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -1365,6 +1366,15 @@ struct FVineBuildInput
 	// the GPUVox* pooled refs above stay null and the pass graph reads the in-graph refs instead.
 	bool bUseFusedVoxels = false;
 	FCSSurfaceVoxelPassInputs SurfaceVoxelInputs;
+
+	// 体素调试的唯一出口。非空时，融合体素 pass 记录完就把它的 position/normal/counter 三个
+	// RDG buffer extract 成 pooled，交给 UCSDisplayComponent 画。
+	//
+	// 为什么是 extract 而不是另跑一遍：融合图里的体素是 transient，图一 Execute 就没了，而调试
+	// 绘制要跨帧存活。以前这个需求是靠 PrepareBoxSceneSurfaceVoxelsGPU 走旧 pooled 路径「再算一遍」
+	// 满足的——那等于把同一片场景体素化两次，还附带一次 FlushRenderingCommands。extract 只是让
+	// 已经算好的结果多一份引用，不增加任何 dispatch。
+	FCSGpuDebugPooledSource* OutDebugVoxelSource = nullptr;
 
 	// Scalars / counts (every value the pass graph reads).
 	FVector3f VoxelOrigin = FVector3f::ZeroVector;
@@ -3459,6 +3469,20 @@ static bool BuildVineGeometryIntoMesh(UCSMesh* Target, const FVineBuildInput& In
 			In.GPUVoxNormalsRDG = VoxelOut.Normals;
 			In.GPUVoxTargetsRDG = VoxelOut.TargetPositions;
 			In.GPUVoxCounterRDG = VoxelOut.Counter;
+
+			// 调试可视化：只把已经算好的 buffer 多留一份 pooled 引用，不追加任何 dispatch。
+			// 画的是 TargetPositions（表面吸附点）而不是 Positions（体素中心）——藤蔓贴的就是前者，
+			// 调试线要和实际投影目标对齐才有意义。
+			if (FCSGpuDebugPooledSource* DebugOut = Input.OutDebugVoxelSource)
+			{
+				DebugOut->Reset();
+				GraphBuilder.QueueBufferExtraction(VoxelOut.TargetPositions, &DebugOut->Positions);
+				GraphBuilder.QueueBufferExtraction(VoxelOut.Normals, &DebugOut->Normals);
+				GraphBuilder.QueueBufferExtraction(VoxelOut.Counter, &DebugOut->Counter);
+				DebugOut->Capacity = int32(VoxelOut.VoxelCapacity);
+				DebugOut->ItemSize = VoxelOut.VoxelSize;
+				DebugOut->WorldBounds = Input.SurfaceVoxelInputs.GetWorldBounds();
+			}
 		}
 
 		if (Input.bUseGPULines)
@@ -3714,14 +3738,14 @@ bool AVineContainer::EnsureVineGeometry()
 
 	// The source and target instance sets are the only serialized inputs a vine is derived from;
 	// everything else (surface voxels, the solved center lines, the build bundle) is transient GPU
-	// state a level load does not restore. With either side empty GenerateVines() bails anyway —
+	// state a level load does not restore. With either side empty GenerateVineGPU() bails anyway —
 	// but only after EnsureTriangleCacheByBox and the scene voxel prep have already run, so the
 	// cheap check has to happen here. An actor that never had a vine therefore stays silent.
 	const int32 SourceCount = TubeVineSource ? TubeVineSource->GetInstanceCount() : 0;
 	const int32 TargetCount = GrowTarget ? GrowTarget->GetInstanceCount() : 0;
 	if (SourceCount == 0 || TargetCount == 0) return false;
 
-	return GenerateVines();
+	return GenerateVineGPU();
 }
 
 // Why PostRegisterAllComponents, and why the work is still pushed a tick out.
@@ -3923,16 +3947,149 @@ void AVineContainer::ExportTransformArrayToFoliage(UFoliageType* InFoliageType)
 	RefreshVineDisplayComponent(FoliageDisplayComponent);
 	RefreshFoliageType(GetWorld(), InFoliageType);
 }
-
-bool AVineContainer::VisVine()
+inline void AVineContainer::Clean()
 {
-	return VisVineGPUInternal();
+	ClearDebugVineSplineActor();
+
+	// The vine itself, which this used to leave standing: every CPU-side cache the generation
+	// produced was emptied and the geometry outlived all of it, so "Clean All" left the actor still
+	// drawing a vine built from inputs that no longer existed. Nothing else drops it either — a
+	// render-state recreation is a rebind now — so the stale vine survived until the next explicit
+	// generation. Releasing it is also what puts EnsureVineGeometry() back in play: that decides from
+	// the geometry, so a retained vine makes it answer "there is already one" forever.
+	//
+	// Unbind first, in that order: the proxy borrows the resident buffers, so freeing them while it
+	// is still bound leaves it drawing from an index buffer that no longer exists.
+	if (VineGpuMesh) VineGpuMesh->SetGpuMesh(nullptr);
+	// ReleaseSync rather than Reset: Reset zeroes the counters but keeps the VRAM, and nothing hands
+	// it back afterwards — EnsureCapacitySync only grows, and the ShrinkCapacitySync that would give
+	// it up runs at the end of a build, which is precisely what Clean is saying not to do. The vine's
+	// capacity comes from VV.MaxVinePointCount (a million points by default), so a Reset here would
+	// park the largest allocation this actor ever makes in VRAM for the rest of the session, behind a
+	// button labelled Clean. The guard keeps a Clean on an actor with no vine from paying the flush.
+	const FCSMeshResident* VineResident = VineGeometry ? VineGeometry->GetResidentPtr() : nullptr;
+	if (VineResident && VineResident->IsAllocated()) VineGeometry->ReleaseSync();
 }
 
-bool AVineContainer::VisVineGPUInternal()
-{
-	const TArray<FGeometryScriptPolyPath>& Lines = TubeLines; // GPU path leaves this empty; used only for logging.
 
+static const FName VineDebugSplineActorTag(TEXT("VineDebugSplineActor"));
+
+// 现在没有任何代码给 DebugVineSplineActor 赋非空值——画中心线的调试样条 actor 那条路已经退休了。
+// 但这个函数仍被生成路径调用，且**必须保留**：下半段扫的是带 VineDebugSplineActorTag 的挂载 actor，
+// 那是旧版本已经存进关卡里的残留，只有这里会清。删掉它们就永远留在关卡里，而且没人知道是什么。
+// 成员本身留着是同理：它是 Transient，删掉不影响序列化，但留着才好在恢复调试样条时接回去。
+void AVineContainer::ClearDebugVineSplineActor()
+{
+	if (DebugVineSplineActor)
+	{
+		DebugVineSplineActor->Modify();
+		DebugVineSplineActor->Destroy();
+		DebugVineSplineActor = nullptr;
+	}
+
+	TArray<AActor*> AttachedActors;
+	GetAttachedActors(AttachedActors);
+	for (AActor* AttachedActor : AttachedActors)
+	{
+		if (AttachedActor && AttachedActor->Tags.Contains(VineDebugSplineActorTag))
+		{
+			AttachedActor->Modify();
+			AttachedActor->Destroy();
+		}
+	}
+}
+
+// 藤蔓生成的 GPU 段：三角形缓存 -> 表面体素 -> 空间殖民求解 -> concat -> 建网格。
+//
+// 这些以前是 4 张 RDG 图外加一次 FlushRenderingCommands：EnsureTriangleCache 之后
+// PrepareBoxSceneSurfaceVoxelsGPU 自己开三张图（清零 / 分批体素化 / finalize+blur），把结果
+// extract 成 pooled buffer，然后阻塞 game thread —— 而藤蔓这条路传的是 bReadbackToCPU=false，
+// 没有任何数据要回读，那次 flush 纯粹是为了让 CPU 能读一个 IsValid()。
+//
+// 现在这里只做 CPU 侧准备，体素的 pass 由 BuildVineGeometryIntoMesh 记录进 VineGeometry 那次
+// EditMeshSync 的图里，和 SC 求解、建网格合并执行：没有中间 Execute，没有 pooled extract，
+// 也没有 flush。分批仍然保留（见 AddCSSurfaceVoxelPasses），显存行为不变。
+bool AVineContainer::GenerateVineGPU()
+{
+	GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVineGPU.Total"));
+
+	// 包围盒在这里现算而不是要调用方给：蓝图侧拿不到 source/target 的 transform 列表，
+	// 让它自己拼 FBox 只会拼出一个和体素化范围对不上的盒子。
+	TArray<FTransform> SourceTransforms;
+	TArray<FTransform> TargetTransforms;
+	GetVineInstanceTransforms(TubeVineSource, SourceTransforms);
+	GetVineInstanceTransforms(GrowTarget, TargetTransforms);
+	if (SourceTransforms.IsEmpty() || TargetTransforms.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[GenerateVineGPU] %s 没有 source 或 target，无法生成藤蔓。"), *GetActorNameOrLabel());
+		return false;
+	}
+
+	TArray<FVector> BoundsPoints;
+	BoundsPoints.Reserve(SourceTransforms.Num() + TargetTransforms.Num());
+	for (const FTransform& T : SourceTransforms) BoundsPoints.Add(T.GetLocation());
+	for (const FTransform& T : TargetTransforms) BoundsPoints.Add(T.GetLocation());
+
+	SurfaceVoxelBlurIterations = FMath::Max(0, VV.GenerateVineVoxelNormalBlurIterations);
+
+	const FBox Bounds = FBox(BoundsPoints).ExpandBy(50.0);
+	const FVector Center = Bounds.GetCenter();
+	const FVector Extent = Bounds.GetExtent();
+
+	// 1. 摆盒子：后面的体素查询范围（GetGeneratorBoundsWorldBox）就是从 GeneratorBounds 读的。
+	//    纯 CPU / 组件操作，不碰 GPU。
+	//
+	//    这里以前调的是 EnsureTriangleCacheByBox，但藤蔓只需要「盒子被摆好」这个副作用：表面体素
+	//    走的是 PrepareSurfaceVoxelPassInputs 自己的场景三角形收集，从不读脏页三角缓存的任何产出
+	//    （句柄当场就被 (void) 丢掉了），而那次调用要为每个参考点扫一遍 17³ 邻域并管理页分配。
+	//    产出无人消费，改为只摆盒子。VoxelGridSettings 仍要写：缓存以外的路径也读它。
+	{
+		VoxelGridSettings.VoxelSize = SC.VoxelSize;
+		VoxelGridSettings.ActivationRadius = SC.VoxelSize * 8.0f;
+		if (GeneratorBounds)
+		{
+			GeneratorBounds->SetWorldLocation(Center);
+			GeneratorBounds->SetBoxExtent(FVector(
+				FMath::Max(0.0, Extent.X), FMath::Max(0.0, Extent.Y), FMath::Max(0.0, Extent.Z)));
+		}
+	}
+
+	// 重建三角形剔除用的参考点。剔除按「离任一参考点多远」来砍，而 ReferencePoints 历史上只有
+	// 视口按钮那条路会写——蓝图直接调生成入口时它要么是空的（剔除静默失效），要么还是上一批
+	// target（按错误位置剔除，表面整块缺失、藤蔓穿模）。两种都是错误结果，所以不依赖调用者，
+	// 每次都用当前这批 target 重填。
+	ReferencePoints.Reset();
+	ReferencePoints.Reserve(TargetTransforms.Num());
+	for (const FTransform& T : TargetTransforms) ReferencePoints.Add(T.GetLocation());
+
+	// 表面三角形的参考点剔除距离。三个三角形展开 pass（Extract / FilterInitialTriangleSoup /
+	// AppendNaniteSource）本来就是边展开边按参考点剔除的，但这里以前传 0——而 0 会让
+	// ReferenceFilterDistanceSq 取 FLT_MAX，开关却仍是 1（ReferencePoints 是非空的 target 列表），
+	// 于是每个三角形都对全部 target 跑一遍无 early-out 的最近距离循环再无条件通过：代价照付，一个
+	// 不剔。ReferencePoints 就是 target 位置，藤蔓中心线不会长到离 target 更远处，按生长影响半径的
+	// 倍数取即可；下限压着体素投影的搜索半径（VoxelSize*8）——剔除范围一旦小于投影搜索范围，边界
+	// 处就会找不到吸附目标，中心线会飘离表面。
+	const float SurfaceTriangleFilterDistance = FMath::Max(SC.InfluenceRadius * 2.0f, SC.VoxelSize * 8.0f);
+
+	// 2. 体素：只做 CPU 侧准备（收集并解析三角形请求、地形三角形、参数），不 dispatch。
+	//    产出的 bundle 一路带到叶子的图里由 AddCSSurfaceVoxelPasses 记录。
+	{
+		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVineGPU.PrepareSurfaceVoxelInputs"));
+		PendingSurfaceVoxelInputs = FCSSurfaceVoxelPassInputs();
+		if (!PrepareSurfaceVoxelPassInputs(SC.VoxelSize, SurfaceTriangleFilterDistance, PendingSurfaceVoxelInputs))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[GenerateVineGPU] 范围内没有可体素化的几何，%s 无法生成藤蔓。"), *GetActorNameOrLabel());
+			return false;
+		}
+	}
+	// Cache generation bounds for subsequent GPU visualization.
+	InstanceBound = Bounds;
+
+	// 3. SpaceColonization 不再在这里跑：它已经和 concat、建网格合并进 VisVineGPUInternal 的那张
+	// RDG 图，由它自行从当前的 source/target transforms 准备输入。
+
+	// 4. 建网格：体素 pass、SC 求解 + concat、建网格三段合并进 VineGeometry 那一次 EditMeshSync
+	//    的 RDG 图，一次 Execute 跑完。结果只存在于它的常驻 stream 里，没有 CPU 网格可返回。
 	if (VV.ResampleLength <= KINDA_SMALL_NUMBER)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] Invalid ResampleLength: %.4f"), VV.ResampleLength);
@@ -3963,13 +4120,10 @@ bool AVineContainer::VisVineGPUInternal()
 	const FCSSurfaceVoxelData EmptySurfaceVoxelData;
 
 	// The space-colonization solve is recorded into the leaf's own graph, so all this side needs
-	// is its CPU-prepped inputs; the resulting counts stay on the GPU.
-	TArray<FTransform> SCSourceTransforms;
-	TArray<FTransform> SCTargetTransforms;
-	GetVineInstanceTransforms(TubeVineSource, SCSourceTransforms);
-	GetVineInstanceTransforms(GrowTarget, SCTargetTransforms);
+	// is its CPU-prepped inputs; the resulting counts stay on the GPU. 复用上面算包围盒时取到的
+	// 那两份 transform：实例列表这一趟里不会变，重新查一遍只是多遍历一次实例组件。
 	FVineFusedSCInputs FusedSCInputs;
-	if (!PrepareVineFusedSCInputs(SCSourceTransforms, SCTargetTransforms, FusedSCInputs))
+	if (!PrepareVineFusedSCInputs(SourceTransforms, TargetTransforms, FusedSCInputs))
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[VisVineGPU] No vine sources or targets to solve."));
 		return false;
@@ -4044,6 +4198,9 @@ bool AVineContainer::VisVineGPUInternal()
 	uint32 LeafVertexCount = 0;
 	uint32 LeafIndexCount = 0;
 
+	// 融合图 extract 出来的体素调试数据。EditMeshSync 返回后（图已 Execute）才有效。
+	FCSGpuDebugPooledSource DebugVoxelSource;
+
 	// The vine is VineGeometry: the shared vine compute passes emit straight into its resident streams
 	// (positions / tangents / texcoords / colors / indices) plus the indirect args and mesh counters
 	// that drive the draw, so no vertex, index or count ever comes back to the CPU. Save Mesh reads
@@ -4088,6 +4245,13 @@ bool AVineContainer::VisVineGPUInternal()
 		LeafVertexCount = LeafInput.OutputVertexCount;
 		LeafIndexCount = LeafInput.OutputIndexCount;
 
+		// 体素调试：只在真要画的时候才挂出口，否则一次 extract 都不做。
+		// 条件与旧的调试块一致（开关 + 时长），差别是不再另跑一遍体素化。
+		const bool bWantVoxelDebug = GPUProjectionDebug.bDrawGPUProjectionVoxelDebugPoints
+			&& (GPUProjectionDebug.GPUProjectionVoxelDebugDuration > 0.0f || GPUProjectionDebug.bGPUProjectionVoxelDebugPointsPersistent)
+			&& DisplayComponent != nullptr;
+		if (bWantVoxelDebug) LeafInput.OutDebugVoxelSource = &DebugVoxelSource;
+
 		// Outered to this actor, not to the component: the vine belongs to the container, which is
 		// what decides when one exists. A component-owned mesh would die with a component swap.
 		if (!VineGeometry) VineGeometry = NewObject<UCSMesh>(this);
@@ -4114,213 +4278,34 @@ bool AVineContainer::VisVineGPUInternal()
 	}
 	const double BuildLeafMs = (FPlatformTime::Seconds() - BuildLeafStartSeconds) * 1000.0;
 
+	// 体素调试绘制。数据来自建网格那张图 extract 出的 pooled buffer——体素只算了一次，
+	// 这里没有额外 dispatch，也没有 readback 或 flush。
+	if (DebugVoxelSource.IsValid())
+	{
+		const float DirectionLength = DebugVoxelSource.ItemSize > 0.0f ? DebugVoxelSource.ItemSize : SC.VoxelSize;
+		const float Lifetime = GPUProjectionDebug.bGPUProjectionVoxelDebugPointsPersistent
+			? -1.0f
+			: GPUProjectionDebug.GPUProjectionVoxelDebugDuration;
+		const int32 Drawn = DisplayComponent->ShowVoxelDirections(
+			DebugVoxelSource,
+			DirectionLength,
+			GPUProjectionDebug.GPUProjectionVoxelTargetColor,
+			true,
+			GPUProjectionDebug.GPUProjectionVoxelCenterColor,
+			GPUProjectionDebug.GPUProjectionVoxelDebugPointLimit,
+			Lifetime);
+		UE_LOG(LogTemp, Display, TEXT("[VisVineGPU] 体素调试：容量 %d，提交绘制 %d。"),
+			DebugVoxelSource.Capacity, Drawn);
+	}
+
 	// Clear any persistent CPU DrawDebug lines left by an older generation.
 	ClearDebugVineSplineActor();
 
 	UE_LOG(LogTemp, Display, TEXT("[VisVineGPUTiming] tube buildLeaf=%.3f ms"), BuildLeafMs);
-	UE_LOG(LogTemp, Log, TEXT("[VisVineGPU] Built tube vine on the GPU. Lines=%d Vertices=%u Indices=%u"),
-		Lines.Num(),
+	UE_LOG(LogTemp, Log, TEXT("[VisVineGPU] Built tube vine on the GPU. Vertices=%u Indices=%u"),
 		LeafVertexCount,
 		LeafIndexCount);
 	return true;
-}
-
-inline void AVineContainer::Clean()
-{
-	TubeLines.Empty();
-	TubeLineSourceLocations.Empty();
-	TubeLinePointScales.Empty();
-	TubeLinePointAxes.Empty();
-	CachedSurfaceTriangles = FCSTriangleMeshData();
-	ClearDebugVineSplineActor();
-
-	// The vine itself, which this used to leave standing: every CPU-side cache the generation
-	// produced was emptied and the geometry outlived all of it, so "Clean All" left the actor still
-	// drawing a vine built from inputs that no longer existed. Nothing else drops it either — a
-	// render-state recreation is a rebind now — so the stale vine survived until the next explicit
-	// generation. Releasing it is also what puts EnsureVineGeometry() back in play: that decides from
-	// the geometry, so a retained vine makes it answer "there is already one" forever.
-	//
-	// Unbind first, in that order: the proxy borrows the resident buffers, so freeing them while it
-	// is still bound leaves it drawing from an index buffer that no longer exists.
-	if (VineGpuMesh) VineGpuMesh->SetGpuMesh(nullptr);
-	// ReleaseSync rather than Reset: Reset zeroes the counters but keeps the VRAM, and nothing hands
-	// it back afterwards — EnsureCapacitySync only grows, and the ShrinkCapacitySync that would give
-	// it up runs at the end of a build, which is precisely what Clean is saying not to do. The vine's
-	// capacity comes from VV.MaxVinePointCount (a million points by default), so a Reset here would
-	// park the largest allocation this actor ever makes in VRAM for the rest of the session, behind a
-	// button labelled Clean. The guard keeps a Clean on an actor with no vine from paying the flush.
-	const FCSMeshResident* VineResident = VineGeometry ? VineGeometry->GetResidentPtr() : nullptr;
-	if (VineResident && VineResident->IsAllocated()) VineGeometry->ReleaseSync();
-}
-
-
-static const FName VineDebugSplineActorTag(TEXT("VineDebugSplineActor"));
-
-// 现在没有任何代码给 DebugVineSplineActor 赋非空值——画中心线的调试样条 actor 那条路已经退休了。
-// 但这个函数仍被生成路径调用，且**必须保留**：下半段扫的是带 VineDebugSplineActorTag 的挂载 actor，
-// 那是旧版本已经存进关卡里的残留，只有这里会清。删掉它们就永远留在关卡里，而且没人知道是什么。
-// 成员本身留着是同理：它是 Transient，删掉不影响序列化，但留着才好在恢复调试样条时接回去。
-void AVineContainer::ClearDebugVineSplineActor()
-{
-	if (DebugVineSplineActor)
-	{
-		DebugVineSplineActor->Modify();
-		DebugVineSplineActor->Destroy();
-		DebugVineSplineActor = nullptr;
-	}
-
-	TArray<AActor*> AttachedActors;
-	GetAttachedActors(AttachedActors);
-	for (AActor* AttachedActor : AttachedActors)
-	{
-		if (AttachedActor && AttachedActor->Tags.Contains(VineDebugSplineActorTag))
-		{
-			AttachedActor->Modify();
-			AttachedActor->Destroy();
-		}
-	}
-}
-
-bool AVineContainer::GenerateVines(float ExtrudeScale, bool Result)
-{
-	GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVines.Total"));
-
-	// 实现只有 GenerateVineGPU 一份：收集 transform、算包围盒、体素化、SC 求解、建网格全在那边，
-	// 这里以前那份包围盒计算是它的重复副本。保留本入口只为不打断已有蓝图连线。
-	return GenerateVineGPU(ExtrudeScale, Result);
-}
-
-// 藤蔓生成的 GPU 段：三角形缓存 -> 表面体素 -> 空间殖民求解 -> concat -> 建网格。
-//
-// 这些以前是 4 张 RDG 图外加一次 FlushRenderingCommands：EnsureTriangleCache 之后
-// PrepareBoxSceneSurfaceVoxelsGPU 自己开三张图（清零 / 分批体素化 / finalize+blur），把结果
-// extract 成 pooled buffer，然后阻塞 game thread —— 而藤蔓这条路传的是 bReadbackToCPU=false，
-// 没有任何数据要回读，那次 flush 纯粹是为了让 CPU 能读一个 IsValid()。
-//
-// 现在这里只做 CPU 侧准备，体素的 pass 由 BuildVineGeometryIntoMesh 记录进 VineGeometry 那次
-// EditMeshSync 的图里，和 SC 求解、建网格合并执行：没有中间 Execute，没有 pooled extract，
-// 也没有 flush。分批仍然保留（见 AddCSSurfaceVoxelPasses），显存行为不变。
-bool AVineContainer::GenerateVineGPU(float ExtrudeScale, bool Result)
-{
-	GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVineGPU.Total"));
-	(void)ExtrudeScale;
-	(void)Result;
-
-	// 包围盒在这里现算而不是要调用方给：蓝图侧拿不到 source/target 的 transform 列表，
-	// 让它自己拼 FBox 只会拼出一个和体素化范围对不上的盒子。
-	TArray<FTransform> SourceTransforms;
-	TArray<FTransform> TargetTransforms;
-	GetVineInstanceTransforms(TubeVineSource, SourceTransforms);
-	GetVineInstanceTransforms(GrowTarget, TargetTransforms);
-	if (SourceTransforms.IsEmpty() || TargetTransforms.IsEmpty())
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[GenerateVineGPU] %s 没有 source 或 target，无法生成藤蔓。"), *GetActorNameOrLabel());
-		return false;
-	}
-
-	TArray<FVector> BoundsPoints;
-	BoundsPoints.Reserve(SourceTransforms.Num() + TargetTransforms.Num());
-	for (const FTransform& T : SourceTransforms) BoundsPoints.Add(T.GetLocation());
-	for (const FTransform& T : TargetTransforms) BoundsPoints.Add(T.GetLocation());
-
-	SurfaceVoxelBlurIterations = FMath::Max(0, VV.GenerateVineVoxelNormalBlurIterations);
-	return GenerateVineGPUInBounds(FBox(BoundsPoints).ExpandBy(50.0));
-}
-
-bool AVineContainer::GenerateVineGPUInBounds(const FBox& Bounds)
-{
-	GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVineGPUInBounds"));
-	const FVector Center = Bounds.GetCenter();
-	const FVector Extent = Bounds.GetExtent();
-
-	// 1. 摆盒子：后面的体素查询范围（GetGeneratorBoundsWorldBox）就是从 GeneratorBounds 读的。
-	//    纯 CPU / 组件操作，不碰 GPU。
-	//
-	//    这里以前调的是 EnsureTriangleCacheByBox，但藤蔓只需要「盒子被摆好」这个副作用：表面体素
-	//    走的是 PrepareSurfaceVoxelPassInputs 自己的场景三角形收集，从不读脏页三角缓存的任何产出
-	//    （句柄当场就被 (void) 丢掉了），而那次调用要为每个参考点扫一遍 17³ 邻域并管理页分配。
-	//    产出无人消费，改为只摆盒子。VoxelGridSettings 仍要写：缓存以外的路径也读它。
-	{
-		VoxelGridSettings.VoxelSize = SC.VoxelSize;
-		VoxelGridSettings.ActivationRadius = SC.VoxelSize * 8.0f;
-		if (GeneratorBounds)
-		{
-			GeneratorBounds->SetWorldLocation(Center);
-			GeneratorBounds->SetBoxExtent(FVector(
-				FMath::Max(0.0, Extent.X), FMath::Max(0.0, Extent.Y), FMath::Max(0.0, Extent.Z)));
-		}
-	}
-
-	// 重建三角形剔除用的参考点。剔除按「离任一参考点多远」来砍，而 ReferencePoints 原本只有
-	// GenerateVineAction 会写——蓝图直接调 GenerateVines 时它要么是空的（剔除静默失效），要么还是
-	// 上一批 target（按错误位置剔除，表面整块缺失、藤蔓穿模）。两种都是错误结果，所以不依赖调用者，
-	// 每次都用当前这批 target 重填。
-	{
-		TArray<FTransform> TargetTransforms;
-		GetVineInstanceTransforms(GrowTarget, TargetTransforms);
-		ReferencePoints.Reset();
-		ReferencePoints.Reserve(TargetTransforms.Num());
-		for (const FTransform& TargetTransform : TargetTransforms) ReferencePoints.Add(TargetTransform.GetLocation());
-	}
-
-	// 表面三角形的参考点剔除距离。三个三角形展开 pass（Extract / FilterInitialTriangleSoup /
-	// AppendNaniteSource）本来就是边展开边按参考点剔除的，但这里以前传 0——而 0 会让
-	// ReferenceFilterDistanceSq 取 FLT_MAX，开关却仍是 1（ReferencePoints 是非空的 target 列表），
-	// 于是每个三角形都对全部 target 跑一遍无 early-out 的最近距离循环再无条件通过：代价照付，一个
-	// 不剔。ReferencePoints 就是 target 位置，藤蔓中心线不会长到离 target 更远处，按生长影响半径的
-	// 倍数取即可；下限压着体素投影的搜索半径（VoxelSize*8）——剔除范围一旦小于投影搜索范围，边界
-	// 处就会找不到吸附目标，中心线会飘离表面。
-	const float SurfaceTriangleFilterDistance = FMath::Max(SC.InfluenceRadius * 2.0f, SC.VoxelSize * 8.0f);
-
-	// 2. 体素：只做 CPU 侧准备（收集并解析三角形请求、地形三角形、参数），不 dispatch。
-	//    产出的 bundle 一路带到叶子的图里由 AddCSSurfaceVoxelPasses 记录。
-	{
-		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVineGPU.PrepareSurfaceVoxelInputs"));
-		PendingSurfaceVoxelInputs = FCSSurfaceVoxelPassInputs();
-		if (!PrepareSurfaceVoxelPassInputs(SC.VoxelSize, SurfaceTriangleFilterDistance, PendingSurfaceVoxelInputs))
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[GenerateVineGPU] 范围内没有可体素化的几何，%s 无法生成藤蔓。"), *GetActorNameOrLabel());
-			return false;
-		}
-	}
-	CachedSurfaceTriangles = FCSTriangleMeshData();
-	// Cache generation bounds for subsequent GPU visualization.
-	InstanceBound = Bounds;
-
-	// 3. SpaceColonization 不再在这里跑：它已经和 concat、建网格合并进 VisVine 的那张 RDG 图，
-	// 由 VisVine() 自行从当前的 source/target transforms 准备输入。这些 CPU 线数组随之作废
-	// （GPU 路径从不填充它们），保持清空以匹配旧行为。
-	TubeLines.Reset();
-	TubeLineSourceLocations.Reset();
-	TubeLinePointScales.Reset();
-	TubeLinePointAxes.Reset();
-
-	// 体素调试线画的是 LastSurfaceVoxelGPUBuffers，那是旧 pooled 路径的产物；融合路径下体素
-	// 只活在构建那张图里，没有 pooled 副本可画。要用这个调试就得走旧接口单独跑一次体素。
-	if (GPUProjectionDebug.bDrawGPUProjectionVoxelDebugPoints && GPUProjectionDebug.GPUProjectionVoxelDebugDuration > 0.0f)
-	{
-		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVineGPU.DrawGPUProjectionVoxelDebugPoints"));
-		if (PrepareBoxSceneSurfaceVoxelsGPU(SC.VoxelSize))
-		{
-			FCSDebugLastVoxelDirectionOptions DebugOptions;
-			DebugOptions.DirectionLength = SC.VoxelSize;
-			DebugOptions.DirectionColor = GPUProjectionDebug.GPUProjectionVoxelTargetColor;
-			DebugOptions.Duration = GPUProjectionDebug.GPUProjectionVoxelDebugDuration;
-			DebugOptions.bPersistentLines = GPUProjectionDebug.bGPUProjectionVoxelDebugPointsPersistent;
-			DebugOptions.bDrawPoints = true;
-			DebugOptions.PointColor = GPUProjectionDebug.GPUProjectionVoxelCenterColor;
-			DebugOptions.PointSize = GPUProjectionDebug.GPUProjectionVoxelCenterPointSize;
-			DebugOptions.MaxDirectionsToDraw = GPUProjectionDebug.GPUProjectionVoxelDebugPointLimit;
-			DrawDebugLastSurfaceVoxelDirections(DebugOptions);
-		}
-	}
-
-	// 4. 可视化：把这一批藤蔓交给 GPU leaf。结果只存在于它的常驻 stream 里，没有 CPU 网格可返回。
-	{
-		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVineGPU.VisVine"));
-		return VisVine();
-	}
 }
 
 void AVineContainer::FetchFoliage()
@@ -4347,108 +4332,6 @@ FString AVineContainer::GetResultAssetBaseName() const
 	return Label.IsEmpty() ? Super::GetResultAssetBaseName() : Label;
 }
 
-void AVineContainer::GenerateVineAction()
-{
-	ReferencePoints.Reset();
-
-	TArray<FTransform> TargetTransforms;
-	GetVineInstanceTransforms(GrowTarget, TargetTransforms);
-
-	const int32 LastTargetIndex = TargetTransforms.Num() - 1;
-	UKismetSystemLibrary::PrintString(
-		this,
-		FString::FromInt(LastTargetIndex),
-		true,
-		true,
-		FLinearColor(0.0f, 0.66f, 1.0f, 1.0f),
-		2.0f);
-
-	for (const FTransform& TargetTransform : TargetTransforms)
-	{
-		ReferencePoints.Add(TargetTransform.GetLocation());
-	}
-
-	UKismetSystemLibrary::PrintString(
-		this,
-		FString::FromInt(ReferencePoints.Num()),
-		true,
-		true,
-		FLinearColor(0.0f, 0.66f, 1.0f, 1.0f),
-		2.0f);
-
-	if (!GenerateVines(50.0f, true)) UE_LOG(LogTemp, Warning, TEXT("[VineContainer] GenerateVineAction produced no vine on %s."), *GetActorNameOrLabel());
-}
-
-int32 AVineContainer::DrawDebugCachedVineSCStagePoints(float Duration)
-{
-	UWorld* World = GetWorld();
-	if (!World)
-	{
-		return 0;
-	}
-
-	if (!SCStageDebug.bSCStageDrawTube)
-	{
-		return 0;
-	}
-
-	const float EffectiveDuration = Duration > 0.0f ? Duration : SCStageDebug.SCStageDebugPointDuration;
-	if (EffectiveDuration <= 0.0f)
-	{
-		return 0;
-	}
-
-	const float SafePointSize = FMath::Max(SCStageDebug.SCStageDebugPointSize, 0.0f);
-	const FColor DebugColor = SCStageDebug.SCStageTubeDebugPointColor.ToFColor(true);
-	const int32 PointLimit = SCStageDebug.SCStageDebugPointLimit;
-	const bool bHasLimit = PointLimit > 0;
-	int32 DrawnPointCount = 0;
-
-	for (const FGeometryScriptPolyPath& Line : TubeLines)
-	{
-		if (bHasLimit && DrawnPointCount >= PointLimit)
-		{
-			break;
-		}
-
-		if (!Line.Path.IsValid())
-		{
-			continue;
-		}
-
-		for (const FVector& Point : *Line.Path)
-		{
-			if (bHasLimit && DrawnPointCount >= PointLimit)
-			{
-				break;
-			}
-
-			DrawDebugPoint(World, Point, SafePointSize, DebugColor,
-				SCStageDebug.bSCStageDebugPointsPersistent,
-				EffectiveDuration,
-				0);
-			++DrawnPointCount;
-		}
-	}
-
-	if (DrawnPointCount == 0)
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[VineSCDebug] No cached SC-stage points on %s. Run GenerateVines before drawing cached SC-stage points."),
-			*GetActorNameOrLabel());
-	}
-	else
-	{
-		UE_LOG(LogTemp, Display,
-			TEXT("[VineSCDebug] Drew cached SC-stage points. TubeLines=%d Points=%d Duration=%.3f"),
-			TubeLines.Num(),
-			DrawnPointCount,
-			EffectiveDuration);
-	}
-
-	return DrawnPointCount;
-}
-
 int32 AVineContainer::DrawDebugVineSurfaceVoxelArrows(float Duration, bool bUseCachedVoxels)
 {
 	const float SafeVoxelSize = FMath::Max(SC.VoxelSize, 1.0e-3f);
@@ -4458,7 +4341,7 @@ int32 AVineContainer::DrawDebugVineSurfaceVoxelArrows(float Duration, bool bUseC
 		if (!LastSurfaceVoxelGPUBuffers.IsValid())
 		{
 			UE_LOG(LogTemp, Warning,
-				TEXT("[VineVoxelDebug] No retained GPU surface voxel data on %s. Run GenerateVines before drawing cached voxel data."),
+				TEXT("[VineVoxelDebug] No retained GPU surface voxel data on %s. Run GenerateVineGPU before drawing cached voxel data."),
 				*GetActorNameOrLabel());
 			return 0;
 		}
@@ -4533,156 +4416,6 @@ int32 AVineContainer::DrawDebugVineSurfaceVoxelArrows(float Duration, bool bUseC
 	DebugOptions.PointSize = SurfaceVoxelDebug.SurfaceVoxelCenterPointSize;
 	DebugOptions.MaxDirectionsToDraw = SurfaceVoxelDebug.SurfaceVoxelMaxArrowsToDraw;
 	return DrawDebugLastSurfaceVoxelDirections(DebugOptions);
-}
-
-int32 AVineContainer::DrawDebugCachedSurfaceTriangles(float Duration)
-{
-	UWorld* World = GetWorld();
-	if (!World)
-	{
-		return 0;
-	}
-
-	if (!TriangleDebug.bDrawTriangles)
-	{
-		return 0;
-	}
-
-	const int32 EffectiveVertexCount = CachedSurfaceTriangles.VertexCount >= 0
-		? FMath::Min(CachedSurfaceTriangles.VertexCount, CachedSurfaceTriangles.Vertices.Num())
-		: CachedSurfaceTriangles.Vertices.Num();
-
-	const int32 EffectiveIndexCount = CachedSurfaceTriangles.IndexCount >= 0
-		? FMath::Min(CachedSurfaceTriangles.IndexCount, CachedSurfaceTriangles.Indices.Num())
-		: CachedSurfaceTriangles.Indices.Num();
-
-	const bool bUseIndices = EffectiveIndexCount >= 3;
-	const int32 TriangleCount = bUseIndices
-		? EffectiveIndexCount / 3
-		: EffectiveVertexCount / 3;
-
-	if (TriangleCount <= 0)
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[VineTriangleDebug] No cached surface triangles on %s. Vertices=%d EffectiveVertices=%d Indices=%d EffectiveIndices=%d. Run GenerateVines first."),
-			*GetActorNameOrLabel(),
-			CachedSurfaceTriangles.Vertices.Num(),
-			EffectiveVertexCount,
-			CachedSurfaceTriangles.Indices.Num(),
-			EffectiveIndexCount);
-		return 0;
-	}
-
-	const float EffectiveDuration = Duration > 0.0f ? Duration : TriangleDebug.TriangleDebugDuration;
-	if (EffectiveDuration <= 0.0f)
-	{
-		return 0;
-	}
-
-	const int32 DrawLimit = TriangleDebug.TriangleDebugCountLimit > 0
-		? FMath::Min(TriangleDebug.TriangleDebugCountLimit, TriangleCount)
-		: TriangleCount;
-
-	const float SafeThickness = FMath::Max(0.0f, TriangleDebug.TriangleLineThickness);
-	const float SafePointSize = FMath::Max(0.0f, TriangleDebug.TriangleVertexPointSize);
-	const float SafeNormalLength = FMath::Max(0.0f, TriangleDebug.TriangleNormalLength);
-	const FColor LineColor = TriangleDebug.TriangleLineColor.ToFColor(true);
-	const FColor VertexColor = TriangleDebug.TriangleVertexColor.ToFColor(true);
-	const FColor NormalColor = TriangleDebug.TriangleNormalColor.ToFColor(true);
-	const float TriDuration = EffectiveDuration;
-	const bool bPersistent = TriangleDebug.bTriangleDebugPersistent;
-
-	auto GetTriangleVertex = [&](int32 TriIndex, int32 LocalVertexIndex) -> FVector
-	{
-		if (bUseIndices)
-		{
-			const int32 BaseIdx = TriIndex * 3;
-			const int32 VertIdx = CachedSurfaceTriangles.Indices[BaseIdx + LocalVertexIndex];
-			return CachedSurfaceTriangles.Vertices.IsValidIndex(VertIdx) ? CachedSurfaceTriangles.Vertices[VertIdx] : FVector::ZeroVector;
-		}
-		else
-		{
-			const int32 VertIdx = TriIndex * 3 + LocalVertexIndex;
-			return CachedSurfaceTriangles.Vertices.IsValidIndex(VertIdx) ? CachedSurfaceTriangles.Vertices[VertIdx] : FVector::ZeroVector;
-		}
-	};
-
-	auto IsFiniteVec = [](const FVector& V) -> bool
-	{
-		return FMath::IsFinite(V.X) && FMath::IsFinite(V.Y) && FMath::IsFinite(V.Z);
-	};
-
-	int32 DrawnLineSegments = 0;
-	int32 DrawnVertexPoints = 0;
-	int32 DrawnNormalArrows = 0;
-	int32 SkippedTriangles = 0;
-
-	for (int32 TriIndex = 0; TriIndex < DrawLimit; ++TriIndex)
-	{
-		const FVector V0 = GetTriangleVertex(TriIndex, 0);
-		const FVector V1 = GetTriangleVertex(TriIndex, 1);
-		const FVector V2 = GetTriangleVertex(TriIndex, 2);
-
-		if (!IsFiniteVec(V0) || !IsFiniteVec(V1) || !IsFiniteVec(V2))
-		{
-			++SkippedTriangles;
-			continue;
-		}
-
-		// Draw triangle wireframe
-		DrawDebugLine(World, V0, V1, LineColor, bPersistent, TriDuration, 0, SafeThickness);
-		DrawDebugLine(World, V1, V2, LineColor, bPersistent, TriDuration, 0, SafeThickness);
-		DrawDebugLine(World, V2, V0, LineColor, bPersistent, TriDuration, 0, SafeThickness);
-		DrawnLineSegments += 3;
-
-		// Draw vertex points
-		if (TriangleDebug.bDrawTriangleVertices && SafePointSize > 0.0f)
-		{
-			DrawDebugPoint(World, V0, SafePointSize, VertexColor, bPersistent, TriDuration, 0);
-			DrawDebugPoint(World, V1, SafePointSize, VertexColor, bPersistent, TriDuration, 0);
-			DrawDebugPoint(World, V2, SafePointSize, VertexColor, bPersistent, TriDuration, 0);
-			DrawnVertexPoints += 3;
-		}
-
-		// Draw normal arrow from triangle centroid
-		if (TriangleDebug.bDrawTriangleNormals && SafeNormalLength > 0.0f)
-		{
-			const FVector Centroid = (V0 + V1 + V2) / 3.0;
-			FVector FaceNormal = FVector::CrossProduct(V1 - V0, V2 - V0);
-			if (FaceNormal.Normalize())
-			{
-				const float ArrowHeadSize = FMath::Max(SafeNormalLength * 0.15f, SafeThickness * 4.0f);
-				DrawDebugDirectionalArrow(
-					World,
-					Centroid,
-					Centroid + FaceNormal * SafeNormalLength,
-					ArrowHeadSize,
-					NormalColor,
-					bPersistent,
-					TriDuration,
-					0,
-					SafeThickness);
-				++DrawnNormalArrows;
-			}
-		}
-	}
-
-	UE_LOG(LogTemp, Display,
-		TEXT("[VineTriangleDebug] Drew cached surface triangles on %s. Triangles=%d/%d LineSegments=%d VertexPoints=%d NormalArrows=%d Skipped=%d "
-			 "bUseIndices=%d EffectiveVertices=%d EffectiveIndices=%d Duration=%.1f"),
-		*GetActorNameOrLabel(),
-		DrawLimit,
-		TriangleCount,
-		DrawnLineSegments,
-		DrawnVertexPoints,
-		DrawnNormalArrows,
-		SkippedTriangles,
-		bUseIndices ? 1 : 0,
-		EffectiveVertexCount,
-		EffectiveIndexCount,
-		TriDuration);
-
-	return DrawLimit;
 }
 
 void AVineContainer::SaveStaticmesh()
@@ -5375,14 +5108,6 @@ static TAutoConsoleVariable<float> CVarVineSCScatter(
 	TEXT("Vine GPU SC point-scatter distance in cm (ApplyVVSCPointOffset parity). 0 = off."),
 	ECVF_Default);
 
-TArray<FSpaceColonizationLineResult> AVineContainer::SpaceColonizationWithScales(TArray<FTransform> /*SourceTransforms*/, TArray<FTransform> /*TargetTransforms*/, bool /*bUseComputeShader*/)
-{
-	// The solve now lives inside the vine mesh RDG graph (BuildVineGeometryIntoMesh's EditMeshSync)
-	// and its output never leaves the GPU, so there is nothing to return here and nothing worth
-	// dispatching for a caller that only wants CPU lines. Kept so existing Blueprints still bind;
-	// use GenerateVines / VisVine instead.
-	return {};
-}
 
 // Prepares the CPU side of the fused space-colonization solve: source/target positions, the
 // per-source scale lookups, the baked taper LUT and each source's slice of the batch-wide point

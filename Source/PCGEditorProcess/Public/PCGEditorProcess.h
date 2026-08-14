@@ -10,7 +10,7 @@
 class AComputeShaderMeshGenerator;
 class ACSPointBrushActor;
 class AGPUSkeletalTree;
-class FVineContainerViewportOverlay;
+class FViewEditCategoryViewportOverlay;
 
 class FPCGEditorProcessModule : public IModuleInterface
 {
@@ -27,7 +27,7 @@ private:
 	void GenerateGPUSkeletalTree(AGPUSkeletalTree* TargetActor);
 
 	FDelegateHandle PostEngineInitHandle;
-	TUniquePtr<FVineContainerViewportOverlay> VineContainerViewportOverlay;
+	TUniquePtr<FViewEditCategoryViewportOverlay> ViewEditCategoryViewportOverlay;
 	bool bEditorModeRegistered = false;
 	bool bPointBrushModeRegistered = false;
 };

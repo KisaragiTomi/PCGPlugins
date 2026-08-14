@@ -52,58 +52,6 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options, meta = (ClampMin = "0"))
 	float InfluenceRadius = 200.0f;
 
-	// DEPRECATED: the vine is fully GPU now, so this flag is ignored by C++. Kept only so existing
-	// Blueprints that still Set it keep compiling; remove once those BP nodes are cleaned up.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
-	bool bUseComputeShader = true;
-};
-
-USTRUCT(BlueprintType)
-struct GEOMETRYSCRIPTEXTRAEDITOR_API FSpaceColonizationAttribute
-{
-	GENERATED_BODY()
-public:
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
-	bool Attractor = true;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
-	bool End = false;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
-	bool Startpt = false;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
-	float CurveU = 0;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
-	int32 SpawnCount = 0;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
-	int32 Startid = 0;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
-	int32 PrePt = -1;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
-	int32 NextPt = -1;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
-	int32 Infaction = 0;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
-	int32 BranchCount = 0;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
-	int32 BackCount = 0;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
-	FVector N = FVector::ZeroVector;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
-	TArray<int32> Associates;
-};
-
-USTRUCT(BlueprintType)
-struct GEOMETRYSCRIPTEXTRAEDITOR_API FSpaceColonizationLineResult
-{
-	GENERATED_BODY()
-public:
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
-	FGeometryScriptPolyPath Path;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
-	TArray<float> PointScales;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Space Colonization")
-	TArray<FVector> PointAxes;
 };
 
 USTRUCT(BlueprintType, meta = (DisplayName = "VV Options"))
@@ -141,10 +89,6 @@ public:
 	UCurveLinearColor* CurveControl = nullptr;
 
 	// --- moved from FVisVineParameters ---
-	// DEPRECATED: the vine is fully GPU now, so this flag is ignored by C++. Kept for Blueprint compat.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
-	bool bUseGPUMode = true;
-
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options, meta = (ClampMin = "0"))
 	int32 GenerateVineVoxelNormalBlurIterations = 0;
 
@@ -202,15 +146,6 @@ struct FVineLinePointScaleData
 
 	UPROPERTY()
 	TArray<float> Values;
-};
-
-USTRUCT()
-struct FVineLinePointAxisData
-{
-	GENERATED_BODY()
-
-	UPROPERTY()
-	TArray<FVector> Values;
 };
 
 // VisVine debug parameter structs moved to ComputeShaderDebugParams.h
@@ -279,14 +214,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
 	FVisVineGPUProjectionDebugOptions GPUProjectionDebug;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
-	FVisVineSCStageDebugOptions SCStageDebug;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
 	FVisVineSurfaceVoxelDebugOptions SurfaceVoxelDebug;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
-	FVisVineTriangleDebugOptions TriangleDebug;
 
 	// ---- Transient State ----
 
@@ -303,27 +233,7 @@ public:
 	UPROPERTY(Transient)
 	TObjectPtr<AActor> DebugVineSplineActor;
 
-	UPROPERTY(Transient)
-	TArray<FGeometryScriptPolyPath> TubeLines;
-
-	UPROPERTY(Transient)
-	TArray<FVector> TubeLineSourceLocations;
-
-	UPROPERTY(Transient)
-	TArray<FVineLinePointScaleData> TubeLinePointScales;
-
-	UPROPERTY(Transient)
-	TArray<FVineLinePointAxisData> TubeLinePointAxes;
-
 	// ---- Core Operations ----
-
-	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
-	bool VisVine();
-
-	/** Returns whether a vine batch was handed to the GPU leaf. The vine has no CPU-side mesh to
-	 *  return: geometry only ever exists as VineGpuMesh's GPU streams. */
-	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
-	bool GenerateVines(float ExtrudeScale = 50, bool Result = true);
 
 	/** Idempotent "the vine I own must exist" entry point: runs a generation only when there is no
 	 *  vine geometry, and returns whether there is one by the time the call is over. Safe to call
@@ -337,18 +247,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
 	bool EnsureVineGeometry();
 
-	/** 藤蔓生成的唯一实现，GenerateVines / VisVine 都转调这里，所以签名与它们保持一致。
-	 *  包围盒由本函数从当前 source/target 现算，蓝图侧无需自己拼一个 FBox。
-	 *  ExtrudeScale / Result 是历史签名，GPU 路径不读，保留只为不打断已有蓝图连线。 */
+	/** 藤蔓生成的唯一入口：表面体素 -> 空间殖民求解 -> concat -> 建网格，全部合并进 VineGeometry
+	 *  那一次 EditMeshSync 的 RDG 图。以前这里是 4 张图外加一次 FlushRenderingCommands，而藤蔓
+	 *  这条路根本不回读数据，那次阻塞是白等的。
+	 *  包围盒由本函数从当前 source/target 现算，同时决定体素化范围：蓝图侧拿不到 transform 列表，
+	 *  让它自己拼 FBox 只会拼出一个和体素化范围对不上的盒子。 */
 	UFUNCTION(BlueprintCallable, Category = ContainerCheck)
-	bool GenerateVineGPU(float ExtrudeScale = 50, bool Result = true);
-
-	/** 藤蔓生成的 GPU 段：三角形缓存 -> 表面体素 -> 空间殖民求解 -> concat -> 建网格，
-	 *  全部合并进 VineGeometry 那一次 EditMeshSync 的 RDG 图。以前这里是 4 张图外加一次
-	 *  FlushRenderingCommands，而藤蔓这条路根本不回读数据，那次阻塞是白等的。
-	 *  Bounds 为这一批 source/target 的世界包围盒，同时决定体素化范围。
-	 *  不是 UFUNCTION：UFUNCTION 不能重载，蓝图入口是上面那个自带包围盒计算的同名重载。 */
-	bool GenerateVineGPUInBounds(const FBox& Bounds);
+	bool GenerateVineGPU();
 
 	/** Drops everything a generation produced — the cached lines and surface triangles, the debug
 	 *  spline actor, and the vine geometry itself, which is unbound and released rather than merely
@@ -377,9 +282,6 @@ public:
 	// ---- Vine Actions ----
 
 	UFUNCTION(BlueprintCallable, Category = "VineActions")
-	void GenerateVineAction();
-
-	UFUNCTION(BlueprintCallable, Category = "VineActions")
 	void SaveStaticmesh();
 
 protected:
@@ -391,11 +293,6 @@ public:
 
 	// ---- SpaceColonization ----
 
-	/** Deprecated entry point: the solve runs on the GPU inside the vine mesh graph and produces
-	 *  no CPU line results, so this always returns an empty array. Use GenerateVines / VisVine. */
-	UFUNCTION(BlueprintCallable, Category = "SpaceColonization")
-	TArray<FSpaceColonizationLineResult> SpaceColonizationWithScales(TArray<FTransform> SourceTransforms, TArray<FTransform> TargetTransforms, bool bUseComputeShader = false);
-
 	// Non-reflected worker (FVineFusedSCInputs isn't a USTRUCT): prepares the CPU side of the
 	// fused space-colonization solve. Dispatches nothing; the passes are recorded into the vine
 	// mesh graph by the build operator, inside VineGeometry's UCSMesh::EditMeshSync.
@@ -406,17 +303,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "VineActions|Debug")
 	void ClearDebugVineSplineActor();
 
-	UFUNCTION(BlueprintCallable, Category = "VineActions|Debug", meta = (DevelopmentOnly, DisplayName = "Draw Cached Vine SC Stage Points"))
-	int32 DrawDebugCachedVineSCStagePoints(float Duration = 5.0f);
-
 	UFUNCTION(BlueprintCallable, Category = "VineActions|Debug", meta = (DevelopmentOnly, DisplayName = "Draw Debug Vine Surface Voxel Arrows"))
 	int32 DrawDebugVineSurfaceVoxelArrows(float Duration = 5.0f, bool bUseCachedVoxels = false);
 
-	UFUNCTION(BlueprintCallable, Category = "VineActions|Debug", meta = (DevelopmentOnly, DisplayName = "Draw Debug Cached Surface Triangles"))
-	int32 DrawDebugCachedSurfaceTriangles(float Duration = 5.0f);
 
 private:
-	bool VisVineGPUInternal();
 
 	/** Queues one EnsureVineGeometry() for the next engine tick. See the rationale on the
 	 *  definition for why the restore is hooked where it is and why it is not run inline. */
@@ -425,7 +316,7 @@ private:
 	/** Latched at the first schedule and never cleared: the automatic restore is one shot per actor
 	 *  lifetime. Re-arming it on every re-registration would stack tickers, and — because a
 	 *  generation that keeps failing leaves the geometry absent — would retry the whole solve every
-	 *  frame. Anything past the first attempt is the owner's call (GenerateVines /
+	 *  frame. Anything past the first attempt is the owner's call (GenerateVineGPU /
 	 *  EnsureVineGeometry are both public). */
 	bool bVineGeometryRestoreAttempted = false;
 

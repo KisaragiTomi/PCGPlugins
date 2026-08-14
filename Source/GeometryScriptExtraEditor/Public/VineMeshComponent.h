@@ -15,7 +15,7 @@ class UCSMesh;
  * FVineMeshSceneProxy, which meant every render-state recreation (a material edit, a visibility
  * toggle, a transform change) re-ran the surface voxelization and the space-colonization solve —
  * by far the most expensive thing this actor does. A recreation is now a rebind, and the solve runs
- * exactly when AVineContainer asks for a vine (GenerateVines / EnsureVineGeometry) and never
+ * exactly when AVineContainer asks for a vine (GenerateVineGPU / EnsureVineGeometry) and never
  * otherwise.
  *
  * The vine surface is one material, so there is no section table: the base draws one batch out of

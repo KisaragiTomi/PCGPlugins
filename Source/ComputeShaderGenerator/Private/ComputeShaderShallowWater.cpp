@@ -1118,7 +1118,7 @@ void ACSShallowWaterCapture::CaptureAll()
 	// 走公用的无状态收集器；actor 只交出自身的排除策略、LOD 与三角上限，
 	// 「只收带 SWCaptureTag 的道具」是本次捕获的策略，故在这里显式给出。
 	FCSBoxSceneCollectOptions CollectOptions = MakeBoxSceneCollectOptions(QueryBox);
-	CollectOptions.RequiredActorTag = SWCaptureTag;
+	if (!SWCaptureTag.IsNone()) CollectOptions.RequiredActorTags = { SWCaptureTag };
 	FCSBoxScenePreparedData Prepared = CSBoxSceneCollection::CollectBoxSceneTriangles(World, CollectOptions);
 
 	FTextureRenderTargetResource* R_SceneDepth = RT_SceneDepth->GameThread_GetRenderTargetResource();

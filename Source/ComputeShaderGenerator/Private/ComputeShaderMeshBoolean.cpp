@@ -1003,6 +1003,10 @@ bool AComputeShaderMeshBoolean::RunBooleanToSnapshot(
 		CollectOptions.MaxTriangles = SourceTriangleLimit;
 		CollectOptions.bIncludeLandscape = bIncludeLandscape;
 		CollectOptions.bPreserveSourceMaterialSlots = Options.bPreserveSourceMaterialSlots;
+		// 白名单取代排除表：没打 Pick/Ref 的 actor 根本不进 soup，基类的 "UA" 排除因此多余，
+		// 显式清掉以免两套过滤在实例上各存一份、日后互相打架。
+		CollectOptions.RequiredActorTags = RequiredActorTags;
+		CollectOptions.ExcludedActorTags.Reset();
 		Prepared = CSBoxSceneCollection::CollectBoxSceneTriangles(World, CollectOptions);
 	}
 	if (!Prepared.IsValid() || !Prepared.HasAnyTriangles()) return false;
@@ -1951,6 +1955,9 @@ bool AComputeShaderMeshBoolean::RunBooleanToGpuMesh(
 		CollectOptions.MaxTriangles = FMath::Max(1, Options.MaxSourceTriangles);
 		CollectOptions.bIncludeLandscape = Options.bReadLandscape;
 		CollectOptions.bPreserveSourceMaterialSlots = Options.bPreserveSourceMaterialSlots;
+		// 与 snapshot 路径同一套过滤，见那边的注释。
+		CollectOptions.RequiredActorTags = RequiredActorTags;
+		CollectOptions.ExcludedActorTags.Reset();
 		// Boolean 不做参照点距离过滤：源 soup 必须完整，否则被裁掉的邻接三角会让 winding 场判错。
 		Prepared = CSBoxSceneCollection::CollectBoxSceneTriangles(World, CollectOptions);
 	}

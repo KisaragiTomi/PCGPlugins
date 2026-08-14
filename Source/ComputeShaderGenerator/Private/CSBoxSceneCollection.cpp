@@ -52,16 +52,21 @@ FCSBoxScenePreparedData CSBoxSceneCollection::CollectBoxSceneTriangles(
 	TArray<FCSStaticMeshTriangleRequest> Requests;
 	BuildBoxSceneTriangleRequestsInternal(World, Options.QueryBox, Options.LODIndex, Requests);
 
-	if (!Options.RequiredActorTag.IsNone())
+	if (!Options.RequiredActorTags.IsEmpty())
 	{
-		const FName RequiredActorTag = Options.RequiredActorTag;
-		Requests.RemoveAll([RequiredActorTag](const FCSStaticMeshTriangleRequest& Req)
+		const TArray<FName>& RequiredActorTags = Options.RequiredActorTags;
+		Requests.RemoveAll([&RequiredActorTags](const FCSStaticMeshTriangleRequest& Req)
 		{
-			return Req.SourceActor && !Req.SourceActor->ActorHasTag(RequiredActorTag);
+			if (!Req.SourceActor) return false;
+			for (const FName& Tag : RequiredActorTags)
+			{
+				if (!Tag.IsNone() && Req.SourceActor->ActorHasTag(Tag)) return false;
+			}
+			return true;
 		});
 	}
 
-	// RequiredActorTag 有意不传给地形：标签是用来挑"要哪些道具"的，连地面一起筛掉会让几何悬空。
+	// RequiredActorTags 有意不传给地形：标签是用来挑"要哪些道具"的，连地面一起筛掉会让几何悬空。
 	if (Options.bIncludeLandscape)
 	{
 		BuildBoxSceneLandscapeTrianglesInternal(

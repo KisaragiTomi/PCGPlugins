@@ -75,10 +75,11 @@ struct COMPUTESHADERGENERATOR_API FCSBoxSceneCollectOptions
 
 	float ReferenceFilterDistance = 0.0f;
 
-	/** Only keep static meshes on actors carrying this tag. NAME_None keeps everything.
-	 *  Landscape is deliberately exempt: the tag selects which props to extract, and dropping
+	/** Only keep static meshes on actors carrying at least one of these tags. Empty keeps
+	 *  everything; entries that are NAME_None never match.
+	 *  Landscape is deliberately exempt: the tags select which props to extract, and dropping
 	 *  the ground with them would leave the geometry floating. */
-	FName RequiredActorTag = NAME_None;
+	TArray<FName> RequiredActorTags;
 
 	/** Actor whose own meshes are skipped. A generator sitting inside its own query box would
 	 *  otherwise extract the geometry it is about to replace. */

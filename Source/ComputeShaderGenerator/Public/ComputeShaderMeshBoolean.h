@@ -172,6 +172,19 @@ class COMPUTESHADERGENERATOR_API AComputeShaderMeshBoolean : public AComputeShad
 	GENERATED_BODY()
 
 public:
+	/**
+	 * 白名单：只有带这些标签之一的 actor 会进源三角 soup，清空则退回「盒内全收」。
+	 *
+	 * 两个标签分工不同，都必须收进来：`Pick` 是真正参与切分并输出的实体；`Ref` 是参照体，
+	 * 进 winding 场参与内外判定，但不切分、不输出（基类提取阶段按 `Ref` 标记，actor 与
+	 * component 两级都认）。少收 `Ref` 会让缠绕数场缺一块，把本该判成「内部」的面留下来。
+	 *
+	 * 白名单是一道比 ExcludedActorTags 更强的闸门：没打标签的东西根本不进 soup，所以基类
+	 * 那个 "UA" 排除表对本 actor 已无意义，提取时会被显式清空（见 RunBooleanInternal）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|Scene Filter")
+	TArray<FName> RequiredActorTags = { TEXT("Pick"), TEXT("Ref") };
+
 	/** 是否把地形（landscape）也纳入切分的场景三角形。false 时只读 static mesh，不读地形。 */
 	UPROPERTY(BlueprintReadWrite, Category = "CS Mesh Boolean")
 	bool bReadLandscape = false;

@@ -856,7 +856,8 @@ UCSMesh* UCSMeshOps::AppendBoxSceneTriangles(
 	CollectOptions.MaxTriangles = MaxTriangles;
 	CollectOptions.ReferencePoints = Options.ReferencePoints;
 	CollectOptions.ReferenceFilterDistance = Options.ReferenceFilterDistance;
-	CollectOptions.RequiredActorTag = Options.RequiredActorTag;
+	// 蓝图侧仍是单标签属性；None 表示不过滤，故空标签不能进数组（数组非空即开启过滤）。
+	if (!Options.RequiredActorTag.IsNone()) CollectOptions.RequiredActorTags = { Options.RequiredActorTag };
 	CollectOptions.ExcludedActor = Options.ExcludedActor;
 	CollectOptions.ExcludedActorTags = Options.ExcludedActorTags;
 	CollectOptions.LODIndex = FMath::Max(0, Options.LODIndex);

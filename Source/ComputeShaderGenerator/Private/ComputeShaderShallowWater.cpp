@@ -1,4 +1,5 @@
 #include "ComputeShaderShallowWater.h"
+#include "CSBoxSceneCollection.h"
 #include "ComputeShaderGenerateHelper.h"
 #include "EngineUtils.h"
 #include "Engine/StaticMesh.h"
@@ -1114,7 +1115,11 @@ void ACSShallowWaterCapture::CaptureAll()
 	QueryBox.Min.Z = FMath::Min(QueryBox.Min.Z, ActorZ - MaxHeight);
 	QueryBox.Max.Z = FMath::Max(QueryBox.Max.Z, ActorZ + MaxHeight);
 
-	FCSBoxScenePreparedData Prepared = PrepareBoxSceneTriangles(World, QueryBox, -1, TArray<FVector>(), 0.0f, SWCaptureTag);
+	// 走公用的无状态收集器；actor 只交出自身的排除策略、LOD 与三角上限，
+	// 「只收带 SWCaptureTag 的道具」是本次捕获的策略，故在这里显式给出。
+	FCSBoxSceneCollectOptions CollectOptions = MakeBoxSceneCollectOptions(QueryBox);
+	CollectOptions.RequiredActorTag = SWCaptureTag;
+	FCSBoxScenePreparedData Prepared = CSBoxSceneCollection::CollectBoxSceneTriangles(World, CollectOptions);
 
 	FTextureRenderTargetResource* R_SceneDepth = RT_SceneDepth->GameThread_GetRenderTargetResource();
 	const float CapturedCameraHeight = ActorZ + MaxHeight;
@@ -1336,5 +1341,6 @@ void ACSShallowWaterCapture::BeginDestroy()
 
 void ACSShallowWaterCapture::ReleaseTransientRenderResources()
 {
+	ClearMeshGeneratorCache();
 	ClearGeneratedDataTextureCache();
 }

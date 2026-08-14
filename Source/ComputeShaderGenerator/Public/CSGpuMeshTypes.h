@@ -8,6 +8,7 @@
 #include "UObject/ObjectPtr.h"
 
 class UMaterialInterface;
+class FRDGBuilder;
 
 // -----------------------------------------------------------------------------
 // Shared GPU-mesh buffer-set types
@@ -198,6 +199,69 @@ struct FCSGpuMeshCPUData
 			&& (TriangleMaterialSlots.IsEmpty() || TriangleMaterialSlots.Num() == Indices.Num() / 3);
 	}
 };
+
+// -----------------------------------------------------------------------------
+// Stream-set services shared by every producer of this buffer set: the descriptor
+// list itself, and the per-role access state a *persistent* buffer must be left in.
+//
+// Both used to be copy-pasted per producer. The access-state block in particular was
+// written out by hand in five places, and getting it wrong is the nastiest failure
+// mode in this system: RDG's default epilogue state (SRVMask) is illegal for index /
+// indirect usage, so a stream left in it silently stops drawing or reading back after
+// whichever pass touched it last — with no error anywhere.
+// -----------------------------------------------------------------------------
+
+namespace CSGpuMeshStreams
+{
+	/** Which extras the standard triangle set carries beyond the seven core streams. */
+	struct FStandardStreamOptions
+	{
+		/** DrawIndexedIndirect arg sets (5 uints each) in the IndirectArgs buffer. */
+		uint32 NumIndirectDraws = 1;
+
+		/** Add a per-triangle material-registry id stream (readback semantic MaterialId).
+		 *  Off for the proxy-owned leaves: none of them fills such a buffer, and an
+		 *  unfilled readback stream would hand the saver garbage material slots. */
+		bool bMaterialIds = false;
+
+		/** Carry vertex colours through the CPU readback. Colours have always existed on
+		 *  the GPU and rendered fine; only the readback dropped them. */
+		bool bReadbackColors = false;
+	};
+
+	/** Fills OutDescs with the standard triangle set: Position / TangentBasis / TexCoord0 /
+	 *  Color / Index / IndirectArgs / MeshCounters, plus whatever Options asks for. */
+	COMPUTESHADERGENERATOR_API void BuildStandardTriangleStreamDescs(
+		TArray<FCSGpuStreamDesc>& OutDescs, const FStandardStreamOptions& Options = FStandardStreamOptions());
+
+	/** How many units a stream of this CountSource covers. The one place PerTriangle is
+	 *  resolved: allocation and readback used to compute it inline and neither handled it,
+	 *  so a per-face stream would have been sized as if it were per-vertex. */
+	COMPUTESHADERGENERATOR_API uint32 UnitsForCountSource(
+		ECSGpuCountSource CountSource, uint32 VertexUnits, uint32 IndexUnits);
+
+	/** The access state a persistent stream of this role must be left in at the end of
+	 *  every pass sequence that writes it. Any operator that skips this leaves the mesh
+	 *  undrawable / unreadable until something else happens to transition it back. */
+	COMPUTESHADERGENERATOR_API ERHIAccess FinalAccessForRole(ECSGpuStreamRole Role);
+
+	/** SetBufferAccessFinal(Buffer, FinalAccessForRole(Role)). Null buffers are ignored so
+	 *  callers can pass optional streams straight through. */
+	COMPUTESHADERGENERATOR_API void SetStreamAccessFinal(
+		FRDGBuilder& GraphBuilder, FRDGBufferRef Buffer, ECSGpuStreamRole Role);
+
+	/** One call for the whole standard set. Every producer that fills these seven buffers ends
+	 *  its graph with exactly this; pass null for any stream it does not own. */
+	COMPUTESHADERGENERATOR_API void SetStandardStreamAccessFinal(
+		FRDGBuilder& GraphBuilder,
+		FRDGBufferRef Positions,
+		FRDGBufferRef Tangents,
+		FRDGBufferRef TexCoords,
+		FRDGBufferRef Colors,
+		FRDGBufferRef Indices,
+		FRDGBufferRef IndirectArgs,
+		FRDGBufferRef MeshCounters);
+}
 
 // -----------------------------------------------------------------------------
 // 「GPU 网格快照 -> StaticMesh」的转换/落盘选项。实现是 UCSGpuMeshComponent 的

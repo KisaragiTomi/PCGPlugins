@@ -1,9 +1,8 @@
 #include "CSDisplayComponent.h"
 
-#include "CSDisplayPointArrowSceneProxy.h"
-#include "CSDisplayTriangleSceneProxy.h"
 #include "CSDisplayVoxelSceneProxy.h"
 #include "CSGpuDebugDraw.h"
+#include "ComputeShaderMeshGenerator.h" // FCSSurfaceVoxelGPUBuffers
 
 #include "Engine/World.h"
 #include "RHI.h"
@@ -24,28 +23,6 @@ UCSDisplayComponent::UCSDisplayComponent()
 	// 因此 indirect 绘制的网格无法投 VSM 阴影（road 也是同样的限制）。
 	CastShadow = false;
 	bReceivesDecals = false;
-}
-
-void UCSDisplayComponent::ShowTriangleSoup(const FCSBoxScenePreparedData& InPrepared, uint32 InVertexCapacity,
-	const FBox& InWorldBounds, float Lifetime)
-{
-	if (!InPrepared.IsValid() || !InPrepared.HasAnyTriangles() || InVertexCapacity == 0)
-	{
-		ClearDisplay();
-		return;
-	}
-
-	PendingVoxelData = FCSDisplayVoxelData();
-	PendingPrepared = InPrepared;
-	PendingVertexCapacity = InVertexCapacity;
-	Mode = ECSDisplayMode::TriangleSoup;
-	LocalBounds = InWorldBounds; // 绝对变换 => local bounds 即 world bounds
-
-	// 提交后紧接着存盘的调用方必须看到新代理。MarkRenderRenderStateDirty 会把重建推迟到
-	// game thread 的帧末更新，而单靠 FlushRenderingCommands 并不会处理那一步。
-	RecreateRenderState_Concurrent();
-	UpdateBounds();
-	ScheduleClear(Lifetime);
 }
 
 int32 UCSDisplayComponent::ShowVoxelDirections(
@@ -102,52 +79,6 @@ int32 UCSDisplayComponent::ShowVoxelDirections(
 		MaxDirectionsToDraw, Lifetime);
 }
 
-int32 UCSDisplayComponent::ShowPointArrows(
-	const FCSGpuDebugPooledSource& Source,
-	int32 MaxArrowsToDraw,
-	float ArrowLength,
-	FLinearColor ArrowColor,
-	float Lifetime)
-{
-	if (!Source.IsValid())
-	{
-		ClearDisplay();
-		return 0;
-	}
-
-	FCSDisplayPointArrowData NewData;
-	NewData.Positions = Source.Positions;
-	NewData.Normals = Source.Normals;
-	NewData.Counter = Source.Counter;
-	NewData.MaxArrowsToDraw = MaxArrowsToDraw > 0
-		? FMath::Min(MaxArrowsToDraw, Source.Capacity)
-		: Source.Capacity;
-	NewData.ArrowLength = FMath::Max(ArrowLength, UE_KINDA_SMALL_NUMBER);
-	// 柱身/锥头比例按总长派生，调用方只需给一个长度就能得到形状合理的箭头。
-	NewData.ShaftRadius = NewData.ArrowLength * 0.06f;
-	NewData.HeadRadius = NewData.ArrowLength * 0.16f;
-	NewData.HeadFraction = 0.35f;
-	NewData.ArrowColor = ArrowColor;
-	NewData.WorldBounds = Source.WorldBounds;
-
-	// 切换到箭头模式：清掉其它两种源，保持"一个实例一次显示一种"的约定。
-	PendingPrepared = FCSBoxScenePreparedData();
-	PendingVertexCapacity = 0;
-	PendingVoxelData = FCSDisplayVoxelData();
-	PendingArrowData = MoveTemp(NewData);
-	Mode = ECSDisplayMode::PointArrows;
-
-	// 箭头会沿法线伸出总长，包围盒需按此外扩，否则会被过早剔除。
-	LocalBounds = PendingArrowData.WorldBounds.IsValid
-		? PendingArrowData.WorldBounds.ExpandBy(PendingArrowData.ArrowLength)
-		: FBox(FVector(-100.0), FVector(100.0));
-
-	RecreateRenderState_Concurrent();
-	UpdateBounds();
-	ScheduleClear(Lifetime);
-	return PendingArrowData.MaxArrowsToDraw;
-}
-
 bool UCSDisplayComponent::ShowVoxelQuads(
 	const FCSSurfaceVoxelGPUBuffers& Source,
 	float QuadScale,
@@ -181,11 +112,7 @@ void UCSDisplayComponent::ClearDisplay()
 {
 	if (UWorld* World = GetWorld()) World->GetTimerManager().ClearTimer(ClearTimerHandle);
 	Mode = ECSDisplayMode::None;
-	PendingPrepared = FCSBoxScenePreparedData();
-	PendingVertexCapacity = 0;
 	PendingVoxelData = FCSDisplayVoxelData();
-	PendingArrowData = FCSDisplayPointArrowData();
-	LocalBounds = FBox(ForceInit);
 	RecreateRenderState_Concurrent();
 	UpdateBounds();
 }
@@ -196,14 +123,6 @@ FPrimitiveSceneProxy* UCSDisplayComponent::CreateSceneProxy()
 
 	switch (Mode)
 	{
-	case ECSDisplayMode::TriangleSoup:
-		if (!PendingPrepared.IsValid() || !PendingPrepared.HasAnyTriangles() || PendingVertexCapacity == 0) return nullptr;
-		return new FCSDisplayTriangleSceneProxy(this, PendingPrepared, PendingVertexCapacity);
-
-	case ECSDisplayMode::PointArrows:
-		if (!PendingArrowData.IsValid()) return nullptr;
-		return new FCSDisplayPointArrowSceneProxy(this, PendingArrowData);
-
 	case ECSDisplayMode::VoxelDirections:
 	case ECSDisplayMode::VoxelQuads:
 		if (!PendingVoxelData.IsValid()) return nullptr;
@@ -216,25 +135,20 @@ FPrimitiveSceneProxy* UCSDisplayComponent::CreateSceneProxy()
 
 FBoxSphereBounds UCSDisplayComponent::CalcBounds(const FTransform& LocalToWorld) const
 {
-	// 三角汤的包围盒由 LocalBounds 承载，交给基类；体素形状需按其绘制尺寸外扩。
-	if (Mode != ECSDisplayMode::VoxelDirections && Mode != ECSDisplayMode::VoxelQuads)
-	{
-		return Super::CalcBounds(LocalToWorld);
-	}
+	// 空闲时（Mode == None）以及源没有交出包围盒时，退回一个固定小盒 —— 组件仍然注册在场景里，
+	// 交出一个无效包围盒会让渲染端每帧对它做无意义的处理。
+	const bool bHasVoxelBounds = Mode != ECSDisplayMode::None && PendingVoxelData.WorldBounds.IsValid;
+	if (!bHasVoxelBounds) return FBoxSphereBounds(FBox(FVector(-100.0), FVector(100.0)).TransformBy(LocalToWorld));
 
-	FBox DisplayBounds = PendingVoxelData.WorldBounds;
-	if (!DisplayBounds.IsValid) DisplayBounds = FBox(FVector(-100.0), FVector(100.0));
+	// 体素形状按其绘制尺寸外扩：方向线伸出 DirectionLength，面片铺开 VoxelSize * QuadScale。
 	const float Expansion = Mode == ECSDisplayMode::VoxelDirections
 		? FMath::Max(PendingVoxelData.DirectionLength, PendingVoxelData.VoxelSize)
 		: PendingVoxelData.VoxelSize * FMath::Max(PendingVoxelData.QuadScale, 1.0f);
-	return FBoxSphereBounds(DisplayBounds.ExpandBy(Expansion).TransformBy(LocalToWorld));
+	return FBoxSphereBounds(PendingVoxelData.WorldBounds.ExpandBy(Expansion).TransformBy(LocalToWorld));
 }
 
 void UCSDisplayComponent::SubmitVoxelData(FCSDisplayVoxelData&& InData, float Lifetime)
 {
-	PendingPrepared = FCSBoxScenePreparedData();
-	PendingVertexCapacity = 0;
-	PendingArrowData = FCSDisplayPointArrowData();
 	Mode = InData.Mode;
 	PendingVoxelData = MoveTemp(InData);
 	RecreateRenderState_Concurrent();

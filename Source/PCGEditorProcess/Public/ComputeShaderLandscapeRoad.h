@@ -66,13 +66,36 @@ public:
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Road")
 	void RebuildRoad();
 
+	/** Idempotent "the road I own must exist" entry point: rebuilds only when there is no road
+	 *  geometry, and returns whether there is one by the time the call is over. Safe to call from
+	 *  any lifecycle event and any number of times — the whole point is that the owner, not a
+	 *  render-state recreation, decides when the road is generated.
+	 *
+	 *  Now that URoadMeshComponent draws a UCSMesh, a render-state recreation is a rebind and
+	 *  regenerates nothing: this and RebuildRoad() are the only two things that produce road
+	 *  geometry, and on a level load this is the one that runs. */
+	UFUNCTION(BlueprintCallable, Category = "Road")
+	bool EnsureRoadGeometry();
+
 	/** The resident road-height RT for downstream landscape editing. */
 	UFUNCTION(BlueprintPure, Category = "Road|Heightmap")
 	UTextureRenderTarget2D* GetRoadHeightRT() const { return RT_RoadHeight; }
 
 	virtual void OnConstruction(const FTransform& Transform) override;
+	virtual void PostRegisterAllComponents() override;
 
 private:
+	/** Queues one EnsureRoadGeometry() for the next engine tick. See the rationale on the
+	 *  definition for why the restore is hooked here and why it is not run inline. */
+	void ScheduleEnsureRoadGeometry();
+
+	/** Latched at the first schedule and never cleared: the automatic restore is one shot per actor
+	 *  lifetime. Re-arming it on every re-registration would stack tickers, and — because a
+	 *  generation that keeps failing leaves the geometry absent — would retry the whole heavy path
+	 *  every frame. Anything past the first attempt is the owner's call (RebuildRoad /
+	 *  EnsureRoadGeometry are both public). */
+	bool bRoadGeometryRestoreAttempted = false;
+
 	UPROPERTY(VisibleAnywhere, Category = "Road")
 	TObjectPtr<URoadMeshComponent> RoadMesh;
 

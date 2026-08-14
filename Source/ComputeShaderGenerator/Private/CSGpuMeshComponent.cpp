@@ -1,27 +1,11 @@
 #include "CSGpuMeshComponent.h"
 #include "CSGpuMeshSceneProxy.h"
+#include "CSMesh.h"
 
 #include "RHI.h"
 #include "RHIGPUReadback.h"
 #include "RenderingThread.h"
 #include "RHICommandList.h"
-
-namespace
-{
-float UnpackSnorm8(uint32 PackedValue, uint32 ByteIndex)
-{
-	const int8 SignedValue = static_cast<int8>((PackedValue >> (ByteIndex * 8u)) & 0xffu);
-	return FMath::Clamp(float(SignedValue) / 127.0f, -1.0f, 1.0f);
-}
-
-FVector3f UnpackSnorm8888XYZ(uint32 PackedValue)
-{
-	return FVector3f(
-		UnpackSnorm8(PackedValue, 0),
-		UnpackSnorm8(PackedValue, 1),
-		UnpackSnorm8(PackedValue, 2)).GetSafeNormal();
-}
-}
 
 UCSGpuMeshComponent::UCSGpuMeshComponent()
 {
@@ -51,8 +35,8 @@ bool UCSGpuMeshComponent::ReadbackMeshSync(FCSGpuMeshCPUData& OutMeshData) const
 	}
 
 	// 下面的 static_cast 无法校验实际类型，因此必须先由子类确认当前代理确实是
-	// FCSGpuMeshSceneProxy。像 UCSDisplayComponent 那样可以按模式创建非本基座代理的
-	// 子类，若不在此拦截，cast 出来的就是野指针（UB）。
+	// FCSGpuMeshSceneProxy。子类若可能创建非本基座的代理、或可能压根没有代理（例如网格对象
+	// 还没分配），不在此拦截的话 cast 出来就是野指针（UB）。
 	if (!IsGpuMeshProxyActive())
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Readback rejected: the component is not currently displaying a GPU mesh."));
@@ -68,198 +52,15 @@ bool UCSGpuMeshComponent::ReadbackMeshSync(FCSGpuMeshCPUData& OutMeshData) const
 		return false;
 	}
 
-	// --- 1) read the GPU-decided vertex/index counts from the MeshCounters buffer
-	FRHIGPUBufferReadback* CountersReadback = new FRHIGPUBufferReadback(TEXT("CSGpuMesh.CountersReadback"));
-	bool bCountersQueued = false;
-	ENQUEUE_RENDER_COMMAND(CSGpuMeshEnqueueCounters)(
-		[Proxy, CountersReadback, &bCountersQueued](FRHICommandListImmediate& RHICmdList)
-		{
-			bCountersQueued = Proxy->EnqueueCountersReadback(RHICmdList, CountersReadback);
-		});
-	FlushRenderingCommands();
-	if (!bCountersQueued)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Readback failed: MeshCounters buffer is unavailable."));
-		delete CountersReadback;
-		return false;
-	}
-
-	uint32 VertexCount = 0;
-	uint32 IndexCount = 0;
-	bool bCountersRead = false;
-	ENQUEUE_RENDER_COMMAND(CSGpuMeshConsumeCounters)(
-		[CountersReadback, &VertexCount, &IndexCount, &bCountersRead](FRHICommandListImmediate& RHICmdList)
-		{
-			if (!CountersReadback->IsReady()) RHICmdList.SubmitAndBlockUntilGPUIdle();
-			if (CountersReadback->IsReady() && CountersReadback->GetGPUSizeBytes() >= sizeof(uint32) * 2u)
-			{
-				if (const uint32* Counts = static_cast<const uint32*>(CountersReadback->Lock(sizeof(uint32) * 2u)))
-				{
-					VertexCount = Counts[0];
-					IndexCount = Counts[1];
-					CountersReadback->Unlock();
-					bCountersRead = true;
-				}
-			}
-			delete CountersReadback;
-		});
-	FlushRenderingCommands();
-	if (!bCountersRead)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Readback failed: MeshCounters GPU readback did not complete."));
-		return false;
-	}
-
-	const uint32 VertexCapacity = Proxy->GetVertexCapacity();
-	const uint32 IndexCapacity = Proxy->GetIndexCapacity();
-	if (VertexCount < 3 || VertexCount > VertexCapacity)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Readback failed: vertex count %u invalid for capacity %u."), VertexCount, VertexCapacity);
-		return false;
-	}
-	if (IndexCount < 3 || IndexCount % 3u != 0 || IndexCount > IndexCapacity)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Readback failed: index count %u invalid for capacity %u."), IndexCount, IndexCapacity);
-		return false;
-	}
-
-	// --- 2) enqueue one readback per mesh stream (descriptor order)
-	TArray<FCSGpuStreamDesc> ReadbackDescs;
-	Proxy->GetMeshReadbackDescs(ReadbackDescs);
-	if (ReadbackDescs.Num() == 0)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Readback failed: proxy exposes no mesh-readback streams."));
-		return false;
-	}
-
-	TArray<FRHIGPUBufferReadback*> StreamReadbacks;
-	StreamReadbacks.Reserve(ReadbackDescs.Num());
-	for (int32 i = 0; i < ReadbackDescs.Num(); ++i)
-		StreamReadbacks.Add(new FRHIGPUBufferReadback(TEXT("CSGpuMesh.StreamReadback")));
-
-	bool bMeshQueued = false;
-	ENQUEUE_RENDER_COMMAND(CSGpuMeshEnqueueStreams)(
-		[Proxy, VertexCount, IndexCount, StreamReadbacks, &bMeshQueued](FRHICommandListImmediate& RHICmdList)
-		{
-			bMeshQueued = Proxy->EnqueueMeshReadback(RHICmdList, VertexCount, IndexCount, StreamReadbacks);
-		});
-	FlushRenderingCommands();
-	if (!bMeshQueued)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Readback failed: mesh stream copies could not be queued."));
-		for (FRHIGPUBufferReadback* RB : StreamReadbacks) delete RB;
-		return false;
-	}
-
-	// --- 3) lock each stream and fill the CPU data by semantic
-	OutMeshData.Positions.SetNumUninitialized(VertexCount);
-	OutMeshData.Normals.SetNumUninitialized(VertexCount);
-	OutMeshData.Tangents.SetNumUninitialized(VertexCount);
-	OutMeshData.TexCoords().SetNumUninitialized(VertexCount);
-	OutMeshData.Indices.SetNumUninitialized(IndexCount);
-	// 按注册的 TexCoord 流决定实际有几条 UV 通道，并为每条预分配（通道 0 已在上面分配）。
-	{
-		int32 HighestTexCoordIndex = 0;
-		for (const FCSGpuStreamDesc& Desc : ReadbackDescs)
-		{
-			if (Desc.CpuSemantic != ECSGpuMeshSemantic::TexCoord) continue;
-			HighestTexCoordIndex = FMath::Max<int32>(HighestTexCoordIndex, Desc.TexCoordIndex);
-		}
-		OutMeshData.NumTexCoordChannels = FMath::Clamp(
-			HighestTexCoordIndex + 1, 1, FCSGpuMeshCPUData::MaxTexCoordChannels);
-		for (int32 Channel = 1; Channel < OutMeshData.NumTexCoordChannels; ++Channel)
-		{
-			OutMeshData.TexCoordChannels[Channel].SetNumZeroed(VertexCount);
-		}
-	}
-
-	bool bMeshRead = false;
-	ENQUEUE_RENDER_COMMAND(CSGpuMeshConsumeStreams)(
-		[StreamReadbacks, ReadbackDescs, VertexCount, IndexCount, &OutMeshData, &bMeshRead](FRHICommandListImmediate& RHICmdList)
-		{
-			bool bAnyNotReady = false;
-			for (FRHIGPUBufferReadback* RB : StreamReadbacks)
-				if (!RB->IsReady()) bAnyNotReady = true;
-			if (bAnyNotReady) RHICmdList.SubmitAndBlockUntilGPUIdle();
-
-			bool bAllReady = true;
-			for (int32 i = 0; i < ReadbackDescs.Num(); ++i)
-			{
-				const FCSGpuStreamDesc& D = ReadbackDescs[i];
-				const uint32 Units = (D.CountSource == ECSGpuCountSource::PerIndex) ? IndexCount : VertexCount;
-				const uint32 Bytes = Units * D.ElementsPerUnit * D.BytesPerElement;
-				if (!StreamReadbacks[i]->IsReady() || StreamReadbacks[i]->GetGPUSizeBytes() < Bytes) { bAllReady = false; break; }
-			}
-
-			if (bAllReady)
-			{
-				bool bLockedOk = true;
-				for (int32 i = 0; i < ReadbackDescs.Num() && bLockedOk; ++i)
-				{
-					const FCSGpuStreamDesc& D = ReadbackDescs[i];
-					const uint32 Units = (D.CountSource == ECSGpuCountSource::PerIndex) ? IndexCount : VertexCount;
-					const uint32 Bytes = Units * D.ElementsPerUnit * D.BytesPerElement;
-					const void* Raw = StreamReadbacks[i]->Lock(Bytes);
-					if (!Raw) { bLockedOk = false; break; }
-
-					switch (D.CpuSemantic)
-					{
-					case ECSGpuMeshSemantic::Position:
-					{
-						const float* P = static_cast<const float*>(Raw);
-						for (uint32 v = 0; v < VertexCount; ++v)
-							OutMeshData.Positions[v] = FVector3f(P[v * 3 + 0], P[v * 3 + 1], P[v * 3 + 2]);
-						break;
-					}
-					case ECSGpuMeshSemantic::TangentBasis:
-					{
-						const uint32* T = static_cast<const uint32*>(Raw);
-						for (uint32 v = 0; v < VertexCount; ++v)
-						{
-							OutMeshData.Tangents[v] = UnpackSnorm8888XYZ(T[v * 2 + 0]);
-							OutMeshData.Normals[v] = UnpackSnorm8888XYZ(T[v * 2 + 1]);
-						}
-						break;
-					}
-					case ECSGpuMeshSemantic::TexCoord:
-					{
-						// 每条 TexCoord 流按自己的 TexCoordIndex 落到对应通道，多条 UV 才能各归各位。
-						const int32 Channel = FMath::Clamp<int32>(
-							D.TexCoordIndex, 0, FCSGpuMeshCPUData::MaxTexCoordChannels - 1);
-						if (Channel >= OutMeshData.NumTexCoordChannels) break;
-						TArray<FVector2f>& ChannelUVs = OutMeshData.TexCoordChannels[Channel];
-						if (ChannelUVs.Num() != int32(VertexCount)) ChannelUVs.SetNumUninitialized(VertexCount);
-						const float* UV = static_cast<const float*>(Raw);
-						for (uint32 v = 0; v < VertexCount; ++v)
-							ChannelUVs[v] = FVector2f(UV[v * 2 + 0], UV[v * 2 + 1]);
-						break;
-					}
-					case ECSGpuMeshSemantic::Index:
-					{
-						const uint32* Idx = static_cast<const uint32*>(Raw);
-						for (uint32 k = 0; k < IndexCount; ++k)
-							OutMeshData.Indices[k] = Idx[k];
-						break;
-					}
-					default:
-						break;
-					}
-					StreamReadbacks[i]->Unlock();
-				}
-				bMeshRead = bLockedOk;
-			}
-
-			for (FRHIGPUBufferReadback* RB : StreamReadbacks) delete RB;
-		});
+	// 回读实现已从「作用于代理」提升为「作用于常驻集」，代理只负责交出自己的流视图。
+	// 代理的 Streams 是渲染线程数据，故快照要在渲染线程取；取完这份视图自带引用，
+	// 后续读取不再依赖代理存活。
+	FCSMeshResident ResidentView;
+	ENQUEUE_RENDER_COMMAND(CSGpuMeshBuildResidentView)(
+		[Proxy, &ResidentView](FRHICommandListImmediate&) { Proxy->BuildResidentView(ResidentView); });
 	FlushRenderingCommands();
 
-	if (!bMeshRead)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Readback failed: mesh stream copies did not complete for %u verts / %u indices."), VertexCount, IndexCount);
-		OutMeshData.Reset();
-		return false;
-	}
-	return OutMeshData.IsValid();
+	return CSMeshReadback::ReadbackResidentSync(ResidentView, OutMeshData);
 }
 
 // -----------------------------------------------------------------------------
@@ -507,8 +308,16 @@ bool UCSGpuMeshComponent::BuildGpuMeshDescription(
 			const int32 UVIndex = AttributeIndex(MeshData.TexCoords().Num(), SourceIndex, CornerIndex);
 			FVector Normal = TransformedNormals[NormalIndex];
 			if (!IsFiniteVec(Normal) || Normal.IsNearlyZero()) Normal = FaceNormal;
-			const bool bNormalFlipped = FVector::DotProduct(Normal, FaceNormal) < 0.0;
-			if (bNormalFlipped) Normal *= -1.0;
+			// 不做逐角点半球校正（曾经是 dot(Normal, FaceNormal) < 0 就把该角点法线取反）。
+			// FaceNormal 由 float32 角点位置相减再叉积得到，布尔切出的窄条/尖角碎片上这一步会
+			// 因灾难性抵消而方向失真；于是同一个三角的三个角点各自去和一条不可靠的参考轴比较，
+			// 三个里往往只有一个被判反 —— 症状正是「偶尔某个三角的某一个角点法线朝里、
+			// 该角出现异常暗部」。
+			// 即使 FaceNormal 可靠，背朝面法线的角点法线也多半是作者有意的（双面卡片、硬边烘焙、
+			// 外扩 shell、近切向法线），逐角点翻转是破坏而非修复，还会在三角内部撕开着色。
+			// ComputeShaderMeshBoolean.cpp 的属性重建段已按同一理由移除该校正，这里是漏下的最后
+			// 一处：布尔结果在烘成 StaticMesh 时又被翻回去了。两处必须保持一致。
+			// 零长度/非有限法线仍由上一行兜底，那条才是真正的安全网。
 			FVector Tangent = TransformedTangents[TangentIndex];
 			Tangent = (Tangent - Normal * FVector::DotProduct(Tangent, Normal)).GetSafeNormal();
 			if (!IsFiniteVec(Tangent) || Tangent.IsNearlyZero())
@@ -534,7 +343,8 @@ bool UCSGpuMeshComponent::BuildGpuMeshDescription(
 			}
 			VertexInstanceNormals[VertexInstanceID] = FVector3f(Normal);
 			VertexInstanceTangents[VertexInstanceID] = FVector3f(Tangent);
-			VertexInstanceBinormalSigns[VertexInstanceID] = BinormalSign * TransformHandedness * (bNormalFlipped ? -1.0f : 1.0f);
+			// 法线不再被逐角点翻转，切线基的手性就不需要再补那个补偿符号；镜像变换那一项仍要保留。
+			VertexInstanceBinormalSigns[VertexInstanceID] = BinormalSign * TransformHandedness;
 			VertexInstanceColors[VertexInstanceID] = Color;
 			VertexInstanceUVs.Set(VertexInstanceID, 0, SafeUV);
 			// 额外 UV 通道与通道 0 等长（IsValid 已校验），沿用同一个角点下标。

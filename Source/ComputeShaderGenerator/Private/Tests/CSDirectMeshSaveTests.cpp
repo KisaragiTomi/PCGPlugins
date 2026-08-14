@@ -3,6 +3,8 @@
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 
 #include "CSGpuMeshComponent.h"
+#include "CSMesh.h"
+#include "CSMeshRenderComponent.h"
 #include "ComputeShaderMeshGenerator.h"
 
 #include "Components/BoxComponent.h"
@@ -128,6 +130,23 @@ bool FCSDirectMeshSaveGPUAutomationTest::RunTest(const FString& Parameters)
 	const FCSTriangleMeshData DiagnosticTriangleData = Generator->GetBoxSceneTrianglesFromGPUFiltered(0.0f);
 	TestEqual(TEXT("Existing GPU triangle extraction sees the cube"), DiagnosticTriangleData.VertexCount, ExpectedVertexCount);
 
+	// --- what the submit is now supposed to leave behind: a retained mesh object the generator owns
+	//     and a render component merely bound to it, instead of geometry that only exists for as long
+	//     as some scene proxy does.
+	UCSMesh* GpuMesh = Generator->DirectGpuMesh;
+	if (!TestNotNull(TEXT("Submit populated the generator's retained GPU mesh"), GpuMesh)) return false;
+	TestEqual(TEXT("The retained mesh holds every cube triangle"), GpuMesh->GetTriangleCountSync(), ExpectedTriangleCount);
+	if (!TestNotNull(TEXT("Direct mesh render component"), Generator->DirectMeshRenderComponent.Get())) return false;
+	TestEqual(TEXT("The render component draws the retained mesh"),
+		Generator->DirectMeshRenderComponent->GetGpuMesh(), GpuMesh);
+
+	// The whole reason the old path could only ever draw one material: it never carried the
+	// extraction's material table or ran the sort. One section per slot is BuildMaterialSections'
+	// documented contract, empty slots included.
+	const int32 MaterialSlotCount = GpuMesh->Materials.Num();
+	TestTrue(TEXT("The extraction filled the mesh's material table"), MaterialSlotCount > 0);
+	TestEqual(TEXT("One draw section per material slot"), GpuMesh->GetSections().Num(), MaterialSlotCount);
+
 	const FString TestAssetPath = FString::Printf(
 		TEXT("/Game/Automation/CSDirectMesh/SM_GPUReadback_%s"),
 		*FGuid::NewGuid().ToString(EGuidFormats::Digits));
@@ -138,6 +157,8 @@ bool FCSDirectMeshSaveGPUAutomationTest::RunTest(const FString& Parameters)
 	if (!TestNotNull(TEXT("Saved mesh LOD0 MeshDescription"), MeshDescription)) return false;
 	TestEqual(TEXT("Cube triangle count survives GPU save"), MeshDescription->Triangles().Num(), ExpectedTriangleCount);
 	TestEqual(TEXT("Direct triangle soup vertex count"), MeshDescription->Vertices().Num(), ExpectedVertexCount);
+	TestEqual(TEXT("The mesh's material slots reach the saved asset"),
+		SavedMesh->GetStaticMaterials().Num(), FMath::Max(1, MaterialSlotCount));
 
 	FStaticMeshConstAttributes Attributes(*MeshDescription);
 	TVertexAttributesConstRef<FVector3f> Positions = Attributes.GetVertexPositions();
@@ -146,6 +167,18 @@ bool FCSDirectMeshSaveGPUAutomationTest::RunTest(const FString& Parameters)
 		LocalBounds += FVector(Positions[VertexID]);
 	TestTrue(TEXT("Saved positions were converted back to generator-local space"),
 		LocalBounds.IsValid && LocalBounds.GetCenter().IsNearlyZero(0.1) && LocalBounds.GetExtent().Equals(FVector(50.0), 0.1));
+
+	// The point of lifting the geometry off the scene proxy: the save reads the mesh object, so it
+	// no longer needs anything to be rendering it. Same path, replacing the same asset in place.
+	Generator->DirectMeshRenderComponent->SetGpuMesh(nullptr);
+	FlushRenderingCommands();
+	UStaticMesh* SavedWithoutProxy = Generator->SaveDirectGPUMeshToStaticMesh(TestAssetPath, true, false, true);
+	if (TestNotNull(TEXT("StaticMesh saved with nothing rendering the mesh"), SavedWithoutProxy))
+	{
+		const FMeshDescription* ProxylessDescription = SavedWithoutProxy->GetMeshDescription(0);
+		if (TestNotNull(TEXT("Proxy-free save LOD0 MeshDescription"), ProxylessDescription))
+			TestEqual(TEXT("Proxy-free save keeps every triangle"), ProxylessDescription->Triangles().Num(), ExpectedTriangleCount);
+	}
 
 	const bool bDeletedTestAsset = UEditorAssetLibrary::DeleteAsset(TestAssetPath);
 	TestTrue(TEXT("Temporary StaticMesh asset cleaned up"), bDeletedTestAsset);

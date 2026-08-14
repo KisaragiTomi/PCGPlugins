@@ -1,12 +1,17 @@
 #include "CSGpuInstancedMeshComponent.h"
 #include "CSGpuInstancedMeshSceneProxy.h"
 
+#include "CSMesh.h"
+#include "CSMeshOps.h"
+
 #include "Engine/StaticMesh.h"
 #include "Materials/MaterialInterface.h"
 #include "Rendering/StaticMeshVertexBuffer.h"
 #include "Rendering/PositionVertexBuffer.h"
 #include "Rendering/ColorVertexBuffer.h"
 #include "StaticMeshResources.h"
+#include "RenderGraphBuilder.h"
+#include "RenderGraphUtils.h"
 #include "RHI.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogCSGpuInstancedMesh, Log, All);
@@ -287,7 +292,9 @@ bool UCSGpuInstancedMeshComponent::UpdateInstanceTransform(int32 InstanceIndex, 
 
 	PerInstanceTransforms[InstanceIndex] = bWorldSpace ? NewInstanceTransform.GetRelativeTransform(GetComponentTransform()) : NewInstanceTransform;
 
-	RebuildInstanceData();
+	// The GPU upload is what bMarkRenderStateDirty now really gates: it blocks on a render flush, so
+	// a caller updating a run of instances must be able to pay for it once rather than per instance.
+	RebuildInstanceData(bMarkRenderStateDirty);
 	if (bMarkRenderStateDirty)
 	{
 		MarkRenderStateDirty();
@@ -353,7 +360,13 @@ void UCSGpuInstancedMeshComponent::ClearInstanceSourceGPU()
 // Cluster build
 // -----------------------------------------------------------------------------
 
-void UCSGpuInstancedMeshComponent::RebuildInstanceData()
+void UCSGpuInstancedMeshComponent::RebuildInstanceData(bool bRebuildGpuMesh)
+{
+	RebuildInstancePacking();
+	if (bRebuildGpuMesh) RebuildGpuMesh();
+}
+
+void UCSGpuInstancedMeshComponent::RebuildInstancePacking()
 {
 	PackedInstances.Reset();
 	ClusterBounds.Reset();
@@ -463,8 +476,261 @@ void UCSGpuInstancedMeshComponent::RebuildInstanceData()
 }
 
 // -----------------------------------------------------------------------------
+// The retained buffer set
+// -----------------------------------------------------------------------------
+
+uint32 UCSGpuInstancedMeshComponent::ResolveInstanceCapacity(uint32 LiveInstanceCount) const
+{
+	// A floor, so a handful of instances still gets a buffer worth having and the first few
+	// AddInstance calls change nothing.
+	constexpr uint32 MinCapacity = 64u;
+
+	const uint32 Held = GpuLayout.InstanceCapacity;
+	const bool bTooSmall = LiveInstanceCount > Held;
+	// Hysteresis: only hand capacity back once three quarters of it are idle. Mirrors what
+	// UCSMesh::ShrinkSlackRatio does for the geometry streams, and for the same reason — an
+	// instance set that oscillates must not churn its buffers on every swing.
+	const bool bMostlyIdle = LiveInstanceCount * 4u < Held;
+	if (!bTooSmall && !bMostlyIdle) return FMath::Max(Held, LiveInstanceCount);
+
+	return FMath::Max(MinCapacity, LiveInstanceCount + LiveInstanceCount / 2u);
+}
+
+void UCSGpuInstancedMeshComponent::ReleaseGpuMesh()
+{
+	GpuLayout = FCSGpuInstancedGpuLayout();
+	if (!InstancedGpuMesh) return;
+
+	// Not merely unbound: the buffers were sized for an instance set that no longer exists, and a
+	// component with nothing to draw is exactly when the VRAM is worth handing back. The live proxy
+	// keeps its own references to the pooled buffers, so it goes on drawing from valid memory until
+	// the render-state recreation its caller is about to trigger replaces it.
+	const FCSMeshResident* Resident = InstancedGpuMesh->GetResidentPtr();
+	if (Resident && Resident->IsAllocated()) InstancedGpuMesh->ReleaseSync();
+}
+
+void UCSGpuInstancedMeshComponent::RebuildGpuMesh()
+{
+	// Deferred to OnRegister while unregistered. Nothing can draw an unregistered component, and
+	// this blocks on a render flush — PostLoad rebuilds every one of these in the level, and a
+	// render round trip each would show up as load time for no visible result. Released rather than
+	// left alone, because what is in the buffers has already stopped matching the instance set.
+	if (!IsRegistered())
+	{
+		ReleaseGpuMesh();
+		return;
+	}
+
+	const bool bPackedGpuSource = GpuInstanceSource.IsValid();
+	const bool bPointGpuSource = GpuPointSource.IsValid();
+	const bool bHasInstances = bPackedGpuSource || bPointGpuSource || PackedInstances.Num() > 0;
+	if (!BaseMeshSnapshot.IsValid() || !bHasInstances)
+	{
+		ReleaseGpuMesh();
+		return;
+	}
+
+	// --- what the buffers have to be sized for
+	FCSGpuInstancedGpuLayout NewLayout;
+	NewLayout.NumLODs = uint32(FMath::Clamp(BaseMeshSnapshot.LODs.Num(), 1, CS_GPU_INSTANCED_MAX_LODS));
+	if (bPackedGpuSource || bPointGpuSource)
+	{
+		// Instances live on the GPU: there is no cluster table to build from, so the coarse level is
+		// skipped and every instance goes through the fine cull. The producer's buffer capacity is
+		// already a capacity, so it needs no ratchet of ours; its counter carries the live count.
+		NewLayout.InstanceCapacity = bPackedGpuSource ? GpuInstanceSource.Capacity : GpuPointSource.Capacity;
+		NewLayout.NumSourceInstances = NewLayout.InstanceCapacity;
+	}
+	else
+	{
+		NewLayout.NumSourceInstances = uint32(PackedInstances.Num() / 5);
+		NewLayout.ClusterSize = uint32(FMath::Clamp(InstancesPerCluster, 1, 4096));
+		NewLayout.InstanceCapacity = ResolveInstanceCapacity(NewLayout.NumSourceInstances);
+		NewLayout.NumClusters = uint32(FMath::DivideAndRoundUp(NewLayout.NumSourceInstances, NewLayout.ClusterSize));
+	}
+	if (!NewLayout.IsValid())
+	{
+		ReleaseGpuMesh();
+		return;
+	}
+
+	if (!InstancedGpuMesh) InstancedGpuMesh = NewObject<UCSMesh>(this);
+	// One entry, and not the material anything draws with — the proxy draws every LOD with
+	// InstanceMaterial directly. This is where a save of the base mesh gets its single slot from,
+	// which is the same table the material-id stream is cleared to index.
+	InstancedGpuMesh->SetMaterial(0, InstanceMaterial);
+
+	// --- declare the stream set: one indirect arg set per LOD, plus this leaf's seven aux streams.
+	//
+	// Declared at the instance capacity the mesh ALREADY holds, not at the new one. A re-declaration
+	// reallocates and copies every resident stream, the base-mesh geometry included, and the only
+	// thing another instance changes is how many instances the aux streams have room for — which is
+	// a per-stream resize, applied right below. So the declaration only moves when the shape of the
+	// set moves: a LOD gained or lost, a different cluster size, or a packed GPU source appearing
+	// and taking the source-row stream down to a placeholder.
+	FCSGpuInstancedGpuLayout DeclaredLayout = NewLayout;
+	if (GpuLayout.IsValid()) DeclaredLayout.InstanceCapacity = GpuLayout.InstanceCapacity;
+
+	FCSMeshStreamLayout StreamLayout;
+	StreamLayout.NumIndirectDraws = DeclaredLayout.NumLODs;
+	CSGpuInstancedBuildAuxStreamDescs(StreamLayout.ExtraStreams, DeclaredLayout, bPackedGpuSource);
+
+	// Refused rather than partially applied, and the return value is the only signal: a slot that
+	// collides with a stream the standard set already owns is dropped, and a dropped stream is a
+	// null buffer bound at draw time with nothing in the log. See ECSGpuInstancedAuxSlot.
+	if (!InstancedGpuMesh->SetStreamLayoutSync(StreamLayout))
+	{
+		UE_LOG(LogCSGpuInstancedMesh, Error,
+			TEXT("%s: the GPU mesh refused this leaf's stream layout (%u LODs, %u instance slots). Nothing will be drawn."),
+			*GetPathName(), DeclaredLayout.NumLODs, DeclaredLayout.InstanceCapacity);
+		ReleaseGpuMesh();
+		return;
+	}
+
+	// --- bring the instance-sized streams to the capacity this rebuild wants, one buffer at a time.
+	//
+	// Built from the same descriptor builder the declaration uses, so the two can never disagree
+	// about what a stream at a given capacity looks like; entries already at their target size are
+	// no-ops, which is what makes a rebuild that changed nothing free. Resized streams come back
+	// zeroed — the rows and the cluster spheres are re-uploaded by the edit below, and every other
+	// one of them is rewritten in full by the cull before anything reads it.
+	TArray<FCSGpuStreamDesc> WantedAux;
+	CSGpuInstancedBuildAuxStreamDescs(WantedAux, NewLayout, bPackedGpuSource);
+
+	TArray<FCSMeshStreamResize> Resizes;
+	Resizes.Reserve(WantedAux.Num());
+	for (const FCSGpuStreamDesc& Desc : WantedAux)
+	{
+		FCSMeshStreamResize& Resize = Resizes.AddDefaulted_GetRef();
+		Resize.Role = Desc.Role;
+		Resize.SlotIndex = Desc.TexCoordIndex;
+		Resize.ElementCount = Desc.ElementsPerUnit;
+	}
+	if (!InstancedGpuMesh->ResizeStreamsSync(Resizes))
+	{
+		UE_LOG(LogCSGpuInstancedMesh, Error,
+			TEXT("%s: the GPU mesh refused to resize this leaf's aux streams to %u instance slots. Nothing will be drawn."),
+			*GetPathName(), NewLayout.InstanceCapacity);
+		ReleaseGpuMesh();
+		return;
+	}
+
+	// --- size it for the base mesh. Both counts are exact here (unlike the road, whose emitted size
+	// only the GPU knows), which is what lets the shrink below run without a counter readback.
+	const int32 NumVertices = BaseMeshSnapshot.Positions.Num();
+	const int32 NumIndices = BaseMeshSnapshot.Indices.Num();
+	if (!InstancedGpuMesh->EnsureCapacitySync(NumVertices, NumIndices))
+	{
+		UE_LOG(LogCSGpuInstancedMesh, Warning,
+			TEXT("%s: capacity for %d vertices / %d indices was refused; the instanced mesh will not be drawn."),
+			*GetPathName(), NumVertices, NumIndices);
+		ReleaseGpuMesh();
+		return;
+	}
+
+	// --- upload
+	const FCSGpuInstancedBaseMesh& Mesh = BaseMeshSnapshot;
+	const TArray<FVector4f>& Rows = PackedInstances;
+	const TArray<FVector4f>& Clusters = ClusterBounds;
+	const FBox DrawnWorldBounds = LocalBounds.IsValid ? LocalBounds.TransformBy(GetComponentTransform()) : FBox(ForceInit);
+	const bool bUploadRows = !bPackedGpuSource && Rows.Num() > 0;
+
+	bool bUploaded = false;
+	InstancedGpuMesh->EditMeshSync([&Mesh, &Rows, &Clusters, &DrawnWorldBounds, bUploadRows, &bUploaded](FCSMeshEditContext& Context)
+	{
+		FRDGBuilder& GraphBuilder = Context.GraphBuilder;
+
+		FRDGBufferRef Positions = Context.Positions();
+		FRDGBufferRef Tangents = Context.Tangents();
+		FRDGBufferRef TexCoords = Context.TexCoords();
+		FRDGBufferRef Colors = Context.Colors();
+		FRDGBufferRef Indices = Context.Indices();
+		FRDGBufferRef IndirectArgs = Context.IndirectArgs();
+		FRDGBufferRef MeshCounters = Context.Counters();
+		if (!Positions || !Tangents || !TexCoords || !Colors) return;
+		if (!Indices || !IndirectArgs || !MeshCounters) return;
+
+		// ERDGInitialDataFlags::None makes RDG take its own copy, so these arrays only have to
+		// outlive the call — which EditMeshSync's flush guarantees anyway.
+		GraphBuilder.QueueBufferUpload(Positions, Mesh.Positions.GetData(), Mesh.Positions.Num() * sizeof(FVector3f), ERDGInitialDataFlags::None);
+		GraphBuilder.QueueBufferUpload(Tangents, Mesh.TangentBasis.GetData(), Mesh.TangentBasis.Num() * sizeof(uint32), ERDGInitialDataFlags::None);
+		GraphBuilder.QueueBufferUpload(TexCoords, Mesh.TexCoords.GetData(), Mesh.TexCoords.Num() * sizeof(FVector2f), ERDGInitialDataFlags::None);
+		GraphBuilder.QueueBufferUpload(Colors, Mesh.Colors.GetData(), Mesh.Colors.Num() * sizeof(uint32), ERDGInitialDataFlags::None);
+		GraphBuilder.QueueBufferUpload(Indices, Mesh.Indices.GetData(), Mesh.Indices.Num() * sizeof(uint32), ERDGInitialDataFlags::None);
+
+		// The readback path (ReadbackMeshSync / save-to-StaticMesh) sees the single base-mesh copy,
+		// not the instanced result — the instances only ever exist as transforms.
+		const uint32 Counters[2] = { uint32(Mesh.Positions.Num()), uint32(Mesh.Indices.Num()) };
+		GraphBuilder.QueueBufferUpload(MeshCounters, Counters, sizeof(Counters), ERDGInitialDataFlags::None);
+
+		// Zeroed until the first cull pass runs, so an unculled frame draws nothing rather than
+		// whatever the buffer pool's previous tenant left in those five uints per LOD.
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgs, PF_R32_UINT)), 0u);
+
+		// This leaf writes no material ids, but every UCSMesh carries that stream and the save path
+		// reads it back as the per-triangle slot. Left holding the pool's previous tenant, a
+		// one-material base mesh would come out of the saver scattered across dozens of slots that
+		// have no materials behind them. Zero is this mesh's only slot.
+		FRDGBufferRef MaterialIds = Context.MaterialIds();
+		if (MaterialIds) AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(MaterialIds, PF_R32_UINT)), 0u);
+
+		FRDGBufferRef SourceInstances = Context.Find(ECSGpuStreamRole::AuxVertex, uint8(ECSGpuInstancedAuxSlot::SourceInstances));
+		FRDGBufferRef ClusterBoundsBuffer = Context.Find(ECSGpuStreamRole::AuxVertex, uint8(ECSGpuInstancedAuxSlot::ClusterBounds));
+		if (!SourceInstances || !ClusterBoundsBuffer) return;
+
+		if (bUploadRows) GraphBuilder.QueueBufferUpload(SourceInstances, Rows.GetData(), Rows.Num() * sizeof(FVector4f), ERDGInitialDataFlags::None);
+		if (Clusters.Num() > 0) GraphBuilder.QueueBufferUpload(ClusterBoundsBuffer, Clusters.GetData(), Clusters.Num() * sizeof(FVector4f), ERDGInitialDataFlags::None);
+
+		// No SetStandardStreamAccessFinal and no GraphBuilder.Execute() here: both belong to
+		// EditMeshSync, which restores every resident stream's access state for the whole edit.
+		// Doing either by hand is the failure that has no symptom but "it stopped drawing".
+
+		// The arg sets are per LOD here, not per material run. A section table would make the render
+		// side draw arg set i with material i, which for this mesh is LOD i's draw.
+		UCSMeshOps::InvalidateSections(Context);
+		// Stated exactly, which is what lets the shrink below skip the counter readback that a
+		// GPU-decided size would force (a full stall) before it even reaches its own hysteresis.
+		Context.SetKnownCounts(Mesh.Positions.Num(), Mesh.Indices.Num());
+		// The streams hold one component-local copy of the base mesh; this box is where the drawn
+		// instances are. They deliberately disagree — the instanced result has no vertices anywhere
+		// — and this is the answer anything asking "where is this mesh" wants.
+		Context.Resident.WorldBounds = DrawnWorldBounds;
+		bUploaded = true;
+	});
+
+	if (!bUploaded)
+	{
+		UE_LOG(LogCSGpuInstancedMesh, Error, TEXT("%s: the base-mesh upload found the GPU mesh missing streams; nothing will be drawn."), *GetPathName());
+		ReleaseGpuMesh();
+		return;
+	}
+
+	// Retention introduces a ratchet the proxy-owned path never had: the buffers used to be
+	// reallocated from scratch on every proxy rebuild, and now only EnsureCapacitySync moves them,
+	// which never goes down. Without this, swapping a 100k-vertex base mesh for a 500-vertex one
+	// keeps the larger allocation for the rest of the session.
+	//
+	// After the upload, not before it: the shrink refuses to go below the mesh's live counts, and
+	// until the edit above ran those were the *previous* base mesh's — which is exactly the case
+	// worth shrinking. The surviving contents are copied across, so the freshly uploaded mesh
+	// arrives intact on the other side.
+	if (NumVertices < InstancedGpuMesh->GetVertexCapacity() || NumIndices < InstancedGpuMesh->GetIndexCapacity())
+	{
+		InstancedGpuMesh->ShrinkCapacitySync(NumVertices, NumIndices);
+	}
+
+	GpuLayout = NewLayout;
+}
+
+// -----------------------------------------------------------------------------
 // UObject / UPrimitiveComponent
 // -----------------------------------------------------------------------------
+
+void UCSGpuInstancedMeshComponent::OnRegister()
+{
+	Super::OnRegister();
+	RebuildGpuMesh();
+}
 
 void UCSGpuInstancedMeshComponent::PostLoad()
 {
@@ -497,10 +763,14 @@ void UCSGpuInstancedMeshComponent::PostEditChangeProperty(FPropertyChangedEvent&
 FPrimitiveSceneProxy* UCSGpuInstancedMeshComponent::CreateSceneProxy()
 {
 	if (GMaxRHIFeatureLevel < ERHIFeatureLevel::SM5) return nullptr;
-	if (!BaseMeshSnapshot.IsValid()) return nullptr;
 
-	const bool bHasInstances = GpuInstanceSource.IsValid() || GpuPointSource.IsValid() || PackedInstances.Num() > 0;
-	if (!bHasInstances) return nullptr;
+	// The one gate now, and it stands for all the old ones: RebuildGpuMesh releases the buffers
+	// unless there is a valid base mesh, a non-empty instance set and a layout the mesh accepted, so
+	// an allocation existing is the same statement as "there is something to draw". Note this is
+	// only a *read* — a proxy creation must never build geometry, since it can run off the game
+	// thread during the end-of-frame update where a blocking flush is not allowed.
+	const FCSMeshResidentRef Resident = InstancedGpuMesh ? InstancedGpuMesh->GetResident() : FCSMeshResidentRef();
+	if (!Resident.IsValid() || !Resident->IsAllocated() || !GpuLayout.IsValid()) return nullptr;
 
 	// The vertex factory only compiles for materials flagged for instancing; this both flags the
 	// material in the editor and warns when it cannot be flagged (same call ISM makes).
@@ -516,5 +786,5 @@ FPrimitiveSceneProxy* UCSGpuInstancedMeshComponent::CreateSceneProxy()
 	// from the proxy so registration stays on the game thread.
 	FCSGpuInstancedMeshSceneProxy::EnsureCullServiceStarted();
 
-	return new FCSGpuInstancedMeshSceneProxy(this);
+	return new FCSGpuInstancedMeshSceneProxy(this, Resident);
 }

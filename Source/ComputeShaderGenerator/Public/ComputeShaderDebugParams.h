@@ -39,6 +39,33 @@ public:
 	FLinearColor GPUProjectionVoxelTargetColor = FLinearColor(1.0f, 0.0f, 0.1f, 1.0f);
 };
 
+USTRUCT(BlueprintType, meta = (DisplayName = "SC Stage Debug"))
+struct COMPUTESHADERGENERATOR_API FVisVineSCStageDebugOptions
+{
+	GENERATED_BODY()
+public:
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
+	bool bSCStageDrawTube = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "0.0"))
+	float SCStageDebugPointDuration = 5.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "0.0"))
+	float SCStageDebugPointSize = 8.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
+	bool bSCStageDebugPointsPersistent = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "0"))
+	int32 SCStageDebugPointLimit = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
+	FLinearColor SCStageTubeDebugPointColor = FLinearColor(0.0f, 1.0f, 0.2f, 1.0f);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
+	FLinearColor SCStagePlaneDebugPointColor = FLinearColor(0.1f, 0.55f, 1.0f, 1.0f);
+};
+
 USTRUCT(BlueprintType, meta = (DisplayName = "Surface Voxel Debug"))
 struct COMPUTESHADERGENERATOR_API FVisVineSurfaceVoxelDebugOptions
 {
@@ -92,8 +119,10 @@ public:
 //   FP  : after the final surface projection (FinalProject)
 //   RS  : after the arc-length resample (ResampleSurface)
 //   B   : after the smoothing ping-pong (final geometry center line)
-// Only the selected stage is copied back from the GPU, so switching stages keeps the
-// readback cost minimal.
+//
+// 目前 C++ 侧没有任何消费者：选中阶段的唯一去处是 FVineMeshSceneProxy 画的中心线叠加，那层
+// 叠加随 proxy 一起退休了。保留本枚举纯粹是因为 BP_VineSource 仍然引用它——删掉会让蓝图断连，
+// 而它本身不占运行时开销。哪天要恢复中心线可视化，从这里接回去。
 UENUM(BlueprintType)
 enum class EVisVineGPUDebugStage : uint8
 {
@@ -103,39 +132,9 @@ enum class EVisVineGPUDebugStage : uint8
 	None         UMETA(DisplayName = "无 - 只输出最终网格 (不画任何调试线)")
 };
 
-USTRUCT(BlueprintType, meta = (DisplayName = "VisVine Spline Debug"))
-struct COMPUTESHADERGENERATOR_API FVisVineSplineDebugOptions
-{
-	GENERATED_BODY()
-public:
-	// When enabled, VisVineGPU submits the selected-stage GPU center-line buffer to the renderer.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
-	bool bDrawDebugLines = true;
-
-	// Which intermediate pipeline stage to draw directly from its GPU buffer.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
-	EVisVineGPUDebugStage DebugStage = EVisVineGPUDebugStage::Smooth;
-
-	// Skip vines whose center line ends up with fewer than this many points.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "2"))
-	int32 MinPointsPerSpline = 2;
-
-	// Color of the drawn center-line segments.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
-	FLinearColor SplineColor = FLinearColor(0.0f, 1.0f, 0.35f, 1.0f);
-
-	// Center-line segment thickness.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "0.0"))
-	float LineThickness = 2.0f;
-
-	// How long (seconds) the debug lines persist. Ignored when bPersistentLines is true.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug", meta = (ClampMin = "0.0"))
-	float DebugDuration = 5.0f;
-
-	// Keep debug lines until explicitly flushed instead of expiring after DebugDuration.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VisVine|Debug")
-	bool bPersistentLines = false;
-};
+// FVisVineSplineDebugOptions 已删除。它唯一的消费者是 FVineMeshSceneProxy 自持顶点工厂画的那层
+// GPU 中心线叠加；藤蔓几何迁到 UCSMesh 后该 proxy 不复存在，绑定别人网格的渲染组件也没地方放这条
+// 额外的线段流。
 
 // =============================================================================
 // ComputeShaderMeshGenerator Debug Parameter Structs
@@ -255,3 +254,30 @@ public:
 	int32 TriangleDebugCountLimit = 0;
 };
 
+/** Debug draw options for DrawDebugActiveVoxels. */
+USTRUCT(BlueprintType, meta = (DisplayName = "CS Active Voxel Debug"))
+struct COMPUTESHADERGENERATOR_API FCSDebugActiveVoxelOptions
+{
+	GENERATED_BODY()
+public:
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Active Voxels")
+	FName RequestId = NAME_None;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Active Voxels")
+	FLinearColor DebugColor = FLinearColor::Green;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Active Voxels", meta = (ClampMin = "0.0"))
+	float Duration = 5.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Active Voxels", meta = (ClampMin = "0.0"))
+	float Thickness = 2.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Active Voxels")
+	bool bPersistentLines = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Active Voxels")
+	bool bDrawCacheBounds = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Debug|Active Voxels", meta = (ClampMin = "0"))
+	int32 MaxVoxelsToDraw = 0;
+};

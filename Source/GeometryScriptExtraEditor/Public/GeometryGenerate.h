@@ -10,9 +10,10 @@
 
 #include "GeometryGenerate.generated.h"
 
+class UCSMesh;
 
 /**
- * 
+ *
  */
 DECLARE_STATS_GROUP(TEXT("TestTime"), STATGROUP_TestTime, STATCAT_Advanced);
 DECLARE_CYCLE_STAT(TEXT("SCTime"), STAT_SpaceColonization, STATGROUP_TestTime);
@@ -54,25 +55,23 @@ public:
 	                                              float PointRadiusMult = 2, bool bProjectToSurface = true,
 	                                              float InclusionDistance = 50.0f);
 
-	UFUNCTION(BlueprintCallable, Category = "Generate|ComputeShader")
-	static UDynamicMesh* CSTriangleDataToDynamicMesh(FCSTriangleMeshData CSTriangleData,
+	// CS 三角形数据的出口一律是 UCSMesh。要 UDynamicMesh 的调用方接一个
+	// UCSMeshOps::CopyToDynamicMesh —— GPU 管线只留一条出桥。
+	// TargetMesh 传 null 会在 Outer 下新建一个（Outer 也为 null 则挂到 transient package）。
+	UFUNCTION(BlueprintCallable, Category = "Generate|ComputeShader", meta = (DefaultToSelf = "Outer"))
+	static UPARAM(DisplayName = "Target") UCSMesh* CSTriangleDataToGpuMesh(UCSMesh* TargetMesh,
+		UObject* Outer,
+		FCSTriangleMeshData CSTriangleData,
 		bool bReverseOrientation = false,
 		bool bSkipDegenerateTriangles = true,
 		bool bRecomputeNormals = true);
 
-	UFUNCTION(BlueprintCallable, Category = "Generate|ComputeShader")
-	static UDynamicMesh* CSTriangleBuffersToDynamicMesh(TArray<FVector> Vertices,
+	UFUNCTION(BlueprintCallable, Category = "Generate|ComputeShader", meta = (DefaultToSelf = "Outer"))
+	static UPARAM(DisplayName = "Target") UCSMesh* CSTriangleBuffersToGpuMesh(UCSMesh* TargetMesh,
+		UObject* Outer,
+		TArray<FVector> Vertices,
 		TArray<int32> Indices,
 		TArray<FVector> VertexNormals,
-		int32 VertexCount = -1,
-		int32 IndexCount = -1,
-		bool bReverseOrientation = false,
-		bool bSkipDegenerateTriangles = true,
-		bool bRecomputeNormals = true);
-
-	static UDynamicMesh* CSTriangleReadbackToDynamicMesh(const TArray<FVector4f>& CompactVertices,
-		const TArray<uint32>& CompactIndices,
-		const TArray<FVector4f>& CompactVertexNormals,
 		int32 VertexCount = -1,
 		int32 IndexCount = -1,
 		bool bReverseOrientation = false,
@@ -101,16 +100,16 @@ public:
 	UFUNCTION(BlueprintCallable, Category = Generate)
 	static FVector TestViewPosition();
 
-	/** 将 ComputeShaderMeshGenerator 的 GPU surface voxels 通过 OpenVDB ParticlesToLevelSet 转为 mesh。
-	 *  输出为世界空间坐标。 */
-	UFUNCTION(BlueprintCallable, Category = "Generate|ComputeShader")
-	static UDynamicMesh* SurfaceVoxelsToVDBMesh(AComputeShaderMeshGenerator* Generator,
-		float VoxelSize = 10.0f,
-		float RadiusMult = 2.0f,
-		bool bRecomputeNormals = true);
-
-	UFUNCTION(BlueprintCallable, Category = "Generate|ComputeShader")
-	static UDynamicMesh* VDBVoxelsToOpenDynamicMesh(FCSSurfaceVoxelData SurfaceVoxels,
+	/** 把一批已经读回 CPU 的 GPU surface voxels 通过 OpenVDB ParticlesToLevelSet 转成 mesh。
+	 *  输出为世界空间坐标。
+	 *
+	 *  实现落在 AComputeShaderMeshGenerator::VDBParticlesToGpuMesh：这里和 generator 自己的
+	 *  SurfaceVoxelsToVDBGpuMesh 只差"体素从哪来"，各写一份 OpenVDB 设置正是两份实现当初
+	 *  走岔的原因。要 generator 直接跑这条路的调用方直接调它的 SurfaceVoxelsToVDBGpuMesh。 */
+	UFUNCTION(BlueprintCallable, Category = "Generate|ComputeShader", meta = (DefaultToSelf = "Outer"))
+	static UPARAM(DisplayName = "Target") UCSMesh* VDBVoxelsToOpenGpuMesh(UCSMesh* TargetMesh,
+		UObject* Outer,
+		FCSSurfaceVoxelData SurfaceVoxels,
 		float VoxelSize = 0.0f,
 		float RadiusMult = 2.0f,
 		bool bRecomputeNormals = true);

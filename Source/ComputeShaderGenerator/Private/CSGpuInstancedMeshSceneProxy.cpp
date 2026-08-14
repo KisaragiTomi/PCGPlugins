@@ -215,44 +215,42 @@ void FCSGpuInstancedMeshSceneProxy::EnsureCullServiceStarted()
 // FCSGpuInstancedMeshSceneProxy
 // -----------------------------------------------------------------------------
 
-FCSGpuInstancedMeshSceneProxy::FCSGpuInstancedMeshSceneProxy(UCSGpuInstancedMeshComponent* Component)
+FCSGpuInstancedMeshSceneProxy::FCSGpuInstancedMeshSceneProxy(UCSGpuInstancedMeshComponent* Component, const FCSMeshResidentRef& InResident)
 	: FCSGpuMeshSceneProxy(Component, Component->InstanceMaterial, "FCSGpuInstancedMeshSceneProxy")
-	, BaseMesh(Component->GetBaseMeshSnapshot())
-	, PackedInstances(Component->GetPackedInstances())
-	, ClusterBounds(Component->GetClusterBounds())
+	, Resident(InResident)
+	, LODs(Component->GetBaseMeshSnapshot().LODs)
 	, GpuSource(Component->GetInstanceSourceGPU())
 	, GpuPointSource(Component->GetInstancePointSourceGPU())
-	, ClusterSize(FMath::Clamp(Component->InstancesPerCluster, 1, 4096))
 	, EndCullDistance(FMath::Max(Component->InstanceEndCullDistance, 0.0f))
 	, LodScreenSizeScale(FMath::Max(Component->LODScreenSizeScale, 0.01f))
 	, bFrustumCull(Component->bGpuFrustumCulling)
 	, bLodSelect(Component->bGpuLODSelection)
+	, Layout(Component->GetGpuLayout())
 {
-	NumLODs = uint32(FMath::Clamp(BaseMesh.LODs.Num(), 1, CS_GPU_INSTANCED_MAX_LODS));
+	// Holding the shared reference (not a raw pointer) is what makes both teardown orders safe:
+	// the component can be destroyed first, or the mesh object can be collected first.
+	SetExternalStreams(InResident);
 
-	if (GpuSource.IsValid() || GpuPointSource.IsValid())
-	{
-		// Instances live on the GPU: there is no cluster table to build from, so the coarse level
-		// is skipped and every instance goes through the fine cull.
-		MaxInstances = GpuSource.IsValid() ? GpuSource.Capacity : GpuPointSource.Capacity;
-		NumClusters = 0;
-		ClusterSize = 0;
-	}
-	else
-	{
-		MaxInstances = uint32(PackedInstances.Num() / 5);
-		NumClusters = MaxInstances > 0 ? uint32(FMath::DivideAndRoundUp(int32(MaxInstances), ClusterSize)) : 0;
-	}
+	const FBox& BaseBounds = Component->GetBaseMeshSnapshot().LocalBounds;
+	BaseSphereCentre = FVector3f(BaseBounds.GetCenter());
+	BaseSphereRadius = float(BaseBounds.GetExtent().Size());
+
+	// The layout was derived from this same snapshot on the same thread, so this cannot fire — but
+	// RunCulling indexes LODs[Lod] straight out of it, and reading one LOD past the end is not a
+	// symptom anyone would trace back to a layout that disagreed with its own base mesh.
+	Layout.NumLODs = FMath::Clamp(Layout.NumLODs, 1u, uint32(FMath::Max(LODs.Num(), 1)));
 
 	// Each LOD needs its own fixed-size region in the visible buffers because SV_InstanceID
 	// restarts per draw, so the cost scales with LOD count as well as instance count. 80 bytes
-	// per slot (3+1+1 float4). Worth knowing about before it shows up as a VRAM surprise.
-	const uint64 VisibleBytes = uint64(MaxInstances) * NumLODs * 5ull * sizeof(FVector4f);
+	// per slot (3+1+1 float4). Still worth a warning even though the mesh's VRAM pre-flight now
+	// refuses an allocation past the device's share outright: a request that fits is not the same
+	// as a request that was a good idea, and it is measured against the ratcheted capacity.
+	const uint64 VisibleBytes = uint64(Layout.InstanceCapacity) * Layout.NumLODs * 5ull * sizeof(FVector4f);
 	if (VisibleBytes > 64ull * 1024ull * 1024ull)
 	{
 		UE_LOG(LogCSGpuInstancedProxy, Warning,
 			TEXT("%s: %u instances x %u LODs need %.1f MiB of visible-instance buffers. Reduce the LOD count or split the component."),
-			*GetOwnerName().ToString(), MaxInstances, NumLODs, double(VisibleBytes) / (1024.0 * 1024.0));
+			*GetOwnerName().ToString(), Layout.InstanceCapacity, Layout.NumLODs, double(VisibleBytes) / (1024.0 * 1024.0));
 	}
 }
 
@@ -318,126 +316,79 @@ void FCSGpuInstancedMeshSceneProxy::DestroyRenderThreadResources()
 // Streams
 // -----------------------------------------------------------------------------
 
-uint32 FCSGpuInstancedMeshSceneProxy::GetAuxElementCount(ECSGpuInstancedAuxSlot Slot) const
+void CSGpuInstancedBuildAuxStreamDescs(
+	TArray<FCSGpuStreamDesc>& OutStreams,
+	const FCSGpuInstancedGpuLayout& Layout,
+	bool bExternalPackedSource)
 {
 	// Every LOD gets its own full-capacity region in the visible buffers: SV_InstanceID restarts
 	// at 0 for each indirect draw, so the per-LOD start offset has to be a CPU-side constant and
 	// cannot depend on the GPU-decided counts.
-	const uint32 VisibleSlots = MaxInstances * NumLODs;
+	const uint32 VisibleSlots = Layout.InstanceCapacity * Layout.NumLODs;
+	const uint32 ClusterCapacity = Layout.ClusterSize > 0
+		? uint32(FMath::DivideAndRoundUp(Layout.InstanceCapacity, Layout.ClusterSize))
+		: 0u;
 
-	switch (Slot)
-	{
-	// The packed rows are supplied directly by a packed GPU source; for a point source the proxy
-	// builds them itself each frame, so it needs the room.
-	case ECSGpuInstancedAuxSlot::SourceInstances:   return GpuSource.IsValid() ? 1u : MaxInstances * 5u;
-	case ECSGpuInstancedAuxSlot::ClusterBounds:     return FMath::Max(NumClusters, 1u);
-	case ECSGpuInstancedAuxSlot::ClusterVisible:    return FMath::Max(NumClusters, 1u);
-	case ECSGpuInstancedAuxSlot::VisibleTransforms: return VisibleSlots * 3u;
-	case ECSGpuInstancedAuxSlot::VisibleOrigins:    return VisibleSlots;
-	case ECSGpuInstancedAuxSlot::VisibleLightmap:   return VisibleSlots;
-	case ECSGpuInstancedAuxSlot::LodCounters:       return CS_GPU_INSTANCED_MAX_LODS;
-	default:                                        return 1u;
-	}
-}
-
-void FCSGpuInstancedMeshSceneProxy::RegisterStreams()
-{
-	VertexCapacity = uint32(BaseMesh.Positions.Num());
-	IndexCapacity = uint32(BaseMesh.Indices.Num());
-	AddStandardTriangleStreams(NumLODs); // one DrawIndexedIndirect arg set per LOD
-
-	auto AddAux = [this](const TCHAR* DebugName, ECSGpuInstancedAuxSlot Slot, uint32 BytesPerElement, EPixelFormat Format)
+	auto AddAux = [&OutStreams](const TCHAR* DebugName, ECSGpuInstancedAuxSlot Slot, uint32 BytesPerElement,
+		EPixelFormat Format, uint32 ElementCount)
 	{
 		FCSGpuStreamDesc D;
 		D.DebugName = DebugName;
 		D.Role = ECSGpuStreamRole::AuxVertex;
 		D.BytesPerElement = BytesPerElement;
-		D.ElementsPerUnit = FMath::Max(GetAuxElementCount(Slot), 1u);
+		// A zero-element descriptor is refused outright by the mesh (it would allocate nothing and
+		// then report the whole mesh as unallocated), so an unused slot still gets one element.
+		D.ElementsPerUnit = FMath::Max(ElementCount, 1u);
 		D.CountSource = ECSGpuCountSource::Fixed;
 		D.SrvFormat = Format;
 		D.VfType = VET_None;
 		D.TexCoordIndex = uint8(Slot);
-		AddStream(D);
+		OutStreams.Add(D);
 	};
 
-	AddAux(TEXT("CSGpuInstanced.SourceInstances"), ECSGpuInstancedAuxSlot::SourceInstances, sizeof(FVector4f), PF_A32B32G32R32F);
-	AddAux(TEXT("CSGpuInstanced.ClusterBounds"), ECSGpuInstancedAuxSlot::ClusterBounds, sizeof(FVector4f), PF_A32B32G32R32F);
-	AddAux(TEXT("CSGpuInstanced.ClusterVisible"), ECSGpuInstancedAuxSlot::ClusterVisible, sizeof(uint32), PF_R32_UINT);
-	AddAux(TEXT("CSGpuInstanced.VisibleTransforms"), ECSGpuInstancedAuxSlot::VisibleTransforms, sizeof(FVector4f), PF_A32B32G32R32F);
-	AddAux(TEXT("CSGpuInstanced.VisibleOrigins"), ECSGpuInstancedAuxSlot::VisibleOrigins, sizeof(FVector4f), PF_A32B32G32R32F);
-	AddAux(TEXT("CSGpuInstanced.VisibleLightmap"), ECSGpuInstancedAuxSlot::VisibleLightmap, sizeof(FVector4f), PF_A32B32G32R32F);
-	AddAux(TEXT("CSGpuInstanced.LodCounters"), ECSGpuInstancedAuxSlot::LodCounters, sizeof(uint32), PF_R32_UINT);
+	// The packed rows are supplied directly by a packed GPU source; for a point source the cull
+	// builds them itself each frame, so it needs the room.
+	AddAux(TEXT("CSGpuInstanced.SourceInstances"), ECSGpuInstancedAuxSlot::SourceInstances, sizeof(FVector4f), PF_A32B32G32R32F,
+		bExternalPackedSource ? 1u : Layout.InstanceCapacity * 5u);
+	AddAux(TEXT("CSGpuInstanced.ClusterBounds"), ECSGpuInstancedAuxSlot::ClusterBounds, sizeof(FVector4f), PF_A32B32G32R32F, ClusterCapacity);
+	AddAux(TEXT("CSGpuInstanced.ClusterVisible"), ECSGpuInstancedAuxSlot::ClusterVisible, sizeof(uint32), PF_R32_UINT, ClusterCapacity);
+	AddAux(TEXT("CSGpuInstanced.VisibleTransforms"), ECSGpuInstancedAuxSlot::VisibleTransforms, sizeof(FVector4f), PF_A32B32G32R32F, VisibleSlots * 3u);
+	AddAux(TEXT("CSGpuInstanced.VisibleOrigins"), ECSGpuInstancedAuxSlot::VisibleOrigins, sizeof(FVector4f), PF_A32B32G32R32F, VisibleSlots);
+	AddAux(TEXT("CSGpuInstanced.VisibleLightmap"), ECSGpuInstancedAuxSlot::VisibleLightmap, sizeof(FVector4f), PF_A32B32G32R32F, VisibleSlots);
+	// Fixed at the maximum rather than sized to NumLODs: 16 bytes, and it keeps a base mesh gaining
+	// or losing a LOD from re-declaring this stream (which reallocates the whole resident set).
+	AddAux(TEXT("CSGpuInstanced.LodCounters"), ECSGpuInstancedAuxSlot::LodCounters, sizeof(uint32), PF_R32_UINT, CS_GPU_INSTANCED_MAX_LODS);
 }
 
 void FCSGpuInstancedMeshSceneProxy::OnStreamsAllocated(FRHICommandListBase& RHICmdList)
 {
+	// Recorded here rather than in the constructor because this is the moment the buffers were
+	// actually adopted: the mesh can be reallocated between proxy creation on the game thread and
+	// this hook running on the render thread, and a generation captured before that would pin the
+	// proxy as stale from birth. See AdoptedAllocationGeneration.
+	AdoptedAllocationGeneration = Resident.IsValid() ? Resident->AllocationGeneration : 0u;
+
 	auto* InstancedVF = static_cast<FCSGpuInstancedMeshVertexFactory*>(VertexFactory.Get());
 	if (!InstancedVF) return;
 
-	InstancedVF->SetInstanceStreams(
-		GetStreamSRV(ECSGpuStreamRole::AuxVertex, uint8(ECSGpuInstancedAuxSlot::VisibleOrigins)),
-		GetStreamSRV(ECSGpuStreamRole::AuxVertex, uint8(ECSGpuInstancedAuxSlot::VisibleTransforms)),
-		GetStreamSRV(ECSGpuStreamRole::AuxVertex, uint8(ECSGpuInstancedAuxSlot::VisibleLightmap)));
-}
+	FRHIShaderResourceView* Origins = GetStreamSRV(ECSGpuStreamRole::AuxVertex, uint8(ECSGpuInstancedAuxSlot::VisibleOrigins));
+	FRHIShaderResourceView* Transforms = GetStreamSRV(ECSGpuStreamRole::AuxVertex, uint8(ECSGpuInstancedAuxSlot::VisibleTransforms));
+	FRHIShaderResourceView* Lightmap = GetStreamSRV(ECSGpuStreamRole::AuxVertex, uint8(ECSGpuInstancedAuxSlot::VisibleLightmap));
 
-// -----------------------------------------------------------------------------
-// One-off upload of the base mesh + instance source
-// -----------------------------------------------------------------------------
-
-void FCSGpuInstancedMeshSceneProxy::BuildGeometry(FRHICommandListBase& RHICmdList)
-{
-	FRHICommandListImmediate& RHICmdListImmediate = FRHICommandListExecutor::GetImmediateCommandList();
-	FRDGBuilder GraphBuilder(RHICmdListImmediate, RDG_EVENT_NAME("CSGpuInstanced.Upload"));
-
-	auto Register = [this, &GraphBuilder](ECSGpuStreamRole Role, uint8 Index = 0)
+	// The one place an aux-slot mistake becomes visible. A slot that collides with another stream's
+	// (Role, TexCoordIndex) is refused at declaration time and simply never exists, and a factory
+	// handed null instance SRVs draws garbage or faults rather than logging anything — which is
+	// precisely the failure the slots were renumbered away from (see ECSGpuInstancedAuxSlot).
+	if (!Origins || !Transforms || !Lightmap)
 	{
-		return GraphBuilder.RegisterExternalBuffer(GetStreamBuffer(Role, Index));
-	};
-	auto RegisterAux = [&Register](ECSGpuInstancedAuxSlot Slot)
-	{
-		return Register(ECSGpuStreamRole::AuxVertex, uint8(Slot));
-	};
+		UE_LOG(LogCSGpuInstancedProxy, Error,
+			TEXT("[CSGpuInstanced] %s: the visible-instance streams did not resolve (origins=%d transforms=%d lightmap=%d). ")
+			TEXT("The mesh's stream layout is missing this leaf's aux slots — check ECSGpuInstancedAuxSlot against the retained set."),
+			*GetOwnerName().ToString(), Origins ? 1 : 0, Transforms ? 1 : 0, Lightmap ? 1 : 0);
+		return;
+	}
 
-	FRDGBufferRef Positions = Register(ECSGpuStreamRole::Position);
-	FRDGBufferRef Tangents = Register(ECSGpuStreamRole::TangentBasis);
-	FRDGBufferRef TexCoords = Register(ECSGpuStreamRole::TexCoord);
-	FRDGBufferRef Colors = Register(ECSGpuStreamRole::Color);
-	FRDGBufferRef Indices = Register(ECSGpuStreamRole::Index);
-	FRDGBufferRef IndirectArgs = Register(ECSGpuStreamRole::IndirectArgs);
-	FRDGBufferRef MeshCounters = Register(ECSGpuStreamRole::MeshCounters);
-
-	GraphBuilder.QueueBufferUpload(Positions, BaseMesh.Positions.GetData(), BaseMesh.Positions.Num() * sizeof(FVector3f), ERDGInitialDataFlags::None);
-	GraphBuilder.QueueBufferUpload(Tangents, BaseMesh.TangentBasis.GetData(), BaseMesh.TangentBasis.Num() * sizeof(uint32), ERDGInitialDataFlags::None);
-	GraphBuilder.QueueBufferUpload(TexCoords, BaseMesh.TexCoords.GetData(), BaseMesh.TexCoords.Num() * sizeof(FVector2f), ERDGInitialDataFlags::None);
-	GraphBuilder.QueueBufferUpload(Colors, BaseMesh.Colors.GetData(), BaseMesh.Colors.Num() * sizeof(uint32), ERDGInitialDataFlags::None);
-	GraphBuilder.QueueBufferUpload(Indices, BaseMesh.Indices.GetData(), BaseMesh.Indices.Num() * sizeof(uint32), ERDGInitialDataFlags::None);
-
-	// The readback path (ReadbackMeshSync / save-to-StaticMesh) sees the single base-mesh copy,
-	// not the instanced result — the instances only ever exist as transforms.
-	const uint32 Counters[2] = { uint32(BaseMesh.Positions.Num()), uint32(BaseMesh.Indices.Num()) };
-	GraphBuilder.QueueBufferUpload(MeshCounters, Counters, sizeof(Counters), ERDGInitialDataFlags::None);
-
-	// Zeroed until the first cull pass runs, so an unculled frame draws nothing rather than garbage.
-	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgs, PF_R32_UINT)), 0u);
-
-	FRDGBufferRef SourceInstances = RegisterAux(ECSGpuInstancedAuxSlot::SourceInstances);
-	FRDGBufferRef ClusterBoundsBuffer = RegisterAux(ECSGpuInstancedAuxSlot::ClusterBounds);
-
-	if (!GpuSource.IsValid() && PackedInstances.Num() > 0) GraphBuilder.QueueBufferUpload(SourceInstances, PackedInstances.GetData(), PackedInstances.Num() * sizeof(FVector4f), ERDGInitialDataFlags::None);
-	if (ClusterBounds.Num() > 0) GraphBuilder.QueueBufferUpload(ClusterBoundsBuffer, ClusterBounds.GetData(), ClusterBounds.Num() * sizeof(FVector4f), ERDGInitialDataFlags::None);
-
-	// RDG's default epilogue state (SRVMask) is illegal for index / indirect usage.
-	GraphBuilder.SetBufferAccessFinal(Positions, ERHIAccess::VertexOrIndexBuffer | ERHIAccess::SRVMask);
-	GraphBuilder.SetBufferAccessFinal(Tangents, ERHIAccess::VertexOrIndexBuffer | ERHIAccess::SRVMask);
-	GraphBuilder.SetBufferAccessFinal(TexCoords, ERHIAccess::VertexOrIndexBuffer | ERHIAccess::SRVMask);
-	GraphBuilder.SetBufferAccessFinal(Colors, ERHIAccess::VertexOrIndexBuffer | ERHIAccess::SRVMask);
-	GraphBuilder.SetBufferAccessFinal(Indices, ERHIAccess::VertexOrIndexBuffer);
-	GraphBuilder.SetBufferAccessFinal(IndirectArgs, ERHIAccess::IndirectArgs);
-	GraphBuilder.SetBufferAccessFinal(MeshCounters, ERHIAccess::CopySrc);
-	GraphBuilder.SetBufferAccessFinal(SourceInstances, ERHIAccess::SRVMask);
-	GraphBuilder.SetBufferAccessFinal(ClusterBoundsBuffer, ERHIAccess::SRVMask);
-
-	GraphBuilder.Execute();
+	InstancedVF->SetInstanceStreams(Origins, Transforms, Lightmap);
 }
 
 // -----------------------------------------------------------------------------
@@ -448,11 +399,15 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 {
 	if (DiagnosticState == EDiagnosticState::Pending)
 	{
-		UE_LOG(LogCSGpuInstancedProxy, Log, TEXT("[CSGpuInstanced] RunCulling entered: DrawValid=%d MaxInstances=%u NumClusters=%u"),
-			DrawDesc.bValid ? 1 : 0, MaxInstances, NumClusters);
+		UE_LOG(LogCSGpuInstancedProxy, Log, TEXT("[CSGpuInstanced] RunCulling entered: DrawValid=%d InstanceCapacity=%u NumClusters=%u"),
+			DrawDesc.bValid ? 1 : 0, Layout.InstanceCapacity, Layout.NumClusters);
 	}
 
-	if (!DrawDesc.bValid || MaxInstances == 0) return;
+	if (!DrawDesc.bValid || !Layout.IsValid()) return;
+	if (!Resident.IsValid() || !Resident->IsAllocated()) return;
+	// The set moved out from under the buffers this proxy adopted; anything written now lands
+	// somewhere the draw does not look. See AdoptedAllocationGeneration.
+	if (Resident->AllocationGeneration != AdoptedAllocationGeneration) return;
 
 	RDG_EVENT_SCOPE(GraphBuilder, "CSGpuInstanced.Cull");
 
@@ -488,48 +443,59 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 	FUintVector4 LodIndexCount(ForceInit);
 	FUintVector4 LodFirstIndex(ForceInit);
 	FUintVector4 LodBaseVertex(ForceInit);
-	for (int32 Lod = 0; Lod < int32(NumLODs); ++Lod)
+	for (int32 Lod = 0; Lod < int32(Layout.NumLODs); ++Lod)
 	{
-		const FCSGpuInstancedLODRange& Range = BaseMesh.LODs[Lod];
+		const FCSGpuInstancedLODRange& Range = LODs[Lod];
 		LodScreenSizes[Lod] = Range.ScreenSize * LodScreenSizeScale;
 		LodIndexCount[Lod] = Range.NumIndices;
 		LodFirstIndex[Lod] = Range.FirstIndex;
 		LodBaseVertex[Lod] = Range.BaseVertex;
 	}
 
-	auto RegisterAux = [this, &GraphBuilder](ECSGpuInstancedAuxSlot Slot)
+	// The mesh's own render-thread edit. It registers every resident stream into the caller's graph
+	// exactly as UCSMesh::EditMeshSync does, takes back the ones last frame handed off in external
+	// access mode, and — when the scope closes at the end of this function — leaves each of them in
+	// CSGpuMeshStreams::FinalAccessForRole's state. That restoration used to be written out by hand
+	// down there, which made this function the second copy of a rule whose violations are silent: a
+	// stream left in RDG's default epilogue (SRVMask) is illegal for index / indirect use and the
+	// mesh simply stops drawing. A pass added below now needs no list kept in step with it.
+	FCSMeshRenderThreadEdit Edit(GraphBuilder, *Resident);
+
+	// A missing slot means the layout was refused at declaration time (OnStreamsAllocated already
+	// logged which one); culling into nothing is the right response every frame after that.
+	auto Aux = [&Edit](ECSGpuInstancedAuxSlot Slot)
 	{
-		return GraphBuilder.RegisterExternalBuffer(GetStreamBuffer(ECSGpuStreamRole::AuxVertex, uint8(Slot)));
+		return Edit->Find(ECSGpuStreamRole::AuxVertex, uint8(Slot));
 	};
 
-	FRDGBufferRef ClusterBoundsBuffer = RegisterAux(ECSGpuInstancedAuxSlot::ClusterBounds);
-	FRDGBufferRef ClusterVisible = RegisterAux(ECSGpuInstancedAuxSlot::ClusterVisible);
-	FRDGBufferRef VisTransforms = RegisterAux(ECSGpuInstancedAuxSlot::VisibleTransforms);
-	FRDGBufferRef VisOrigins = RegisterAux(ECSGpuInstancedAuxSlot::VisibleOrigins);
-	FRDGBufferRef VisLightmap = RegisterAux(ECSGpuInstancedAuxSlot::VisibleLightmap);
-	FRDGBufferRef LodCounters = RegisterAux(ECSGpuInstancedAuxSlot::LodCounters);
-	FRDGBufferRef IndirectArgs = GraphBuilder.RegisterExternalBuffer(GetStreamBuffer(ECSGpuStreamRole::IndirectArgs));
+	FRDGBufferRef ClusterBoundsBuffer = Aux(ECSGpuInstancedAuxSlot::ClusterBounds);
+	FRDGBufferRef ClusterVisible = Aux(ECSGpuInstancedAuxSlot::ClusterVisible);
+	FRDGBufferRef VisTransforms = Aux(ECSGpuInstancedAuxSlot::VisibleTransforms);
+	FRDGBufferRef VisOrigins = Aux(ECSGpuInstancedAuxSlot::VisibleOrigins);
+	FRDGBufferRef VisLightmap = Aux(ECSGpuInstancedAuxSlot::VisibleLightmap);
+	FRDGBufferRef LodCounters = Aux(ECSGpuInstancedAuxSlot::LodCounters);
+	FRDGBufferRef IndirectArgs = Edit->IndirectArgs();
+	// A packed GPU source replaces this stream outright; the mesh then carries only a placeholder.
+	// It belongs to the producer rather than to the mesh, so it is registered directly and is not
+	// the edit's to restore — the cull only ever reads it.
+	FRDGBufferRef SourceInstances = GpuSource.IsValid()
+		? GraphBuilder.RegisterExternalBuffer(GpuSource.PackedInstances)
+		: Aux(ECSGpuInstancedAuxSlot::SourceInstances);
 
-	// The visible buffers and the indirect args were left in external access mode by last frame's
-	// pass so the draw could read them; hand them back to RDG before writing them again.
-	GraphBuilder.UseInternalAccessMode(VisTransforms);
-	GraphBuilder.UseInternalAccessMode(VisOrigins);
-	GraphBuilder.UseInternalAccessMode(VisLightmap);
-	GraphBuilder.UseInternalAccessMode(IndirectArgs);
+	if (!ClusterBoundsBuffer || !ClusterVisible || !VisTransforms || !VisOrigins || !VisLightmap) return;
+	if (!LodCounters || !IndirectArgs || !SourceInstances) return;
 
-	// Instance count: a plain uniform for the CPU array, the producer's GPU counter otherwise.
+	// Instance count: a plain uniform for the CPU array, the producer's GPU counter otherwise. The
+	// CPU value is the LIVE row count, not the capacity — the source buffer ratchets, so the rows
+	// past the live count are the previous instance set and would draw as ghosts.
 	FRDGBufferRef InstanceCount;
 	if (GpuSource.IsValid()) InstanceCount = GraphBuilder.RegisterExternalBuffer(GpuSource.Counter);
 	else if (GpuPointSource.IsValid()) InstanceCount = GraphBuilder.RegisterExternalBuffer(GpuPointSource.Counter);
 	else
 	{
 		InstanceCount = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1), TEXT("CSGpuInstanced.InstanceCount"));
-		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(InstanceCount, PF_R32_UINT)), MaxInstances);
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(InstanceCount, PF_R32_UINT)), Layout.NumSourceInstances);
 	}
-
-	FRDGBufferRef SourceInstances = GpuSource.IsValid()
-		? GraphBuilder.RegisterExternalBuffer(GpuSource.PackedInstances)
-		: RegisterAux(ECSGpuInstancedAuxSlot::SourceInstances);
 
 	FRDGBufferUAVRef ClusterVisibleUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(ClusterVisible, PF_R32_UINT));
 	FRDGBufferUAVRef LodCountersUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(LodCounters, PF_R32_UINT));
@@ -553,18 +519,18 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 		// Point positions are absolute world space. The component sits at ordinary level
 		// coordinates, so a float matrix keeps sub-millimetre accuracy over the level.
 		Params->WorldToComponent = FMatrix44f(WorldToLocal);
-		Params->BaseSphereCentre = FVector3f(BaseMesh.LocalBounds.GetCenter());
-		Params->BaseSphereRadius = float(BaseMesh.LocalBounds.GetExtent().Size());
+		Params->BaseSphereCentre = BaseSphereCentre;
+		Params->BaseSphereRadius = BaseSphereRadius;
 		Params->PointInstanceScale = GpuPointSource.InstanceScale;
-		Params->MaxSourceInstances = MaxInstances;
+		Params->MaxSourceInstances = Layout.InstanceCapacity;
 
 		TShaderMapRef<FCSInstancedPackPointsCS> Shader(ShaderMap);
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("PackPointInstances"), Shader, Params,
-			FComputeShaderUtils::GetGroupCount(MaxInstances, CullGroupSize));
+			FComputeShaderUtils::GetGroupCount(Layout.InstanceCapacity, CullGroupSize));
 	}
 
 	// Coarse level.
-	if (NumClusters > 0)
+	if (Layout.NumClusters > 0)
 	{
 		FCSInstancedClusterCullCS::FParameters* Params = GraphBuilder.AllocParameters<FCSInstancedClusterCullCS::FParameters>();
 		Params->SrcClusterBounds = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(ClusterBoundsBuffer, PF_A32B32G32R32F));
@@ -573,12 +539,12 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 		Params->ViewOriginLocal = ViewOriginLocal;
 		Params->ComponentScale = ComponentScale;
 		Params->MaxDrawDistanceSq = MaxDrawDistanceSq;
-		Params->NumClusters = NumClusters;
+		Params->NumClusters = Layout.NumClusters;
 		Params->bFrustumCull = bFrustumCull ? 1u : 0u;
 
 		TShaderMapRef<FCSInstancedClusterCullCS> Shader(ShaderMap);
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("ClusterCull"), Shader, Params,
-			FComputeShaderUtils::GetGroupCount(NumClusters, CullGroupSize));
+			FComputeShaderUtils::GetGroupCount(Layout.NumClusters, CullGroupSize));
 	}
 
 	// Fine level + compaction.
@@ -597,17 +563,17 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 		Params->ScreenMultiple = ScreenMultiple;
 		Params->LodScreenSizes = LodScreenSizes;
 		Params->MaxDrawDistanceSq = MaxDrawDistanceSq;
-		Params->NumLods = NumLODs;
-		Params->NumClusters = NumClusters;
-		Params->ClusterSize = NumClusters > 0 ? uint32(ClusterSize) : 0u;
-		Params->MaxInstancesPerLod = MaxInstances;
-		Params->MaxSourceInstances = MaxInstances;
+		Params->NumLods = Layout.NumLODs;
+		Params->NumClusters = Layout.NumClusters;
+		Params->ClusterSize = Layout.NumClusters > 0 ? Layout.ClusterSize : 0u;
+		Params->MaxInstancesPerLod = Layout.InstanceCapacity;
+		Params->MaxSourceInstances = Layout.InstanceCapacity;
 		Params->bFrustumCull = bFrustumCull ? 1u : 0u;
 		Params->bLodSelect = bLodSelect ? 1u : 0u;
 
 		TShaderMapRef<FCSInstancedInstanceCullCS> Shader(ShaderMap);
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("InstanceCull"), Shader, Params,
-			FComputeShaderUtils::GetGroupCount(MaxInstances, CullGroupSize));
+			FComputeShaderUtils::GetGroupCount(Layout.InstanceCapacity, CullGroupSize));
 	}
 
 	// Indirect args, one set per LOD.
@@ -618,8 +584,8 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 		Params->LodIndexCount = LodIndexCount;
 		Params->LodFirstIndex = LodFirstIndex;
 		Params->LodBaseVertex = LodBaseVertex;
-		Params->NumLods = NumLODs;
-		Params->MaxInstancesPerLod = MaxInstances;
+		Params->NumLods = Layout.NumLODs;
+		Params->MaxInstancesPerLod = Layout.InstanceCapacity;
 
 		TShaderMapRef<FCSInstancedBuildArgsCS> Shader(ShaderMap);
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("BuildArgs"), Shader, Params, FIntVector(1, 1, 1));
@@ -629,20 +595,21 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 	if (DiagnosticState == EDiagnosticState::Pending)
 	{
 		DiagnosticReadback = new FRHIGPUBufferReadback(TEXT("CSGpuInstanced.DiagArgs"));
-		AddEnqueueCopyPass(GraphBuilder, DiagnosticReadback, IndirectArgs, sizeof(uint32) * IndirectArgsPerDraw * NumLODs);
+		AddEnqueueCopyPass(GraphBuilder, DiagnosticReadback, IndirectArgs, sizeof(uint32) * IndirectArgsPerDraw * Layout.NumLODs);
 		DiagnosticState = EDiagnosticState::Waiting;
 	}
 	else if (DiagnosticState == EDiagnosticState::Waiting && DiagnosticReadback && DiagnosticReadback->IsReady())
 	{
-		const uint32 NumArgs = IndirectArgsPerDraw * NumLODs;
+		const uint32 NumArgs = IndirectArgsPerDraw * Layout.NumLODs;
 		if (const uint32* Args = static_cast<const uint32*>(DiagnosticReadback->Lock(sizeof(uint32) * NumArgs)))
 		{
-			for (uint32 Lod = 0; Lod < NumLODs; ++Lod)
+			for (uint32 Lod = 0; Lod < Layout.NumLODs; ++Lod)
 			{
 				const uint32* A = Args + Lod * IndirectArgsPerDraw;
 				UE_LOG(LogCSGpuInstancedProxy, Log,
-					TEXT("[CSGpuInstanced] %s LOD%u args: IndexCount=%u Instances=%u FirstIndex=%u BaseVertex=%u (capacity %u instances, %u clusters, verts %u, indices %u)"),
-					*GetOwnerName().ToString(), Lod, A[0], A[1], A[2], A[3], MaxInstances, NumClusters, VertexCapacity, IndexCapacity);
+					TEXT("[CSGpuInstanced] %s LOD%u args: IndexCount=%u Instances=%u FirstIndex=%u BaseVertex=%u (capacity %u instances, %u live, %u clusters, verts %u, indices %u)"),
+					*GetOwnerName().ToString(), Lod, A[0], A[1], A[2], A[3],
+					Layout.InstanceCapacity, Layout.NumSourceInstances, Layout.NumClusters, VertexCapacity, IndexCapacity);
 			}
 			DiagnosticReadback->Unlock();
 		}
@@ -651,13 +618,11 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 		DiagnosticState = EDiagnosticState::Done;
 	}
 
-	// The draw reads these through raw SRVs and an indirect-args binding that RDG knows nothing
-	// about, and it happens later in this same graph — SetBufferAccessFinal would only transition
-	// them at the very end, far too late. External access mode transitions them here and holds it.
-	GraphBuilder.UseExternalAccessMode(VisTransforms, ERHIAccess::SRVMask);
-	GraphBuilder.UseExternalAccessMode(VisOrigins, ERHIAccess::SRVMask);
-	GraphBuilder.UseExternalAccessMode(VisLightmap, ERHIAccess::SRVMask);
-	GraphBuilder.UseExternalAccessMode(IndirectArgs, ERHIAccess::IndirectArgs);
+	// Nothing to do here on the way out: ~FCSMeshRenderThreadEdit runs next and transitions every
+	// resident stream to CSGpuMeshStreams::FinalAccessForRole's state, immediately rather than in
+	// the graph epilogue — the draw that reads them is a later pass in this same graph. The
+	// diagnostic copy above therefore has to stay inside the scope, since it needs the args buffer
+	// while RDG still owns it.
 }
 
 // -----------------------------------------------------------------------------
@@ -668,7 +633,7 @@ void FCSGpuInstancedMeshSceneProxy::GetDynamicMeshElements(const TArray<const FS
 	const FSceneViewFamily& ViewFamily, uint32 VisibilityMap, FMeshElementCollector& Collector) const
 {
 	if (!DrawDesc.bValid || DrawDesc.IndexBuffer == nullptr || !VertexFactory) return;
-	if (DrawDesc.IndirectArgsBuffer == nullptr || MaxInstances == 0) return;
+	if (DrawDesc.IndirectArgsBuffer == nullptr || !Layout.IsValid()) return;
 
 	FMaterialRenderProxy* MaterialProxy = Material->GetRenderProxy();
 
@@ -677,7 +642,7 @@ void FCSGpuInstancedMeshSceneProxy::GetDynamicMeshElements(const TArray<const FS
 		bLoggedFirstDraw = true;
 		UE_LOG(LogCSGpuInstancedProxy, Log,
 			TEXT("[CSGpuInstanced] %s first draw: %u LODs, material '%s', bounds radius %.1f"),
-			*GetOwnerName().ToString(), NumLODs, *Material->GetName(), GetBounds().SphereRadius);
+			*GetOwnerName().ToString(), Layout.NumLODs, *Material->GetName(), GetBounds().SphereRadius);
 	}
 
 	for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ++ViewIndex)
@@ -691,7 +656,7 @@ void FCSGpuInstancedMeshSceneProxy::GetDynamicMeshElements(const TArray<const FS
 
 		// One indirect draw per LOD. The instance count sits in the args the cull pass wrote, so a
 		// LOD nobody selected costs an empty draw call and nothing else.
-		for (uint32 Lod = 0; Lod < NumLODs; ++Lod)
+		for (uint32 Lod = 0; Lod < Layout.NumLODs; ++Lod)
 		{
 			FMeshBatch& Mesh = Collector.AllocateMesh();
 			Mesh.VertexFactory = VertexFactory.Get();
@@ -711,8 +676,9 @@ void FCSGpuInstancedMeshSceneProxy::GetDynamicMeshElements(const TArray<const FS
 			BatchElement.IndirectArgsBuffer = DrawDesc.IndirectArgsBuffer;
 			BatchElement.IndirectArgsOffset = Lod * IndirectArgsPerDraw * sizeof(uint32);
 			// Start of this LOD's region in the visible-instance buffers; the vertex factory adds
-			// SV_InstanceID to it.
-			BatchElement.UserIndex = int32(Lod * MaxInstances);
+			// SV_InstanceID to it. The stride is the capacity the buffers were sized from, which is
+			// why the proxy copies the layout instead of re-deriving it from the live count.
+			BatchElement.UserIndex = int32(Lod * Layout.InstanceCapacity);
 			BatchElement.LooseParametersUniformBuffer = InstancedLooseUniformBuffer;
 			BatchElement.PrimitiveUniformBufferResource = &DynamicPrimitiveUniformBuffer.UniformBuffer;
 			// This factory has no primitive-id stream (that is what puts the shader on the

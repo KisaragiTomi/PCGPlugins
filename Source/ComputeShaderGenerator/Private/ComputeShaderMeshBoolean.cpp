@@ -1,6 +1,9 @@
 #include "ComputeShaderMeshBoolean.h"
 
+#include "CSBoxSceneCollection.h"
 #include "CSGpuMeshComponent.h"
+#include "CSMesh.h"
+#include "CSMeshOps.h"
 #include "ComputeShaderGenerateHelper.h"
 
 #include "GlobalShader.h"
@@ -79,6 +82,7 @@ class FFinalStatusCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, FinalTriStats)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, FinalOutputCounter)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, FinalBSPStats)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, FinalKeptCounter)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_FinalStatus)
 		SHADER_PARAMETER(uint32, FinalBSPStatCount)
 	END_SHADER_PARAMETER_STRUCT()
@@ -282,6 +286,75 @@ class FRescueIndirectArgsCS : public FGlobalShader
 
 #undef MB_GROUP_PERM
 
+// ---- GPU 输出路径：fragment → UCSMesh 常驻流（CPU 属性重建的移植） ----
+
+/** 只数不写：CPU 用这个数分配常驻容量，判据与 emit 共用同一个 HLSL 函数。 */
+class FMeshBooleanCountKeptCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FMeshBooleanCountKeptCS);
+	SHADER_USE_PARAMETER_STRUCT(FMeshBooleanCountKeptCS, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FVector3f>, MBOutFragmentSoup)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MBOutFragmentSource)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MBOutFragmentCounterSRV)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MBOutSoupCounterSRV)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, MBOutSourceVertices)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_MBOutKeptCounter)
+		SHADER_PARAMETER(uint32, MBOutFragmentCapacity)
+		SHADER_PARAMETER(uint32, MBOutSourceTriangleCapacity)
+		SHADER_PARAMETER(uint32, MBOutStageB)
+		RDG_BUFFER_ACCESS(MBOutIndirectArgsBuffer, ERHIAccess::IndirectArgs)
+	END_SHADER_PARAMETER_STRUCT()
+	CSGEN_SHADER_PERM_SM5_GROUPSIZE_X(64)
+};
+
+class FMeshBooleanEmitToMeshCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FMeshBooleanEmitToMeshCS);
+	SHADER_USE_PARAMETER_STRUCT(FMeshBooleanEmitToMeshCS, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FVector3f>, MBOutFragmentSoup)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MBOutFragmentSource)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, MBOutSourceVertices)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, MBOutSourceNormals)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float2>, MBOutSourceUVs)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, MBOutSourceColors)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, MBOutSourceTangents)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, MBOutSourceBiTangents)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MBOutSourceMaterialIds)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, RW_MBOutPositions)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_MBOutTangents)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, RW_MBOutTexCoords)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_MBOutColors)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_MBOutIndices)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_MBOutMaterialIds)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_MBOutTriangleCounter)
+		SHADER_PARAMETER(uint32, MBOutFragmentCount)
+		SHADER_PARAMETER(uint32, MBOutSourceTriangleCount)
+		SHADER_PARAMETER(uint32, MBOutSourceUVChannels)
+		SHADER_PARAMETER(uint32, MBOutMaterialRegistryCount)
+		SHADER_PARAMETER(uint32, MBOutNoMaterialSlot)
+		SHADER_PARAMETER(uint32, MBOutVertexCapacity)
+		SHADER_PARAMETER(uint32, MBOutIndexCapacity)
+		SHADER_PARAMETER(uint32, MBOutStageB)
+	END_SHADER_PARAMETER_STRUCT()
+	CSGEN_SHADER_PERM_SM5_GROUPSIZE_X(64)
+};
+
+class FMeshBooleanFinalizeMeshCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FMeshBooleanFinalizeMeshCS);
+	SHADER_USE_PARAMETER_STRUCT(FMeshBooleanFinalizeMeshCS, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MBOutTriangleCounterSRV)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_MBOutMeshCounters)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_MBOutIndirectArgs)
+		SHADER_PARAMETER(uint32, MBOutVertexCapacity)
+		SHADER_PARAMETER(uint32, MBOutIndexCapacity)
+	END_SHADER_PARAMETER_STRUCT()
+	CSGEN_SHADER_PERM_SM5()
+};
+
 IMPLEMENT_GLOBAL_SHADER(FTriTriIntersectCS, "/Plugin/PCGPlugins/Shaders/Private/MeshBoolean.usf", "TriTriIntersectCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FFinalStatusCS, "/Plugin/PCGPlugins/Shaders/Private/MeshBoolean.usf", "FinalStatusCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FCountCutsCS, "/Plugin/PCGPlugins/Shaders/Private/MeshBoolean.usf", "CountCutsCS", SF_Compute);
@@ -294,6 +367,9 @@ IMPLEMENT_GLOBAL_SHADER(FClassifyFragmentsCS, "/Plugin/PCGPlugins/Shaders/Privat
 IMPLEMENT_GLOBAL_SHADER(FRayRescueCS, "/Plugin/PCGPlugins/Shaders/Private/MeshBoolean.usf", "RayRescueCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FClassifyIndirectArgsCS, "/Plugin/PCGPlugins/Shaders/Private/MeshBoolean.usf", "ClassifyIndirectArgsCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FRescueIndirectArgsCS, "/Plugin/PCGPlugins/Shaders/Private/MeshBoolean.usf", "RescueIndirectArgsCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FMeshBooleanCountKeptCS, "/Plugin/PCGPlugins/Shaders/Private/MeshBoolean.usf", "MeshBooleanCountKeptCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FMeshBooleanEmitToMeshCS, "/Plugin/PCGPlugins/Shaders/Private/MeshBoolean.usf", "MeshBooleanEmitToMeshCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FMeshBooleanFinalizeMeshCS, "/Plugin/PCGPlugins/Shaders/Private/MeshBoolean.usf", "MeshBooleanFinalizeMeshCS", SF_Compute);
 
 struct FMeshBooleanStageBRDGContext
 {
@@ -374,10 +450,358 @@ namespace
 	constexpr int32 FinalStatusOutputCount = 11;
 	constexpr int32 FinalStatusOutputOverflow = 12;
 	constexpr int32 FinalStatusBSPStatsBase = 13;
-	constexpr int32 FinalStatusCount = FinalStatusBSPStatsBase + BSPStatCount;
+	// GPU 输出路径的 accept 计数（= 输出三角数）。CPU 回读路径不跑计数核，读到 0。
+	constexpr int32 FinalStatusKeptCount = FinalStatusBSPStatsBase + BSPStatCount;
+	constexpr int32 FinalStatusCount = FinalStatusKeptCount + 1;
 
 	// CPU winding BVH 已移除：最终 BSP emit 直接遍历同一 RDG 内的 GPU LBVH + 多极 refit。
 
+	/**
+	 * Boolean 管线的归一化参数。
+	 *
+	 * 两条消费路径（CPU 回读快照、GPU 直写常驻流）跑的是同一张图，参数换算也就只能有
+	 * 一份：各写一份 clamp/单位换算，漂移的那一份不会报编译错，只会让两条路径悄悄算出
+	 * 不同的布尔结果 —— 而那正是 parity 测试要防的东西，参数本身先分了岔，测试就白测了。
+	 */
+	struct FMeshBooleanPipelineConfig
+	{
+		int32 CutSegmentsPerTriangle = 4;
+		int32 CutSegmentsHardCap = 200000000;
+		float SideEps = 0.01f;
+		float MinSegLenSq = 0.0025f;
+		float SinCoplanarSq = 0.0f;
+		float CoplanarOffsetEps = 0.1f;
+		FVector3f LBVHAabbMin = FVector3f::ZeroVector;
+		FVector3f LBVHInvExtent = FVector3f::ZeroVector;
+		FVector3f SnapOrigin = FVector3f::ZeroVector;
+		float SnapQuantum = 0.01f;
+		bool bRunStageB = false;
+		float WindingBetaSq = 6.25f;
+		float WindingSampleOffset = 0.5f;
+		float WindingThreshold = 0.5f;
+		float ExpansionDistance = 0.0f;
+		uint32 RayCount = 64;
+		float CapMinCos = 0.0f;
+		float ShellRadius = 1.0f;
+		float RayBias = 0.05f;
+		float SampleDensity = 0.0f;
+		uint32 bKeepBack = 0;
+		float WeldDistance = 0.0f;
+		int32 OutputTrianglesPerSource = 8;
+		/** GPU 输出路径专用：多跑一个 accept 计数核，结果搭 FinalStatus 的车回 CPU。 */
+		bool bCountKeptFragments = false;
+	};
+
+	/** 管线产出的、跨 FRDGBuilder 存活的 buffer 与容量。 */
+	struct FMeshBooleanPipelineBuffers
+	{
+		TRefCountPtr<FRDGPooledBuffer> SourceVertices;
+		TRefCountPtr<FRDGPooledBuffer> SourceNormals;
+		TRefCountPtr<FRDGPooledBuffer> SourceMaterialIds;
+		TRefCountPtr<FRDGPooledBuffer> SourceUVs;
+		TRefCountPtr<FRDGPooledBuffer> SourceColors;
+		TRefCountPtr<FRDGPooledBuffer> SourceTangents;
+		TRefCountPtr<FRDGPooledBuffer> SourceBiTangents;
+		TRefCountPtr<FRDGPooledBuffer> FragmentSoup;
+		TRefCountPtr<FRDGPooledBuffer> FragmentSource;
+		TRefCountPtr<FRDGPooledBuffer> WeldRepresentatives;
+
+		int32 SourceVertexCapacity = 0;
+		int32 SourceTriangleCapacity = 0;
+		int32 SourceUVChannels = 1;
+		int32 CutCapacity = 0;
+		int32 FragmentCapacity = 0;
+
+		/** 图确实建起来了（soup 非空、容量在 RHI 支持范围内）。 */
+		bool bGraphBuilt = false;
+		/** 源容量或输出容量超出 RHI/工程上限；调用方据此报错而不是当成空结果。 */
+		bool bCapacityUnsupported = false;
+	};
+
+	FMeshBooleanPipelineConfig MeshBoolean_BuildPipelineConfig(
+		const FCSMeshBooleanOptions& Options, const FBox& QueryBox, bool bRunStageB)
+	{
+		FMeshBooleanPipelineConfig Config;
+		Config.CutSegmentsPerTriangle = FMath::Max(1, Options.CutSegmentsPerTriangle);
+		Config.CutSegmentsHardCap = FMath::Max(1024, Options.MaxCutSegmentsHardCap);
+		Config.SideEps = FMath::Max(0.0f, Options.SideEpsilon);
+		Config.MinSegLenSq = FMath::Max(1e-6f, Options.MinCutSegmentLength * Options.MinCutSegmentLength);
+		// 共面判定阈值（归一化）：角度→sin²，偏移→真实 cm。
+		const float CoplanarAngleRad = FMath::DegreesToRadians(FMath::Clamp(Options.CoplanarAngleDegrees, 0.0f, 45.0f));
+		Config.SinCoplanarSq = FMath::Square(FMath::Sin(CoplanarAngleRad));
+		Config.CoplanarOffsetEps = FMath::Max(0.0f, Options.CoplanarOffsetEpsilon);
+
+		// tri-tri broad-phase：LBVH 的 Morton 量化用查询盒作 AABB（CPU 已知，免 GPU 归约往返）。
+		Config.LBVHAabbMin = FVector3f((float)QueryBox.Min.X, (float)QueryBox.Min.Y, (float)QueryBox.Min.Z);
+		const FVector BoxExtent = QueryBox.GetSize();
+		Config.LBVHInvExtent = FVector3f(
+			BoxExtent.X > 1e-3 ? 1.0f / float(BoxExtent.X) : 0.0f,
+			BoxExtent.Y > 1e-3 ? 1.0f / float(BoxExtent.Y) : 0.0f,
+			BoxExtent.Z > 1e-3 ? 1.0f / float(BoxExtent.Z) : 0.0f);
+
+		// snap-round 平移帧（origin=QueryBox.Min；量化=max(SnapRoundQuantum, 最大边·2^-18)）。
+		Config.SnapOrigin = Config.LBVHAabbMin;
+		Config.SnapQuantum = FMath::Max(
+			FMath::Max(Options.SnapRoundQuantum, float(BoxExtent.GetMax()) * FMath::Pow(2.0f, -18.0f)), 1e-6f);
+
+		Config.bRunStageB = bRunStageB;
+		Config.WindingBetaSq = FMath::Max(1.0f, Options.WindingBeta * Options.WindingBeta);
+		Config.WindingSampleOffset = FMath::Max(0.001f, Options.WindingSampleOffset);
+		Config.WindingThreshold = FMath::Max(0.0f, Options.WindingIsoThreshold);
+		Config.ExpansionDistance = bRunStageB ? FMath::Max(0.0f, Options.RetainedTriangleExpansionDistance) : 0.0f;
+		Config.RayCount = uint32(FMath::Max(1, Options.VisibilityRayCount));
+		Config.CapMinCos = FMath::Cos(FMath::DegreesToRadians(FMath::Clamp(Options.VisibilityHalfAngleDegrees, 90.0f, 180.0f)));
+		Config.ShellRadius = FMath::Max(
+			Options.VisibilityShellRadius > 0.0f ? Options.VisibilityShellRadius : float(BoxExtent.Size()), 1.0f);
+		Config.RayBias = FMath::Max(0.0f, Options.VisibilityRayBiasEpsilon);
+		Config.SampleDensity = FMath::Max(0.0f, Options.VisibilitySampleDensity);
+		Config.bKeepBack = Options.bKeepBackFacingVisible ? 1u : 0u;
+		Config.WeldDistance = FMath::Max(0.0f, Options.VertexWeldDistance);
+		Config.OutputTrianglesPerSource = FMath::Max(2, Options.ArrangementOutputTrianglesPerSource);
+		return Config;
+	}
+
+}
+
+/**
+ * [render thread] 在给定的 FRDGBuilder 上建出整条 Boolean 管线：源 soup 上传、LBVH、
+ * 可选的 fast-winding 场、tri-tri 求交、CSR 分组 + BSP 重三角化、Stage B 分类与射线救回、
+ * 可选的焊接代表元，最后把要跨图存活的 buffer 提取出来。
+ *
+ * 故意不 Execute：提交时机和提交后要读什么由调用方决定。这条缝就是「布尔管线」与
+ * 「结果送去哪」的分界 —— 前者两条消费路径（CPU 快照、GPU 直写常驻流）必须共用一份，
+ * 否则 parity 测试比的是两条已经先分了岔的管线。
+ */
+static void MeshBoolean_AddPipelineToRDG(
+	FRDGBuilder& GraphBuilder,
+	FRHICommandListImmediate& RHICmdList,
+	const FCSBoxScenePreparedData& Prepared,
+	const FMeshBooleanPipelineConfig& Config,
+	const FString& DebugName,
+	FRHIGPUBufferReadback* FinalStatusReadback,
+	uint32 FinalStatusBytes,
+	FMeshBooleanPipelineBuffers& Out)
+{
+	FCSStaticMeshTriangleRDGOutput Soup;
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_SceneSoupUpload);
+		Soup = AComputeShaderMeshGenerator::AddPreparedBoxSceneTrianglesToRDG(
+			GraphBuilder, RHICmdList, Prepared, TEXT("CS.MeshBoolean.Soup"));
+	}
+	if (!Soup.TriangleVertices || !Soup.TriangleCounter || Soup.MaxTriangles == 0) return;
+
+	const uint32 TriangleCapacity = Soup.MaxTriangles;
+	if (TriangleCapacity > 8000000u)
+	{
+		Out.bCapacityUnsupported = true;
+		return;
+	}
+	// 按实际要分配的容量校验 RHI 上限，而不是按 1536 MiB 硬预算——缩容后本就更容易通过。
+	const int64 PlannedOutputTriangleCapacity = FMath::Clamp<int64>(
+		int64(TriangleCapacity) * int64(Config.OutputTrianglesPerSource),
+		1024, int64(ArrangementOutputTriangleCapacity));
+	const uint64 ArrangementOutSoupCapacityBytes = uint64(PlannedOutputTriangleCapacity) * 3ull * sizeof(FVector3f);
+	if (ArrangementOutSoupCapacityBytes > GRHIGlobals.MaxViewSizeBytesForNonTypedBuffer ||
+		uint64(PlannedOutputTriangleCapacity) > GRHIGlobals.MaxViewDimensionForTypedBuffer)
+	{
+		Out.bCapacityUnsupported = true;
+		return;
+	}
+	const uint32 MaxCutSegments = uint32(FMath::Clamp<int64>(
+		int64(TriangleCapacity) * Config.CutSegmentsPerTriangle, 1024, Config.CutSegmentsHardCap));
+
+	Out.SourceVertexCapacity = int32(Soup.MaxVertices);
+	Out.SourceTriangleCapacity = int32(Soup.MaxTriangles);
+	Out.SourceUVChannels = FMath::Max(1, Soup.NumUVChannels);
+	Out.CutCapacity = int32(MaxCutSegments);
+
+	// 源法线/切线恒需保留：输出沿用源属性，不再重算法线。
+	GraphBuilder.QueueBufferExtraction(Soup.TriangleVertices, &Out.SourceVertices, ERHIAccess::CopySrc);
+	if (Soup.TriangleNormals) GraphBuilder.QueueBufferExtraction(Soup.TriangleNormals, &Out.SourceNormals, ERHIAccess::CopySrc);
+	if (Soup.TriangleMaterialIds) GraphBuilder.QueueBufferExtraction(Soup.TriangleMaterialIds, &Out.SourceMaterialIds, ERHIAccess::CopySrc);
+	if (Soup.TriangleUVs) GraphBuilder.QueueBufferExtraction(Soup.TriangleUVs, &Out.SourceUVs, ERHIAccess::CopySrc);
+	if (Soup.TriangleColors) GraphBuilder.QueueBufferExtraction(Soup.TriangleColors, &Out.SourceColors, ERHIAccess::CopySrc);
+	if (Soup.TriangleTangents) GraphBuilder.QueueBufferExtraction(Soup.TriangleTangents, &Out.SourceTangents, ERHIAccess::CopySrc);
+	if (Soup.TriangleBiTangents) GraphBuilder.QueueBufferExtraction(Soup.TriangleBiTangents, &Out.SourceBiTangents, ERHIAccess::CopySrc);
+
+	// ---- 交线 buffer ----
+	FRDGBufferRef CutP0Buf; FRDGBufferUAVRef CutP0UAV;
+	CSHelper::CreateClearedTypedBuffer(GraphBuilder, CutP0Buf, CutP0UAV, sizeof(FVector4f), MaxCutSegments, PF_A32B32G32R32F, TEXT("CS.MeshBoolean.CutP0"), 0.0f);
+
+	FRDGBufferRef CutP1Buf; FRDGBufferUAVRef CutP1UAV;
+	CSHelper::CreateClearedTypedBuffer(GraphBuilder, CutP1Buf, CutP1UAV, sizeof(FVector4f), MaxCutSegments, PF_A32B32G32R32F, TEXT("CS.MeshBoolean.CutP1"), 0.0f);
+
+	FRDGBufferRef CutCounterBuf; FRDGBufferUAVRef CutCounterUAV;
+	CSHelper::CreateClearedTypedBuffer(GraphBuilder, CutCounterBuf, CutCounterUAV, sizeof(uint32), 2, PF_R32_UINT, TEXT("CS.MeshBoolean.CutCounter"), 0u);
+
+	FRDGBufferRef StatsBuf; FRDGBufferUAVRef StatsUAV;
+	CSHelper::CreateClearedTypedBuffer(GraphBuilder, StatsBuf, StatsUAV, sizeof(uint32), 8, PF_R32_UINT, TEXT("CS.MeshBoolean.Stats"), 0u);
+
+	// ---- tri-tri broad-phase：固定构建并遍历 LBVH；需要分类时同时建多极矩场 ----
+	int32 SortM = 1; while (SortM < int32(TriangleCapacity)) SortM <<= 1;
+	const CSGpuTriangleUtilities::FTriangleLBVH TriangleLBVH = AComputeShaderMeshGenerator::AddTriangleLBVHToRDG(
+		GraphBuilder, Soup.TriangleVerticesSRV, int32(TriangleCapacity), SortM,
+		Config.LBVHAabbMin, Config.LBVHInvExtent);
+	FRDGBufferSRVRef TriBVHNodesSRV = GraphBuilder.CreateSRV(
+		FRDGBufferSRVDesc(TriangleLBVH.Nodes, PF_A32B32G32R32F));
+	FMeshBooleanStageBRDGContext StageBContext;
+	if (Config.bRunStageB)
+	{
+		// The base facility produces only the winding field. Boolean retains the
+		// iso threshold and sample offset below because those define classification.
+		FRDGBufferRef WindingMultipoles = AComputeShaderMeshGenerator::AddFastWindingToRDG(
+			GraphBuilder, Soup.TriangleVerticesSRV, TriangleLBVH, int32(TriangleCapacity));
+		StageBContext.bEnabled = true;
+		StageBContext.TopologySRV = TriBVHNodesSRV;
+		StageBContext.MultipoleSRV = GraphBuilder.CreateSRV(
+			FRDGBufferSRVDesc(WindingMultipoles, PF_A32B32G32R32F));
+		StageBContext.SoupSRV = Soup.TriangleVerticesSRV;
+		StageBContext.TriangleCount = TriangleCapacity;
+		StageBContext.WindingBetaSq = Config.WindingBetaSq;
+		StageBContext.WindingSampleOffset = Config.WindingSampleOffset;
+		StageBContext.WindingThreshold = Config.WindingThreshold;
+		StageBContext.ExpansionDistance = Config.ExpansionDistance;
+		StageBContext.RayCount = Config.RayCount;
+		StageBContext.CapMinCos = Config.CapMinCos;
+		StageBContext.ShellRadius = Config.ShellRadius;
+		StageBContext.RayBias = Config.RayBias;
+		StageBContext.SampleDensity = Config.SampleDensity;
+		StageBContext.bKeepBack = Config.bKeepBack;
+	}
+
+	// ---- 三角形对求交（LBVH broad-phase），包裹 dispatch 支持 >4.19M 三角 ----
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_TriTriSubmission);
+		FTriTriIntersectCS::FParameters* P = GraphBuilder.AllocParameters<FTriTriIntersectCS::FParameters>();
+		P->TriangleVertices = Soup.TriangleVerticesSRV;
+		P->TriangleCounter = Soup.TriangleCounterSRV;
+		P->RW_CutP0 = CutP0UAV;
+		P->RW_CutP1 = CutP1UAV;
+		P->RW_CutCounter = CutCounterUAV;
+		P->RW_Stats = StatsUAV;
+		P->TriTriBVHNodes = TriBVHNodesSRV;
+		P->TriangleReferenceFlags = Soup.TriangleReferenceFlagsSRV;
+		P->TriangleCapacity = TriangleCapacity;
+		P->MaxCutSegments = MaxCutSegments;
+		P->SideEps = Config.SideEps;
+		P->ParallelEps = 1e-8f;
+		P->MinSegLenSq = Config.MinSegLenSq;
+		P->SinCoplanarSq = Config.SinCoplanarSq;
+		P->CoplanarOffsetEps = Config.CoplanarOffsetEps;
+
+		TShaderMapRef<FTriTriIntersectCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CS.MeshBoolean.TriTriIntersect"), Shader, P,
+			FComputeShaderUtils::GetGroupCountWrapped(int32(TriangleCapacity), 64));
+	}
+
+	// ---- GPU arrangement：CSR 分组 + N 段 BSP 重三角化，Stage B 在其中完成分类 ----
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_ArrangementSubmission);
+		const int32 ScratchBatchSize = FMath::Min(int32(TriangleCapacity), GPUArrangementTriangleBatchSize);
+		// 输出容量按源三角数缩放，不再无条件买断 1536 MiB：实测子三角数约为源三角的 2.5 倍，
+		// 固定容量的利用率只有 ~7%，其余全是每次调用都要分配并清零的死重。溢出仍由
+		// OutCounter[1] 拦下并报错（提示调大倍率），语义与固定容量时一致。
+		const int32 OutCapLocal = int32(FMath::Clamp<int64>(
+			int64(TriangleCapacity) * int64(Config.OutputTrianglesPerSource),
+			1024, int64(ArrangementOutputTriangleCapacity)));
+		FRDGBufferRef ArrOutSoup = nullptr, ArrOutSrc = nullptr, ArrOutCnt = nullptr, ArrOutStat = nullptr;
+		AddArrangementToRDG(GraphBuilder, Soup.TriangleVerticesSRV, Soup.TriangleReferenceFlagsSRV,
+			GraphBuilder.CreateSRV(FRDGBufferSRVDesc(CutP0Buf, PF_A32B32G32R32F)),
+			GraphBuilder.CreateSRV(FRDGBufferSRVDesc(CutP1Buf, PF_A32B32G32R32F)),
+			GraphBuilder.CreateSRV(FRDGBufferSRVDesc(CutCounterBuf, PF_R32_UINT)),
+			int32(TriangleCapacity), int32(MaxCutSegments),
+			Config.SnapOrigin, Config.SnapQuantum, ScratchBatchSize, OutCapLocal, StageBContext,
+			ArrOutSoup, ArrOutSrc, ArrOutCnt, ArrOutStat);
+		if (Config.WeldDistance > UE_SMALL_NUMBER)
+		{
+			// Shared welding stops at corner representatives. Source attributes,
+			// duplicate removal, and winding restoration are Boolean output policy.
+			// Stage B 只给 fragment 打标记而不从 soup 里移除，故必须让 weld 跳过被剔除的
+			// 角点：桶里只保留最小角点序号，混入的死角点会遮蔽真正该配对的活角点。
+			// 过滤条件与消费端一致：ArrangementOnly 不跑分类，此时不过滤。
+			FRDGBufferSRVRef WeldFilterSRV = Config.bRunStageB
+				? GraphBuilder.CreateSRV(FRDGBufferSRVDesc(ArrOutSrc, PF_R32_UINT))
+				: nullptr;
+			FRDGBufferRef WeldRepresentatives = AComputeShaderMeshGenerator::AddVertexWeldToRDG(
+				GraphBuilder, ArrOutSoup, ArrOutCnt, OutCapLocal, int32(TriangleCapacity),
+				Config.SnapOrigin, Config.WeldDistance,
+				WeldFilterSRV, Config.bRunStageB ? MeshBooleanSourceKeep : 0u);
+			GraphBuilder.QueueBufferExtraction(
+				WeldRepresentatives, &Out.WeldRepresentatives, ERHIAccess::CopySrc);
+		}
+
+		// GPU 输出路径的 accept 计数。CPU 分配常驻容量要的就是这个数，而它只有 GPU 知道；
+		// 判据与 emit 核共用同一个 HLSL 函数，两者不可能算出不同的三角数。
+		FRDGBufferRef KeptCounterBuf; FRDGBufferUAVRef KeptCounterUAV; FRDGBufferSRVRef KeptCounterSRV;
+		CSHelper::CreateClearedTypedBuffer(GraphBuilder, KeptCounterBuf, KeptCounterUAV, KeptCounterSRV,
+			sizeof(uint32), 2, PF_R32_UINT, TEXT("MB.Out.KeptCounter"), 0u);
+		if (Config.bCountKeptFragments)
+		{
+			FRDGBufferSRVRef FragmentCounterSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(ArrOutCnt, PF_R32_UINT));
+			FRDGBufferRef CountArgsBuf = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateIndirectDesc<FRHIDispatchIndirectParameters>(), TEXT("MB.Out.CountArgs"));
+			FRDGBufferUAVRef CountArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(CountArgsBuf, PF_R32_UINT));
+			{
+				// fragment 数只有 GPU 知道，所以线程数也只能由 GPU 写。复用 Stage B 的同一个
+				// args 核，规则（含 WRAPPED_GROUP_STRIDE 截断）自然与 classify 一致。
+				FClassifyIndirectArgsCS::FParameters* P = GraphBuilder.AllocParameters<FClassifyIndirectArgsCS::FParameters>();
+				P->MBFragmentCounter = FragmentCounterSRV;
+				P->RW_MBIndirectArgs = CountArgsUAV;
+				P->MBFragmentCapacity = uint32(OutCapLocal);
+				TShaderMapRef<FClassifyIndirectArgsCS> S(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("MB.Out.CountArgs"), S, P, FIntVector(1, 1, 1));
+			}
+			{
+				FMeshBooleanCountKeptCS::FParameters* P = GraphBuilder.AllocParameters<FMeshBooleanCountKeptCS::FParameters>();
+				P->MBOutFragmentSoup = GraphBuilder.CreateSRV(ArrOutSoup);
+				P->MBOutFragmentSource = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(ArrOutSrc, PF_R32_UINT));
+				P->MBOutFragmentCounterSRV = FragmentCounterSRV;
+				P->MBOutSoupCounterSRV = Soup.TriangleCounterSRV;
+				P->MBOutSourceVertices = Soup.TriangleVerticesSRV;
+				P->RW_MBOutKeptCounter = KeptCounterUAV;
+				P->MBOutFragmentCapacity = uint32(OutCapLocal);
+				P->MBOutSourceTriangleCapacity = TriangleCapacity;
+				P->MBOutStageB = Config.bRunStageB ? 1u : 0u;
+				P->MBOutIndirectArgsBuffer = CountArgsBuf;
+				TShaderMapRef<FMeshBooleanCountKeptCS> S(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("MB.Out.CountKept"), S, P, CountArgsBuf, 0u);
+			}
+		}
+
+		// 先回读小型状态块，调用方据此确定精确的输出规模。
+		FRDGBufferRef FinalStatusBuf = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), FinalStatusCount), TEXT("MB.FinalStatus"));
+		FFinalStatusCS::FParameters* FinalStatusParameters =
+			GraphBuilder.AllocParameters<FFinalStatusCS::FParameters>();
+		FinalStatusParameters->FinalSoupCounter = Soup.TriangleCounterSRV;
+		FinalStatusParameters->FinalCutCounter = GraphBuilder.CreateSRV(
+			FRDGBufferSRVDesc(CutCounterBuf, PF_R32_UINT));
+		FinalStatusParameters->FinalTriStats = GraphBuilder.CreateSRV(
+			FRDGBufferSRVDesc(StatsBuf, PF_R32_UINT));
+		FinalStatusParameters->FinalOutputCounter = GraphBuilder.CreateSRV(
+			FRDGBufferSRVDesc(ArrOutCnt, PF_R32_UINT));
+		FinalStatusParameters->FinalBSPStats = GraphBuilder.CreateSRV(
+			FRDGBufferSRVDesc(ArrOutStat, PF_R32_UINT));
+		FinalStatusParameters->FinalKeptCounter = KeptCounterSRV;
+		FinalStatusParameters->RW_FinalStatus = GraphBuilder.CreateUAV(
+			FRDGBufferUAVDesc(FinalStatusBuf, PF_R32_UINT));
+		FinalStatusParameters->FinalBSPStatCount = BSPStatCount;
+		TShaderMapRef<FFinalStatusCS> FinalStatusShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("MB.FinalStatus"),
+			FinalStatusShader, FinalStatusParameters, FIntVector(1, 1, 1));
+		if (FinalStatusReadback) AddEnqueueCopyPass(GraphBuilder, FinalStatusReadback, FinalStatusBuf, FinalStatusBytes);
+		UE_LOG(LogTemp, Log, TEXT("[MeshBoolean:%s] [GPU-arr] scratchBatch=%d batches=%d limits=%d cuts/%d verts/%d cells/%d outputsPerSource outCap=%d (%.0fx源三角, %.0fMiB, 硬上限 %d/1536MiB)"),
+			*DebugName, ScratchBatchSize, FMath::DivideAndRoundUp(int32(TriangleCapacity), ScratchBatchSize),
+			BSPMaxCuts, BSPMaxVerts, BSPMaxCells, BSPMaxOutputTrianglesPerSource, OutCapLocal,
+			double(OutCapLocal) / FMath::Max(1.0, double(TriangleCapacity)),
+			double(uint64(OutCapLocal) * 40ull) / (1024.0 * 1024.0),
+			ArrangementOutputTriangleCapacity);
+		Out.FragmentCapacity = OutCapLocal;
+		GraphBuilder.QueueBufferExtraction(ArrOutSoup, &Out.FragmentSoup, ERHIAccess::CopySrc);
+		GraphBuilder.QueueBufferExtraction(ArrOutSrc, &Out.FragmentSource, ERHIAccess::CopySrc);
+	}
+
+	Out.bGraphBuilt = true;
 }
 
 // =============================================================================
@@ -394,58 +818,160 @@ UStaticMesh* AComputeShaderMeshBoolean::BooleanBoxScene(ECSMeshBooleanOp Op)
 	return RunBooleanInternal(Op);
 }
 
+FCSMeshBooleanOptions AComputeShaderMeshBoolean::MakeBooleanOptions() const
+{
+	// Every value still lives on the actor as a UPROPERTY (serialized Blueprint defaults and
+	// existing call sites depend on that); this is only the hand-off into the pipeline.
+	FCSMeshBooleanOptions Options;
+	Options.MaxSourceTriangles = MaxTriangles;
+	Options.bReadLandscape = bReadLandscape;
+	Options.CutSegmentsPerTriangle = CutSegmentsPerTriangle;
+	Options.MaxCutSegmentsHardCap = MaxCutSegmentsHardCap;
+	Options.SideEpsilon = SideEpsilon;
+	Options.MinCutSegmentLength = MinCutSegmentLength;
+	Options.CoplanarAngleDegrees = CoplanarAngleDegrees;
+	Options.CoplanarOffsetEpsilon = CoplanarOffsetEpsilon;
+	Options.WindingIsoThreshold = WindingIsoThreshold;
+	Options.WindingSampleOffset = WindingSampleOffset;
+	Options.WindingBeta = WindingBeta;
+	Options.VisibilityRayCount = VisibilityRayCount;
+	Options.VisibilityHalfAngleDegrees = VisibilityHalfAngleDegrees;
+	Options.VisibilityShellRadius = VisibilityShellRadius;
+	Options.VisibilitySampleDensity = VisibilitySampleDensity;
+	Options.VisibilityRayBiasEpsilon = VisibilityRayBiasEpsilon;
+	Options.bKeepBackFacingVisible = bKeepBackFacingVisible;
+	Options.RetainedTriangleExpansionDistance = RetainedTriangleExpansionDistance;
+	Options.VertexWeldDistance = VertexWeldDistance;
+	Options.bPreserveSourceMaterialSlots = bPreserveSourceMaterialSlots;
+	Options.SnapRoundQuantum = SnapRoundQuantum;
+	Options.ArrangementOutputTrianglesPerSource = ArrangementOutputTrianglesPerSource;
+	return Options;
+}
+
 UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
+{
+	const FCSMeshBooleanOptions BooleanOptions = MakeBooleanOptions();
+
+	// GPU 直写路径：结果先落进一个 transient UCSMesh，再由公用 sink 转成 StaticMesh。这个
+	// 一次性入口和 operator 库因此走同一条管线、同一份属性重建 —— 两条产出各自维护一份
+	// 重建代码，正是「资产里的 UV 和运行时画出来的不一样」这类问题的来源。
+	// 焊接留在 CPU 快照路径（重复三角剔除未移植，见 RunBooleanToGpuMesh）。
+	if (BooleanOptions.VertexWeldDistance <= UE_SMALL_NUMBER)
+	{
+		UCSMesh* GpuMesh = NewObject<UCSMesh>(this);
+		if (!RunBooleanToGpuMesh(Op, BooleanOptions, GpuMesh)) return nullptr;
+
+		FCSMeshToStaticMeshOptions SinkOptions;
+		// 输出是 StaticMesh 资产，与组件无关，直接用 actor 变换把世界空间结果烘到局部空间。
+		SinkOptions.TargetTransform = GetActorTransform();
+		SinkOptions.bBakeToLocalSpace = true;
+		// 布尔结果动辄百万级三角，正是 Nanite 的适用场景。
+		SinkOptions.bEnableNanite = bOutputNanite;
+#if WITH_EDITOR
+		// 结果落盘为 level 同级 AutoResult 文件夹，建完标脏，由用户自行 Save All 决定是否写盘。
+		SinkOptions.AssetPath = BuildResultAssetPath();
+		SinkOptions.bTransient = SinkOptions.AssetPath.IsEmpty();
+#else
+		SinkOptions.bTransient = true;
+#endif
+		OutputStaticMesh = UCSMeshOps::CopyToStaticMesh(GpuMesh, this, this, SinkOptions);
+		if (!OutputStaticMesh && !SinkOptions.bTransient)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[MeshBoolean:%s] result 资产保存失败，回退为 transient StaticMesh。"), *GetName());
+			SinkOptions.bTransient = true;
+			SinkOptions.AssetPath.Empty();
+			OutputStaticMesh = UCSMeshOps::CopyToStaticMesh(GpuMesh, this, this, SinkOptions);
+		}
+		if (!OutputStaticMesh)
+			UE_LOG(LogTemp, Error, TEXT("[MeshBoolean:%s] shared GPU-mesh StaticMesh conversion failed."), *GetName());
+		return OutputStaticMesh;
+	}
+
+	FCSGpuMeshCPUData StaticMeshData;
+	TArray<UMaterialInterface*> OutputMaterialSlots;
+	if (!RunBooleanToSnapshot(Op, BooleanOptions, StaticMeshData, OutputMaterialSlots)) return nullptr;
+
+	// 输出是 StaticMesh 资产，与 DynamicMesh 组件无关，直接用 actor 变换把世界空间结果烘到局部空间。
+	const FTransform OutputTransform = GetActorTransform();
+	// 统一走公用转换入口：属性装配与落盘的策略（绕序、退化面阈值、空槽兜底默认材质）都在
+	// CSGpuMeshConvert 里，不再由各产出路径各写一份。
+	// 结果落盘为 level 同级 AutoResult 文件夹（/<level 目录>/AutoResult/SM_<actor>_<稳定编号>），建完标脏，
+	// 由用户自行 Save All 决定是否写盘。名字里不带每次运行的时间戳（命名规则与 CSSW 烘焙一致），
+	// 同一个 actor 反复运行始终写同一个资产，直接覆盖旧模型，引用它的组件仍指向同一份资产。
+	// 非编辑器构建没有资产系统，公用入口内部退回 transient。
+	FCSGpuMeshConvertOptions ConvertOptions;
+	ConvertOptions.TargetTransform = OutputTransform;
+	ConvertOptions.bBakeToLocalSpace = true;
+
+	FCSGpuMeshAssetOptions AssetOptions;
+	// 布尔结果动辄百万级三角，正是 Nanite 的适用场景：交给它做 LOD 与剔除，
+	// 省掉手工 LOD，渲染开销与三角数基本脱钩。
+	AssetOptions.bEnableNanite = bOutputNanite;
+#if WITH_EDITOR
+	AssetOptions.AssetPath = BuildResultAssetPath();
+#else
+	AssetOptions.bTransient = true;
+#endif
+	OutputStaticMesh = UCSGpuMeshComponent::BuildStaticMesh(
+		this, this, StaticMeshData, OutputMaterialSlots, ConvertOptions, AssetOptions);
+	if (!OutputStaticMesh && !AssetOptions.bTransient)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[MeshBoolean:%s] result 资产保存失败，回退为 transient StaticMesh。"), *GetName());
+		AssetOptions.bTransient = true;
+		OutputStaticMesh = UCSGpuMeshComponent::BuildStaticMesh(
+			this, this, StaticMeshData, OutputMaterialSlots, ConvertOptions, AssetOptions);
+	}
+	if (!OutputStaticMesh)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[MeshBoolean:%s] shared GPU-mesh StaticMesh conversion failed (vertices=%d indices=%d)."),
+			*GetName(), StaticMeshData.Positions.Num(), StaticMeshData.Indices.Num());
+	}
+
+	return OutputStaticMesh;
+}
+
+bool AComputeShaderMeshBoolean::RunBooleanToSnapshot(
+	ECSMeshBooleanOp Op,
+	const FCSMeshBooleanOptions& Options,
+	FCSGpuMeshCPUData& StaticMeshData,
+	TArray<UMaterialInterface*>& OutputMaterialSlots,
+	FCSMeshBooleanCapture* OutCapture)
 {
 	// Stage 0：校验运行环境与查询范围；任一条件无效时不启动 Boolean 管线。
 	TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_RunBooleanInternal);
+	StaticMeshData.Reset();
+	OutputMaterialSlots.Reset();
+	if (OutCapture) *OutCapture = FCSMeshBooleanCapture();
+
 	UWorld* World = GetWorld();
 	if (!World)
 	{
-		return nullptr;
+		return false;
 	}
 
 	const FBox QueryBox = GetGeneratorBoundsWorldBox();
 	if (!QueryBox.IsValid)
 	{
-		return nullptr;
+		return false;
 	}
 
+	// Shadow-free local names: the actor still owns UPROPERTYs with these names, and the
+	// pipeline must read the options struct, never the members.
+	const int32 SourceTriangleLimit = FMath::Max(1, Options.MaxSourceTriangles);
+	const bool bIncludeLandscape = Options.bReadLandscape;
+
 	// tri-tri 固定使用 GPU LBVH broad-phase。
-	// Stage 1：规范化 Boolean 参数，并计算 LBVH、吸附取整及 Stage B 分类所需常量。
-	const int32 CutPerTri = FMath::Max(1, CutSegmentsPerTriangle);
-	const int32 CutHardCap = FMath::Max(1024, MaxCutSegmentsHardCap);
-	const float SideEpsV = FMath::Max(0.0f, SideEpsilon);
-	const float MinSegLenSqV = FMath::Max(1e-6f, MinCutSegmentLength * MinCutSegmentLength);
-	// 共面判定阈值（归一化）：角度→sin²，偏移→真实 cm。
-	const float CoplanarAngleRadV = FMath::DegreesToRadians(FMath::Clamp(CoplanarAngleDegrees, 0.0f, 45.0f));
-	const float SinCoplanarSqV = FMath::Square(FMath::Sin(CoplanarAngleRadV));
-	const float CoplanarOffsetEpsV = FMath::Max(0.0f, CoplanarOffsetEpsilon);
-
-	// tri-tri broad-phase：LBVH 的 Morton 量化用 GeneratorBounds 盒作 AABB（CPU 已知，免 GPU 归约往返）。
-	const FVector3f LBVHAabbMinV((float)QueryBox.Min.X, (float)QueryBox.Min.Y, (float)QueryBox.Min.Z);
-	const FVector QBExt = QueryBox.GetSize();
-	const FVector3f LBVHInvExtV(
-		QBExt.X > 1e-3 ? 1.0f / float(QBExt.X) : 0.0f,
-		QBExt.Y > 1e-3 ? 1.0f / float(QBExt.Y) : 0.0f,
-		QBExt.Z > 1e-3 ? 1.0f / float(QBExt.Z) : 0.0f);
-
-	// M4 GPU arrangement：snap-round 平移帧（origin=QueryBox.Min=LBVHAabbMinV；量化=max(SnapRoundQuantum, 最大边·2^-18)）。
-	const FVector3f SnapOriginV = LBVHAabbMinV;
-	const float SnapQV = FMath::Max(FMath::Max(SnapRoundQuantum, float(QBExt.GetMax()) * FMath::Pow(2.0f, -18.0f)), 1e-6f);
+	// Stage 1：规范化 Boolean 参数（与 GPU 直写路径共用同一份换算，见 MeshBoolean_BuildPipelineConfig）。
 	const bool bRunStageB = (Op != ECSMeshBooleanOp::ArrangementOnly);
-	const float StageBWindingBetaSqV = FMath::Max(1.0f, WindingBeta * WindingBeta);
-	const float StageBWindingSampleOffsetV = FMath::Max(0.001f, WindingSampleOffset);
-	const float StageBWindingThresholdV = FMath::Max(0.0f, WindingIsoThreshold);
-	const float StageBExpansionDistanceV = bRunStageB ? FMath::Max(0.0f, RetainedTriangleExpansionDistance) : 0.0f;
-	const uint32 StageBRayCountV = uint32(FMath::Max(1, VisibilityRayCount));
-	const float StageBCapMinCosV = FMath::Cos(FMath::DegreesToRadians(FMath::Clamp(VisibilityHalfAngleDegrees, 90.0f, 180.0f)));
-	const float StageBShellRadiusV = FMath::Max(
-		VisibilityShellRadius > 0.0f ? VisibilityShellRadius : float(QBExt.Size()), 1.0f);
-	const float StageBRayBiasV = FMath::Max(0.0f, VisibilityRayBiasEpsilon);
-	const float StageBSampleDensityV = FMath::Max(0.0f, VisibilitySampleDensity);
-	const uint32 StageBKeepBackV = bKeepBackFacingVisible ? 1u : 0u;
-	const float OutputWeldDistanceV = FMath::Max(0.0f, VertexWeldDistance);
-	const int32 OutputTrianglesPerSourceV = FMath::Max(2, ArrangementOutputTrianglesPerSource);
+	FMeshBooleanPipelineConfig PipelineConfig = MeshBoolean_BuildPipelineConfig(Options, QueryBox, bRunStageB);
+	// 只有要交出 capture 时才多跑那个计数核：拿到 capture 的调用方要用它给 GPU 重建定容量，
+	// 而这条路径自己不需要。
+	PipelineConfig.bCountKeptFragments = (OutCapture != nullptr);
+	// 管线之外仍要用到的几个值，从同一份 config 里取，避免第二次换算。
+	const float StageBWindingThresholdV = PipelineConfig.WindingThreshold;
+	const float StageBExpansionDistanceV = PipelineConfig.ExpansionDistance;
+	const float OutputWeldDistanceV = PipelineConfig.WeldDistance;
+	const int32 OutputTrianglesPerSourceV = PipelineConfig.OutputTrianglesPerSource;
 
 	// Stage 1.5: VRAM pre-flight. Every buffer below scales linearly with the source triangle
 	// count, so the machine-dependent ceiling is knowable before any work starts - unlike the
@@ -454,7 +980,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 	// or welding moves the limit accordingly.
 	{
 		CSGpuMemoryBudget::FTriangleSoupCostModel Cost;
-		Cost.CutSegmentsPerTriangle = CutPerTri;
+		Cost.CutSegmentsPerTriangle = PipelineConfig.CutSegmentsPerTriangle;
 		Cost.OutputTrianglesPerSource = OutputTrianglesPerSourceV;
 		Cost.bBuildLBVH = true;
 		Cost.bBuildWindingField = bRunStageB;
@@ -462,20 +988,24 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 		// 源法线/切线始终回读：输出沿用源属性，不再重算法线。
 		Cost.bSourceNormals = true;
 		Cost.bSourceTangents = true;
-		if (!ConfirmGpuMemoryBudgetForBoxScene(TEXT("Mesh Boolean"), QueryBox, Cost, bReadLandscape)) return nullptr;
+		if (!ConfirmGpuMemoryBudgetForBoxScene(TEXT("Mesh Boolean"), QueryBox, Cost, bIncludeLandscape)) return false;
 	}
 
-	// ---- game thread：解析场景三角形（bReadLandscape 控制是否纳入地形）----
+	// ---- game thread：解析场景三角形（bIncludeLandscape 控制是否纳入地形）----
 	// Stage 2（Game Thread）：收集查询框内的场景三角形及其顶点属性，形成源 triangle soup。
-	constexpr bool bUseMeshDescriptionSourceTriangles = true;
+	// 走公用的无状态收集器：盒内有哪些三角是对世界的提问，与本 actor 无关；actor 只提供
+	// 自身的排除策略与 LOD（MakeBoxSceneCollectOptions），其余由 Boolean 的 options 决定。
+	// Boolean 不做参照点距离过滤：源 soup 必须完整，否则被裁掉的邻接三角会让 winding 场判错。
 	FCSBoxScenePreparedData Prepared;
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_MeshDescriptionExtraction);
-		Prepared = PrepareBoxSceneTriangles(
-			World, QueryBox, MaxTriangles, TArray<FVector>(), 0.0f, NAME_None, bReadLandscape,
-			bUseMeshDescriptionSourceTriangles, bPreserveSourceMaterialSlots);
+		FCSBoxSceneCollectOptions CollectOptions = MakeBoxSceneCollectOptions(QueryBox);
+		CollectOptions.MaxTriangles = SourceTriangleLimit;
+		CollectOptions.bIncludeLandscape = bIncludeLandscape;
+		CollectOptions.bPreserveSourceMaterialSlots = Options.bPreserveSourceMaterialSlots;
+		Prepared = CSBoxSceneCollection::CollectBoxSceneTriangles(World, CollectOptions);
 	}
-	if (!Prepared.IsValid() || !Prepared.HasAnyTriangles()) return nullptr;
+	if (!Prepared.IsValid() || !Prepared.HasAnyTriangles()) return false;
 
 	// 输出沿用源法线/切线，故两者恒需回读。
 	constexpr bool bNeedSourceNormals = true;
@@ -525,235 +1055,41 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 	uint32 CornerAttributeBytes = 0;
 	uint32 WeldRepresentativeBytes = 0;
 
+	FMeshBooleanPipelineBuffers Pipeline;
+	const FString PipelineDebugName = GetName();
+
 	ENQUEUE_RENDER_COMMAND(MeshBooleanSplitGPU)(
-		[this, Prepared,
-		 CutPerTri, CutHardCap, SideEpsV, MinSegLenSqV, SinCoplanarSqV, CoplanarOffsetEpsV,
-		 LBVHAabbMinV, LBVHInvExtV, SnapOriginV, SnapQV,
-		 bRunStageB, StageBWindingBetaSqV, StageBWindingSampleOffsetV, StageBWindingThresholdV,
-		 StageBExpansionDistanceV, StageBRayCountV, StageBCapMinCosV, StageBShellRadiusV,
-		 StageBRayBiasV, StageBSampleDensityV, StageBKeepBackV, OutputWeldDistanceV,
-		 OutputTrianglesPerSourceV,
+		[Prepared, PipelineConfig, PipelineDebugName,
 		 VertexReadback, NormalReadback, FinalStatusReadback, MaterialReadback, UVReadback, ColorReadback, TangentReadback, BiTangentReadback,
 		 OutSoupReadback, OutSourceReadback, WeldRepresentativeReadback,
 		 bNeedSourceNormals, bNeedSourceTangents,
-		 FinalStatusBytes, &FinalStatusData,
+		 FinalStatusBytes, &FinalStatusData, &Pipeline,
 		 &bRenderWorkQueued, &bHasGPUOutput, &bArrangementCapacityUnsupported, &OutSubTriCap, &OutSoupBytes, &OutSrcBytes,
 		 &GPUArrOutCount, &GPUArrOutOverflow, &SoupTriangleCount, &WeldRepresentativeBytes,
 		 &VertexCapacity, &VertexBytes, &NormalBytes, &CutCapacity, &MaterialCapacity, &MaterialBytes, &UVCapacity, &UVBytes, &SoupUVChannels, &CornerAttributeBytes]
 		(FRHICommandListImmediate& RHICmdList)
 		{
-			// Stage 4（Render Thread）：上传源 triangle soup，并检查输入及固定输出容量是否受 RHI 支持。
+			// Stage 4-10（Render Thread）：整条 Boolean 管线，与 GPU 直写路径共用同一个建图函数。
 			FRDGBuilder GraphBuilder(RHICmdList);
 			auto ExecuteSingleGraph = [&GraphBuilder]() { GraphBuilder.Execute(); };
 
-			FCSStaticMeshTriangleRDGOutput Soup;
+			MeshBoolean_AddPipelineToRDG(GraphBuilder, RHICmdList, Prepared, PipelineConfig,
+				PipelineDebugName, FinalStatusReadback, FinalStatusBytes, Pipeline);
+			if (!Pipeline.bGraphBuilt)
 			{
-				TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_SceneSoupUpload);
-				Soup = AddPreparedBoxSceneTrianglesToRDG(
-					GraphBuilder, RHICmdList, Prepared, TEXT("CS.MeshBoolean.Soup"));
-			}
-
-			if (!Soup.TriangleVertices || !Soup.TriangleCounter || Soup.MaxTriangles == 0)
-			{
+				// 容量不受支持要报错，空 soup 只是没东西可算：前者置位让调用方打日志，后者连
+				// bRenderWorkQueued 都不置 —— 与把建图拆出去之前的两条 early-out 逐字等价。
+				bArrangementCapacityUnsupported = Pipeline.bCapacityUnsupported;
 				ExecuteSingleGraph();
+				if (Pipeline.bCapacityUnsupported) bRenderWorkQueued = true;
 				return;
 			}
 
-			const uint32 TriangleCapacity = Soup.MaxTriangles;
-			if (TriangleCapacity > 8000000u)
-			{
-				bArrangementCapacityUnsupported = true;
-				ExecuteSingleGraph();
-				bRenderWorkQueued = true;
-				return;
-			}
-			// 按实际要分配的容量校验 RHI 上限，而不是按 1536 MiB 硬预算——缩容后本就更容易通过。
-			const int64 PlannedOutputTriangleCapacity = FMath::Clamp<int64>(
-				int64(TriangleCapacity) * int64(OutputTrianglesPerSourceV),
-				1024, int64(ArrangementOutputTriangleCapacity));
-			const uint64 ArrangementOutSoupCapacityBytes = uint64(PlannedOutputTriangleCapacity) * 3ull * sizeof(FVector3f);
-			if (ArrangementOutSoupCapacityBytes > GRHIGlobals.MaxViewSizeBytesForNonTypedBuffer ||
-				uint64(PlannedOutputTriangleCapacity) > GRHIGlobals.MaxViewDimensionForTypedBuffer)
-			{
-				bArrangementCapacityUnsupported = true;
-				ExecuteSingleGraph();
-				bRenderWorkQueued = true;
-				return;
-			}
-			const uint32 MaxCutSegments = uint32(FMath::Clamp<int64>(
-				int64(TriangleCapacity) * CutPerTri, 1024, CutHardCap));
-
-			VertexCapacity = int32(Soup.MaxVertices);
-			VertexBytes = uint32(uint64(Soup.MaxVertices) * sizeof(FVector4f));
-			NormalBytes = VertexBytes;
-			CutCapacity = int32(MaxCutSegments);
-			MaterialCapacity = int32(Soup.MaxTriangles);
-			MaterialBytes = uint32(uint64(Soup.MaxTriangles) * sizeof(uint32));
-			SoupUVChannels = FMath::Max(1, Soup.NumUVChannels);
-			UVCapacity = int32(Soup.MaxVertices) * SoupUVChannels;
-			UVBytes = uint32(uint64(Soup.MaxVertices) * uint64(SoupUVChannels) * sizeof(FVector2f));
-			CornerAttributeBytes = uint32(uint64(Soup.MaxVertices) * sizeof(FVector4f));
-
-			TRefCountPtr<FRDGPooledBuffer> SourceVerticesExtracted;
-			TRefCountPtr<FRDGPooledBuffer> SourceNormalsExtracted;
-			TRefCountPtr<FRDGPooledBuffer> SourceMaterialsExtracted;
-			TRefCountPtr<FRDGPooledBuffer> SourceUVsExtracted;
-			TRefCountPtr<FRDGPooledBuffer> SourceColorsExtracted;
-			TRefCountPtr<FRDGPooledBuffer> SourceTangentsExtracted;
-			TRefCountPtr<FRDGPooledBuffer> SourceBiTangentsExtracted;
-			GraphBuilder.QueueBufferExtraction(Soup.TriangleVertices, &SourceVerticesExtracted, ERHIAccess::CopySrc);
-			if (bNeedSourceNormals && Soup.TriangleNormals) GraphBuilder.QueueBufferExtraction(Soup.TriangleNormals, &SourceNormalsExtracted, ERHIAccess::CopySrc);
-			if (Soup.TriangleMaterialIds) GraphBuilder.QueueBufferExtraction(Soup.TriangleMaterialIds, &SourceMaterialsExtracted, ERHIAccess::CopySrc);
-			if (Soup.TriangleUVs) GraphBuilder.QueueBufferExtraction(Soup.TriangleUVs, &SourceUVsExtracted, ERHIAccess::CopySrc);
-			if (Soup.TriangleColors) GraphBuilder.QueueBufferExtraction(Soup.TriangleColors, &SourceColorsExtracted, ERHIAccess::CopySrc);
-			if (bNeedSourceTangents && Soup.TriangleTangents) GraphBuilder.QueueBufferExtraction(Soup.TriangleTangents, &SourceTangentsExtracted, ERHIAccess::CopySrc);
-			if (bNeedSourceTangents && Soup.TriangleBiTangents) GraphBuilder.QueueBufferExtraction(Soup.TriangleBiTangents, &SourceBiTangentsExtracted, ERHIAccess::CopySrc);
-
-			// ---- 交线 buffer ----
-			// Stage 5：创建相交线段、计数器及诊断缓冲区，供窄相位求交和 arrangement 共用。
-			FRDGBufferRef CutP0Buf; FRDGBufferUAVRef CutP0UAV;
-			CSHelper::CreateClearedTypedBuffer(GraphBuilder, CutP0Buf, CutP0UAV, sizeof(FVector4f), MaxCutSegments, PF_A32B32G32R32F, TEXT("CS.MeshBoolean.CutP0"), 0.0f);
-
-			FRDGBufferRef CutP1Buf; FRDGBufferUAVRef CutP1UAV;
-			CSHelper::CreateClearedTypedBuffer(GraphBuilder, CutP1Buf, CutP1UAV, sizeof(FVector4f), MaxCutSegments, PF_A32B32G32R32F, TEXT("CS.MeshBoolean.CutP1"), 0.0f);
-
-			FRDGBufferRef CutCounterBuf; FRDGBufferUAVRef CutCounterUAV;
-			CSHelper::CreateClearedTypedBuffer(GraphBuilder, CutCounterBuf, CutCounterUAV, sizeof(uint32), 2, PF_R32_UINT, TEXT("CS.MeshBoolean.CutCounter"), 0u);
-
-			FRDGBufferRef StatsBuf; FRDGBufferUAVRef StatsUAV;
-			CSHelper::CreateClearedTypedBuffer(GraphBuilder, StatsBuf, StatsUAV, sizeof(uint32), 8, PF_R32_UINT, TEXT("CS.MeshBoolean.Stats"), 0u);
-
-			// ---- tri-tri broad-phase：固定构建并遍历 LBVH。 ----
-			// Stage 6：构建三角形 LBVH；需要布尔分类时同时构建快速缠绕数多极矩场。
-			int32 SortM = 1; while (SortM < int32(TriangleCapacity)) SortM <<= 1;
-			const CSGpuTriangleUtilities::FTriangleLBVH TriangleLBVH = AddTriangleLBVHToRDG(
-				GraphBuilder, Soup.TriangleVerticesSRV, int32(TriangleCapacity), SortM,
-				LBVHAabbMinV, LBVHInvExtV);
-			FRDGBufferSRVRef TriBVHNodesSRV = GraphBuilder.CreateSRV(
-				FRDGBufferSRVDesc(TriangleLBVH.Nodes, PF_A32B32G32R32F));
-			FMeshBooleanStageBRDGContext StageBContext;
-			if (bRunStageB)
-			{
-				// The base facility produces only the winding field. Boolean retains the
-				// iso threshold and sample offset below because those define classification.
-				FRDGBufferRef WindingMultipoles = AddFastWindingToRDG(
-					GraphBuilder, Soup.TriangleVerticesSRV, TriangleLBVH, int32(TriangleCapacity));
-				StageBContext.bEnabled = true;
-				StageBContext.TopologySRV = TriBVHNodesSRV;
-				StageBContext.MultipoleSRV = GraphBuilder.CreateSRV(
-					FRDGBufferSRVDesc(WindingMultipoles, PF_A32B32G32R32F));
-				StageBContext.SoupSRV = Soup.TriangleVerticesSRV;
-				StageBContext.TriangleCount = TriangleCapacity;
-				StageBContext.WindingBetaSq = StageBWindingBetaSqV;
-				StageBContext.WindingSampleOffset = StageBWindingSampleOffsetV;
-				StageBContext.WindingThreshold = StageBWindingThresholdV;
-				StageBContext.ExpansionDistance = StageBExpansionDistanceV;
-				StageBContext.RayCount = StageBRayCountV;
-				StageBContext.CapMinCos = StageBCapMinCosV;
-				StageBContext.ShellRadius = StageBShellRadiusV;
-				StageBContext.RayBias = StageBRayBiasV;
-				StageBContext.SampleDensity = StageBSampleDensityV;
-				StageBContext.bKeepBack = StageBKeepBackV;
-			}
-
-			// ---- 三角形对求交（LBVH broad-phase），包裹 dispatch 支持 >4.19M 三角 ----
-			{
-				// Stage 7：遍历 LBVH 执行 tri-tri 窄相位求交，输出每个源三角形上的切割线段。
-				TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_TriTriSubmission);
-				FTriTriIntersectCS::FParameters* P = GraphBuilder.AllocParameters<FTriTriIntersectCS::FParameters>();
-				P->TriangleVertices = Soup.TriangleVerticesSRV;
-				P->TriangleCounter = Soup.TriangleCounterSRV;
-				P->RW_CutP0 = CutP0UAV;
-				P->RW_CutP1 = CutP1UAV;
-				P->RW_CutCounter = CutCounterUAV;
-				P->RW_Stats = StatsUAV;
-				P->TriTriBVHNodes = TriBVHNodesSRV;
-				P->TriangleReferenceFlags = Soup.TriangleReferenceFlagsSRV;
-				P->TriangleCapacity = TriangleCapacity;
-				P->MaxCutSegments = MaxCutSegments;
-				P->SideEps = SideEpsV;
-				P->ParallelEps = 1e-8f;
-				P->MinSegLenSq = MinSegLenSqV;
-				P->SinCoplanarSq = SinCoplanarSqV;
-				P->CoplanarOffsetEps = CoplanarOffsetEpsV;
-
-				TShaderMapRef<FTriTriIntersectCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CS.MeshBoolean.TriTriIntersect"), Shader, P,
-					FComputeShaderUtils::GetGroupCountWrapped(int32(TriangleCapacity), 64));
-			}
-
-			// ---- GPU arrangement：固定执行 CSR 分组 + N 段 BSP 重三角化。 ----
-			// Stage 8：将切割线段整理为 CSR，分批进行 BSP 切分与重三角化；Stage B 在此融合完成保留/剔除分类。
-			TRefCountPtr<FRDGPooledBuffer> ArrOutSoupExtracted;
-			TRefCountPtr<FRDGPooledBuffer> ArrOutSourceExtracted;
-			TRefCountPtr<FRDGPooledBuffer> WeldRepresentativeExtracted;
-			{
-				TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_ArrangementSubmission);
-				const int32 ScratchBatchSize = FMath::Min(int32(TriangleCapacity), GPUArrangementTriangleBatchSize);
-				// 输出容量按源三角数缩放，不再无条件买断 1536 MiB：实测子三角数约为源三角的 2.5 倍，
-				// 固定容量的利用率只有 ~7%，其余全是每次调用都要分配并清零的死重。溢出仍由
-				// GPUArrOutOverflow 拦下并报错（提示调大倍率），语义与固定容量时一致。
-				const int32 OutCapLocal = int32(FMath::Clamp<int64>(
-					int64(TriangleCapacity) * int64(OutputTrianglesPerSourceV),
-					1024, int64(ArrangementOutputTriangleCapacity)));
-				FRDGBufferRef ArrOutSoup = nullptr, ArrOutSrc = nullptr, ArrOutCnt = nullptr, ArrOutStat = nullptr;
-				AddArrangementToRDG(GraphBuilder, Soup.TriangleVerticesSRV, Soup.TriangleReferenceFlagsSRV,
-					GraphBuilder.CreateSRV(FRDGBufferSRVDesc(CutP0Buf, PF_A32B32G32R32F)),
-					GraphBuilder.CreateSRV(FRDGBufferSRVDesc(CutP1Buf, PF_A32B32G32R32F)),
-					GraphBuilder.CreateSRV(FRDGBufferSRVDesc(CutCounterBuf, PF_R32_UINT)),
-					int32(TriangleCapacity), int32(MaxCutSegments),
-					SnapOriginV, SnapQV, ScratchBatchSize, OutCapLocal, StageBContext,
-					ArrOutSoup, ArrOutSrc, ArrOutCnt, ArrOutStat);
-				if (OutputWeldDistanceV > UE_SMALL_NUMBER)
-				{
-					// Stage 9（可选 GPU 后处理）：为近邻角点生成焊接代表元，实际拓扑重建留在 CPU 完成。
-					// Shared welding stops at corner representatives. Source attributes,
-					// duplicate removal, and winding restoration are Boolean output policy.
-					// Stage B 只给 fragment 打标记而不从 soup 里移除，故必须让 weld 跳过被剔除的
-					// 角点：桶里只保留最小角点序号，混入的死角点会遮蔽真正该配对的活角点。
-					// 过滤条件与 CPU 消费端一致：ArrangementOnly 不跑分类，此时不过滤。
-					const bool bFilterWeldByKeep = bRunStageB;
-					FRDGBufferSRVRef WeldFilterSRV = bFilterWeldByKeep
-						? GraphBuilder.CreateSRV(FRDGBufferSRVDesc(ArrOutSrc, PF_R32_UINT))
-						: nullptr;
-					FRDGBufferRef WeldRepresentatives = AddVertexWeldToRDG(
-						GraphBuilder, ArrOutSoup, ArrOutCnt, OutCapLocal, int32(TriangleCapacity),
-						SnapOriginV, OutputWeldDistanceV,
-						WeldFilterSRV, bFilterWeldByKeep ? MeshBooleanSourceKeep : 0u);
-					GraphBuilder.QueueBufferExtraction(
-						WeldRepresentatives, &WeldRepresentativeExtracted, ERHIAccess::CopySrc);
-				}
-				// Stage 10：汇总 soup、切线、输出及 BSP 状态，先回读小型状态块以确定精确回读字节数。
-				FRDGBufferRef FinalStatusBuf = GraphBuilder.CreateBuffer(
-					FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), FinalStatusCount), TEXT("MB.FinalStatus"));
-				FFinalStatusCS::FParameters* FinalStatusParameters =
-					GraphBuilder.AllocParameters<FFinalStatusCS::FParameters>();
-				FinalStatusParameters->FinalSoupCounter = Soup.TriangleCounterSRV;
-				FinalStatusParameters->FinalCutCounter = GraphBuilder.CreateSRV(
-					FRDGBufferSRVDesc(CutCounterBuf, PF_R32_UINT));
-				FinalStatusParameters->FinalTriStats = GraphBuilder.CreateSRV(
-					FRDGBufferSRVDesc(StatsBuf, PF_R32_UINT));
-				FinalStatusParameters->FinalOutputCounter = GraphBuilder.CreateSRV(
-					FRDGBufferSRVDesc(ArrOutCnt, PF_R32_UINT));
-				FinalStatusParameters->FinalBSPStats = GraphBuilder.CreateSRV(
-					FRDGBufferSRVDesc(ArrOutStat, PF_R32_UINT));
-				FinalStatusParameters->RW_FinalStatus = GraphBuilder.CreateUAV(
-					FRDGBufferUAVDesc(FinalStatusBuf, PF_R32_UINT));
-				FinalStatusParameters->FinalBSPStatCount = BSPStatCount;
-				TShaderMapRef<FFinalStatusCS> FinalStatusShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("MB.FinalStatus"),
-					FinalStatusShader, FinalStatusParameters, FIntVector(1, 1, 1));
-				AddEnqueueCopyPass(GraphBuilder, FinalStatusReadback, FinalStatusBuf, FinalStatusBytes);
-				UE_LOG(LogTemp, Log, TEXT("[MeshBoolean:%s] [GPU-arr] scratchBatch=%d batches=%d limits=%d cuts/%d verts/%d cells/%d outputsPerSource outCap=%d (%.0fx源三角, %.0fMiB, 硬上限 %d/1536MiB)"),
-					*GetName(), ScratchBatchSize, FMath::DivideAndRoundUp(int32(TriangleCapacity), ScratchBatchSize),
-					BSPMaxCuts, BSPMaxVerts, BSPMaxCells, BSPMaxOutputTrianglesPerSource, OutCapLocal,
-					double(OutCapLocal) / FMath::Max(1.0, double(TriangleCapacity)),
-					double(uint64(OutCapLocal) * 40ull) / (1024.0 * 1024.0),
-					ArrangementOutputTriangleCapacity);
-				OutSubTriCap = OutCapLocal;
-				GraphBuilder.QueueBufferExtraction(ArrOutSoup, &ArrOutSoupExtracted, ERHIAccess::CopySrc);
-				GraphBuilder.QueueBufferExtraction(ArrOutSrc, &ArrOutSourceExtracted, ERHIAccess::CopySrc);
-			}
+			const uint32 TriangleCapacity = uint32(Pipeline.SourceTriangleCapacity);
+			VertexCapacity = Pipeline.SourceVertexCapacity;
+			CutCapacity = Pipeline.CutCapacity;
+			SoupUVChannels = Pipeline.SourceUVChannels;
+			OutSubTriCap = Pipeline.FragmentCapacity;
 
 			ExecuteSingleGraph();
 			bHasGPUOutput = true;
@@ -781,34 +1117,34 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 				UVCapacity = int32(SourceVertexCount) * SoupUVChannels;
 				UVBytes = SourceVertexCount * uint32(SoupUVChannels) * sizeof(FVector2f);
 				CornerAttributeBytes = SourceVertexCount * sizeof(FVector4f);
-				if (bHasGPUOutput && VertexBytes > 0u && SourceVerticesExtracted) VertexReadback->EnqueueCopy(RHICmdList, SourceVerticesExtracted->GetRHI(), VertexBytes);
+				if (bHasGPUOutput && VertexBytes > 0u && Pipeline.SourceVertices) VertexReadback->EnqueueCopy(RHICmdList, Pipeline.SourceVertices->GetRHI(), VertexBytes);
 				else bHasGPUOutput = false;
-				if (bHasGPUOutput && NormalBytes > 0u && SourceNormalsExtracted) NormalReadback->EnqueueCopy(RHICmdList, SourceNormalsExtracted->GetRHI(), NormalBytes);
-				if (bHasGPUOutput && MaterialBytes > 0u && SourceMaterialsExtracted) MaterialReadback->EnqueueCopy(RHICmdList, SourceMaterialsExtracted->GetRHI(), MaterialBytes);
-				if (bHasGPUOutput && UVBytes > 0u && SourceUVsExtracted) UVReadback->EnqueueCopy(RHICmdList, SourceUVsExtracted->GetRHI(), UVBytes);
-				if (bHasGPUOutput && CornerAttributeBytes > 0u && SourceColorsExtracted) ColorReadback->EnqueueCopy(RHICmdList, SourceColorsExtracted->GetRHI(), CornerAttributeBytes);
-				if (bHasGPUOutput && bNeedSourceTangents && CornerAttributeBytes > 0u && SourceTangentsExtracted) TangentReadback->EnqueueCopy(RHICmdList, SourceTangentsExtracted->GetRHI(), CornerAttributeBytes);
-				if (bHasGPUOutput && bNeedSourceTangents && CornerAttributeBytes > 0u && SourceBiTangentsExtracted) BiTangentReadback->EnqueueCopy(RHICmdList, SourceBiTangentsExtracted->GetRHI(), CornerAttributeBytes);
+				if (bHasGPUOutput && NormalBytes > 0u && Pipeline.SourceNormals) NormalReadback->EnqueueCopy(RHICmdList, Pipeline.SourceNormals->GetRHI(), NormalBytes);
+				if (bHasGPUOutput && MaterialBytes > 0u && Pipeline.SourceMaterialIds) MaterialReadback->EnqueueCopy(RHICmdList, Pipeline.SourceMaterialIds->GetRHI(), MaterialBytes);
+				if (bHasGPUOutput && UVBytes > 0u && Pipeline.SourceUVs) UVReadback->EnqueueCopy(RHICmdList, Pipeline.SourceUVs->GetRHI(), UVBytes);
+				if (bHasGPUOutput && CornerAttributeBytes > 0u && Pipeline.SourceColors) ColorReadback->EnqueueCopy(RHICmdList, Pipeline.SourceColors->GetRHI(), CornerAttributeBytes);
+				if (bHasGPUOutput && bNeedSourceTangents && CornerAttributeBytes > 0u && Pipeline.SourceTangents) TangentReadback->EnqueueCopy(RHICmdList, Pipeline.SourceTangents->GetRHI(), CornerAttributeBytes);
+				if (bHasGPUOutput && bNeedSourceTangents && CornerAttributeBytes > 0u && Pipeline.SourceBiTangents) BiTangentReadback->EnqueueCopy(RHICmdList, Pipeline.SourceBiTangents->GetRHI(), CornerAttributeBytes);
 
 				const uint32 PrefixCount = GPUArrOutOverflow == 0u
 					? FMath::Min(GPUArrOutCount, uint32(FMath::Max(0, OutSubTriCap)))
 					: 0u;
 				OutSoupBytes = PrefixCount * 3u * sizeof(FVector3f);
 				OutSrcBytes = PrefixCount * sizeof(uint32);
-				WeldRepresentativeBytes = OutputWeldDistanceV > UE_SMALL_NUMBER
+				WeldRepresentativeBytes = PipelineConfig.WeldDistance > UE_SMALL_NUMBER
 					? PrefixCount * 3u * sizeof(uint32)
 					: 0u;
-				if (bHasGPUOutput && OutSoupBytes > 0u && ArrOutSoupExtracted && ArrOutSourceExtracted)
+				if (bHasGPUOutput && OutSoupBytes > 0u && Pipeline.FragmentSoup && Pipeline.FragmentSource)
 				{
-					OutSoupReadback->EnqueueCopy(RHICmdList, ArrOutSoupExtracted->GetRHI(), OutSoupBytes);
-					OutSourceReadback->EnqueueCopy(RHICmdList, ArrOutSourceExtracted->GetRHI(), OutSrcBytes);
+					OutSoupReadback->EnqueueCopy(RHICmdList, Pipeline.FragmentSoup->GetRHI(), OutSoupBytes);
+					OutSourceReadback->EnqueueCopy(RHICmdList, Pipeline.FragmentSource->GetRHI(), OutSrcBytes);
 				}
 				else if (bHasGPUOutput && OutSoupBytes > 0u) bHasGPUOutput = false;
 				if (bHasGPUOutput && WeldRepresentativeBytes > 0u
-					&& WeldRepresentativeReadback && WeldRepresentativeExtracted)
+					&& WeldRepresentativeReadback && Pipeline.WeldRepresentatives)
 				{
 					WeldRepresentativeReadback->EnqueueCopy(
-						RHICmdList, WeldRepresentativeExtracted->GetRHI(), WeldRepresentativeBytes);
+						RHICmdList, Pipeline.WeldRepresentatives->GetRHI(), WeldRepresentativeBytes);
 				}
 				else if (bHasGPUOutput && WeldRepresentativeBytes > 0u) bHasGPUOutput = false;
 			}
@@ -826,7 +1162,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 		delete ColorReadback; delete TangentReadback; delete BiTangentReadback;
 		delete OutSoupReadback; delete OutSourceReadback;
 		delete WeldRepresentativeReadback;
-		return nullptr;
+		return false;
 	}
 	delete FinalStatusReadback;
 	FinalStatusReadback = nullptr;
@@ -979,7 +1315,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 
 	if (!bReadbackOk)
 	{
-		return nullptr;
+		return false;
 	}
 
 	const int32 MaxTriCapacity = VertexCapacity / 3;
@@ -995,24 +1331,51 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 	{
 		UE_LOG(LogTemp, Error, TEXT("[MeshBoolean:%s] Arrangement aborted: incomplete tri-tri cut input (cutOverflow=%u segOverflow=%u)"),
 			*GetName(), CutOverflow, StatsData[3]);
-		return nullptr;
+		return false;
 	}
 	if (bArrangementOverflow)
 	{
 		if (GOutCnt[1] > 0u || GOutCnt[0] > uint32(FMath::Max(0, OutSubTriCap)))
-			UE_LOG(LogTemp, Error, TEXT("[MeshBoolean:%s] 子三角输出超出容量（需要 %u > 容量 %d）。把 ArrangementOutputTrianglesPerSource 调大（当前 %d）后重试。"),
+			UE_LOG(LogTemp, Error, TEXT("[MeshBoolean:%s] 子三角输出超出容量（需要 %u > 容量 %d）。把 Options.ArrangementOutputTrianglesPerSource 调大（当前 %d）后重试。"),
 				*GetName(), GOutCnt[0], OutSubTriCap, OutputTrianglesPerSourceV);
 		UE_LOG(LogTemp, Error, TEXT("[MeshBoolean:%s] GPU arrangement aborted: structural/global failure (outOverflow=%u scratchOverflow=%u partialSplitCommit=%u areaMismatch=%u maxSeg=%u maxVerts=%u maxCells=%u maxOutputPerSource=%u)"),
 			*GetName(), GOutCnt[1], GStat[BSPStatScratchOverflow], GStat[BSPStatPartialSplitCommit],
 			GStat[BSPStatAreaMismatch], GStat[BSPStatMaxSegments], GStat[BSPStatMaxVertices],
 			GStat[BSPStatMaxCells], GStat[BSPStatMaxOutputTrianglesPerSource]);
-		return nullptr;
+		return false;
 	}
 	{
 		const double GPUCopyMiB = double(uint64(OutSoupBytes) + uint64(OutSrcBytes)) / (1024.0 * 1024.0);
 		const double CPUCopyMiB = double(uint64(GOutSoup.Num()) * sizeof(FVector3f) + uint64(GOutSrc.Num()) * sizeof(uint32)) / (1024.0 * 1024.0);
 		UE_LOG(LogTemp, Log, TEXT("[MeshBoolean:%s] arrangement readback cap=%d actual=%u gpuCopy=%.1fMiB cpuPrefix=%.1fMiB"),
 			*GetName(), OutSubTriCap, GOutCnt[0], GPUCopyMiB, CPUCopyMiB);
+	}
+
+	// 这一步之后的东西全部是「输出重建」，输入已经定死。要 capture 的调用方在这里拿走那份
+	// 输入：下面那些 CPU 数组是这些 buffer 的回读，同一份字节的两种表示。管线本身不是可
+	// 复现的（源 soup 用原子 bump 分配槽位，见 FCSMeshBooleanCapture 的注释），所以「跑两遍
+	// 各自重建再比」比的是两套不同的碎片；要比重建，两边必须吃同一份 capture。
+	if (OutCapture)
+	{
+		OutCapture->FragmentSoup = Pipeline.FragmentSoup;
+		OutCapture->FragmentSource = Pipeline.FragmentSource;
+		OutCapture->SourceVertices = Pipeline.SourceVertices;
+		OutCapture->SourceNormals = Pipeline.SourceNormals;
+		OutCapture->SourceUVs = Pipeline.SourceUVs;
+		OutCapture->SourceColors = Pipeline.SourceColors;
+		OutCapture->SourceTangents = Pipeline.SourceTangents;
+		OutCapture->SourceBiTangents = Pipeline.SourceBiTangents;
+		OutCapture->SourceMaterialIds = Pipeline.SourceMaterialIds;
+		OutCapture->MaterialRegistry.Reset(Prepared.GetMaterialRegistryNum());
+		for (int32 Index = 0; Index < Prepared.GetMaterialRegistryNum(); ++Index)
+			OutCapture->MaterialRegistry.Add(Prepared.GetMaterialByRegistryIndex(Index));
+		OutCapture->SourceTriangleCount = uint32(FMath::Max(0, TriCount));
+		// 与下面 emit 循环遍历的范围完全一致（OutCount = clamp(GOutCnt[0], 0, OutSubTriCap)）。
+		OutCapture->FragmentCount = uint32(FMath::Clamp<int32>(int32(GOutCnt[0]), 0, OutSubTriCap));
+		OutCapture->OutputTriangleCount = FinalStatusData[FinalStatusKeptCount];
+		OutCapture->SourceUVChannels = SoupUVChannels;
+		OutCapture->bStageB = bRunStageB;
+		OutCapture->QueryBox = QueryBox;
 	}
 
 	// [丢面诊断] 提取阶段：QueryBox 是否框住网格 + 实际写入 soup 的三角数 vs 容量。
@@ -1047,7 +1410,15 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 		const int32 Idx = Tri * 3 + K;
 		if (!NormalData.IsValidIndex(Idx)) return FVector3f::UnitZ();
 		const FVector4f& N = NormalData[Idx];
-		return FVector3f(N.X, N.Y, N.Z).GetSafeNormal(UE_SMALL_NUMBER, FVector3f::UnitZ());
+		// 判据写成 !(SquareSum > tol) 而不是直接调 GetSafeNormal：UE 的实现里 NaN 让
+		// 「SquareSum < Tolerance」为假，于是 NaN 被乘进结果继续传播；而 GPU 侧的
+		// MBOutSafeNormal 是刻意写成 !(x > t) 好让 NaN 也走 fallback。Nanite 提取
+		// （AppendSourceTrianglesCS）对源法线只做裸 normalize()，零长度的授权法线会变成
+		// NaN 写进 soup —— 两侧就在这里分叉，而 parity 用的干净数据永远照不到。
+		const FVector3f V(N.X, N.Y, N.Z);
+		const float SquareSum = V.SizeSquared();
+		if (!(SquareSum > UE_SMALL_NUMBER)) return FVector3f::UnitZ();
+		return V * FMath::InvSqrt(SquareSum);
 	};
 	// 把世界点 P（位于源三角 Tri 平面内/近旁）用重心坐标插值出 UV。重心 clamp[0,1]+归一化保数值稳。
 	// arrangement 生成的每个输出顶点都落在其源三角内 → 直通顶点自然得到 (1,0,0)/(0,1,0)/(0,0,1) 即直接拷贝源 UV。
@@ -1100,8 +1471,8 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 		const double len = n.Length();
 		SrcN[t] = (len > 1e-12) ? (n / len) : FVector3d(0.0, 0.0, 1.0);
 	}
-	const double SinSq = FMath::Square(FMath::Sin(FMath::DegreesToRadians(FMath::Clamp(CoplanarAngleDegrees, 0.0f, 45.0f))));
-	const double OffEps = FMath::Max(0.0f, CoplanarOffsetEpsilon);
+	const double SinSq = FMath::Square(FMath::Sin(FMath::DegreesToRadians(FMath::Clamp(Options.CoplanarAngleDegrees, 0.0f, 45.0f))));
+	const double OffEps = FMath::Max(0.0f, Options.CoplanarOffsetEpsilon);
 
 	TArray<FVector3f> OutputCorners;
 	TArray<int32> OutputSources;
@@ -1165,7 +1536,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 			GStat[BSPStatMaxOutputTrianglesPerSource], GOutCnt[1]);
 	}
 
-	if (OutputSources.IsEmpty()) return nullptr;
+	if (OutputSources.IsEmpty()) return false;
 
 	// 诊断：统计 GPU arrangement 后仍共面重叠的输出三角对。
 	int32 OverlapSame = 0, OverlapCross = 0;
@@ -1214,7 +1585,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 		*GetName(), bRunStageB ? 1 : 0, StageBWindingThresholdV,
 		StageBExpansionDistanceV, GOutCnt[0], OutputSources.Num());
 
-	const float EffectiveWeldDistance = FMath::Max(0.0f, VertexWeldDistance);
+	const float EffectiveWeldDistance = FMath::Max(0.0f, Options.VertexWeldDistance);
 	const FVector4f DefaultColor(1.0f, 1.0f, 1.0f, 1.0f);
 	TArray<FVector3f> FinalPositions = OutputCorners;
 	TArray<uint32> FinalIndices;
@@ -1314,7 +1685,7 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 		}
 	}
 
-	if (FinalSources.IsEmpty()) return nullptr;
+	if (FinalSources.IsEmpty()) return false;
 
 	// Stage 14：焊接可能改变角点位置；按源面法线恢复每个保留碎片的绕序，确保属性与索引一致。
 	FMeshBooleanOrientationStats WorldOrientationStats;
@@ -1355,7 +1726,6 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 		WorldOrientationStats.MissingSources, FinalSources.Num());
 
 	// Stage 15：插值或重建法线、切线、UV、颜色和材质，组装最终 Static Mesh 数据。
-	FCSGpuMeshCPUData StaticMeshData;
 	StaticMeshData.Positions = MoveTemp(FinalPositions);
 	StaticMeshData.Indices = MoveTemp(FinalIndices);
 	StaticMeshData.Normals.SetNumUninitialized(StaticMeshData.Indices.Num());
@@ -1480,7 +1850,6 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 			}
 		});
 	}
-	TArray<UMaterialInterface*> OutputMaterialSlots;
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_MaterialAttributeBuild);
 		TMap<int32, int32> RegistryToSlot;
@@ -1528,43 +1897,313 @@ UStaticMesh* AComputeShaderMeshBoolean::RunBooleanInternal(ECSMeshBooleanOp Op)
 		else LogMaterialWarnings();
 	}
 
-	// 输出是 StaticMesh 资产，与 DynamicMesh 组件无关，直接用 actor 变换把世界空间结果烘到局部空间。
-	const FTransform OutputTransform = GetActorTransform();
-	// 统一走公用转换入口：属性装配与落盘的策略（绕序、退化面阈值、空槽兜底默认材质）都在
-	// CSGpuMeshConvert 里，不再由各产出路径各写一份。
-	// 结果落盘为 level 同级 AutoResult 文件夹（/<level 目录>/AutoResult/SM_<actor>_<稳定编号>），建完标脏，
-	// 由用户自行 Save All 决定是否写盘。名字里不带每次运行的时间戳（命名规则与 CSSW 烘焙一致），
-	// 同一个 actor 反复运行始终写同一个资产，直接覆盖旧模型，引用它的组件仍指向同一份资产。
-	// 非编辑器构建没有资产系统，公用入口内部退回 transient。
-	FCSGpuMeshConvertOptions ConvertOptions;
-	ConvertOptions.TargetTransform = OutputTransform;
-	ConvertOptions.bBakeToLocalSpace = true;
+	return true;
+}
 
-	FCSGpuMeshAssetOptions AssetOptions;
-	// 布尔结果动辄百万级三角，正是 Nanite 的适用场景：交给它做 LOD 与剔除，
-	// 省掉手工 LOD，渲染开销与三角数基本脱钩。
-	AssetOptions.bEnableNanite = bOutputNanite;
-#if WITH_EDITOR
-	AssetOptions.AssetPath = BuildResultAssetPath();
-#else
-	AssetOptions.bTransient = true;
-#endif
-	OutputStaticMesh = UCSGpuMeshComponent::BuildStaticMesh(
-		this, this, StaticMeshData, OutputMaterialSlots, ConvertOptions, AssetOptions);
-	if (!OutputStaticMesh && !AssetOptions.bTransient)
+bool AComputeShaderMeshBoolean::RunBooleanToGpuMesh(
+	ECSMeshBooleanOp Op,
+	const FCSMeshBooleanOptions& Options,
+	UCSMesh* Target)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_RunBooleanToGpuMesh);
+	if (!Target) return false;
+
+	UWorld* World = GetWorld();
+	if (!World) return false;
+
+	const FBox QueryBox = GetGeneratorBoundsWorldBox();
+	if (!QueryBox.IsValid) return false;
+
+	const bool bRunStageB = (Op != ECSMeshBooleanOp::ArrangementOnly);
+	FMeshBooleanPipelineConfig PipelineConfig = MeshBoolean_BuildPipelineConfig(Options, QueryBox, bRunStageB);
+	// 常驻容量是 CPU 侧的分配，而输出三角数只有 GPU 知道，所以要多跑一个 accept 计数核。
+	PipelineConfig.bCountKeptFragments = true;
+
+	// 焊接没有移植。CPU 版的焊接后处理除了按代表元压缩顶点，还要剔退化面和**重复三角**，
+	// 而后者的判据是「同一组代表元里保留 fragment 序号最小的那片」——在 GPU 上要一张全局
+	// 哈希表才能复现。给出一条结果与 CPU 版不同的 GPU 路径，比慢一点糟得多：不一致是永久的，
+	// 而且没有任何症状会指向这里。所以显式拒绝，由调用方回退。
+	if (PipelineConfig.WeldDistance > UE_SMALL_NUMBER)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[MeshBoolean:%s] result 资产保存失败，回退为 transient StaticMesh。"), *GetName());
-		AssetOptions.bTransient = true;
-		OutputStaticMesh = UCSGpuMeshComponent::BuildStaticMesh(
-			this, this, StaticMeshData, OutputMaterialSlots, ConvertOptions, AssetOptions);
-	}
-	if (!OutputStaticMesh)
-	{
-		UE_LOG(LogTemp, Error, TEXT("[MeshBoolean:%s] shared GPU-mesh StaticMesh conversion failed (vertices=%d indices=%d triangles=%d)."),
-			*GetName(), StaticMeshData.Positions.Num(), StaticMeshData.Indices.Num(), FinalSources.Num());
+		UE_LOG(LogTemp, Log, TEXT("[MeshBoolean:%s] GPU 直写路径不支持 VertexWeldDistance=%.4f（重复三角剔除未移植），回退 CPU 快照路径。"),
+			*GetName(), PipelineConfig.WeldDistance);
+		return false;
 	}
 
-	return OutputStaticMesh;
+	// VRAM pre-flight：与 CPU 路径同一套成本模型。常驻流之外的临时 buffer 两条路径完全一样，
+	// 差别只在结果去哪，所以这里的上限也必须一样，否则同一个场景一条能跑一条不能。
+	{
+		CSGpuMemoryBudget::FTriangleSoupCostModel Cost;
+		Cost.CutSegmentsPerTriangle = PipelineConfig.CutSegmentsPerTriangle;
+		Cost.OutputTrianglesPerSource = PipelineConfig.OutputTrianglesPerSource;
+		Cost.bBuildLBVH = true;
+		Cost.bBuildWindingField = bRunStageB;
+		Cost.bWeldOutput = false;
+		Cost.bSourceNormals = true;
+		Cost.bSourceTangents = true;
+		if (!ConfirmGpuMemoryBudgetForBoxScene(TEXT("Mesh Boolean (GPU mesh)"), QueryBox, Cost, Options.bReadLandscape)) return false;
+	}
+
+	FCSBoxScenePreparedData Prepared;
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_MeshDescriptionExtraction);
+		FCSBoxSceneCollectOptions CollectOptions = MakeBoxSceneCollectOptions(QueryBox);
+		CollectOptions.MaxTriangles = FMath::Max(1, Options.MaxSourceTriangles);
+		CollectOptions.bIncludeLandscape = Options.bReadLandscape;
+		CollectOptions.bPreserveSourceMaterialSlots = Options.bPreserveSourceMaterialSlots;
+		// Boolean 不做参照点距离过滤：源 soup 必须完整，否则被裁掉的邻接三角会让 winding 场判错。
+		Prepared = CSBoxSceneCollection::CollectBoxSceneTriangles(World, CollectOptions);
+	}
+	if (!Prepared.IsValid() || !Prepared.HasAnyTriangles()) return false;
+
+	// ---- 第一张图：整条布尔管线；回来的只有状态块 ----
+	FRHIGPUBufferReadback* FinalStatusReadback = new FRHIGPUBufferReadback(TEXT("MeshBoolean_GpuMeshStatusReadback"));
+	const uint32 FinalStatusBytes = sizeof(uint32) * uint32(FinalStatusCount);
+	TArray<uint32> FinalStatusData;
+	FinalStatusData.SetNumZeroed(FinalStatusCount);
+
+	FMeshBooleanPipelineBuffers Pipeline;
+	const FString PipelineDebugName = GetName();
+	bool bStatusRead = false;
+
+	ENQUEUE_RENDER_COMMAND(MeshBooleanToGpuMesh)(
+		[Prepared, PipelineConfig, PipelineDebugName, FinalStatusReadback, FinalStatusBytes,
+		 &FinalStatusData, &Pipeline, &bStatusRead](FRHICommandListImmediate& RHICmdList)
+		{
+			FRDGBuilder GraphBuilder(RHICmdList);
+			MeshBoolean_AddPipelineToRDG(GraphBuilder, RHICmdList, Prepared, PipelineConfig,
+				PipelineDebugName, FinalStatusReadback, FinalStatusBytes, Pipeline);
+			GraphBuilder.Execute();
+			if (!Pipeline.bGraphBuilt) return;
+
+			// 本管线唯一一次 CPU 等 GPU。读回来的是 27 个 uint，不是网格：常驻容量是 CPU 侧的
+			// 分配，输出三角数又只有 GPU 知道，这一步换不掉。属性一个字节都没下来。
+			if (!FinalStatusReadback->IsReady()) RHICmdList.SubmitAndBlockUntilGPUIdle();
+			if (const uint32* Ptr = static_cast<const uint32*>(FinalStatusReadback->Lock(FinalStatusBytes)))
+			{
+				FMemory::Memcpy(FinalStatusData.GetData(), Ptr, FinalStatusBytes);
+				FinalStatusReadback->Unlock();
+				bStatusRead = true;
+			}
+		});
+
+	FlushRenderingCommands();
+	delete FinalStatusReadback;
+	FinalStatusReadback = nullptr;
+
+	if (!Pipeline.bGraphBuilt)
+	{
+		if (Pipeline.bCapacityUnsupported)
+			UE_LOG(LogTemp, Error, TEXT("[MeshBoolean:%s] GPU arrangement aborted: source or output buffers exceed the supported project/RHI limits"), *GetName());
+		return false;
+	}
+	if (!bStatusRead) return false;
+
+	const uint32 SoupTriangleCount = FMath::Min(
+		FinalStatusData[FinalStatusSoupCount], uint32(FMath::Max(0, Pipeline.SourceTriangleCapacity)));
+	const uint32 FragmentCount = FMath::Min(
+		FinalStatusData[FinalStatusOutputCount], uint32(FMath::Max(0, Pipeline.FragmentCapacity)));
+	const uint32 KeptTriangleCount = FinalStatusData[FinalStatusKeptCount];
+
+	// 中止判据与 CPU 路径逐条一致：切段不全或结构性溢出时结果就是错的，宁可不产出。
+	{
+		const uint32 CutOverflow = FinalStatusData[FinalStatusCutOverflow];
+		const uint32 SegOverflow = FinalStatusData[FinalStatusTriStatsBase + 3];
+		if (CutOverflow > 0u || SegOverflow > 0u)
+		{
+			UE_LOG(LogTemp, Error, TEXT("[MeshBoolean:%s] Arrangement aborted: incomplete tri-tri cut input (cutOverflow=%u segOverflow=%u)"),
+				*GetName(), CutOverflow, SegOverflow);
+			return false;
+		}
+		const uint32 OutputOverflow = FinalStatusData[FinalStatusOutputOverflow];
+		const uint32 ScratchOverflow = FinalStatusData[FinalStatusBSPStatsBase + BSPStatScratchOverflow];
+		const uint32 PartialSplitCommit = FinalStatusData[FinalStatusBSPStatsBase + BSPStatPartialSplitCommit];
+		const uint32 AreaMismatch = FinalStatusData[FinalStatusBSPStatsBase + BSPStatAreaMismatch];
+		if (OutputOverflow > 0u || FinalStatusData[FinalStatusOutputCount] > uint32(FMath::Max(0, Pipeline.FragmentCapacity))
+			|| ScratchOverflow > 0u || PartialSplitCommit > 0u || AreaMismatch > 0u)
+		{
+			if (OutputOverflow > 0u || FinalStatusData[FinalStatusOutputCount] > uint32(FMath::Max(0, Pipeline.FragmentCapacity)))
+				UE_LOG(LogTemp, Error, TEXT("[MeshBoolean:%s] 子三角输出超出容量（需要 %u > 容量 %d）。把 Options.ArrangementOutputTrianglesPerSource 调大（当前 %d）后重试。"),
+					*GetName(), FinalStatusData[FinalStatusOutputCount], Pipeline.FragmentCapacity,
+					PipelineConfig.OutputTrianglesPerSource);
+			UE_LOG(LogTemp, Error, TEXT("[MeshBoolean:%s] GPU arrangement aborted: structural/global failure (outOverflow=%u scratchOverflow=%u partialSplitCommit=%u areaMismatch=%u)"),
+				*GetName(), OutputOverflow, ScratchOverflow, PartialSplitCommit, AreaMismatch);
+			return false;
+		}
+	}
+
+	if (SoupTriangleCount == 0u || KeptTriangleCount == 0u)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[MeshBoolean:%s] GPU 直写路径没有输出三角（源三角=%u fragment=%u）。"),
+			*GetName(), SoupTriangleCount, FragmentCount);
+		return false;
+	}
+
+	FCSMeshBooleanCapture Capture;
+	Capture.FragmentSoup = Pipeline.FragmentSoup;
+	Capture.FragmentSource = Pipeline.FragmentSource;
+	Capture.SourceVertices = Pipeline.SourceVertices;
+	Capture.SourceNormals = Pipeline.SourceNormals;
+	Capture.SourceUVs = Pipeline.SourceUVs;
+	Capture.SourceColors = Pipeline.SourceColors;
+	Capture.SourceTangents = Pipeline.SourceTangents;
+	Capture.SourceBiTangents = Pipeline.SourceBiTangents;
+	Capture.SourceMaterialIds = Pipeline.SourceMaterialIds;
+	for (int32 Index = 0; Index < Prepared.GetMaterialRegistryNum(); ++Index)
+		Capture.MaterialRegistry.Add(Prepared.GetMaterialByRegistryIndex(Index));
+	Capture.SourceTriangleCount = SoupTriangleCount;
+	Capture.FragmentCount = FragmentCount;
+	Capture.OutputTriangleCount = KeptTriangleCount;
+	Capture.SourceUVChannels = FMath::Max(1, Pipeline.SourceUVChannels);
+	Capture.bStageB = bRunStageB;
+	Capture.QueryBox = QueryBox;
+
+	// 重建自己会打日志（它也服务于外部传进来的 capture），这里不重复。
+	return RebuildGpuMeshFromCapture(Capture, Target);
+}
+
+bool FCSMeshBooleanCapture::IsValid() const
+{
+	return FragmentSoup.IsValid() && FragmentSource.IsValid() && SourceVertices.IsValid()
+		&& SourceNormals.IsValid() && SourceUVs.IsValid() && SourceColors.IsValid()
+		&& SourceTangents.IsValid() && SourceBiTangents.IsValid() && SourceMaterialIds.IsValid()
+		&& SourceTriangleCount > 0u && FragmentCount > 0u && OutputTriangleCount > 0u;
+}
+
+bool AComputeShaderMeshBoolean::RebuildGpuMeshFromCapture(const FCSMeshBooleanCapture& Capture, UCSMesh* Target)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(MeshBoolean_RebuildGpuMeshFromCapture);
+	if (!Target || !Capture.IsValid()) return false;
+	if (!IsInGameThread()) return false;
+
+	// 材质表：registry 原样铺开，末尾追加一个空槽。
+	// 常驻流里的 id 是 UCSMesh::Materials 的槽位下标，所以「无材质」必须有自己的槽 —— 靠
+	// 「越界即槽 0」的兜底会把无材质的三角和 registry 0 的三角画成同一个材质，而 CPU 路径
+	// 给它们各自的槽。槽位编号与 CPU 路径不同（那边按首次使用顺序去重），每个三角解析到的
+	// 材质相同，parity 测试比的也是后者。
+	const int32 MaterialRegistryNum = Capture.MaterialRegistry.Num();
+	Target->Materials.Reset(MaterialRegistryNum + 1);
+	for (UMaterialInterface* Material : Capture.MaterialRegistry) Target->Materials.Add(Material);
+	Target->Materials.Add(nullptr);
+	const uint32 NoMaterialSlot = uint32(MaterialRegistryNum);
+
+	const uint32 SoupTriangleCount = Capture.SourceTriangleCount;
+	const uint32 FragmentCount = Capture.FragmentCount;
+	const uint32 KeptTriangleCount = Capture.OutputTriangleCount;
+	const FBox QueryBox = Capture.QueryBox;
+	const bool bRunStageB = Capture.bStageB;
+
+	// 输出是逐角点 soup（索引恒等），容量正好是 accept 计数核数出来的三角数 ×3。
+	const int32 OutputCornerCount = int32(KeptTriangleCount) * 3;
+	if (!Target->EnsureCapacitySync(OutputCornerCount, OutputCornerCount))
+	{
+		UE_LOG(LogTemp, Error, TEXT("[MeshBoolean:%s] GPU 直写路径无法为 %d 个角点分配常驻容量。"),
+			*GetName(), OutputCornerCount);
+		return false;
+	}
+
+	const int32 SourceUVChannels = FMath::Max(1, Capture.SourceUVChannels);
+	bool bEmitted = false;
+	const bool bEdited = Target->EditMeshSync(
+		[&Capture, &bEmitted, FragmentCount, SoupTriangleCount, SourceUVChannels,
+		 MaterialRegistryNum, NoMaterialSlot, bRunStageB, QueryBox](FCSMeshEditContext& Context)
+	{
+		FRDGBuilder& GraphBuilder = Context.GraphBuilder;
+		if (!Context.Positions() || !Context.Tangents() || !Context.TexCoords() || !Context.Colors()
+			|| !Context.Indices() || !Context.MaterialIds() || !Context.Counters() || !Context.IndirectArgs()) return;
+		if (!Capture.FragmentSoup || !Capture.FragmentSource || !Capture.SourceVertices
+			|| !Capture.SourceNormals || !Capture.SourceUVs || !Capture.SourceColors
+			|| !Capture.SourceTangents || !Capture.SourceBiTangents || !Capture.SourceMaterialIds) return;
+
+		// 上一张图产出的常驻 buffer 在这张图里重新注册。常驻流本身由 EditMeshSync 注册并在
+		// 结束时恢复访问状态；这些是本次编辑自带的输入，归本函数管。
+		FRDGBufferRef FragmentSoup = GraphBuilder.RegisterExternalBuffer(Capture.FragmentSoup);
+		FRDGBufferRef FragmentSource = GraphBuilder.RegisterExternalBuffer(Capture.FragmentSource);
+		FRDGBufferRef SourceVertices = GraphBuilder.RegisterExternalBuffer(Capture.SourceVertices);
+		FRDGBufferRef SourceNormals = GraphBuilder.RegisterExternalBuffer(Capture.SourceNormals);
+		FRDGBufferRef SourceUVs = GraphBuilder.RegisterExternalBuffer(Capture.SourceUVs);
+		FRDGBufferRef SourceColors = GraphBuilder.RegisterExternalBuffer(Capture.SourceColors);
+		FRDGBufferRef SourceTangents = GraphBuilder.RegisterExternalBuffer(Capture.SourceTangents);
+		FRDGBufferRef SourceBiTangents = GraphBuilder.RegisterExternalBuffer(Capture.SourceBiTangents);
+		FRDGBufferRef SourceMaterialIds = GraphBuilder.RegisterExternalBuffer(Capture.SourceMaterialIds);
+
+		FRDGBufferRef TriangleCounterBuf; FRDGBufferUAVRef TriangleCounterUAV; FRDGBufferSRVRef TriangleCounterSRV;
+		CSHelper::CreateClearedTypedBuffer(GraphBuilder, TriangleCounterBuf, TriangleCounterUAV, TriangleCounterSRV,
+			sizeof(uint32), 2, PF_R32_UINT, TEXT("MB.Out.TriangleCounter"), 0u);
+
+		FRDGBufferUAVRef MaterialIdUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Context.MaterialIds(), PF_R32_UINT));
+		// 材质 id 流整条先清成「无材质」槽。发射核会覆写每个活三角自己那一格，可常驻 buffer
+		// 来自池子，容量尾部留着上一位租客的字节 —— 计数一变大（下一次布尔、或别的算子），
+		// 那些字节就成了「材质槽」，而没有任何症状会指向这里。
+		AddClearUAVPass(GraphBuilder, MaterialIdUAV, NoMaterialSlot);
+
+		{
+			FMeshBooleanEmitToMeshCS::FParameters* P = GraphBuilder.AllocParameters<FMeshBooleanEmitToMeshCS::FParameters>();
+			P->MBOutFragmentSoup = GraphBuilder.CreateSRV(FragmentSoup);
+			P->MBOutFragmentSource = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(FragmentSource, PF_R32_UINT));
+			P->MBOutSourceVertices = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SourceVertices, PF_A32B32G32R32F));
+			P->MBOutSourceNormals = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SourceNormals, PF_A32B32G32R32F));
+			P->MBOutSourceUVs = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SourceUVs, PF_G32R32F));
+			P->MBOutSourceColors = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SourceColors, PF_A32B32G32R32F));
+			P->MBOutSourceTangents = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SourceTangents, PF_A32B32G32R32F));
+			P->MBOutSourceBiTangents = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SourceBiTangents, PF_A32B32G32R32F));
+			P->MBOutSourceMaterialIds = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SourceMaterialIds, PF_R32_UINT));
+			P->RW_MBOutPositions = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Context.Positions(), PF_R32_FLOAT));
+			P->RW_MBOutTangents = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Context.Tangents(), PF_R32_UINT));
+			P->RW_MBOutTexCoords = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Context.TexCoords(), PF_R32_FLOAT));
+			P->RW_MBOutColors = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Context.Colors(), PF_R32_UINT));
+			P->RW_MBOutIndices = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Context.Indices(), PF_R32_UINT));
+			P->RW_MBOutMaterialIds = MaterialIdUAV;
+			P->RW_MBOutTriangleCounter = TriangleCounterUAV;
+			P->MBOutFragmentCount = FragmentCount;
+			P->MBOutSourceTriangleCount = SoupTriangleCount;
+			P->MBOutSourceUVChannels = uint32(SourceUVChannels);
+			P->MBOutMaterialRegistryCount = uint32(MaterialRegistryNum);
+			P->MBOutNoMaterialSlot = NoMaterialSlot;
+			P->MBOutVertexCapacity = Context.Resident.VertexCapacity;
+			P->MBOutIndexCapacity = Context.Resident.IndexCapacity;
+			P->MBOutStageB = bRunStageB ? 1u : 0u;
+
+			TShaderMapRef<FMeshBooleanEmitToMeshCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("MB.Out.EmitToMesh"), Shader, P,
+				FComputeShaderUtils::GetGroupCountWrapped(int32(FragmentCount), 64));
+		}
+		{
+			// 三角数变了、顺序也变了：section 表描述的是已经不存在的那套排布，必须一起作废。
+			UCSMeshOps::InvalidateSections(Context);
+
+			FMeshBooleanFinalizeMeshCS::FParameters* P = GraphBuilder.AllocParameters<FMeshBooleanFinalizeMeshCS::FParameters>();
+			P->MBOutTriangleCounterSRV = TriangleCounterSRV;
+			P->RW_MBOutMeshCounters = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Context.Counters(), PF_R32_UINT));
+			P->RW_MBOutIndirectArgs = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Context.IndirectArgs(), PF_R32_UINT));
+			P->MBOutVertexCapacity = Context.Resident.VertexCapacity;
+			P->MBOutIndexCapacity = Context.Resident.IndexCapacity;
+
+			TShaderMapRef<FMeshBooleanFinalizeMeshCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("MB.Out.FinalizeMesh"), Shader, P,
+				FIntVector(1, 1, 1));
+		}
+
+		// 输出大小是 GPU 定的，游戏线程不能声称自己知道。
+		Context.InvalidateKnownCounts();
+		// 查询盒是不问 GPU 就能拿到的唯一界；下面的精确归约算不出来时它就是兜底。
+		Context.Resident.WorldBounds = QueryBox;
+		bEmitted = true;
+	});
+
+	if (!bEdited || !bEmitted)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[MeshBoolean:%s] GPU 直写路径的常驻流写入失败。"), *GetName());
+		return false;
+	}
+
+	// 结果的包围盒只有 GPU 知道。CPU 路径是顺手从回读的位置里算的；这里没有回读，所以显式
+	// 归约一次 —— 否则包围盒就是整个查询盒，稀疏结果的剔除和阴影都要为那片空气买单。
+	UCSMeshOps::ComputeWorldBoundsSync(Target);
+
+	UE_LOG(LogTemp, Log, TEXT("[MeshBoolean:%s] GPU direct write: sourceTris=%u fragments=%u outTris=%u stageB=%d materialSlots=%d"),
+		*GetName(), SoupTriangleCount, FragmentCount, KeptTriangleCount, bRunStageB ? 1 : 0, Target->Materials.Num());
+	return true;
 }
 
 

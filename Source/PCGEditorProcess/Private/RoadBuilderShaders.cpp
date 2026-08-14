@@ -1,7 +1,11 @@
 #include "RoadBuilderShaders.h"
 
+#include "CSMesh.h"
+#include "CSMeshOps.h"
+
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
+#include "RHI.h"
 #include "RHICommandList.h"
 
 #define ROAD_SHADER TEXT("/Plugin/PCGPlugins/Shaders/Private/RoadBuilder.usf")
@@ -92,7 +96,7 @@ void AddRoadDepthToResultPass(
 }
 
 // -----------------------------------------------------------------------------
-// Reusable road-build producer (extracted from FRoadMeshSceneProxy::BuildRoadNetwork)
+// Reusable road-build producer: the pass sequence itself, independent of where it writes
 // -----------------------------------------------------------------------------
 
 namespace
@@ -107,6 +111,24 @@ namespace
 		float Length;
 		float HalfWidth;
 	};
+
+	// The bounds to hand the mesh, in the input's own space. Input.LocalBounds is what the road
+	// actor supplies; deriving a fallback matters because an invalid box does not fail loudly --
+	// the road simply gets culled from some angles, and that symptom points at the renderer rather
+	// than at a bound nobody set.
+	FBox RoadBuilder_InputBounds(const FRoadBuildInput& Input)
+	{
+		if (Input.LocalBounds.IsValid) return Input.LocalBounds;
+
+		FBox Bounds(ForceInit);
+		for (const FRoadSplinePoint& Point : Input.Points) Bounds += FVector(Point.Position);
+		if (!Bounds.IsValid) return Bounds;
+
+		// The ribbon reaches half a road width past the centre line, and a junction corner strip
+		// reaches CornerSolveCS's CornerDist (three half-widths, at least one sample step) past that.
+		const double Margin = double(FMath::Max(Input.RoadHalfWidth * 4.0f, Input.SampleStep * 2.0f));
+		return Bounds.ExpandBy(FVector(Margin));
+	}
 }
 
 void BuildRoadGeometryRDG(
@@ -314,4 +336,91 @@ void BuildRoadGeometryRDG(
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Road.Finalize"), ERDGPassFlags::Compute,
 			TShaderMapRef<FRoadFinalizeCS>(ShaderMap), Params, FIntVector(1, 1, 1));
 	}
+}
+
+// -----------------------------------------------------------------------------
+// The road as a UCSMesh operator
+// -----------------------------------------------------------------------------
+
+bool BuildRoadGeometryIntoMesh(UCSMesh* Target, const FRoadBuildInput& Input, const FTransform& InputToWorld)
+{
+	if (!Target || Input.Splines.Num() == 0) return false;
+	// The bail-out the scene proxy used to make. None of the road kernels compile below SM5, and
+	// building anyway would leave the caller with an allocated, empty mesh instead of a refusal.
+	if (GMaxRHIFeatureLevel < ERHIFeatureLevel::SM5) return false;
+
+	// A genuinely indexed mesh: the two capacities are independent (IndexCapacity != VertexCapacity).
+	// The floors are the ones the kernels clamp their writes against.
+	const uint32 VertexCapacity = FMath::Max(Input.MaxVertices, 64u);
+	const uint32 IndexCapacity = FMath::Max(Input.MaxIndices, 192u);
+
+	// Load-bearing rather than defensive: the emit kernels bound their writes by Input.MaxVertices /
+	// MaxIndices, not by what the mesh actually got. A refused allocation leaves the previous,
+	// possibly smaller, buffers in place -- and building into those writes past the end of them.
+	if (!Target->EnsureCapacitySync(int32(VertexCapacity), int32(IndexCapacity)))
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoadMesh] Road build skipped: capacity for %u vertices / %u indices was refused."),
+			VertexCapacity, IndexCapacity);
+		return false;
+	}
+
+	const FBox InputBounds = RoadBuilder_InputBounds(Input);
+
+	// Set from inside the edit, so it reports whether the passes were actually added rather than
+	// whether the edit ran. EditMeshSync's flush is what makes writing to a caller-stack local here
+	// safe (same fence that keeps the lambda itself alive).
+	bool bBuilt = false;
+	Target->EditMeshSync([&Input, &InputBounds, &bBuilt](FCSMeshEditContext& Context)
+	{
+		FRoadGeometryBuffers Out;
+		Out.Positions = Context.Positions();
+		Out.Tangents = Context.Tangents();
+		Out.TexCoords = Context.TexCoords();
+		Out.Colors = Context.Colors();
+		Out.Indices = Context.Indices();
+		Out.IndirectArgs = Context.IndirectArgs();
+		Out.MeshCounters = Context.Counters();
+		if (!Out.Positions || !Out.Tangents || !Out.TexCoords || !Out.Colors) return;
+		if (!Out.Indices || !Out.IndirectArgs || !Out.MeshCounters) return;
+
+		// No SetStandardStreamAccessFinal and no GraphBuilder.Execute() here: both belong to
+		// EditMeshSync, which restores every resident stream's access state for the whole edit.
+		// Doing either by hand is the failure that has no symptom but "it stopped drawing".
+		BuildRoadGeometryRDG(Context.GraphBuilder, GMaxRHIFeatureLevel, Input, Out);
+
+		// The road writes no material ids, but every UCSMesh carries that stream and the save path
+		// reads it back as the per-triangle slot. Left holding whatever the buffer pool's previous
+		// tenant wrote, a one-material road would come out of the saver scattered across dozens of
+		// slots that have no materials behind them. Zero is the road's only slot.
+		FRDGBufferRef MaterialIds = Context.MaterialIds();
+		if (MaterialIds) AddClearUAVPass(Context.GraphBuilder, Context.GraphBuilder.CreateUAV(FRDGBufferUAVDesc(MaterialIds, PF_R32_UINT)), 0u);
+
+		// FinalizeCS writes arg set 0 alone, exactly like the shared counter kernels: a table left
+		// over from an earlier life of this mesh would keep indexing arg sets that describe a
+		// triangle layout this build has just replaced.
+		UCSMeshOps::InvalidateSections(Context);
+		// Junction count and corner sample count are decided on the GPU, so the emitted size is too
+		// -- the game thread must not claim to know it.
+		Context.InvalidateKnownCounts();
+		Context.Resident.WorldBounds = InputBounds;
+		bBuilt = true;
+	});
+	if (!bBuilt) return false;
+
+	// Into world space, which is what the resident set is by contract. Skipped at identity so a road
+	// authored at the origin (and every heightmap-only caller) pays nothing for it.
+	if (!InputToWorld.Equals(FTransform::Identity)) UCSMeshOps::TransformMesh(Target, InputToWorld);
+
+	// Retention introduces a ratchet the proxy-owned path never had: the buffers used to be
+	// reallocated from scratch on every rebuild, and now only EnsureCapacitySync moves them, which
+	// never goes down. Without this a road edited shorter keeps the largest allocation it ever had
+	// for the rest of the session. Gated on the CPU-side request because the road's counts are
+	// GPU-decided, which makes ShrinkCapacitySync pay for a counter readback -- a full GPU stall --
+	// before it even reaches its own hysteresis check.
+	const bool bRoadNeedsLessThanItHolds = int32(VertexCapacity) < Target->GetVertexCapacity()
+		|| int32(IndexCapacity) < Target->GetIndexCapacity();
+	if (bRoadNeedsLessThanItHolds) Target->ShrinkCapacitySync(int32(VertexCapacity), int32(IndexCapacity));
+
+	return true;
 }

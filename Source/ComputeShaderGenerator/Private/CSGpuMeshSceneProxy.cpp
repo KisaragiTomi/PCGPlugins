@@ -1,4 +1,5 @@
 #include "CSGpuMeshSceneProxy.h"
+#include "CSMesh.h"
 
 #include "Components/PrimitiveComponent.h"
 #include "Materials/Material.h"
@@ -152,98 +153,14 @@ void FCSGpuMeshSceneProxy::AddStream(const FCSGpuStreamDesc& Desc)
 
 void FCSGpuMeshSceneProxy::AddStandardTriangleStreams(uint32 NumIndirectDraws)
 {
-	{
-		FCSGpuStreamDesc D;
-		D.DebugName = TEXT("CSGpuMesh.Positions");
-		D.Role = ECSGpuStreamRole::Position;
-		D.BytesPerElement = sizeof(float);
-		D.ElementsPerUnit = 3;
-		D.CountSource = ECSGpuCountSource::PerVertex;
-		D.SrvFormat = PF_R32_FLOAT;
-		D.VfType = VET_Float3;
-		D.CpuSemantic = ECSGpuMeshSemantic::Position;
-		D.bReadback = true;
-		AddStream(D);
-	}
-	{
-		FCSGpuStreamDesc D;
-		D.DebugName = TEXT("CSGpuMesh.Tangents");
-		D.Role = ECSGpuStreamRole::TangentBasis;
-		D.BytesPerElement = sizeof(uint32);
-		D.ElementsPerUnit = 2;
-		D.CountSource = ECSGpuCountSource::PerVertex;
-		D.SrvFormat = PF_R8G8B8A8_SNORM;
-		D.VfType = VET_PackedNormal;
-		D.CpuSemantic = ECSGpuMeshSemantic::TangentBasis;
-		D.bReadback = true;
-		AddStream(D);
-	}
-	{
-		FCSGpuStreamDesc D;
-		D.DebugName = TEXT("CSGpuMesh.TexCoords");
-		D.Role = ECSGpuStreamRole::TexCoord;
-		D.BytesPerElement = sizeof(float);
-		D.ElementsPerUnit = 2;
-		D.CountSource = ECSGpuCountSource::PerVertex;
-		D.SrvFormat = PF_G32R32F;
-		D.VfType = VET_Float2;
-		D.TexCoordIndex = 0;
-		D.CpuSemantic = ECSGpuMeshSemantic::TexCoord;
-		D.bReadback = true;
-		AddStream(D);
-	}
-	{
-		FCSGpuStreamDesc D;
-		D.DebugName = TEXT("CSGpuMesh.Colors");
-		D.Role = ECSGpuStreamRole::Color;
-		D.BytesPerElement = sizeof(uint32);
-		D.ElementsPerUnit = 1;
-		D.CountSource = ECSGpuCountSource::PerVertex;
-		D.SrvFormat = PF_R8G8B8A8;
-		D.VfType = VET_Color;
-		D.CpuSemantic = ECSGpuMeshSemantic::None; // vertex colours are not part of the saved mesh today
-		D.bReadback = false;
-		AddStream(D);
-	}
-	{
-		FCSGpuStreamDesc D;
-		D.DebugName = TEXT("CSGpuMesh.Indices");
-		D.Role = ECSGpuStreamRole::Index;
-		D.BytesPerElement = sizeof(uint32);
-		D.ElementsPerUnit = 1;
-		D.CountSource = ECSGpuCountSource::PerIndex;
-		D.SrvFormat = PF_Unknown;
-		D.VfType = VET_None;
-		D.CpuSemantic = ECSGpuMeshSemantic::Index;
-		D.bReadback = true;
-		AddStream(D);
-	}
-	{
-		FCSGpuStreamDesc D;
-		D.DebugName = TEXT("CSGpuMesh.IndirectArgs");
-		D.Role = ECSGpuStreamRole::IndirectArgs;
-		D.BytesPerElement = sizeof(uint32);
-		D.ElementsPerUnit = 5 * FMath::Max(NumIndirectDraws, 1u);
-		D.CountSource = ECSGpuCountSource::Fixed;
-		D.SrvFormat = PF_Unknown;
-		D.VfType = VET_None;
-		D.CpuSemantic = ECSGpuMeshSemantic::None;
-		D.bReadback = false;
-		AddStream(D);
-	}
-	{
-		FCSGpuStreamDesc D;
-		D.DebugName = TEXT("CSGpuMesh.MeshCounters");
-		D.Role = ECSGpuStreamRole::MeshCounters;
-		D.BytesPerElement = sizeof(uint32);
-		D.ElementsPerUnit = 2; // [0]=vertexCount, [1]=indexCount
-		D.CountSource = ECSGpuCountSource::Fixed;
-		D.SrvFormat = PF_Unknown;
-		D.VfType = VET_None;
-		D.CpuSemantic = ECSGpuMeshSemantic::None; // read via EnqueueCountersReadback, not the mesh loop
-		D.bReadback = false;
-		AddStream(D);
-	}
+	// The descriptor list itself lives in CSGpuMeshStreams so the retained UCSMesh set and
+	// this proxy-owned set cannot drift apart.
+	CSGpuMeshStreams::FStandardStreamOptions Options;
+	Options.NumIndirectDraws = NumIndirectDraws;
+
+	TArray<FCSGpuStreamDesc> Descs;
+	CSGpuMeshStreams::BuildStandardTriangleStreamDescs(Descs, Options);
+	for (const FCSGpuStreamDesc& D : Descs) AddStream(D);
 }
 
 const FCSGpuMeshSceneProxy::FCSGpuStreamRuntime* FCSGpuMeshSceneProxy::FindStream(ECSGpuStreamRole Role, uint8 Index) const
@@ -270,12 +187,22 @@ TUniquePtr<FLocalVertexFactory> FCSGpuMeshSceneProxy::CreateVertexFactory(ERHIFe
 	return MakeUnique<FLocalVertexFactory>(InFeatureLevel, InDebugName);
 }
 
-void FCSGpuMeshSceneProxy::GetMeshReadbackDescs(TArray<FCSGpuStreamDesc>& OutDescs) const
+void FCSGpuMeshSceneProxy::BuildResidentView(FCSMeshResident& OutResident) const
 {
-	OutDescs.Reset();
+	OutResident.Streams.Reset(Streams.Num());
 	for (const TUniquePtr<FCSGpuStreamRuntime>& S : Streams)
-		if (S->Desc.bReadback && S->Desc.CpuSemantic != ECSGpuMeshSemantic::None)
-			OutDescs.Add(S->Desc);
+	{
+		FCSMeshResident::FStream& Stream = OutResident.Streams.AddDefaulted_GetRef();
+		Stream.Desc = S->Desc;
+		Stream.Pooled = S->Pooled;
+	}
+	OutResident.VertexCapacity = VertexCapacity;
+	OutResident.IndexCapacity = IndexCapacity;
+}
+
+void FCSGpuMeshSceneProxy::SetExternalStreams(TSharedPtr<FCSMeshResident, ESPMode::ThreadSafe> InResident)
+{
+	ExternalResident = MoveTemp(InResident);
 }
 
 void FCSGpuMeshSceneProxy::InitGpuGeometry(FRHICommandListBase& RHICmdList)
@@ -285,12 +212,28 @@ void FCSGpuMeshSceneProxy::InitGpuGeometry(FRHICommandListBase& RHICmdList)
 	IndexCapacity = 0;
 	DrawDesc = FDrawDesc();
 
+	if (ExternalResident.IsValid())
+	{
+		// Adopt: the buffers already exist and already hold geometry, so there is nothing to
+		// allocate and nothing to generate. This is what turns a render-state recreation from
+		// "re-run the generation compute" into "rebind the vertex factory".
+		for (const FCSMeshResident::FStream& Stream : ExternalResident->Streams)
+		{
+			AddStream(Stream.Desc);
+			Streams.Last()->Pooled = Stream.Pooled;
+		}
+		VertexCapacity = ExternalResident->VertexCapacity;
+		IndexCapacity = ExternalResident->IndexCapacity;
+		AllocateStreamsAndBindVF(RHICmdList, /*bAllocateBuffers*/ false);
+		return;
+	}
+
 	RegisterStreams();                    // leaf: push descriptors + set capacities
 	AllocateStreamsAndBindVF(RHICmdList); // base: alloc pooled buffers + SRVs + VF + DrawDesc handles
 	BuildGeometry(RHICmdList);            // leaf: run compute into the base-owned buffers
 }
 
-void FCSGpuMeshSceneProxy::AllocateStreamsAndBindVF(FRHICommandListBase& RHICmdList)
+void FCSGpuMeshSceneProxy::AllocateStreamsAndBindVF(FRHICommandListBase& RHICmdList, bool bAllocateBuffers)
 {
 	const uint32 VertUnits = FMath::Max(VertexCapacity, 1u);
 	const uint32 IdxUnits = FMath::Max(IndexCapacity, 1u);
@@ -305,21 +248,24 @@ void FCSGpuMeshSceneProxy::AllocateStreamsAndBindVF(FRHICommandListBase& RHICmdL
 		FCSGpuStreamRuntime& S = *SPtr;
 		const FCSGpuStreamDesc& D = S.Desc;
 
-		// --- allocate the pooled buffer
-		FRDGBufferDesc Desc;
-		if (D.Role == ECSGpuStreamRole::IndirectArgs)
+		// --- allocate the pooled buffer (adopt mode arrives with one already attached)
+		if (bAllocateBuffers)
 		{
-			Desc = FRDGBufferDesc::CreateIndirectDesc(D.BytesPerElement, D.ElementsPerUnit);
+			FRDGBufferDesc Desc;
+			if (D.Role == ECSGpuStreamRole::IndirectArgs)
+			{
+				Desc = FRDGBufferDesc::CreateIndirectDesc(D.BytesPerElement, D.ElementsPerUnit);
+			}
+			else
+			{
+				const uint32 Units = FMath::Max(CSGpuMeshStreams::UnitsForCountSource(D.CountSource, VertUnits, IdxUnits), 1u);
+				Desc = FRDGBufferDesc::CreateBufferDesc(D.BytesPerElement, D.ElementsPerUnit * Units);
+				if (D.Role == ECSGpuStreamRole::Index)
+					Desc.Usage = (Desc.Usage & ~EBufferUsageFlags::VertexBuffer) | EBufferUsageFlags::IndexBuffer;
+			}
+			S.Pooled = AllocatePooledBuffer(Desc, D.DebugName);
 		}
-		else
-		{
-			const uint32 Units = (D.CountSource == ECSGpuCountSource::PerVertex) ? VertUnits
-				: (D.CountSource == ECSGpuCountSource::PerIndex) ? IdxUnits : 1u;
-			Desc = FRDGBufferDesc::CreateBufferDesc(D.BytesPerElement, D.ElementsPerUnit * Units);
-			if (D.Role == ECSGpuStreamRole::Index)
-				Desc.Usage = (Desc.Usage & ~EBufferUsageFlags::VertexBuffer) | EBufferUsageFlags::IndexBuffer;
-		}
-		S.Pooled = AllocatePooledBuffer(Desc, D.DebugName);
+		if (!S.Pooled.IsValid()) continue;
 
 		// --- manual-fetch SRV
 		if (D.SrvFormat != PF_Unknown)
@@ -405,54 +351,4 @@ void FCSGpuMeshSceneProxy::ReleaseGpuGeometry()
 		S.Pooled.SafeRelease();
 	}
 	Streams.Reset();
-}
-
-bool FCSGpuMeshSceneProxy::EnqueueCountersReadback(FRHICommandListImmediate& RHICmdList, FRHIGPUBufferReadback* Readback) const
-{
-	if (!Readback || !DrawDesc.bValid) return false;
-	const FCSGpuStreamRuntime* Counters = FindStream(ECSGpuStreamRole::MeshCounters);
-	if (!Counters || !Counters->Pooled.IsValid()) return false;
-
-	FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("CSGpuMesh.ReadbackCounters"));
-	FRDGBufferRef CountersRDG = GraphBuilder.RegisterExternalBuffer(Counters->Pooled);
-	AddEnqueueCopyPass(GraphBuilder, Readback, CountersRDG, sizeof(uint32) * 2u);
-	GraphBuilder.SetBufferAccessFinal(CountersRDG, ERHIAccess::CopySrc);
-	GraphBuilder.Execute();
-	return true;
-}
-
-bool FCSGpuMeshSceneProxy::EnqueueMeshReadback(FRHICommandListImmediate& RHICmdList, uint32 VertexCount, uint32 IndexCount,
-	const TArray<FRHIGPUBufferReadback*>& Readbacks) const
-{
-	if (!DrawDesc.bValid) return false;
-	if (VertexCount == 0 || VertexCount > FMath::Max(VertexCapacity, 1u)) return false;
-	if (IndexCount == 0 || IndexCount > FMath::Max(IndexCapacity, 1u)) return false;
-
-	// Gather the mesh-readback streams in registration order (matches GetMeshReadbackDescs).
-	TArray<const FCSGpuStreamRuntime*, TInlineAllocator<8>> ReadStreams;
-	for (const TUniquePtr<FCSGpuStreamRuntime>& S : Streams)
-		if (S->Desc.bReadback && S->Desc.CpuSemantic != ECSGpuMeshSemantic::None)
-			ReadStreams.Add(S.Get());
-
-	if (ReadStreams.Num() != Readbacks.Num()) return false;
-	for (const FCSGpuStreamRuntime* S : ReadStreams)
-		if (!S->Pooled.IsValid()) return false;
-	for (FRHIGPUBufferReadback* RB : Readbacks)
-		if (!RB) return false;
-
-	FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("CSGpuMesh.ReadbackData"));
-	for (int32 i = 0; i < ReadStreams.Num(); ++i)
-	{
-		const FCSGpuStreamRuntime& S = *ReadStreams[i];
-		const uint32 Units = (S.Desc.CountSource == ECSGpuCountSource::PerIndex) ? IndexCount : VertexCount;
-		const uint32 Bytes = Units * S.Desc.ElementsPerUnit * S.Desc.BytesPerElement;
-		FRDGBufferRef BufRDG = GraphBuilder.RegisterExternalBuffer(S.Pooled);
-		AddEnqueueCopyPass(GraphBuilder, Readbacks[i], BufRDG, Bytes);
-		const ERHIAccess Final = (S.Desc.Role == ECSGpuStreamRole::Index)
-			? ERHIAccess::VertexOrIndexBuffer
-			: (ERHIAccess::VertexOrIndexBuffer | ERHIAccess::SRVMask);
-		GraphBuilder.SetBufferAccessFinal(BufRDG, Final);
-	}
-	GraphBuilder.Execute();
-	return true;
 }

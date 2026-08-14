@@ -59,17 +59,14 @@ public:
 	uint32 GetVertexCapacity() const { return VertexCapacity; }
 	uint32 GetIndexCapacity() const { return IndexCapacity; }
 
-	/** Fills OutDescs with the descriptors of every stream that participates in the CPU
-	 *  mesh readback (bReadback && CpuSemantic != None), in registration order. */
-	void GetMeshReadbackDescs(TArray<FCSGpuStreamDesc>& OutDescs) const;
-
-	/** Enqueues a copy of the 2-uint MeshCounters buffer ([0]=vertexCount, [1]=indexCount). */
-	bool EnqueueCountersReadback(FRHICommandListImmediate& RHICmdList, FRHIGPUBufferReadback* Readback) const;
-
-	/** Enqueues one readback per mesh-readback stream (same order as GetMeshReadbackDescs),
-	 *  sizing each copy by the stream's CountSource against VertexCount/IndexCount. */
-	bool EnqueueMeshReadback(FRHICommandListImmediate& RHICmdList, uint32 VertexCount, uint32 IndexCount,
-		const TArray<FRHIGPUBufferReadback*>& Readbacks) const;
+	/** Snapshots this proxy's stream set as a plain FCSMeshResident so the shared readback
+	 *  (CSMeshReadback::ReadbackResidentSync) can consume it. The proxy keeps owning the
+	 *  buffers; the view only adds references. Render thread only.
+	 *
+	 *  This is what makes readback independent of the proxy: the counter read and the
+	 *  descriptor loop used to be proxy methods, so a GPU mesh that was not being drawn
+	 *  could not be saved. The proxy is now just one possible source of a resident set. */
+	void BuildResidentView(struct FCSMeshResident& OutResident) const;
 
 	/** Submit an indexed GPU-buffer draw for every visible view. This is shared by the base
 	 *  triangle path and leaf-owned debug geometry; it never maps or reads either buffer. */
@@ -142,6 +139,16 @@ protected:
 	// Base services callable by leaves
 	// -------------------------------------------------------------------------
 
+	/** Bind an externally-owned resident buffer set instead of allocating one.
+	 *
+	 *  Call from a leaf's constructor. It switches InitGpuGeometry from
+	 *  "RegisterStreams -> allocate -> BuildGeometry" to "adopt the given buffers -> bind the
+	 *  vertex factory", so a render-state recreation stops re-running the leaf's generation
+	 *  compute and becomes a rebind. RegisterStreams()/BuildGeometry() are not called at all
+	 *  in this mode; the proxy holds a reference to the set, so the buffers outlive the mesh
+	 *  object being garbage-collected mid-frame. */
+	void SetExternalStreams(TSharedPtr<struct FCSMeshResident, ESPMode::ThreadSafe> InResident);
+
 	/** Register one stream. Call from RegisterStreams(). */
 	void AddStream(const FCSGpuStreamDesc& Desc);
 
@@ -192,14 +199,20 @@ protected:
 	bool bBatchCastShadow = true;
 
 private:
-	/** Base orchestrator: RegisterStreams() -> AllocateStreamsAndBindVF() -> BuildGeometry(). */
+	/** Base orchestrator. Owned mode: RegisterStreams() -> AllocateStreamsAndBindVF() ->
+	 *  BuildGeometry(). External mode: adopt the resident set -> bind only. */
 	void InitGpuGeometry(FRHICommandListBase& RHICmdList);
-	/** Release SRVs then pooled buffers for every stream (after the VF is released). */
+	/** Release SRVs then pooled buffers for every stream (after the VF is released).
+	 *  In external mode this only drops this proxy's references; the set outlives it. */
 	void ReleaseGpuGeometry();
 
-	/** Allocate pooled buffers + SRVs for every stream, bind the vertex-factory streams,
-	 *  and fill DrawDesc's index/indirect handles. */
-	void AllocateStreamsAndBindVF(FRHICommandListBase& RHICmdList);
+	/** Create SRVs / render-resource wrappers for every stream, bind the vertex-factory
+	 *  streams, and fill DrawDesc's index/indirect handles. bAllocateBuffers=false expects
+	 *  every stream's pooled buffer to already be set (the adopt path). */
+	void AllocateStreamsAndBindVF(FRHICommandListBase& RHICmdList, bool bAllocateBuffers = true);
+
+	/** Externally-owned buffer set, when this proxy borrows instead of allocating. */
+	TSharedPtr<struct FCSMeshResident, ESPMode::ThreadSafe> ExternalResident;
 
 	/** Find a stream runtime by role (+ TexCoord index for the TexCoord role). */
 	const FCSGpuStreamRuntime* FindStream(ECSGpuStreamRole Role, uint8 Index = 0) const;

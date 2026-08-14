@@ -1,0 +1,175 @@
+#include "CSGpuMeshTypes.h"
+
+#include "RenderGraphBuilder.h"
+
+namespace CSGpuMeshStreams
+{
+void BuildStandardTriangleStreamDescs(TArray<FCSGpuStreamDesc>& OutDescs, const FStandardStreamOptions& Options)
+{
+	OutDescs.Reset();
+
+	{
+		FCSGpuStreamDesc D;
+		D.DebugName = TEXT("CSGpuMesh.Positions");
+		D.Role = ECSGpuStreamRole::Position;
+		D.BytesPerElement = sizeof(float);
+		D.ElementsPerUnit = 3;
+		D.CountSource = ECSGpuCountSource::PerVertex;
+		D.SrvFormat = PF_R32_FLOAT;
+		D.VfType = VET_Float3;
+		D.CpuSemantic = ECSGpuMeshSemantic::Position;
+		D.bReadback = true;
+		OutDescs.Add(D);
+	}
+	{
+		FCSGpuStreamDesc D;
+		D.DebugName = TEXT("CSGpuMesh.Tangents");
+		D.Role = ECSGpuStreamRole::TangentBasis;
+		D.BytesPerElement = sizeof(uint32);
+		D.ElementsPerUnit = 2;
+		D.CountSource = ECSGpuCountSource::PerVertex;
+		D.SrvFormat = PF_R8G8B8A8_SNORM;
+		D.VfType = VET_PackedNormal;
+		D.CpuSemantic = ECSGpuMeshSemantic::TangentBasis;
+		D.bReadback = true;
+		OutDescs.Add(D);
+	}
+	{
+		FCSGpuStreamDesc D;
+		D.DebugName = TEXT("CSGpuMesh.TexCoords");
+		D.Role = ECSGpuStreamRole::TexCoord;
+		D.BytesPerElement = sizeof(float);
+		D.ElementsPerUnit = 2;
+		D.CountSource = ECSGpuCountSource::PerVertex;
+		D.SrvFormat = PF_G32R32F;
+		D.VfType = VET_Float2;
+		D.TexCoordIndex = 0;
+		D.CpuSemantic = ECSGpuMeshSemantic::TexCoord;
+		D.bReadback = true;
+		OutDescs.Add(D);
+	}
+	{
+		FCSGpuStreamDesc D;
+		D.DebugName = TEXT("CSGpuMesh.Colors");
+		D.Role = ECSGpuStreamRole::Color;
+		D.BytesPerElement = sizeof(uint32);
+		D.ElementsPerUnit = 1;
+		D.CountSource = ECSGpuCountSource::PerVertex;
+		D.SrvFormat = PF_R8G8B8A8;
+		D.VfType = VET_Color;
+		D.CpuSemantic = Options.bReadbackColors ? ECSGpuMeshSemantic::Color : ECSGpuMeshSemantic::None;
+		D.bReadback = Options.bReadbackColors;
+		OutDescs.Add(D);
+	}
+	{
+		FCSGpuStreamDesc D;
+		D.DebugName = TEXT("CSGpuMesh.Indices");
+		D.Role = ECSGpuStreamRole::Index;
+		D.BytesPerElement = sizeof(uint32);
+		D.ElementsPerUnit = 1;
+		D.CountSource = ECSGpuCountSource::PerIndex;
+		D.SrvFormat = PF_Unknown;
+		D.VfType = VET_None;
+		D.CpuSemantic = ECSGpuMeshSemantic::Index;
+		D.bReadback = true;
+		OutDescs.Add(D);
+	}
+	if (Options.bMaterialIds)
+	{
+		FCSGpuStreamDesc D;
+		D.DebugName = TEXT("CSGpuMesh.MaterialIds");
+		D.Role = ECSGpuStreamRole::AuxVertex;
+		D.BytesPerElement = sizeof(uint32);
+		D.ElementsPerUnit = 1;
+		D.CountSource = ECSGpuCountSource::PerTriangle;
+		D.SrvFormat = PF_R32_UINT;
+		D.VfType = VET_None;
+		D.CpuSemantic = ECSGpuMeshSemantic::MaterialId;
+		D.bReadback = true;
+		OutDescs.Add(D);
+	}
+	{
+		FCSGpuStreamDesc D;
+		D.DebugName = TEXT("CSGpuMesh.IndirectArgs");
+		D.Role = ECSGpuStreamRole::IndirectArgs;
+		D.BytesPerElement = sizeof(uint32);
+		D.ElementsPerUnit = 5 * FMath::Max(Options.NumIndirectDraws, 1u);
+		D.CountSource = ECSGpuCountSource::Fixed;
+		D.SrvFormat = PF_Unknown;
+		D.VfType = VET_None;
+		D.CpuSemantic = ECSGpuMeshSemantic::None;
+		D.bReadback = false;
+		OutDescs.Add(D);
+	}
+	{
+		FCSGpuStreamDesc D;
+		D.DebugName = TEXT("CSGpuMesh.MeshCounters");
+		D.Role = ECSGpuStreamRole::MeshCounters;
+		D.BytesPerElement = sizeof(uint32);
+		D.ElementsPerUnit = 2; // [0]=vertexCount, [1]=indexCount
+		D.CountSource = ECSGpuCountSource::Fixed;
+		D.SrvFormat = PF_Unknown; // operators create the SRV inside their own graph
+		D.VfType = VET_None;
+		D.CpuSemantic = ECSGpuMeshSemantic::None; // read via the counters readback, not the mesh loop
+		D.bReadback = false;
+		OutDescs.Add(D);
+	}
+}
+
+uint32 UnitsForCountSource(ECSGpuCountSource CountSource, uint32 VertexUnits, uint32 IndexUnits)
+{
+	switch (CountSource)
+	{
+	case ECSGpuCountSource::PerVertex:   return VertexUnits;
+	case ECSGpuCountSource::PerIndex:    return IndexUnits;
+	case ECSGpuCountSource::PerTriangle: return IndexUnits / 3u;
+	default:                             return 1u; // Fixed: ElementsPerUnit is the whole count
+	}
+}
+
+ERHIAccess FinalAccessForRole(ECSGpuStreamRole Role)
+{
+	switch (Role)
+	{
+	case ECSGpuStreamRole::Index:
+		return ERHIAccess::VertexOrIndexBuffer;
+	case ECSGpuStreamRole::IndirectArgs:
+		return ERHIAccess::IndirectArgs;
+	case ECSGpuStreamRole::MeshCounters:
+		// The counters buffer is the readback carrier; leaving it in CopySrc is what lets
+		// ReadbackMeshSync enqueue its copy without an extra transition.
+		return ERHIAccess::CopySrc;
+	case ECSGpuStreamRole::AuxVertex:
+		// No vertex-factory binding, so plain shader access is enough.
+		return ERHIAccess::SRVMask;
+	default:
+		// Vertex streams are both drawn from and manually fetched by the vertex factory.
+		return ERHIAccess::VertexOrIndexBuffer | ERHIAccess::SRVMask;
+	}
+}
+
+void SetStreamAccessFinal(FRDGBuilder& GraphBuilder, FRDGBufferRef Buffer, ECSGpuStreamRole Role)
+{
+	if (!Buffer) return;
+	GraphBuilder.SetBufferAccessFinal(Buffer, FinalAccessForRole(Role));
+}
+
+void SetStandardStreamAccessFinal(
+	FRDGBuilder& GraphBuilder,
+	FRDGBufferRef Positions,
+	FRDGBufferRef Tangents,
+	FRDGBufferRef TexCoords,
+	FRDGBufferRef Colors,
+	FRDGBufferRef Indices,
+	FRDGBufferRef IndirectArgs,
+	FRDGBufferRef MeshCounters)
+{
+	SetStreamAccessFinal(GraphBuilder, Positions, ECSGpuStreamRole::Position);
+	SetStreamAccessFinal(GraphBuilder, Tangents, ECSGpuStreamRole::TangentBasis);
+	SetStreamAccessFinal(GraphBuilder, TexCoords, ECSGpuStreamRole::TexCoord);
+	SetStreamAccessFinal(GraphBuilder, Colors, ECSGpuStreamRole::Color);
+	SetStreamAccessFinal(GraphBuilder, Indices, ECSGpuStreamRole::Index);
+	SetStreamAccessFinal(GraphBuilder, IndirectArgs, ECSGpuStreamRole::IndirectArgs);
+	SetStreamAccessFinal(GraphBuilder, MeshCounters, ECSGpuStreamRole::MeshCounters);
+}
+}

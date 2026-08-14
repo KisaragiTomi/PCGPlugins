@@ -5,12 +5,40 @@
 #include "RoadBuilderShaders.h"
 #include "ComputeShaderMeshGenerator.h"
 #include "Components/SplineComponent.h"
+#include "Containers/Ticker.h"
 #include "Engine/TextureRenderTarget2D.h"
+#include "Engine/World.h"
 #include "Kismet/KismetRenderingLibrary.h"
 #include "Landscape.h"
+#include "Misc/App.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
+#include "RHI.h"
 #include "RHICommandList.h"
+
+// May this actor run a blocking road generation right now? Every case below is one where the
+// generation would either write into something shared with all instances or burn a full GPU stall
+// (RebuildRoad ends in FlushRenderingCommands) for output nobody will ever look at.
+static bool CSRoad_CanGenerateFor(const AActor* Actor)
+{
+	if (!IsValid(Actor)) return false;
+	// A CDO/archetype has no world, and anything a generation leaves on it propagates into every
+	// instance created afterwards.
+	if (Actor->IsTemplate()) return false;
+	// Cook and every other commandlet: the road exists only as GPU buffers and nothing about it is
+	// serialized, so a per-road-actor GPU stall during a cook buys exactly nothing.
+	if (IsRunningCommandlet() || !FApp::CanEverRender()) return false;
+	// The road compute path needs SM5; the road operator refuses to build below it, so generating
+	// would only pay the CPU resample and the heightmap rasterize for a mesh that cannot draw.
+	if (GMaxRHIFeatureLevel < ERHIFeatureLevel::SM5) return false;
+	const UWorld* World = Actor->GetWorld();
+	if (!World) return false;
+	// Only worlds somebody is actually looking at. Inactive worlds (a level held open by the editor
+	// but not the one being edited) and preview worlds (asset thumbnails, the Blueprint editor
+	// viewport) both register components and neither renders this road.
+	const EWorldType::Type WorldType = World->WorldType;
+	return WorldType == EWorldType::Editor || WorldType == EWorldType::PIE || WorldType == EWorldType::Game;
+}
 
 ACSLandscapeRoad::ACSLandscapeRoad()
 {
@@ -21,7 +49,16 @@ ACSLandscapeRoad::ACSLandscapeRoad()
 void ACSLandscapeRoad::OnConstruction(const FTransform& Transform)
 {
 	Super::OnConstruction(Transform);
+	// Stays an unconditional rebuild: this is the authoring response (RoadWidth edited, actor moved,
+	// undo), and the input it is reacting to has just changed by definition. EnsureRoadGeometry() is
+	// the restore path and must not be confused with it.
 	RebuildRoad();
+}
+
+void ACSLandscapeRoad::PostRegisterAllComponents()
+{
+	Super::PostRegisterAllComponents();
+	ScheduleEnsureRoadGeometry();
 }
 
 void ACSLandscapeRoad::CollectSplines(TArray<USplineComponent*>& OutSplines) const
@@ -124,10 +161,11 @@ void ACSLandscapeRoad::RebuildRoad()
 	FRoadBuildInput Input;
 	if (!BuildRoadInput(Input)) return;
 
-	// 1) Render the visible road mesh (SetBuildInput consumes a moved snapshot).
-	RoadMesh->RoadMaterial = RoadMaterial;
-	FRoadBuildInput RenderInput = Input;
-	RoadMesh->SetBuildInput(MoveTemp(RenderInput));
+	// 1) Build and draw the visible road mesh. The samples are in this actor's local space
+	//    (BuildRoadInput resamples them there), so that is the transform the component bakes the
+	//    geometry into world space with — and the one the saved asset comes back out of.
+	RoadMesh->MeshMaterial = RoadMaterial;
+	RoadMesh->SetBuildInput(Input, GetActorTransform());
 
 	if (!Input.LocalBounds.IsValid) return;
 	const FBox WorldBounds = Input.LocalBounds.TransformBy(GetActorTransform());
@@ -167,6 +205,74 @@ void ACSLandscapeRoad::RebuildRoad()
 	bHasResult = true;
 	bRealtimeUpdate = false; // use only the cached road result, not the realtime external blend
 	RequestLandscapeUpdate(true);
+}
+
+bool ACSLandscapeRoad::EnsureRoadGeometry()
+{
+	if (!RoadMesh) return false;
+	// The idempotent half of the contract. Asked of the component rather than assumed from a
+	// "did I already run" flag on the actor, because the geometry can disappear without this actor
+	// hearing about it (the component being reset, a failed build) and a stale flag would then
+	// permanently refuse to restore it.
+	if (RoadMesh->HasGeneratedGeometry()) return true;
+	if (!CSRoad_CanGenerateFor(this)) return false;
+
+	// No usable spline is "there is no road here", not "restore an empty road". Bailing before
+	// RebuildRoad() also keeps it from resizing the RTs and re-publishing an empty edit-layer
+	// contribution over whatever the landscape currently holds. The predicate is the one
+	// BuildRoadInput() accepts a spline on; a road whose splines arrive later is picked up by the
+	// next RebuildRoad() (the construction rerun that attaching them triggers).
+	TArray<USplineComponent*> Splines;
+	CollectSplines(Splines);
+	const bool bHasUsableSpline = Splines.ContainsByPredicate([](const USplineComponent* Spline)
+	{
+		return IsValid(Spline) && Spline->GetNumberOfSplinePoints() >= 2 && Spline->GetSplineLength() >= KINDA_SMALL_NUMBER;
+	});
+	if (!bHasUsableSpline) return false;
+
+	RebuildRoad();
+	return RoadMesh->HasGeneratedGeometry();
+}
+
+// Why PostRegisterAllComponents, and why the work is still pushed a tick out.
+//
+// Rejected alternatives:
+//   PostLoad               — runs mid-package-load. GetWorld() is not dependable there, the child
+//                            spline actors CollectSplines() walks are not attached yet, and
+//                            RebuildRoad() ends in FlushRenderingCommands, which is the last thing
+//                            to do from inside async loading.
+//   OnRegister             — fires per component and is re-entered by every re-registration
+//                            (transform edit, visibility toggle, a construction rerun). A blocking
+//                            GPU build at that frequency is not affordable, and RoadMesh registers
+//                            before the actor's remaining components exist.
+//   OnConstruction         — kept, but as the authoring rebuild, not as the restore. It is also not
+//                            a universal restore point: construction scripts are only re-run for
+//                            uncooked data (see UWorld::UpdateLevelStreaming), so nothing calls it
+//                            for a level-placed actor once the data is cooked.
+//   PostEditChangeProperty — editor-only and user-driven; never fires on a level load at all, so it
+//                            can never be the thing that brings the road back.
+//
+// PostRegisterAllComponents is the one hook that fires in the editor, in PIE and in a game world,
+// and only once every component of this actor is live. The build is deferred to the next tick for
+// two independent reasons: a level load runs IncrementalRegisterComponents before
+// IncrementalRunConstructionScripts, so in an uncooked world OnConstruction -> RebuildRoad() is
+// already queued up behind us and building here would cost a second full GPU stall on every level
+// open; and blocking on the GPU from inside the level's registration pass blocks the load itself.
+// By the time the ticker fires, the idempotent check above turns that ordering into a no-op.
+void ACSLandscapeRoad::ScheduleEnsureRoadGeometry()
+{
+	if (bRoadGeometryRestoreAttempted) return;
+	if (!CSRoad_CanGenerateFor(this)) return;
+
+	bRoadGeometryRestoreAttempted = true;
+	// Weak, because the actor can be destroyed (level closed, undo of a placement, PIE ending)
+	// between the schedule and the tick, and the ticker outlives it.
+	TWeakObjectPtr<ACSLandscapeRoad> WeakThis(this);
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakThis](float)
+	{
+		if (ACSLandscapeRoad* Road = WeakThis.Get()) Road->EnsureRoadGeometry();
+		return false; // one shot
+	}), 0.0f);
 }
 
 void ACSLandscapeRoad::BuildRoadHeightRT(const FRoadBuildInput& Input, const FBox& WorldBounds, float CameraHeight)

@@ -133,5 +133,5 @@ PathPoints[P].w = CurveLUT(l / (N-1)) · (TargetScale · StartSourceScale · 分
 
 - SC 是 `SC.Iteration` 轮 × 每轮若干 pass，且每源一遍。合图后 N 个源全在一张图里，pass 数是 N × (3 + 5 × Iteration + 10)，建图开销和 RDG Insights 可读性会随源数量变差。源很多时值得把 SC 改成单次 dispatch 内按 source index 分流。
 - `MaxVinePointCount` 的默认值 `262144` 未经真实场景校准。它现在直接决定常驻显存，需按实际藤蔓规模调整。
-- `AVineContainer::SpaceColonizationWithScales` 已退化成永远返回空数组的存根（解算不再产出 CPU 线结果），只为不破坏已有蓝图绑定而保留。确认无蓝图依赖后可以删除。
-- **`BP_VineSource` 现在编译不过**（删 `UDynamicMeshComponent` 那一批的后果，未修）：`GenerateVines` 的返回值从 `UDynamicMesh*` 改成 `bool`，蓝图里 `GenerateVines → ReturnValue` 还接着 `IsValid` 的 `InputObject`（`Object Reference is not compatible with Boolean`），另有 6 处 `Get DynamicMeshComponent` 变量取值失效。旧链路本来就只是把 `GenerateVines` 返回的**空** `UDynamicMesh` 塞回 `SetDynamicMesh`，所以断掉不改变藤蔓外观，但错误列表一直红着。修法是在蓝图里删掉这条已经无产出的支线。
+- `AVineContainer::DrawDebugCachedVineSCStagePoints` 已退化成只打一条警告的存根（CPU 侧 SC 阶段点缓存随解算上 GPU 一并移除），只为不破坏已有蓝图绑定而保留。确认无蓝图依赖后可以删除。（同类的 `SpaceColonizationWithScales` 存根已删除。）
+- ~~**`BP_VineSource` 编译不过**~~（2026-08-13 已修）：删 `UDynamicMeshComponent` 那一批之后，`GenerateVines` 的返回值从 `UDynamicMesh*` 变成 `bool`，蓝图里 `GenerateVines → ReturnValue` 还接着 `IsValid` 的 `InputObject`，另有 6 处 `Get DynamicMeshComponent` 变量取值失效。已在蓝图里删掉这条早就无产出的支线（旧链路只是把返回的**空** `UDynamicMesh` 塞回 `SetDynamicMesh`，所以断掉本就不影响藤蔓外观），生成结果已人工确认正确。

@@ -8,6 +8,7 @@
 #include "RoadTypes.h"
 
 class FRDGBuilder;
+class UCSMesh;
 
 // Persistent GPU output buffers the road build writes into. The caller creates or
 // registers these (transient RDG buffers, or external-registered pooled buffers) and
@@ -25,13 +26,35 @@ struct FRoadGeometryBuffers
 
 // Runs the full road compute pipeline (Clear -> Intersect -> Cluster -> CornerSolve ->
 // EmitRoad -> EmitCorner -> Finalize), adding the passes to GraphBuilder and writing into
-// Out. Shared by FRoadMeshSceneProxy (renders the result) and the CS-landscape road
+// Out. Shared by the UCSMesh operator below (renders the result) and the CS-landscape road
 // heightmap path. The caller sets final buffer access and calls GraphBuilder.Execute().
 void BuildRoadGeometryRDG(
 	FRDGBuilder& GraphBuilder,
 	ERHIFeatureLevel::Type FeatureLevel,
 	const FRoadBuildInput& Input,
 	const FRoadGeometryBuffers& Out);
+
+/**
+ * The road as a UCSMesh operator: sizes Target, runs the pipeline above into its resident
+ * streams inside one UCSMesh::EditMeshSync, then bakes InputToWorld into the result.
+ *
+ * Why the bake is a separate step and not a shader parameter: RoadBuilder.usf emits the
+ * samples in whatever space they arrive in, and the resident set is world space by contract
+ * (UCSMeshRenderComponent draws it with an absolute transform). Rather than thread a matrix
+ * through six kernels, the finished mesh goes through UCSMeshOps::TransformMesh — the
+ * sanctioned way to touch the resident buffers, and it moves the bounds with the geometry.
+ * Identity is skipped, so a road authored at the origin pays nothing.
+ *
+ * InputToWorld is the transform Input.Points are expressed relative to. It is NOT read off
+ * any component: the caller resampled the splines into that space and is the only thing that
+ * knows which one it was.
+ *
+ * Replaces Target's contents. Blocking (allocation, edit and bake each flush). Returns false
+ * when there is nothing to build, the RHI is below SM5, or the capacity was refused — and in
+ * every one of those cases Target is left holding whatever it held before, so the caller must
+ * not assume the mesh now matches Input.
+ */
+bool BuildRoadGeometryIntoMesh(UCSMesh* Target, const FRoadBuildInput& Input, const FTransform& InputToWorld);
 
 // Compute kernels of Shaders/Private/RoadBuilder.usf. One class per entry
 // point; parameter structs list exactly the resources each kernel touches.

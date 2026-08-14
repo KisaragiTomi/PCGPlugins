@@ -34,13 +34,14 @@ public:
 
 protected:
 	/** Render material reported to GetUsedMaterials and used by the scene proxy.
-	 *  Leaves back this with their own UPROPERTY (e.g. RoadMaterial) to avoid changing
-	 *  serialized data. Null falls back to the default surface material in the proxy. */
+	 *  Leaves back this with their own UPROPERTY to avoid changing serialized data. Null falls
+	 *  back to the default surface material in the proxy. */
 	virtual UMaterialInterface* GetRenderMaterial() const { return nullptr; }
 
 	/** ReadbackMeshSync 会把当前代理无检查地 static_cast 成 FCSGpuMeshSceneProxy。
-	 *  只创建本基座代理的叶子（road / vine）保持默认 true 即可；能按模式创建其他代理的
-	 *  叶子（UCSDisplayComponent）必须覆写，否则那次 cast 是 UB。 */
+	 *  只创建本基座代理的叶子保持默认 true 即可；任何可能创建其他代理、或可能没有代理的叶子
+	 *  必须覆写，否则那次 cast 是 UB。现存的覆写者是 UCSMeshRenderComponent（按网格对象有没有
+	 *  分配来答）。曾经的例子 UCSDisplayComponent 已不再派生自本基座。 */
 	virtual bool IsGpuMeshProxyActive() const { return true; }
 
 	// Local-space bounds used by CalcBounds; leaves update this when their geometry changes.

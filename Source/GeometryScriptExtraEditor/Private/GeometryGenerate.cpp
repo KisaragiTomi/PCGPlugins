@@ -362,16 +362,20 @@ void AddActorComponentPoints(UStaticMeshComponent* StaticMeshComponent, const FB
 	}
 }
 
-// IsValid/IsFinite/IsDegenerate helpers + BuildDynamicMeshFromCSTriangleData moved to CSMeshBuild.cpp (ComputeShaderGenerator).
+// IsValid/IsFinite/IsDegenerate helpers + the CS-triangle mesh builder live in CSMeshBuild.cpp
+// (ComputeShaderGenerator); it produces a UCSMesh, and UCSMeshOps::CopyToDynamicMesh is the only
+// conversion from there to a UDynamicMesh.
 }
 
 
 
 
 
-UDynamicMesh* UGeometryGenerate::CSTriangleDataToDynamicMesh(FCSTriangleMeshData CSTriangleData, bool bReverseOrientation, bool bSkipDegenerateTriangles, bool bRecomputeNormals)
+UCSMesh* UGeometryGenerate::CSTriangleDataToGpuMesh(UCSMesh* TargetMesh, UObject* Outer, FCSTriangleMeshData CSTriangleData, bool bReverseOrientation, bool bSkipDegenerateTriangles, bool bRecomputeNormals)
 {
-	return CSTriangleBuffersToDynamicMesh(
+	return CSTriangleBuffersToGpuMesh(
+		TargetMesh,
+		Outer,
 		CSTriangleData.Vertices,
 		CSTriangleData.Indices,
 		CSTriangleData.VertexNormals,
@@ -382,61 +386,16 @@ UDynamicMesh* UGeometryGenerate::CSTriangleDataToDynamicMesh(FCSTriangleMeshData
 		bRecomputeNormals);
 }
 
-UDynamicMesh* UGeometryGenerate::CSTriangleBuffersToDynamicMesh(TArray<FVector> Vertices, TArray<int32> Indices, TArray<FVector> VertexNormals, int32 VertexCount, int32 IndexCount, bool bReverseOrientation, bool bSkipDegenerateTriangles, bool bRecomputeNormals)
+UCSMesh* UGeometryGenerate::CSTriangleBuffersToGpuMesh(UCSMesh* TargetMesh, UObject* Outer, TArray<FVector> Vertices, TArray<int32> Indices, TArray<FVector> VertexNormals, int32 VertexCount, int32 IndexCount, bool bReverseOrientation, bool bSkipDegenerateTriangles, bool bRecomputeNormals)
 {
-	return CSMeshBuild::BuildDynamicMeshFromCSTriangleData(
+	return CSMeshBuild::BuildGpuMeshFromCSTriangleData(
+		TargetMesh,
+		Outer,
 		Vertices,
 		Indices,
 		VertexNormals,
 		VertexCount,
 		IndexCount,
-		bReverseOrientation,
-		bSkipDegenerateTriangles,
-		bRecomputeNormals);
-}
-
-UDynamicMesh* UGeometryGenerate::CSTriangleReadbackToDynamicMesh(const TArray<FVector4f>& CompactVertices, const TArray<uint32>& CompactIndices, const TArray<FVector4f>& CompactVertexNormals, int32 VertexCount, int32 IndexCount, bool bReverseOrientation, bool bSkipDegenerateTriangles, bool bRecomputeNormals)
-{
-	const int32 EffectiveVertexCount = VertexCount >= 0
-		? FMath::Clamp(VertexCount, 0, CompactVertices.Num())
-		: CompactVertices.Num();
-	const int32 EffectiveIndexCount = IndexCount >= 0
-		? FMath::Clamp(IndexCount, 0, CompactIndices.Num())
-		: CompactIndices.Num();
-
-	TArray<FVector> Vertices;
-	Vertices.Reserve(EffectiveVertexCount);
-	for (int32 VertexIndex = 0; VertexIndex < EffectiveVertexCount; ++VertexIndex)
-	{
-		const FVector4f& Vertex = CompactVertices[VertexIndex];
-		Vertices.Add(FVector(Vertex.X, Vertex.Y, Vertex.Z));
-	}
-
-	TArray<int32> Indices;
-	Indices.Reserve(EffectiveIndexCount);
-	for (int32 IndexBufferIndex = 0; IndexBufferIndex < EffectiveIndexCount; ++IndexBufferIndex)
-	{
-		const uint32 Index = CompactIndices[IndexBufferIndex];
-		Indices.Add(Index <= uint32(TNumericLimits<int32>::Max()) ? int32(Index) : INDEX_NONE);
-	}
-
-	TArray<FVector> VertexNormals;
-	if (CompactVertexNormals.Num() >= EffectiveVertexCount)
-	{
-		VertexNormals.Reserve(EffectiveVertexCount);
-		for (int32 NormalIndex = 0; NormalIndex < EffectiveVertexCount; ++NormalIndex)
-		{
-			const FVector4f& Normal = CompactVertexNormals[NormalIndex];
-			VertexNormals.Add(FVector(Normal.X, Normal.Y, Normal.Z));
-		}
-	}
-
-	return CSMeshBuild::BuildDynamicMeshFromCSTriangleData(
-		Vertices,
-		Indices,
-		VertexNormals,
-		EffectiveVertexCount,
-		EffectiveIndexCount,
 		bReverseOrientation,
 		bSkipDegenerateTriangles,
 		bRecomputeNormals);
@@ -1536,15 +1495,9 @@ FVector UGeometryGenerate::TestViewPosition()
 	return FVector::ZeroVector;
 }
 
-UDynamicMesh* UGeometryGenerate::SurfaceVoxelsToVDBMesh(AComputeShaderMeshGenerator* Generator,
-	float VoxelSize,
-	float RadiusMult,
-	bool bRecomputeNormals)
-{
-	return Generator ? Generator->SurfaceVoxelsToVDBMesh(VoxelSize, RadiusMult, bRecomputeNormals) : nullptr;
-}
-
-UDynamicMesh* UGeometryGenerate::VDBVoxelsToOpenDynamicMesh(FCSSurfaceVoxelData SurfaceVoxels,
+UCSMesh* UGeometryGenerate::VDBVoxelsToOpenGpuMesh(UCSMesh* TargetMesh,
+	UObject* Outer,
+	FCSSurfaceVoxelData SurfaceVoxels,
 	float VoxelSize,
 	float RadiusMult,
 	bool bRecomputeNormals)
@@ -1552,40 +1505,14 @@ UDynamicMesh* UGeometryGenerate::VDBVoxelsToOpenDynamicMesh(FCSSurfaceVoxelData 
 	const int32 EffectiveVoxelCount = SurfaceVoxels.VoxelCount >= 0
 		? FMath::Clamp(SurfaceVoxels.VoxelCount, 0, SurfaceVoxels.Positions.Num())
 		: SurfaceVoxels.Positions.Num();
-	if (EffectiveVoxelCount <= 0)
-	{
-		return NewObject<UDynamicMesh>();
-	}
 
-	const float SafeVoxelSize = FMath::Max(VoxelSize > 0.0f ? VoxelSize : SurfaceVoxels.VoxelSize, UE_KINDA_SMALL_NUMBER);
-
-	// 收集有效的世界空间位置
+	// 收集世界空间位置。非有限值的剔除留给下游统一做，这里只截取有效计数那一段。
 	TArray<FVector> WorldPositions;
-	WorldPositions.Reserve(EffectiveVoxelCount);
-	for (int32 Index = 0; Index < EffectiveVoxelCount; ++Index)
-	{
-		const FVector& Position = SurfaceVoxels.Positions[Index];
-		if (Position.ContainsNaN() || !FMath::IsFinite(Position.X) || !FMath::IsFinite(Position.Y) || !FMath::IsFinite(Position.Z))
-		{
-			continue;
-		}
-		WorldPositions.Add(Position);
-	}
+	WorldPositions.Reserve(FMath::Max(EffectiveVoxelCount, 0));
+	for (int32 Index = 0; Index < EffectiveVoxelCount; ++Index) WorldPositions.Add(SurfaceVoxels.Positions[Index]);
 
-	if (WorldPositions.IsEmpty())
-	{
-		return NewObject<UDynamicMesh>();
-	}
-
-	// 使用 VDB ParticlesToLevelSet 转 mesh，输入已经是世界空间坐标
-	UDynamicMesh* OutMesh = NewObject<UDynamicMesh>();
-	UVDBExtra::ParticlesToVDBMeshUniform(OutMesh, WorldPositions, RadiusMult, SafeVoxelSize, false);
-
-	if (bRecomputeNormals)
-	{
-		FGeometryScriptCalculateNormalsOptions CalculateOptions;
-		UGeometryScriptLibrary_MeshNormalsFunctions::RecomputeNormals(OutMesh, CalculateOptions);
-	}
-
-	return OutMesh;
+	// VoxelSize<=0 表示"沿用体素化时的尺寸"，只有这份数据知道那个尺寸是多少。
+	const float SafeVoxelSize = FMath::Max(VoxelSize > 0.0f ? VoxelSize : SurfaceVoxels.VoxelSize, UE_KINDA_SMALL_NUMBER);
+	return AComputeShaderMeshGenerator::VDBParticlesToGpuMesh(
+		TargetMesh, Outer, WorldPositions, SafeVoxelSize, RadiusMult, bRecomputeNormals);
 }

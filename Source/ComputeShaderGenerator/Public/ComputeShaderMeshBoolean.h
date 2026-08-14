@@ -1,9 +1,11 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "CSGpuMeshTypes.h"
 #include "ComputeShaderMeshGenerator.h"
 #include "ComputeShaderMeshBoolean.generated.h"
 
+class UCSMesh;
 class UStaticMesh;
 
 /** Stage B 布尔运算。当前用 self-winding（整个 soup 一起求缠绕数）实现，见各枚举说明。 */
@@ -18,6 +20,139 @@ enum class ECSMeshBooleanOp : uint8
 	KeepInside,
 	/** 反：保留 |winding| < WindingIsoThreshold 区域的边界（外部外壳）。 */
 	KeepOutside,
+};
+
+/**
+ * Boolean policy, lifted out of the actor so the operator library can run the same pipeline
+ * without one.
+ *
+ * The actor keeps every UPROPERTY it ever had and packs them into this struct on the way in
+ * (MakeBooleanOptions), so serialized Blueprint values and existing call sites are untouched;
+ * this is the parameter set, not a second source of truth.
+ */
+USTRUCT(BlueprintType)
+struct COMPUTESHADERGENERATOR_API FCSMeshBooleanOptions
+{
+	GENERATED_BODY()
+
+	/** Ceiling on source triangles collected from the box. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean", meta = (ClampMin = "1"))
+	int32 MaxSourceTriangles = 5000000;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean")
+	bool bReadLandscape = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean", meta = (ClampMin = "1"))
+	int32 CutSegmentsPerTriangle = 4;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean", meta = (ClampMin = "1024"))
+	int32 MaxCutSegmentsHardCap = 200000000;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean")
+	float SideEpsilon = 0.01f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean")
+	float MinCutSegmentLength = 0.05f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean", meta = (ClampMin = "0.0", ClampMax = "45.0"))
+	float CoplanarAngleDegrees = 1.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean", meta = (ClampMin = "0.0"))
+	float CoplanarOffsetEpsilon = 0.1f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|Boolean")
+	float WindingIsoThreshold = 0.5f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|Boolean", meta = (ClampMin = "0.001"))
+	float WindingSampleOffset = 0.5f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|Boolean", meta = (ClampMin = "1.1"))
+	float WindingBeta = 2.5f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|RayVisibility", meta = (ClampMin = "1"))
+	int32 VisibilityRayCount = 64;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|RayVisibility", meta = (ClampMin = "90.0", ClampMax = "180.0"))
+	float VisibilityHalfAngleDegrees = 120.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|RayVisibility", meta = (ClampMin = "0.0"))
+	float VisibilityShellRadius = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|RayVisibility", meta = (ClampMin = "0.0"))
+	float VisibilitySampleDensity = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|RayVisibility", meta = (ClampMin = "0.0"))
+	float VisibilityRayBiasEpsilon = 0.05f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|RayVisibility")
+	bool bKeepBackFacingVisible = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|PostProcess", meta = (ClampMin = "0.0"))
+	float RetainedTriangleExpansionDistance = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|PostProcess", meta = (ClampMin = "0.0"))
+	float VertexWeldDistance = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|Output")
+	bool bPreserveSourceMaterialSlots = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|GPU Arrangement", meta = (ClampMin = "0.0"))
+	float SnapRoundQuantum = 0.01f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|GPU Arrangement", meta = (ClampMin = "2"))
+	int32 ArrangementOutputTrianglesPerSource = 8;
+};
+
+/**
+ * One Boolean pipeline run's raw output, held in the two representations the two output
+ * rebuilds consume.
+ *
+ * Why this exists: **the pipeline is not run-to-run deterministic.** The source soup is filled
+ * by a CAS bump allocator (ExtractStaticMeshTrianglesCS), so a given source triangle's soup
+ * index moves between runs; the BSP orders each triangle's cuts by the *index* of the other
+ * triangle that produced them (BSPCutOtherOwner), so the cut application order moves with it,
+ * and with it the tessellation. Two runs of the same Boolean on the same scene return slightly
+ * different triangle counts.
+ *
+ * That makes "run the pipeline twice and compare the two outputs" useless as a parity check —
+ * it compares two different fragment sets, not two implementations. A capture is what lets both
+ * rebuilds be handed the *same* fragments: the CPU arrays a consumer reads back and the pooled
+ * buffers held here are the same bytes, so a comparison across them isolates the rebuild.
+ *
+ * Lifetime: pooled render buffers and raw material pointers, valid only for the synchronous
+ * call that produced it. Not reflected, and not for storage.
+ */
+struct COMPUTESHADERGENERATOR_API FCSMeshBooleanCapture
+{
+	/** The arrangement's sub-triangle soup (3 float3 per fragment) and its per-fragment
+	 *  encoded source (low bits source triangle, high bits Stage B classification). */
+	TRefCountPtr<FRDGPooledBuffer> FragmentSoup;
+	TRefCountPtr<FRDGPooledBuffer> FragmentSource;
+
+	/** The source triangle soup's per-corner attributes, parallel to the source triangles. */
+	TRefCountPtr<FRDGPooledBuffer> SourceVertices;
+	TRefCountPtr<FRDGPooledBuffer> SourceNormals;
+	TRefCountPtr<FRDGPooledBuffer> SourceUVs;
+	TRefCountPtr<FRDGPooledBuffer> SourceColors;
+	TRefCountPtr<FRDGPooledBuffer> SourceTangents;
+	TRefCountPtr<FRDGPooledBuffer> SourceBiTangents;
+	TRefCountPtr<FRDGPooledBuffer> SourceMaterialIds;
+
+	/** The extraction's material registry; the per-triangle ids index it. */
+	TArray<UMaterialInterface*> MaterialRegistry;
+
+	uint32 SourceTriangleCount = 0;
+	uint32 FragmentCount = 0;
+	/** Fragments the accept predicate keeps, i.e. the output triangle count. GPU-counted, so a
+	 *  consumer can size a resident allocation without guessing. */
+	uint32 OutputTriangleCount = 0;
+	int32 SourceUVChannels = 1;
+	/** Stage B ran, so MB_SRC_KEEP filtering applies. */
+	bool bStageB = false;
+	/** Conservative world bound, for a consumer that has nothing better until it reduces. */
+	FBox QueryBox = FBox(ForceInit);
+
+	bool IsValid() const;
 };
 
 /**
@@ -192,6 +327,84 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Boolean")
 	UStaticMesh* BooleanBoxScene(ECSMeshBooleanOp Op);
+
+	/** Packs this actor's UPROPERTYs into the policy struct the pipeline actually reads. */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Boolean")
+	FCSMeshBooleanOptions MakeBooleanOptions() const;
+
+	/**
+	 * Runs the Boolean pipeline and returns the result as a CPU mesh snapshot, stopping short
+	 * of building any asset. Splitting the one-shot entry point here is what lets the operator
+	 * library put the result into a UCSMesh (where it can be welded, transformed, drawn or
+	 * saved) instead of only ever producing a transient StaticMesh.
+	 *
+	 * Note what is and is not GPU-resident: the arrangement, classification and visibility
+	 * work all run on the GPU, but the output attribute reconstruction (barycentric UV /
+	 * normal / tangent / colour interpolation onto the sub-triangles, and the per-corner
+	 * material-slot table) is CPU work reading a readback. So the *pipeline* is chainable on
+	 * the GPU from here on, while the Boolean itself still round-trips once.
+	 *
+	 * Synchronous (internal FlushRenderingCommands). Game thread only.
+	 *
+	 * Passing OutCapture also hands back the pipeline output this rebuild consumed — the same
+	 * fragments and source attributes, as the GPU buffers the CPU arrays were read back from.
+	 * That is what lets a caller feed the GPU rebuild identical data instead of a second,
+	 * differently-tessellated run of the pipeline (see FCSMeshBooleanCapture). It costs one
+	 * extra counting dispatch and is otherwise inert; the default leaves every existing call
+	 * site unchanged.
+	 */
+	bool RunBooleanToSnapshot(
+		ECSMeshBooleanOp Op,
+		const FCSMeshBooleanOptions& Options,
+		FCSGpuMeshCPUData& OutMeshData,
+		TArray<UMaterialInterface*>& OutMaterials,
+		FCSMeshBooleanCapture* OutCapture = nullptr);
+
+	/**
+	 * The GPU output rebuild on its own: takes one captured pipeline run and writes Target's
+	 * resident streams. This is the half that was ported from the CPU rebuild — the accept
+	 * predicate and the barycentric attribute interpolation — with the pipeline factored out.
+	 *
+	 * Split out from RunBooleanToGpuMesh so it can be pointed at a capture somebody else
+	 * produced. Since the pipeline is not run-to-run deterministic, that is the only way to
+	 * compare this rebuild against the CPU one on equal terms.
+	 *
+	 * Replaces Target's contents and its material table. Game thread only; blocks.
+	 */
+	bool RebuildGpuMeshFromCapture(const FCSMeshBooleanCapture& Capture, UCSMesh* Target);
+
+	/**
+	 * Runs the same Boolean pipeline and writes the result straight into Target's resident
+	 * streams, replacing its contents. The GPU counterpart of RunBooleanToSnapshot: no mesh
+	 * data ever reaches the CPU.
+	 *
+	 * What the two share is the graph itself (one builder, one set of passes). What differs is
+	 * only the consumer: the snapshot path reads the sub-triangle soup and the source attributes
+	 * back and rebuilds the output attributes on the CPU; this one runs that same barycentric
+	 * rebuild as a compute kernel over buffers the GPU already holds. The output is expected to
+	 * agree to float precision — MeshBoolean.GpuParity is what holds them together.
+	 *
+	 * One small readback survives and cannot be removed: a ~26-uint status block carrying the
+	 * source triangle count, the fragment count, the overflow flags and the output triangle
+	 * count. UCSMesh capacity is a CPU-side allocation and only the GPU knows how big the result
+	 * is, so the size has to come back before the streams can be sized. No attribute does.
+	 *
+	 * Target->Materials is replaced by the extraction's material registry plus one trailing
+	 * empty slot, and the per-triangle id stream indexes that table: a source triangle with
+	 * CS_NO_MATERIAL_ID (or an out-of-range registry id) lands in the trailing slot rather than
+	 * in registry slot 0. Slot NUMBERING therefore differs from RunBooleanToSnapshot, which
+	 * builds a deduplicated table in first-use order; the material each triangle resolves to
+	 * does not.
+	 *
+	 * Returns false — leaving Target untouched — when the pipeline produces nothing, and also
+	 * when Options.VertexWeldDistance > 0, which this path does not implement (see the comment
+	 * on the implementation). Callers that must always produce a result fall back to
+	 * RunBooleanToSnapshot. Synchronous (internal FlushRenderingCommands). Game thread only.
+	 */
+	bool RunBooleanToGpuMesh(
+		ECSMeshBooleanOp Op,
+		const FCSMeshBooleanOptions& Options,
+		UCSMesh* Target);
 
 private:
 	/** Split / Boolean 的共用实现。Op 决定是否跑 Stage B 缠绕数分类。 */

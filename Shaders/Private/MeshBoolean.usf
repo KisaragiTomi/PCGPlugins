@@ -495,6 +495,10 @@ Buffer<uint> FinalCutCounter;
 Buffer<uint> FinalTriStats;
 Buffer<uint> FinalOutputCounter;
 Buffer<uint> FinalBSPStats;
+// GPU 输出路径的 accept 计数（MeshBooleanCountKeptCS 写）。搭这趟车而不是另开一次回读：
+// 这是本管线唯一一次 CPU 等 GPU，多读一个 uint 是免费的，而输出三角数正是 CPU 分配
+// UCSMesh 常驻容量所必需的。CPU 回读路径不 dispatch 计数核，这里读到的就是清零值。
+Buffer<uint> FinalKeptCounter;
 RWBuffer<uint> RW_FinalStatus;
 uint FinalBSPStatCount;
 
@@ -508,6 +512,7 @@ void FinalStatusCS(uint3 DTid : SV_DispatchThreadID)
 	RW_FinalStatus[11] = FinalOutputCounter[0];
 	RW_FinalStatus[12] = FinalOutputCounter[1];
 	for (uint i = 0u; i < FinalBSPStatCount; ++i) RW_FinalStatus[13u + i] = FinalBSPStats[i];
+	RW_FinalStatus[13u + FinalBSPStatCount] = FinalKeptCounter[0];
 }
 
 // =============================================================================
@@ -1091,4 +1096,348 @@ void ClassifyIndirectArgsCS(uint3 DTid : SV_DispatchThreadID)
 void RescueIndirectArgsCS(uint3 DTid : SV_DispatchThreadID)
 {
 	MBWriteIndirectArgs(min(MBAmbiguousCounterSRV[0], MBAmbiguousCapacity));
+}
+
+// =============================================================================
+// GPU 输出：fragment → UCSMesh 常驻流
+//
+// 这是 RunBooleanToSnapshot 里那段 CPU 属性重建的移植。算法一字未改：按源三角解重心
+// 权重（clamp 到 [0,1] 再归一化），同一组权重复用给 UV / 法线 / 切线 / 副切线 / 颜色。
+// 变的只是数据从哪来、往哪去 —— 源属性本来就在 GPU 上（提取阶段写的那几条 buffer），
+// 输出直接写常驻流，中间不再落回 CPU 又传上来。
+//
+// 两条路径必须给出同样的结果：改这里就要同步改 ComputeShaderMeshBoolean.cpp 里的
+// CPU 版，反之亦然。MeshBoolean.GpuParity 就是拿来钉死这件事的。
+// =============================================================================
+
+// --- 上一张图产出的 fragment（本图重新注册的常驻 buffer）---
+StructuredBuffer<float3> MBOutFragmentSoup;   // 3 float3 / fragment
+Buffer<uint>   MBOutFragmentSource;           // 低位源三角序号 + 高位分类（MB_SRC_*）
+Buffer<uint>   MBOutFragmentCounterSRV;       // [0]=fragment 数
+Buffer<uint>   MBOutSoupCounterSRV;           // [0]=源三角数
+
+// --- 源 soup 的逐角点属性（与源三角 soup 平行，3 个/三角）---
+Buffer<float4> MBOutSourceVertices;
+Buffer<float4> MBOutSourceNormals;
+Buffer<float2> MBOutSourceUVs;                // 按通道交错：[(tri*3+k) * 通道数 + 通道]
+Buffer<float4> MBOutSourceColors;             // RGBA 0..1；提取阶段预清成 (1,1,1,1)
+Buffer<float4> MBOutSourceTangents;
+Buffer<float4> MBOutSourceBiTangents;
+Buffer<uint>   MBOutSourceMaterialIds;
+
+// --- 目标：常驻流（布局与 CSMeshOps.usf 逐字节一致）---
+RWBuffer<float> RW_MBOutPositions;
+RWBuffer<uint>  RW_MBOutTangents;
+RWBuffer<float> RW_MBOutTexCoords;
+RWBuffer<uint>  RW_MBOutColors;
+RWBuffer<uint>  RW_MBOutIndices;
+RWBuffer<uint>  RW_MBOutMaterialIds;
+RWBuffer<uint>  RW_MBOutMeshCounters;
+RWBuffer<uint>  RW_MBOutIndirectArgs;
+RWBuffer<uint>  RW_MBOutTriangleCounter;      // [0]=已发射三角数（emit 的分配游标）
+RWBuffer<uint>  RW_MBOutKeptCounter;          // [0]=通过 accept 的 fragment 数（CPU 据此定容量）
+Buffer<uint>    MBOutTriangleCounterSRV;
+
+uint MBOutFragmentCount;
+uint MBOutFragmentCapacity;
+uint MBOutSourceTriangleCount;
+uint MBOutSourceTriangleCapacity;
+uint MBOutSourceUVChannels;
+uint MBOutMaterialRegistryCount;
+uint MBOutNoMaterialSlot;
+uint MBOutVertexCapacity;
+uint MBOutIndexCapacity;
+uint MBOutStageB;                             // 1 = 跑过 Stage B，需按 MB_SRC_KEEP 过滤
+
+// 与 CSMeshOps.usf 的同名函数逐字节一致：常驻切线流是 VET_PackedNormal /
+// PF_R8G8B8A8_SNORM，颜色流是 VET_Color（BGRA）。两处必须同时改，否则同一条流被
+// 两个生产者写成两种编码，而顶点工厂只按一种解。
+uint MBOutPackSnorm8888(float4 V)
+{
+	int4 I = int4(round(clamp(V, -1.0, 1.0) * 127.0));
+	return (uint(I.x) & 0xFF) | ((uint(I.y) & 0xFF) << 8) | ((uint(I.z) & 0xFF) << 16) | ((uint(I.w) & 0xFF) << 24);
+}
+
+uint MBOutPackColorBGRA(float4 RGBA)
+{
+	uint4 I = uint4(round(saturate(RGBA) * 255.0));
+	return (I.z & 0xFF) | ((I.y & 0xFF) << 8) | ((I.x & 0xFF) << 16) | ((I.w & 0xFF) << 24);
+}
+
+// FVector3f::GetSafeNormal(UE_SMALL_NUMBER, Fallback) 的等价物。阈值是**模平方**上的
+// 1e-8，与 UE 一致；写成 !(x > t) 是为了让 NaN 也走 fallback。
+float3 MBOutSafeNormal(float3 V, float3 Fallback)
+{
+	const float SquareSum = dot(V, V);
+	if (!(SquareSum > 1e-8f)) return Fallback;
+	return V * rsqrt(SquareSum);
+}
+
+// FVector3f::IsNearlyZero()：逐分量绝对值判据，不是模长。
+bool MBOutIsNearlyZero(float3 V)
+{
+	return all(abs(V) <= 1e-8f);
+}
+
+// ---- 补偿叉积：让退化面判据与 CPU 版的 double 叉积给出同一个答案 ----
+//
+// CPU 版是 FVector3d(P1-P0).Cross(FVector3d(P2-P0))：**相减在 float32，叉积在 double**。
+// 两个 float32 的乘积在 double 里可精确表示（24+24=48 ≤ 53 位），相近两数相减又是精确的，
+// 所以那个叉积是 float32 输入的**精确**行列式。它的判据 SquaredLength() < 1e-24（即
+// |cross| < 1e-12）因此等价于「精确面积基本为零」。
+//
+// 直接用 float32 叉积复现不了这个判断：arrangement 切出的小碎片边长可以到 0.01 cm 量级，
+// 乘积约 1e-4，一个 float32 ulp 就是 6e-12。两个精确值只差 1e-18 的乘积，多数情况下舍入到
+// 同一个 float32、相减得 0（与 CPU 一致），但只要它们跨在舍入边界两侧，float32 就会报出
+// 一个 6e-12 的差 —— 平方后 3.6e-23，越过 1e-24 被判为非退化，而 CPU 看到的是 1e-36。
+// 这就是 GPU 比 CPU 多吐几片三角的全部原因。
+//
+// 补偿（Dekker 二乘 + Kahan 行列式）把 a*d-b*c 算到真值的 ~1.5 ulp，与量级无关：精确值为零
+// 时结果精确为零，非零时也不会被舍入噪声顶到阈值之上。
+//
+// 分裂用位掩码而不是教科书的 c-(c-a)：后者在允许重结合的浮点模型下会被优化器折成 a，
+// 补偿项静默变成 0，退化回现在这个 bug —— 而且没有任何症状会指向它。位运算折不掉。
+void MBOutSplitFloat(float a, out float hi, out float lo)
+{
+	hi = asfloat(asuint(a) & 0xFFFFF000u);   // 只留 12 位尾数
+	lo = a - hi;                             // 余下 12 位，精确
+}
+
+// p = fl(a*b)，e = a*b - p（精确）。四个部分积都是 12x12 位，float32 可精确表示。
+void MBOutTwoProduct(float a, float b, out float p, out float e)
+{
+	p = a * b;
+	float ahi, alo, bhi, blo;
+	MBOutSplitFloat(a, ahi, alo);
+	MBOutSplitFloat(b, bhi, blo);
+	e = ((ahi * bhi - p) + ahi * blo + alo * bhi) + alo * blo;
+}
+
+// a*d - b*c，带补偿。抵消发生在 p1-p2 上，而相近两浮点数相减是精确的，误差项 e1-e2 再把
+// 被舍掉的部分补回来。
+float MBOutDeterminant2(float a, float d, float b, float c)
+{
+	float p1, e1, p2, e2;
+	MBOutTwoProduct(a, d, p1, e1);
+	MBOutTwoProduct(b, c, p2, e2);
+	return (p1 - p2) + (e1 - e2);
+}
+
+float3 MBOutCompensatedCross(float3 u, float3 v)
+{
+	return float3(
+		MBOutDeterminant2(u.y, v.z, u.z, v.y),
+		MBOutDeterminant2(u.z, v.x, u.x, v.z),
+		MBOutDeterminant2(u.x, v.y, u.y, v.x));
+}
+
+// 源三角自身的平面法线。这里用普通 float32 叉积就够：源三角是提取阶段产物，退化的
+// （dot(N,N) <= 1e-8）在提取时就被跳过了，|N| > 1e-4 离 1e-12 阈值有八个数量级，
+// 不存在碎片那种贴着阈值的情形。补偿只用在 fragment 的面积判据上。
+float3 MBOutSourceFaceNormal(uint tri)
+{
+	const float3 A = MBOutSourceVertices[tri * 3u + 0u].xyz;
+	const float3 B = MBOutSourceVertices[tri * 3u + 1u].xyz;
+	const float3 C = MBOutSourceVertices[tri * 3u + 2u].xyz;
+	const float3 N = cross(B - A, C - A);
+	const float L = length(N);
+	return (L > 1e-12f) ? (N / L) : float3(0.0f, 0.0f, 1.0f);
+}
+
+// 一个 fragment 是否进入输出，以及它最终的角点顺序。计数核与发射核共用同一份判据：
+// 分成两份写就等于让 CPU 分配的容量和 GPU 实际写的三角数各自演化，而两者对不上时
+// 表现为「网格尾部是上一位租客的数据」，不会报任何错。
+bool MBOutAcceptFragment(uint f, uint sourceCount, out uint tri, out float3 p0, out float3 p1, out float3 p2)
+{
+	p0 = float3(0.0f, 0.0f, 0.0f);
+	p1 = p0;
+	p2 = p0;
+	const uint encoded = MBOutFragmentSource[f];
+	tri = encoded & MB_SRC_MASK;
+	if (tri >= sourceCount) return false;
+	// Stage B 只在 OutSource 上打标记而不从 soup 里移除，故过滤在消费端做。
+	// ArrangementOnly 没跑分类 pass，全部 fragment 保留。
+	if (MBOutStageB != 0u && (encoded & MB_SRC_KEEP) == 0u) return false;
+
+	p0 = MBOutFragmentSoup[f * 3u + 0u];
+	p1 = MBOutFragmentSoup[f * 3u + 1u];
+	p2 = MBOutFragmentSoup[f * 3u + 2u];
+	// 与 CPU 版逐字对应：相减在 float32、叉积走补偿（等价于它的 double 叉积），阈值同为
+	// 1e-24，非有限同样丢弃。补偿是必须的，见 MBOutCompensatedCross 的注释。
+	const float3 facing = MBOutCompensatedCross(p1 - p0, p2 - p0);
+	const float facingSq = dot(facing, facing);
+	if (!isfinite(facingSq) || facingSq < 1e-24f) return false;
+
+	// 绕序约定：UE 取的正面法线是**反向**叉积 cross(P2-P0, P1-P0)，所以常规右手叉积
+	// 与源法线**同向**才说明绕序反了。与 CPU 版同一口径，两处必须一起改，否则整块
+	// 输出翻面。
+	if (dot(facing, MBOutSourceFaceNormal(tri)) > 0.0f)
+	{
+		const float3 swap = p1;
+		p1 = p2;
+		p2 = swap;
+	}
+	return true;
+}
+
+// 点 P（落在源三角 tri 的平面内或近旁）相对该三角的重心权重。
+//
+// clamp + 归一化是承重的：布尔切出来的窄条/尖角碎片上，不夹的解会飘出三角外，把插值
+// 出来的 UV 一起拖走。
+//
+// 分母与分子用叉积而不是 CPU 版的 2x2 点积行列式：由拉格朗日恒等式两者在精确算术下
+// 完全相同（CPU 在 double 里算，用哪个都准），但在 float32 里点积形式的
+// D00*D11 - D01² 早在夹角约 1e-3 rad 就被抵消吃光，叉积形式要到 1e-7 rad 才失真。
+float3 MBOutSolveBary(uint tri, float3 P)
+{
+	const float3 A = MBOutSourceVertices[tri * 3u + 0u].xyz;
+	const float3 B = MBOutSourceVertices[tri * 3u + 1u].xyz;
+	const float3 C = MBOutSourceVertices[tri * 3u + 2u].xyz;
+	const float3 V0 = B - A;
+	const float3 V1 = C - A;
+	const float3 V2 = P - A;
+	const float3 N = cross(V0, V1);
+	const float Denom = dot(N, N);
+
+	float Wa = 1.0f;
+	float Wb = 0.0f;
+	float Wc = 0.0f;
+	if (Denom > 1e-20f)
+	{
+		Wb = dot(cross(V2, V1), N) / Denom;
+		Wc = dot(cross(V0, V2), N) / Denom;
+		Wa = 1.0f - Wb - Wc;
+	}
+	// saturate 与 FMath::Clamp(W, 0, 1) 同义；NaN 在这里归 0，随后被 Sum 判据兜成 (1,0,0)，
+	// 与 CPU 版 NaN 透传到 Sum 判据的结果一致。
+	Wa = saturate(Wa);
+	Wb = saturate(Wb);
+	Wc = saturate(Wc);
+	const float Sum = Wa + Wb + Wc;
+	if (Sum > 1e-12f) return float3(Wa, Wb, Wc) / Sum;
+	return float3(1.0f, 0.0f, 0.0f);
+}
+
+float2 MBOutBaryUV(uint tri, float3 W)
+{
+	const uint Ch = MBOutSourceUVChannels;
+	const float2 Ua = MBOutSourceUVs[(tri * 3u + 0u) * Ch];
+	const float2 Ub = MBOutSourceUVs[(tri * 3u + 1u) * Ch];
+	const float2 Uc = MBOutSourceUVs[(tri * 3u + 2u) * Ch];
+	return W.x * Ua + W.y * Ub + W.z * Uc;
+}
+
+// 每 fragment 一线程，只数不写：CPU 拿这个数分配常驻容量，所以它必须与 emit 的接受
+// 判据完全一致（同一个 MBOutAcceptFragment）。
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MeshBooleanCountKeptCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint f = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (f >= min(MBOutFragmentCounterSRV[0], MBOutFragmentCapacity)) return;
+
+	const uint sourceCount = min(MBOutSoupCounterSRV[0], MBOutSourceTriangleCapacity);
+	uint tri;
+	float3 p0, p1, p2;
+	if (!MBOutAcceptFragment(f, sourceCount, tri, p0, p1, p2)) return;
+	InterlockedAdd(RW_MBOutKeptCounter[0], 1u);
+}
+
+// 每 fragment 一线程：解重心权重、插源属性、写进常驻流。
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MeshBooleanEmitToMeshCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint f = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (f >= MBOutFragmentCount) return;
+
+	uint tri;
+	float3 p[3];
+	if (!MBOutAcceptFragment(f, MBOutSourceTriangleCount, tri, p[0], p[1], p[2])) return;
+
+	uint dstTri;
+	InterlockedAdd(RW_MBOutTriangleCounter[0], 1u, dstTri);
+	const uint dstCorner = dstTri * 3u;
+	if ((dstCorner + 2u) >= MBOutVertexCapacity || (dstCorner + 2u) >= MBOutIndexCapacity) return;
+
+	// 被接受的 fragment 一定有合法源三角（accept 的第一条判据就是它），所以 CPU 版里
+	// 「没有源」那条分支（几何法线 + 由 UV 反解切线）在这里不可达，没有移植。
+	const float3 faceNormal = MBOutSourceFaceNormal(tri);
+	const float3 Na = MBOutSafeNormal(MBOutSourceNormals[tri * 3u + 0u].xyz, float3(0.0f, 0.0f, 1.0f));
+	const float3 Nb = MBOutSafeNormal(MBOutSourceNormals[tri * 3u + 1u].xyz, float3(0.0f, 0.0f, 1.0f));
+	const float3 Nc = MBOutSafeNormal(MBOutSourceNormals[tri * 3u + 2u].xyz, float3(0.0f, 0.0f, 1.0f));
+
+	[unroll]
+	for (uint k = 0u; k < 3u; ++k)
+	{
+		// 一个角点只解一次重心权重，UV / 法线 / 切线 / 副切线 / 颜色全部复用 ——
+		// 这段 2x2 解曾经每个角点重算五遍，是属性重建的大头。
+		const float3 W = MBOutSolveBary(tri, p[k]);
+		const float2 UV = MBOutBaryUV(tri, W);
+
+		// 源法线原样保留，不做半球校正：那段校正是为了掩盖绕序 bug 而存在的，绕序修好
+		// 之后剩下的多半是作者有意的背面法线（双面卡片、硬边烘焙、外扩 shell），逐角点
+		// 翻转它们是破坏而非修复。零长度法线由 SafeNormal 的 fallback 兜。
+		float3 N = MBOutSafeNormal(W.x * Na + W.y * Nb + W.z * Nc, Na);
+		N = MBOutSafeNormal(N, faceNormal);
+
+		const float4 T4 = W.x * MBOutSourceTangents[tri * 3u + 0u]
+			+ W.y * MBOutSourceTangents[tri * 3u + 1u]
+			+ W.z * MBOutSourceTangents[tri * 3u + 2u];
+		const float4 B4 = W.x * MBOutSourceBiTangents[tri * 3u + 0u]
+			+ W.y * MBOutSourceBiTangents[tri * 3u + 1u]
+			+ W.z * MBOutSourceBiTangents[tri * 3u + 2u];
+
+		float3 T = T4.xyz - dot(T4.xyz, N) * N;
+		T = MBOutSafeNormal(T, float3(0.0f, 0.0f, 0.0f));   // GetSafeNormal() 无参 = 退化时归零
+		if (MBOutIsNearlyZero(T))
+		{
+			const float3 Axis = (abs(N.z) < 0.9f) ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+			T = MBOutSafeNormal(cross(Axis, N), float3(0.0f, 0.0f, 0.0f));
+		}
+		float3 Bt = B4.xyz;
+		if (MBOutIsNearlyZero(Bt)) Bt = cross(N, T);
+		const float Sign = (dot(cross(N, T), Bt) < 0.0f) ? -1.0f : 1.0f;
+
+		const float4 Color = W.x * MBOutSourceColors[tri * 3u + 0u]
+			+ W.y * MBOutSourceColors[tri * 3u + 1u]
+			+ W.z * MBOutSourceColors[tri * 3u + 2u];
+
+		const uint v = dstCorner + k;
+		RW_MBOutPositions[v * 3u + 0u] = p[k].x;
+		RW_MBOutPositions[v * 3u + 1u] = p[k].y;
+		RW_MBOutPositions[v * 3u + 2u] = p[k].z;
+		RW_MBOutTangents[v * 2u + 0u] = MBOutPackSnorm8888(float4(T, 0.0f));
+		RW_MBOutTangents[v * 2u + 1u] = MBOutPackSnorm8888(float4(N, Sign));
+		RW_MBOutTexCoords[v * 2u + 0u] = UV.x;
+		RW_MBOutTexCoords[v * 2u + 1u] = UV.y;
+		RW_MBOutColors[v] = MBOutPackColorBGRA(Color);
+		// 输出是逐角点 soup（焊接后的顶点仍要各自保留 UV/法线/颜色接缝），索引恒等。
+		RW_MBOutIndices[v] = v;
+	}
+
+	// 常驻流里的材质 id 是 UCSMesh::Materials 的槽位下标，不是提取阶段的 registry id。
+	// CS_NO_MATERIAL_ID（以及越界的 registry id，CPU 版按 InvalidMaterialRegistryIds 计数
+	// 后同样降级）落到调用方额外追加的那个空槽，而不是靠「越界即槽 0」的兜底 —— 否则
+	// 无材质的三角会和 registry 0 的三角画成同一个材质。
+	const uint SourceMaterialId = MBOutSourceMaterialIds[tri];
+	RW_MBOutMaterialIds[dstTri] = (SourceMaterialId >= MBOutMaterialRegistryCount)
+		? MBOutNoMaterialSlot
+		: SourceMaterialId;
+}
+
+// 输出大小只有 GPU 知道，所以计数与 DrawIndexedIndirect 参数都从 emit 的游标里取，
+// 与 AdvanceCountersBySoupCS 同理。clamp 到容量：容量正是按 CountKept 的结果分配的，
+// 两者对不上说明有 bug，宁可画少也不能让 draw 读出常驻流之外。
+[numthreads(1, 1, 1)]
+void MeshBooleanFinalizeMeshCS(uint3 Id : SV_DispatchThreadID)
+{
+	const uint TriangleCount = MBOutTriangleCounterSRV[0];
+	const uint VertexCount = min(TriangleCount * 3u, MBOutVertexCapacity);
+	const uint IndexCount = min(TriangleCount * 3u, MBOutIndexCapacity);
+	RW_MBOutMeshCounters[0] = VertexCount;
+	RW_MBOutMeshCounters[1] = IndexCount;
+	RW_MBOutIndirectArgs[0] = IndexCount;
+	RW_MBOutIndirectArgs[1] = 1;
+	RW_MBOutIndirectArgs[2] = 0;
+	RW_MBOutIndirectArgs[3] = 0;
+	RW_MBOutIndirectArgs[4] = 0;
 }

@@ -4,7 +4,8 @@
 
 #include "CSPointBrushActor.h"
 
-#include "CSDisplayComponent.h"
+#include "CSMesh.h"
+#include "CSMeshRenderComponent.h"
 
 #include "Engine/World.h"
 #include "RenderingThread.h"
@@ -31,15 +32,16 @@ TArray<FCSBrushPoint> MakeTestBrushPoints(int32 Count)
 }
 }
 
-// Drives the painted-point path end to end: CPU points -> pooled GPU buffers -> debug compute
-// passes -> indirect draw submission, and back out again.
+// Drives the painted-point path end to end: CPU points -> pooled GPU buffers -> the arrow compute
+// passes -> a retained UCSMesh -> indirect draw submission, and back out again.
 //
-// The upload half is worth a test because the debug passes read the three buffers as typed
-// Buffer<float4> / Buffer<uint> views; allocating them as structured buffers instead compiles
-// fine and only fails when the proxy is built, which is what FlushRenderingCommands forces here.
-// The lifetime half is the other half: the actor's pooled refs are the only owners outside the
-// RDG pool, so release, rebuild and destroy all have to give them up without asserting against
-// an in-flight draw.
+// The upload half is worth a test because the arrow passes read the three buffers as typed
+// Buffer<float4> / Buffer<uint> views; allocating them as structured buffers instead compiles fine
+// and only fails when those passes actually run, which the build's own EditMeshSync flush forces
+// during AppendBrushPoints. The lifetime half is the other half, and retention made it wider: the
+// actor's pooled refs are the only owners of the source outside the RDG pool, and the arrow mesh now
+// holds a second allocation of its own, so release, rebuild and destroy have to give up both without
+// asserting against an in-flight draw.
 bool FCSPointBrushBufferAutomationTest::RunTest(const FString& Parameters)
 {
 	if (GMaxRHIFeatureLevel < ERHIFeatureLevel::SM5) return true;
@@ -55,9 +57,10 @@ bool FCSPointBrushBufferAutomationTest::RunTest(const FString& Parameters)
 	World->UpdateWorldComponents(true, false);
 	FlushRenderingCommands();
 
-	UCSDisplayComponent* Debug = BrushActor->FindComponentByClass<UCSDisplayComponent>();
-	if (!TestNotNull(TEXT("Point debug component"), Debug)) return false;
+	UCSMeshRenderComponent* Arrows = BrushActor->FindComponentByClass<UCSMeshRenderComponent>();
+	if (!TestNotNull(TEXT("Point arrow render component"), Arrows)) return false;
 	TestFalse(TEXT("A fresh actor holds no GPU buffer"), BrushActor->HasPointBuffer());
+	TestNull(TEXT("A fresh actor has no arrow mesh"), BrushActor->GetPointArrowMesh());
 
 	// --- adding points through the CPU API: the array is seeded into a cap-sized GPU buffer, whose
 	// tail is the room the depth brush's compute pass appends into.
@@ -68,14 +71,21 @@ bool FCSPointBrushBufferAutomationTest::RunTest(const FString& Parameters)
 		BrushActor->GetPointBuffers().Capacity, BrushActor->MaxPointCount);
 
 	FlushRenderingCommands();
-	TestNotNull(TEXT("Painted points produced a debug proxy"), Debug->SceneProxy);
-	TestTrue(TEXT("Debug bounds cover the painted points"), Debug->Bounds.GetBox().IsValid != 0);
+	TestNotNull(TEXT("Painted points produced an arrow proxy"), Arrows->SceneProxy);
+	TestTrue(TEXT("Arrow bounds cover the painted points"), Arrows->Bounds.GetBox().IsValid != 0);
+
+	// The arrows live in a mesh object now, and the component draws that object rather than owning
+	// the geometry — so the binding, not just the proxy, is what the display depends on.
+	UCSMesh* ArrowMesh = BrushActor->GetPointArrowMesh();
+	if (!TestNotNull(TEXT("Painting built an arrow mesh"), ArrowMesh)) return false;
+	TestTrue(TEXT("The arrow mesh is what the component draws"), Arrows->GetGpuMesh() == ArrowMesh);
+	TestTrue(TEXT("The arrow mesh has GPU capacity"), ArrowMesh->GetVertexCapacity() > 0);
 
 	// --- a second stroke appends and re-uploads the whole set.
 	BrushActor->AppendBrushPoints(MakeTestBrushPoints(4));
 	FlushRenderingCommands();
 	TestEqual(TEXT("Second stroke appends to the same point set"), BrushActor->GetBrushPointCount(), 12);
-	TestNotNull(TEXT("Second stroke still has a debug proxy"), Debug->SceneProxy);
+	TestNotNull(TEXT("Second stroke still has an arrow proxy"), Arrows->SceneProxy);
 
 	// --- the point cap is a hard limit, not a suggestion.
 	BrushActor->MaxPointCount = 13;
@@ -90,12 +100,16 @@ bool FCSPointBrushBufferAutomationTest::RunTest(const FString& Parameters)
 	FlushRenderingCommands();
 	TestFalse(TEXT("Release drops the GPU buffer"), BrushActor->HasPointBuffer());
 	TestEqual(TEXT("Release keeps the painted points"), BrushActor->GetBrushPointCount(), 13);
-	TestNull(TEXT("Release drops the debug proxy"), Debug->SceneProxy);
+	TestNull(TEXT("Release drops the arrow proxy"), Arrows->SceneProxy);
+	// Retention makes this a separate claim from the proxy: unbinding alone would leave the arrow
+	// allocation held for the rest of the session with nothing drawing it.
+	TestTrue(TEXT("Release hands the arrow mesh's VRAM back"), ArrowMesh->IsEmpty());
 
 	// --- and it rebuilds from the points that survived.
 	TestTrue(TEXT("Rebuild restores the GPU buffer"), BrushActor->RebuildPointBuffer());
 	FlushRenderingCommands();
-	TestNotNull(TEXT("Rebuild restores the debug proxy"), Debug->SceneProxy);
+	TestNotNull(TEXT("Rebuild restores the arrow proxy"), Arrows->SceneProxy);
+	TestTrue(TEXT("Rebuild reuses the same arrow mesh object"), BrushActor->GetPointArrowMesh() == ArrowMesh);
 
 	// --- clearing wipes both sides.
 	BrushActor->ClearBrushPoints();

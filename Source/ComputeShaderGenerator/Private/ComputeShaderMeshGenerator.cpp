@@ -1,4 +1,5 @@
 #include "ComputeShaderMeshGenerator.h"
+#include "CSBoxSceneCollectionImpl.h"
 #include "MeshGeneratorBrushCache.h"
 #include "MeshGeneratorInternal.h"
 
@@ -34,7 +35,10 @@
 #include "CSDisplayComponent.h"
 #include "CSGpuMeshComponent.h"
 #include "CSGpuMeshTypes.h"
+#include "CSMesh.h"
 #include "CSMeshBuild.h"
+#include "CSMeshOps.h"
+#include "CSMeshRenderComponent.h"
 #include "CSSurfaceVoxelPasses.h"
 #include "Materials/MaterialInterface.h"
 #include "MeshDescription.h"
@@ -205,99 +209,43 @@ private:
 	std::vector<FParticle> Particles;
 };
 
-void ConvertVDBVolumeToMeshDescription(openvdb::FloatGrid::ConstPtr SDFVolume, FMeshDescription& OutRawMesh)
+// Meshes an OpenVDB level set into a shared-vertex triangle list.
+//
+// Replaces the older FMeshDescription form: the GPU mesh object takes positions + indices, and
+// routing them through a MeshDescription and an FDynamicMesh3 first only to read them back out
+// again was two conversions that could not add anything — a VDB isosurface carries no UVs,
+// colours or material slots, and its per-corner normals are recoverable from the winding.
+void ConvertVDBVolumeToTriangles(openvdb::FloatGrid::ConstPtr SDFVolume, TArray<FVector>& OutVertices, TArray<int32>& OutIndices)
 {
-	OutRawMesh.Empty();
-	if (!SDFVolume)
-	{
-		return;
-	}
+	OutVertices.Reset();
+	OutIndices.Reset();
+	if (!SDFVolume) return;
 
 	std::vector<openvdb::Vec3s> Points;
 	std::vector<openvdb::Vec3I> Triangles;
 	std::vector<openvdb::Vec4I> Quads;
 	openvdb::tools::volumeToMesh(*SDFVolume, Points, Triangles, Quads, 0.001, 0.25);
 
-	FStaticMeshAttributes Attributes(OutRawMesh);
-	Attributes.Register();
-	TVertexAttributesRef<FVector3f> VertexPositions = Attributes.GetVertexPositions();
-	TPolygonGroupAttributesRef<FName> PolygonGroupImportedMaterialSlotNames = Attributes.GetPolygonGroupMaterialSlotNames();
-	TVertexInstanceAttributesRef<FVector3f> VertexInstanceNormals = Attributes.GetVertexInstanceNormals();
-	TVertexInstanceAttributesRef<FVector3f> VertexInstanceTangents = Attributes.GetVertexInstanceTangents();
-	TVertexInstanceAttributesRef<float> VertexInstanceBinormalSigns = Attributes.GetVertexInstanceBinormalSigns();
-	TVertexInstanceAttributesRef<FVector4f> VertexInstanceColors = Attributes.GetVertexInstanceColors();
-	TVertexInstanceAttributesRef<FVector2f> VertexInstanceUVs = Attributes.GetVertexInstanceUVs();
+	OutVertices.Reserve(static_cast<int32>(Points.size()));
+	for (const openvdb::Vec3s& Point : Points) OutVertices.Add(FVector(Point[0], Point[1], Point[2]));
 
-	if (VertexInstanceUVs.GetNumChannels() < 1)
+	const int32 VertexNum = OutVertices.Num();
+	auto AppendTriangle = [&OutIndices, VertexNum](int32 Index0, int32 Index1, int32 Index2)
 	{
-		VertexInstanceUVs.SetNumChannels(1);
-	}
-
-	const FPolygonGroupID PolygonGroupID = OutRawMesh.CreatePolygonGroup();
-	PolygonGroupImportedMaterialSlotNames[PolygonGroupID] = FName(TEXT("OpenVDB_Material_0"));
-
-	TArray<FVertexID> VertexIDs;
-	VertexIDs.Reserve(static_cast<int32>(Points.size()));
-	for (const openvdb::Vec3s& Point : Points)
-	{
-		const FVertexID NewVertexID = OutRawMesh.CreateVertex();
-		VertexPositions[NewVertexID] = FVector3f(Point[0], Point[1], Point[2]);
-		VertexIDs.Add(NewVertexID);
-	}
-
-	auto AppendTriangle = [&OutRawMesh, PolygonGroupID, &VertexIDs, &VertexPositions, &VertexInstanceNormals,
-		&VertexInstanceTangents, &VertexInstanceBinormalSigns, &VertexInstanceColors, &VertexInstanceUVs](int32 Index0, int32 Index1, int32 Index2)
-	{
-		if (!VertexIDs.IsValidIndex(Index0) || !VertexIDs.IsValidIndex(Index1) || !VertexIDs.IsValidIndex(Index2))
-		{
-			return;
-		}
-
-		const FVector3f P0 = VertexPositions[VertexIDs[Index0]];
-		const FVector3f P1 = VertexPositions[VertexIDs[Index1]];
-		const FVector3f P2 = VertexPositions[VertexIDs[Index2]];
-		const FVector Normal = FVector::CrossProduct(FVector(P1 - P0), FVector(P2 - P0)).GetSafeNormal();
-		FVector Tangent = FVector(P1 - P0).GetSafeNormal();
-		if (Tangent.IsNearlyZero())
-		{
-			Tangent = FVector::CrossProduct(FVector::UpVector, Normal).GetSafeNormal();
-		}
-		if (Tangent.IsNearlyZero())
-		{
-			Tangent = FVector::ForwardVector;
-		}
-
-		TArray<FVertexInstanceID> VertexInstanceIDs;
-		VertexInstanceIDs.SetNum(3);
-		const int32 SourceIndices[3] = {Index0, Index1, Index2};
-		for (int32 Corner = 0; Corner < UE_ARRAY_COUNT(SourceIndices); ++Corner)
-		{
-			const FVertexID VertexID = VertexIDs[SourceIndices[Corner]];
-			const FVertexInstanceID VertexInstanceID = OutRawMesh.CreateVertexInstance(VertexID);
-
-			VertexInstanceTangents[VertexInstanceID] = FVector3f(Tangent);
-			VertexInstanceNormals[VertexInstanceID] = FVector3f(Normal);
-			VertexInstanceBinormalSigns[VertexInstanceID] = GetBasisDeterminantSign(
-				FVector(VertexInstanceTangents[VertexInstanceID]).GetSafeNormal(),
-				FVector(FVector3f(Normal) ^ VertexInstanceTangents[VertexInstanceID]).GetSafeNormal(),
-				Normal);
-			VertexInstanceColors[VertexInstanceID] = FVector4f(1.0f);
-			VertexInstanceUVs.Set(VertexInstanceID, 0, FVector2f(0.0f, 0.0f));
-			VertexInstanceIDs[Corner] = VertexInstanceID;
-		}
-		OutRawMesh.CreatePolygon(PolygonGroupID, VertexInstanceIDs);
+		if (Index0 < 0 || Index1 < 0 || Index2 < 0 || Index0 >= VertexNum || Index1 >= VertexNum || Index2 >= VertexNum) return;
+		OutIndices.Add(Index0);
+		OutIndices.Add(Index1);
+		OutIndices.Add(Index2);
 	};
 
+	OutIndices.Reserve(static_cast<int32>(Quads.size()) * 6 + static_cast<int32>(Triangles.size()) * 3);
 	for (const openvdb::Vec4I& Quad : Quads)
 	{
 		AppendTriangle(Quad[0], Quad[1], Quad[2]);
 		AppendTriangle(Quad[2], Quad[3], Quad[0]);
 	}
 
-	for (const openvdb::Vec3I& Triangle : Triangles)
-	{
-		AppendTriangle(Triangle[0], Triangle[1], Triangle[2]);
-	}
+	for (const openvdb::Vec3I& Triangle : Triangles) AppendTriangle(Triangle[0], Triangle[1], Triangle[2]);
 }
 }
 
@@ -700,61 +648,9 @@ FVector MakeLandscapeNormalFaceUp(const FVector& Normal)
 	return SafeNormal;
 }
 
-void NormalizeTriangleMeshDataWinding(FCSTriangleMeshData& TriangleData)
-{
-	const int32 EffectiveVertexCount = GetEffectiveVertexCount(TriangleData);
-	const int32 EffectiveIndexCount = GetEffectiveIndexCount(TriangleData);
-	const bool bUseIndices = EffectiveIndexCount >= 3;
-	const int32 TriangleCount = bUseIndices ? EffectiveIndexCount / 3 : EffectiveVertexCount / 3;
-	const bool bHasVertexNormals = TriangleData.VertexNormals.Num() >= EffectiveVertexCount;
-
-	for (int32 TriangleIndex = 0; TriangleIndex < TriangleCount; ++TriangleIndex)
-	{
-		int32 I0 = TriangleIndex * 3 + 0;
-		int32 I1 = TriangleIndex * 3 + 1;
-		int32 I2 = TriangleIndex * 3 + 2;
-		if (bUseIndices)
-		{
-			I0 = TriangleData.Indices[TriangleIndex * 3 + 0];
-			I1 = TriangleData.Indices[TriangleIndex * 3 + 1];
-			I2 = TriangleData.Indices[TriangleIndex * 3 + 2];
-		}
-
-		if (!IsValidCSTriangleIndex(I0, EffectiveVertexCount)
-			|| !IsValidCSTriangleIndex(I1, EffectiveVertexCount)
-			|| !IsValidCSTriangleIndex(I2, EffectiveVertexCount))
-		{
-			continue;
-		}
-
-		const FVector& P0 = TriangleData.Vertices[I0];
-		const FVector& P1 = TriangleData.Vertices[I1];
-		const FVector& P2 = TriangleData.Vertices[I2];
-		const FVector WindingNormal = GetSafeTriangleNormal(P0, P1, P2);
-		FVector DesiredNormal = WindingNormal;
-		if (bHasVertexNormals)
-		{
-			DesiredNormal = ((TriangleData.VertexNormals[I0] + TriangleData.VertexNormals[I1] + TriangleData.VertexNormals[I2]) / 3.0)
-				.GetSafeNormal(UE_SMALL_NUMBER, WindingNormal);
-		}
-
-		if (FVector::DotProduct(WindingNormal, DesiredNormal) < 0.0)
-		{
-			if (bUseIndices)
-			{
-				Swap(TriangleData.Indices[TriangleIndex * 3 + 1], TriangleData.Indices[TriangleIndex * 3 + 2]);
-			}
-			else
-			{
-				Swap(TriangleData.Vertices[I1], TriangleData.Vertices[I2]);
-				if (bHasVertexNormals)
-				{
-					Swap(TriangleData.VertexNormals[I1], TriangleData.VertexNormals[I2]);
-				}
-			}
-		}
-	}
-}
+// NormalizeTriangleMeshDataWinding 随 GetBoxSceneTrianglesFilteredToDynamicMesh 一起删掉了：
+// 它只服务那条"CPU 回读三角形 -> DynamicMesh"的出口。GPU 常驻提取（AppendBoxSceneTriangles）
+// 原样保留源网格的绕序，不需要按顶点法线再纠一遍。
 
 bool TriangleIntersectsBox(const FVector& P0, const FVector& P1, const FVector& P2, const FBox& QueryBox)
 {
@@ -897,16 +793,6 @@ FShaderResourceViewRHIRef CreateTriangleIndexBufferSRV(FRHICommandListImmediate&
 		FRHIViewDesc::CreateBufferSRV()
 			.SetType(FRHIViewDesc::EBufferType::Typed)
 			.SetFormat(LODResource->IndexBuffer.Is32Bit() ? PF_R32_UINT : PF_R16_UINT));
-}
-
-UDynamicMesh* CreateEmptyDynamicMesh()
-{
-	UDynamicMesh* OutMesh = NewObject<UDynamicMesh>();
-	if (OutMesh)
-	{
-		OutMesh->Reset();
-	}
-	return OutMesh;
 }
 
 uint32 GetSurfaceVoxelHashSlotCount(int32 VoxelCapacity, int32 RequestedHashSlotCount)
@@ -1813,14 +1699,6 @@ FCSStaticMeshTriangleRDGOutput CSMeshGenInternal::AddResolvedStaticMeshTriangles
 	const int32 CombinedTriangleCountInt = int32(CombinedTriangleCount);
 	const uint32 TriangleCapacity = uint32(FMath::Clamp(MaxTriangles > 0 ? MaxTriangles : CombinedTriangleCountInt, 1, CombinedTriangleCountInt));
 	const uint32 VertexCapacity = TriangleCapacity * 3u;
-	// 容量不够时超出的三角形会被 shader 里的原子追加直接丢弃 —— 表面上只是「这块几何没被体素化」，
-	// 下游看到的是残缺的表面，很容易被误判成生成器逻辑出错。所以这里必须出声，不能静默截断。
-	if (TriangleCapacity < uint32(CombinedTriangleCountInt))
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[%s] 三角形容量不足：本次 %d 个三角形，容量只有 %u（MaxTriangles=%d），超出的会被丢弃，表面将不完整。请调大 MaxTriangles。"),
-			DebugName ? DebugName : TEXT("CS.StaticMeshTriangles"), CombinedTriangleCountInt, TriangleCapacity, MaxTriangles);
-	}
 	Output.MaxTriangles = TriangleCapacity;
 	Output.MaxVertices = VertexCapacity;
 
@@ -2028,12 +1906,8 @@ FCSStaticMeshTriangleRDGOutput CSMeshGenInternal::AddResolvedStaticMeshTriangles
 		PassParameters->TriangleCapacity = TriangleCapacity;
 		PassParameters->NumTexCoords = RequestNumTexCoords;
 		PassParameters->bUseBounds = Request.WorldBounds.IsValid ? 1u : 0u;
-		// 距离 <= 0 表示“不按参考点剔除”，此时必须把开关也关掉。只把阈值设成 FLT_MAX 的话，
-		// shader 里那个循环仍会对每个三角形遍历全部参考点求最近距离（没有 early-out），再无条件
-		// 通过 —— 代价照付、一个不剔。开关置 0 才能让它直接 return true。
-		const bool bReferenceFilterActive = ReferencePoints.Num() > 0 && ReferenceFilterDistance > 0.0f;
-		PassParameters->bUseReferenceFilter = bReferenceFilterActive ? 1u : 0u;
-		PassParameters->ReferenceFilterDistanceSq = bReferenceFilterActive
+		PassParameters->bUseReferenceFilter = ReferencePoints.Num() > 0 ? 1u : 0u;
+		PassParameters->ReferenceFilterDistanceSq = ReferenceFilterDistance > 0.0f
 			? ReferenceFilterDistance * ReferenceFilterDistance
 			: TNumericLimits<float>::Max();
 
@@ -2141,10 +2015,8 @@ FCSStaticMeshTriangleRDGOutput CSMeshGenInternal::AddResolvedStaticMeshTriangles
 		AppendParameters->TriangleCapacity = TriangleCapacity;
 		AppendParameters->ReferenceCount = uint32(ReferencePoints.Num());
 		AppendParameters->bUseBounds = 0u; // CPU 端已按 request bounds 粗筛
-		// 同 Extract：距离 <= 0 时把开关一并关掉，否则那个无 early-out 的最近距离循环会白跑。
-		const bool bNaniteReferenceFilterActive = ReferencePoints.Num() > 0 && ReferenceFilterDistance > 0.0f;
-		AppendParameters->bUseReferenceFilter = bNaniteReferenceFilterActive ? 1u : 0u;
-		AppendParameters->ReferenceFilterDistanceSq = bNaniteReferenceFilterActive
+		AppendParameters->bUseReferenceFilter = ReferencePoints.Num() > 0 ? 1u : 0u;
+		AppendParameters->ReferenceFilterDistanceSq = ReferenceFilterDistance > 0.0f
 			? ReferenceFilterDistance * ReferenceFilterDistance
 			: TNumericLimits<float>::Max();
 
@@ -2163,91 +2035,23 @@ FCSStaticMeshTriangleRDGOutput CSMeshGenInternal::AddResolvedStaticMeshTriangles
 }
 
 // -----------------------------------------------------------------------------
-// PrepareBoxSceneTriangles / AddPreparedBoxSceneTrianglesToRDG
+// MakeBoxSceneCollectOptions / AddPreparedBoxSceneTrianglesToRDG
+//
+// 收集本体（原 PrepareBoxSceneTriangles）已搬去 CSBoxSceneCollection.cpp。留在这里的只有两件
+// 与 actor 真正相关的事：把本 actor 的提取策略装进 options，以及 render 线程消费预备数据。
 // -----------------------------------------------------------------------------
 
-struct FCSBoxScenePreparedDataImpl
+FCSBoxSceneCollectOptions AComputeShaderMeshGenerator::MakeBoxSceneCollectOptions(const FBox& QueryBox) const
 {
-	TArray<FResolvedStaticMeshTriangleRequest> ResolvedRequests;
-	uint64 TotalStaticMeshTriangleCount = 0;
-	FCSTriangleMeshData LandscapeTriangleData;
-	TArray<FVector> ReferencePoints;
-	float ReferenceFilterDistance = 0.0f;
-	int32 SafeMaxTriangles = 1;
-	// 去重材质表：soup 材质 buffer 里的 id 索引进本表。TObjectPtr 持有强引用，保证 readback 前不被 GC。
-	TArray<TObjectPtr<UMaterialInterface>> MaterialRegistry;
-	// Nanite 网格的全细节源三角（editor MeshDescription 提取，world-space + UV0 + 材质 id）。
-	// game thread 在 PrepareBoxSceneTriangles 里填充，render thread 在 AddPreparedBoxSceneTrianglesToRDG 追加进 soup。
-	FCSNaniteSourceTriangleData NaniteTriangles;
-};
-
-bool FCSBoxScenePreparedData::HasAnyTriangles() const
-{
-	if (!Impl) return false;
-	return !Impl->ResolvedRequests.IsEmpty()
-		|| GetTriangleMeshDataTriangleCount(Impl->LandscapeTriangleData) > 0
-		|| !Impl->NaniteTriangles.IsEmpty();
-}
-
-int32 FCSBoxScenePreparedData::GetMaterialRegistryNum() const
-{
-	return Impl ? Impl->MaterialRegistry.Num() : 0;
-}
-
-UMaterialInterface* FCSBoxScenePreparedData::GetMaterialByRegistryIndex(int32 Index) const
-{
-	if (!Impl || !Impl->MaterialRegistry.IsValidIndex(Index)) return nullptr;
-	return Impl->MaterialRegistry[Index].Get();
-}
-
-FCSBoxScenePreparedData AComputeShaderMeshGenerator::PrepareBoxSceneTriangles(
-	UWorld* World,
-	const FBox& QueryBox,
-	int32 InMaxTriangles,
-	const TArray<FVector>& InReferencePoints,
-	float InReferenceFilterDistance,
-	FName RequiredActorTag,
-	bool bIncludeLandscape,
-	bool bUseMeshDescriptionSourceTriangles,
-	bool bPreserveSourceMaterialSlots)
-{
-	FCSBoxScenePreparedData Result;
-	if (!World || !QueryBox.IsValid) return Result;
-
-	auto ImplData = MakeShared<FCSBoxScenePreparedDataImpl, ESPMode::ThreadSafe>();
-
-	const int32 SafeMaxTriangles = InMaxTriangles > 0 ? InMaxTriangles : FMath::Max(1, MaxTriangles);
-	const float SafeRefDist = InReferencePoints.IsEmpty() ? 0.0f : FMath::Max(0.0f, InReferenceFilterDistance);
-
-	TArray<FCSStaticMeshTriangleRequest> Requests;
-	BuildBoxSceneTriangleRequests(World, QueryBox, Requests);
-
-	if (!RequiredActorTag.IsNone())
-	{
-		Requests.RemoveAll([RequiredActorTag](const FCSStaticMeshTriangleRequest& Req)
-		{
-			return Req.SourceActor && !Req.SourceActor->ActorHasTag(RequiredActorTag);
-		});
-	}
-
-	if (bIncludeLandscape)
-	{
-		BuildBoxSceneLandscapeTrianglesInternal(
-			World, QueryBox, InReferencePoints, SafeRefDist, SafeMaxTriangles,
-			ImplData->LandscapeTriangleData);
-	}
-
-	ImplData->TotalStaticMeshTriangleCount = ResolveStaticMeshTriangleRequests(
-		Requests, this, ExcludedActorTags, true, ImplData->ResolvedRequests, &ImplData->MaterialRegistry,
-		bUseMeshDescriptionSourceTriangles ? &ImplData->NaniteTriangles : nullptr,
-		bPreserveSourceMaterialSlots);
-
-	ImplData->ReferencePoints = InReferencePoints;
-	ImplData->ReferenceFilterDistance = SafeRefDist;
-	ImplData->SafeMaxTriangles = SafeMaxTriangles;
-
-	Result.Impl = ImplData;
-	return Result;
+	FCSBoxSceneCollectOptions Options;
+	Options.QueryBox = QueryBox.IsValid ? QueryBox : GetGeneratorBoundsWorldBox();
+	Options.MaxTriangles = FMath::Max(1, MaxTriangles);
+	Options.ExcludedActor = this;
+	Options.ExcludedActorTags = ExcludedActorTags;
+	// 提取用哪级 LOD 必须与显存预检（ConfirmGpuMemoryBudgetForBoxScene）走同一个值，
+	// 否则预检按一套三角数放行、提取按另一套分配。
+	Options.LODIndex = VoxelGridSettings.LODIndex;
+	return Options;
 }
 
 FCSStaticMeshTriangleRDGOutput AComputeShaderMeshGenerator::AddPreparedBoxSceneTrianglesToRDG(
@@ -3587,52 +3391,44 @@ bool AComputeShaderMeshGenerator::SurfaceVoxelsToIsolatedQuadsDebug(float VoxelS
 }
 
 // -----------------------------------------------------------------------------
-// Core System - Dynamic Mesh Output
+// Core System - GPU Mesh Output
+//
+// 这里的出口一律产出 UCSMesh。要 UDynamicMesh 的调用方走 UCSMeshOps::CopyToDynamicMesh
+// —— GPU 管线只留一条出桥，转换的修补（材质 id、顶点色、逐角点属性）才会一次覆盖所有路径，
+// 而不是只修到被改的那一条。
 // -----------------------------------------------------------------------------
 
-UDynamicMesh* AComputeShaderMeshGenerator::SurfaceVoxelsToOpenDynamicMesh(float VoxelSize,
+UCSMesh* AComputeShaderMeshGenerator::SurfaceVoxelsToOpenGpuMesh(UCSMesh* TargetMesh,
+	float VoxelSize,
 	bool bReverseOrientation,
 	bool bRecomputeNormals)
 {
 	const FCSSurfaceVoxelData SurfaceVoxels = ReadbackBoxSceneSurfaceVoxelsSync(VoxelSize);
 
-	UDynamicMesh* OutMesh = CreateEmptyDynamicMesh();
-	if (!OutMesh)
-	{
-		return nullptr;
-	}
-
 	const int32 EffectiveVoxelCount = SurfaceVoxels.VoxelCount >= 0
 		? FMath::Clamp(SurfaceVoxels.VoxelCount, 0, SurfaceVoxels.Positions.Num())
 		: SurfaceVoxels.Positions.Num();
-	if (EffectiveVoxelCount <= 0)
-	{
-		return OutMesh;
-	}
 
 	const float BaseVoxelSize = VoxelSize > 0.0f ? VoxelSize : SurfaceVoxels.VoxelSize;
 	const float SafeVoxelSize = FMath::Max(BaseVoxelSize, UE_KINDA_SMALL_NUMBER);
 	const float HalfQuadSize = SafeVoxelSize * FMath::Max(QuadScale, UE_KINDA_SMALL_NUMBER) * 0.5f;
 
-	UE::Geometry::FDynamicMesh3 Mesh;
-	Mesh.EnableVertexNormals(FVector3f::UpVector);
+	TArray<FVector> Vertices;
+	TArray<FVector> Normals;
+	TArray<int32> Indices;
+	Vertices.Reserve(FMath::Max(EffectiveVoxelCount, 0) * 4);
+	Normals.Reserve(FMath::Max(EffectiveVoxelCount, 0) * 4);
+	Indices.Reserve(FMath::Max(EffectiveVoxelCount, 0) * 6);
 
-	int32 AddedTriangles = 0;
 	for (int32 VoxelIndex = 0; VoxelIndex < EffectiveVoxelCount; ++VoxelIndex)
 	{
 		const FVector& Position = SurfaceVoxels.Positions[VoxelIndex];
-		if (!IsFiniteVector(Position))
-		{
-			continue;
-		}
+		if (!IsFiniteVector(Position)) continue;
 
 		FVector Normal = SurfaceVoxels.Normals.IsValidIndex(VoxelIndex)
 			? SurfaceVoxels.Normals[VoxelIndex]
 			: FVector::UpVector;
-		if (Normal.ContainsNaN())
-		{
-			continue;
-		}
+		if (Normal.ContainsNaN()) continue;
 		Normal = Normal.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
 
 		const FVector HelperAxis = FMath::Abs(Normal.Z) < 0.99 ? FVector::UpVector : FVector::RightVector;
@@ -3642,82 +3438,67 @@ UDynamicMesh* AComputeShaderMeshGenerator::SurfaceVoxelsToOpenDynamicMesh(float 
 		const FVector DX = AxisX * HalfQuadSize;
 		const FVector DY = AxisY * HalfQuadSize;
 
-		const int32 A = Mesh.AppendVertex(FVector3d(Center - DX - DY));
-		const int32 B = Mesh.AppendVertex(FVector3d(Center + DX - DY));
-		const int32 C = Mesh.AppendVertex(FVector3d(Center + DX + DY));
-		const int32 D = Mesh.AppendVertex(FVector3d(Center - DX + DY));
-		Mesh.SetVertexNormal(A, FVector3f(Normal));
-		Mesh.SetVertexNormal(B, FVector3f(Normal));
-		Mesh.SetVertexNormal(C, FVector3f(Normal));
-		Mesh.SetVertexNormal(D, FVector3f(Normal));
+		const int32 A = Vertices.Num();
+		Vertices.Add(Center - DX - DY);
+		Vertices.Add(Center + DX - DY);
+		Vertices.Add(Center + DX + DY);
+		Vertices.Add(Center - DX + DY);
+		for (int32 Corner = 0; Corner < 4; ++Corner) Normals.Add(Normal);
 
-		const int32 T0 = bReverseOrientation
-			? Mesh.AppendTriangle(UE::Geometry::FIndex3i(A, C, B), 0)
-			: Mesh.AppendTriangle(UE::Geometry::FIndex3i(A, B, C), 0);
-		const int32 T1 = bReverseOrientation
-			? Mesh.AppendTriangle(UE::Geometry::FIndex3i(A, D, C), 0)
-			: Mesh.AppendTriangle(UE::Geometry::FIndex3i(A, C, D), 0);
-		if (T0 >= 0)
-		{
-			++AddedTriangles;
-		}
-		if (T1 >= 0)
-		{
-			++AddedTriangles;
-		}
+		// 两个三角形直接按最终绕序写出，所以下面 builder 的 bReverseOrientation 必须关着：
+		// 在那里再翻一次会把这里的翻转抵消掉。
+		const int32 Reversed[6] = { A + 0, A + 2, A + 1, A + 0, A + 3, A + 2 };
+		const int32 Forward[6] = { A + 0, A + 1, A + 2, A + 0, A + 2, A + 3 };
+		Indices.Append(bReverseOrientation ? Reversed : Forward, 6);
 	}
 
-	if (AddedTriangles <= 0)
-	{
-		return OutMesh;
-	}
-
-	OutMesh->SetMesh(MoveTemp(Mesh));
-	if (bRecomputeNormals)
-	{
-		FGeometryScriptCalculateNormalsOptions CalculateOptions;
-		UGeometryScriptLibrary_MeshNormalsFunctions::RecomputeNormals(OutMesh, CalculateOptions);
-	}
-	return OutMesh;
+	// 不做退化剔除：这里唯一能让四边形零面积的是 QuadScale，那是调用方自己设的，不该被悄悄丢掉。
+	return CSMeshBuild::BuildGpuMeshFromCSTriangleData(TargetMesh, this, Vertices, Indices, Normals,
+		Vertices.Num(), Indices.Num(), false, false, bRecomputeNormals);
 }
 
-UDynamicMesh* AComputeShaderMeshGenerator::SurfaceVoxelsToVDBMesh(float VoxelSize,
+UCSMesh* AComputeShaderMeshGenerator::SurfaceVoxelsToVDBGpuMesh(UCSMesh* TargetMesh,
+	float VoxelSize,
 	float RadiusMult,
 	bool bRecomputeNormals)
 {
 	const FCSSurfaceVoxelData SurfaceVoxels = ReadbackBoxSceneSurfaceVoxelsSync(VoxelSize);
-	UDynamicMesh* OutMesh = CreateEmptyDynamicMesh();
-	if (!OutMesh)
-	{
-		return nullptr;
-	}
 
 	const int32 EffectiveVoxelCount = SurfaceVoxels.VoxelCount >= 0
 		? FMath::Clamp(SurfaceVoxels.VoxelCount, 0, SurfaceVoxels.Positions.Num())
 		: SurfaceVoxels.Positions.Num();
-	if (EffectiveVoxelCount <= 0)
-	{
-		return OutMesh;
-	}
 
+	TArray<FVector> Positions;
+	Positions.Reserve(FMath::Max(EffectiveVoxelCount, 0));
+	for (int32 Index = 0; Index < EffectiveVoxelCount; ++Index) Positions.Add(SurfaceVoxels.Positions[Index]);
+
+	// VoxelSize<=0 表示"沿用体素化时的尺寸"，这个回退只有读回来的数据知道，必须在这里解开，
+	// 不能推给通用的粒子入口。
 	const float SafeVoxelSize = FMath::Max(VoxelSize > 0.0f ? VoxelSize : SurfaceVoxels.VoxelSize, UE_KINDA_SMALL_NUMBER);
+	return VDBParticlesToGpuMesh(TargetMesh, this, Positions, SafeVoxelSize, RadiusMult, bRecomputeNormals);
+}
+
+UCSMesh* AComputeShaderMeshGenerator::VDBParticlesToGpuMesh(UCSMesh* TargetMesh,
+	UObject* Outer,
+	const TArray<FVector>& WorldPositions,
+	float VoxelSize,
+	float RadiusMult,
+	bool bRecomputeNormals)
+{
+	if (!TargetMesh) TargetMesh = UCSMeshOps::AllocateGpuMesh(Outer, 3, 3);
+	if (!TargetMesh) return nullptr;
+
+	const float SafeVoxelSize = FMath::Max(VoxelSize, UE_KINDA_SMALL_NUMBER);
 	const float Rmin = 1.5f;
 	const float Radius = FMath::Max((Rmin + 0.1f) * SafeVoxelSize * RadiusMult, (Rmin + 0.1f) * SafeVoxelSize);
 
 	FCSGeneratorVDBParticleList Particles;
-	for (int32 Index = 0; Index < EffectiveVoxelCount; ++Index)
-	{
-		const FVector& Position = SurfaceVoxels.Positions[Index];
-		if (!IsFiniteVector(Position))
-		{
-			continue;
-		}
-		Particles.Add(Position, Radius);
-	}
+	for (const FVector& Position : WorldPositions) if (IsFiniteVector(Position)) Particles.Add(Position, Radius);
 
 	if (Particles.size() == 0)
 	{
-		return OutMesh;
+		TargetMesh->Reset();
+		return TargetMesh;
 	}
 
 	const float Rmax = 100.0f;
@@ -3729,62 +3510,59 @@ UDynamicMesh* AComputeShaderMeshGenerator::SurfaceVoxelsToVDBMesh(float VoxelSiz
 	Raster.finalize(true);
 	LevelSet->setTransform(openvdb::math::Transform::createLinearTransform(SafeVoxelSize));
 
-	FMeshDescription MeshDescription;
-	ConvertVDBVolumeToMeshDescription(LevelSet, MeshDescription);
+	TArray<FVector> Vertices;
+	TArray<int32> Indices;
+	ConvertVDBVolumeToTriangles(LevelSet, Vertices, Indices);
 
-	FDynamicMesh3 ConvertedMesh;
-	FMeshDescriptionToDynamicMesh Converter;
-	Converter.Convert(&MeshDescription, ConvertedMesh);
-	OutMesh->SetMesh(MoveTemp(ConvertedMesh));
-
+	// 等值面本身不带法线。共享顶点 + builder 的面积加权累加就是"平滑"的那一档。
 	if (bRecomputeNormals)
 	{
-		FGeometryScriptCalculateNormalsOptions CalculateOptions;
-		UGeometryScriptLibrary_MeshNormalsFunctions::RecomputeNormals(OutMesh, CalculateOptions);
+		return CSMeshBuild::BuildGpuMeshFromCSTriangleData(TargetMesh, Outer, Vertices, Indices, TArray<FVector>(),
+			Vertices.Num(), Indices.Num(), false, true, true);
 	}
 
-	return OutMesh;
-}
+	// 平面着色这一档必须逐角点拆开：一个共享顶点只能带一条法线，想保住 VDB 的逐面法线就得先摊成 soup。
+	TArray<FVector> SoupVertices;
+	TArray<FVector> SoupNormals;
+	SoupVertices.Reserve(Indices.Num());
+	SoupNormals.Reserve(Indices.Num());
+	for (int32 Corner = 0; Corner + 2 < Indices.Num(); Corner += 3)
+	{
+		const int32 SourceCorners[3] = { Indices[Corner + 0], Indices[Corner + 1], Indices[Corner + 2] };
+		// 口径必须与平滑档（builder 的面积加权累加）同源，否则同一份 VDB 换个开关就整体翻面。
+		const FVector FaceNormal = CSMeshBuild::ResidentFaceNormal(
+			Vertices[SourceCorners[0]], Vertices[SourceCorners[1]], Vertices[SourceCorners[2]]);
 
-UDynamicMesh* AComputeShaderMeshGenerator::GetBoxSceneTrianglesFilteredToDynamicMesh(float ReferenceFilterDistance,
-	bool bReverseOrientation,
-	bool bSkipDegenerateTriangles,
-	bool bRecomputeNormals)
-{
-	FCSTriangleMeshData TriangleData = GetBoxSceneTrianglesFromGPUFiltered(ReferenceFilterDistance);
-	NormalizeTriangleMeshDataWinding(TriangleData);
-	UDynamicMesh* OutMesh = CSMeshBuild::BuildDynamicMeshFromCSTriangleData(
-		TriangleData.Vertices,
-		TriangleData.Indices,
-		TriangleData.VertexNormals,
-		TriangleData.VertexCount,
-		TriangleData.IndexCount,
-		bReverseOrientation,
-		bSkipDegenerateTriangles,
-		bRecomputeNormals);
-	return OutMesh;
+		for (int32 k = 0; k < 3; ++k)
+		{
+			SoupVertices.Add(Vertices[SourceCorners[k]]);
+			SoupNormals.Add(FaceNormal);
+		}
+	}
+
+	return CSMeshBuild::BuildGpuMeshFromCSTriangleData(TargetMesh, Outer, SoupVertices, TArray<int32>(), SoupNormals,
+		SoupVertices.Num(), 0, false, true, false);
 }
 
 void AComputeShaderMeshGenerator::DrawDebugBoxSceneSurfaceTrianglesGPU(float LifetimeSeconds)
 {
-	UWorld* World = GetWorld();
-	if (!World || !DisplayComponent) return;
+	// 和提交路径同一条管线，只是不做参照点过滤并且到期自动清除。
+	//
+	// 容量**不**取 actor 的 MaxTriangles：那是抽取的上限（场景走查最多收多少三角），拿它当分配
+	// 尺寸意味着永远按最坏情况分配。默认 2000 万三角 ≈ 2.2 GB 显存，过不了 UCSMesh 的预算闸门，
+	// 于是一个调试可视化在多数机器上会直接变成"拒绝分配"。老的 proxy 是盲分配才看不出这个问题。
+	// 调试画面本来就不需要看完整场景，这里给一个自己的上限，超出部分不画。
+	static constexpr int32 DebugDrawTriangleCap = 2000000;
+	const int32 DebugTriangles = FMath::Min(MaxTriangles, DebugDrawTriangleCap);
+	if (MaxTriangles > DebugDrawTriangleCap)
+		UE_LOG(LogTemp, Verbose, TEXT("[CSMeshGen] Debug draw caps extraction at %d of %d triangles."), DebugTriangles, MaxTriangles);
 
-	const FBox QueryBox = GetGeneratorBoundsWorldBox();
-	if (!QueryBox.IsValid) return;
-	const int32 SafeMaxTriangles = FMath::Max(1, MaxTriangles);
-	const FCSBoxScenePreparedData Prepared = PrepareBoxSceneTriangles(
-		World, QueryBox, SafeMaxTriangles, TArray<FVector>(), 0.0f);
-	if (!Prepared.IsValid() || !Prepared.HasAnyTriangles())
+	if (!SubmitBoxSceneTrianglesToRenderPipeline(nullptr, DebugTriangles, 0.0f))
 	{
-		DisplayComponent->ClearDisplay();
+		ClearDirectGPUMesh();
 		return;
 	}
-
-	// LifetimeSeconds <= 0 沿用改动前的语义（常驻），映射到组件的 Lifetime = -1；
-	// 定时清除由组件自己管，Actor 不再持有 FTimerHandle。
-	DisplayComponent->ShowTriangleSoup(Prepared, uint32(SafeMaxTriangles) * 3u, QueryBox,
-		LifetimeSeconds > 0.0f ? LifetimeSeconds : -1.0f);
+	ScheduleDirectMeshClear(LifetimeSeconds);
 }
 
 void AComputeShaderMeshGenerator::SpawnDebugSurfaceTrianglesDynamicMeshActor(float LifetimeSeconds)
@@ -3795,51 +3573,76 @@ void AComputeShaderMeshGenerator::SpawnDebugSurfaceTrianglesDynamicMeshActor(flo
 void AComputeShaderMeshGenerator::ClearMeshGeneratorGPUDebug()
 {
 	if (DisplayComponent) DisplayComponent->ClearDisplay();
+	// 三角汤迁到 UCSMesh 之前也归 DisplayComponent 管，清场一并抹掉它 —— 保持这条语义。
+	ClearDirectGPUMesh();
 }
 
 bool AComputeShaderMeshGenerator::SubmitBoxSceneTrianglesToRenderPipeline(UMaterialInterface* Material, int32 MaxDirectTriangles, float ReferenceFilterDistance)
 {
-	if (!DisplayComponent)
-	{
-		return false;
-	}
-
 	UWorld* World = GetWorld();
-	if (!World)
-	{
-		return false;
-	}
+	if (!World || !DirectMeshRenderComponent) return false;
 
 	const FBox QueryBox = GetGeneratorBoundsWorldBox();
-	if (!QueryBox.IsValid)
+	if (!QueryBox.IsValid) return false;
+
+	if (!DirectGpuMesh) DirectGpuMesh = UCSMeshOps::AllocateGpuMesh(this, 3, 3);
+	if (!DirectGpuMesh) return false;
+
+	// 提交是"替换"而不是"追加"：计数与材质表都要先归零。留着计数会让新几何堆在旧几何后面，
+	// 留着材质表则会让 id 偏移越推越远、section 数每次提交都翻一倍。Reset 保留已有分配，
+	// 所以同样容量的反复提交不会来回重分配。
+	DirectGpuMesh->Reset();
+	DirectGpuMesh->Materials.Reset();
+
+	// 提取算子不再读 generator，本 actor 的场景过滤策略必须显式交出去，否则会退回算子的中立
+	// 默认值（不排除自身、只按默认 tag 过滤），提取范围就变了。这份策略同时是 Blueprint 能拿到
+	// 它的唯一途径，所以它住在 UCSMeshOps 而不是这里手写一份。
+	// MaxDirectTriangles 仍然是分配上限，只是现在落在网格容量上而不是代理的持久 buffer 上。
+	const FCSMeshBoxSceneOptions SceneOptions = UCSMeshOps::MakeGeneratorBoxSceneOptions(
+		this, ReferenceFilterDistance, FMath::Max(1, MaxDirectTriangles));
+	UCSMeshOps::AppendBoxSceneTriangles(DirectGpuMesh, this, SceneOptions);
+
+	// 提取的输出大小由 GPU 决定，因此"盒内到底有没有几何"只能问 GPU。这比旧路径那个
+	// game-thread 预检更准：预检说有，距离过滤之后仍可能一个三角都不剩。
+	if (DirectGpuMesh->GetTriangleCountSync() <= 0)
 	{
+		// 显式记一笔：这里也接住"容量申请被显存预检拒了"的情况，那种失败在下游只表现为
+		// 一个空网格，不打日志就没人能从"什么都没画出来"回溯到显存预算上。
+		UE_LOG(LogTemp, Warning,
+			TEXT("[CSMeshGenerator] SubmitBoxSceneTrianglesToRenderPipeline produced no triangles on %s (empty box, filtered out, or the %d-triangle allocation was refused)."),
+			*GetActorNameOrLabel(), SceneOptions.MaxTriangles);
+		ClearDirectGPUMesh();
 		return false;
 	}
 
-	const int32 SafeMaxTriangles = FMath::Max(1, MaxDirectTriangles);
-	const TArray<FVector> ReferencePointsForRender = ReferencePoints;
-	const float SafeFilterDistance = ReferencePointsForRender.IsEmpty() ? 0.0f : FMath::Max(0.0f, ReferenceFilterDistance);
+	// 提取已经填好逐三角材质 id 和材质表；排一次 section 才能真的按材质槽分批绘制，
+	// 否则整片场景只会用一个材质画出来（旧路径唯一能做到的事）。
+	UCSMeshOps::BuildMaterialSections(DirectGpuMesh);
 
-	// Game-thread resolve of scene triangles into a render-thread-safe snapshot (no UObject access
-	// happens later on the render thread). Static meshes carrying ExcludedActorTags are skipped.
-	const FCSBoxScenePreparedData Prepared = PrepareBoxSceneTriangles(
-		World, QueryBox, SafeMaxTriangles, ReferencePointsForRender, SafeFilterDistance);
+	if (Material) DirectMeshRenderComponent->MeshMaterial = Material;
+	DirectMeshRenderComponent->SetGpuMesh(DirectGpuMesh);
 
-	if (!Prepared.IsValid() || !Prepared.HasAnyTriangles())
-	{
-		return false;
-	}
-
-	if (Material)
-	{
-		DisplayComponent->MeshMaterial = Material;
-	}
-
-	// VertexCapacity = triangle capacity * 3 (triangle soup: 3 verts per triangle).
-	// 提交路径是常驻显示（Lifetime = -1），后续可回读存盘。
-	const uint32 VertexCapacity = uint32(SafeMaxTriangles) * 3u;
-	DisplayComponent->ShowTriangleSoup(Prepared, VertexCapacity, QueryBox);
+	// 常驻显示：取消上一次 DrawDebug 排下的定时清除，否则新提交的网格会被旧计时器抹掉。
+	ScheduleDirectMeshClear(-1.0f);
 	return true;
+}
+
+void AComputeShaderMeshGenerator::ClearDirectGPUMesh()
+{
+	ScheduleDirectMeshClear(-1.0f);
+	if (DirectMeshRenderComponent) DirectMeshRenderComponent->SetGpuMesh(nullptr);
+	// 只清计数不放显存等于白占：这条路上的容量是按 MaxDirectTriangles 开的，可能是几百 MB。
+	if (DirectGpuMesh) DirectGpuMesh->ReleaseSync();
+}
+
+void AComputeShaderMeshGenerator::ScheduleDirectMeshClear(float LifetimeSeconds)
+{
+	UWorld* World = GetWorld();
+	if (!World) return;
+	World->GetTimerManager().ClearTimer(DirectMeshClearTimerHandle);
+	if (LifetimeSeconds <= 0.0f) return; // 常驻，直到调用方自己清除
+	World->GetTimerManager().SetTimer(DirectMeshClearTimerHandle, this,
+		&AComputeShaderMeshGenerator::ClearDirectGPUMesh, LifetimeSeconds, false);
 }
 
 int64 AComputeShaderMeshGenerator::EnsureGeneratorTimeCode()
@@ -3981,13 +3784,24 @@ UStaticMesh* AComputeShaderMeshGenerator::SaveDirectGPUMeshToStaticMesh(
 	bool bConvertToActorLocalSpace)
 {
 #if WITH_EDITOR
+	if (!DirectGpuMesh) return nullptr;
+
 	// 空路径走本 actor 的稳定结果命名（覆盖上一次的结果），而不是让落盘层各自兜底。
+	// 仍留空（未存盘的地图）时交给落盘层的 AutoResult 兜底，与改动前一致。
 	FString EffectiveAssetPath = AssetPathAndName.TrimStartAndEnd();
 	if (EffectiveAssetPath.IsEmpty()) EffectiveAssetPath = BuildResultAssetPath();
-	if (!DisplayComponent) return nullptr;
-	return DisplayComponent->SaveRenderedMeshToStaticMesh(
-		EffectiveAssetPath, DisplayComponent->MeshMaterial.Get(),
-		GetActorTransform(), bConvertToActorLocalSpace, bReplaceExistingAsset, bSaveAsset);
+
+	FCSMeshToStaticMeshOptions Options;
+	Options.AssetPath = EffectiveAssetPath;
+	Options.bTransient = false; // 这个入口的语义就是产出资产
+	Options.bReplaceExisting = bReplaceExistingAsset;
+	Options.bSaveToDisk = bSaveAsset;
+	Options.TargetTransform = GetActorTransform();
+	Options.bBakeToLocalSpace = bConvertToActorLocalSpace;
+
+	// 直接读网格对象，不经组件/代理：网格没在被渲染也能存盘。材质槽由网格自己的材质表带出，
+	// 于是存出的资产保留逐槽材质，而不是整片场景压成一个槽。
+	return UCSMeshOps::CopyToStaticMesh(DirectGpuMesh, this, this, Options);
 #else
 	return nullptr;
 #endif
@@ -4099,6 +3913,11 @@ AComputeShaderMeshGenerator::AComputeShaderMeshGenerator(const FObjectInitialize
 
 	DisplayComponent = CreateDefaultSubobject<UCSDisplayComponent>(TEXT("DisplayComponent"));
 	DisplayComponent->SetupAttachment(SceneRoot);
+
+	// 常驻场景三角汤的画笔。自身不生成任何东西，只绑定 DirectGpuMesh；没绑网格时不建代理，
+	// 所以对没用过提交路径的 actor 是零成本。
+	DirectMeshRenderComponent = CreateDefaultSubobject<UCSMeshRenderComponent>(TEXT("DirectMeshRenderComponent"));
+	DirectMeshRenderComponent->SetupAttachment(SceneRoot);
 }
 
 void AComputeShaderMeshGenerator::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -4112,33 +3931,6 @@ void AComputeShaderMeshGenerator::EndPlay(const EEndPlayReason::Type EndPlayReas
 // -----------------------------------------------------------------------------
 // Generator bounds helper（BrushCache 缓存实现已归位 MeshGeneratorBrushCache.cpp）
 // -----------------------------------------------------------------------------
-
-void AComputeShaderMeshGenerator::SetGeneratorBoundsWorldBox(const FVector& BoxCenter, const FVector& BoxExtent)
-{
-	if (!GeneratorBounds)
-	{
-		return;
-	}
-
-	GeneratorBounds->SetWorldLocation(BoxCenter);
-
-	// SetBoxExtent 吃的是组件本地 extent，所以要先除掉组件自身的缩放，世界范围才对得上。
-	const FVector SafeWorldExtent(
-		FMath::Max(0.0, BoxExtent.X),
-		FMath::Max(0.0, BoxExtent.Y),
-		FMath::Max(0.0, BoxExtent.Z));
-	const FVector ComponentScale = GeneratorBounds->GetComponentTransform().GetScale3D().GetAbs();
-	const FVector SafeComponentScale(
-		FMath::Max(UE_KINDA_SMALL_NUMBER, ComponentScale.X),
-		FMath::Max(UE_KINDA_SMALL_NUMBER, ComponentScale.Y),
-		FMath::Max(UE_KINDA_SMALL_NUMBER, ComponentScale.Z));
-	GeneratorBounds->SetBoxExtent(
-		FVector(
-			SafeWorldExtent.X / SafeComponentScale.X,
-			SafeWorldExtent.Y / SafeComponentScale.Y,
-			SafeWorldExtent.Z / SafeComponentScale.Z),
-		true);
-}
 
 FBox AComputeShaderMeshGenerator::GetGeneratorBoundsWorldBox() const
 {
@@ -4281,6 +4073,11 @@ void AComputeShaderMeshGenerator::RasterizeIndexedMeshToHeightmapRDG(
 	FRDGBufferRef MaterialIdsBuf; FRDGBufferUAVRef MaterialIdsUAV;
 	CSHelper::CreateClearedTypedBuffer(GraphBuilder, MaterialIdsBuf, MaterialIdsUAV, sizeof(uint32), TriangleCapacity, PF_R32_UINT, TEXT("IdxMeshHM.Soup.MaterialIds"), CS_NO_MATERIAL_ID);
 
+	// 同理：本路径不做参照体过滤（bUseReferenceFilter=0），但 shader 声明了这个 UAV，而
+	// SHADER_PARAMETER_RDG_BUFFER_UAV 是必填的——不绑就是 dispatch 时 fatal，不是静默降级。
+	FRDGBufferRef ReferenceFlagsBuf; FRDGBufferUAVRef ReferenceFlagsUAV;
+	CSHelper::CreateClearedTypedBuffer(GraphBuilder, ReferenceFlagsBuf, ReferenceFlagsUAV, sizeof(uint32), TriangleCapacity, PF_R32_UINT, TEXT("IdxMeshHM.Soup.ReferenceFlags"), 0u);
+
 	// Heightmap 路径不追踪 UV，但 shader 参数必须绑定：输入绑 dummy tex-coord SRV（NumTexCoords=0
 	// 让 shader 不真正读取），输出绑一个丢弃用的 UV buffer。
 	FRDGBufferRef UVsBuf; FRDGBufferUAVRef UVsUAV;
@@ -4297,6 +4094,7 @@ void AComputeShaderMeshGenerator::RasterizeIndexedMeshToHeightmapRDG(
 	EP->RW_OutTriangleNormals = Soup.TriangleNormalsUAV;
 	EP->RW_TriangleCounter = Soup.TriangleCounterUAV;
 	EP->RW_OutTriangleMaterialIds = MaterialIdsUAV;
+	EP->RW_OutTriangleReferenceFlags = ReferenceFlagsUAV;
 	EP->RW_OutTriangleUVs = UVsUAV;
 	// 这条路径的 UV buffer 是单通道的，交错步长必须显式给 1，否则 shader 会按未初始化的步长写越界。
 	EP->CSNumUVChannels = 1u;

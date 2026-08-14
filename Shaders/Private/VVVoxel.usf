@@ -18,21 +18,29 @@ StructuredBuffer<int4> VoxelCells;
 StructuredBuffer<uint> VoxelHashSlots;
 StructuredBuffer<float4> VoxelNormals;
 StructuredBuffer<float4> VoxelTargetPositions;
+StructuredBuffer<int4> TargetBucketRanges;
+StructuredBuffer<uint> TargetBucketRangeCounts;
+StructuredBuffer<uint> TargetBucketVoxelIndices;
+StructuredBuffer<uint> TargetBucketHashSlots;
 RWStructuredBuffer<float4> RW_PathPointTangents;
 RWStructuredBuffer<float4> RW_PathPointNormals;
 RWStructuredBuffer<float4> RW_PathPointFrameNormals;
 RWStructuredBuffer<float4> RW_PathPointSurfaceTargets;
 RWStructuredBuffer<float4> RW_PathPointSurfaceNormals;
+#if VINE_OUTPUT_BASESTREAMS
 // Base-stream output layout (matches RoadBuilder.usf): interleaved-free typed buffers the
 // GPU-resident mesh path consumes directly, plus DrawIndexedIndirect args and CPU-readback counters.
-// 这曾经是 VINE_OUTPUT_BASESTREAMS permutation 的一半，另一半（写三个 StructuredBuffer 再回读的
-// 老路）随 CPU 回读一起废弃了，现在只有这一种输出。
 RWBuffer<float> RWPositions;    // 3 floats / vertex
 RWBuffer<uint>  RWTangents;     // 2 packed 8888 SNORM / vertex (TangentX, TangentZ)
 RWBuffer<float> RWTexCoords;    // 2 floats / vertex
 RWBuffer<uint>  RWColors;       // packed / vertex
 RWBuffer<uint>  RWBaseIndices;
 float4x4 VineWorldToLocal;
+#else
+RWStructuredBuffer<float4> RW_OutVertices;
+RWStructuredBuffer<float2> RW_OutUVs;
+RWStructuredBuffer<uint> RW_OutIndices;
+#endif
 RWStructuredBuffer<float4> RW_PathPointsNoised;
 
 uint PackSnorm8888(float4 V)
@@ -62,6 +70,11 @@ float3 VoxelOrigin;
 float VoxelSize;
 uint VoxelCount;
 uint VoxelHashSlotCount;
+float3 TargetBucketOrigin;
+float TargetBucketSize;
+uint TargetBucketCount;
+uint TargetBucketHashSlotCount;
+uint TargetBucketSearchRadius;
 float VinesOffset;
 float TinyZJitterStrength;
 float CurlNoiseStrength;
@@ -84,6 +97,7 @@ static const int VINE_VOXEL_WEIGHTED_SAMPLE_COUNT = 8;
 static const uint VINE_VOXEL_SAMPLE_MODE_FAIL = 0u;
 static const uint VINE_VOXEL_SAMPLE_MODE_NEIGHBOR = 1u;
 static const uint VINE_VOXEL_SAMPLE_MODE_LOCAL = 2u;
+static const uint VINE_VOXEL_SAMPLE_MODE_BUCKET = 3u;
 
 uint HashVoxelCell(int3 Cell)
 {
@@ -168,6 +182,323 @@ void BuildVineVoxelHashCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     }
 }
 
+// Trip B / Stage 2: build the target-bucket CSR acceleration structure on the GPU straight from
+// the producer's GPU-resident target positions, so the vine no longer needs the blocking surface-
+// voxel readback + CPU BuildVineTargetBucketBuffers. The layout produced here is exactly what
+// FindTargetBucketRangeForCell (below) decodes: RW_BB_HashSlots[slot] = rangeIndex+1 (0=empty),
+// linear probe; RW_BB_Ranges[r] = (cellX, cellY, cellZ, itemStart); RW_BB_RangeCounts[r] = count;
+// RW_BB_VoxelIndices is the concatenated per-bucket target-index list (CSR). BB_SlotCount is a
+// power of two; BB_TargetCount (= voxel/target count) is an upper bound on the real bucket count.
+StructuredBuffer<float4> BB_TargetPositions;
+RWStructuredBuffer<uint>  RW_BB_HashSlots;    // [SB], cleared 0; 0=empty, 0xffffffff=claiming, else rangeIndex+1
+RWStructuredBuffer<int4>  RW_BB_Ranges;       // [N]; xyz=bucket cell, w=item start offset
+RWStructuredBuffer<uint>  RW_BB_RangeCounts;  // [N], cleared 0; items per bucket
+RWStructuredBuffer<uint>  RW_BB_Counter;      // [1], cleared 0; dense bucket allocator
+RWStructuredBuffer<uint>  RW_BB_ItemCursor;   // [1], cleared 0; CSR start allocator
+RWStructuredBuffer<uint>  RW_BB_RangeFill;    // [N], cleared 0; per-bucket scatter cursor
+RWStructuredBuffer<uint>  RW_BB_VoxelIndices; // [N]; CSR item list (target indices)
+float3 BB_Origin;
+float  BB_BucketSize;
+uint   BB_TargetCount;
+uint   BB_SlotCount;
+
+// Byte-identical to GetTargetBucketCell below so the built cells match what the decode queries.
+int3 BuildTargetBucketCell(float3 Position)
+{
+    return int3(floor((Position - BB_Origin) / max(BB_BucketSize, 1.0e-8f)));
+}
+
+static const uint BB_SLOT_LOCK = 0xffffffffu;
+
+// Pass 1: dedup targets into coarse-cell buckets, allocate a dense range index per unique cell,
+// build the hash-slot table, and count items per bucket. Adapts StaticMeshPointSampler.usf's
+// claim -> allocate -> DeviceMemoryBarrier -> publish -> bounded-spin pattern to the single-array
+// (rangeIndex+1) slot format the vine decodes.
+[numthreads(64, 1, 1)]
+void VVBuildTargetBucketsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint i = DispatchThreadId.x;
+    if (i >= BB_TargetCount || BB_SlotCount == 0u)
+    {
+        return;
+    }
+    float3 T = BB_TargetPositions[i].xyz;
+    if (!all(isfinite(T)))
+    {
+        return; // matches the CPU build's non-finite skip
+    }
+    int3 Cell = BuildTargetBucketCell(T);
+    uint Mask = BB_SlotCount - 1u;
+    uint Slot = HashVoxelCell(Cell) & Mask;
+    for (uint Probe = 0u; Probe < BB_SlotCount; ++Probe)
+    {
+        uint Prev = 0u;
+        InterlockedCompareExchange(RW_BB_HashSlots[Slot], 0u, BB_SLOT_LOCK, Prev);
+        if (Prev == 0u)
+        {
+            // Claimed an empty slot -> this thread owns a brand-new bucket.
+            uint RangeIndex = 0u;
+            InterlockedAdd(RW_BB_Counter[0], 1u, RangeIndex);
+            RW_BB_Ranges[RangeIndex] = int4(Cell, 0);
+            InterlockedAdd(RW_BB_RangeCounts[RangeIndex], 1u); // count this target
+            DeviceMemoryBarrier();
+            uint Ignored = 0u;
+            InterlockedExchange(RW_BB_HashSlots[Slot], RangeIndex + 1u, Ignored); // publish
+            return;
+        }
+        else if (Prev == BB_SLOT_LOCK)
+        {
+            // Another thread is mid-claim on this slot; wait (bounded) for it to publish.
+            uint Published = BB_SLOT_LOCK;
+            for (uint Wait = 0u; Wait < 64u; ++Wait)
+            {
+                Published = RW_BB_HashSlots[Slot];
+                if (Published != BB_SLOT_LOCK)
+                {
+                    break;
+                }
+            }
+            if (Published != BB_SLOT_LOCK && Published != 0u)
+            {
+                uint RangeIndex = Published - 1u;
+                if (all(RW_BB_Ranges[RangeIndex].xyz == Cell))
+                {
+                    InterlockedAdd(RW_BB_RangeCounts[RangeIndex], 1u);
+                    return;
+                }
+            }
+            Slot = (Slot + 1u) & Mask; // different cell (or spin timeout) -> linear probe
+        }
+        else
+        {
+            // Slot already holds a published rangeIndex+1.
+            uint RangeIndex = Prev - 1u;
+            if (all(RW_BB_Ranges[RangeIndex].xyz == Cell))
+            {
+                InterlockedAdd(RW_BB_RangeCounts[RangeIndex], 1u);
+                return;
+            }
+            Slot = (Slot + 1u) & Mask; // hash collision, different cell -> linear probe
+        }
+    }
+}
+
+// Pass 2: turn per-bucket counts into CSR start offsets via an atomic bump (order-independent;
+// each real bucket gets a unique contiguous [start, start+count) slice). No prefix-sum needed.
+[numthreads(64, 1, 1)]
+void VVComputeBucketStartsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint RangeIndex = DispatchThreadId.x;
+    if (RangeIndex >= BB_TargetCount)
+    {
+        return;
+    }
+    uint Count = RW_BB_RangeCounts[RangeIndex];
+    if (Count == 0u)
+    {
+        return; // not an allocated bucket
+    }
+    uint Start = 0u;
+    InterlockedAdd(RW_BB_ItemCursor[0], Count, Start);
+    RW_BB_Ranges[RangeIndex].w = int(Start);
+}
+
+// Pass 3: scatter each target index into its bucket's CSR slice (re-probe the published hash).
+[numthreads(64, 1, 1)]
+void VVScatterTargetsToBucketsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint i = DispatchThreadId.x;
+    if (i >= BB_TargetCount || BB_SlotCount == 0u)
+    {
+        return;
+    }
+    float3 T = BB_TargetPositions[i].xyz;
+    if (!all(isfinite(T)))
+    {
+        return;
+    }
+    int3 Cell = BuildTargetBucketCell(T);
+    uint Mask = BB_SlotCount - 1u;
+    uint Slot = HashVoxelCell(Cell) & Mask;
+    for (uint Probe = 0u; Probe < BB_SlotCount; ++Probe)
+    {
+        uint Packed = RW_BB_HashSlots[Slot];
+        if (Packed == 0u)
+        {
+            return; // unreachable: pass 1 created a slot for every finite target
+        }
+        if (Packed != BB_SLOT_LOCK)
+        {
+            uint RangeIndex = Packed - 1u;
+            if (all(RW_BB_Ranges[RangeIndex].xyz == Cell))
+            {
+                uint LocalPos = 0u;
+                InterlockedAdd(RW_BB_RangeFill[RangeIndex], 1u, LocalPos);
+                RW_BB_VoxelIndices[uint(RW_BB_Ranges[RangeIndex].w) + LocalPos] = i;
+                return;
+            }
+        }
+        Slot = (Slot + 1u) & Mask;
+    }
+}
+
+int3 GetTargetBucketCell(float3 Position)
+{
+    return int3(floor((Position - TargetBucketOrigin) / max(TargetBucketSize, 1.0e-8f)));
+}
+
+int FindTargetBucketRangeForCell(int3 QueryBucket)
+{
+    if (TargetBucketCount == 0u || TargetBucketHashSlotCount == 0u)
+    {
+        return -1;
+    }
+
+    uint Mask = TargetBucketHashSlotCount - 1u;
+    uint Slot = HashVoxelCell(QueryBucket) & Mask;
+    for (uint Probe = 0u; Probe < TargetBucketHashSlotCount; ++Probe)
+    {
+        uint PackedRangeIndex = TargetBucketHashSlots[Slot];
+        if (PackedRangeIndex == 0u)
+        {
+            return -1;
+        }
+
+        uint RangeIndex = PackedRangeIndex - 1u;
+        if (RangeIndex < TargetBucketCount && all(TargetBucketRanges[RangeIndex].xyz == QueryBucket))
+        {
+            return int(RangeIndex);
+        }
+
+        Slot = (Slot + 1u) & Mask;
+    }
+
+    return -1;
+}
+
+bool FindNearestTargetBucketSample(float3 Query, out float3 OutTarget, out float3 OutNormal)
+{
+    OutTarget = Query;
+    OutNormal = float3(0.0f, 0.0f, 1.0f);
+
+    if (VoxelCount == 0u || TargetBucketCount == 0u || TargetBucketHashSlotCount == 0u || TargetBucketSize <= 1.0e-8f)
+    {
+        return false;
+    }
+
+    int3 QueryBucket = GetTargetBucketCell(Query);
+    float BestDistSq[VINE_VOXEL_WEIGHTED_SAMPLE_COUNT];
+    int BestVoxelIndex[VINE_VOXEL_WEIGHTED_SAMPLE_COUNT];
+    for (int BestIndex = 0; BestIndex < VINE_VOXEL_WEIGHTED_SAMPLE_COUNT; ++BestIndex)
+    {
+        BestDistSq[BestIndex] = 3.402823466e+38f;
+        BestVoxelIndex[BestIndex] = -1;
+    }
+
+    int MaxRadius = min(int(TargetBucketSearchRadius), 16);
+
+    [loop]
+    for (int Radius = 0; Radius <= MaxRadius; ++Radius)
+    {
+        [loop]
+        for (int Z = -Radius; Z <= Radius; ++Z)
+        {
+            [loop]
+            for (int Y = -Radius; Y <= Radius; ++Y)
+            {
+                [loop]
+                for (int X = -Radius; X <= Radius; ++X)
+                {
+                    if (Radius > 0 && max(max(abs(X), abs(Y)), abs(Z)) != Radius)
+                    {
+                        continue;
+                    }
+
+                    int RangeIndex = FindTargetBucketRangeForCell(QueryBucket + int3(X, Y, Z));
+                    if (RangeIndex < 0)
+                    {
+                        continue;
+                    }
+
+                    uint Start = (uint)max(TargetBucketRanges[RangeIndex].w, 0);
+                    uint Count = TargetBucketRangeCounts[RangeIndex];
+                    [loop]
+                    for (uint ItemIndex = 0u; ItemIndex < Count; ++ItemIndex)
+                    {
+                        uint PackedIndex = Start + ItemIndex;
+                        uint VoxelIdx = TargetBucketVoxelIndices[PackedIndex];
+                        if (VoxelIdx >= VoxelCount)
+                        {
+                            continue;
+                        }
+
+                        float3 Target = VoxelTargetPositions[VoxelIdx].xyz;
+                        float3 Delta = Query - Target;
+                        float DistSq = dot(Delta, Delta);
+                        [unroll]
+                        for (int BestIndex = 0; BestIndex < VINE_VOXEL_WEIGHTED_SAMPLE_COUNT; ++BestIndex)
+                        {
+                            if (DistSq < BestDistSq[BestIndex])
+                            {
+                                [unroll(7)]
+                                for (int ShiftIndex = VINE_VOXEL_WEIGHTED_SAMPLE_COUNT - 1; ShiftIndex > 0; --ShiftIndex)
+                                {
+                                    if (ShiftIndex > BestIndex)
+                                    {
+                                        BestDistSq[ShiftIndex] = BestDistSq[ShiftIndex - 1];
+                                        BestVoxelIndex[ShiftIndex] = BestVoxelIndex[ShiftIndex - 1];
+                                    }
+                                }
+
+                                BestDistSq[BestIndex] = DistSq;
+                                BestVoxelIndex[BestIndex] = int(VoxelIdx);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        float NextShellDist = max(0.0f, (float(Radius) - 0.5f) * TargetBucketSize);
+        if (BestVoxelIndex[VINE_VOXEL_WEIGHTED_SAMPLE_COUNT - 1] >= 0 && BestDistSq[VINE_VOXEL_WEIGHTED_SAMPLE_COUNT - 1] <= NextShellDist * NextShellDist)
+        {
+            break;
+        }
+    }
+
+    if (BestVoxelIndex[0] < 0)
+    {
+        return false;
+    }
+
+    float3 SumWeightedTarget = float3(0.0f, 0.0f, 0.0f);
+    float3 SumWeightedNormal = float3(0.0f, 0.0f, 0.0f);
+    float TotalWeight = 0.0f;
+    [unroll]
+    for (int BestIndex = 0; BestIndex < VINE_VOXEL_WEIGHTED_SAMPLE_COUNT; ++BestIndex)
+    {
+        int VoxelIdx = BestVoxelIndex[BestIndex];
+        if (VoxelIdx < 0)
+        {
+            continue;
+        }
+
+        float Weight = 1.0f / max(BestDistSq[BestIndex], 1.0e-8f);
+        SumWeightedTarget += VoxelTargetPositions[VoxelIdx].xyz * Weight;
+        SumWeightedNormal += VoxelNormals[VoxelIdx].xyz * Weight;
+        TotalWeight += Weight;
+    }
+
+    if (TotalWeight <= 1.0e-8f)
+    {
+        return false;
+    }
+
+    OutTarget = SumWeightedTarget / TotalWeight;
+    OutNormal = SafeNormalize3(SumWeightedNormal / TotalWeight, float3(0.0f, 0.0f, 1.0f));
+    return true;
+}
 
 void AccumulateVoxelProjectionSample(
     float3 Query,
@@ -415,11 +746,18 @@ bool FindNearestVoxelSample(float3 Query, out float3 OutTarget, out float3 OutNo
     OutNormal = float3(0.0f, 0.0f, 1.0f);
     OutSampleMode = VINE_VOXEL_SAMPLE_MODE_FAIL;
 
-    // Local expanding voxel interpolation around the query point.
+    // Prefer the local expanding voxel interpolation around the query point.
+    // The target bucket search is only a fallback for sparse surface regions.
     uint NeighborSampleMode = VINE_VOXEL_SAMPLE_MODE_FAIL;
     if (SampleVoxelNeighborsExpanded(Query, OutTarget, OutNormal, NeighborSampleMode))
     {
         OutSampleMode = NeighborSampleMode;
+        return true;
+    }
+
+    if (FindNearestTargetBucketSample(Query, OutTarget, OutNormal))
+    {
+        OutSampleMode = VINE_VOXEL_SAMPLE_MODE_BUCKET;
         return true;
     }
 
@@ -1025,6 +1363,7 @@ void BuildVVVoxelCS(uint3 DispatchThreadId : SV_DispatchThreadID)
             float3 Center = SurfaceTarget + SurfaceNormal * TinyJitter;
             float3 OutPosition = Center + Binormal * Profile.x + FrameNormal * Profile.y;
 
+#if VINE_OUTPUT_BASESTREAMS
             float3 LocalPos = mul(float4(OutPosition, 1.0f), VineWorldToLocal).xyz;
             RWPositions[Index*3+0] = LocalPos.x; RWPositions[Index*3+1] = LocalPos.y; RWPositions[Index*3+2] = LocalPos.z;
             float3 RadialNormal = SafeNormalize3(Binormal * Profile.x + FrameNormal * Profile.y, FrameNormal);
@@ -1032,10 +1371,19 @@ void BuildVVVoxelCS(uint3 DispatchThreadId : SV_DispatchThreadID)
             RWTangents[Index*2+1] = PackSnorm8888(float4(RadialNormal, 1.0f));  // TangentZ = 法线(+w 符号)
             RWTexCoords[Index*2+0] = U; RWTexCoords[Index*2+1] = V;
             RWColors[Index] = 0xFFFFFFFFu;
+#else
+            RW_OutVertices[Index] = float4(OutPosition, 1.0f);
+            RW_OutUVs[Index] = float2(U, V);
+#endif
         }
     }
 
+    // Index target is chosen once here; index values / winding below are identical either way.
+#if VINE_OUTPUT_BASESTREAMS
 #define OUT_INDEX(i) RWBaseIndices[i]
+#else
+#define OUT_INDEX(i) RW_OutIndices[i]
+#endif
 
     if (Index < RealSegmentCount && ProfileCount > 0u)
     {
@@ -1134,7 +1482,8 @@ void ApplyVVPerlinNoiseCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 
 // ============================================================================
 // Base-stream axial V (mesh UV.y) — GPU port of the CPU
-// RecomputeVineOutputUVsFromGeneratedLength. BuildVVVoxelCS (pass#8) writes
+// RecomputeVineOutputUVsFromGeneratedLength. ONLY dispatched on the base-stream
+// path (see AddVineMeshPasses / Out.bBaseStreams). BuildVVVoxelCS (pass#8) writes
 // RWTexCoords[Index*2+1] = 0; these four passes overwrite it with the correct V.
 // Everything works over scratch structured buffers holding one entry per output
 // point (PointCount = OutputVertexCount / ProfileCount):

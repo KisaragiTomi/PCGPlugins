@@ -102,7 +102,8 @@ namespace CSGpuMemoryBudget
 
 	/**
 	 * 预估 QueryBox 内的场景三角数。只读渲染数据的三角计数和组件包围盒，不触碰
-	 * MeshDescription——真正的提取（PrepareBoxSceneTriangles）本身就是重活，不能拿来预检。
+	 * MeshDescription——真正的提取（CSBoxSceneCollection::CollectBoxSceneTriangles）本身就是重活，
+	 * 不能拿来预检。
 	 *
 	 * 必须在 game thread 调用（遍历 UObject）。EstimatedTriangles 按包围盒重叠比例折算：
 	 * 一个只有一角伸进盒里的大 mesh，实际进入 soup 的三角远少于它的总数。

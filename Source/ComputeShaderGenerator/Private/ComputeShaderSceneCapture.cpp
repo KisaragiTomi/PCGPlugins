@@ -178,17 +178,6 @@ void ACSGenerateCaptureScene::CheckTexture()
 
 bool ACSGenerateCaptureScene::CreateLandscapeMesh()
 {
-;
-	// FVector Center = Box->Bounds.Origin;
-	// FVector Extent = Box->Bounds.BoxExtent;
-	// if (PreCenter == Center && PreExtent == Extent && Mesh->GetTriangleCount() > 0) return false;
-	//
-	// PreCenter = Center;
-	// PreExtent = Extent;
-	//
-	// ULandscapeExtra::CreateProjectPlane(Mesh, PreCenter, PreExtent, 3);
-	// FGeometryScriptCalculateNormalsOptions CalculateOptions;
-	// UGeometryScriptLibrary_MeshNormalsFunctions::RecomputeNormals(Mesh, CalculateOptions);
 	return true;
 }
 

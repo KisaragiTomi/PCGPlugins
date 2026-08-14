@@ -233,15 +233,18 @@ void InstanceCullCS(uint3 Id : SV_DispatchThreadID)
 void BuildArgsCS(uint3 Id : SV_DispatchThreadID)
 {
 	const uint Lod = Id.x;
-	if (Lod >= CS_INSTANCED_MAX_LODS) return;
+
+	// Bounded by NumLods, not by CS_INSTANCED_MAX_LODS. The args buffer is one of the mesh's declared
+	// streams and holds exactly NumLods arg sets, so a thread for an inactive LOD wrote five uints
+	// past the end of it — silently dropped by a typed UAV's bounds check, which is not something to
+	// keep relying on. There is nothing to zero either: a set past NumLods does not exist.
+	if (Lod >= NumLods) return;
 
 	const uint Args = Lod * 5u;
-	const bool bActive = Lod < NumLods;
-	const uint Visible = bActive ? min(RWLodCounters[Lod], MaxInstancesPerLod) : 0u;
 
-	RWIndirectArgs[Args + 0u] = bActive ? GetLodIndexCount(Lod) : 0u; // IndexCountPerInstance
-	RWIndirectArgs[Args + 1u] = Visible;                              // InstanceCount
-	RWIndirectArgs[Args + 2u] = bActive ? GetLodFirstIndex(Lod) : 0u; // StartIndexLocation
-	RWIndirectArgs[Args + 3u] = bActive ? GetLodBaseVertex(Lod) : 0u; // BaseVertexLocation
-	RWIndirectArgs[Args + 4u] = 0u;                                   // StartInstanceLocation
+	RWIndirectArgs[Args + 0u] = GetLodIndexCount(Lod);                    // IndexCountPerInstance
+	RWIndirectArgs[Args + 1u] = min(RWLodCounters[Lod], MaxInstancesPerLod); // InstanceCount
+	RWIndirectArgs[Args + 2u] = GetLodFirstIndex(Lod);                    // StartIndexLocation
+	RWIndirectArgs[Args + 3u] = GetLodBaseVertex(Lod);                    // BaseVertexLocation
+	RWIndirectArgs[Args + 4u] = 0u;                                       // StartInstanceLocation
 }

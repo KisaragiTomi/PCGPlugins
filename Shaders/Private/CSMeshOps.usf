@@ -1,0 +1,543 @@
+// Operators over a UCSMesh resident stream set (FCSMeshResident).
+//
+// Every kernel here writes the same descriptor-driven buffer set the render base draws
+// from — positions, packed tangent basis, UV0, colour, indices, per-triangle material id,
+// DrawIndexedIndirect args and the two-uint MeshCounters carrier. The vertex layout is
+// byte-compatible with RoadBuilder.usf / CSDirectMesh.usf so all three feed the same
+// FLocalVertexFactory draw path.
+//
+// Positions in the resident set are WORLD space: the render component draws with an
+// identity transform, and the scene-extraction and boolean paths already produce world
+// space. Operators taking a source in local space bake the transform in here.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/ComputeShaderUtils.ush"   // GetUnWrappedDispatchThreadId: >65535 groups wrap to 2D
+
+#ifndef THREADGROUPSIZE_X
+#define THREADGROUPSIZE_X 64
+#endif
+
+// For LBVHFloatFlip, the monotone float->uint transform the world-bounds reduction below
+// needs to do atomic min/max on floats. Included rather than copied for the same reason
+// MeshBoolean.usf includes this file: an ordering trick that is subtly wrong for negative
+// floats is exactly the kind of thing that must have one implementation.
+#include "/Plugin/PCGPlugins/Shaders/Private/CSGpuTriangleUtilities.ush"
+
+// --- destination: the resident stream set -----------------------------------
+RWBuffer<float> RW_Positions;    // 3 floats / vertex
+RWBuffer<uint>  RW_Tangents;     // 2 packed 8888 SNORM / vertex (TangentX, TangentZ)
+RWBuffer<float> RW_TexCoords;    // 2 floats / vertex
+RWBuffer<uint>  RW_Colors;       // packed BGRA / vertex (matches RoadBuilder.usf)
+RWBuffer<uint>  RW_Indices;
+RWBuffer<uint>  RW_MaterialIds;  // 1 uint / triangle
+RWBuffer<uint>  RW_IndirectArgs; // DrawIndexedIndirect: 5 uints
+RWBuffer<uint>  RW_MeshCounters; // [0] = vertexCount, [1] = indexCount
+
+// Read-only view of the counters, used by append-style operators to find their base offset
+// without a CPU round-trip.
+Buffer<uint> InMeshCounters;
+
+// --- source: a static mesh's own render buffers ------------------------------
+Buffer<uint>   SrcIndexBuffer;
+Buffer<float>  SrcPositionBuffer;   // stride SrcPositionStrideFloat
+Buffer<float4> SrcTangentBuffer;    // 2 entries / vertex: [0] TangentX, [1] TangentZ(.w = sign)
+Buffer<float2> SrcTexCoordBuffer;   // interleaved, SrcNumTexCoords per vertex
+Buffer<float4> SrcColorBuffer;      // memory order (B,G,R,A)
+Buffer<uint>   SrcTriToMaterial;    // 1 registry id / source triangle
+
+// --- source: a triangle soup (scene extraction / boolean output) -------------
+Buffer<float4> SrcSoupVertices;     // xyz world position, w = 1; 3 per triangle
+Buffer<float4> SrcSoupNormals;      // xyz world normal, w = 0; 3 per triangle
+Buffer<float2> SrcSoupUVs;          // interleaved SrcSoupUVChannels per corner
+Buffer<uint>   SrcSoupMaterialIds;  // 1 per triangle
+Buffer<uint>   SrcSoupCounter;      // [0] = triangle count
+
+float4x4 SrcLocalToWorld;
+float4x4 SrcNormalToWorld;          // inverse-transpose of SrcLocalToWorld, for normals/tangents
+float4   ConstantColor;             // RGBA in 0..1
+
+uint SrcVertexCount;
+uint SrcIndexCount;
+uint SrcTriangleCount;
+uint SrcPositionStrideFloat;
+uint SrcNumTexCoords;
+uint SrcSoupUVChannels;
+uint SrcHasTangents;
+uint SrcHasColors;
+uint MaterialIdOffset;
+uint DstVertexBase;
+uint DstIndexBase;
+uint VertexCapacity;
+uint IndexCapacity;
+uint bFlipWinding;
+uint ThreadCount;
+
+// Byte-for-byte identical to RoadBuilder.usf / CSDirectMesh.usf so every producer feeds
+// the same VET_PackedNormal / PF_R8G8B8A8_SNORM tangent stream.
+uint PackSnorm8888(float4 V)
+{
+	int4 I = int4(round(clamp(V, -1.0, 1.0) * 127.0));
+	return (uint(I.x) & 0xFF) | ((uint(I.y) & 0xFF) << 8) | ((uint(I.z) & 0xFF) << 16) | ((uint(I.w) & 0xFF) << 24);
+}
+
+// The colour stream is packed BGRA (RoadBuilder.usf's documented convention, which is also
+// what VET_Color expects); the CPU readback unpacks with the same byte order.
+uint PackColorBGRA(float4 RGBA)
+{
+	uint4 I = uint4(round(saturate(RGBA) * 255.0));
+	return (I.z & 0xFF) | ((I.y & 0xFF) << 8) | ((I.x & 0xFF) << 16) | ((I.w & 0xFF) << 24);
+}
+
+float3 ReadSrcPosition(uint VertexId)
+{
+	const uint Base = VertexId * SrcPositionStrideFloat;
+	return float3(SrcPositionBuffer[Base + 0], SrcPositionBuffer[Base + 1], SrcPositionBuffer[Base + 2]);
+}
+
+float3 SafeNormal(float3 N)
+{
+	const float LenSq = dot(N, N);
+	if (!(LenSq > 1e-12f) || any(isnan(N))) return float3(0.0f, 0.0f, 1.0f);
+	return N * rsqrt(LenSq);
+}
+
+// A tangent perpendicular to N, used whenever the source has none.
+float3 ArbitraryTangent(float3 N)
+{
+	const float3 Helper = (abs(N.z) < 0.99f) ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+	return SafeNormal(cross(Helper, N));
+}
+
+void WriteVertex(uint V, float3 P, float3 TanX, float4 TanZ, float2 UV, uint PackedColor)
+{
+	RW_Positions[V * 3 + 0] = P.x;
+	RW_Positions[V * 3 + 1] = P.y;
+	RW_Positions[V * 3 + 2] = P.z;
+	RW_Tangents[V * 2 + 0] = PackSnorm8888(float4(TanX, 0.0f));
+	RW_Tangents[V * 2 + 1] = PackSnorm8888(TanZ);
+	RW_TexCoords[V * 2 + 0] = UV.x;
+	RW_TexCoords[V * 2 + 1] = UV.y;
+	RW_Colors[V] = PackedColor;
+}
+
+// ---------------------------------------------------------------- counters + indirect args
+//
+// Every operator that changes the mesh size ends by writing both the MeshCounters carrier and
+// the DrawIndexedIndirect args, which is why the render side never has to be told how big the
+// mesh is. Uploads know their counts on the CPU (SetCountersCS); GPU-sized operators derive
+// them from their own output counter (AdvanceCountersBySoupCS).
+
+// Writes CPU-known counts (uploads) and the args in one pass.
+[numthreads(1, 1, 1)]
+void SetCountersCS(uint3 Id : SV_DispatchThreadID)
+{
+	const uint VertexCount = min(DstVertexBase, VertexCapacity);
+	const uint IndexCount = min(DstIndexBase, IndexCapacity);
+	RW_MeshCounters[0] = VertexCount;
+	RW_MeshCounters[1] = IndexCount;
+	RW_IndirectArgs[0] = IndexCount;
+	RW_IndirectArgs[1] = 1;
+	RW_IndirectArgs[2] = 0;
+	RW_IndirectArgs[3] = 0;
+	RW_IndirectArgs[4] = 0;
+}
+
+// ---------------------------------------------------------------- static mesh upload
+
+// One thread per source vertex. Positions are baked to world space here because the
+// resident set is world space by contract.
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void UploadStaticMeshVerticesCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint V = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (V >= SrcVertexCount) return;
+
+	const uint Dst = DstVertexBase + V;
+	if (Dst >= VertexCapacity) return;
+
+	const float3 P = mul(float4(ReadSrcPosition(V), 1.0f), SrcLocalToWorld).xyz;
+
+	float3 N = float3(0.0f, 0.0f, 1.0f);
+	float3 T = float3(1.0f, 0.0f, 0.0f);
+	float Sign = 1.0f;
+	if (SrcHasTangents != 0u)
+	{
+		const float4 SrcTanX = SrcTangentBuffer[V * 2 + 0];
+		const float4 SrcTanZ = SrcTangentBuffer[V * 2 + 1];
+		N = SafeNormal(mul(float4(SrcTanZ.xyz, 0.0f), SrcNormalToWorld).xyz);
+		T = SafeNormal(mul(float4(SrcTanX.xyz, 0.0f), SrcLocalToWorld).xyz);
+		Sign = (SrcTanZ.w < 0.0f) ? -1.0f : 1.0f;
+		// Re-orthogonalise: a non-uniform scale skews tangent and normal apart.
+		T = SafeNormal(T - N * dot(T, N));
+	}
+	else
+	{
+		T = ArbitraryTangent(N);
+	}
+
+	float2 UV = float2(0.0f, 0.0f);
+	if (SrcNumTexCoords > 0u) UV = SrcTexCoordBuffer[V * SrcNumTexCoords];
+
+	// FColor is stored BGRA, and the destination stream is BGRA too, so the components pass
+	// straight through in memory order.
+	uint PackedColor = 0xffffffffu;
+	if (SrcHasColors != 0u)
+	{
+		const float4 SrcColor = SrcColorBuffer[V];
+		PackedColor = PackColorBGRA(float4(SrcColor.z, SrcColor.y, SrcColor.x, SrcColor.w));
+	}
+
+	WriteVertex(Dst, P, T, float4(N, Sign), UV, PackedColor);
+}
+
+// One thread per source index. Winding is preserved by default: UE's render index buffer
+// already draws the source mesh correctly, and the readback -> MeshDescription path derives
+// its face normal from the same convention.
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void UploadStaticMeshIndicesCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint K = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (K >= SrcIndexCount) return;
+
+	const uint Dst = DstIndexBase + K;
+	if (Dst >= IndexCapacity) return;
+
+	uint Corner = K % 3u;
+	if (bFlipWinding != 0u && Corner != 0u) Corner = 3u - Corner; // swap corners 1 and 2
+	const uint SrcK = (K / 3u) * 3u + Corner;
+
+	RW_Indices[Dst] = DstVertexBase + SrcIndexBuffer[SrcK];
+
+	if (Corner == 0u)
+	{
+		const uint Tri = K / 3u;
+		const uint DstTri = (DstIndexBase / 3u) + Tri;
+		if (Tri < SrcTriangleCount) RW_MaterialIds[DstTri] = SrcTriToMaterial[Tri] + MaterialIdOffset;
+	}
+}
+
+// ---------------------------------------------------------------- triangle-soup append
+
+// Appends a world-space triangle soup (the scene extraction / boolean output format) onto
+// the end of the resident mesh. The base offset comes from the counters buffer, so no CPU
+// round-trip is needed even though only the GPU knows how big the soup turned out.
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void AppendTriangleSoupCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint V = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+
+	const uint SoupVertexCount = min(SrcSoupCounter[0] * 3u, SrcTriangleCount * 3u);
+	if (V >= SoupVertexCount) return;
+
+	const uint BaseVertex = InMeshCounters[0];
+	const uint BaseIndex = InMeshCounters[1];
+	const uint Dst = BaseVertex + V;
+	if (Dst >= VertexCapacity || (BaseIndex + V) >= IndexCapacity) return;
+
+	const float3 P = SrcSoupVertices[V].xyz;
+	const float3 N = SafeNormal(SrcSoupNormals[V].xyz);
+	const float3 T = ArbitraryTangent(N);
+
+	float2 UV = float2(0.0f, 0.0f);
+	if (SrcSoupUVChannels > 0u) UV = SrcSoupUVs[V * SrcSoupUVChannels];
+
+	WriteVertex(Dst, P, T, float4(N, 1.0f), UV, 0xffffffffu);
+
+	// Soup is a triangle list with a unique vertex per corner, so the index buffer is identity.
+	RW_Indices[BaseIndex + V] = Dst;
+
+	if ((V % 3u) == 0u)
+	{
+		const uint SoupTri = V / 3u;
+		const uint DstTri = (BaseIndex / 3u) + SoupTri;
+		// CS_NO_MATERIAL_ID stays out of range on purpose; the readback maps it to slot 0.
+		const uint SrcId = SrcSoupMaterialIds[SoupTri];
+		RW_MaterialIds[DstTri] = (SrcId == 0xFFFFFFFFu) ? SrcId : (SrcId + MaterialIdOffset);
+	}
+}
+
+// Adds the appended soup to the counters. Runs after AppendTriangleSoupCS.
+[numthreads(1, 1, 1)]
+void AdvanceCountersBySoupCS(uint3 Id : SV_DispatchThreadID)
+{
+	const uint SoupVertexCount = min(SrcSoupCounter[0] * 3u, SrcTriangleCount * 3u);
+	RW_MeshCounters[0] = min(RW_MeshCounters[0] + SoupVertexCount, VertexCapacity);
+	RW_MeshCounters[1] = min(RW_MeshCounters[1] + SoupVertexCount, IndexCapacity);
+
+	const uint IndexCount = RW_MeshCounters[1];
+	RW_IndirectArgs[0] = IndexCount;
+	RW_IndirectArgs[1] = 1;
+	RW_IndirectArgs[2] = 0;
+	RW_IndirectArgs[3] = 0;
+	RW_IndirectArgs[4] = 0;
+}
+
+// ---------------------------------------------------------------- in-place vertex ops
+
+// Transforms positions and rotates the tangent basis with them.
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void TransformMeshCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint V = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (V >= ThreadCount || V >= InMeshCounters[0]) return;
+
+	const float3 P = float3(RW_Positions[V * 3 + 0], RW_Positions[V * 3 + 1], RW_Positions[V * 3 + 2]);
+	const float3 NewP = mul(float4(P, 1.0f), SrcLocalToWorld).xyz;
+	RW_Positions[V * 3 + 0] = NewP.x;
+	RW_Positions[V * 3 + 1] = NewP.y;
+	RW_Positions[V * 3 + 2] = NewP.z;
+
+	// The packed basis has to be unpacked, rotated and repacked; there is no in-place rotate.
+	const uint PackedX = RW_Tangents[V * 2 + 0];
+	const uint PackedZ = RW_Tangents[V * 2 + 1];
+	const float3 TanX = SafeNormal(mul(float4(
+		float((int)((PackedX << 24) >> 24)) / 127.0f,
+		float((int)((PackedX << 16) >> 24)) / 127.0f,
+		float((int)((PackedX << 8) >> 24)) / 127.0f, 0.0f), SrcLocalToWorld).xyz);
+	const float3 TanZ = SafeNormal(mul(float4(
+		float((int)((PackedZ << 24) >> 24)) / 127.0f,
+		float((int)((PackedZ << 16) >> 24)) / 127.0f,
+		float((int)((PackedZ << 8) >> 24)) / 127.0f, 0.0f), SrcNormalToWorld).xyz);
+	const float Sign = (((PackedZ >> 24) & 0xFFu) >= 128u) ? -1.0f : 1.0f;
+
+	RW_Tangents[V * 2 + 0] = PackSnorm8888(float4(SafeNormal(TanX - TanZ * dot(TanX, TanZ)), 0.0f));
+	RW_Tangents[V * 2 + 1] = PackSnorm8888(float4(TanZ, Sign));
+}
+
+// Swaps corners 1 and 2 of every triangle and negates the stored normal, which is what
+// "flip" has to mean when the normal is a vertex attribute rather than a derived quantity.
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void FlipNormalsCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint Tri = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (Tri >= ThreadCount || (Tri * 3u + 2u) >= InMeshCounters[1]) return;
+
+	const uint I1 = RW_Indices[Tri * 3u + 1u];
+	const uint I2 = RW_Indices[Tri * 3u + 2u];
+	RW_Indices[Tri * 3u + 1u] = I2;
+	RW_Indices[Tri * 3u + 2u] = I1;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void NegateNormalsCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint V = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (V >= ThreadCount || V >= InMeshCounters[0]) return;
+
+	const uint PackedZ = RW_Tangents[V * 2 + 1];
+	const float3 TanZ = float3(
+		float((int)((PackedZ << 24) >> 24)) / 127.0f,
+		float((int)((PackedZ << 16) >> 24)) / 127.0f,
+		float((int)((PackedZ << 8) >> 24)) / 127.0f);
+	const float Sign = (((PackedZ >> 24) & 0xFFu) >= 128u) ? -1.0f : 1.0f;
+	RW_Tangents[V * 2 + 1] = PackSnorm8888(float4(-TanZ, -Sign));
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void SetVertexColorsCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint V = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (V >= ThreadCount || V >= InMeshCounters[0]) return;
+	RW_Colors[V] = PackColorBGRA(ConstantColor);
+}
+
+// ---------------------------------------------------------------- vertex welding
+//
+// The shared weld facility (CSGpuTriangleUtilities) works on a corner-indexed triangle soup
+// and hands back a representative corner per corner. These three kernels are the adapter
+// between that and an indexed resident mesh: build the soup view, then rewrite the index
+// buffer so co-located corners point at one shared vertex. Attribute merging stays a
+// producer decision, exactly as the facility's contract says.
+
+RWStructuredBuffer<float3> RW_WeldSoup;
+RWBuffer<uint> RW_WeldTriangleCounter;
+Buffer<float>  WeldSrcPositions;
+Buffer<uint>   WeldSrcIndices;      // pre-weld copy: reading the live buffer while rewriting it would race
+Buffer<uint>   WeldRepresentatives;
+
+[numthreads(1, 1, 1)]
+void BuildWeldCounterCS(uint3 Id : SV_DispatchThreadID)
+{
+	RW_WeldTriangleCounter[0] = min(InMeshCounters[1], IndexCapacity) / 3u;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void BuildWeldSoupCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint K = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (K >= ThreadCount || K >= InMeshCounters[1]) return;
+
+	const uint V = WeldSrcIndices[K];
+	RW_WeldSoup[K] = float3(WeldSrcPositions[V * 3 + 0], WeldSrcPositions[V * 3 + 1], WeldSrcPositions[V * 3 + 2]);
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void RemapIndicesByWeldCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint K = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (K >= ThreadCount || K >= InMeshCounters[1]) return;
+
+	// Corners the weld pass never touched come back as 0xFFFFFFFF and keep their own vertex.
+	const uint Rep = WeldRepresentatives[K];
+	if (Rep == 0xFFFFFFFFu || Rep >= InMeshCounters[1]) return;
+	RW_Indices[K] = WeldSrcIndices[Rep];
+}
+
+// ---------------------------------------------------------------- material sections
+//
+// Counting sort of the triangles by material slot, so each slot's triangles are contiguous in
+// the index buffer and one DrawIndexedIndirect arg set can cover each run. Four phases:
+//   1. clear the per-slot counters (an RDG clear, not a kernel)
+//   2. histogram   - one thread per triangle, InterlockedAdd into its slot
+//   3. scan        - one thread, serial exclusive prefix; also emits the arg sets, because this
+//                    is the only point where a slot's first triangle and its count are both known
+//   4. scatter     - one thread per triangle, InterlockedAdd on a per-slot cursor hands out the
+//                    destination
+// The slot count is CPU-known (UCSMesh::Materials); the triangle count is not, so every kernel
+// bounds itself off MeshCounters like the rest of this file.
+//
+// The scatter order inside a run is whatever the cursors hand out and therefore not
+// reproducible between runs. Nothing downstream depends on it: the draw only needs the run to
+// be contiguous.
+
+RWBuffer<uint> RW_SlotCounters;     // per material slot: the histogram
+RWBuffer<uint> RW_SlotCursors;      // per material slot: the scatter cursor, seeded by the scan
+Buffer<uint>   InSlotCounters;      // read-only view of the histogram, for the scan
+Buffer<uint>   SortSrcIndices;      // pre-sort copy: one triangle's destination is another's source
+Buffer<uint>   SortSrcMaterialIds;  // pre-sort copy, for the same reason
+uint NumMaterialSlots;
+
+// CS_NO_MATERIAL_ID (0xFFFFFFFF, what AppendTriangleSoupCS writes for geometry with no registry
+// entry) and any other out-of-range id land in slot 0 — the same fallback the CPU readback
+// applies, and the only one that cannot index the counter buffer out of bounds.
+uint MaterialSlotForId(uint MaterialId)
+{
+	return (MaterialId < NumMaterialSlots) ? MaterialId : 0u;
+}
+
+uint MaterialSortTriangleCount()
+{
+	return min(InMeshCounters[1], IndexCapacity) / 3u;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void HistogramMaterialSlotsCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint Tri = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (Tri >= ThreadCount || Tri >= MaterialSortTriangleCount()) return;
+
+	InterlockedAdd(RW_SlotCounters[MaterialSlotForId(SortSrcMaterialIds[Tri])], 1u);
+}
+
+// One thread: slot counts are in the tens, and a parallel scan over them would cost more passes
+// than it saves. RW_IndirectArgs is cleared before this pass, so an arg set past NumMaterialSlots
+// draws nothing instead of holding the previous section layout's draw.
+[numthreads(1, 1, 1)]
+void ScanMaterialSlotsCS(uint3 Id : SV_DispatchThreadID)
+{
+	uint FirstTriangle = 0u;
+	[loop] for (uint Slot = 0u; Slot < NumMaterialSlots; ++Slot)
+	{
+		const uint SlotTriangles = InSlotCounters[Slot];
+		RW_SlotCursors[Slot] = FirstTriangle;
+
+		const uint Base = Slot * 5u;
+		RW_IndirectArgs[Base + 0u] = SlotTriangles * 3u;  // IndexCountPerInstance
+		RW_IndirectArgs[Base + 1u] = 1u;                  // InstanceCount
+		RW_IndirectArgs[Base + 2u] = FirstTriangle * 3u;  // StartIndexLocation
+		RW_IndirectArgs[Base + 3u] = 0u;                  // BaseVertexLocation (indices are absolute)
+		RW_IndirectArgs[Base + 4u] = 0u;                  // StartInstanceLocation
+
+		FirstTriangle += SlotTriangles;
+	}
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void ScatterTrianglesByMaterialCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint Tri = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	const uint TriangleCount = MaterialSortTriangleCount();
+	if (Tri >= ThreadCount || Tri >= TriangleCount) return;
+
+	const uint Slot = MaterialSlotForId(SortSrcMaterialIds[Tri]);
+	uint DstTri = 0u;
+	InterlockedAdd(RW_SlotCursors[Slot], 1u, DstTri);
+	// Cursors are seeded from the histogram over the same triangles, so this can only fire if the
+	// two phases disagreed — and a scatter past the end would corrupt whatever follows.
+	if (DstTri >= TriangleCount) return;
+
+	RW_Indices[DstTri * 3u + 0u] = SortSrcIndices[Tri * 3u + 0u];
+	RW_Indices[DstTri * 3u + 1u] = SortSrcIndices[Tri * 3u + 1u];
+	RW_Indices[DstTri * 3u + 2u] = SortSrcIndices[Tri * 3u + 2u];
+
+	// The resolved slot, not the source id: after the sort the id stream has to agree with the
+	// section the triangle now sits in, and an unresolved CS_NO_MATERIAL_ID would not.
+	RW_MaterialIds[DstTri] = Slot;
+}
+
+// ---------------------------------------------------------------- world-bounds reduction
+//
+// InterlockedMin/Max only exist for uints, and asuint(float) does not order negative floats —
+// their bit patterns run backwards, so a naive atomic min over asuint would report the *least*
+// negative coordinate as the minimum. LBVHFloatFlip (CSGpuTriangleUtilities.ush) is the monotone
+// transform the LBVH refit already uses for exactly this; the CPU undoes it after the readback.
+
+RWBuffer<uint> RW_MeshBounds;   // [0..2] flipped min xyz, [3..5] flipped max xyz
+Buffer<float>  BoundsSrcPositions;
+
+groupshared uint GSBoundsMin[3];
+groupshared uint GSBoundsMax[3];
+
+// The min/max identities in the flipped ordering: 0xFFFFFFFF sits above every real float and 0
+// below every one, so a group — or a whole mesh — that contributes nothing leaves the result at
+// the clear value, which is how the CPU tells "empty" from "a degenerate box at the origin".
+[numthreads(1, 1, 1)]
+void ClearMeshBoundsCS(uint3 Id : SV_DispatchThreadID)
+{
+	for (uint Axis = 0u; Axis < 3u; ++Axis)
+	{
+		RW_MeshBounds[Axis] = 0xFFFFFFFFu;
+		RW_MeshBounds[3u + Axis] = 0u;
+	}
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void ReduceMeshBoundsCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	// The group reduces into LDS first. Six global atomics per vertex would serialise the entire
+	// dispatch on six addresses, and the meshes worth an exact bound are the ones with millions
+	// of vertices.
+	if (GroupIndex < 3u)
+	{
+		GSBoundsMin[GroupIndex] = 0xFFFFFFFFu;
+		GSBoundsMax[GroupIndex] = 0u;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	// No early return anywhere in this kernel: every thread has to reach both barriers.
+	const uint V = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (V < ThreadCount && V < min(InMeshCounters[0], VertexCapacity))
+	{
+		const float3 P = float3(
+			BoundsSrcPositions[V * 3u + 0u], BoundsSrcPositions[V * 3u + 1u], BoundsSrcPositions[V * 3u + 2u]);
+		// One NaN flips to an extreme uint and swallows the whole box, which would then be
+		// blamed on the geometry rather than on the single bad vertex that caused it.
+		if (!any(isnan(P)))
+		{
+			const uint3 Flipped = uint3(LBVHFloatFlip(P.x), LBVHFloatFlip(P.y), LBVHFloatFlip(P.z));
+			InterlockedMin(GSBoundsMin[0], Flipped.x);
+			InterlockedMin(GSBoundsMin[1], Flipped.y);
+			InterlockedMin(GSBoundsMin[2], Flipped.z);
+			InterlockedMax(GSBoundsMax[0], Flipped.x);
+			InterlockedMax(GSBoundsMax[1], Flipped.y);
+			InterlockedMax(GSBoundsMax[2], Flipped.z);
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if (GroupIndex < 3u)
+	{
+		InterlockedMin(RW_MeshBounds[GroupIndex], GSBoundsMin[GroupIndex]);
+		InterlockedMax(RW_MeshBounds[3u + GroupIndex], GSBoundsMax[GroupIndex]);
+	}
+}

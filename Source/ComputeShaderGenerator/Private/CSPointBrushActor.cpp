@@ -1,7 +1,9 @@
 #include "CSPointBrushActor.h"
 
-#include "CSDisplayComponent.h"
 #include "CSGpuInstancedMeshComponent.h"
+#include "CSMesh.h"
+#include "CSMeshRenderComponent.h"
+#include "CSPointArrowMesh.h"
 
 #include "Engine/World.h"
 #include "RenderGraphBuilder.h"
@@ -105,7 +107,7 @@ ACSPointBrushActor::ACSPointBrushActor()
 	PointInstanceComponent = CreateDefaultSubobject<UCSGpuInstancedMeshComponent>(TEXT("PointInstances"));
 	PointInstanceComponent->SetupAttachment(Root);
 
-	PointArrowComponent = CreateDefaultSubobject<UCSDisplayComponent>(TEXT("PointArrows"));
+	PointArrowComponent = CreateDefaultSubobject<UCSMeshRenderComponent>(TEXT("PointArrows"));
 	PointArrowComponent->SetupAttachment(Root);
 }
 
@@ -218,23 +220,39 @@ void ACSPointBrushActor::RefreshDebugDraw()
 
 		if (!PointBuffers.IsValid())
 		{
-			PointArrowComponent->ClearDisplay();
+			ClearPointArrowDisplay();
 			return;
 		}
+
+		if (!PointArrowMesh) PointArrowMesh = NewObject<UCSMesh>(this);
+
+		// 一个材质槽，不是 section 表：整片箭头就一种材质，BuildMaterialSections 只会把索引缓冲排
+		// 一遍、再把 indirect args 撑大到"恰好一段"。这个槽是存盘资产的材质槽来源，组件的
+		// MeshMaterial 才是那一次绘制批次实际用的材质 —— 两者职责不同。
+		PointArrowMesh->SetMaterial(0, PointArrowComponent->MeshMaterial);
 
 		// 每个点一个沿法线朝向的箭头，由 compute pass 直接从 PointBuffers 生成。
 		// 箭头几何按 CPU 侧的点数上界分配（真计数只在 GPU 上），画多少仍由 GPU 计数决定。
 		const int32 DisplayCount = GetDisplayPointCount();
-		PointArrowComponent->ShowPointArrows(
-			PointBuffers,
-			(MaxPointsToDraw > 0) ? FMath::Min(MaxPointsToDraw, DisplayCount) : DisplayCount,
-			FMath::Max(ArrowLength, 1.0f),
-			PointColor,
-			/*Lifetime*/ -1.0f); // 常驻，跟随笔刷数据存在
+		FCSPointArrowBuildParams ArrowParams;
+		ArrowParams.Source = PointBuffers;
+		ArrowParams.MaxArrows = (MaxPointsToDraw > 0) ? FMath::Min(MaxPointsToDraw, DisplayCount) : DisplayCount;
+		ArrowParams.ArrowLength = FMath::Max(ArrowLength, 1.0f);
+		ArrowParams.ArrowColor = PointColor;
+		if (!BuildPointArrowGeometryIntoMesh(PointArrowMesh, ArrowParams))
+		{
+			// 生成失败时网格里留着的是**上一次**的箭头。把它继续画在已经对不上的点集旁边是最坏的
+			// 结果：看起来像一次成功的生成。宁可清掉。
+			ClearPointArrowDisplay();
+			return;
+		}
+
+		// 常驻显示，跟随笔刷数据存在：没有定时清除，因为这条路上唯一的调用方就是"让显示跟上数据"。
+		PointArrowComponent->SetGpuMesh(PointArrowMesh);
 		return;
 	}
 
-	if (PointArrowComponent) PointArrowComponent->ClearDisplay();
+	ClearPointArrowDisplay();
 	if (!PointInstanceComponent) return;
 
 	if (!PointBuffers.IsValid())
@@ -262,9 +280,20 @@ void ACSPointBrushActor::RefreshDebugDraw()
 void ACSPointBrushActor::ReleasePointBuffer()
 {
 	if (PointInstanceComponent) PointInstanceComponent->ClearInstances();
-	if (PointArrowComponent) PointArrowComponent->ClearDisplay();
+	ClearPointArrowDisplay();
 	ReleasePooledSourceOnRenderThread(PointBuffers);
 	GpuPointCountUpperBound = 0;
+}
+
+void ACSPointBrushActor::ClearPointArrowDisplay()
+{
+	// 解绑在前：代理借的是网格的常驻 buffer，先释放会让它继续从一条已经不存在的索引缓冲上画。
+	if (PointArrowComponent) PointArrowComponent->SetGpuMesh(nullptr);
+	if (!PointArrowMesh) return;
+
+	// 只停止绘制而不放显存等于白占：这条路上的容量按显示点数开，满笔刷（65536 点）约 40 MB。
+	const FCSMeshResident* Resident = PointArrowMesh->GetResidentPtr();
+	if (Resident && Resident->IsAllocated()) PointArrowMesh->ReleaseSync();
 }
 
 bool ACSPointBrushActor::IsBrushPointAllowed(const FVector& WorldPosition) const

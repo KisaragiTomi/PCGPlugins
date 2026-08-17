@@ -1478,23 +1478,6 @@ UDynamicMesh* UGeometryGenerate::VDBMeshFromSurfaceVoxels(TArray<AActor*> In_Act
 	return OutMesh;
 }
 
-FVector UGeometryGenerate::TestViewPosition()
-{
-	// FLevelEditorViewportClient* SelectedViewport = NULL;
-	//
-	// for(FLevelEditorViewportClient* ViewportClient : GEditor->GetLevelViewportClients())
-	// {
-	// 	if (!ViewportClient->IsOrtho())
-	// 	{
-	// 		SelectedViewport = ViewportClient;
-	// 	}
-	// }
-	// FViewport* Viewport =  SelectedViewport->Viewport;
-	//
-	//
-	return FVector::ZeroVector;
-}
-
 UCSMesh* UGeometryGenerate::VDBVoxelsToOpenGpuMesh(UCSMesh* TargetMesh,
 	UObject* Outer,
 	FCSSurfaceVoxelData SurfaceVoxels,

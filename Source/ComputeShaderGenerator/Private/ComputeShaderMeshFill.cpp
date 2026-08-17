@@ -460,7 +460,6 @@ void ACSFillTarget::Generate(int32 NumIteration, float InSpawnSize)
 		FlushRenderingCommands();
 	}
 	
-	// void* Data = RHILockBuffer(DebugBuffer->GetRHI(), ;
 	TArray<FLinearColor> LinearSamples;
 	
 	FTextureRenderTargetResource* R_Result = RT_Result->GameThread_GetRenderTargetResource();

@@ -74,7 +74,6 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capturer")
 	FName Tag = FName(TEXT("Auto"));
 	
-	TRefCountPtr<FRDGPooledBuffer> DebugBuffer;
 	
 	virtual void OnConstruction(const FTransform& Transform) override;
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")

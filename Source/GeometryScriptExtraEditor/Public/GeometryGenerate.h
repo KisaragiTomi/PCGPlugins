@@ -96,9 +96,6 @@ public:
 
 	static UDynamicMesh* CollectMeshs(UDynamicMesh* TargetMesh, TArray<UStaticMesh*> BoundTransformMapKeyArray, TArray<TArray<FTransform>>
 	                                  BoundTransformMapValueArray, FBox Bounds, float MeshExtrude);
-	
-	UFUNCTION(BlueprintCallable, Category = Generate)
-	static FVector TestViewPosition();
 
 	/** 把一批已经读回 CPU 的 GPU surface voxels 通过 OpenVDB ParticlesToLevelSet 转成 mesh。
 	 *  输出为世界空间坐标。

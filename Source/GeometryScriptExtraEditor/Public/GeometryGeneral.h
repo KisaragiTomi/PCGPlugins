@@ -30,7 +30,6 @@ public:
 	TArray<int> TIDs;
 	TArray<FVector> VPoss;
 
-	bool IsValid = true;
 };
 
 
@@ -40,7 +39,6 @@ public:
 	float Count = 0;
 	float MaxDist = -TNumericLimits<float>::Max();
 	float MinDist = TNumericLimits<float>::Max();
-	int ClassNum = -1;
 	int ParentClass = -1;
 
 	virtual bool  CollectedData(FDynamicMesh3& EditMesh, int TID, float Dist) = 0;

@@ -355,14 +355,6 @@ public:
 // IMPLEMENT_GLOBAL_SHADER moved to ComputeShaderBasicFunction.cpp
 
 
-class FDrawPrimHeightVertexBuffer : public FVertexBuffer
-{
-public:
-	/** Initialize the RHI for this rendering resource */
-	virtual void InitRHI(FRHICommandListBase& RHICmdList) override;
-};
-
-
 class COMPUTESHADERGENERATOR_API FSampleSpline : public FGlobalShader
 {
 public:

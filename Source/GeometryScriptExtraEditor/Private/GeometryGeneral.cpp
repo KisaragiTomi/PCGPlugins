@@ -1013,20 +1013,6 @@ void UGeometryGeneral::WeldVertices(FDynamicMesh3& EditMesh, float Tolerance)
 	DuplicatesQueue.Initialize(EditMesh.MaxEdgeID());
 	for (int eid : RemainingEdges) 
 	{
-		// if (OnlyUniquePairs) 
-		// {
-		// 	if (EquivalenceSets[eid]->Num() != 1)
-		// 	{
-		// 		continue;
-		// 	}
-		//
-		// 	// check that reverse match is the same and unique
-		// 	int other_eid = (*EquivalenceSets[eid])[0];
-		// 	if (EquivalenceSets[other_eid]->Num() != 1 || (*EquivalenceSets[other_eid])[0] != eid)
-		// 	{
-		// 		continue;
-		// 	}
-		// }
 		const float Priority = (float)EquivalenceSets[eid]->Num();
 		DuplicatesQueue.Insert(eid, Priority);
 	}
@@ -1126,160 +1112,7 @@ void UGeometryGeneral::WeldVertices(FDynamicMesh3& EditMesh, float Tolerance)
 	
 	}
 	
-	// FinalNumBoundaryEdges = 0;
-	// for (int eid : Mesh->BoundaryEdgeIndicesItr())
-	// {
-	// 	FinalNumBoundaryEdges++;
-	// }
 
-	return ;
-
-
-
-
-
-	
-	// TSet<int32> GroupEdgeIDs;
-	// TArray<int32> CornerIDs;
-	// CornerIDs.Reserve(EditMesh.VertexCount());
-	// for (int i : EditMesh.VertexIndicesItr())
-	// {
-	// 	CornerIDs.Add(i);
-	// }
-	// FGroupTopology GroupTopology(&EditMesh, true);
-	//
-	// for (int32 CornerID : CornerIDs)
-	// {
-	// 	GroupTopology.ForCornerNbrEdges(CornerID, [CornerID, &CornerIDs, &GroupEdgeIDs, GroupTopology](int32 EdgeID)
-	// 	{
-	// 		if (CornerIDs.Contains(GroupTopology.Edges[EdgeID].EndpointCorners.A)
-	// 			&& CornerIDs.Contains(GroupTopology.Edges[EdgeID].EndpointCorners.B))
-	// 		{
-	// 			GroupEdgeIDs.Add(EdgeID);					
-	// 		}
-	// 		return true;
-	// 	});
-	// }
-	//
-	//
-	// FDynamicMesh3::FCollapseEdgeOptions CollapseOptions;
-	// CollapseOptions.bAllowHoleCollapse = true;
-	// CollapseOptions.bAllowCollapsingInternalEdgeWithBoundaryVertices = true;
-	// CollapseOptions.bAllowTetrahedronCollapse = true;
-	//
-	// TSet<int32> EidsToCollapse;
-	// for (int32 GroupEdgeID : GroupEdgeIDs)
-	// {
-	// 	EidsToCollapse.Append(GroupTopology.GetGroupEdgeEdges(GroupEdgeID));
-	// }
-	//
-	// // Partition our edges into connected components so that we can collapse into their
-	// //  individual centroids.
-	// TArray<TSet<int32>> EidComponents;
-	// TSet<int32> PartitionedEids;
-	// TArray<int32> TempQueue;
-	// for (int32 Eid : EidsToCollapse)
-	// {
-	// 	if (PartitionedEids.Contains(Eid))
-	// 	{
-	// 		continue;
-	// 	}
-	//
-	// 	TSet<int32>& ComponentEids = EidComponents.Emplace_GetRef();
-	// 	ComponentEids.Add(Eid);
-	// 	FMeshConnectedComponents::GrowToConnectedEdges(EditMesh, { Eid }, ComponentEids, &TempQueue,
-	// 		[&EidsToCollapse](int32 CurrentEid, int32 NeighborEid)
-	// 		{
-	// 			return EidsToCollapse.Contains(NeighborEid);
-	// 		});
-	// 	PartitionedEids.Append(ComponentEids);
-	// }
-	//
-	// // Now process our components.
-	// bool bAllCollapsesSuccessful = true;
-	// TSet<int32> NewSelectionVids;
-	// for (TSet<int32>& Component : EidComponents)
-	// {
-	// 	FVector3d Centroid = FVector3d::Zero();
-	// 	for (int32 Eid : Component)
-	// 	{
-	// 		Centroid += EditMesh.GetEdgePoint(Eid, 0.5);
-	// 	}
-	// 	Centroid /= Component.Num();
-	//
-	// 	// Unfiltered because vids will disappear in subsequent collapses
-	// 	TSet<int32> UnfilteredVidsToMove;
-	//
-	// 	for (int32 Eid : Component)
-	// 	{
-	// 		// Some edges might be collapsed away by other collapses
-	// 		if (!EditMesh.IsEdge(Eid))
-	// 		{
-	// 			continue;
-	// 		}
-	//
-	// 		FIndex2i EdgeVids = EditMesh.GetEdgeV(Eid);
-	// 		FDynamicMesh3::FEdgeCollapseInfo CollapseInfo;
-	// 		EMeshResult Result = EditMesh.CollapseEdge(EdgeVids.A, EdgeVids.B, CollapseOptions, CollapseInfo);
-	//
-	// 		// Certain collapses of isolated triangles/quads are not currently allowed by CollapseEdge,
-	// 		//  but we allow them if the user asks for them.
-	// 		if (Result == EMeshResult::Failed_CollapseTriangle
-	// 			|| Result == EMeshResult::Failed_CollapseQuad
-	// 			|| Result == EMeshResult::Failed_FoundDuplicateTriangle)
-	// 		{
-	// 			bAllCollapsesSuccessful = RemoveEdgeTrisIfNotLast(*CurrentMesh, Eid) && bAllCollapsesSuccessful;
-	// 		}
-	// 		// We could also check for EMeshResult::InvalidTopology and do the "move with seam"
-	// 		//  approach we do for welding, but it seems like it would be harder to notice this
-	// 		//  for collapses because the degenerate triangles are harder to find than open boundaries.
-	// 		//  So for now we won't fake a collapse in that case.
-	// 		else if (Result == EMeshResult::Ok)
-	// 		{
-	// 			UnfilteredVidsToMove.Add(CollapseInfo.KeptVertex);
-	// 		}
-	// 		else
-	// 		{
-	// 			bAllCollapsesSuccessful = false;
-	// 		}
-	// 	}
-	//
-	// 	for (int32 Vid : UnfilteredVidsToMove)
-	// 	{
-	// 		if (EditMesh.IsVertex(Vid))
-	// 		{
-	// 			EditMesh.SetVertex(Vid, Centroid);
-	// 			NewSelectionVids.Add(Vid);
-	// 		}
-	// 	}
-	// }
-	//
-	// EmitCurrentMeshChangeAndUpdate(CollapseEdgeTransactionLabel, ChangeTracker.EndChange(), FGroupTopologySelection());
-	//
-	// // Now that the topology is updated, we can get the new corner id's to
-	// //  set the new selection.
-	// FGroupTopologySelection NewSelection;
-	// for (int32 Vid : NewSelectionVids)
-	// {
-	// 	// Even though we filtered each component, it's possible for one component's collapses to indirectly
-	// 	//  destroy verts in another, hence the check here.
-	// 	if (!EditMesh.IsVertex(Vid))
-	// 	{
-	// 		continue;
-	// 	}
-	// 	int32 CornerID = Topology->GetCornerIDFromVertexID(Vid);
-	// 	if (CornerID != IndexConstants::InvalidID)
-	// 	{
-	// 		NewSelection.SelectedCornerIDs.Add(CornerID);
-	// 	}
-	// }
-	// // Seems possible to end up with an empty selection if we collapsed a triangle hole in a group,
-	// //  so the new vertex is not part of a group boundary.
-	// if (!NewSelection.IsEmpty())
-	// {
-	// 	SelectionMechanic->SetSelection(NewSelection);
-	// }
-	//
 
 
 }
@@ -1441,165 +1274,6 @@ TMap<int, ReduceDatatype> UGeometryGeneral::FindNearestComponents(FDynamicMesh3&
 	}
 	return ReduceComponentMap;
 	
-	// for (TPair<int, ReduceDatatype>& ComponentReduceData: ReduceComponentMap)
-	// {
-	// 	int Class = ComponentReduceData.Key;
-	// 	ReduceDatatype& ReduceDatatype = ComponentReduceData.Value;
-	// 	FDynamicMeshComponentData& Data = ComponentDatas[Class];
-	// 	int ParentClass = Data.ParentClass;
-	// 	float MaxDist = ReduceDatatype.MaxDist;
-	// 	if (MaxDist > CombineDistThreshold ||  MaxDist == TNumericLimits<int>::Max() ) continue;
-	//
-	// 	if (ReduceComponentMap.Find(ParentClass))
-	// 	{
-	// 		FWindTreeReduceData& ParentReduceData = ReduceComponentMap[ParentClass];
-	// 		MaxDist = ParentReduceData.MaxDist;
-	// 		if (MaxDist > CombineDistThreshold ||  MaxDist == TNumericLimits<int>::Max() ) continue;
-	// 	}
-	// 	ComponentDatas[ParentClass].TIDs.Append(Data.TIDs);
-	// 	ComponentDatas[Class].TIDs.Empty();
-	// 	ComponentDatas[Class].IsValid = false;
-	// 	for (int TID : ComponentDatas[Class].TIDs)
-	// 	{
-	// 		FIndex3i TVIDs = EditMesh.GetTriangle(TID);
-	// 		for (int i = 0; i < 3; i++)
-	// 		{
-	// 			int DiscardPoint = 1;
-	// 			AVI_DiscardPoint->SetValue(TVIDs[i], &DiscardPoint);
-	// 		}
-	// 	}
-	// }
-	// for (auto It = ComponentDatas.CreateIterator(); It; ++It)
-	// {
-	// 	if (It.Value().IsValid) continue;
-	// 	It.RemoveCurrent();
-	// }
-
-
-	
-	// if (!MergeOptions.FindConditionLambda) return;
-	// struct FComponentReduceData
-	// {
-	//     double Dist = TNumericLimits<double>::Max();
-	//     int Count = 0;
-	// };
-	//
-
-	
- //    for (TPair<int, FDynamicMeshComponentData>& ComponentDataPair : ComponentDatas)
- //    {
- //        int Class = ComponentDataPair.Key;
- //        FDynamicMeshComponentData& Data = ComponentDataPair.Value;
- //
- //
- //        TMap<int, int> ComponentMap;
- //    	
- //    	TDynamicMeshTriangleAttribute<int, 1>* AttribClass = static_cast<TDynamicMeshTriangleAttribute<int, 1>*>(EditMesh->Attributes()->GetAttachedAttribute(FName("ATI_Class")));
- //        IMeshSpatial::FQueryOptions QueryOptionsXYZ([&](int32 TID)
- //        {
-	//        int FindClass = -1;
-	//         EditMesh->IsTriangle(TID);
-	//        AttribClass->GetValue(TID, &FindClass);
-	//         
-	//        return FindClass != Class;
- //        });
- //    	
- //        for (int TID : Data.TIDs)
- //        {
-	// 		FIndex3i TVIDs = EditMesh->GetTriangle(TID);
-	// 		FVector3d VertexPos = EditMesh->GetVertex(TVIDs[0]); 
-	// 		        
-	// 		double Dist = TNumericLimits<double>::Max();
-	// 		int HitTID = BVH.Spatial->FindNearestTriangle(VertexPos, Dist, QueryOptionsXYZ);
- //
-	// 		if (HitTID >= 0 && Dist < TNumericLimits<double>::Max())
-	// 		{
-	// 		    if (!MergeOptions.FindConditionLambda(TID)) continue;
- //
-	// 		        
-	// 			ComponentMap.Add(Class, ParentClassNum);
-	// 		}
- //        	TPair<int, FComponentReduceData> MinDistComponentReduceData;
- //        	for (TPair<int, FComponentReduceData> ComponentReduceData: ComponentMap)
- //        	{
- //        		if ( MinDistComponentReduceData.Value.Count <  ComponentReduceData.Value.Count) MinDistComponentReduceData = ComponentReduceData;
- //        	}
- //        	float MaxDist = MinDistComponentReduceData.Value.Dist;
- //        	if (MaxDist > CombineDistThreshold || MaxDist == TNumericLimits<int>::Max() ) continue;
-	// 		
- //        	ComponentData.Value.AddToClass = MinDistComponentReduceData.Key;
-	// 		
- //        	for (int TID :Data.TIDs)
- //        	{
- //        		FIndex3i TVIDs = EditMesh.GetTriangle(TID);
- //        		for (int i = 0; i < 3; i++)
- //        		{
- //        			int DiscardPoint = 1;
- //        			AVI_DiscardPoint->SetValue(TVIDs[i], &DiscardPoint);
- //        		}
- //        	}
- //        }
- //    	
- //        TPair<int, FComponentReduceData> MinDistComponentReduceData(
- //            -1, FComponentReduceData()
- //        ); 
- //
- //        for (const TPair<int, FComponentReduceData>& ComponentReduceDataPair: ComponentMap)
- //        {
- //           if (MinDistComponentReduceData.Value.Count < ComponentReduceDataPair.Value.Count)
- //           {
- //               MinDistComponentReduceData = ComponentReduceDataPair;
- //           }
- //        }
- //        
- //        double MaxDist = MinDistComponentReduceData.Value.Dist;
- //        int TargetClass = MinDistComponentReduceData.Key;
- //    	
- //        if (TargetClass < 0 || MaxDist > CombineDistThreshold || MaxDist == TNumericLimits<double>::Max())
- //        {
- //            Data.AddToClass = -1;
- //            Data.MaxDistToParent = TNumericLimits<double>::Max();
- //            MergeMapping.Add(Class, -1);
- //            continue;
- //        }
- //    	
- //        Data.AddToClass = TargetClass;
- //        Data.MaxDistToParent = MaxDist;
- //        MergeMapping.Add(Class, TargetClass);
- //    	
- //        for (int TID :Data.TIDs)
- //        {
- //           FIndex3i TVIDs = EditMesh->GetTriangle(TID);
- //           for (int i = 0; i < 3; i++)
- //           {
- //              int DiscardPoint = 1;
- //              AVI_DiscardPoint->SetValue(TVIDs[i], &DiscardPoint);
- //           }
- //        }
- //    }
-	//
-	// for (TPair<int, FDynamicMeshComponentData>& ComponentData :  ComponentDatas)
-	// {
-	// 	FDynamicMeshComponentData& Data = ComponentData.Value;
-	// 	int ParentClass = Data.ParentClass;
-	// 	if (ParentClass < 0) continue;
-	// 	FDynamicMeshComponentData& ParentData = ComponentDatas[Data.ParentClass];
-	// 		
-	// 	if (ParentData.ParentClass >= 0) continue;
-	// 	ComponentDatas[ParentClass].TIDs.Append(Data.TIDs);
-	// 	Data.TIDs.Empty();
-	// 		
-	// }
-	// TArray<int> KeyToRemove;
-	// for (TPair<int, FDynamicMeshComponentData>& ComponentData :  ComponentDatas)
-	// {
-	// 	if (ComponentData.Value.TIDs.Num() > 0) continue;
-	// 	KeyToRemove.Add(ComponentData.Key);
-	// }
-	// for (int i = 0; i < KeyToRemove.Num(); i++)
-	// {
-	// 	ComponentDatas.Remove(KeyToRemove[i]);
-	// }
 
 }
 
@@ -1691,17 +1365,6 @@ UDynamicMesh* UGeometryGeneral::FillUVData(UDynamicMesh* TargetMesh, int32 UVLay
 				}
 			}
 		}
-		// for (int32 TriangleID : EditMesh.TriangleIndicesItr())
-		// {
-		// 	if (UVLayer0->IsSetTriangle(TriangleID))
-		// 	{
-		// 		FIndex3i UVTriangle = UVLayer0->GetTriangle(TriangleID);
-		// 		UVTriangle.A = ElementIDMap[UVTriangle.A];
-		// 		UVTriangle.B = ElementIDMap[UVTriangle.B];
-		// 		UVTriangle.C = ElementIDMap[UVTriangle.C];
-		// 		UVOverlay->SetTriangle(TriangleID, UVTriangle);
-		// 	}
-		// }
 	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
 
 	return TargetMesh;
@@ -1750,43 +1413,6 @@ UDynamicMesh* UGeometryGeneral::AddCustomAttribute(UDynamicMesh* TargetMesh, FNa
 			TestData = 0;
 		}
 
-		//
-		//
-		// FVector Sum = FVector::ZeroVector;
-		// FVector SumNormal = FVector::ZeroVector;
-		// FIndex3i T0 = EditMesh.GetTriangle(0);
-		// FDynamicMeshNormalOverlay* NormalOverlay = EditMesh.Attributes()->PrimaryNormals();
-		// FIndex3i TN0 = NormalOverlay->GetTriangle(0);
-		// for (int32 i = 0; i < 3; i++)
-		// {
-		// 	FVector Pos = EditMesh.GetVertex(T0[i]);
-		// 	Sum += Pos;
-		// 	SumNormal = (FVector)NormalOverlay->GetElement(TN0[i]) ;
-		// }
-		// Sum /= 3.0;
-		// SumNormal *= 100;
-		//
-		//
-		// FGeometryScriptDynamicMeshBVH BVH;
-		// UGeometryScriptLibrary_MeshSpatial::BuildBVHForMesh(TargetMesh, BVH, nullptr);
-		//
-		// FGeometryScriptRayHitResult HitResult;
-		//
-		//
-		// IMeshSpatial::FQueryOptions QueryOptions;
-		// QueryOptions.MaxDistance = TNumericLimits<float>::Max();
-		// FRay3d Ray((FVector3d)Sum, Normalized((FVector3d)SumNormal));
-		// int HitTID = BVH.Spatial->FindNearestHitTriangle(Ray, QueryOptions);
-		// if (HitTID >= 0)
-		// {
-		// 	FIntrRay3Triangle3d Intersection = TMeshQueries<FDynamicMesh3>::TriangleIntersection(EditMesh, HitTID, Ray);
-		// 	HitResult.RayParameter = Intersection.RayParameter;
-		// 	HitResult.bHit = true;
-		// 	HitResult.HitTriangleID = HitTID;
-		// 	HitResult.HitPosition = Ray.PointAt(Intersection.RayParameter);
-		// 	HitResult.HitBaryCoords = (FVector)Intersection.TriangleBaryCoords;
-		// }
-		//
 		
 	}, EDynamicMeshChangeType::GeneralEdit, EDynamicMeshAttributeChangeFlags::Unknown, false);
 	
@@ -1909,16 +1535,11 @@ void UGeometryGeneral::CalculateOBBUpDir(TArray<FVector> OrientSpaceVertices, FV
 	FVector3d Extents = Box.Extents;
 	FVector3d Center = Box.Frame.Origin;
 	FQuaterniond Quat = Box.Frame.Rotation;
-	// OutCenter = FVector(Center.X, Center.Y, Center.Z);
-	// OutExtent = FVector(Extents.X, Extents.Y, Extents.Z);
-	// OutRotator = FQuat(Quat.X, Quat.Y, Quat.Z, Quat.W).Rotator();
 
 	float DotObjectCheck = -1;
 	float DotUpCheck = -1;
 	float FAxisDot = 0;
 	float UpDot = 0;
-	// FVector ObjectUpDir;
-	// FVector UpVectorUpDir;
 
 	FVector3d Corner0 = Box.GetCorner(0);
 	FVector3d Corner1 = Box.GetCorner(1);
@@ -1927,7 +1548,6 @@ void UGeometryGeneral::CalculateOBBUpDir(TArray<FVector> OrientSpaceVertices, FV
 	FVector3d Axis0 = Corner1 - Corner0;
 	FVector3d Axis1 = Corner3 - Corner0;
 	FVector3d Axis2 = Corner4 - Corner0;
-	// FVector3d BoxUpDir;
 	
 	if (Axis0.Length() < Axis1.Length())
 	{
@@ -1949,39 +1569,6 @@ void UGeometryGeneral::CalculateOBBUpDir(TArray<FVector> OrientSpaceVertices, FV
 		BoxUpDir *= -1;
 	}
 	BoxUpDir = (FVector)BoxUpDir;
-	//
-	// for (int32 i = 0; i < 3; i++)
-	// {
-	// 	FVector3d Axis = Box.GetAxis(i);
-	// 	FVector FAxis = FVector(Axis.X, Axis.Y, Axis.Z);
-	//
-	// 	FAxisDot = FVector::DotProduct(ObjectUpVector, FAxis);
-	// 	UpDot = FVector::DotProduct(UpVector, FAxis);
-	// 	if (FAxisDot > DotObjectCheck)
-	// 	{
-	// 		ObjectUpDir = FAxis;
-	// 		DotObjectCheck = FAxisDot;
-	// 	}
-	// 	if (UpDot > DotUpCheck)
-	// 	{
-	// 		UpVectorUpDir = FAxis;
-	// 		DotUpCheck = UpDot;
-	// 	}
-	// 	FAxisDot = FVector::DotProduct(ObjectUpVector, -FAxis);
-	// 	UpDot = FVector::DotProduct(UpVector, -FAxis);
-	// 	if (FAxisDot > DotObjectCheck)
-	// 	{
-	// 		ObjectUpDir = -FAxis;
-	// 		DotObjectCheck = FAxisDot;
-	// 	}
-	// 	if (UpDot > DotUpCheck)
-	// 	{
-	// 		UpVectorUpDir = FAxis;
-	// 		DotUpCheck = UpDot;
-	// 	}
-	// }
-	// float QuadrateThreshold = 11;
-	// if (FMath::Abs(Axis0.Length() - Axis1.Length()) < QuadrateThreshold || FMath::Abs(Axis0.Length() - Axis2.Length()) < QuadrateThreshold || FMath::A
 }
 
 bool UGeometryGeneral::HasMeshDistanceField(UStaticMesh* StaticMesh)

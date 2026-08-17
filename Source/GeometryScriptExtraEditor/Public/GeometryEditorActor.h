@@ -139,14 +139,6 @@ public:
 
 };
 
-USTRUCT()
-struct FVineLinePointScaleData
-{
-	GENERATED_BODY()
-
-	UPROPERTY()
-	TArray<float> Values;
-};
 
 // VisVine debug parameter structs moved to ComputeShaderDebugParams.h
 

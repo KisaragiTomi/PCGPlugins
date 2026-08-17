@@ -33,11 +33,6 @@ public:
 	bool IsValid = true;
 };
 
-// struct FComponentMergeOptions
-// {
-// 	TFunction<bool(int32)> FindConditionLambda;
-// 	virtual bool MergeQ();
-// };
 
 struct FDynamicMeshComponentReduceData
 {

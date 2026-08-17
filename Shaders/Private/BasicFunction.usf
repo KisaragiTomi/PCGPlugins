@@ -26,23 +26,6 @@
 
 SamplerState Sampler;
 
-Texture2D T_Height;
-RWTexture2D<float4> RW_Gradient;
-
-
-
-[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
-void CalculateGradient(
-					   uint3 DispatchThreadId : SV_DispatchThreadID,
-					   uint GroupIndex : SV_GroupIndex)
-{
-	float MaxCell = 0;
-	T_Height.GetDimensions(MaxCell, MaxCell);
-	float2 uv = DispatchThreadId.xy / (MaxCell - 1);
-	float4 Gradient = float4(0, 0, 0, 0);
-	Gradient = ComputeGradientT(Sampler, T_Height, uv);
-	RW_Gradient[DispatchThreadId.xy] = Gradient;
-}
 
 Texture2D T_BlurTexture;
 RWTexture2D<float4> RW_BlurTexture;
@@ -131,26 +114,6 @@ float4 BlurPixel(SamplerState Sampler, Texture2D BlurTexture, uint3 DispatchThre
 }
 
 
-float4 BlurPixelOrig(SamplerState Sampler, Texture2D BlurTexture, float2 uv)
-{
-	float Gx = 0;
-	float Gy = 0;
-	float4 SumSampleValue = float4(0, 0, 0, 0);
-	float MaxCell = 0;
-	BlurTexture.GetDimensions(MaxCell, MaxCell);
-    
-	for (int i = -1; i <= 1; i++)
-	{
-		for (int j = -1; j <= 1; j++)
-		{
-			float2 offset = float2(i, j) / MaxCell; 
-			float4 SampleValue = BlurTexture.SampleLevel(Sampler, uv + offset, 0);
-			SumSampleValue += SampleValue;
-		}
-	}
-	SumSampleValue /= 9.0; 
-	return SumSampleValue; 
-}
 
 float4 BlurNormalPixel(SamplerState Sampler, Texture2D BlurTexture, float2 uv)
 {

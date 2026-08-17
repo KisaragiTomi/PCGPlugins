@@ -4,7 +4,6 @@
 #include "/Engine/Public/Platform.ush"
 
 #define PI 3.14159265358979323846264f
-#define PI2 6.2831853071795864769252866f
 
 #ifndef GENERAL_SHAREGROUP_EXTENT
 #define GENERAL_SHAREGROUP_EXTENT 4
@@ -20,68 +19,12 @@
 #define CREATE_SHARE_DATA_FUNC Require_CreateFunc_Name
 #endif
 
-#ifndef MAXCELL
-#define MAXCELL MaxCell
-#endif
-
-
 half4 Require_CreateFunc_Name(int2 Pos)
 {
     return 0;
 }
 
 groupshared half4 GENERAL_SHAREGROUP_NAME[THREADGROUPSIZE_X + GENERAL_SHAREGROUP_EXTENT * 2][THREADGROUPSIZE_Y + GENERAL_SHAREGROUP_EXTENT * 2];
-
-// void WaiteShareGroup(int X_OFF, int Y_OFF, int2 POS, int2 GroupThreadId)
-// {
-//     GENERAL_SHAREGROUP_NAME[GroupThreadId.x + X_OFF][GroupThreadId.y + Y_OFF] = CREATE_SHARE_DATA_FUNC(POS);
-// }
-
-void FillSharedGroup(
-    in int3 DispatchThreadId, 
-    in int3 GroupThreadId,
-
-    int2 MaxCell,
-    in uint GroupIndex
-)
-{
-    // int2 HVCheck = int2(GroupThreadId.x < GENERAL_SHAREGROUP_EXTENT, GroupThreadId.y < GENERAL_SHAREGROUP_EXTENT);
-    // HVCheck *= -1;
-    // HVCheck += int2(GroupThreadId.x + GENERAL_SHAREGROUP_EXTENT >= THREADGROUPSIZE_X, GroupThreadId.y + GENERAL_SHAREGROUP_EXTENT >= THREADGROUPSIZE_Y);
-    // HVCheck *= GENERAL_SHAREGROUP_EXTENT;
-    // int2 GroupOffset = HVCheck + GENERAL_SHAREGROUP_EXTENT;
-	   //
-    // int2 SharePosX = clamp(DispatchThreadId.xy + int2(HVCheck.x, 0), int2(0,0), int2(MaxCell.x - 1, MaxCell.y - 1));
-    // int2 SharePosY = clamp(DispatchThreadId.xy + int2(0, HVCheck.y), int2(0,0), int2(MaxCell.x - 1, MaxCell.y - 1));
-    // int2 SharePosXY = clamp(DispatchThreadId.xy + HVCheck, int2(0,0), int2(MaxCell.x - 1, MaxCell.y - 1));
-    // int2 SharePosCore = DispatchThreadId.xy;
-    // // SharePosX = clamp(DispatchThreadId.xy -3, int2(0,0), int2(MaxCell.x - 1, MaxCell.y - 1));
-    // // SharePosX.x = max(SharePosX.x, 0);
-    // GENERAL_SHAREGROUP_NAME[GroupThreadId.x + GroupOffset.x][GroupThreadId.y + GENERAL_SHAREGROUP_EXTENT] = CREATE_SHARE_DATA_FUNC(SharePosX);
-    // GENERAL_SHAREGROUP_NAME[GroupThreadId.x + GENERAL_SHAREGROUP_EXTENT][GroupThreadId.y + GroupOffset.y] = CREATE_SHARE_DATA_FUNC(SharePosY);
-    // GENERAL_SHAREGROUP_NAME[GroupThreadId.x + GroupOffset.x][GroupThreadId.y + GroupOffset.y] = CREATE_SHARE_DATA_FUNC(SharePosXY);
-    // GENERAL_SHAREGROUP_NAME[GroupThreadId.x + GENERAL_SHAREGROUP_EXTENT][GroupThreadId.y + GENERAL_SHAREGROUP_EXTENT] = CREATE_SHARE_DATA_FUNC(SharePosCore);
-    
-    int2 groupTopLeftGlobal = DispatchThreadId.xy - GroupThreadId.xy - int2(GENERAL_SHAREGROUP_EXTENT, GENERAL_SHAREGROUP_EXTENT);
-    
-    const uint THREAD_COUNT = THREADGROUPSIZE_X * THREADGROUPSIZE_Y;
-    const uint SHARED_DIM_X = THREADGROUPSIZE_X + 2 * GENERAL_SHAREGROUP_EXTENT;
-    const uint SHARED_DIM_Y = THREADGROUPSIZE_Y + 2 * GENERAL_SHAREGROUP_EXTENT;
-    const uint TOTAL_SHARED_ELEMENTS = SHARED_DIM_X * SHARED_DIM_Y;
-    
-    for (uint i = GroupIndex; i < TOTAL_SHARED_ELEMENTS; i += THREAD_COUNT)
-    {
-        int localX = i % SHARED_DIM_X;
-        int localY = i / SHARED_DIM_X;
-        
-        int2 globalPos = groupTopLeftGlobal + int2(localX, localY);
-        globalPos = clamp(globalPos, int2(0,0), MaxCell - 1);
-        
-        GENERAL_SHAREGROUP_NAME[localX][localY] = CREATE_SHARE_DATA_FUNC(globalPos);
-    }
-    
-    GroupMemoryBarrierWithGroupSync();
-}
 
 
 
@@ -96,31 +39,6 @@ static const int2 NeighbourOffset[4] =
 float Random1D(float value) {
     return frac(sin(value * 15677.12154));
 }
-
-float2 Random2D(float2 value) {
-    return float2(
-        frac(sin(dot(value.xy, float2(12.9898, 78.233))) * 43758.5453),
-        frac(sin(dot(value.xy, float2(39.346, 31.132))) * 43758.5453)
-    );
-}
-
-float3 Random3D(float3 value) {
-    return float3(
-        frac(sin(dot(value.xyz, float3(12.9898, 78.233, 45.164))) * 43758.5453),
-        frac(sin(dot(value.xyz, float3(39.346, 31.132, 74.989))) * 43758.5453),
-        frac(sin(dot(value.xyz, float3(23.543, 45.345, 67.890))) * 43758.5453)
-    );
-}
-
-float4 Random4D(float4 value) {
-    return float4(
-        frac(sin(dot(value.xyz, float3(12.9898, 78.233, 45.164))) * 43758.5453),
-        frac(sin(dot(value.xyz, float3(39.346, 31.132, 74.989))) * 43758.5453),
-        frac(sin(dot(value.xyz, float3(23.543, 45.345, 67.890))) * 43758.5453),
-        frac(sin(dot(value.xyz, float3(23.543, 45.345, 67.890))) * 43758.5453)
-    );
-}
-
 
 float2 ScaleUV(float2 UV, float2 Scale)
 {
@@ -154,183 +72,6 @@ float2 RotUV(float2 UV, float Angle)
         SinRot, CosRot
     );
     return mul(UV, RotMat);
-}
-
-
-float ColorToGray(float4 color)
-{
-    float graycolor = color.x + color.y + color.z;
-    graycolor /= 3;
-    
-    return graycolor;
-}
-
-float ColorToGray(float3 color)
-{
-    float graycolor = color.x + color.y + color.z;
-    graycolor /= 3;
-    
-    return graycolor;
-}
-
-static const float SobelX[3][3] = {
-    { -1,  0,  1 },
-    { -2,  0,  2 },
-    { -1,  0,  1 }
-};
-
-static const float SobelY[3][3] = {
-    { -1, -2, -1 },
-    {  0,  0,  0 },
-    {  1,  2,  1 }
-};
-
-float4 ComputeGradientT(SamplerState Sampler, Texture2D GrayTexture, float2 uv)
-{
-    float Gx = 0;
-    float Gy = 0;
-
-    float MaxCell = 0;
-    GrayTexture.GetDimensions(MaxCell, MaxCell);
-    
-    for (int i = -1; i <= 1; i++)
-    {
-        for (int j = -1; j <= 1; j++)
-        {
-            float2 offset = float2(i, j) / MaxCell; 
-            float sampleValue = GrayTexture.SampleLevel(Sampler, uv + offset, 0).r;
-            
-            Gx += sampleValue * SobelX[i + 1][j + 1];
-            Gy += sampleValue * SobelY[i + 1][j + 1];
-        }
-    }
-    
-    float2 Gradient = float2(-Gy, Gx);
-    float GradientLength = length(Gradient);
-    if (GradientLength > 0.01)
-    {
-        Gradient = normalize(Gradient);
-    }
-    else
-    {
-        Gradient = float2(0, 0);
-    }
-    return float4(Gradient, GradientLength, 0); 
-}
-
-
-float2 CalculateGrayGradientT(Texture2D Texture2D, uint3 DispatchThreadId)
-{
-    uint width, height;
-    Texture2D.GetDimensions(width, height);
-    float2 gradient = float2(0.0f, 0.0f);
-
-    float4 color = Texture2D[clamp(DispatchThreadId.xy, uint2(0, 0), uint2(width, height))];
-    
-    float4 upcolor = Texture2D[clamp(DispatchThreadId.xy + uint2(0,1), uint2(0, 0), uint2(width, height))];
-    gradient += float2(0,1) * (ColorToGray(upcolor) - ColorToGray(color));
-    float4 downcolor = Texture2D[clamp(DispatchThreadId.xy + uint2(0,-1), uint2(0, 0), uint2(width, height))];
-    gradient += float2(0,-1) * (ColorToGray(downcolor) - ColorToGray(color));
-    float4 leftcolor = Texture2D[clamp(DispatchThreadId.xy + uint2(-1,0), uint2(0, 0), uint2(width, height))];
-    gradient += float2(-1,0) * (ColorToGray(leftcolor) - ColorToGray(color));
-    float4 rightcolor = Texture2D[clamp(DispatchThreadId.xy + uint2(0,1), uint2(0, 0), uint2(width, height))];
-    gradient += float2(1,0) * (ColorToGray(rightcolor) - ColorToGray(color));
-
-    // float3 tempgradient = float3(0.0f, 0.0f, 0.0f);
-    // tempgradient.xy = gradient;
-    // tempgradient = normalize(tempgradient);
-    // gradient = tempgradient.xy;
-    //gradient = normalize(gradient);
-    return gradient;
-}
-
-float4 SampleBilinear(RWTexture2D<float4> _SourceTexture, float2 uv) {
-
-    int2 MaxCell;
-    _SourceTexture.GetDimensions(MaxCell.x, MaxCell.y);
-    float2 coord = uv * MaxCell - 0.5; 
-    int2 x0y0 = floor(coord);
-    int2 x1y0 = x0y0 + int2(1, 0);
-    int2 x0y1 = x0y0 + int2(0, 1);
-    int2 x1y1 = x0y0 + int2(1, 1);
-
-    x0y0 = clamp(x0y0, int2(0, 0), MaxCell - 1);
-    x1y0 = clamp(x1y0, int2(0, 0), MaxCell - 1);
-    x0y1 = clamp(x0y1, int2(0, 0), MaxCell - 1);
-    x1y1 = clamp(x1y1, int2(0, 0), MaxCell - 1);
-    
-    float4 p00 = _SourceTexture[x0y0];
-    float4 p10 = _SourceTexture[x1y0];
-    float4 p01 = _SourceTexture[x0y1];
-    float4 p11 = _SourceTexture[x1y1];
-    
-    float2 weight = frac(coord);
-    float w00 = (1 - weight.x) * (1 - weight.y);
-    float w10 = weight.x * (1 - weight.y);
-    float w01 = (1 - weight.x) * weight.y;
-    float w11 = weight.x * weight.y;
-
-    return w00 * p00 + w10 * p10 + w01 * p01 + w11 * p11;
-}
-
-float3x3 RotateAxisAngleMatrix(float3 axis, float angle)
-{
-    float s, c;
-    sincos(angle, s, c);
-    float t = 1 - c;
-    
-    float x = axis.x;
-    float y = axis.y;
-    float z = axis.z;
-    
-    return float3x3(
-        t*x*x + c,   t*x*y - s*z, t*x*z + s*y,
-        t*x*y + s*z, t*y*y + c,   t*y*z - s*x,
-        t*x*z - s*y, t*y*z + s*x, t*z*z + c
-    );
-}
-
-float3x3 RotationMatrixFromTwoVectors3x3(float3 TargetDir, float3 SourceDir)
-{
-    TargetDir = normalize(TargetDir);
-    SourceDir = normalize(SourceDir);
-    
-    float3 axis = cross(TargetDir, SourceDir);
-    float axisLength = length(axis);
-    
-    if (axisLength < 1e-6)
-    {
-        if (dot(TargetDir, SourceDir) < -0.999)
-        {
-            float3 perp = abs(TargetDir.x) > 0.9 ? float3(0, 1, 0) : float3(1, 0, 0);
-            axis = normalize(cross(TargetDir, perp));
-            return float3x3(-1, 0, 0,
-                             0,-1, 0,
-                             0, 0,-1);
-        }
-        else
-        {
-            return float3x3(1, 0, 0,
-                            0, 1, 0,
-                            0, 0, 1);
-        }
-    }
-    
-    axis = normalize(axis);
-    
-    float3 u = axis;
-    float3 v = normalize(cross(u, TargetDir));
-    float3 w = TargetDir;
-    
-    float3 uRot = axis;
-    float3 vRot = normalize(cross(uRot, SourceDir));
-    float3 wRot = SourceDir;
-    
-    return float3x3(
-        dot(uRot, u), dot(uRot, v), dot(uRot, w),
-        dot(vRot, u), dot(vRot, v), dot(vRot, w),
-        dot(wRot, u), dot(wRot, v), dot(wRot, w)
-    );
 }
 
 float4x4 RotationMatrixFromTwoVectors4x4(float3 SourceDir, float3 TargetDir)
@@ -408,63 +149,6 @@ float4x4 RotationMatrixFromTwoVectors4x4(float3 SourceDir, float3 TargetDir)
     );
 }
 
-float4x4 MakeRotationMatrixFromXZ(float3 xAxis, float3 zAxis) 
-{
-
-    float3 rightDir = normalize(xAxis);
-    float3 forwardDir = normalize(zAxis);
-    
-
-    float3 upDir = cross(rightDir, forwardDir);
-    upDir = normalize(upDir);
-    
-
-    return float4x4(
-        rightDir.x, upDir.x, forwardDir.x, 0,
-        rightDir.y, upDir.y, forwardDir.y, 0,
-        rightDir.z, upDir.z, forwardDir.z, 0,
-        0,          0,        0,           1
-    );
-}
-
-float3 ComputeNormal(RWTexture2D<float4> SceneDepth, float2 DispatchThreadId)
-{
-    float depthCenter = SceneDepth[DispatchThreadId].x;
-    float depthRight = SceneDepth[DispatchThreadId + float2(1, 0)].x;
-    float depthUp = SceneDepth[DispatchThreadId + float2(0, -1)].x;
-    
-
-    float gradientX = depthRight - depthCenter;
-    float gradientY = depthUp - depthCenter;
-    float2 gradient = float2(gradientX, gradientY);
-    float3 normal = normalize(float3(-gradient.x, -gradient.y, 1.0)); 
-    return normal;
-}
-
-float4 ConvexConcaveFromDepth(RWTexture2D<float4> SceneDepth, float2 DispatchThreadId)
-{
-    float3 normal = ComputeNormal(SceneDepth, DispatchThreadId);
-    
-    float curvatureSum = 0.0;
-    float curvatureSign = 0.0;
-    for (int Y = -1; Y <= 1; Y++)
-    {
-        for (int X = -1; X <= 1; X++)
-        {
-            if (X == 0 && Y == 0) continue;
-            float3 NeighborNormal = ComputeNormal(SceneDepth, DispatchThreadId + uint2(X, Y));
-            
-            float curvature = 1.0 - dot(normal, NeighborNormal);;
-            curvatureSum += curvature;
-            curvatureSign += (dot(normal, NeighborNormal) < 0) ? -1.0 : 1.0;
-        }
-    }
-    
-    float convex = saturate(curvatureSign * curvatureSum); 
-    float concave = saturate(-curvatureSign * curvatureSum);
-    
-    return float4(convex, concave, 1.0, 1.0); 
-}
 
 float4 ConvexConcave(Texture2D<float4> SceneDepth, Texture2D<float4> NormalMap, float2 DispatchThreadId, float4x4 ActorTransform, float MaxHeight, float PixelScale)
 {

@@ -23,44 +23,6 @@
 /// </summary>
 ///
 
-class COMPUTESHADERGENERATOR_API FCalculateGradient : public FGlobalShader
-{
-public:
-	//Declare this class as a global shader
-	DECLARE_GLOBAL_SHADER(FCalculateGradient);
-	//Tells the engine that this shader uses a structure for its parameters
-	SHADER_USE_PARAMETER_STRUCT(FCalculateGradient, FGlobalShader);
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, T_Height)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_Gradient)
-
-		SHADER_PARAMETER_SAMPLER(SamplerState, Sampler)
-	END_SHADER_PARAMETER_STRUCT()
-public:
-	//Called by the engine to determine which permutations to compile for this shader
-	CSGEN_SHADER_PERM_ALWAYS()
-	//Modifies the compilations environment of the shader
-	static inline void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-
-		//We're using it here to add some preprocessor defines. That way we don't have to change both C++ and HLSL code 
-		// when we change the value for NUM_THREADS_PER_GROUP_DIMENSION
-	
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), NUM_THREADS_PER_GROUP_DIMENSION_X);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Y"), NUM_THREADS_PER_GROUP_DIMENSION_Y);
-		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Z"), NUM_THREADS_PER_GROUP_DIMENSION_Z);
-
-		// if (Parameters.PermutationId == 0)
-		// {
-		// 	OutEnvironment.SetDefine(TEXT("ENTRY_FUNCTION"), TEXT("Init"));
-		// }
-		
-	}
-	
-};
-
-// IMPLEMENT_GLOBAL_SHADER moved to ComputeShaderBasicFunction.cpp
 
 class COMPUTESHADERGENERATOR_API FConnectivityPixel : public FGlobalShader
 {
@@ -407,7 +369,6 @@ public:
 	enum class ESampleStep : uint8
 	{
 		SS_SampleSpline,
-		SS_RasterizeSpline,
 		MAX
 	};
 	class FSampleSplineStep : SHADER_PERMUTATION_ENUM_CLASS("GeneralFunction", ESampleStep);
@@ -456,7 +417,6 @@ public:
 		static const TCHAR* ShaderSourceModeDefineName[] =
 		{
 			TEXT("SS_SAMPLESPLINE"),
-			TEXT("SS_RASTERIZESPLINE"),
 		};
 		static_assert(UE_ARRAY_COUNT(ShaderSourceModeDefineName) == (uint32)ESampleStep::MAX, "Enum doesn't match define table.");
 		
@@ -464,12 +424,6 @@ public:
 		const uint32 SourceModeIndex = static_cast<uint32>(PermutationVector.Get<FSampleSplineStep>());
 		OutEnvironment.SetDefine(ShaderSourceModeDefineName[SourceModeIndex], 1u);
 
-		ESampleStep BlurType = PermutationVector.Get<FSampleSplineStep>();
-		if (BlurType == ESampleStep::SS_RasterizeSpline)
-		{
-			OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), 1024);
-			OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Y"), 1);
-		}
 	}
 };
 

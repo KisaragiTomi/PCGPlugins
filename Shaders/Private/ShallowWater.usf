@@ -628,11 +628,6 @@ void SetHeight(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupID, uint 
 	RW_VelHeightSimA[DispatchThreadId.xy].z = VC;
 }
 
-// ─── Pass: Height Smooth (reserved) ────────────────────────────────
-
-void HeightSmooth(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupID, uint GroupIndex)
-{
-}
 
 // ─── Sparse Tile Compact Passes ─────────────────────────────────────
 
@@ -683,7 +678,5 @@ void ShallowWater(
 	CalShallowWaterResult_Flux(DispatchThreadId, GroupThreadId, GroupId, GroupIndex);
 #elif SW_SETHEIGHT
 	SetHeight(DispatchThreadId, GroupThreadId, GroupId, GroupIndex);
-#elif SW_SMOOTHHEIGHT
-	HeightSmooth(DispatchThreadId, GroupThreadId, GroupId, GroupIndex);
 #endif
 }

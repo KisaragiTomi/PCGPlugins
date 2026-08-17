@@ -66,8 +66,6 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000, ClampMin="1", ClampMax="32", UIMin="1", UIMax="8"))
 	int32 Iteration = 1;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
-	int32 HeightSmoothIteration = 1;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SWParameter", Meta=(Priority=1000))
 	EWaterfallExpansion WaterfallExpansionIterations = EWaterfallExpansion::Expansion_10;
@@ -237,8 +235,6 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
 	void SetHeight();
 
-	UFUNCTION(BlueprintCallable, Category = "ComputeShader")
-	void HeightSmooth();
 
 	UFUNCTION(BlueprintNativeEvent)
 	void SetMaterialParameter();

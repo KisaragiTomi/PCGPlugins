@@ -63,7 +63,6 @@ public:
 		SW_ShallowIntegrate,
 		SW_Result,
 		SW_SetHeight,
-		SW_SmoothHeight,
 		MAX
 	};
 	class FShallowWaterSimStep : SHADER_PERMUTATION_ENUM_CLASS("SWS", EShallowWaterSimStep);
@@ -146,7 +145,6 @@ public:
 			TEXT("SW_SHALLOWINTEGRATE"),
 			TEXT("SW_RESULT"),
 			TEXT("SW_SETHEIGHT"),
-			TEXT("SW_SMOOTHHEIGHT"),
 		}; 
 		static_assert(UE_ARRAY_COUNT(ShaderSourceModeDefineName) == (uint32)EShallowWaterSimStep::MAX, "Enum doesn't match define table.");
 
@@ -654,7 +652,6 @@ void ACSShallowWaterCapture::ShallowWaterSolverSoucePoint(int32 InIteration)
 
 			TShaderMapRef<FShallowWaterSim> ComputeShader_CompactActiveTiles = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_CompactActiveTiles);
 			TShaderMapRef<FShallowWaterSim> ComputeShader_FinalizeCompact = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_FinalizeCompact);
-			TShaderMapRef<FShallowWaterSim> ComputeShader_CalSmoothHeight = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_SmoothHeight);
 			TShaderMapRef<FShallowWaterSim> ComputeShader_CalVelocityHeight = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_VelocityHeightSim, false, CapturedWaterfallExpansionIterations);
 			TShaderMapRef<FShallowWaterSim> ComputeShader_CalShallowIntegrate = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_ShallowIntegrate);
 			TShaderMapRef<FShallowWaterSim> ComputeShader_CalResult = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_Result);
@@ -966,79 +963,6 @@ void ACSShallowWaterCapture::SetHeight()
 	});
 }
 
-void ACSShallowWaterCapture::HeightSmooth()
-{
-	if (!CheckAndCreateTexture_SWSourcePoint()) return;
-	if (!RT_SceneDepth) { UE_LOG(LogTemp, Error, TEXT("[CSSW] RT_SceneDepth is null in HeightSmooth")); return; }
-	SCOPE_CYCLE_COUNTER(STAT_CSSW_Execute);
-	
-	RT_SceneDepth->ResizeTarget(TextureSize, TextureSize);
-	RT_DebugView->ResizeTarget(TextureSize, TextureSize);
-	RT_VelocityHeight->ResizeTarget(TextureSize, TextureSize);
-	RT_ResultVelHeight->ResizeTarget(TextureSize, TextureSize);
-
-	FTextureRenderTargetResource* R_SceneDepth = RT_SceneDepth->GameThread_GetRenderTargetResource();
-	FTextureRenderTargetResource* R_DebugView = RT_DebugView->GameThread_GetRenderTargetResource();
-	FTextureRenderTargetResource* R_VelocityHeight = RT_VelocityHeight->GameThread_GetRenderTargetResource();
-	FTextureRenderTargetResource* R_ResultVelHeight = RT_ResultVelHeight->GameThread_GetRenderTargetResource();
-	
-	ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)(
-	[R_SceneDepth, R_DebugView, R_VelocityHeight, R_ResultVelHeight](FRHICommandListImmediate& RHICmdList)
-	{
-		FRDGBuilder GraphBuilder(RHICmdList);
-		{
-			float SizeX = R_SceneDepth->GetSizeXY().X;
-			float SizeY = R_SceneDepth->GetSizeXY().Y;
-			FIntPoint TextureSize = FIntPoint(SizeX, SizeY);
-			const ERDGPassFlags ComputePassFlags = ERDGPassFlags::Compute;
-			TShaderMapRef<FShallowWaterSim> ComputeShader_SmoothHeight = FShallowWaterSim::CreatePermutation(FShallowWaterSim::EShallowWaterSimStep::SW_SmoothHeight);
-			
-			FShallowWaterSim::FParameters* PassParameters = GraphBuilder.AllocParameters<FShallowWaterSim::FParameters>();
-			FIntVector GroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(SizeX, SizeY, 1), 16);
-			
-			FRDGTextureRef TmpRDG_DebugView = ConvertToUVATextureFormat(GraphBuilder, R_DebugView, PF_FloatRGBA, TEXT("UAV_DebugView")); 
-			FRDGTextureUAVRef RDGUAV_DebugView = GraphBuilder.CreateUAV(TmpRDG_DebugView);
-			FRDGTextureRef RDG_VelHeightSimA = ConvertToUVATextureFormat(GraphBuilder, TextureSize, PF_FloatRGBA, TEXT("UAV_Sim_A"));
-			FRDGTextureUAVRef RDGUAV_VelHeightSimA = GraphBuilder.CreateUAV(RDG_VelHeightSimA);
-			FRDGTextureRef TmpRDG_Result = ConvertToUVATextureFormat(GraphBuilder, TextureSize, PF_FloatRGBA, TEXT("UAV_Result"));
-			FRDGTextureUAVRef RDGUAV_Result = GraphBuilder.CreateUAV(TmpRDG_Result);
-
-			FRDGTextureRef RDG_SmoothHeightA = nullptr;
-			FRDGTextureUAVRef RDGUAV_SmoothHeightA = nullptr;
-			ConvertToUVATextureFormat(GraphBuilder, RDG_SmoothHeightA, RDGUAV_SmoothHeightA, TextureSize, PF_A32B32G32R32F, TEXT("UAV_SmoothHeightA"));
-
-			FRDGTextureRef RDG_SmoothHeightB = nullptr;
-			FRDGTextureUAVRef RDGUAV_SmoothHeightB = nullptr;
-			ConvertToUVATextureFormat(GraphBuilder, RDG_SmoothHeightB, RDGUAV_SmoothHeightB, TextureSize, PF_A32B32G32R32F, TEXT("UAV_SmoothHeightB"));
-			
-			FRDGTextureRef RDG_SceneDepth = RegisterExternalTexture(GraphBuilder, R_SceneDepth->GetRenderTargetTexture(), TEXT("SceneDepth_RT"));
-			FRDGTextureRef RDG_VelocityHeight = RegisterExternalTexture(GraphBuilder, R_VelocityHeight->GetRenderTargetTexture(), TEXT("VelocityHeight_RT"));
-			FRDGTextureRef RDG_DebugView = RegisterExternalTexture(GraphBuilder, R_DebugView->GetRenderTargetTexture(), TEXT("DebugView_RT"));
-			FRDGTextureRef RDG_Result = RegisterExternalTexture(GraphBuilder, R_ResultVelHeight->GetRenderTargetTexture(), TEXT("Result_RT"));
-			
-			PassParameters->T_SceneDepth = RDG_SceneDepth;
-			PassParameters->RW_DebugView = RDGUAV_DebugView;
-			PassParameters->RW_SmoothHeightA = RDGUAV_SmoothHeightA;
-			PassParameters->RW_SmoothHeightB = RDGUAV_SmoothHeightB;
-			PassParameters->BCount_SourceUVRads = 0;
-			PassParameters->DispatchExpandPixels = 0;
-			PassParameters->RWB_SourceUVRads = nullptr;
-			PassParameters->Sampler	= TStaticSamplerState<SF_Bilinear>::GetRHI();
-			
-			FComputeShaderUtils::AddPass(
-				GraphBuilder,
-				RDG_EVENT_NAME("SmoothHeight"),
-				ComputePassFlags,
-				ComputeShader_SmoothHeight,
-				PassParameters,
-				GroupCount);
-			
-			AddCopyTexturePass(GraphBuilder, TmpRDG_DebugView, RDG_DebugView, FRHICopyTextureInfo());
-			
-		}
-		GraphBuilder.Execute();
-	});
-}
 
 void ACSShallowWaterCapture::SetMaterialParameter_Implementation()
 {

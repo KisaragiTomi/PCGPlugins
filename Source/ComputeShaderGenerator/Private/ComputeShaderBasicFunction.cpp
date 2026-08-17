@@ -3,7 +3,6 @@
 #include "ComputeShaderMeshFill.h"
 #include "ComputeShaderCliffGenerate.h"
 
-IMPLEMENT_GLOBAL_SHADER(FCalculateGradient, "/Plugin/PCGPlugins/Shaders/Private/BasicFunction.usf", "CalculateGradient", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FConnectivityPixel, "/Plugin/PCGPlugins/Shaders/Private/Connectivity.usf", "ConnectivityPixel", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FBlurTexture, "/Plugin/PCGPlugins/Shaders/Private/BasicFunction.usf", "BlurTexture", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FUpPixelsMask, "/Plugin/PCGPlugins/Shaders/Private/BasicFunction.usf", "UpPixel", SF_Compute);

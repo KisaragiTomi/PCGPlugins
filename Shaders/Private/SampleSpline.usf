@@ -189,17 +189,6 @@ void AttributeFromSpline(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 Grou
 	RW_DebugView[DispatchThreadId.xy] = 1;
 }
 
-void RasterizeSpline(uint3 DispatchThreadId, uint3 GroupThreadId, uint3 GroupId, uint GroupIndex)
-{
-	// if (DispatchThreadId.x > RW_SplinePointCount[0]) return;
-	// float MaxCell;
-	// RW_OutTexture.GetDimensions(MaxCell, MaxCell);
-	//
-	// float2 UV = (RW_PointsToSampleBuffer[DispatchThreadId.x].xy - BoundsMin.xy) / BoundsSize.xy;
-	// RW_OutTexture[uint2(UV * MaxCell)] = 11;
-	// // RW_OutTexture[uint2(DispatchThreadId.x, 0)].x = UV.x > 1;
-	
-}
 
 [numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
 void SampleSpline(
@@ -210,8 +199,6 @@ void SampleSpline(
 {
 #if SS_SAMPLESPLINE
 	AttributeFromSpline(DispatchThreadId, GroupThreadId, GroupId, GroupIndex);
-#elif SS_RASTERIZESPLINE
-	RasterizeSpline(DispatchThreadId, GroupThreadId, GroupId, GroupIndex);
 #endif
 
 }

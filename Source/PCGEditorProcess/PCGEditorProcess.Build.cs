@@ -49,19 +49,16 @@ public class PCGEditorProcess : ModuleRules
 				"DynamicMesh",
 				"GeometryCore", 
 				"RHI",
-				"Core", 
 				"InputCore",
 				"Slate",
 				"SlateCore",
 				"AssetRegistry",
-				"Core",
 				"CoreUObject",
 				"EditorStyle",
 				"LevelEditor",
 				"UnrealEd",
 				"MaterialEditor",
 				"MaterialUtilities",
-				"Blutility",
 				"LandscapeEditorUtilities",
 			"AnimationCore",
 			"MeshDescription",
@@ -79,13 +76,5 @@ public class PCGEditorProcess : ModuleRules
 			}
 			);
 		
-		// if (Target.Type == TargetType.Editor)
-		// {
-		// 	PublicDependencyModuleNames.Add("PCGEditorProcess");
-		// }
-		// else
-		// {
-		// 	PublicDependencyModuleNames.Remove("PCGEditorProcess");
-		// }
 	}
 }

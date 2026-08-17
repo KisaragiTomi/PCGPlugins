@@ -50,8 +50,6 @@ public class ComputeShaderGenerator : ModuleRules
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
-				"CoreUObject",
-				"Engine",
 				"Projects", 
 				"GeometryScriptingCore",
 				"DynamicMesh",
@@ -59,7 +57,6 @@ public class ComputeShaderGenerator : ModuleRules
 				"MeshConversion", 
 				"Landscape",
 				"ImageCore",
-				"Foliage",
 				"MeshDescription",
 				"StaticMeshDescription",
 				"GeometryAlgorithms",

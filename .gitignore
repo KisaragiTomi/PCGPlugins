@@ -4,3 +4,6 @@ Config/*
 Intermediate/
 ThirdParty/
 backup/
+
+# MeshBoolean 自动落盘的 StaticMesh 产出，非源资产
+Content/MeshBoolean/AutoResult/

@@ -2,6 +2,7 @@
 #include "ComputeShaderGeneral.h"
 #include "ComputeShaderMeshFill.h"
 #include "ComputeShaderCliffGenerate.h"
+#include "CSMesh.h"   // UCSMesh::CountedBlockingFlush —— 阻塞刷新的唯一计数入口
 
 IMPLEMENT_GLOBAL_SHADER(FConnectivityPixel, "/Plugin/PCGPlugins/Shaders/Private/Connectivity.usf", "ConnectivityPixel", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FBlurTexture, "/Plugin/PCGPlugins/Shaders/Private/BasicFunction.usf", "BlurTexture", SF_Compute);
@@ -145,7 +146,7 @@ void UploadPixelsToRT(FTextureRenderTargetResource* TextureTarget, TArray<TPixel
 
 		RHIUnlockTexture2D(TextureRHI, 0, false);
 	});
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 }
 }
 
@@ -324,7 +325,7 @@ void UComputeShaderBasicFunction::ConnectivityPixel(UTextureRenderTarget2D* InTe
 			}
 			GraphBuilder.Execute();
 		});
-		FlushRenderingCommands();
+		UCSMesh::CountedBlockingFlush();
 	}
 	
 }
@@ -373,7 +374,7 @@ void UComputeShaderBasicFunction::BlurTexture(UTextureRenderTarget2D* InTextureT
 		}
 		GraphBuilder.Execute();
 	});
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 }
 
 void UComputeShaderBasicFunction::BlurTextureRDG(FRDGBuilder& GraphBuilder, FRDGTextureRef& InTexture, FRDGTextureUAVRef& InTextureUAV, FRDGTextureRef& OutTexture, FIntVector GroupCount, FBlurTexture::EBlurType Type,float BlurScale)
@@ -522,7 +523,7 @@ void UComputeShaderBasicFunction::ExtentMaskFast(UTextureRenderTarget2D* InTextu
 		}
 		GraphBuilder.Execute();
 	});
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 }
 
 void UComputeShaderBasicFunction::DrawLinearColorToRenderTarget(UTextureRenderTarget2D* InTextureTarget,
@@ -579,7 +580,7 @@ void UComputeShaderBasicFunction::DrawLinearColorToRenderTarget(UTextureRenderTa
 		}
 		GraphBuilder.Execute();
 	});
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 }
 
 void UComputeShaderBasicFunction::CalTreeWindTexture(UTextureRenderTarget2D* InWindTexture_PivotIndex,
@@ -668,7 +669,7 @@ void UComputeShaderBasicFunction::CalTreeWindTexture(UTextureRenderTarget2D* InW
 		}
 		GraphBuilder.Execute();
 	});
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 }
 
 TArray<FTransform> UComputeShaderBasicFunction::SampleSpline(UTextureRenderTarget2D* InSampleDistRotate,
@@ -796,7 +797,7 @@ TArray<FTransform> UComputeShaderBasicFunction::SampleSpline(UTextureRenderTarge
 			}
 			GraphBuilder.Execute();
 		});
-		FlushRenderingCommands();
+		UCSMesh::CountedBlockingFlush();
 	}
 	
 	return OutTransforms;
@@ -959,7 +960,7 @@ void UComputeShaderBasicFunction::DrawSmoothSplinePoints(
 		CopyBack(TanReadback, TanDst, NumSamples);
 	});
 
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 
 	const bool bPersistent = (Duration <= 0.f);
 	for (int32 i = 0; i < NumSamples; ++i)
@@ -1165,7 +1166,7 @@ void UComputeShaderBasicFunction::CopyTexture(UTextureRenderTarget2D* InOrig, UT
 		}
 		GraphBuilder.Execute();
 	});
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 }
 
 void UComputeShaderBasicFunction::DrawCopyTexture(FRDGBuilder& GraphBuilder, FRDGTextureUAVRef RDGUAV_CopySource, FRDGTextureRef& RDG_CopyTarget)
@@ -1420,5 +1421,5 @@ void UComputeShaderBasicFunction::UpdateTextureArray(UTexture2DArray* Texture2DA
 
 void UComputeShaderBasicFunction::SyncRenderThread()
 {
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 }

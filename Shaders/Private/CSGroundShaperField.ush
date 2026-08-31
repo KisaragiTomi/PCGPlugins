@@ -1,0 +1,161 @@
+// 地形塑形物高度场的 GPU 侧**唯一**求值处（TinyGladeHouse D9 / 石阶改造）。
+//
+// 为什么单开一个 .ush 而不是各写各的：这份公式现在有三个消费者 ——
+//   ① 地面位移 pass（CSMeshOps.usf 的 DisplaceGroundShapersCS，决定地面网格长什么样）
+//   ② 石阶扫描 pass（CSGroundStairs.usf，决定石阶摆在哪一层的哪条等值线上）
+//   ③ CPU 孪生 CSGroundShaperField::EvalShaper（Public/CSGroundShaperField.h，供落座/拾取/道路查询）
+// ③ 与 GPU 的一致靠人盯（本项目反复强调的"镜像/GPU 不许分叉"纪律），但 ① 与 ② 之间
+// 完全可以由 include 保证。分叉的症状极难归因：石阶会整体浮在坡面上方或陷进去几厘米，
+// 只在裙边中段看得出来，不报任何错，而且两条路各自都"自洽"。
+//
+// ⚠️ 本文件与 Public/CSGroundShaperField.h **逐行对照**，改一边必须改另一边；
+// 单测 GroundShaper.CpuGpuFieldParity 会把两侧在整张地面上逐顶点比一遍。
+//
+// ⚠️ 参数名与 CSMeshOps.usf 里原来的声明**逐字相同**。shader 参数是按名字绑定的，
+// 在这里改名等于把绑定悄悄拆掉 —— 不报错，只是永远读到 0，表现为"地面怎么都是平的"。
+
+#pragma once
+
+// 每塑形物 3 个 float4（步长写死在 CSGroundShaperField.h 的 Float4sPerShaper，两边必须同步）：
+//   [3i + 0] = (中心 X, 中心 Y, Radius, FalloffDistance)
+//   [3i + 1] = (台高, 裙边噪声幅度(归一化), 噪声频率 = 1/波长, 二次抬升系数)
+//   [3i + 2] = (噪声种子, _, _, _)
+// 打包处是 ACSGroundShaperActor::GetHeightFieldParams，收集处是 ACSGroundActor::BuildShaperGpuParams。
+StructuredBuffer<float4> GroundShaperParams;
+uint GroundShaperCount;
+
+// -----------------------------------------------------------------------------
+// 噪声：整数哈希 + value noise + fbm
+//
+// **为什么不用 HLSL 的 noise()**：CPU 侧没有对应物，而这条场必须有一份逐位可复刻的 CPU 孪生
+// （房子落座、拾取、道路查询全走 CPU 那份）。所以这里只用 uint 环绕乘法/异或/移位与
+// 加减乘 —— 这几样在 C++ 与 HLSL 里是同一套语义，两侧才谈得上"给出同一个数"。
+// 同理**不用 sin/cos/pow/exp**：超越函数的实现两边不同，误差会以"石阶浮在坡面上方几厘米"
+// 这种不报错的形式冒出来。
+//
+// 参数照 Tiny Glade 的 FBM 实测（gain 0.55 / lacunarity 1.9 / 每层旋转 [0.8,-0.6;0.6,0.8]
+// ≈ 36.87°，见 Docs/TinyGlade/CSGroundShaper.md「对照 Tiny Glade」⑥）。逐层旋转不是装饰：
+// 不转的话各层的整数格点会对齐，出一片沿轴向的条纹。
+// -----------------------------------------------------------------------------
+
+#define CSGSF_NOISE_OCTAVES 3
+
+uint CSGSF_Hash(uint2 C, uint Seed)
+{
+	uint H = C.x * 0x9E3779B1u;
+	H ^= C.y * 0x85EBCA77u;
+	H ^= Seed * 0xC2B2AE3Du;
+	H ^= H >> 15;
+	H *= 0x2545F491u;
+	H ^= H >> 13;
+	return H;
+}
+
+/** [0,1)。只取低 24 bit 再除 2^24：float 尾数就是 24 bit，这样商在两侧都是精确值。 */
+float CSGSF_Hash01(uint2 C, uint Seed)
+{
+	return float(CSGSF_Hash(C, Seed) & 0x00FFFFFFu) * (1.0f / 16777216.0f);
+}
+
+/** 整数格点 value noise，t²(3−2t) 插值（与 TG 底层同形），返回 [-1, 1)。 */
+float CSGSF_ValueNoise(float2 P, uint Seed)
+{
+	const float2 F = floor(P);
+	const float2 T = P - F;
+	const float2 U = T * T * (3.0f - 2.0f * T);
+	// floor 之后再转 int 才对负坐标成立；int → uint 在 HLSL 与 C++ 里都是模 2^32 的位保持转换。
+	const int2 I = int2(F);
+	const uint2 C = uint2(asuint(I.x), asuint(I.y));
+
+	const float H00 = CSGSF_Hash01(C + uint2(0u, 0u), Seed);
+	const float H10 = CSGSF_Hash01(C + uint2(1u, 0u), Seed);
+	const float H01 = CSGSF_Hash01(C + uint2(0u, 1u), Seed);
+	const float H11 = CSGSF_Hash01(C + uint2(1u, 1u), Seed);
+
+	// 展开写而不用 lerp()：CPU 孪生里必须能逐字复刻同一个求值顺序。
+	const float A = H00 + (H10 - H00) * U.x;
+	const float B = H01 + (H11 - H01) * U.x;
+	return (A + (B - A) * U.y) * 2.0f - 1.0f;
+}
+
+/** 归一化 fbm，返回约 [-1, 1]（实测 min/max ≈ ∓0.85，rms 0.27）。 */
+float CSGSF_Turbulence(float2 P, uint Seed)
+{
+	float Sum = 0.0f;
+	float Amp = 1.0f;
+	float Norm = 0.0f;
+	float2 Q = P;
+	[unroll] for (uint O = 0u; O < CSGSF_NOISE_OCTAVES; ++O)
+	{
+		Sum += CSGSF_ValueNoise(Q, Seed + O * 101u) * Amp;
+		Norm += Amp;
+		Amp *= 0.55f;
+		Q = float2(Q.x * 0.8f - Q.y * 0.6f, Q.x * 0.6f + Q.y * 0.8f) * 1.9f;
+	}
+	return Sum / Norm;
+}
+
+/**
+ * 单座塑形物的高度贡献（相对地面基面，恒 ≥ 0）。
+ *
+ * 盘内恒为台高（原型里 circle 是 poly 面，xyzdist 面内为 0，所以台顶是平的），
+ * 盘外按 FalloffDistance 做 smoothstep 羽化到 0。
+ */
+float GroundShaperEvalOne(float2 P, float4 A, float4 B, float4 C)
+{
+	const float Skirt = max(0.0f, distance(P, A.xy) - A.z);
+	if (Skirt >= A.w) return 0.0f;
+
+	const float T = A.w > 1e-6f ? Skirt / A.w : 0.0f;
+	const float W = 1.0f - T;
+	float S = W * W * (3.0f - 2.0f * W);   // smoothstep ≙ 原型 deformbyinfluence 的 bspline lerp
+
+	// 裙边噪声（原型 noisebysourcestress）：dist = clamp(dist − |turb(P)·(1−dist)|)。
+	// 两条性质必须保住：**只减不加**（abs 之后做减法，像侵蚀，绝不抬高地面），
+	// **权重是 (1−S)**（台顶 S≈1 一点不受扰，裙边 S→0 被打得最碎）。
+	//
+	// 噪声在**每座自己的贡献里**、加在下面调用方的 max **之前** —— 这是计划裁决六派给它的
+	// 活：高度场是"全部塑形物重叠取 max"，max 在等值线上 C¹ 不连续，两座相接处会留一条
+	// 干净的几何折痕。加在 max 之后等于给整片地形蒙一层噪声，折痕原样还在。
+	// 噪声域取**本座局部坐标** (P − 中心)：一是折痕两侧因此拿到两份不同的噪声实现，
+	// 折痕线才会左右游走（同一份世界噪声在对称的两座之间会原样抵消，折痕纹丝不动，实测）；
+	// 二是图案钉在塑形物身上，拖动时不会整片"沸腾"。
+	if (B.y > 0.0f)
+	{
+		const float2 Q = (P - A.xy) * B.z;
+		const uint Seed = uint(max(C.x, 0.0f));
+		S = saturate(S - abs(CSGSF_Turbulence(Q, Seed) * (1.0f - S)) * B.y);
+	}
+
+	// 二次抬升（原型 attribwrangle5）：pow(dist/maxheight, 1.5) · maxheight · scale，偏向台顶。
+	// 用 S·sqrt(S) 而不是 pow(S, 1.5)：GPU 的 pow 是 exp2(1.5·log2(S))，与 CPU 的 pow 不是
+	// 同一条路径，会在 CPU/GPU 一致性断言上冒出肉眼看不见但断言看得见的差；sqrt 两边都是
+	// 硬件正确舍入的同一个数。
+	return max(0.0f, B.x) * (S + B.w * S * sqrt(S));
+}
+
+/** 该座的峰值高度（台顶，含二次抬升）—— 包围盒/MaxAbsHeight 用，别拿 B.x 当上界。 */
+float GroundShaperPeakHeight(float4 B)
+{
+	return max(0.0f, B.x) * (1.0f + max(0.0f, B.w));
+}
+
+/**
+ * 与 CSGroundShaperField::EvalField 同一公式：多座重叠**取 max**
+ * （计划 D9 的合成裁决，与 Tiny Glade 的笔画合成逐字相同）。
+ *
+ * 返回值是**相对地面基面**的抬升，恒 ≥ 0；世界 Z = 地面 actor 的 Z + 本值。
+ */
+float GroundShaperHeightAtXY(float2 P)
+{
+	float H = 0.0f;
+	for (uint i = 0; i < GroundShaperCount; ++i)
+	{
+		H = max(H, GroundShaperEvalOne(
+			P,
+			GroundShaperParams[i * 3u + 0u],
+			GroundShaperParams[i * 3u + 1u],
+			GroundShaperParams[i * 3u + 2u]));
+	}
+	return H;
+}

@@ -1,6 +1,7 @@
 #include "StaticMeshRenderDataPointSampler.h"
 
 #include "Engine/StaticMesh.h"
+#include "CSMesh.h"   // UCSMesh::CountedBlockingFlush —— 阻塞刷新的唯一计数入口
 #include "GlobalShader.h"
 #include "RawIndexBuffer.h"
 #include "RenderGraphBuilder.h"
@@ -335,7 +336,7 @@ bool FStaticMeshRenderDataPointSampler::SamplePointsSync(const TArray<FStaticMes
 			bRenderWorkQueued = true;
 		});
 
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 
 	if (!bRenderWorkQueued)
 	{
@@ -420,7 +421,7 @@ bool FStaticMeshRenderDataPointSampler::SamplePointsSync(const TArray<FStaticMes
 			delete CountReadback;
 		});
 
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 
 	if (!bReadbackSucceeded)
 	{

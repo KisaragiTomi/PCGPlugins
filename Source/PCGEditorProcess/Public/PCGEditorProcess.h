@@ -8,6 +8,7 @@
 #include "ComputeShaderDebugParams.h"
 
 class AComputeShaderMeshGenerator;
+class ACSGroundActor;
 class ACSPointBrushActor;
 class AGPUSkeletalTree;
 class FViewEditCategoryViewportOverlay;
@@ -24,10 +25,12 @@ private:
 	void InitializeEditorUI();
 	void StartInstanceBrush(AComputeShaderMeshGenerator* TargetActor);
 	void StartPointBrush(ACSPointBrushActor* TargetActor);
+	void StartGroundPaint(ACSGroundActor* TargetActor);
 	void GenerateGPUSkeletalTree(AGPUSkeletalTree* TargetActor);
 
 	FDelegateHandle PostEngineInitHandle;
 	TUniquePtr<FViewEditCategoryViewportOverlay> ViewEditCategoryViewportOverlay;
 	bool bEditorModeRegistered = false;
 	bool bPointBrushModeRegistered = false;
+	bool bGroundPaintModeRegistered = false;
 };

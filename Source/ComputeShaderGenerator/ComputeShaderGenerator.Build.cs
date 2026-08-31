@@ -56,6 +56,7 @@ public class ComputeShaderGenerator : ModuleRules
 				"GeometryCore",
 				"MeshConversion", 
 				"Landscape",
+				"Foliage",
 				"ImageCore",
 				"MeshDescription",
 				"StaticMeshDescription",

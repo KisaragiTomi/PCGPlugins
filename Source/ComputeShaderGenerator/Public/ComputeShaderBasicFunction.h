@@ -116,7 +116,14 @@ public:
 
 	/** RDG 流程版：在 GPU 上对一组控制点做三次 B-Spline 重采样。
 	 *  ControlPoints: xyz=世界位置（w 备用）；NumSamples: 输出采样点数。
-	 *  输出两个 buffer：OutPositions(xyz=位置,w=有效) 与 OutTangents(xyz=切线方向)。*/
+	 *  输出两个 buffer：OutPositions(xyz=位置,w=有效) 与 OutTangents(xyz=切线方向)。
+	 *
+	 *  ⚠️ **2026-08-30「裁决一」点名要删这个函数，但它没删** —— TinyGlade 那两个消费者
+	 *  （门框旧路 `BuildFramePlan`、地形石阶旧路 `CSShaperSteps::Scatter`）确实都删掉了，
+	 *  可它还有第三个、与石阶无关的消费者：下面那个蓝图可调的 `DrawSmoothSplinePoints`，
+	 *  而 `Content/SpaceColonization/NewBlueprint.uasset` 的图里有一个 `K2Node_CallFunction`
+	 *  真的在调它。删掉会让那张蓝图编译不过。要不要连 `DrawSmoothSplinePoints` 一起删，
+	 *  超出裁决一的范围，留给驱动方拍板。 */
 	static void RDG_SmoothSpline(
 		FRDGBuilder& GraphBuilder,
 		const TArray<FVector4f>& ControlPoints,

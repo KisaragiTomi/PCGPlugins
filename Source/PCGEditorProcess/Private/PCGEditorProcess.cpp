@@ -1,7 +1,8 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "PCGEditorProcess.h"
-#include "ActorTagShortcut.h"
+#include "CSGroundActor.h"
+#include "CSGroundPaintEdMode.h"
 #include "CSInstanceBrushEdMode.h"
 #include "CSPointBrushActor.h"
 #include "CSPointBrushEdMode.h"
@@ -151,6 +152,7 @@ void FPCGEditorProcessModule::StartupModule()
 	ACSShallowWaterCapture::OnBakeResultMeshDelegate.BindStatic(&UCSShallowWaterProcess::SaveSWData);
 	AMeshGeneratorBrushCache::OnInstanceBrushEditorRequest.AddRaw(this, &FPCGEditorProcessModule::StartInstanceBrush);
 	ACSPointBrushActor::OnPointBrushEditorRequest.AddRaw(this, &FPCGEditorProcessModule::StartPointBrush);
+	ACSGroundActor::OnGroundPaintEditorRequest.AddRaw(this, &FPCGEditorProcessModule::StartGroundPaint);
 	AGPUSkeletalTree::OnGenerateTreeEditorRequest.BindRaw(this, &FPCGEditorProcessModule::GenerateGPUSkeletalTree);
 
 	// Defer editor UI initialization until the engine is fully loaded.
@@ -168,8 +170,6 @@ void FPCGEditorProcessModule::StartupModule()
 
 void FPCGEditorProcessModule::ShutdownModule()
 {
-	FActorTagInputProcessor::Unregister();
-
 	if (PostEngineInitHandle.IsValid())
 	{
 		FCoreDelegates::OnPostEngineInit.Remove(PostEngineInitHandle);
@@ -179,14 +179,17 @@ void FPCGEditorProcessModule::ShutdownModule()
 	ViewEditCategoryViewportOverlay.Reset();
 	AMeshGeneratorBrushCache::OnInstanceBrushEditorRequest.RemoveAll(this);
 	ACSPointBrushActor::OnPointBrushEditorRequest.RemoveAll(this);
+	ACSGroundActor::OnGroundPaintEditorRequest.RemoveAll(this);
 	AGPUSkeletalTree::OnGenerateTreeEditorRequest.Unbind();
 	if (!IsEngineExitRequested() && GEditor)
 	{
 		if (bEditorModeRegistered) FEditorModeRegistry::Get().UnregisterMode(FCSInstanceBrushEdMode::EM_CSInstanceBrush);
 		if (bPointBrushModeRegistered) FEditorModeRegistry::Get().UnregisterMode(FCSPointBrushEdMode::EM_CSPointBrush);
+		if (bGroundPaintModeRegistered) FEditorModeRegistry::Get().UnregisterMode(FCSGroundPaintEdMode::EM_CSGroundPaint);
 	}
 	bEditorModeRegistered = false;
 	bPointBrushModeRegistered = false;
+	bGroundPaintModeRegistered = false;
 	ACSShallowWaterCapture::OnBakeResultMeshDelegate.Unbind();
 }
 
@@ -202,8 +205,6 @@ void FPCGEditorProcessModule::InitializeEditorUI()
 	{
 		return;
 	}
-
-	FActorTagInputProcessor::Register();
 
 	const bool bModeAlreadyRegistered = FEditorModeRegistry::Get().GetFactoryMap().Contains(FCSInstanceBrushEdMode::EM_CSInstanceBrush);
 	if (!bModeAlreadyRegistered)
@@ -224,6 +225,16 @@ void FPCGEditorProcessModule::InitializeEditorUI()
 			FSlateIcon(),
 			false);
 		bPointBrushModeRegistered = true;
+	}
+
+	if (!FEditorModeRegistry::Get().GetFactoryMap().Contains(FCSGroundPaintEdMode::EM_CSGroundPaint))
+	{
+		FEditorModeRegistry::Get().RegisterMode<FCSGroundPaintEdMode>(
+			FCSGroundPaintEdMode::EM_CSGroundPaint,
+			LOCTEXT("CSGroundPaintMode", "CS Ground Paint"),
+			FSlateIcon(),
+			false);
+		bGroundPaintModeRegistered = true;
 	}
 
 	ViewEditCategoryViewportOverlay = MakeUnique<FViewEditCategoryViewportOverlay>();
@@ -253,6 +264,18 @@ void FPCGEditorProcessModule::StartPointBrush(ACSPointBrushActor* TargetActor)
 	FEditorModeTools& ModeTools = GLevelEditorModeTools();
 	ModeTools.ActivateMode(FCSPointBrushEdMode::EM_CSPointBrush);
 	if (FCSPointBrushEdMode* BrushMode = ModeTools.GetActiveModeTyped<FCSPointBrushEdMode>(FCSPointBrushEdMode::EM_CSPointBrush))
+	{
+		BrushMode->SetTargetActor(TargetActor);
+	}
+}
+
+void FPCGEditorProcessModule::StartGroundPaint(ACSGroundActor* TargetActor)
+{
+	if (!TargetActor || !GEditor) return;
+
+	FEditorModeTools& ModeTools = GLevelEditorModeTools();
+	ModeTools.ActivateMode(FCSGroundPaintEdMode::EM_CSGroundPaint);
+	if (FCSGroundPaintEdMode* BrushMode = ModeTools.GetActiveModeTyped<FCSGroundPaintEdMode>(FCSGroundPaintEdMode::EM_CSGroundPaint))
 	{
 		BrushMode->SetTargetActor(TargetActor);
 	}

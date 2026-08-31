@@ -16,7 +16,8 @@ struct FRoadBuildInput;
  * target (RT_RoadHeight) holding the road surface height for downstream landscape blending.
  *
  * Inherits AComputeShaderMeshGenerator (through ACSLandscape), so the road triangles are turned
- * into a heightmap by reusing FExtractStaticMeshTrianglesCS -> RasterizeTriangleSoupToHeightmapRDG.
+ * into a heightmap by reusing RasterizeIndexedMeshToHeightmapRDG (fused index/position-buffer
+ * rasterization, no intermediate triangle soup).
  */
 UCLASS()
 class PCGEDITORPROCESS_API ACSLandscapeRoad : public ACSLandscape

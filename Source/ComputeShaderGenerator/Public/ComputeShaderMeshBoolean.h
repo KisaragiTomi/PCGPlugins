@@ -96,6 +96,12 @@ struct COMPUTESHADERGENERATOR_API FCSMeshBooleanOptions
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|Output")
 	bool bPreserveSourceMaterialSlots = true;
 
+	/** Nanite 网格用编辑器 MeshDescription 的全精度源三角（而非低模 render fallback）。
+	 *  布尔切割需要与视觉一致的完整几何，默认开启；场景收集的全局默认是 fallback（省内存）。
+	 *  高面数源网格 × 多实例会显著增加 CPU/上传内存，内存受限时可关闭换 fallback。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean")
+	bool bUseMeshDescriptionSourceTriangles = true;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|GPU Arrangement", meta = (ClampMin = "0.0"))
 	float SnapRoundQuantum = 0.01f;
 
@@ -298,6 +304,15 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|Output")
 	bool bPreserveSourceMaterialSlots = true;
+
+	/**
+	 * Nanite 网格用编辑器 MeshDescription 的全精度源三角（而非低模 render fallback）。
+	 * 布尔切割需要与视觉一致的完整几何，默认开启；场景收集的全局默认是 fallback（省内存），
+	 * 目前只有布尔通过本勾选项显式启用。高面数源网格 × 多实例会显著增加 CPU/上传内存，
+	 * 内存受限时可关闭换 fallback。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean")
+	bool bUseMeshDescriptionSourceTriangles = true;
 
 	/**
 	 * 输出的 StaticMesh 启用 Nanite。布尔结果通常是百万级三角的一次性产物，交给 Nanite 做

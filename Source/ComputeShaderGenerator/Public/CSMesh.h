@@ -185,6 +185,13 @@ struct FCSMeshStreamLayout
 	/** Appended after the standard set, in order. Each must use a (Role, TexCoordIndex) pair no
 	 *  standard stream already holds; AuxVertex slot 0 is the material-id stream. */
 	TArray<FCSGpuStreamDesc> ExtraStreams;
+
+	/**
+	 * UV 组数。1（默认）= 今天的形态，逐位不变；2 = 房子墙那种"UV0 贴图 + UV1 传解析场"。
+	 * 加宽的是同一条 TexCoord 流（交错），不是新增一条 —— 理由见 FStandardStreamOptions。
+	 * 只有真正需要的 mesh 才声明，别人不为它付显存。
+	 */
+	uint32 NumTexCoordSets = 1;
 };
 
 /**
@@ -224,6 +231,14 @@ struct COMPUTESHADERGENERATOR_API FCSMeshEditContext
 		 *  that happens before anything can read the streams, and that same flush is what fences
 		 *  the resident set's game-thread-read fields. */
 		OwnedGraph,
+		/** UCSMesh::EditMeshAsync. Owns and executes its own graph exactly like OwnedGraph — same
+		 *  registration, same access-state restoration — but the game thread does NOT block on the
+		 *  flush. That one difference moves the whole lifetime burden onto the caller: the operator
+		 *  callable and everything it reads must be OWNED by the edit (moved into it), never
+		 *  borrowed from the caller's stack, because that stack is gone by the time the graph runs.
+		 *  Counts published here are only visible to the game thread once the completion callback
+		 *  fires — that callback, not this function's return, is the fence. */
+		OwnedGraphAsync,
 		/** FCSMeshRenderThreadEdit. The edit shares a graph somebody else owns and executes.
 		 *  Nothing is fenced, and the passes that read these streams — the draw itself — are later
 		 *  passes IN that graph, so an epilogue transition would land after them. */
@@ -349,6 +364,23 @@ namespace CSMeshReadback
 	 *  Does not fill OutMeshData.Materials — the resident set carries ids, not materials. */
 	COMPUTESHADERGENERATOR_API bool ReadbackResidentSync(
 		const FCSMeshResident& Resident, FCSGpuMeshCPUData& OutMeshData);
+
+	/**
+	 * **诊断 / 验收专用**：回读任意 uint32 buffer 的前 NumUints 个元素。游戏线程；**阻塞**。
+	 *
+	 * 为什么要有这么一条"什么 buffer 都能读"的通路：本项目栽过三次"CPU 侧断言全绿、画面是错的"，
+	 * 其中最难看见的一类是**陈旧的 GPU 计数器** —— CPU 记录说 0，而 GPU 上那个被剔除 pass /
+	 * indirect draw 真正消费的计数器还留着上一代的值，于是画面上东西还立着。判据只能是
+	 * "把那个计数器本身读出来"，而它可能是 producer 自持的 pooled buffer（GPU 实例源的 Counter），
+	 * 也可能是 resident 集合里的 IndirectArgs —— 两者没有共同的宿主对象，所以入口开在这里。
+	 *
+	 * FinalAccessRole 决定读完把 buffer 放回哪个访问状态：回读要 CopySrc，而这些 buffer 平时
+	 * 分别停在 SRVMask（实例计数器，`AuxVertex`）或 IndirectArgs 上 —— **不放回去，下一帧的
+	 * 剔除 pass / 间接绘制会在错误的状态上撞见它们**（既有的石阶回读就是这么写的）。
+	 */
+	COMPUTESHADERGENERATOR_API bool ReadUintBufferSync(
+		const TRefCountPtr<FRDGPooledBuffer>& Buffer, uint32 NumUints,
+		ECSGpuStreamRole FinalAccessRole, TArray<uint32>& OutValues);
 }
 
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnCSMeshChanged, UCSMesh*);
@@ -480,6 +512,63 @@ public:
 	 * over the same registration and the same access-state restoration.
 	 */
 	bool EditMeshSync(TFunctionRef<void(FCSMeshEditContext&)> EditFunc);
+
+	/**
+	 * The non-blocking sibling of EditMeshSync, for game-thread callers that must not stall on the
+	 * render thread — a generation triggered from the editor UI, where the flush is the whole hitch.
+	 * Same registration, same access-state restoration, same one-graph-per-edit shape; only the
+	 * fence moves.
+	 *
+	 * What that costs the caller: EditFunc is OWNED (TFunction, moved in), not a view of a stack
+	 * callable, and everything it reads must be owned by it too. A raw pointer into the caller's
+	 * frame — the pattern EditMeshSync's flush makes safe — is a use-after-free here. Results come
+	 * back through OnComplete, which runs on the game thread after the graph has executed; its bool
+	 * is false when the mesh was destroyed before that point.
+	 *
+	 * Refused, and OnComplete never runs, when an async edit is already in flight: a second edit
+	 * would write the same resident streams while the first is still queued. Render commands are
+	 * FIFO, so a LATER EditMeshSync is correctly ordered behind an in-flight async edit — it just
+	 * blocks until both have run.
+	 *
+	 * Game thread only. Returns whether the edit was accepted and recorded, NOT whether it built.
+	 */
+	bool EditMeshAsync(TFunction<void(FCSMeshEditContext&)> EditFunc, TFunction<void(bool)> OnComplete = nullptr);
+
+	/** True between an accepted EditMeshAsync and its completion callback. */
+	bool IsEditInFlight() const { return bAsyncEditInFlight; }
+
+	/**
+	 * How many times this class has blocked the game thread on the render thread, process-wide.
+	 *
+	 * Every FlushRenderingCommands the mesh layer performs is counted here — the sync edit path,
+	 * the allocation paths, the readbacks. It exists to make the "no device syncs on the
+	 * interactive hot path" rule **testable** instead of aspirational: snapshot it, paint a
+	 * stroke / re-evaluate N houses, and the delta must be zero. A rule nothing checks is a rule
+	 * that quietly comes untrue the next time somebody reaches for a convenient *Sync operator.
+	 */
+	UFUNCTION(BlueprintPure, Category = "CS GpuMesh|Diagnostics")
+	static int64 GetBlockingFlushCount();
+
+	/**
+	 * FlushRenderingCommands + one tick of the counter above. **This is the only flush entry point
+	 * outside this class that the discipline can see.**
+	 *
+	 * 踩过的坑：计数器原来只在 CSMesh.cpp 内部自增，而 GPU 缓冲的分配路径
+	 * （CSShaperSteps / CSGroundStairs 的 pooled buffer 必须在渲染线程分配、结果要回到游戏线程）
+	 * 各自裸调 FlushRenderingCommands ⇒ **走那条路的阻塞对断言完全隐形**。
+	 * 断言绿灯于是只证明了"没走 CSMesh 的同步算子"，没证明"没阻塞"。
+	 * 任何新的阻塞点都必须走这里，否则等于把这条纪律的唯一自动化防线关掉。
+	 *
+	 * ⚠️ **走这里不等于"这条路不该阻塞"**。本模块剩下的 31 处（ComputeShaderBasicFunction /
+	 * MeshGeneratorLandscapeCapture / ComputeShaderMeshGenerator / ComputeShaderMeshBoolean /
+	 * ComputeShaderMeshFill / CSGpuMeshComponent / StaticMeshRenderDataPointSampler /
+	 * ComputeShaderCliffGenerate / CSPointBrushActor / CSMeshOps::ComputeWorldBoundsSync）
+	 * 绝大多数是离线 / 编辑器工具路径，**本来就该阻塞**，纳入计数**没有也不许改变它们的行为**。
+	 * 目的只有一个：让计数器诚实。计数器少数一次，"零阻塞"那几条断言就是在拿一个不完整的
+	 * 度量说话 —— 而它们的绿灯正是这条纪律唯一的自动化证据。若某条交互断言因此转红，
+	 * 结论是**我们本来就漏数了**，该修的是那条路径，不是把断言放宽。
+	 */
+	static void CountedBlockingFlush();
 
 	/**
 	 * Guarantees at least this much capacity, reallocating and copying the existing contents
@@ -656,4 +745,8 @@ private:
 	bool ConfirmGpuMemoryBudget(int64 RequestedBytes, const TCHAR* OperationName) const;
 
 	FCSMeshResidentRef Resident;
+
+	/** Set by an accepted EditMeshAsync, cleared by its completion callback. Guards against a
+	 *  second async edit writing the same resident streams while the first is still queued. */
+	bool bAsyncEditInFlight = false;
 };

@@ -361,22 +361,35 @@ void CalVelocityHeight_Flux(uint3 LocalDispatchThreadId, uint3 GroupThreadId, ui
 		SHB = DispatchThreadId.y + 1 >= MaxCell.y - WaterBoundSize - 1 ? 99999 : SHB;
 	}
 
-	// Source injection (skip sources buried inside terrain)
+	// Source injection: a source force-sets the water surface to its own height, both ways —
+	// above the current surface it fills, below it drains (target depth 0 = fully drained).
 	for (int i = 0; i < BCount_SourceUVRads; i++)
 	{
 		float4 SrcData = RWB_SourceUVRads[i];
 		SrcData.z -= ActorLocationZ;
 		if (SrcData.w <= 0)
 			continue;
-		int2 SrcPixel = (int2)floor(SrcData.xy * MaxCell);
-		SrcPixel = clamp(SrcPixel, int2(0,0), MaxCellInt - int2(1,1));
-		float SrcTerrainH = max(HeightMAX - T_SceneDepth[SrcPixel].x, RW_SmoothHeightA[SrcPixel].y);
-		if (SrcData.z <= SrcTerrainH)
-			continue;
+
 		float DistToSource = distance((DispatchThreadId.xy + 0.5) / MaxCell, SrcData.xy);
 		float Blend = max(1 - DistToSource / SrcData.w, 0);
-		float TarVC = lerp(VC, max(SrcData.z - SHC, 0), Blend);
-		VC = TarVC;
+		if (Blend <= 0)
+			continue;
+
+		// 埋地判定只看真实地形。SmoothHeight 是瀑布用的膨胀场，被 clamp 到邻域最大地形，
+		// 岸边/坡地会抬到水面之上；拿它当地面会把"泡在水里的源"误判成埋在山体里，
+		// 于是整条注入被跳过——这正是"源低于水面就不吸水"的成因。
+		int2 SrcPixel = (int2)floor(SrcData.xy * MaxCell);
+		SrcPixel = clamp(SrcPixel, int2(0,0), MaxCellInt - int2(1,1));
+		float SrcTerrainH = HeightMAX - T_SceneDepth[SrcPixel].x;
+
+		float TargetVC = max(SrcData.z - SHC, 0);
+		// 埋在地形里的源只许排水、不许造水：半径内比它低的洼地若照常写入目标深度，
+		// 就会平白涨水（原 skip 守卫要防的就是这个）。排水方向必须保留，否则
+		// "强制设置水面高度"这个语义只剩一半。
+		if (SrcData.z <= SrcTerrainH)
+			TargetVC = min(TargetVC, VC);
+
+		VC = lerp(VC, TargetVC, Blend);
 		FC = lerp(FC, 0, Blend);
 	}
 

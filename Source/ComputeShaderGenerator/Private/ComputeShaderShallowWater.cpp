@@ -1,7 +1,12 @@
 #include "ComputeShaderShallowWater.h"
 #include "CSBoxSceneCollection.h"
+#include "CSBoxSceneCollectionImpl.h"
 #include "ComputeShaderGenerateHelper.h"
 #include "EngineUtils.h"
+#include "Landscape.h"
+#if WITH_EDITOR
+#include "AssetCompilingManager.h"
+#endif
 #include "Engine/StaticMesh.h"
 #include "GlobalShader.h"
 #include "MaterialShader.h"
@@ -10,6 +15,7 @@
 #include "RenderGraphUtils.h"
 #include "RenderGraphBuilder.h"
 #include "Engine/StaticMeshActor.h"
+#include "Engine/DecalActor.h"
 #include "Kismet/KismetRenderingLibrary.h"
 #include "ComputeShaderGeneral.h"
 #include "ComputeShaderBasicFunction.h"
@@ -283,6 +289,13 @@ void ACSShallowWaterCapture::Clean()
 {
 	ClearSolverTimer();
 	ResetSolverState(true);
+	// 生成出来的代理 actor 是这次仿真的产物，清理时一并收走，否则关卡里会留下孤立的
+	// StaticMeshActor/DecalActor（本体组件已隐藏，视觉上还以为水体没清干净）。
+	if (const int32 Removed = DestroyAttachedProxyActors(AutoProxyTag))
+	{
+		UE_LOG(LogTemp, Log, TEXT("[CSSW] Clean removed %d attached '%s' proxy actor(s) on %s"),
+			Removed, *AutoProxyTag.ToString(), *GetName());
+	}
 	if (!CleanRenderTargets())
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[CSSW] Clean failed on %s: render targets could not be initialized."), *GetName());
@@ -989,6 +1002,15 @@ void ACSShallowWaterCapture::SetMaterialParameter_Implementation()
 		return MID;
 	};
 
+	// 展示烘焙结果时不铺 MID：烘焙 MIC 指向落盘贴图，MID 只绑 transient render target，
+	// 一旦覆盖上去，关卡重开或 RT 释放后水面与焦散就变成空白。本函数会被 CaptureAll /
+	// 求解 / Clean 间接调用，所以这道判断必须在这里，而不是只在展示时设一次。
+	if (bUseBakedResultMesh && (BakedWaterMaterial || BakedDecalMaterial))
+	{
+		ApplyBakedMaterials();
+		return;
+	}
+
 	ApplySimParams(EnsureMID(ReusltMesh, 0, WaterMaterial));
 	ApplySimParams(EnsureMID(SimVisHISM, 0, WaterMaterial));
 
@@ -1001,6 +1023,19 @@ void ACSShallowWaterCapture::SetMaterialParameter_Implementation()
 			CausticsDecal->SetDecalMaterial(DecalMID);
 		}
 		ApplySimParams(DecalMID);
+	}
+}
+
+void ACSShallowWaterCapture::ApplyBakedMaterials()
+{
+	if (BakedWaterMaterial)
+	{
+		if (ReusltMesh && ReusltMesh->GetMaterial(0) != BakedWaterMaterial) ReusltMesh->SetMaterial(0, BakedWaterMaterial);
+		if (SimVisHISM && SimVisHISM->GetMaterial(0) != BakedWaterMaterial) SimVisHISM->SetMaterial(0, BakedWaterMaterial);
+	}
+	if (BakedDecalMaterial && CausticsDecal && CausticsDecal->GetDecalMaterial() != BakedDecalMaterial)
+	{
+		CausticsDecal->SetDecalMaterial(BakedDecalMaterial);
 	}
 }
 
@@ -1041,39 +1076,106 @@ void ACSShallowWaterCapture::CaptureAll()
 
 	// 走公用的无状态收集器；actor 只交出自身的排除策略、LOD 与三角上限，
 	// 「只收带 SWCaptureTag 的道具」是本次捕获的策略，故在这里显式给出。
+	// 深度捕获只需要位置：Nanite 走 render fallback（不做 MeshDescription 全精度 CPU 提取），
+	// 地形不走 CPU 逐 quad 提取而是下面的 GPU RenderHeightmap——这两处正是旧路径的内存大头。
 	FCSBoxSceneCollectOptions CollectOptions = MakeBoxSceneCollectOptions(QueryBox);
 	if (!SWCaptureTag.IsNone()) CollectOptions.RequiredActorTags = { SWCaptureTag };
+	CollectOptions.bIncludeLandscape = false;
+	CollectOptions.bUseMeshDescriptionSourceTriangles = false;
 	FCSBoxScenePreparedData Prepared = CSBoxSceneCollection::CollectBoxSceneTriangles(World, CollectOptions);
 
 	FTextureRenderTargetResource* R_SceneDepth = RT_SceneDepth->GameThread_GetRenderTargetResource();
 	const float CapturedCameraHeight = ActorZ + MaxHeight;
 	const FBox CapturedBounds = QueryBox;
 
-	ENQUEUE_RENDER_COMMAND(CaptureAllSceneDepth)(
-	[this, R_SceneDepth, Prepared, CapturedCameraHeight, CapturedBounds](FRHICommandListImmediate& RHICmdList)
+	// 带 tag 的 static mesh：index/position buffer 直读的融合光栅化（不落 triangle soup），
+	// min 合并进 RT_SceneDepth，空 texel 保留清屏哨兵。
+	if (Prepared.IsValid() && !Prepared.Impl->ResolvedRequests.IsEmpty())
 	{
-		FRDGBuilder GraphBuilder(RHICmdList);
-
-		FCSStaticMeshTriangleRDGOutput TriangleOutput = AddPreparedBoxSceneTrianglesToRDG(
-			GraphBuilder, RHICmdList, Prepared, TEXT("CSSW.SceneDepthTriangles"));
-
-		if (!TriangleOutput.TriangleVertices)
+		ENQUEUE_RENDER_COMMAND(CaptureAllSceneDepth)(
+		[R_SceneDepth, Prepared, CapturedCameraHeight, CapturedBounds](FRHICommandListImmediate& RHICmdList)
 		{
+			FRDGBuilder GraphBuilder(RHICmdList);
+
+			FRDGTextureRef RDG_SceneDepth = GraphBuilder.RegisterExternalTexture(
+				CreateRenderTarget(R_SceneDepth->GetRenderTargetTexture(), TEXT("CSSW.RT_SceneDepth")));
+
+			CSMeshGenInternal::RasterizeResolvedMeshesToHeightmapRDG(
+				GraphBuilder, RHICmdList, Prepared.Impl->ResolvedRequests, RDG_SceneDepth,
+				CapturedBounds, CapturedCameraHeight);
+
 			GraphBuilder.Execute();
-			return;
+		});
+	}
+
+	// 地形：ALandscape::RenderHeightmap 在 GPU 上出 G16 高度图，LandscapeG16ToDepthCS 按 min
+	// 合并进 RT_SceneDepth（更高的地面赢，与网格光栅化可任意排序）。TempRT 清成全 0
+	//（raw==0 表示"无地形"），RenderHeightmap 对未覆盖/未加载的 texel 不写入，合并 shader
+	// 据此跳过，不会在网格深度或清屏哨兵上盖出幽灵地板。
+	const FVector CaptureCenter = CapturedBounds.GetCenter();
+	const FVector CaptureExtent = CapturedBounds.GetExtent();
+	for (TActorIterator<ALandscape> It(World); It; ++It)
+	{
+		ALandscape* Landscape = *It;
+		if (!IsValid(Landscape)) continue;
+
+#if WITH_EDITOR
+		// 冷启动（无头一次性运行/编辑器刚开图）时 RenderHeightmap 的输入可能没就绪，有两种冷态，
+		// 都表现为"返回 true 但一个 texel 都不写"：
+		// 1) 高度图纹理仍在异步编译，GPU 侧还是占位小纹理——FinishAllCompilation 等它编完；
+		// 2) edit-layer 存在待处理合并请求——ForceLayersFullUpdate 同步补齐。
+		// 交互编辑器稳态两步都近乎立即返回，不会引入可感知的卡顿。
+		FAssetCompilingManager::Get().FinishAllCompilation();
+		if (!Landscape->IsUpToDate())
+		{
+			UE_LOG(LogTemp, Log, TEXT("[CSSW] Landscape '%s' edit layers not merged yet; forcing full update before RenderHeightmap"), *Landscape->GetName());
+			Landscape->ForceLayersFullUpdate();
+		}
+#endif
+
+		UTextureRenderTarget2D* TempRT = NewObject<UTextureRenderTarget2D>(GetTransientPackage());
+		TempRT->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
+		TempRT->ClearColor = FLinearColor(0, 0, 0, 0);
+		TempRT->InitAutoFormat(SafeTextureSize, SafeTextureSize);
+		TempRT->UpdateResourceImmediate(true);
+
+		const FTransform AreaTransform(FQuat::Identity, CaptureCenter, FVector::OneVector);
+		const FBox2D AreaExtents(FVector2D(-CaptureExtent.X, -CaptureExtent.Y), FVector2D(CaptureExtent.X, CaptureExtent.Y));
+		if (!Landscape->RenderHeightmap(AreaTransform, AreaExtents, TempRT))
+		{
+			TempRT->MarkAsGarbage();
+			continue;
 		}
 
-		FRDGTextureRef RDG_SceneDepth = GraphBuilder.RegisterExternalTexture(
-			CreateRenderTarget(R_SceneDepth->GetRenderTargetTexture(), TEXT("CSSW.RT_SceneDepth")));
+		const float LandscapeScaleZ = Landscape->GetActorScale3D().Z;
+		const float LandscapeOriginZ = Landscape->GetActorLocation().Z;
+		FTextureRenderTargetResource* R_LandscapeRGBA = TempRT->GameThread_GetRenderTargetResource();
 
-		RasterizeTriangleSoupToHeightmapRDG(
-			GraphBuilder, TriangleOutput, RDG_SceneDepth,
-			CapturedBounds, CapturedCameraHeight);
+		ENQUEUE_RENDER_COMMAND(CaptureAllLandscapeDepth)(
+		[this, R_LandscapeRGBA, R_SceneDepth, CapturedCameraHeight, LandscapeScaleZ, LandscapeOriginZ](FRHICommandListImmediate& RHICmdList)
+		{
+			FRDGBuilder GraphBuilder(RHICmdList);
 
-		GraphBuilder.Execute();
-	});
+			FRDGTextureRef RDG_LandscapeRGBA = GraphBuilder.RegisterExternalTexture(
+				CreateRenderTarget(R_LandscapeRGBA->GetRenderTargetTexture(), TEXT("CSSW.LandscapeG16")));
+			FRDGTextureRef RDG_SceneDepth = GraphBuilder.RegisterExternalTexture(
+				CreateRenderTarget(R_SceneDepth->GetRenderTargetTexture(), TEXT("CSSW.RT_SceneDepth")));
 
-	FlushRenderingCommands();
+			ConvertLandscapeHeightmapToDepthRDG(
+				GraphBuilder, RDG_LandscapeRGBA, RDG_SceneDepth,
+				CapturedCameraHeight, LandscapeScaleZ, LandscapeOriginZ);
+
+			GraphBuilder.Execute();
+		});
+
+		// 立即弃置是安全的：GC 销毁 UObject 走 BeginReleaseResource（渲染命令），
+		// 排在上面的合并命令之后；合并命令自身持有的只是 resource 指针，不触碰 UObject。
+		TempRT->MarkAsGarbage();
+	}
+
+	// 有意不 FlushRenderingCommands：捕获结果的全部消费者（SetHeight/求解 pass/像素读回）
+	// 要么同在渲染命令队列里排在其后，要么读取 API 自带 flush。同步等待只会把游戏线程
+	// 挂在 GPU 光栅化上——这正是旧路径"远慢于 SceneCapture"观感的另一半来源。
 }
 
 void ACSShallowWaterCapture::StartSolver(float TimerRate, int32 InIteration)
@@ -1141,6 +1243,21 @@ FString ACSShallowWaterCapture::GetResultAssetUniqueTag()
 	return LexToString(EnsureSWUniqueID());
 }
 
+FString ACSShallowWaterCapture::BuildBakedAssetPath(const FString& Suffix)
+{
+	const FString ResultFolderPath = GetResultAssetFolderPath();
+	if (ResultFolderPath.IsEmpty()) return FString();
+
+	// 统一命名：CSSW_<SWUniqueID>_<后缀>。编号随 actor 存盘，所以重复烘焙会覆盖同一批资产。
+	return FString::Printf(TEXT("%s/CSSW_%s_%s"), *ResultFolderPath, *GetResultAssetUniqueTag(), *Suffix);
+}
+
+FString ACSShallowWaterCapture::BuildResultAssetPath(const FString& NameSuffix)
+{
+	// 结果网格走同一套命名（CSSW_<编号>_SM），NameSuffix 仍追加在最后，供"一个 actor 多份产出"使用。
+	return BuildBakedAssetPath(TEXT("SM") + NameSuffix);
+}
+
 void ACSShallowWaterCapture::BrowseBakedAssets()
 {
 #if WITH_EDITOR
@@ -1155,7 +1272,7 @@ void ACSShallowWaterCapture::BrowseBakedAssets()
 
 	if (SWUniqueID >= 0 && !AssetFolderPath.IsEmpty())
 	{
-		FString MICPath = AssetFolderPath / FString::Printf(TEXT("MI_CSSW_Water_%d"), SWUniqueID);
+		FString MICPath = BuildBakedAssetPath(TEXT("Water"));
 		UObject* MIC = StaticLoadObject(UObject::StaticClass(), nullptr, *MICPath, nullptr, LOAD_NoWarn | LOAD_Quiet);
 		if (MIC) ObjectsToSync.Add(MIC);
 	}
@@ -1181,7 +1298,9 @@ void ACSShallowWaterCapture::ShowBakedResult()
 	StopSolver();
 	if (SimVisHISM)
 	{
-		SimVisHISM->ClearInstances();
+		// 只隐藏，不清实例：这批实例就是烘焙的源网格栅格，清掉之后再烘焙一次就没有源了
+		// （只能退回单个预览网格，落在一两个 texel 上，产出零三角）。StartSolver 每次都会
+		// 重建它们，留着不会累积。
 		SimVisHISM->SetVisibility(false);
 	}
 	if (ReusltMesh)
@@ -1194,7 +1313,132 @@ void ACSShallowWaterCapture::ShowBakedResult()
 		}
 		ReusltMesh->SetVisibility(true);
 	}
-	if (CausticsDecal && DecalMaterial) CausticsDecal->SetVisibility(true);
+	// 烘焙 MIC 优先于运行时 MID：贴的是落盘贴图，关卡重开后依然有画面。
+	ApplyBakedMaterials();
+	if (CausticsDecal && (BakedDecalMaterial || DecalMaterial)) CausticsDecal->SetVisibility(true);
+}
+
+const FName ACSShallowWaterCapture::AutoProxyTag(TEXT("Auto"));
+
+int32 ACSShallowWaterCapture::DestroyAttachedProxyActors(FName Tag)
+{
+	TArray<AActor*> AttachedActors;
+	GetAttachedActors(AttachedActors);
+	int32 Removed = 0;
+	for (AActor* Actor : AttachedActors)
+	{
+		if (!IsValid(Actor)) continue;
+		// Tag 为 None 表示"收走全部挂载 actor"；带 tag 时只收自己生成的那批，
+		// 免得把美术手工挂上来的东西一起销毁。
+		if (!Tag.IsNone() && !Actor->ActorHasTag(Tag)) continue;
+		Actor->Destroy();
+		++Removed;
+	}
+	return Removed;
+}
+
+void ACSShallowWaterCapture::BuildProxyActors(FName ProxyTag, AStaticMeshActor*& OutMeshActor, ADecalActor*& OutDecalActor)
+{
+	OutMeshActor = nullptr;
+	OutDecalActor = nullptr;
+
+	UWorld* World = GetWorld();
+	if (!World || HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject)) return;
+
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	SpawnParams.Owner = this;
+
+	// StaticMeshActor：复制 ReusltMesh 当前网格 + 材质 + 世界变换。
+	// 取的是组件"当前"的材质而不是 WaterMaterial：ShowBakedResult 已经把烘焙 MIC 贴上去了，
+	// 照抄当前值才能让代理拿到落盘材质（而不是绑 transient RT 的 MID）。
+	UStaticMesh* ProxyMesh = ReusltMesh ? ReusltMesh->GetStaticMesh() : nullptr;
+	if (ReusltMesh && ProxyMesh)
+	{
+		AStaticMeshActor* MeshActor = World->SpawnActor<AStaticMeshActor>(
+			AStaticMeshActor::StaticClass(), ReusltMesh->GetComponentTransform(), SpawnParams);
+		if (MeshActor)
+		{
+			UStaticMeshComponent* SMC = MeshActor->GetStaticMeshComponent();
+			SMC->SetMobility(ReusltMesh->Mobility);
+			SMC->SetStaticMesh(ProxyMesh);
+			const int32 NumMats = ReusltMesh->GetNumMaterials();
+			for (int32 i = 0; i < NumMats; ++i) SMC->SetMaterial(i, ReusltMesh->GetMaterial(i));
+			SMC->SetCastShadow(ReusltMesh->CastShadow);
+			SMC->bVisibleInRayTracing = ReusltMesh->bVisibleInRayTracing;
+			SMC->SetCollisionEnabled(ReusltMesh->GetCollisionEnabled());
+			MeshActor->Tags.Add(ProxyTag);
+			MeshActor->AttachToActor(this, FAttachmentTransformRules::KeepWorldTransform);
+			OutMeshActor = MeshActor;
+		}
+	}
+
+	// DecalActor：位置/缩放/材质/DecalSize 沿用 CausticsDecal。烘焙 MIC 优先，其次是组件上
+	// 当前的材质，最后才回退到作者指定的 DecalMaterial。
+	UMaterialInterface* ProxyDecalMat = BakedDecalMaterial;
+	if (!ProxyDecalMat && CausticsDecal) ProxyDecalMat = CausticsDecal->GetDecalMaterial();
+	if (!ProxyDecalMat) ProxyDecalMat = DecalMaterial;
+	if (CausticsDecal && ProxyDecalMat)
+	{
+		ADecalActor* DecalActor = World->SpawnActor<ADecalActor>(
+			ADecalActor::StaticClass(), CausticsDecal->GetComponentTransform(), SpawnParams);
+		if (DecalActor)
+		{
+			if (UDecalComponent* DC = DecalActor->GetDecal())
+			{
+				DC->SetMobility(EComponentMobility::Movable);
+				// 用 SetWorldRotation 直接锁死组件世界朝向（俯视投影），不靠 spawn 旋转：
+				// ADecalActor 根组件自带 -90° pitch 偏移，会与 spawn 传入的旋转叠加。
+				DC->SetWorldRotation(FRotator(-90, 0, 0));
+				DC->SetDecalMaterial(ProxyDecalMat);
+				DC->DecalSize = CausticsDecal->DecalSize;
+				DC->SortOrder = CausticsDecal->SortOrder;
+				DC->MarkRenderStateDirty();
+			}
+			DecalActor->Tags.Add(ProxyTag);
+			DecalActor->AttachToActor(this, FAttachmentTransformRules::KeepWorldTransform);
+			OutDecalActor = DecalActor;
+		}
+	}
+}
+
+void ACSShallowWaterCapture::SpawnResultProxyActors(AStaticMeshActor*& OutMeshActor, ADecalActor*& OutDecalActor)
+{
+	// 这个入口的语义是"重建全部代理"：先收走本 actor 下已挂的所有 actor，再按当前状态重建。
+	DestroyAttachedProxyActors(NAME_None);
+	BuildProxyActors(SWTag, OutMeshActor, OutDecalActor);
+}
+
+void ACSShallowWaterCapture::SpawnAutoResultActors()
+{
+	// 先看有没有结果可代理。没有网格就整个跳过：既不生成、也不隐藏本体组件，
+	// 否则会把水体变成"什么都看不见"的状态，比不做还糟。
+	UStaticMesh* ResultMesh = ReusltMesh ? ReusltMesh->GetStaticMesh() : nullptr;
+	if (!ResultMesh)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[CSSW] SpawnAutoResultActors: %s has no result mesh (bake or start the solver first); nothing spawned."), *GetName());
+		return;
+	}
+
+	// 重复调用只替换自己那批：按 tag 回收，不碰手工挂上来的其它 actor。
+	DestroyAttachedProxyActors(AutoProxyTag);
+
+	AStaticMeshActor* MeshActor = nullptr;
+	ADecalActor* DecalActor = nullptr;
+	BuildProxyActors(AutoProxyTag, MeshActor, DecalActor);
+	if (!MeshActor && !DecalActor)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[CSSW] SpawnAutoResultActors: %s spawned nothing; keeping own components visible."), *GetName());
+		return;
+	}
+
+	// 代理已经接管显示，本体组件让位；隐藏而不是销毁，重新仿真/烘焙时还要用它们。
+	if (ReusltMesh) ReusltMesh->SetVisibility(false);
+	if (CausticsDecal) CausticsDecal->SetVisibility(false);
+
+	UE_LOG(LogTemp, Log, TEXT("[CSSW] SpawnAutoResultActors on %s: mesh=%s decal=%s (tag '%s'), own mesh/decal hidden."),
+		*GetName(), MeshActor ? *MeshActor->GetName() : TEXT("none"),
+		DecalActor ? *DecalActor->GetName() : TEXT("none"), *AutoProxyTag.ToString());
 }
 
 void ACSShallowWaterCapture::ShowDebugViewPlane(float Duration)

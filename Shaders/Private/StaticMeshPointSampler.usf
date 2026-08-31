@@ -1342,18 +1342,10 @@ float2 HM_BoundsInvSize;
 float  HM_CameraHeight;
 int2   HM_TextureSize;
 
-[numthreads(THREADGROUPSIZE_X, 1, 1)]
-void TriangleSoupToHeightmapCS(uint3 DTid : SV_DispatchThreadID)
+// 单三角俯视正交光栅化（TriangleSoupToHeightmapCS 与 IndexedMeshToHeightmapCS 共用）。
+// depth = HM_CameraHeight - WorldZ，非负 float 的位型保持单调，InterlockedMin 即取最高面。
+void HM_RasterizeWorldTriangle(float3 V0, float3 V1, float3 V2)
 {
-	uint TriCount = RW_TriangleCounter[0];
-	uint TriIdx = DTid.x;
-	if (TriIdx >= TriCount)
-		return;
-
-	float3 V0 = RW_OutTriangleVertices[TriIdx * 3 + 0].xyz;
-	float3 V1 = RW_OutTriangleVertices[TriIdx * 3 + 1].xyz;
-	float3 V2 = RW_OutTriangleVertices[TriIdx * 3 + 2].xyz;
-
 	float2 UV0 = (V0.xy - HM_BoundsMin) * HM_BoundsInvSize;
 	float2 UV1 = (V1.xy - HM_BoundsMin) * HM_BoundsInvSize;
 	float2 UV2 = (V2.xy - HM_BoundsMin) * HM_BoundsInvSize;
@@ -1388,6 +1380,51 @@ void TriangleSoupToHeightmapCS(uint3 DTid : SV_DispatchThreadID)
 	}
 }
 
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void TriangleSoupToHeightmapCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint TriCount = RW_TriangleCounter[0];
+	uint TriIdx = DTid.x;
+	if (TriIdx >= TriCount)
+		return;
+
+	float3 V0 = RW_OutTriangleVertices[TriIdx * 3 + 0].xyz;
+	float3 V1 = RW_OutTriangleVertices[TriIdx * 3 + 1].xyz;
+	float3 V2 = RW_OutTriangleVertices[TriIdx * 3 + 2].xyz;
+
+	HM_RasterizeWorldTriangle(V0, V1, V2);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// IndexedMeshToHeightmapCS
+// index/position buffer 直读版光栅化：ExtractStaticMeshTrianglesCS 的三角读取 +
+// HM_RasterizeWorldTriangle，中间不落任何 triangle soup。高度图只需要位置，
+// soup 的 normal/UV/材质通道在这条路径上全是死重，故整组省掉。
+// ─────────────────────────────────────────────────────────────────────────
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void IndexedMeshToHeightmapCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	// 与 extract 相同的包裹 dispatch 线性化（Nanite fallback 网格三角数可超 65535 组）。
+	uint TriIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (TriIndex >= TriangleCount)
+		return;
+
+	uint IndexBase = TriIndex * 3u;
+	float3 P0 = mul(float4(ReadPosition(IndexBuffer[IndexBase + 0u]), 1.0f), LocalToWorld).xyz;
+	float3 P1 = mul(float4(ReadPosition(IndexBuffer[IndexBase + 1u]), 1.0f), LocalToWorld).xyz;
+	float3 P2 = mul(float4(ReadPosition(IndexBuffer[IndexBase + 2u]), 1.0f), LocalToWorld).xyz;
+
+	// NaN 顶点会让像素包围盒的 min/max 失去意义，可能退化成全图循环，先行剔除。
+	if (any(isnan(P0)) || any(isnan(P1)) || any(isnan(P2)))
+		return;
+
+	if (bUseBounds != 0u && !TriangleIntersectsBounds(P0, P1, P2))
+		return;
+
+	HM_RasterizeWorldTriangle(P0, P1, P2);
+}
+
 RWTexture2D<float4> RW_HeightmapFloat;
 Texture2D<uint> T_HeightmapUint;
 
@@ -1398,6 +1435,21 @@ void ConvertHeightmapUintToFloatCS(uint3 DTid : SV_DispatchThreadID)
 		return;
 	float depth = asfloat(T_HeightmapUint[DTid.xy]);
 	RW_HeightmapFloat[DTid.xy] = float4(depth, 0, 0, 1);
+}
+
+// min 合并版转换：跳过没有任何三角覆盖的 texel（清屏哨兵 0xFFFFFFFF 位型是 NaN，直写会污染输出），
+// 已覆盖的与输出现值取 min（更高的面赢），因此可与地形深度合并按任意顺序叠加。
+[numthreads(8, 8, 1)]
+void MergeHeightmapUintToFloatMinCS(uint3 DTid : SV_DispatchThreadID)
+{
+	if (any(DTid.xy >= (uint2)HM_TextureSize))
+		return;
+	uint depthBits = T_HeightmapUint[DTid.xy];
+	if (depthBits == 0xFFFFFFFFu)
+		return;
+	float depth = asfloat(depthBits);
+	float existing = RW_HeightmapFloat[DTid.xy].r;
+	RW_HeightmapFloat[DTid.xy] = float4(min(existing, depth), 0, 0, 1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1428,7 +1480,15 @@ void LandscapeG16ToDepthCS(uint3 DTid : SV_DispatchThreadID)
 	if (any(DTid.xy >= (uint2)LHM_TextureSize))
 		return;
 
-	float worldZ = LHM_DecodeWorldZ(T_LandscapeRGBA[DTid.xy]);
+	float4 rgba = T_LandscapeRGBA[DTid.xy];
+
+	// RenderHeightmap 对区域外/未加载的 texel 不写入，RT 保持清屏值。把清屏色设为全 0 的调用方
+	// （raw==0，即 int16 最低高度，正常雕刻取不到）以此标记"无地形"，这里跳过以保住输出里已有的
+	// 网格深度/清屏哨兵；旧调用方清 0.5（raw=32640）不受影响，仍全量写入。
+	if (rgba.r == 0.0f && rgba.g == 0.0f)
+		return;
+
+	float worldZ = LHM_DecodeWorldZ(rgba);
 	float depth = LHM_CameraHeight - worldZ;
 
 	float existing = RW_HeightmapFloat[DTid.xy].r;

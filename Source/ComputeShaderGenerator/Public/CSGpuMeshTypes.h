@@ -227,6 +227,23 @@ namespace CSGpuMeshStreams
 		/** Carry vertex colours through the CPU readback. Colours have always existed on
 		 *  the GPU and rendered fine; only the readback dropped them. */
 		bool bReadbackColors = false;
+
+		/**
+		 * UV 组数（UV0..UVn-1）。**这是逐 mesh 的变体旋钮,不是全局设置。**
+		 *
+		 * 为什么必须做成变体：这条 TexCoord 流是全插件共用的（道路 / 藤蔓 / 布尔产物 / 直接
+		 * 网格 / 地面都在用），把它一刀切成 4 float 等于让每个 gpumesh 的 UV 显存翻倍 ——
+		 * 1024² 地面单这一张就多 8.4 MB，而需要第二组 UV 的只有房子墙。默认 1 时产出的
+		 * 描述符与改动前**逐位相同**，所有既有 mesh 和写 TexCoord 的 7 个 .usf 一行都不用动
+		 * （它们的 `RW_TexCoords[V]` 对单组 mesh 依然正确）。
+		 *
+		 * 布局是**交错**的而不是另起一条流，这一条没得选：引擎 LocalVertexFactory.ush:734 的
+		 * `VertexFetch_TexCoordBuffer[NumFetchTexCoords * VertexId + CoordIndex]` 是单 buffer
+		 * 交错取数，两条独立 buffer 物理上表达不了；而代理里 `TextureCoordinatesSRV` 也只有
+		 * 一个槽位，第二条流会直接覆盖第一条。所以第二组 UV 的正确形态是把**同一条流**加宽到
+		 * 每顶点 2×N 个 float，SrvFormat 保持 PF_G32R32F（float2 视图，元素数自然翻倍）。
+		 */
+		uint32 NumTexCoordSets = 1;
 	};
 
 	/** Fills OutDescs with the standard triangle set: Position / TangentBasis / TexCoord0 /
@@ -277,11 +294,10 @@ struct FCSGpuMeshConvertOptions
 	/** 源数据是世界空间、需要烘到 TargetTransform 的局部空间。源数据本就是局部空间时置 false。 */
 	bool bBakeToLocalSpace = true;
 
-	/** 忽略源法线切线，按几何重算。 */
-	bool bRecomputeNormals = false;
-
-	/** 三角面积平方低于该值视为退化并丢弃。 */
-	float DegenerateAreaThresholdSq = 1.0e-8f;
+	// 这里曾有 bRecomputeNormals 与 DegenerateAreaThresholdSq 两个字段，全项目无人读取：
+	// 法线一律取自回读快照，退化面判据写死在 BuildGpuMeshDescription 里的 FaceNormal.IsNearlyZero()。
+	// 留着只会让人以为它们可调。（BP 面的 FCSMeshToStaticMeshOptions::bRecomputeNormals 是另一个
+	// 字段，DynamicMesh 那条出口确实在读，不受影响。）
 
 	/** 材质槽为空时填入引擎默认表面材质，避免输出网格渲染成默认灰且无法在编辑器里区分槽位。 */
 	bool bFillEmptySlotsWithDefaultMaterial = true;

@@ -60,6 +60,38 @@ public:
 	virtual void InitRHI(FRHICommandListBase& RHICmdList) override;
 	virtual void ReleaseRHI() override;
 
+	/**
+	 * 这两条 override 是**深度预通道的入场券**，删掉的症状是「实例只在天空背景上看得见」。
+	 *
+	 * `FLocalVertexFactory::InitRHI` 会顺手建出 PositionOnly / PositionAndNormalOnly 两套顶点
+	 * 声明，于是基类的 `SupportsPositionOnlyStream()` 返回 true。而深度预通道的选路是**两套口径**：
+	 *   · `FDepthPassMeshProcessor::ShouldRender`（`DepthRendering.cpp:962`）看的是**实例**的
+	 *     `MeshBatch.VertexFactory->SupportsPositionOnlyStream()` —— true 就选 position-only 着色器；
+	 *   · `TDepthOnlyVS<true>::ShouldCompilePermutation`（`DepthRendering.h:85`）看的是**类型**的
+	 *     `VertexFactoryType->SupportsPositionOnly()` —— 本工厂的 `IMPLEMENT_VERTEX_FACTORY_TYPE`
+	 *     里没有这个 flag（见本文件末尾），所以那个着色器**从来没被编译过**。
+	 * 两边一冲突，`GetDepthPassShaders<true>` 取不到着色器 ⇒ `Process<true>` 返回 false ⇒
+	 * **整个 batch 被静默地踢出深度预通道**，一条日志都没有。
+	 *
+	 * 后果不是"画不出来"而是"画了但不占深度"：本工程是全深度预通道（Lumen/VSM 强制
+	 * `DDM_AllOpaque`），基通道因此是 `DepthRead` + `CF_DepthNearOrEqual`，**谁都不写深度**。
+	 * 实例的颜色照常写进去，但深度缓冲里没有它 —— 于是同一趟基通道里**后画的任何不透明物**
+	 * （地面、墙）都能通过深度测试把它整片盖掉。实测症状：`L_TerrainOpsDemo` 的 216 级石阶
+	 * 只剩地形轮廓线外侧那十几块（背后是天空、没有后画的东西盖它）。
+	 *
+	 * 引擎自己的 `FInstancedStaticMeshVertexFactory` 没有这个问题，因为它**重写了 InitRHI**、
+	 * 压根不建这两套声明（`InstancedStaticMesh.cpp:778` 那行注释原文：
+	 * "we don't need per-vertex shadow or lightmap rendering"）。本工厂复用基类的 InitRHI，
+	 * 所以必须在这里把口径对齐 —— 两条 override 的效果就是让深度预通道走
+	 * `Process<false>`（完整顶点声明 + 默认材质），也就是基通道用的那条、已经被证明正确的路。
+	 *
+	 * 代价：预通道多绑一份完整顶点声明。手取顶点（SupportsManualVertexFetch）下这份声明
+	 * 实际只有 position 一个元素，所以代价接近零；且**只影响本实例工厂**，
+	 * `FCSGpuMeshSceneProxy` 的非实例路仍用原生 `FLocalVertexFactory`，一个字节都没动。
+	 */
+	virtual bool SupportsPositionOnlyStream() const override { return false; }
+	virtual bool SupportsPositionAndNormalOnlyStream() const override { return false; }
+
 	FRHIShaderResourceView* GetInstanceOriginSRV() const { return InstanceOriginSRV; }
 	FRHIShaderResourceView* GetInstanceTransformSRV() const { return InstanceTransformSRV; }
 	FRHIShaderResourceView* GetInstanceLightmapSRV() const { return InstanceLightmapSRV; }

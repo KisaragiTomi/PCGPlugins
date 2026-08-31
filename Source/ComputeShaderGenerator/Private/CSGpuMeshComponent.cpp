@@ -1,6 +1,11 @@
 #include "CSGpuMeshComponent.h"
 #include "CSGpuMeshSceneProxy.h"
 #include "CSMesh.h"
+#include "CSStaticMeshAssetSink.h"
+
+// GetDefaultSurfaceMaterial 的 MD_Surface（EMaterialDomain）。unity 构建里靠邻居 TU 兜住，
+// -SingleFile 才炸 —— 与坑表里"unity 构建掩盖缺失 include"记的是同一件事，与本轮改动无关。
+#include "MaterialDomain.h"
 
 #include "RHI.h"
 #include "RHIGPUReadback.h"
@@ -44,7 +49,7 @@ bool UCSGpuMeshComponent::ReadbackMeshSync(FCSGpuMeshCPUData& OutMeshData) const
 	}
 
 	// Complete any pending proxy recreation before capturing the proxy pointer.
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 	FCSGpuMeshSceneProxy* Proxy = static_cast<FCSGpuMeshSceneProxy*>(GetSceneProxy());
 	if (!Proxy)
 	{
@@ -58,7 +63,7 @@ bool UCSGpuMeshComponent::ReadbackMeshSync(FCSGpuMeshCPUData& OutMeshData) const
 	FCSMeshResident ResidentView;
 	ENQUEUE_RENDER_COMMAND(CSGpuMeshBuildResidentView)(
 		[Proxy, &ResidentView](FRHICommandListImmediate&) { Proxy->BuildResidentView(ResidentView); });
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 
 	return CSMeshReadback::ReadbackResidentSync(ResidentView, OutMeshData);
 }
@@ -95,53 +100,6 @@ bool IsFiniteVec(const FVector& V)
 	return !V.ContainsNaN() && FMath::IsFinite(V.X) && FMath::IsFinite(V.Y) && FMath::IsFinite(V.Z);
 }
 
-FName BuildMaterialSlotName(int32 Slot)
-{
-	return FName(*FString::Printf(TEXT("MaterialSlot_%d"), Slot));
-}
-
-// Shared by the transient and the saved-asset paths so both get identical material slots and
-// build settings; only the outer/flags and whether the MeshDescription is committed differ.
-bool PopulateStaticMeshFromDescription(
-	UStaticMesh* StaticMesh,
-	FMeshDescription& MeshDescription,
-	const FCSGpuMeshCPUData& MeshData,
-	const TArray<UMaterialInterface*>& Materials,
-	bool bCommitMeshDescription,
-	bool bEnableNanite)
-{
-	if (!StaticMesh) return false;
-
-	// 必须在 BuildFromMeshDescriptions 之前设置：Nanite 数据是在那次构建里生成的，
-	// 建完再改设置只会标脏，不会真的产出 Nanite 数据。
-	{
-		FMeshNaniteSettings NaniteSettings = StaticMesh->GetNaniteSettings();
-		NaniteSettings.bEnabled = bEnableNanite;
-		StaticMesh->SetNaniteSettings(NaniteSettings);
-	}
-
-	int32 RequiredMaterialSlots = FMath::Max(1, Materials.Num());
-	for (int32 Slot : MeshData.TriangleMaterialSlots) RequiredMaterialSlots = FMath::Max(RequiredMaterialSlots, Slot + 1);
-	for (int32 Slot = 0; Slot < RequiredMaterialSlots; ++Slot)
-	{
-		UMaterialInterface* Material = Materials.IsValidIndex(Slot) ? Materials[Slot] : nullptr;
-		const FName SlotName = BuildMaterialSlotName(Slot);
-		StaticMesh->GetStaticMaterials().Add(FStaticMaterial(Material, SlotName, SlotName));
-	}
-
-	UStaticMesh::FBuildMeshDescriptionsParams BuildParams;
-	BuildParams.bBuildSimpleCollision = false;
-	// The fast path (UStaticMesh::BuildFromMeshDescription) emits one render vertex per vertex
-	// instance and never merges them, so a perfectly welded MeshDescription still renders with
-	// 3 vertices per triangle - welding looks like it did nothing and the buffers stay large.
-	// Saved assets therefore take the full build, which merges vertices by attribute equality.
-	// Transient results are throwaway previews, so they keep the fast path.
-	BuildParams.bFastBuild = !bCommitMeshDescription;
-	// A saved asset must keep its editable source data; a transient one must not pay for it.
-	BuildParams.bCommitMeshDescription = bCommitMeshDescription;
-	return StaticMesh->BuildFromMeshDescriptions({ &MeshDescription }, BuildParams);
-}
-
 #if WITH_EDITOR
 // Default save location when the caller passes an empty path: an "AutoResult" folder sitting next to
 // the component's current level asset — e.g. level /Game/Maps/L_Foo -> /Game/Maps/AutoResult/SM_<owner>.
@@ -163,13 +121,6 @@ FString BuildDefaultResultAssetPath(const AActor* Owner, const FString& NameSuff
 }
 #endif
 }
-
-#if WITH_EDITOR
-FString UCSGpuMeshComponent::BuildResultAssetPath(const AActor* OwnerActor, const FString& NameSuffix)
-{
-	return BuildDefaultResultAssetPath(OwnerActor, NameSuffix);
-}
-#endif
 
 bool UCSGpuMeshComponent::BuildGpuMeshDescription(
 	const FCSGpuMeshCPUData& MeshData,
@@ -205,7 +156,7 @@ bool UCSGpuMeshComponent::BuildGpuMeshDescription(
 	for (int32 Slot = 0; Slot <= MaxMaterialSlot; ++Slot)
 	{
 		const FPolygonGroupID PolygonGroupID = OutMeshDescription.CreatePolygonGroup();
-		PolygonGroupMaterialSlotNames[PolygonGroupID] = BuildMaterialSlotName(Slot);
+		PolygonGroupMaterialSlotNames[PolygonGroupID] = CSStaticMeshAsset::MaterialSlotName(Slot);
 		PolygonGroupIDs.Add(PolygonGroupID);
 	}
 
@@ -388,7 +339,8 @@ UStaticMesh* UCSGpuMeshComponent::BuildTransientStaticMesh(
 	if (!StaticMesh) return nullptr;
 	// Transient results are rebuilt from scratch every run, so the editable MeshDescription
 	// copy is dead weight; skipping the commit avoids ~1.5 GiB of resident bulk data per mesh.
-	if (!PopulateStaticMeshFromDescription(StaticMesh, MeshDescription, MeshData, Materials, false, bEnableNanite)) return nullptr;
+	if (!CSStaticMeshAsset::PopulateFromDescription(
+		StaticMesh, MeshDescription, Materials, MeshData.TriangleMaterialSlots, false, bEnableNanite)) return nullptr;
 	return StaticMesh;
 }
 
@@ -405,6 +357,8 @@ UStaticMesh* UCSGpuMeshComponent::SaveGpuMeshDataToStaticMesh(
 	bool bSaveAsset,
 	bool bEnableNanite)
 {
+	static const TCHAR* LogPrefix = TEXT("[CSGpuMesh]");
+
 	FString EffectiveAssetPath = AssetPathAndName.TrimStartAndEnd();
 	if (EffectiveAssetPath.IsEmpty())
 	{
@@ -416,89 +370,44 @@ UStaticMesh* UCSGpuMeshComponent::SaveGpuMeshDataToStaticMesh(
 		}
 	}
 
-	const FString SanitizedAssetPathAndName = UPackageTools::SanitizePackageName(EffectiveAssetPath);
-	if (!FPackageName::IsValidLongPackageName(SanitizedAssetPathAndName))
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: invalid asset path '%s'."), *SanitizedAssetPathAndName);
-		return nullptr;
-	}
+	// 路径清洗/校验/建目录/重名判定全在公用 sink 里，这一步不改动任何资产。
+	FCSStaticMeshAssetTarget Target;
+	if (!CSStaticMeshAsset::ResolveTarget(EffectiveAssetPath, bReplaceExistingAsset, LogPrefix, Target)) return nullptr;
 
-	const FString AssetName = FPackageName::GetLongPackageAssetName(SanitizedAssetPathAndName);
-	if (AssetName.IsEmpty()) return nullptr;
-
-	const FString AssetFolderPath = FPackageName::GetLongPackagePath(SanitizedAssetPathAndName);
-	if (!AssetFolderPath.IsEmpty()
-		&& !UEditorAssetLibrary::DoesDirectoryExist(AssetFolderPath)
-		&& !UEditorAssetLibrary::MakeDirectory(AssetFolderPath))
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: could not create asset folder '%s'."), *AssetFolderPath);
-		return nullptr;
-	}
-
-	// 同名资产已存在时优先「就地重建」而不是删掉重建：删除会打断所有已有引用（本 actor 的
-	// OutputStaticMesh、场上的 StaticMeshComponent、其他关卡），而且只要还有人在内存里引用它，
-	// DeleteAsset 本身就会失败，重跑等于永远存不上。就地重建保留同一个 UObject，引用自然跟着更新。
-	UStaticMesh* ExistingStaticMesh = nullptr;
-	if (UEditorAssetLibrary::DoesAssetExist(SanitizedAssetPathAndName))
-	{
-		if (!bReplaceExistingAsset)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save skipped: asset already exists at '%s'."), *SanitizedAssetPathAndName);
-			return nullptr;
-		}
-		ExistingStaticMesh = Cast<UStaticMesh>(UEditorAssetLibrary::LoadAsset(SanitizedAssetPathAndName));
-		// 同名的不是 StaticMesh（材质、贴图……）就没法就地重建，只能按老路子删掉。
-		if (!ExistingStaticMesh && !UEditorAssetLibrary::DeleteAsset(SanitizedAssetPathAndName))
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: could not replace '%s'."), *SanitizedAssetPathAndName);
-			return nullptr;
-		}
-	}
-
+	// 几何先建，且刻意排在 PrepareMesh 之前：这一步失败过去会留下一个已被删除或已被清空材质槽的
+	// 资产，而调用方只看到一个 nullptr（旧实现在这里连日志都没有）。现在失败时资产原封不动。
 	const double SaveStartTime = FPlatformTime::Seconds();
 	FMeshDescription MeshDescription;
-	if (!BuildGpuMeshDescription(MeshData, ActorTransform, bConvertToActorLocalSpace, MeshDescription)) return nullptr;
+	if (!BuildGpuMeshDescription(MeshData, ActorTransform, bConvertToActorLocalSpace, MeshDescription))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: could not build a mesh description for '%s' (empty or fully degenerate input?)."),
+			*Target.SanitizedPath);
+		return nullptr;
+	}
 	const double DescriptionBuiltTime = FPlatformTime::Seconds();
 
-	UPackage* Package = ExistingStaticMesh ? ExistingStaticMesh->GetPackage() : CreatePackage(*SanitizedAssetPathAndName);
-	if (!Package) return nullptr;
-	Package->FullyLoad();
+	UStaticMesh* StaticMesh = CSStaticMeshAsset::PrepareMesh(Target, LogPrefix);
+	if (!StaticMesh) return nullptr;
 
-	UStaticMesh* StaticMesh = ExistingStaticMesh;
-	if (StaticMesh)
-	{
-		StaticMesh->Modify();
-		// 材质槽与 section 映射是按本次网格重新装配的，先清空，否则上一轮的槽位会残留在前面。
-		StaticMesh->GetStaticMaterials().Empty();
-		StaticMesh->GetSectionInfoMap().Clear();
-	}
-	else
-	{
-		StaticMesh = NewObject<UStaticMesh>(Package, *AssetName, RF_Public | RF_Standalone);
-	}
 	// Committed on purpose: this one is a real asset that must survive save/reload and stay editable.
-	if (!PopulateStaticMeshFromDescription(StaticMesh, MeshDescription, MeshData, Materials, true, bEnableNanite))
+	if (!CSStaticMeshAsset::PopulateFromDescription(
+		StaticMesh, MeshDescription, Materials, MeshData.TriangleMaterialSlots, true, bEnableNanite))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: StaticMesh build failed for '%s'."), *SanitizedAssetPathAndName);
+		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Save failed: StaticMesh build failed for '%s'."), *Target.SanitizedPath);
 		return nullptr;
 	}
 	const double MeshBuiltTime = FPlatformTime::Seconds();
 
-	// 就地重建的资产 registry 里本来就有，再报一次 AssetCreated 会多出一条重复记录。
-	if (!ExistingStaticMesh) FAssetRegistryModule::AssetCreated(StaticMesh);
-	StaticMesh->MarkPackageDirty();
-	Package->SetDirtyFlag(true);
+	CSStaticMeshAsset::Finalize(StaticMesh, Target, bSaveAsset, LogPrefix);
+
 	UE_LOG(LogTemp, Log, TEXT("[CSGpuMesh] save timing: meshDescription=%.3fs staticMeshBuild=%.3fs registry=%.3fs"),
 		DescriptionBuiltTime - SaveStartTime,
 		MeshBuiltTime - DescriptionBuiltTime,
 		FPlatformTime::Seconds() - MeshBuiltTime);
 
-	if (bSaveAsset && !UEditorAssetLibrary::SaveLoadedAsset(StaticMesh, false))
-		UE_LOG(LogTemp, Warning, TEXT("[CSGpuMesh] Created '%s' but failed to write the package to disk."), *SanitizedAssetPathAndName);
-
 	UE_LOG(LogTemp, Display, TEXT("[CSGpuMesh] %s '%s' (dirty): vertices=%d triangles=%d slots=%d"),
-		ExistingStaticMesh ? TEXT("Overwrote") : TEXT("Saved"),
-		*SanitizedAssetPathAndName, MeshData.Positions.Num(), MeshData.Indices.Num() / 3, StaticMesh->GetStaticMaterials().Num());
+		Target.ExistingMesh ? TEXT("Overwrote") : TEXT("Saved"),
+		*Target.SanitizedPath, MeshData.Positions.Num(), MeshData.Indices.Num() / 3, StaticMesh->GetStaticMaterials().Num());
 	return StaticMesh;
 }
 
@@ -508,23 +417,6 @@ UStaticMesh* UCSGpuMeshComponent::SaveGpuMeshDataToStaticMesh(
 UMaterialInterface* UCSGpuMeshComponent::GetDefaultSurfaceMaterial()
 {
 	return UMaterial::GetDefaultMaterial(MD_Surface);
-}
-
-bool UCSGpuMeshComponent::BuildMeshDescription(
-	const FCSGpuMeshCPUData& MeshData,
-	const FCSGpuMeshConvertOptions& Options,
-	FMeshDescription& OutMeshDescription)
-{
-	// 属性装配仍复用已验证的实现（绕序、切线正交化、退化面过滤、per-corner/per-vertex 判别
-	// 都在里面），这里只负责把统一的选项翻译过去。后续把那份实现搬进本文件时，调用方无感。
-	//
-	// 只有当数据确实是世界空间、且调用方要求烘到局部空间时才做变换。以前靠单个
-	// bConvertToActorLocalSpace 表达，数据本就是局部空间的 leaf 只能靠默认 false 绕开，
-	// 语义含混；现在由 MeshData.SourceSpace 说明数据自己是什么空间。
-	const bool bNeedsBake = Options.bBakeToLocalSpace
-		&& MeshData.SourceSpace == FCSGpuMeshCPUData::ESpace::World;
-	return BuildGpuMeshDescription(
-		MeshData, Options.TargetTransform, bNeedsBake, OutMeshDescription);
 }
 
 UStaticMesh* UCSGpuMeshComponent::BuildStaticMesh(

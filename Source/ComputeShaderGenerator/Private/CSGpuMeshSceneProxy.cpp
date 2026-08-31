@@ -299,9 +299,17 @@ void FCSGpuMeshSceneProxy::AllocateStreamsAndBindVF(FRHICommandListBase& RHICmdL
 			break;
 		case ECSGpuStreamRole::TexCoord:
 		{
-			Data.TextureCoordinates.Add(FVertexStreamComponent(&S.VB, 0, VertexStride, VET_Float2));
+			// 一条流可以承载多组 UV（交错，每组 2 个 float）—— 见 FStandardStreamOptions::NumTexCoordSets。
+			// 逐组各挂一个 stream component（偏移 8×组号、步长 = 整条 unit），SRV 只有一个槽位、
+			// 设一次即可：引擎的 manual fetch 正是按 NumTexCoords 做交错索引的。
+			const int32 NumSets = FMath::Max(int32(D.ElementsPerUnit) / 2, 1);
+			for (int32 Set = 0; Set < NumSets; ++Set)
+			{
+				Data.TextureCoordinates.Add(FVertexStreamComponent(
+					&S.VB, uint32(Set) * 2u * sizeof(float), VertexStride, VET_Float2));
+			}
 			Data.TextureCoordinatesSRV = S.SRV;
-			const int32 DesiredTexCoords = int32(D.TexCoordIndex) + 1;
+			const int32 DesiredTexCoords = int32(D.TexCoordIndex) + NumSets;
 			if (int32(Data.NumTexCoords) < DesiredTexCoords) Data.NumTexCoords = DesiredTexCoords;
 			if (D.TexCoordIndex == 0)
 			{

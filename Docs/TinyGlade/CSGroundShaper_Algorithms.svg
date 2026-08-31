@@ -1,0 +1,302 @@
+<svg viewBox="0 0 1180 890" width="1180" height="890" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Microsoft YaHei, sans-serif">
+  <defs>
+    <pattern id="live-dot-bg" patternUnits="userSpaceOnUse" width="12" height="12">
+      <rect width="12" height="12" fill="#cffafe"/>
+      <circle cx="3" cy="3" r="1.25" fill="#0891b2" opacity="0.256281"/>
+      <circle cx="9" cy="9" r="1.25" fill="#0891b2" opacity="0.256281"/>
+    </pattern>
+    <pattern id="missing-hatch-bg" patternUnits="userSpaceOnUse" width="10" height="10" patternTransform="rotate(45)">
+      <rect width="10" height="10" fill="#f1f5f9"/>
+      <rect x="0" y="0" width="10" height="2" fill="#64748b" opacity="0.361702"/>
+    </pattern>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#475569"/>
+    </marker>
+    <marker id="arrowo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#b45309"/>
+    </marker>
+    <marker id="arrowr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#b91c1c"/>
+    </marker>
+  </defs>
+
+  <style>
+    .title    { font-size: 17px; font-weight: 700; fill: #0f172a; }
+    .sub      { font-size: 11.5px; fill: #475569; }
+    .panel    { fill: #ffffff; stroke: #94a3b8; stroke-width: 1; rx: 6; }
+    .phead    { fill: #e2e8f0; stroke: #94a3b8; stroke-width: 1; rx: 6; }
+    .ptext    { font-size: 12px; font-weight: 700; fill: #0f172a; }
+    .h        { font-size: 10.5px; font-weight: 700; fill: #0f172a; }
+    .t        { font-size: 9.5px;  fill: #334155; }
+    .s        { font-size: 9px;    fill: #64748b; }
+    .hou      { font-size: 9.5px;  fill: #b45309; }
+    .ue       { font-size: 9.5px;  fill: #0e7490; }
+    .curve    { stroke: #0f172a; stroke-width: 2; fill: none; }
+    .axis     { stroke: #94a3b8; stroke-width: 1; fill: none; }
+    .guide    { stroke: #94a3b8; stroke-width: 1; fill: none; stroke-dasharray: 3 3; }
+    .noise    { stroke: #b91c1c; stroke-width: 1.2; fill: none; stroke-dasharray: 4 3; }
+    .chord    { stroke: #b45309; stroke-width: 1.6; fill: none; stroke-dasharray: 6 3; }
+    .tick     { stroke: #b45309; stroke-width: 2; fill: none; }
+    .rayarrow { stroke: #b45309; stroke-width: 1.3; fill: none; marker-end: url(#arrowo); }
+    .level    { stroke: #0e7490; stroke-width: 1.1; fill: none; stroke-dasharray: 4 3; }
+    .box      { stroke: #64748b; stroke-width: 1; rx: 5; }
+    .live-dot { fill: url(#live-dot-bg); }
+    .missing  { fill: url(#missing-hatch-bg); }
+    .plain    { fill: #f8fafc; }
+    .road     { fill: #b45309; opacity: 0.16; }
+    .ring     { stroke: #94a3b8; stroke-width: 1; fill: none; stroke-dasharray: 3 3; }
+    .run      { stroke: #0e7490; stroke-width: 4.5; fill: none; stroke-linecap: round; }
+    .spline   { stroke: #0e7490; stroke-width: 2.5; fill: none; }
+    .step     { fill: #0891b2; stroke: #0e7490; stroke-width: 0.9; }
+    .ctrl     { fill: #ffffff; stroke: #0e7490; stroke-width: 1.6; }
+    .ctrlx    { fill: #ffffff; stroke: #94a3b8; stroke-width: 1.4; stroke-dasharray: 2 2; }
+    .bisect   { stroke: #0e7490; stroke-width: 1.3; fill: none; }
+    .bisectd  { stroke: #94a3b8; stroke-width: 1; fill: none; stroke-dasharray: 2 3; }
+    .seed     { fill: #ffffff; stroke: #475569; stroke-width: 1.2; }
+    .seedc    { fill: #0e7490; stroke: #0e7490; stroke-width: 1; }
+    .solidf   { fill: #0891b2; stroke: #0e7490; stroke-width: 1; }
+    .face     { fill: #cbd5e1; stroke: #475569; stroke-width: 1; }
+    .facetop  { fill: #e2e8f0; stroke: #334155; stroke-width: 1.2; }
+    .inflate  { stroke: #b91c1c; stroke-width: 1.2; fill: none; stroke-dasharray: 4 3; }
+    .infarrow { stroke: #b91c1c; stroke-width: 1.3; fill: none; marker-end: url(#arrowr); }
+    .brace    { stroke: #475569; stroke-width: 1; fill: none; }
+    .cap      { stroke: #0e7490; stroke-width: 3.2; fill: none; stroke-linecap: round; }
+    .lip      { stroke: #b45309; stroke-width: 3.6; fill: none; stroke-linecap: round; }
+    .ghost    { stroke: #94a3b8; stroke-width: 2; fill: none; stroke-dasharray: 4 3; }
+    .terrain  { stroke: #334155; stroke-width: 2; fill: none; }
+    .drop     { stroke: #0e7490; stroke-width: 0.9; fill: none; stroke-dasharray: 2 2; }
+  </style>
+
+  <text x="20" y="30" class="title">UE 端怎么替掉 Houdini 的解法：四处算法替换</text>
+  <text x="20" y="52" class="sub">橙色 = Houdini 原型的求解方式；青色 = UE 的做法。①②③ 已落地，④ 是计划 D9 的方案。</text>
+
+  <!-- ============================== ① 高度剖面 ============================== -->
+  <rect x="20" y="70" width="560" height="390" class="panel"/>
+  <rect x="20" y="70" width="560" height="26" class="phead"/>
+  <text x="32" y="88" class="ptext">① 高度剖面：台顶为什么是平的</text>
+
+  <text x="62" y="122" class="hou">Houdini：xyzdist 到 DeformSource 多边形"面"，面内距离 = 0 ⇒ chramp(0) = 1</text>
+  <text x="62" y="138" class="ue">UE：Skirt = max(0, d − Radius)，盘内 Skirt = 0 ⇒ 同样恒为 Top</text>
+
+  <line x1="62" y1="392" x2="556" y2="392" class="axis"/>
+  <line x1="62" y1="392" x2="62" y2="168" class="axis"/>
+  <text x="558" y="396" class="s">r</text>
+  <text x="54" y="166" class="s">h</text>
+
+  <line x1="200" y1="185" x2="200" y2="392" class="guide"/>
+  <line x1="420" y1="240" x2="420" y2="392" class="guide"/>
+  <text x="200" y="408" class="s" text-anchor="middle">Radius</text>
+  <text x="420" y="408" class="s" text-anchor="middle">Radius + Falloff</text>
+  <text x="56" y="182" class="s" text-anchor="end">Top</text>
+
+  <path d="M62,185 L200,185 C268,185 352,390 420,390 L548,390" class="curve"/>
+  <polyline points="231,203 240,216 250,219 259,236 268,238 277,256 287,258 296,281 306,283 315,304 325,306 334,329 344,331 353,352 363,354 372,371 382,373 391,384 401,386 410,391" class="noise"/>
+
+  <rect x="300" y="200" width="248" height="62" class="box plain"/>
+  <text x="310" y="218" class="h">UE：h = Top · W²(3 − 2W)</text>
+  <text x="310" y="234" class="t">W = 1 − Skirt / Falloff</text>
+  <text x="310" y="252" class="hou">原型：chramp("lerp", Skirt/Falloff)，B 样条</text>
+
+  <text x="32" y="434" class="t">换成 smoothstep 不只是等效替换 —— 它有闭式反函数，② 才成立。</text>
+  <text x="32" y="450" class="s">红虚线 = 裙边噪声 dist −= |turb·(1−dist)|（已落地，默认开）；等高线因此不再是圆，② 的闭式解只剩作数值求交的初值。</text>
+
+  <!-- ============================== ② 环半径 ============================== -->
+  <rect x="600" y="70" width="560" height="390" class="panel"/>
+  <rect x="600" y="70" width="560" height="26" class="phead"/>
+  <text x="612" y="88" class="ptext">② 等高线环半径：从"投影求交"换成闭式反函数</text>
+
+  <line x1="878" y1="104" x2="878" y2="400" class="axis"/>
+
+  <text x="614" y="122" class="hou">Houdini：线性锥近似 + ray 投影</text>
+  <text x="614" y="138" class="s">每层套一圈点，逐点最近距离投到坡面</text>
+  <text x="614" y="154" class="s">line1 → resample1 → copytopoints2 → ray1</text>
+
+  <path d="M628,250 L676,250 C712,250 754,360 790,360 L856,360" class="curve"/>
+  <line x1="628" y1="360" x2="862" y2="360" class="axis"/>
+  <line x1="628" y1="360" x2="628" y2="238" class="axis"/>
+  <path d="M676,250 L790,360" class="chord"/>
+  <text x="682" y="244" class="hou">线性锥（pscale 线性插值）</text>
+
+  <line x1="694.7" y1="273.8" x2="706.7" y2="273.8" class="tick"/>
+  <line x1="718.5" y1="296.8" x2="730.5" y2="296.8" class="tick"/>
+  <line x1="743.9" y1="321.3" x2="755.9" y2="321.3" class="tick"/>
+  <line x1="766.3" y1="342.9" x2="778.3" y2="342.9" class="tick"/>
+  <line x1="702" y1="273.8" x2="709.7" y2="273.8" class="rayarrow"/>
+  <line x1="775" y1="342.9" x2="762.0" y2="342.9" class="rayarrow"/>
+  <circle cx="709.7" cy="273.8" r="2.6" fill="#0f172a"/>
+  <circle cx="727.2" cy="296.8" r="2.6" fill="#0f172a"/>
+  <circle cx="744.7" cy="321.3" r="2.6" fill="#0f172a"/>
+  <circle cx="762.0" cy="342.9" r="2.6" fill="#0f172a"/>
+  <text x="716" y="268" class="s">ray 投影</text>
+  <text x="642" y="304" class="s">横杠 = 一层的一圈点</text>
+  <text x="642" y="318" class="s">（剖面里看就是一段）</text>
+  <text x="742" y="384" class="s" text-anchor="middle">N 层 × M 点 次投影</text>
+
+  <text x="896" y="122" class="ue">UE：smoothstep 反函数，一步到位</text>
+  <text x="896" y="140" class="t">y = LevelHeight / Top</text>
+  <text x="896" y="156" class="t">W = 0.5 − sin( asin(1 − 2y) / 3 )</text>
+  <text x="896" y="172" class="t">R = Radius + Falloff · (1 − W)</text>
+
+  <path d="M908,250 L956,250 C992,250 1034,360 1070,360 L1136,360" class="curve"/>
+  <line x1="908" y1="360" x2="1142" y2="360" class="axis"/>
+  <line x1="908" y1="360" x2="908" y2="238" class="axis"/>
+
+  <line x1="908" y1="273.8" x2="989.7" y2="273.8" class="level"/>
+  <line x1="908" y1="296.8" x2="1007.2" y2="296.8" class="level"/>
+  <line x1="908" y1="321.3" x2="1024.7" y2="321.3" class="level"/>
+  <line x1="908" y1="342.9" x2="1042.0" y2="342.9" class="level"/>
+  <line x1="989.7" y1="273.8" x2="989.7" y2="360" class="level"/>
+  <line x1="1007.2" y1="296.8" x2="1007.2" y2="360" class="level"/>
+  <line x1="1024.7" y1="321.3" x2="1024.7" y2="360" class="level"/>
+  <line x1="1042.0" y1="342.9" x2="1042.0" y2="360" class="level"/>
+  <circle cx="989.7" cy="273.8" r="3" fill="#0e7490"/>
+  <circle cx="1007.2" cy="296.8" r="3" fill="#0e7490"/>
+  <circle cx="1024.7" cy="321.3" r="3" fill="#0e7490"/>
+  <circle cx="1042.0" cy="342.9" r="3" fill="#0e7490"/>
+  <text x="896" y="206" class="s">LevelHeight 水平线直接命中曲线，</text>
+  <text x="896" y="220" class="s">垂足就是该层的环半径 R</text>
+  <text x="1016" y="374" class="s" text-anchor="middle">R₁ R₂ R₃ R₄</text>
+  <text x="1016" y="390" class="s" text-anchor="middle">每层 1 次求值，0 次地面采样</text>
+
+  <text x="612" y="428" class="t">同一条 smoothstep 既是高度场也是环半径的来源 —— 分层不需要几何，只要解一次方程。</text>
+  <text x="612" y="446" class="s">非孤立（邻座压过来）时等高线不再是圆，才退回"一次验证采样 + 割线一步 + 6 次二分"（BuildStepPlan:230-256）。</text>
+
+  <!-- ============================== ③ 俯视弧段 ============================== -->
+  <rect x="20" y="480" width="560" height="390" class="panel"/>
+  <rect x="20" y="480" width="560" height="26" class="phead"/>
+  <text x="32" y="498" class="ptext">③ 俯视：道路弧段 → B 样条控制点 → 变长铺装</text>
+
+  <circle cx="146" cy="700" r="105" class="axis" fill="#f8fafc"/>
+  <circle cx="146" cy="700" r="52" class="axis" fill="#e2e8f0"/>
+  <circle cx="146" cy="700" r="84" class="ring"/>
+  <rect x="26" y="666" width="240" height="68" class="road" transform="rotate(-35 146 700)"/>
+  <text x="146" y="704" class="s" text-anchor="middle">台顶</text>
+
+  <circle cx="230.0" cy="700.0" r="2.5" class="seed"/>
+  <circle cx="227.1" cy="721.7" r="2.5" class="seed"/>
+  <circle cx="218.7" cy="742.0" r="2.5" class="seed"/>
+  <circle cx="205.4" cy="759.4" r="2.5" class="seed"/>
+  <circle cx="188.0" cy="772.7" r="2.5" class="seed"/>
+  <circle cx="167.7" cy="781.1" r="2.5" class="seed"/>
+  <circle cx="146.0" cy="784.0" r="2.5" class="seed"/>
+  <circle cx="124.3" cy="781.1" r="2.5" class="seed"/>
+  <circle cx="104.0" cy="772.7" r="2.5" class="seed"/>
+  <circle cx="86.6"  cy="759.4" r="3.6" class="solidf"/>
+  <circle cx="73.3"  cy="742.0" r="3.6" class="solidf"/>
+  <circle cx="64.9"  cy="721.7" r="3.6" class="solidf"/>
+  <circle cx="62.0"  cy="700.0" r="2.5" class="seed"/>
+  <circle cx="64.9"  cy="678.3" r="2.5" class="seed"/>
+  <circle cx="73.3"  cy="658.0" r="2.5" class="seed"/>
+  <circle cx="86.6"  cy="640.6" r="2.5" class="seed"/>
+  <circle cx="104.0" cy="627.3" r="2.5" class="seed"/>
+  <circle cx="124.3" cy="618.9" r="2.5" class="seed"/>
+  <circle cx="146.0" cy="616.0" r="2.5" class="seed"/>
+  <circle cx="167.7" cy="618.9" r="2.5" class="seed"/>
+  <circle cx="188.0" cy="627.3" r="2.5" class="seed"/>
+  <circle cx="205.4" cy="640.6" r="3.6" class="solidf"/>
+  <circle cx="218.7" cy="658.0" r="3.6" class="solidf"/>
+  <circle cx="227.1" cy="678.3" r="3.6" class="solidf"/>
+
+  <path d="M205.4,640.6 A84,84 0 0,1 227.1,678.3" class="run"/>
+  <path d="M240,652 C262,640 272,616 288,598" class="axis" marker-end="url(#arrow)" stroke-dasharray="3 3"/>
+  <text x="250" y="670" class="s">展开看</text>
+
+  <text x="300" y="536" class="ue">把这段弧展开：控制点 → B 样条 → 铺装</text>
+
+  <line x1="300" y1="592" x2="556" y2="592" class="axis"/>
+  <path d="M300,592 L556,592" class="spline"/>
+  <rect x="296.5" y="588.5" width="7" height="7" class="ctrlx"/>
+  <rect x="360.5" y="588.5" width="7" height="7" class="ctrl"/>
+  <rect x="424.5" y="588.5" width="7" height="7" class="ctrl"/>
+  <rect x="488.5" y="588.5" width="7" height="7" class="ctrl"/>
+  <rect x="552.5" y="588.5" width="7" height="7" class="ctrlx"/>
+  <text x="300" y="580" class="s" text-anchor="middle">外延</text>
+  <text x="556" y="580" class="s" text-anchor="middle">外延</text>
+  <text x="428" y="558" class="s" text-anchor="middle">等角控制点，间隔 Δ</text>
+
+  <rect x="364" y="600" width="47.4" height="15" class="step"/>
+  <rect x="417.9" y="600" width="36.6" height="15" class="step"/>
+  <rect x="461.0" y="600" width="28.0" height="15" class="step"/>
+  <path d="M364,624 L364,630 L489,630 L489,624" class="brace"/>
+  <text x="426" y="644" class="s" text-anchor="middle">石阶只取内区间 · 三块长度不同 · 缝 = StepGap</text>
+
+  <text x="300" y="668" class="ue">① 逐方向采样 road 权重，过阈的连成弧段（跨 0° 也连）</text>
+  <text x="300" y="686" class="ue">② 两端各外延一格：三次 B 样条端点会内缩 1/6 弦长</text>
+  <text x="300" y="704" class="ue">③ 控制点半径 × 3 / (2 + cosΔ)</text>
+  <text x="300" y="718" class="t">　 均匀三次 B 样条在等角控制点上会把半径缩到 R(2+cosΔ)/3</text>
+  <text x="300" y="736" class="ue">④ 先 −StepEmbed 内推，再取该点真实地面高度</text>
+  <text x="300" y="750" class="t">　 曲线因此直接躺在坡面上，不悬空不穿模</text>
+  <text x="300" y="768" class="ue">⑤ SolveBlockLayout：随机取不同长度填到越界，</text>
+  <text x="300" y="782" class="t">　 再整体缩放恰好占满弧长</text>
+
+  <circle cx="306" cy="806" r="3.6" class="solidf"/>
+  <text x="316" y="810" class="s">过阈方向</text>
+  <circle cx="382" cy="806" r="2.5" class="seed"/>
+  <text x="392" y="810" class="s">未过阈</text>
+  <rect x="446.5" y="802.5" width="7" height="7" class="ctrlx"/>
+  <text x="460" y="810" class="s">外延控制点</text>
+
+  <text x="32" y="834" class="hou">原型只有一个 Step 盒等距摆放（copytopoints1），②③⑤ 三样都是 UE 侧新加的。</text>
+  <text x="32" y="850" class="s">方向采样画成每 15° 只为看清；实际 StepAngleStepDeg = 3° 是上限，还会按环长再收紧。</text>
+  <text x="32" y="864" class="s">碎石长在"未过阈"的那些方向上 —— 原型用 blast10 / blast8 一对互补删点保证两者不重叠。</text>
+
+  <!-- ============================== ④ 碎石 ============================== -->
+  <rect x="600" y="480" width="560" height="390" class="panel"/>
+  <rect x="600" y="480" width="560" height="26" class="phead"/>
+  <text x="612" y="498" class="ptext">④ 碎石（计划 D9 方案）：Tiny Glade 式披挂岩壳</text>
+
+  <text x="614" y="520" class="hou">静止姿态：一张平的 2D 碎裂图案，底圈相对顶圈横向错开 LipOffset</text>
+  <line x1="625" y1="557" x2="1142" y2="557" class="axis"/>
+  <path d="M645,542 L745,542" class="cap"/>
+  <path d="M775,542 L875,542" class="cap"/>
+  <path d="M905,542 L1005,542" class="cap"/>
+  <path d="M1035,542 L1128,542" class="cap"/>
+  <path d="M645,542 L631,557" class="lip"/>
+  <path d="M745,542 L759,557" class="lip"/>
+  <path d="M775,542 L761,557" class="lip"/>
+  <path d="M875,542 L889,557" class="lip"/>
+  <path d="M905,542 L891,557" class="lip"/>
+  <path d="M1005,542 L1019,557" class="lip"/>
+  <path d="M1035,542 L1021,557" class="lip"/>
+  <line x1="745" y1="561" x2="745" y2="573" class="brace"/>
+  <line x1="759" y1="561" x2="759" y2="573" class="brace"/>
+  <path d="M745,569 L759,569" class="brace"/>
+  <text x="766" y="573" class="s">LipOffset（TG 实测 21.4 cm）</text>
+  <text x="1140" y="573" class="s" text-anchor="end">青 = 盖（is_top=1）　橙 = 裙（is_top=0，每一个都跨两圈）</text>
+
+  <line x1="700" y1="583" x2="700" y2="599" class="edge"/>
+  <text x="712" y="596" class="ue">披挂：每个顶点用自己的 XY 取地面高度（Y 是替换，不是位移）</text>
+
+  <path d="M630,745 L760,745 C820,745 880,635 940,635 L1140,635" class="terrain"/>
+  <text x="640" y="762" class="s">地面高度场</text>
+
+  <path d="M636,740 L696,740" class="ghost"/>
+  <path d="M1006,630 L1066,630" class="ghost"/>
+  <path d="M1080,630 L1140,630" class="ghost"/>
+  <text x="672" y="690" class="s" text-anchor="middle">平地：坡度≈0，裙边塌成 0</text>
+  <text x="672" y="703" class="s" text-anchor="middle">且 mask 把它写成 NaN</text>
+  <line x1="672" y1="710" x2="668" y2="732" class="axis" marker-end="url(#arrow)"/>
+  <text x="1073" y="656" class="s" text-anchor="middle">台顶同理，整批 NaN</text>
+
+  <path d="M710,740 L770,736.2" class="cap"/>
+  <path d="M784,730.9 L844,690.1" class="cap"/>
+  <path d="M858,678.2 L918,638.3" class="cap"/>
+  <path d="M932,633 L992,630" class="cap"/>
+  <path d="M696,740 L710,740" class="lip"/>
+  <path d="M770,736.2 L784,730.9" class="lip"/>
+  <path d="M844,690.1 L858,678.2" class="lip"/>
+  <path d="M918,638.3 L932,633" class="lip"/>
+  <path d="M992,630 L1006,630" class="lip"/>
+
+  <path d="M862,690.1 L876,690.1" class="brace"/>
+  <path d="M862,678.2 L876,678.2" class="brace"/>
+  <line x1="869" y1="690.1" x2="869" y2="678.2" class="brace"/>
+  <text x="884" y="706" class="hou">裙边高度 = 局部坡度 × LipOffset</text>
+  <text x="884" y="719" class="s">陡处自动拉开、缓处自动收拢 —— 零行代码</text>
+
+  <text x="614" y="790" class="t">静止姿态只提供平面上的碎裂图案；顶点 Y 在运行时被地面高度整个替换（TG：`_357.y = _356`，赋值不是 +=）。</text>
+  <text x="614" y="806" class="t">显隐由坡度 mask 驱动：抬高地形 → 出现新一圈陡坡 → 一整批原本 NaN 的胞腔亮起来。看着"形状大变"，</text>
+  <text x="614" y="822" class="t">其实是换了一批胞腔在演。三个顶点任一过阈即保留整个三角；都不过则只往第 0 个顶点写 NaN（省 2/3 写入）。</text>
+  <rect x="614" y="832" width="534" height="30" class="box missing"/>
+  <text x="626" y="852" class="h">无运行时 Voronoi / 无挤出 / 无减面 / 无 counter / 无 indirect / 无回读 —— buffer 定长，永不变。</text>
+</svg>

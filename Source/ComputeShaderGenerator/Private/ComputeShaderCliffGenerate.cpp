@@ -3,6 +3,7 @@
 #include "ComputeShaderBasicFunction.h"
 #include "ComputeShaderGenerateHelper.h"
 #include "CSRangeGeneratorActor.h"
+#include "CSMesh.h"   // UCSMesh::CountedBlockingFlush —— 阻塞刷新的唯一计数入口
 #include "GlobalShader.h"
 #include "RenderGraphResources.h"
 #include "RenderGraphUtils.h"
@@ -78,7 +79,7 @@ void ACSCliffGenerateCapture::Generate(int32 NumIteration, float InSpawnSize)
 	{
 		SCOPE_CYCLE_COUNTER(STAT_CSCliffGenerate_Execute);
 		GenerateCliffVerticalCal(GenerateDatas);
-		FlushRenderingCommands();
+		UCSMesh::CountedBlockingFlush();
 	}
 	
 	TArray<FLinearColor> LinearSamples;

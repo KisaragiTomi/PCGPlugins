@@ -843,6 +843,7 @@ FCSMeshBooleanOptions AComputeShaderMeshBoolean::MakeBooleanOptions() const
 	Options.RetainedTriangleExpansionDistance = RetainedTriangleExpansionDistance;
 	Options.VertexWeldDistance = VertexWeldDistance;
 	Options.bPreserveSourceMaterialSlots = bPreserveSourceMaterialSlots;
+	Options.bUseMeshDescriptionSourceTriangles = bUseMeshDescriptionSourceTriangles;
 	Options.SnapRoundQuantum = SnapRoundQuantum;
 	Options.ArrangementOutputTrianglesPerSource = ArrangementOutputTrianglesPerSource;
 	return Options;
@@ -1003,6 +1004,8 @@ bool AComputeShaderMeshBoolean::RunBooleanToSnapshot(
 		CollectOptions.MaxTriangles = SourceTriangleLimit;
 		CollectOptions.bIncludeLandscape = bIncludeLandscape;
 		CollectOptions.bPreserveSourceMaterialSlots = Options.bPreserveSourceMaterialSlots;
+		// 收集默认是 render fallback（省内存）；布尔切割需要与视觉一致的完整几何，按勾选项显式开启。
+		CollectOptions.bUseMeshDescriptionSourceTriangles = Options.bUseMeshDescriptionSourceTriangles;
 		// 白名单取代排除表：没打 Pick/Ref 的 actor 根本不进 soup，基类的 "UA" 排除因此多余，
 		// 显式清掉以免两套过滤在实例上各存一份、日后互相打架。
 		CollectOptions.RequiredActorTags = RequiredActorTags;
@@ -1155,7 +1158,7 @@ bool AComputeShaderMeshBoolean::RunBooleanToSnapshot(
 			bRenderWorkQueued = true;
 		});
 
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 
 	if (!bRenderWorkQueued || !bHasGPUOutput || VertexCapacity <= 0)
 	{
@@ -1315,7 +1318,7 @@ bool AComputeShaderMeshBoolean::RunBooleanToSnapshot(
 			bReadbackOk = bOk;
 		});
 
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 
 	if (!bReadbackOk)
 	{
@@ -1955,6 +1958,8 @@ bool AComputeShaderMeshBoolean::RunBooleanToGpuMesh(
 		CollectOptions.MaxTriangles = FMath::Max(1, Options.MaxSourceTriangles);
 		CollectOptions.bIncludeLandscape = Options.bReadLandscape;
 		CollectOptions.bPreserveSourceMaterialSlots = Options.bPreserveSourceMaterialSlots;
+		// 收集默认是 render fallback（省内存）；布尔切割需要与视觉一致的完整几何，按勾选项显式开启。
+		CollectOptions.bUseMeshDescriptionSourceTriangles = Options.bUseMeshDescriptionSourceTriangles;
 		// 与 snapshot 路径同一套过滤，见那边的注释。
 		CollectOptions.RequiredActorTags = RequiredActorTags;
 		CollectOptions.ExcludedActorTags.Reset();
@@ -1994,7 +1999,7 @@ bool AComputeShaderMeshBoolean::RunBooleanToGpuMesh(
 			}
 		});
 
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 	delete FinalStatusReadback;
 	FinalStatusReadback = nullptr;
 

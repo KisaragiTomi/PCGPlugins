@@ -1204,13 +1204,26 @@ void MBOutSplitFloat(float a, out float hi, out float lo)
 }
 
 // p = fl(a*b)，e = a*b - p（精确）。四个部分积都是 12x12 位，float32 可精确表示。
+//
+// ⚠️ **两个交叉项必须自成一次加法**（`(ahi*blo + alo*bhi)` 的那对括号是承重的）。
+// IEEE 加法可交换但**不可结合**：把它们分开累进running sum，TwoProduct(a,b) 与
+// TwoProduct(b,a) 就会在最后一位上分叉 —— 因为两者的交叉项集合相同、加入顺序相反。
+// 后果直接落在叉积上：u×u 的每个分量都是 det2(x,y,y,x) 形式，本该精确为零，分叉后
+// 变成 ~1e-9 的残差，平方 ~1e-17 越过 1e-24 阈值 ⇒ **两个角点完全重合的零面积碎片
+// 被判为非退化**，GPU 因此比 CPU 多吐几片三角。合成一次加法后两边逐位相同，
+// (p1-p2) + (e1-e2) 精确得 0。
+//
+// precise 修饰同样是承重的：没有它，允许重结合的浮点模型会把上面那对括号连同整个
+// 补偿一起折掉，静默退回本段描述的 bug，且没有任何症状指向这里。
 void MBOutTwoProduct(float a, float b, out float p, out float e)
 {
-	p = a * b;
+	precise float prod = a * b;
 	float ahi, alo, bhi, blo;
 	MBOutSplitFloat(a, ahi, alo);
 	MBOutSplitFloat(b, bhi, blo);
-	e = ((ahi * bhi - p) + ahi * blo + alo * bhi) + alo * blo;
+	precise float err = ((ahi * bhi - prod) + (ahi * blo + alo * bhi)) + alo * blo;
+	p = prod;
+	e = err;
 }
 
 // a*d - b*c，带补偿。抵消发生在 p1-p2 上，而相近两浮点数相减是精确的，误差项 e1-e2 再把
@@ -1220,7 +1233,10 @@ float MBOutDeterminant2(float a, float d, float b, float c)
 	float p1, e1, p2, e2;
 	MBOutTwoProduct(a, d, p1, e1);
 	MBOutTwoProduct(b, c, p2, e2);
-	return (p1 - p2) + (e1 - e2);
+	// 两个 TwoProduct 对同一组无序实参必须给出逐位相同的 (p, e)，这条对称性就是
+	// "精确零面积判为退化"的全部依据 —— 见 MBOutTwoProduct 里那对括号。
+	precise float det = (p1 - p2) + (e1 - e2);
+	return det;
 }
 
 float3 MBOutCompensatedCross(float3 u, float3 v)

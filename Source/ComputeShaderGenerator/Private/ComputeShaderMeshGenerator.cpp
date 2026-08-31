@@ -497,6 +497,52 @@ class FConvertHeightmapUintToFloatCS : public FGlobalShader
 
 IMPLEMENT_GLOBAL_SHADER(FConvertHeightmapUintToFloatCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "ConvertHeightmapUintToFloatCS", SF_Compute);
 
+// index/position buffer 直读版光栅化：extract 的三角读取 + soup 光栅化融合成一个 kernel，
+// 中间不再落 triangle soup（高度图只用位置，soup 的 normal/UV/材质通道在该路径全是死重）。
+class FIndexedMeshToHeightmapCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FIndexedMeshToHeightmapCS);
+	SHADER_USE_PARAMETER_STRUCT(FIndexedMeshToHeightmapCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_SRV(Buffer<uint>, IndexBuffer)
+		SHADER_PARAMETER_SRV(Buffer<float>, PositionBuffer)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint>, RW_HeightmapUint)
+		SHADER_PARAMETER(FMatrix44f, LocalToWorld)
+		SHADER_PARAMETER(FVector3f, BoundsMin)
+		SHADER_PARAMETER(FVector3f, BoundsMax)
+		SHADER_PARAMETER(uint32, TriangleCount)
+		SHADER_PARAMETER(uint32, PositionStrideFloat)
+		SHADER_PARAMETER(uint32, bUseBounds)
+		SHADER_PARAMETER(FVector2f, HM_BoundsMin)
+		SHADER_PARAMETER(FVector2f, HM_BoundsInvSize)
+		SHADER_PARAMETER(float, HM_CameraHeight)
+		SHADER_PARAMETER(FIntPoint, HM_TextureSize)
+	END_SHADER_PARAMETER_STRUCT()
+
+	CSGEN_SHADER_PERM_SM5_GROUPSIZE_X(64)
+};
+
+IMPLEMENT_GLOBAL_SHADER(FIndexedMeshToHeightmapCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "IndexedMeshToHeightmapCS", SF_Compute);
+
+// min 合并版 uint→float 转换：跳过无三角覆盖的 texel（哨兵位型是 NaN），已覆盖的与现值取 min，
+// 可与 LandscapeG16ToDepthCS 的地形深度按任意顺序叠加。
+class FMergeHeightmapUintToFloatMinCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FMergeHeightmapUintToFloatMinCS);
+	SHADER_USE_PARAMETER_STRUCT(FMergeHeightmapUintToFloatMinCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<uint>, T_HeightmapUint)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RW_HeightmapFloat)
+		SHADER_PARAMETER(FIntPoint, HM_TextureSize)
+	END_SHADER_PARAMETER_STRUCT()
+
+	CSGEN_SHADER_PERM_SM5()
+};
+
+IMPLEMENT_GLOBAL_SHADER(FMergeHeightmapUintToFloatMinCS, "/Plugin/PCGPlugins/Shaders/Private/StaticMeshPointSampler.usf", "MergeHeightmapUintToFloatMinCS", SF_Compute);
+
 // -----------------------------------------------------------------------------
 // Core System - Internal Helpers
 // -----------------------------------------------------------------------------
@@ -1573,7 +1619,8 @@ void CSMeshGenInternal::BuildBoxSceneLandscapeTrianglesInternal(UWorld* World,
 void CSMeshGenInternal::BuildBoxSceneTriangleRequestsInternal(UWorld* World,
 	const FBox& QueryBox,
 	int32 LODIndex,
-	TArray<FCSStaticMeshTriangleRequest>& OutRequests)
+	TArray<FCSStaticMeshTriangleRequest>& OutRequests,
+	const TArray<FName>& RequiredActorTags)
 {
 	OutRequests.Reset();
 	if (!World || !QueryBox.IsValid)
@@ -1597,6 +1644,21 @@ void CSMeshGenInternal::BuildBoxSceneTriangleRequestsInternal(UWorld* World,
 		if (!StaticMesh)
 		{
 			continue;
+		}
+
+		// 无属主的组件不参与 tag 过滤（与旧 RemoveAll 语义一致：SourceActor 为空时保留）。
+		if (!RequiredActorTags.IsEmpty() && SourceActor)
+		{
+			bool bHasRequiredTag = false;
+			for (const FName& Tag : RequiredActorTags)
+			{
+				if (!Tag.IsNone() && SourceActor->ActorHasTag(Tag))
+				{
+					bHasRequiredTag = true;
+					break;
+				}
+			}
+			if (!bHasRequiredTag) continue;
 		}
 
 		// "Ref" 标签把网格标成参照体：进 winding 场但不切分、不输出。
@@ -2116,15 +2178,16 @@ FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPUFilt
 	}
 
 	TArray<FResolvedStaticMeshTriangleRequest> ResolvedRequests;
+	// 与全局收集约定一致：Nanite 用 render fallback（不做 MeshDescription 全精度 CPU 提取）。
+	// 全精度是 Mesh Boolean 勾选项专属；这个 legacy 回读/诊断入口跟随默认，NaniteTriangles
+	// 保持为空，下游按空集自然跳过追加 pass。
 	FCSNaniteSourceTriangleData NaniteTriangles;
 	const uint64 TotalStaticMeshTriangleCount = ResolveStaticMeshTriangleRequests(
 		Requests,
 		this,
 		ExcludedActorTags,
 		true,
-		ResolvedRequests,
-		nullptr,
-		&NaniteTriangles);
+		ResolvedRequests);
 	if (ResolvedRequests.IsEmpty() && !bHasLandscapeTriangles && NaniteTriangles.IsEmpty())
 	{
 		return ResultTriangleData;
@@ -2176,7 +2239,7 @@ FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPUFilt
 			bRenderWorkQueued = true;
 		});
 
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 
 	if (!bRenderWorkQueued || !bHasGPUOutput || VertexCapacity <= 0)
 	{
@@ -2205,7 +2268,7 @@ FCSTriangleMeshData AComputeShaderMeshGenerator::GetBoxSceneTrianglesFromGPUFilt
 			bReadbackSucceeded = CSMeshGen_DrainReadbacks(RHICmdList, Specs, TEXT("GetBoxSceneTrianglesFromGPUFiltered"));
 		});
 
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 
 	if (!bReadbackSucceeded)
 	{
@@ -2891,7 +2954,7 @@ void AComputeShaderMeshGenerator::BuildBoxSceneFilteredSurfaceVoxels(float Voxel
 			bRenderWorkQueued = true;
 		});
 
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 
 	if (!bRenderWorkQueued || !bHasGPUOutput)
 	{
@@ -2934,7 +2997,7 @@ void AComputeShaderMeshGenerator::BuildBoxSceneFilteredSurfaceVoxels(float Voxel
 			DroppedVoxelCount = LocalCounters[1];
 		});
 
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 
 	if (!bReadbackSucceeded)
 	{
@@ -3832,8 +3895,13 @@ UStaticMesh* AComputeShaderMeshGenerator::SaveDirectGPUMeshToStaticMesh(
 
 	// 落盘本身没有任何"直接网格"特有的东西，走组件那条公用入口。烘焙空间用 actor 变换：
 	// 组件以绝对变换渲染，它自己的组件变换恒为单位，按它烘会把几何冻结在世界坐标上。
+	//
+	// 显式把 DirectGpuMesh 传进去，而不是让组件用自己的绑定：几何归本 actor 所有，组件只是
+	// 它的显示端。上面那句 `if (!DirectGpuMesh)` 守卫本来就说明了这一点 —— 不传的话，组件一旦
+	// 被解绑（或绑到别的网格上），这里就会静默存出空/错的东西。
 	return DirectMeshRenderComponent->SaveToStaticMesh(
-		GetActorTransform(), EffectiveAssetPath, bReplaceExistingAsset, bSaveAsset, bConvertToActorLocalSpace);
+		GetActorTransform(), EffectiveAssetPath, bReplaceExistingAsset, bSaveAsset, bConvertToActorLocalSpace,
+		/*bEnableNanite*/ false, DirectGpuMesh);
 #else
 	return nullptr;
 #endif
@@ -4070,6 +4138,85 @@ void AComputeShaderMeshGenerator::RasterizeTriangleSoupToHeightmapRDG(
 	}
 }
 
+namespace
+{
+// FIndexedMeshToHeightmapCS 的目标封装：一张清成哨兵的 uint 高度图 + 光栅化参数，
+// 单网格入口与多网格入口共用（多网格把所有 pass 打进同一张 uint 图后只转换一次）。
+struct FIndexedMeshHeightmapTarget
+{
+	FRDGTextureRef HeightmapUint = nullptr;
+	FRDGTextureUAVRef HeightmapUintUAV = nullptr;
+	FVector2f BoundsMin = FVector2f::ZeroVector;
+	FVector2f BoundsInvSize = FVector2f::ZeroVector;
+	float CameraHeight = 0.0f;
+	FIntPoint TextureSize = FIntPoint::ZeroValue;
+};
+
+FIndexedMeshHeightmapTarget MakeIndexedMeshHeightmapTarget(
+	FRDGBuilder& GraphBuilder,
+	FRDGTextureRef OutputHeightmap,
+	const FBox& WorldBounds,
+	float CameraHeight)
+{
+	FIndexedMeshHeightmapTarget Target;
+	Target.TextureSize = FIntPoint(OutputHeightmap->Desc.Extent.X, OutputHeightmap->Desc.Extent.Y);
+	Target.CameraHeight = CameraHeight;
+
+	const FVector2f BoundsSize(WorldBounds.Max.X - WorldBounds.Min.X, WorldBounds.Max.Y - WorldBounds.Min.Y);
+	Target.BoundsMin = FVector2f(WorldBounds.Min.X, WorldBounds.Min.Y);
+	Target.BoundsInvSize = FVector2f(
+		BoundsSize.X > 0.01f ? 1.0f / BoundsSize.X : 0.0f,
+		BoundsSize.Y > 0.01f ? 1.0f / BoundsSize.Y : 0.0f);
+
+	const FRDGTextureDesc UintDesc = FRDGTextureDesc::Create2D(
+		Target.TextureSize, PF_R32_UINT, FClearValueBinding::None,
+		TexCreate_ShaderResource | TexCreate_UAV);
+	Target.HeightmapUint = GraphBuilder.CreateTexture(UintDesc, TEXT("CS.IdxMeshHeightmapUint"));
+	Target.HeightmapUintUAV = GraphBuilder.CreateUAV(Target.HeightmapUint);
+	AddClearUAVPass(GraphBuilder, Target.HeightmapUintUAV, 0xFFFFFFFFu);
+	return Target;
+}
+
+// 单网格光栅化 pass：index/position buffer 直读 + 顶点变换 + 俯视光栅化一次完成，
+// 不再经过 extract→triangle soup 的中转（那一套 per-mesh 顶点/法线/UV/材质 buffer 全部省掉）。
+// IndexBufferSRV 按引用捕获进 pass lambda 保活；PositionBufferSRV 的生命周期由调用方
+// 持有的 LODResource 引用保证。
+void AddIndexedMeshToHeightmapPass(
+	FRDGBuilder& GraphBuilder,
+	const FIndexedMeshHeightmapTarget& Target,
+	FShaderResourceViewRHIRef IndexBufferSRV,
+	FRHIShaderResourceView* PositionBufferSRV,
+	const FMatrix44f& LocalToWorld,
+	const FBox3f& TriangleCullBounds,
+	uint32 TriangleCount,
+	uint32 PositionStrideFloat)
+{
+	TShaderMapRef<FIndexedMeshToHeightmapCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	auto* PassParams = GraphBuilder.AllocParameters<FIndexedMeshToHeightmapCS::FParameters>();
+	PassParams->IndexBuffer = IndexBufferSRV.GetReference();
+	PassParams->PositionBuffer = PositionBufferSRV;
+	PassParams->RW_HeightmapUint = Target.HeightmapUintUAV;
+	PassParams->LocalToWorld = LocalToWorld;
+	PassParams->BoundsMin = TriangleCullBounds.IsValid ? TriangleCullBounds.Min : FVector3f(-TNumericLimits<float>::Max());
+	PassParams->BoundsMax = TriangleCullBounds.IsValid ? TriangleCullBounds.Max : FVector3f(TNumericLimits<float>::Max());
+	PassParams->TriangleCount = TriangleCount;
+	PassParams->PositionStrideFloat = PositionStrideFloat;
+	PassParams->bUseBounds = TriangleCullBounds.IsValid ? 1u : 0u;
+	PassParams->HM_BoundsMin = Target.BoundsMin;
+	PassParams->HM_BoundsInvSize = Target.BoundsInvSize;
+	PassParams->HM_CameraHeight = Target.CameraHeight;
+	PassParams->HM_TextureSize = Target.TextureSize;
+
+	GraphBuilder.AddPass(RDG_EVENT_NAME("IndexedMeshToHeightmap"), PassParams, ERDGPassFlags::Compute,
+		[PassParams, CS, TriangleCount, IndexBufferSRV](FRHIComputeCommandList& CmdList)
+		{
+			// wrapped：与 IndexedMeshToHeightmapCS 的 GetUnWrappedDispatchThreadId 配套（大网格三角数可 >4.19M）
+			FComputeShaderUtils::Dispatch(CmdList, CS, *PassParams,
+				FComputeShaderUtils::GetGroupCountWrapped(FMath::Max(1, int32(TriangleCount)), 64));
+		});
+}
+} // namespace
+
 void AComputeShaderMeshGenerator::RasterizeIndexedMeshToHeightmapRDG(
 	FRDGBuilder& GraphBuilder,
 	FRHIShaderResourceView* PositionSRV,
@@ -4080,84 +4227,79 @@ void AComputeShaderMeshGenerator::RasterizeIndexedMeshToHeightmapRDG(
 	const FBox& WorldBounds,
 	float CameraHeight)
 {
-	if (!PositionSRV || !IndexSRV || TriangleCapacity == 0 || !OutHeightmap)
-	{
-		return;
-	}
+	if (!PositionSRV || !IndexSRV || TriangleCapacity == 0 || !OutHeightmap) return;
 
-	FCSStaticMeshTriangleRDGOutput Soup;
-	Soup.MaxTriangles = TriangleCapacity;
-	Soup.MaxVertices = TriangleCapacity * 3u;
-	CSHelper::CreateClearedTypedBuffer(GraphBuilder, Soup.TriangleVertices, Soup.TriangleVerticesUAV, Soup.TriangleVerticesSRV, sizeof(FVector4f), TriangleCapacity * 3u, PF_A32B32G32R32F, TEXT("IdxMeshHM.Soup.Verts"), 0.0f);
+	FIndexedMeshHeightmapTarget Target = MakeIndexedMeshHeightmapTarget(GraphBuilder, OutHeightmap, WorldBounds, CameraHeight);
 
-	CSHelper::CreateClearedTypedBuffer(GraphBuilder, Soup.TriangleNormals, Soup.TriangleNormalsUAV, sizeof(FVector4f), TriangleCapacity * 3u, PF_A32B32G32R32F, TEXT("IdxMeshHM.Soup.Normals"), 0.0f);
-
-	CSHelper::CreateClearedTypedBuffer(GraphBuilder, Soup.TriangleCounter, Soup.TriangleCounterUAV, Soup.TriangleCounterSRV, sizeof(uint32), 1, PF_R32_UINT, TEXT("IdxMeshHM.Soup.Counter"), 0u);
-
-	// Dummy reference-point buffer (filter disabled).
-	FRDGBufferRef RefBuf = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), 1), TEXT("IdxMeshHM.Soup.Ref"));
-	FVector4f* RefData = GraphBuilder.AllocPODArray<FVector4f>(1);
-	RefData[0] = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
-	GraphBuilder.QueueBufferUpload(RefBuf, RefData, sizeof(FVector4f));
-	FRDGBufferSRVRef RefSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(RefBuf, PF_A32B32G32R32F));
-
-	// Heightmap 路径不追踪材质，但 shader 参数必须绑定：给一个全 CS_NO_MATERIAL_ID 的输入 +
-	// 一个丢弃用的输出 material buffer。
-	FRDGBufferRef TriToMaterialBuf = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), TriangleCapacity), TEXT("IdxMeshHM.Soup.TriToMaterial"));
-	uint32* TriToMaterialData = GraphBuilder.AllocPODArray<uint32>(TriangleCapacity);
-	for (uint32 FillIndex = 0; FillIndex < TriangleCapacity; ++FillIndex) TriToMaterialData[FillIndex] = CS_NO_MATERIAL_ID;
-	GraphBuilder.QueueBufferUpload(TriToMaterialBuf, TriToMaterialData, TriangleCapacity * sizeof(uint32));
-
-	FRDGBufferRef MaterialIdsBuf; FRDGBufferUAVRef MaterialIdsUAV;
-	CSHelper::CreateClearedTypedBuffer(GraphBuilder, MaterialIdsBuf, MaterialIdsUAV, sizeof(uint32), TriangleCapacity, PF_R32_UINT, TEXT("IdxMeshHM.Soup.MaterialIds"), CS_NO_MATERIAL_ID);
-
-	// 同理：本路径不做参照体过滤（bUseReferenceFilter=0），但 shader 声明了这个 UAV，而
-	// SHADER_PARAMETER_RDG_BUFFER_UAV 是必填的——不绑就是 dispatch 时 fatal，不是静默降级。
-	FRDGBufferRef ReferenceFlagsBuf; FRDGBufferUAVRef ReferenceFlagsUAV;
-	CSHelper::CreateClearedTypedBuffer(GraphBuilder, ReferenceFlagsBuf, ReferenceFlagsUAV, sizeof(uint32), TriangleCapacity, PF_R32_UINT, TEXT("IdxMeshHM.Soup.ReferenceFlags"), 0u);
-
-	// Heightmap 路径不追踪 UV，但 shader 参数必须绑定：输入绑 dummy tex-coord SRV（NumTexCoords=0
-	// 让 shader 不真正读取），输出绑一个丢弃用的 UV buffer。
-	FRDGBufferRef UVsBuf; FRDGBufferUAVRef UVsUAV;
-	CSHelper::CreateClearedTypedBuffer(GraphBuilder, UVsBuf, UVsUAV, sizeof(FVector2f), TriangleCapacity * 3u, PF_G32R32F, TEXT("IdxMeshHM.Soup.UVs"), 0.0f);
-
-	TShaderMapRef<FExtractStaticMeshTrianglesCS> ExtractCS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-	auto* EP = GraphBuilder.AllocParameters<FExtractStaticMeshTrianglesCS::FParameters>();
-	EP->IndexBuffer = IndexSRV;
-	EP->PositionBuffer = PositionSRV;
-	EP->SourceTexCoordBuffer = GCSDummyTexCoordVertexBuffer.ShaderResourceViewRHI.GetReference();
-	EP->ReferencePoints = RefSRV;
-	EP->TriToMaterial = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(TriToMaterialBuf, PF_R32_UINT));
-	EP->RW_OutTriangleVertices = Soup.TriangleVerticesUAV;
-	EP->RW_OutTriangleNormals = Soup.TriangleNormalsUAV;
-	EP->RW_TriangleCounter = Soup.TriangleCounterUAV;
-	EP->RW_OutTriangleMaterialIds = MaterialIdsUAV;
-	EP->RW_OutTriangleReferenceFlags = ReferenceFlagsUAV;
-	EP->RW_OutTriangleUVs = UVsUAV;
-	// 这条路径的 UV buffer 是单通道的，交错步长必须显式给 1，否则 shader 会按未初始化的步长写越界。
-	EP->CSNumUVChannels = 1u;
-	EP->LocalToWorld = LocalToWorld;
-	EP->BoundsMin = FVector3f(-TNumericLimits<float>::Max());
-	EP->BoundsMax = FVector3f(TNumericLimits<float>::Max());
 	// Unused indices are zero -> degenerate (0,0,0) triangles that rasterize to nothing.
-	EP->TriangleCount = TriangleCapacity;
-	EP->PositionStrideFloat = 3u;
-	EP->ReferenceCount = 0u;
-	EP->TriangleCapacity = TriangleCapacity;
-	EP->NumTexCoords = 0u;
-	EP->bUseBounds = 0u;
-	EP->bUseReferenceFilter = 0u;
-	EP->ReferenceFilterDistanceSq = TNumericLimits<float>::Max();
+	AddIndexedMeshToHeightmapPass(GraphBuilder, Target, IndexSRV, PositionSRV,
+		LocalToWorld, FBox3f(EForceInit::ForceInit), TriangleCapacity, 3u);
 
-	GraphBuilder.AddPass(RDG_EVENT_NAME("IdxMeshHM.Extract"), EP, ERDGPassFlags::Compute,
-		[EP, ExtractCS, TriangleCapacity](FRHIComputeCommandList& CmdList)
-		{
-			// wrapped：与 ExtractStaticMeshTrianglesCS 的 GetUnWrappedDispatchThreadId 配套（大网格 TriangleCapacity 可 >4.19M）
-			FComputeShaderUtils::Dispatch(CmdList, ExtractCS, *EP,
-				FComputeShaderUtils::GetGroupCountWrapped(FMath::Max(1, int32(TriangleCapacity)), 64));
-		});
+	// 覆盖式 uint→float 转换，保持本入口旧语义（空 texel 也写入，值为哨兵位型）。
+	{
+		TShaderMapRef<FConvertHeightmapUintToFloatCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		auto* ConvertParams = GraphBuilder.AllocParameters<FConvertHeightmapUintToFloatCS::FParameters>();
+		ConvertParams->T_HeightmapUint = GraphBuilder.CreateSRV(FRDGTextureSRVDesc(Target.HeightmapUint));
+		ConvertParams->RW_HeightmapFloat = GraphBuilder.CreateUAV(OutHeightmap);
+		ConvertParams->HM_TextureSize = Target.TextureSize;
 
-	RasterizeTriangleSoupToHeightmapRDG(GraphBuilder, Soup, OutHeightmap, WorldBounds, CameraHeight);
+		FIntVector GroupCount(
+			FMath::DivideAndRoundUp(Target.TextureSize.X, 8),
+			FMath::DivideAndRoundUp(Target.TextureSize.Y, 8),
+			1);
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("ConvertHeightmapUintToFloat"),
+			ERDGPassFlags::Compute,
+			CS,
+			ConvertParams,
+			GroupCount);
+	}
+}
+
+void CSMeshGenInternal::RasterizeResolvedMeshesToHeightmapRDG(
+	FRDGBuilder& GraphBuilder,
+	FRHICommandListImmediate& RHICmdList,
+	const TArray<FResolvedStaticMeshTriangleRequest>& ResolvedRequests,
+	FRDGTextureRef OutputHeightmap,
+	const FBox& WorldBounds,
+	float CameraHeight)
+{
+	if (ResolvedRequests.IsEmpty() || !OutputHeightmap) return;
+
+	FIndexedMeshHeightmapTarget Target = MakeIndexedMeshHeightmapTarget(GraphBuilder, OutputHeightmap, WorldBounds, CameraHeight);
+
+	bool bAnyPass = false;
+	for (const FResolvedStaticMeshTriangleRequest& Request : ResolvedRequests)
+	{
+		if (!Request.LODResource || Request.TriangleCount <= 0) continue;
+
+		FShaderResourceViewRHIRef IndexBufferSRV = CreateTriangleIndexBufferSRV(RHICmdList, Request.LODResource.GetReference());
+		FRHIShaderResourceView* PositionBufferSRV = Request.LODResource->VertexBuffers.PositionVertexBuffer.GetSRV();
+		if (!IndexBufferSRV.IsValid() || !PositionBufferSRV) continue;
+
+		AddIndexedMeshToHeightmapPass(GraphBuilder, Target, IndexBufferSRV, PositionBufferSRV,
+			Request.LocalToWorld, Request.WorldBounds, uint32(Request.TriangleCount), uint32(Request.PositionStrideFloat));
+		bAnyPass = true;
+	}
+	if (!bAnyPass) return;
+
+	// min 合并进浮点输出：空 texel 保留输出现值（清屏哨兵/已合并的地形深度不被覆盖）。
+	TShaderMapRef<FMergeHeightmapUintToFloatMinCS> MergeCS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	auto* MergeParams = GraphBuilder.AllocParameters<FMergeHeightmapUintToFloatMinCS::FParameters>();
+	MergeParams->T_HeightmapUint = GraphBuilder.CreateSRV(FRDGTextureSRVDesc(Target.HeightmapUint));
+	MergeParams->RW_HeightmapFloat = GraphBuilder.CreateUAV(OutputHeightmap);
+	MergeParams->HM_TextureSize = Target.TextureSize;
+
+	FIntVector GroupCount(
+		FMath::DivideAndRoundUp(Target.TextureSize.X, 8),
+		FMath::DivideAndRoundUp(Target.TextureSize.Y, 8),
+		1);
+	FComputeShaderUtils::AddPass(
+		GraphBuilder,
+		RDG_EVENT_NAME("MergeHeightmapUintToFloatMin"),
+		ERDGPassFlags::Compute,
+		MergeCS,
+		MergeParams,
+		GroupCount);
 }

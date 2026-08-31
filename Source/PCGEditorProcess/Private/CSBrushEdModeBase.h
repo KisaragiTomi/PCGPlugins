@@ -105,6 +105,12 @@ protected:
 	/** Preconditions beyond having a target, e.g. the instance brush needing a mesh assigned. */
 	virtual bool IsReadyToPaint() const { return true; }
 
+	/** The ray-to-surface trace behind both the cursor (brush sphere placement) and the default
+	 *  disc sampling. The default sweeps engine collision via FoliageTrace; a leaf whose target has
+	 *  no collision at all (GPU-resident meshes are created NoCollision) overrides this with its own
+	 *  analytic intersection and the rest of the stroke lifecycle works unchanged. */
+	virtual bool TraceCandidatePoint(const FVector& Start, const FVector& End, FHitResult& OutHit) const;
+
 	/** Leaves call this from their SetTargetActor to drop any stroke aimed at the old target. */
 	void ResetBrushState();
 
@@ -126,7 +132,6 @@ private:
 	void UpdateBrushComponent(FEditorViewportClient* ViewportClient);
 	bool UpdateBrushTraceFromMouse(FEditorViewportClient* ViewportClient, FViewport* Viewport, int32 MouseX, int32 MouseY);
 	bool TraceBrushRay(FEditorViewportClient* ViewportClient, const FVector& RayOrigin, const FVector& RayDirection);
-	bool TraceCandidatePoint(const FVector& Start, const FVector& End, FHitResult& OutHit) const;
 	bool IsSurfacePaintable(const FHitResult& Hit, const FVector& TraceDirection, const FCSBrushSettings& Settings) const;
 	void BeginStroke();
 	void UpdateStroke();

@@ -4,8 +4,16 @@
 
 #include "CSGpuInstancedMeshComponent.h"
 #include "CSGpuInstancedMeshSceneProxy.h" // ECSGpuInstancedAuxSlot + the aux stream declaration
+#include "CSGpuInstancedMeshVertexFactory.h" // depth-prepass admission contract, asserted below
+#include "CSHouseActor.h"                    // FrameBricksSurviveBake 借门框砖当被测对象
 #include "CSMesh.h"
 
+// 下面这五个只有烘焙那条用例要（真 world / 真资产）。unity 构建下它们恰好被邻居 TU 带进来，
+// 漏写只有 -SingleFile 才照得出来（坑表里那条）。
+#include "EditorAssetLibrary.h"
+#include "Engine/StaticMesh.h"
+#include "Engine/World.h"
+#include "Tests/AutomationEditorCommon.h"
 #include "UObject/Package.h"
 
 namespace
@@ -190,6 +198,26 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 // commands), so the whole contract can be pinned without a GPU.
 bool FCSGpuInstancedMeshStreamsAutomationTest::RunTest(const FString& Parameters)
 {
+	// ---- 深度预通道的入场券（2026-08-30 的缺陷，症状与本测试的"静默失效"同一类）----
+	//
+	// 引擎选深度预通道着色器用的是**两套口径**：
+	//   · `FDepthPassMeshProcessor::ShouldRender` 看**实例**的 SupportsPositionOnlyStream()；
+	//   · `TDepthOnlyVS<true>::ShouldCompilePermutation` 看**类型**的 SupportsPositionOnly()。
+	// 两者不一致时 GetDepthPassShaders 取不到着色器，整个 batch 被**静默地**踢出深度预通道：
+	// 实例照常写颜色但不占深度，于是同一趟基通道里后画的任何不透明物都能把它整片盖掉
+	// （实测：L_TerrainOpsDemo 的 216 级石阶只剩地形轮廓线外侧那十几块）。
+	// 一行日志都不会有，所以这条契约必须由断言守着。
+	{
+		FCSGpuInstancedMeshVertexFactory VertexFactory(ERHIFeatureLevel::SM5, "StreamsTest");
+		TestFalse(TEXT("The instanced factory type does not declare SupportsPositionOnly"),
+			VertexFactory.GetType()->SupportsPositionOnly());
+		// 所以实例也一个字都不能提 position-only —— 否则深度预通道就会去要一个没编译过的着色器。
+		TestFalse(TEXT("...so the factory must not advertise a position-only stream either"),
+			VertexFactory.SupportsPositionOnlyStream());
+		TestFalse(TEXT("...nor a position-and-normal-only stream (same two-sided contract, shadow depth)"),
+			VertexFactory.SupportsPositionAndNormalOnlyStream());
+	}
+
 	FCSGpuInstancedGpuLayout Layout;
 	Layout.NumLODs = 3;
 	Layout.InstanceCapacity = 128;
@@ -410,6 +438,107 @@ bool FCSGpuInstancedMeshStreamResizeAutomationTest::RunTest(const FString& Param
 	TestFalse(TEXT("Neither can the per-LOD indirect args"),
 		Mesh->ResizeStreamSync(ECSGpuStreamRole::IndirectArgs, 0, 5 * 4));
 	TestEqual(TEXT("A refused resize leaves the draw layout alone"), Mesh->GetIndirectDrawCount(), int32(Layout.NumLODs));
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// 烘焙出口（裁决六 ①②）：门框砖走真正的 `SaveToStaticMesh`，通道与多组 UV 都要活下来
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSGpuInstancedMeshBakeAutomationTest,
+	"PCGPlugins.ComputeShaderGenerator.GpuInstancedMesh.FrameBricksSurviveBake",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter | EAutomationTestFlags::NonNullRHI)
+
+/**
+ * 抄的是 `RockShell.CapSkirtSurvivesBake` 的形状：**真烘一遍**，再从烘出来的资产里读回来。
+ *
+ * 这条守的是三件事，每一件的失效方式都是"不报错、画面错"：
+ *   ① 裁决六 ① —— 实例路以前**一个出口都没有**，整族（门框砖/接缝砖/藤/摆件）一件都存不出来；
+ *   ② 裁决六 ② —— 顶点色通道与多组 UV 必须随网格一起保住；
+ *   ③ 裁决六 ③ —— 烘完就没有 `PerInstanceRandom` 了（非实例图元的 RandomID 恒 0），
+ *      材质里那条 `lerp(0.88, 1.12, rnd)` 会把整片砖/石/藤烘成**同一个色**。
+ *      判据只能是"烘焙件里那条通道还有多少种取值"，三角数 / 包围盒 / 实例数**全都看不见它**。
+ *
+ * 用门框砖而不是石阶：它的前置最少（一栋房 + 一张砖网格 + 一份显式窗户列表，不需要地形与落笔），
+ * 而判据最完整（砖数 CPU 侧有账、GPU 侧有计数器、烘焙件有三角数，三者能互相对）。
+ */
+bool FCSGpuInstancedMeshBakeAutomationTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	// 引擎的 Cube 顶了 TG 的 brick：两者都是居中单位立方体（尺寸全靠逐实例非均匀缩放），
+	// 而这条测的是出口不是资产 —— 用引擎自带件才不会因为 Content/ 没跟进 git 就跑不起来。
+	UStaticMesh* BrickMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	if (!TestNotNull(TEXT("Frame brick base mesh"), BrickMesh)) return false;
+
+	ACSHouseActor* House = World->SpawnActor<ACSHouseActor>(FVector::ZeroVector, FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("House actor"), House)) return false;
+
+	House->FrameBrickMesh = BrickMesh;
+	House->bFrameEnabled = true;
+	House->bWindowsEnabled = true;
+	// 显式窗户列表 —— 这里**没有也不许有**任何触发规则（唯一没拍板的那条是门洞触发规则，
+	// 本测试一行都不碰它）。三扇开在短墙上，理由同回归脚本 demo_house_window。
+	auto MakeWindow = [](int32 Edge, float CenterS)
+	{
+		FCSHouseWindow Window;
+		Window.EdgeIndex = Edge;
+		Window.CenterS = CenterS;
+		Window.Width = 78.0f;
+		Window.SillZ = 90.0f;
+		Window.Height = 110.0f;
+		return Window;
+	};
+	House->Windows = { MakeWindow(1, 120.0f), MakeWindow(1, 232.0f), MakeWindow(3, 176.0f) };
+	House->RebuildHouse();
+
+	const int32 Bricks = House->GetFrameBrickCount();
+	AddInfo(FString::Printf(TEXT("窗 %d 洞 %d 砖 %d"), House->GetWindowCount(), House->GetOpeningCount(), Bricks));
+	if (!TestTrue(FString::Printf(TEXT("这栋房子砌出了门框砖（%d 块）"), Bricks), Bricks > 0)) return false;
+
+	// GPU 上真的在画的那一份必须与 CPU 的账对得上，否则下面烘出来的是"另一批砖"而没人知道。
+	const int32 GpuBricks = House->DebugReadFrameBrickCountGpuSync();
+	if (!TestEqual(TEXT("GPU 计数器与 CPU 的砖账一致"), GpuBricks, Bricks)) return false;
+
+	const FString BakePath = FString::Printf(
+		TEXT("/Game/Automation/GpuInstanced/SM_FrameBricks_%s"),
+		*FGuid::NewGuid().ToString(EGuidFormats::Digits));
+
+	int32 Triangles = 0, VertexInstances = 0, UVChannels = 0, DistinctRandoms = 0, GpuInstances = 0;
+	bool bRandomsMatchGpu = false;
+	const bool bBaked = House->DebugBakeFrameBricksSync(
+		BakePath, Triangles, VertexInstances, UVChannels, DistinctRandoms, GpuInstances, bRandomsMatchGpu);
+	AddInfo(FString::Printf(TEXT("烘成 StaticMesh：%d 三角 / %d 角点 / %d 组 UV；逐实例随机 %d 种（%d 个实例）"),
+		Triangles, VertexInstances, UVChannels, DistinctRandoms, GpuInstances));
+	if (!TestTrue(TEXT("实例路有一条走得通的 SaveToStaticMesh 出口（裁决六 ①）"), bBaked)) return false;
+
+	// --- 几何：烘出来的必须是**整族**砖，不是一块 ---
+	TestEqual(TEXT("烘出来的实例数 = GPU 上的实例数"), GpuInstances, Bricks);
+	// 逐实例展开之后三角数必然是基础网格 LOD0 三角数的整数倍，且倍数就是实例数 ——
+	// 差一个倍数说明索引的 BaseVertex/FirstIndex 换算错了，而那只表现为"少了几块砖"。
+	// 三角数从资产现取，不写常数：引擎的 BasicShapes/Cube 换过面数（5.7 是 48 不是 12），
+	// 写死会让这条断言在下次引擎升级时报一个与出口毫无关系的红。
+	const int32 BaseTriangles = BrickMesh->GetNumTriangles(0);
+	TestEqual(TEXT("三角数 = 实例数 × 基础网格三角数"), Triangles, Bricks * BaseTriangles);
+	TestEqual(TEXT("角点数 = 三角数 × 3"), VertexInstances, Triangles * 3);
+
+	// --- 裁决六 ②：通道与多组 UV 还在 ---
+	// 「多组」不是修辞：Cube 带 UV0 + 光照图 UV1，出口必须把两组都带过去。少带一组不报错，
+	// 症状是烘焙件在任何读 UV1 的材质下变成一整片同一个像素。
+	const int32 BaseUVChannels = BrickMesh->GetNumTexCoords(0);
+	TestEqual(TEXT("UV 组数与基础网格资产一致（裁决六 ②）"), UVChannels, BaseUVChannels);
+	TestTrue(FString::Printf(TEXT("基础网格本来就不止一组 UV，这条断言才有内容（%d 组）"), BaseUVChannels),
+		BaseUVChannels >= 2);
+	// **这一条就是裁决六 ③ 的判据本身**。只有一种取值 = 整片同色 = 烘出来的东西不能看，
+	// 而三角数、角点数、UV 组数、实例数上面四条**全都会照绿**。
+	TestTrue(FString::Printf(TEXT("逐实例随机不止一种取值（%d 种 / %d 个实例）"), DistinctRandoms, Bricks),
+		DistinctRandoms > 1);
+	// 逐个对 GPU 上 packed 行的 Origin.w，不是"看着都挺随机"。
+	TestTrue(TEXT("烘焙件里的逐实例随机与 GPU 上那一份逐个对得上"), bRandomsMatchGpu);
+
+	UEditorAssetLibrary::DeleteAsset(BakePath);
 	return true;
 }
 

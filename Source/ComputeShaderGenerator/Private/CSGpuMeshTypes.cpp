@@ -39,7 +39,9 @@ void BuildStandardTriangleStreamDescs(TArray<FCSGpuStreamDesc>& OutDescs, const 
 		D.DebugName = TEXT("CSGpuMesh.TexCoords");
 		D.Role = ECSGpuStreamRole::TexCoord;
 		D.BytesPerElement = sizeof(float);
-		D.ElementsPerUnit = 2;
+		// 交错：每顶点 2×N 个 float。N=1 时与改动前逐位相同。SrvFormat 仍是 float2 视图，
+		// 于是 SRV 的元素数天然变成 N×顶点数，正好是引擎交错取数期待的排布。
+		D.ElementsPerUnit = 2 * FMath::Clamp(Options.NumTexCoordSets, 1u, 4u);
 		D.CountSource = ECSGpuCountSource::PerVertex;
 		D.SrvFormat = PF_G32R32F;
 		D.VfType = VET_Float2;

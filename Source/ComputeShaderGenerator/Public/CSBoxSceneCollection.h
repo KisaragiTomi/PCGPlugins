@@ -94,9 +94,11 @@ struct COMPUTESHADERGENERATOR_API FCSBoxSceneCollectOptions
 	bool bIncludeLandscape = true;
 
 	/** Pull Nanite meshes from their editor MeshDescription instead of the render fallback.
-	 *  Off means a Nanite source contributes its coarse fallback mesh, which is usually not
-	 *  what a geometry operation wants but is the only option outside the editor. */
-	bool bUseMeshDescriptionSourceTriangles = true;
+	 *  默认关闭：全精度源三角按「实例数 × 源面数 × ~272B」吃 CPU 与上传内存，生产场景里
+	 *  镜像实例化的摄影测量岩石曾把编辑器直接顶到 OOM（2026-08 Lycoris Chapter1 实录）。
+	 *  只有确实需要与视觉一致的完整几何的消费方显式开启——目前即 Mesh Boolean 的
+	 *  bUseMeshDescriptionSourceTriangles 勾选项；其余系统一律用 render fallback。 */
+	bool bUseMeshDescriptionSourceTriangles = false;
 
 	/** true keeps one registry entry per source (mesh, material slot), so a mesh with five
 	 *  slots yields five output slots even when they share a material or are all unassigned.

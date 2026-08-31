@@ -16,6 +16,8 @@
 #define CSSW_VELOCITY_CLAMP 4
 
 class FObjectPreSaveContext;
+class AStaticMeshActor;
+class ADecalActor;
 
 #include "ComputeShaderShallowWater.generated.h"
 
@@ -126,6 +128,15 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Bake", Meta=(EditCondition="bUseBakedResultMesh", Priority=1000))
 	UStaticMesh* BakedResultMesh = nullptr;
+
+	/** 烘焙出的水面材质实例（MI_CSSW_Water_<编号>），指向落盘的 T_CSSW_* 贴图。
+	 *  展示烘焙结果时用它替代运行时 MID：MID 绑的是 transient render target，关卡重开即失效。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Bake", Meta=(EditCondition="bUseBakedResultMesh", Priority=1000))
+	UMaterialInterface* BakedWaterMaterial = nullptr;
+
+	/** 烘焙出的焦散 decal 材质实例（MI_CSSW_Decal_<编号>），与 BakedWaterMaterial 同批生成。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Bake", Meta=(EditCondition="bUseBakedResultMesh", Priority=1000))
+	UMaterialInterface* BakedDecalMaterial = nullptr;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Bake", Meta=(Priority=999))
 	UStaticMesh* SimulationPreviewMesh = nullptr;
@@ -269,18 +280,54 @@ public:
 	UFUNCTION(BlueprintNativeEvent, Category = "ComputeShader|Bake")
 	void OnBakeComplete();
 	virtual void OnBakeComplete_Implementation();
+
+	/** 生成两个静态代理 actor：StaticMeshActor（复制 ReusltMesh 当前网格/材质/变换）+
+	 *  DecalActor（复制 CausticsDecal 当前材质/DecalSize/变换），并挂到本 actor 下。
+	 *  先销毁本 actor 已挂载的代理，再重建，因此可重复调用。不销毁自身，销毁时机由调用方控制。 */
+	UFUNCTION(BlueprintCallable, Category = "ComputeShader|Bake")
+	void SpawnResultProxyActors(AStaticMeshActor*& OutMeshActor, ADecalActor*& OutDecalActor);
+
+	/** 有烘焙/结果网格时，生成一对静态代理 actor（StaticMeshActor + DecalActor）挂到本 actor 下、
+	 *  打上 AutoProxyTag，并隐藏本体的 ReusltMesh / CausticsDecal —— 让关卡里留下的是普通 actor，
+	 *  不再依赖本 actor 的运行时组件。没有结果网格时整个跳过（不生成、也不隐藏本体）。
+	 *  重复调用安全：挂载前先销毁已挂载的同 tag 代理。 */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "ComputeShader|Bake")
+	void SpawnAutoResultActors();
+
+	/** 结果网格的资产路径（CSSW_<SWUniqueID>_SM）。覆写基类的 SM_<BaseName>_<Tag> 模板：
+	 *  那套前缀在前的命名与 CSSW 的后缀命名对不上。NameSuffix 仍追加在最后。 */
+	virtual FString BuildResultAssetPath(const FString& NameSuffix = TEXT("")) override;
+
+	/** 烘焙产物的统一取名入口：<CSSWData 目录>/CSSW_<SWUniqueID>_<Suffix>。
+	 *  SM / Water / Decal / 贴图全部经由它取名，烘焙流程（PCGEditorProcess）也调用它，
+	 *  所以命名规则只此一处。 */
+	FString BuildBakedAssetPath(const FString& Suffix);
 	
 	UFUNCTION(BlueprintCallable, Category = "Debug|DebugViewPlane")
 	void ShowDebugViewPlane(float Duration = 5.0f);
 
 protected:
-	// 烘焙结果沿用基类的结果资产命名（关卡同级文件夹 + 稳定编号），只把文件夹、基名和编号
-	// 换成 CSSW 自己那套，已烘好的 SM_CSSW_Water_<SWUniqueID> 名字保持不变。
+	// 烘焙产物统一命名为 CSSW_<SWUniqueID>_<后缀>，全部落在关卡同级的 CSSWData 文件夹里。
+	// 基类的 SM_<BaseName>_<Tag> 模板前缀在前，与这套后缀命名对不上，所以直接覆写路径构造；
+	// GetResultAssetBaseName 因此不再参与 CSSW 的命名，不再覆写它。
 	virtual FString GetResultAssetFolderName() const override { return TEXT("CSSWData"); }
-	virtual FString GetResultAssetBaseName() const override { return TEXT("CSSW_Water"); }
 	virtual FString GetResultAssetUniqueTag() override;
 
 private:
+	/** 代理 actor 的 tag：SpawnAutoResultActors 生成时打上，Clean 与再次生成时据此回收。 */
+	static const FName AutoProxyTag;
+
+	/** 把烘焙 MIC（BakedWaterMaterial / BakedDecalMaterial）贴回结果网格 / SimVis / 焦散 decal，
+	 *  保证运行时 MID 不会覆盖掉指向落盘贴图的烘焙材质。 */
+	void ApplyBakedMaterials();
+
+	/** 销毁挂在本 actor 下、带 Tag 的 actor；Tag 为 None 时销毁全部挂载 actor。返回销毁个数。 */
+	int32 DestroyAttachedProxyActors(FName Tag);
+
+	/** 按 ReusltMesh / CausticsDecal 当前的网格、材质与世界变换生成一对代理 actor，打上 ProxyTag
+	 *  并挂到本 actor 下。不负责回收旧代理，调用方自行决定回收策略。 */
+	void BuildProxyActors(FName ProxyTag, AStaticMeshActor*& OutMeshActor, ADecalActor*& OutDecalActor);
+
 	void ClearSolverTimer();
 	void ScheduleSolverTimerTick();
 	void StopSimulationRuntime();

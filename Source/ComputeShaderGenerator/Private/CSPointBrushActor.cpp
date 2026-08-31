@@ -68,7 +68,7 @@ bool UploadBrushPointsToGPU(
 			GraphBuilder.Execute();
 		});
 
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 
 	OutSource.Positions = MoveTemp(PositionBuffer);
 	OutSource.Normals = MoveTemp(NormalBuffer);

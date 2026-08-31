@@ -80,6 +80,29 @@ uint PackSnorm8888(float4 V)
 	return (uint(I.x) & 0xFF) | ((uint(I.y) & 0xFF) << 8) | ((uint(I.z) & 0xFF) << 16) | ((uint(I.w) & 0xFF) << 24);
 }
 
+// PackSnorm8888 的逆。
+//
+// ⚠️ **必须先转 int 再右移**：HLSL 的 `>>` 对 **uint 是逻辑移位**（补 0）、只有 int 才是
+// 算术移位（补符号位）。写成 `(int)((P << 24) >> 24)` 时那两下移位都发生在 uint 上，
+// 于是每个分量都被剥掉符号 —— −1 存成 0x81，取回来是 +129/127 而不是 −1。
+//
+// 实测后果（2026-08-31 定位，疑案 A 的光照那一半）：凡是走过一次 `TransformMeshCS` /
+// `NegateNormalsCS` 的网格，**全部法线被折进 +X+Y+Z 那个卦限**。房子只要被
+// `ACSHouseActor::ApplyBodyPlacement` 增量搬过一次（拖动归位、平移、快扫唤醒都走这条），
+// 朝 −X/−Y 的两面墙法线当场翻面 ⇒ 背对太阳 ⇒ Lumen 的半球指进屋里 ⇒ 那面墙
+// **精确 (0,0,0)**，屋面则偏亮。而反照率、三角形数、包围盒、砖数、零阻塞**全部照绿**：
+// 法线不进任何一条断言。松手/全量重建会从 CPU 重新上传法线，所以症状表现为
+// "拖动中的画面 ≠ 松手后的画面"，看着像 Lumen 预热不够（`预热 8→384 次一个数都不动`，
+// 见 `Scripts/TinyGladeShotResizeProbe.py` 的 Q1）。
+float4 UnpackSnorm8888(uint P)
+{
+	return float4(
+		float((int)(P << 24) >> 24),
+		float((int)(P << 16) >> 24),
+		float((int)(P << 8) >> 24),
+		float((int)P >> 24)) / 127.0f;
+}
+
 // The colour stream is packed BGRA (RoadBuilder.usf's documented convention, which is also
 // what VET_Color expects); the CPU readback unpacks with the same byte order.
 uint PackColorBGRA(float4 RGBA)
@@ -288,16 +311,12 @@ void TransformMeshCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex
 	RW_Positions[V * 3 + 2] = NewP.z;
 
 	// The packed basis has to be unpacked, rotated and repacked; there is no in-place rotate.
+	// ⚠️ 解包只能走 UnpackSnorm8888 —— 手写 `(int)((P << 24) >> 24)` 会剥掉符号位，理由与
+	// 实测症状见那个函数上面的注释。
 	const uint PackedX = RW_Tangents[V * 2 + 0];
 	const uint PackedZ = RW_Tangents[V * 2 + 1];
-	const float3 TanX = SafeNormal(mul(float4(
-		float((int)((PackedX << 24) >> 24)) / 127.0f,
-		float((int)((PackedX << 16) >> 24)) / 127.0f,
-		float((int)((PackedX << 8) >> 24)) / 127.0f, 0.0f), SrcLocalToWorld).xyz);
-	const float3 TanZ = SafeNormal(mul(float4(
-		float((int)((PackedZ << 24) >> 24)) / 127.0f,
-		float((int)((PackedZ << 16) >> 24)) / 127.0f,
-		float((int)((PackedZ << 8) >> 24)) / 127.0f, 0.0f), SrcNormalToWorld).xyz);
+	const float3 TanX = SafeNormal(mul(float4(UnpackSnorm8888(PackedX).xyz, 0.0f), SrcLocalToWorld).xyz);
+	const float3 TanZ = SafeNormal(mul(float4(UnpackSnorm8888(PackedZ).xyz, 0.0f), SrcNormalToWorld).xyz);
 	const float Sign = (((PackedZ >> 24) & 0xFFu) >= 128u) ? -1.0f : 1.0f;
 
 	RW_Tangents[V * 2 + 0] = PackSnorm8888(float4(SafeNormal(TanX - TanZ * dot(TanX, TanZ)), 0.0f));
@@ -325,10 +344,8 @@ void NegateNormalsCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex
 	if (V >= ThreadCount || V >= InMeshCounters[0]) return;
 
 	const uint PackedZ = RW_Tangents[V * 2 + 1];
-	const float3 TanZ = float3(
-		float((int)((PackedZ << 24) >> 24)) / 127.0f,
-		float((int)((PackedZ << 16) >> 24)) / 127.0f,
-		float((int)((PackedZ << 8) >> 24)) / 127.0f);
+	// ⚠️ 同 TransformMeshCS：解包必须走 UnpackSnorm8888，手写移位会剥掉符号位。
+	const float3 TanZ = UnpackSnorm8888(PackedZ).xyz;
 	const float Sign = (((PackedZ >> 24) & 0xFFu) >= 128u) ? -1.0f : 1.0f;
 	RW_Tangents[V * 2 + 1] = PackSnorm8888(float4(-TanZ, -Sign));
 }
@@ -339,6 +356,73 @@ void SetVertexColorsCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupInd
 	const uint V = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
 	if (V >= ThreadCount || V >= InMeshCounters[0]) return;
 	RW_Colors[V] = PackColorBGRA(ConstantColor);
+}
+
+// ---------------------------------------------------------------- sphere colour brush
+//
+// Reads the resident positions (world space) as an SRV and rewrites only the colour stream.
+// The falloff weight and the four blend formulas are a CONTRACT shared with CPU mirrors of
+// painted colours (ECSMeshPaintBlendOp in CSMeshOps.h, ACSGroundActor's mirror twin): both
+// sides read the same stored 8-bit value, apply the same math, and round back to 8 bits, so
+// they cannot drift apart by more than float rounding. Change one, change all three.
+
+Buffer<float> BrushSrcPositions;   // resident position stream, 3 floats / vertex
+float4 BrushChannelMask;           // per-channel gate: > 0 = channel is painted
+float3 BrushCenter;                // world space
+float  BrushRadius;
+float  BrushFalloff;               // 0 = hard to the rim, 1 = fade from the centre out
+float  BrushStrength;
+uint   PaintBlendOp;               // ECSMeshPaintBlendOp: 0 Replace, 1 Add, 2 Max, 3 Erase
+uint4  BrushRegion;                // regular-grid vertex rect, inclusive (x0, y0, x1, y1)
+uint   BrushGridVertsX;            // 0 = dispatch over the whole mesh (non-grid meshes)
+uint   BrushGridVertsY;
+
+float4 UnpackColorBGRA(uint Packed)   // inverse of PackColorBGRA, returns RGBA in 0..1
+{
+	return float4(
+		float((Packed >> 16) & 0xFFu) / 255.0f,
+		float((Packed >> 8) & 0xFFu) / 255.0f,
+		float(Packed & 0xFFu) / 255.0f,
+		float((Packed >> 24) & 0xFFu) / 255.0f);
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void PaintVertexColorsSphereCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint Thread = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (Thread >= ThreadCount) return;
+
+	// Regional dispatch decodes the thread as a cell of the row-major grid (Id = Y * VertsX + X,
+	// the ground mirror's layout — same decode as DisplaceGroundShapersCS). A brush stroke only
+	// touches a handful of cells, so this keeps the dispatch off the mesh's total vertex count.
+	uint V = Thread;
+	if (BrushGridVertsX > 0u)
+	{
+		const uint RegionW = BrushRegion.z - BrushRegion.x + 1u;
+		const uint X = BrushRegion.x + (Thread % RegionW);
+		const uint Y = BrushRegion.y + (Thread / RegionW);
+		if (X >= BrushGridVertsX || Y >= BrushGridVertsY || Y > BrushRegion.w) return;
+		V = Y * BrushGridVertsX + X;
+	}
+	if (V >= InMeshCounters[0]) return;
+
+	const float3 P = float3(BrushSrcPositions[V * 3 + 0], BrushSrcPositions[V * 3 + 1], BrushSrcPositions[V * 3 + 2]);
+	const float Distance = length(P - BrushCenter);
+	if (Distance >= BrushRadius) return;
+
+	// Smoothstep from the hard core out to the rim. Falloff 0 makes the core the whole brush.
+	const float HardRadius = BrushRadius * (1.0f - BrushFalloff);
+	const float T = saturate((BrushRadius - Distance) / max(BrushRadius - HardRadius, 1e-3f));
+	const float Weight = T * T * (3.0f - 2.0f * T);
+
+	const float4 E = Weight * BrushStrength * saturate(BrushChannelMask);
+	const float4 C = UnpackColorBGRA(RW_Colors[V]);
+	float4 Result = C;
+	if (PaintBlendOp == 0u) Result = lerp(C, ConstantColor, E);
+	else if (PaintBlendOp == 1u) Result = C + ConstantColor * E;
+	else if (PaintBlendOp == 2u) Result = max(C, ConstantColor * E);
+	else if (PaintBlendOp == 3u) Result = C * (1.0f - E);
+	RW_Colors[V] = PackColorBGRA(Result);
 }
 
 // ---------------------------------------------------------------- vertex welding
@@ -540,4 +624,66 @@ void ReduceMeshBoundsCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIn
 		InterlockedMin(RW_MeshBounds[GroupIndex], GSBoundsMin[GroupIndex]);
 		InterlockedMax(RW_MeshBounds[3u + GroupIndex], GSBoundsMax[GroupIndex]);
 	}
+}
+
+// -----------------------------------------------------------------------------
+// Ground height-field displacement (TinyGladeHouse D9)
+//
+// 把一组塑形物（圆盘 + 羽化裙边）的高度场直接写进常驻流：只改位置 Z 与切线，
+// 不动计数/索引/材质，所以调用方不需要 AddSetCountersPass / InvalidateSections。
+//
+// 法线走**解析**中心差分：同一个场在 ±1 格重新求值，而不是读邻居顶点的 RW_Positions ——
+// 同一 dispatch 内读邻居写自己是竞态（见 CSMeshOps.cpp 焊接/材质排序两处预拷贝注释）。
+// 差分的 clamp 与 ACSGroundActor::BuildSnapshotFromMirror 逐字一致，区域更新与全量
+// 重建才会给出同一张法线，边界看不出接缝。
+// -----------------------------------------------------------------------------
+
+// 高度场本身（GroundShaperParams / GroundShaperCount / GroundShaperHeightAtXY）搬进了共享
+// 头文件：石阶扫描 pass（CSGroundStairs.usf）要在**任意世界 XY** 上求同一个场，两边各抄一份
+// 迟早会分叉，而分叉的表现是"石阶浮在坡面上方几厘米"这种不报错、只在裙边中段可见的错位。
+#include "/Plugin/PCGPlugins/Shaders/Private/CSGroundShaperField.ush"
+
+float2 GroundOriginXY;    // 格点 (0,0) 的世界 XY
+float  GroundCellSize;
+float  GroundBaseZ;       // 地面 actor 的世界 Z（镜像高度是相对它的）
+uint   GroundVertsX;
+uint   GroundVertsY;
+uint4  GroundRegion;      // 更新矩形的格点闭区间 (x0, y0, x1, y1)
+
+/** 格点索引版：本 kernel 逐顶点工作，换算一次坐标即可，公式仍是共享的那一份。 */
+float GroundShaperHeightAt(uint X, uint Y)
+{
+	return GroundShaperHeightAtXY(GroundOriginXY + float2(float(X), float(Y)) * GroundCellSize);
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void DisplaceGroundShapersCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint Thread = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (Thread >= ThreadCount) return;
+
+	const uint RegionW = GroundRegion.z - GroundRegion.x + 1u;
+	const uint X = GroundRegion.x + (Thread % RegionW);
+	const uint Y = GroundRegion.y + (Thread / RegionW);
+	if (X >= GroundVertsX || Y >= GroundVertsY || Y > GroundRegion.w) return;
+
+	const uint V = Y * GroundVertsX + X;
+	if (V >= InMeshCounters[0]) return;
+
+	RW_Positions[V * 3u + 2u] = GroundBaseZ + GroundShaperHeightAt(X, Y);
+
+	// 中心差分；边界退化为单侧（除数随之变），与 CPU 侧 clamp 写法逐字对应。
+	const uint XPrev = X > 0u ? X - 1u : 0u;
+	const uint XNext = min(X + 1u, GroundVertsX - 1u);
+	const uint YPrev = Y > 0u ? Y - 1u : 0u;
+	const uint YNext = min(Y + 1u, GroundVertsY - 1u);
+	const float DxSpan = GroundCellSize * float(max(XNext - XPrev, 1u));
+	const float DySpan = GroundCellSize * float(max(YNext - YPrev, 1u));
+	const float DzDx = (GroundShaperHeightAt(XNext, Y) - GroundShaperHeightAt(XPrev, Y)) / DxSpan;
+	const float DzDy = (GroundShaperHeightAt(X, YNext) - GroundShaperHeightAt(X, YPrev)) / DySpan;
+
+	const float3 N = SafeNormal(float3(-DzDx, -DzDy, 1.0f));
+	const float3 TanX = SafeNormal(cross(float3(0.0f, 1.0f, 0.0f), N));   // 同 BuildSnapshotFromMirror
+	RW_Tangents[V * 2u + 0u] = PackSnorm8888(float4(SafeNormal(TanX - N * dot(TanX, N)), 0.0f));
+	RW_Tangents[V * 2u + 1u] = PackSnorm8888(float4(N, 1.0f));
 }

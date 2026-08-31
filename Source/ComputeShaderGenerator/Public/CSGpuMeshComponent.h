@@ -6,6 +6,7 @@
 #include "CSGpuMeshComponent.generated.h"
 
 class UMaterialInterface;
+struct FMeshDescription;   // BuildGpuMeshDescription 的 out 参数；unity 构建下靠邻居 TU 的 include 兜住，单文件编译会露馅
 
 /**
  * Abstract base for components that draw a GPU-generated mesh directly through the
@@ -57,15 +58,6 @@ public:
 	static UMaterialInterface* GetDefaultSurfaceMaterial();
 
 	/**
-	 * 由 GPU 回读快照装配 LOD0 的 FMeshDescription。支持索引网格（顶点数 != 角点数）、
-	 * per-corner 属性与 per-triangle 材质槽。不触碰任何资产系统。
-	 */
-	static bool BuildMeshDescription(
-		const FCSGpuMeshCPUData& MeshData,
-		const FCSGpuMeshConvertOptions& Options,
-		FMeshDescription& OutMeshDescription);
-
-	/**
 	 * 由 GPU 回读快照产出 UStaticMesh。Materials 为空槽时按 Options 兜底默认材质。
 	 * bTransient 时在 Outer 下建临时网格（不提交 MeshDescription，省下每网格约 1.5 GiB 常驻）；
 	 * 否则建成资产并标脏，bSaveToDisk 决定是否立即写盘。
@@ -91,6 +83,14 @@ public:
 		bool bConvertToActorLocalSpace,
 		FMeshDescription& OutMeshDescription);
 
+private:
+	// BuildStaticMesh 的两个落地分支。它们只被上面那个分发器调用（同类、同一个 .cpp），
+	// 对外暴露只会让人以为存在第二条合法入口——落盘的策略位（transient? 烘焙空间? 材质来源?）
+	// 全在 BuildStaticMesh 里合成，绕过它直接调这两个就会绕过那些合成。
+	//
+	// 包/资产生命周期（路径校验、删旧、建包、注册、写盘）已抽到 CSStaticMeshAssetSink.h，
+	// 由这里和 DynamicMesh 侧共用；这两个函数剩下的只是"喂什么数据进去"。
+
 	/** Builds a transient UStaticMesh directly from a final GPU readback snapshot. */
 	static UStaticMesh* BuildTransientStaticMesh(
 		UObject* Outer,
@@ -101,30 +101,18 @@ public:
 		bool bEnableNanite = false);
 
 #if WITH_EDITOR
-	/** Builds "<OwnerActor's level folder>/AutoResult/SM_<owner><NameSuffix>". Producers that emit
-	 *  more than one result from the same actor (an intermediate stage and the final mesh, or
-	 *  repeated runs) must pass distinct suffixes — a timestamp works — otherwise each run
-	 *  replaces the previous asset.
-	 *  Returns an empty string when the owning level has no content path (unsaved map). */
-	static FString BuildResultAssetPath(
-		const AActor* OwnerActor,
-		const FString& NameSuffix = FString());
-
 	/** Saves an already-read-back GPU mesh snapshot as a StaticMesh asset, preserving every
 	 *  material slot. With an empty AssetPathAndName the location defaults to an "AutoResult" folder
-	 *  next to OwnerActor's level (e.g. level /Game/Maps/L_Foo -> /Game/Maps/AutoResult/SM_<owner>).
-	 *  The asset and its package are always marked dirty; bSaveAsset additionally writes it to
-	 *  disk (default false = leave it dirty for a manual Save-All). */
+	 *  next to OwnerActor's level (e.g. level /Game/Maps/L_Foo -> /Game/Maps/AutoResult/SM_<owner>). */
 	static UStaticMesh* SaveGpuMeshDataToStaticMesh(
 		const AActor* OwnerActor,
 		const FCSGpuMeshCPUData& MeshData,
 		const TArray<UMaterialInterface*>& Materials,
 		const FTransform& ActorTransform,
-		bool bConvertToActorLocalSpace = true,
-		const FString& AssetPathAndName = FString(),
-		bool bReplaceExistingAsset = true,
-		bool bSaveAsset = false,
-		bool bEnableNanite = false);
-
+		bool bConvertToActorLocalSpace,
+		const FString& AssetPathAndName,
+		bool bReplaceExistingAsset,
+		bool bSaveAsset,
+		bool bEnableNanite);
 #endif
 };

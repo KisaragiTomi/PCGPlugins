@@ -140,10 +140,14 @@ uint64 ResolveStaticMeshTriangleRequests(
 	bool bPreserveSourceMaterialSlots = true);
 
 // [game thread] 枚举 QueryBox 内的 static mesh component，生成提取 request。
+// RequiredActorTags 非空时在枚举阶段就跳过不带任一 tag 的 actor——放到 request 建完再筛，
+// 盒内未带 tag 的大型 instanced 组件会先展开成海量 per-instance request（各自拷贝材质槽表）
+// 再被整批丢弃，白付一次峰值内存。NAME_None 条目永不匹配（与收集器的既有约定一致）。
 void BuildBoxSceneTriangleRequestsInternal(UWorld* World,
 	const FBox& QueryBox,
 	int32 LODIndex,
-	TArray<FCSStaticMeshTriangleRequest>& OutRequests);
+	TArray<FCSStaticMeshTriangleRequest>& OutRequests,
+	const TArray<FName>& RequiredActorTags = TArray<FName>());
 
 // [game thread] Landscape 高度场 CPU 提取为 triangle soup（世界坐标）。细节见定义处注释。
 void BuildBoxSceneLandscapeTrianglesInternal(UWorld* World,
@@ -156,6 +160,18 @@ void BuildBoxSceneLandscapeTrianglesInternal(UWorld* World,
 	const FVector* LocalBoxExtent = nullptr,
 	FName RequiredActorTag = NAME_None,
 	bool bSortComponentsByDistance = true);
+
+// [render thread] 轻量高度图光栅化：resolved request 的 index/position buffer 直读，逐网格
+// dispatch 融合 kernel 打进一张共享 uint 深度图，最后按 min 合并进 OutputHeightmap
+//（空 texel 保留输出现值）。全程不建 triangle soup，是 AddResolvedStaticMeshTrianglesToRDGInternal
+// 的"只要高度"替代——soup 的顶点/法线/UV/材质 buffer 对深度捕获全是死重。
+void RasterizeResolvedMeshesToHeightmapRDG(
+	FRDGBuilder& GraphBuilder,
+	FRHICommandListImmediate& RHICmdList,
+	const TArray<FResolvedStaticMeshTriangleRequest>& ResolvedRequests,
+	FRDGTextureRef OutputHeightmap,
+	const FBox& WorldBounds,
+	float CameraHeight);
 
 // [render thread] 核心 RDG 提取管线：resolved request + landscape/initial 三角 + Nanite 源三角
 // → 统一 triangle soup buffer 组。

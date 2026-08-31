@@ -1,6 +1,9 @@
 #include "CSMesh.h"
 
+#include <atomic>
+
 #include "CSGpuMemoryBudget.h"
+#include "Async/Async.h"
 #include "Materials/MaterialInterface.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
@@ -10,6 +13,17 @@
 #include "RHIGPUReadback.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogCSMesh, Log, All);
+
+// 阻塞刷新的进程级计数器。每一次 FlushRenderingCommands 都要走 CSMesh_CountedFlush ——
+// 直接调 FlushRenderingCommands 会让计数器悄悄失真，而它正是"交互热路径零设备同步"这条
+// 纪律唯一的自动化防线。
+static std::atomic<int64> GCSMeshBlockingFlushCount{ 0 };
+
+static void CSMesh_CountedFlush()
+{
+	GCSMeshBlockingFlushCount.fetch_add(1, std::memory_order_relaxed);
+	FlushRenderingCommands();
+}
 
 namespace
 {
@@ -94,12 +108,13 @@ FRDGBufferDesc CSMesh_MakeStreamBufferDesc(const FCSGpuStreamDesc& Desc, uint32 
 /** The resident set's standard descriptors. Both extras are forced on rather than exposed:
  *  every operator in CSMeshOps requires the material-id stream, and a retained mesh that ends
  *  up being saved wants its vertex colours to survive the trip. */
-void CSMesh_BuildStandardDescs(TArray<FCSGpuStreamDesc>& OutDescs, uint32 NumIndirectDraws)
+void CSMesh_BuildStandardDescs(TArray<FCSGpuStreamDesc>& OutDescs, uint32 NumIndirectDraws, uint32 NumTexCoordSets = 1)
 {
 	CSGpuMeshStreams::FStandardStreamOptions Options;
 	Options.NumIndirectDraws = FMath::Max(NumIndirectDraws, 1u);
 	Options.bMaterialIds = true;
 	Options.bReadbackColors = true;
+	Options.NumTexCoordSets = FMath::Clamp(NumTexCoordSets, 1u, 4u);
 	CSGpuMeshStreams::BuildStandardTriangleStreamDescs(OutDescs, Options);
 }
 
@@ -465,7 +480,9 @@ void FCSMeshEditContext::RestoreStreamAccess()
 		if (!Buffer) continue;
 
 		const ECSGpuStreamRole Role = Resident.Streams[Index].Desc.Role;
-		if (Kind == EKind::OwnedGraph) CSGpuMeshStreams::SetStreamAccessFinal(GraphBuilder, Buffer, Role);
+		// Both owned-graph kinds transition at the end of the graph they own; only the fence after
+		// it differs, and RDG knows nothing about that.
+		if (Kind != EKind::BorrowedGraph) CSGpuMeshStreams::SetStreamAccessFinal(GraphBuilder, Buffer, Role);
 		// The consumers of a borrowed graph's streams — the vertex factory's raw SRVs, the index
 		// buffer binding, the DrawIndexedIndirect args — are things RDG knows nothing about, reached
 		// by passes later in the very graph this edit is adding to. SetBufferAccessFinal would
@@ -546,6 +563,57 @@ FCSMeshRenderThreadEdit::~FCSMeshRenderThreadEdit()
 
 namespace CSMeshReadback
 {
+bool ReadUintBufferSync(const TRefCountPtr<FRDGPooledBuffer>& Buffer, uint32 NumUints,
+	ECSGpuStreamRole FinalAccessRole, TArray<uint32>& OutValues)
+{
+	OutValues.Reset();
+	if (!IsInGameThread() || !Buffer.IsValid() || NumUints == 0) return false;
+
+	const uint32 Bytes = NumUints * sizeof(uint32);
+	FRHIGPUBufferReadback* Readback = new FRHIGPUBufferReadback(TEXT("CSMesh.UintReadback"));
+	TRefCountPtr<FRDGPooledBuffer> Pooled = Buffer;
+	ENQUEUE_RENDER_COMMAND(CSMeshEnqueueUintReadback)(
+		[Pooled, Readback, Bytes, FinalAccessRole](FRHICommandListImmediate& RHICmdList)
+		{
+			FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("CSMesh.ReadbackUints"));
+			FRDGBufferRef Ref = GraphBuilder.RegisterExternalBuffer(Pooled);
+			AddEnqueueCopyPass(GraphBuilder, Readback, Ref, Bytes);
+			// 读完必须放回常态访问状态，理由逐字见头文件那段注释。
+			CSGpuMeshStreams::SetStreamAccessFinal(GraphBuilder, Ref, FinalAccessRole);
+			GraphBuilder.Execute();
+		});
+	// 诊断回读按设计就是阻塞的，但也要计数 —— 计数器要么数到每一次阻塞，要么就不能拿它当证据。
+	// （零阻塞的测量窗口里不该出现任何 Debug*Sync，真出现了就该报红。）
+	CSMesh_CountedFlush();
+
+	bool bRead = false;
+	TArray<uint32> Values;
+	ENQUEUE_RENDER_COMMAND(CSMeshConsumeUintReadback)(
+		[Readback, Bytes, NumUints, &Values, &bRead](FRHICommandListImmediate& RHICmdList)
+		{
+			if (!Readback->IsReady()) RHICmdList.SubmitAndBlockUntilGPUIdle();
+			if (Readback->IsReady() && Readback->GetGPUSizeBytes() >= uint64(Bytes))
+			{
+				if (const uint32* Data = static_cast<const uint32*>(Readback->Lock(Bytes)))
+				{
+					Values.Append(Data, int32(NumUints));
+					Readback->Unlock();
+					bRead = true;
+				}
+			}
+			delete Readback;
+		});
+	CSMesh_CountedFlush();
+
+	if (!bRead)
+	{
+		UE_LOG(LogCSMesh, Warning, TEXT("[CSMesh] Readback failed: uint buffer readback did not complete."));
+		return false;
+	}
+	OutValues = MoveTemp(Values);
+	return true;
+}
+
 bool ReadCountersSync(const FCSMeshResident& Resident, uint32& OutVertexCount, uint32& OutIndexCount)
 {
 	OutVertexCount = 0;
@@ -570,7 +638,7 @@ bool ReadCountersSync(const FCSMeshResident& Resident, uint32& OutVertexCount, u
 			CSGpuMeshStreams::SetStreamAccessFinal(GraphBuilder, CountersRDG, ECSGpuStreamRole::MeshCounters);
 			GraphBuilder.Execute();
 		});
-	FlushRenderingCommands();
+	CSMesh_CountedFlush();
 
 	uint32 VertexCount = 0;
 	uint32 IndexCount = 0;
@@ -591,7 +659,7 @@ bool ReadCountersSync(const FCSMeshResident& Resident, uint32& OutVertexCount, u
 			}
 			delete CountersReadback;
 		});
-	FlushRenderingCommands();
+	CSMesh_CountedFlush();
 
 	if (!bRead)
 	{
@@ -674,7 +742,7 @@ bool ReadbackResidentSync(const FCSMeshResident& Resident, FCSGpuMeshCPUData& Ou
 			}
 			GraphBuilder.Execute();
 		});
-	FlushRenderingCommands();
+	CSMesh_CountedFlush();
 
 	// --- 3) lock each stream and fill the CPU snapshot by semantic
 	OutMeshData.Positions.SetNumUninitialized(VertexCount);
@@ -797,7 +865,7 @@ bool ReadbackResidentSync(const FCSMeshResident& Resident, FCSGpuMeshCPUData& Ou
 
 			for (const FReadStream& Read : ReadStreams) delete Read.Readback;
 		});
-	FlushRenderingCommands();
+	CSMesh_CountedFlush();
 
 	if (!bMeshRead)
 	{
@@ -871,7 +939,7 @@ void UCSMesh::ReleaseSync()
 	FCSMeshResident* ResidentPtr = Resident.Get();
 	ENQUEUE_RENDER_COMMAND(CSMeshRelease)(
 		[ResidentPtr](FRHICommandListImmediate&) { ResidentPtr->ReleaseBuffers(); });
-	FlushRenderingCommands();
+	CSMesh_CountedFlush();
 	Resident->VertexCapacity = 0;
 	Resident->IndexCapacity = 0;
 	Resident->WorldBounds = FBox(ForceInit);
@@ -951,10 +1019,84 @@ bool UCSMesh::EditMeshSync(TFunctionRef<void(FCSMeshEditContext&)> EditFunc)
 			EditFunc(Context);
 			CSMesh_FinalizeGraph(GraphBuilder, Context);
 		});
-	FlushRenderingCommands();
+	CSMesh_CountedFlush();
 
 	++Resident->Generation;
 	OnMeshChanged.Broadcast(this);
+	return true;
+}
+
+int64 UCSMesh::GetBlockingFlushCount()
+{
+	return GCSMeshBlockingFlushCount.load(std::memory_order_relaxed);
+}
+
+void UCSMesh::CountedBlockingFlush()
+{
+	// 计数器是 file-local static，别的 TU 够不着；这条是它们唯一的入口。
+	// unity 构建里别的 TU **恰好**能看见 GCSMeshBlockingFlushCount，
+	// 直接引用它会在非 unity（-SingleFile）下才炸 —— 所以只能走这个函数。
+	CSMesh_CountedFlush();
+}
+
+bool UCSMesh::EditMeshAsync(TFunction<void(FCSMeshEditContext&)> EditFunc, TFunction<void(bool)> OnComplete)
+{
+	if (!IsInGameThread())
+	{
+		UE_LOG(LogCSMesh, Warning, TEXT("[CSMesh] Async edit rejected: not on the game thread."));
+		return false;
+	}
+	if (!Resident.IsValid() || !Resident->IsAllocated())
+	{
+		UE_LOG(LogCSMesh, Warning, TEXT("[CSMesh] Async edit rejected: the mesh has no GPU allocation (call EnsureCapacitySync first)."));
+		return false;
+	}
+	if (bAsyncEditInFlight)
+	{
+		UE_LOG(LogCSMesh, Warning, TEXT("[CSMesh] Async edit rejected: one is already in flight on this mesh."));
+		return false;
+	}
+	if (!EditFunc)
+	{
+		UE_LOG(LogCSMesh, Warning, TEXT("[CSMesh] Async edit rejected: no operator was supplied."));
+		return false;
+	}
+
+	bAsyncEditInFlight = true;
+
+	// A shared ref, not the raw pointer EditMeshSync hands over: without the flush, this UCSMesh can
+	// be collected before the graph runs, and the resident set has to outlive the edit that writes
+	// it. The weak pointer is only for the game-thread tail, which touches the UObject.
+	FCSMeshResidentRef ResidentRef = Resident;
+	TWeakObjectPtr<UCSMesh> WeakThis(this);
+
+	ENQUEUE_RENDER_COMMAND(CSMeshEditAsync)(
+		[ResidentRef, WeakThis, EditFunc = MoveTemp(EditFunc), OnComplete = MoveTemp(OnComplete)](FRHICommandListImmediate& RHICmdList) mutable
+		{
+			{
+				FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("CSMesh.EditAsync"));
+				FCSMeshEditContext Context(GraphBuilder, *ResidentRef, FCSMeshEditContext::EKind::OwnedGraphAsync);
+				EditFunc(Context);
+				CSMesh_FinalizeGraph(GraphBuilder, Context);
+			}
+
+			// Generation, OnMeshChanged and the caller's callback are all game-thread state, and this
+			// hop is what fences the counts the operator just published: it is enqueued after the
+			// graph executed, so anything the game thread reads from inside it is already written.
+			AsyncTask(ENamedThreads::GameThread, [ResidentRef, WeakThis, OnComplete = MoveTemp(OnComplete)]() mutable
+			{
+				++ResidentRef->Generation;
+
+				UCSMesh* Mesh = WeakThis.Get();
+				if (Mesh)
+				{
+					Mesh->bAsyncEditInFlight = false;
+					Mesh->OnMeshChanged.Broadcast(Mesh);
+				}
+				if (OnComplete) OnComplete(Mesh != nullptr);
+			});
+		});
+
 	return true;
 }
 
@@ -1020,7 +1162,7 @@ bool UCSMesh::AllocateSync(uint32 InVertexCapacity, uint32 InIndexCapacity)
 			CSMesh_AddClearCountersPasses(Context);
 			CSMesh_FinalizeGraph(GraphBuilder, Context);
 		});
-	FlushRenderingCommands();
+	CSMesh_CountedFlush();
 
 	ResidentPtr->WorldBounds = FBox(ForceInit);
 	++ResidentPtr->Generation;
@@ -1055,7 +1197,7 @@ bool UCSMesh::EnsureCapacitySync(int32 InVertexCapacity, int32 InIndexCapacity)
 		{
 			CSMesh_ReallocateResident(RHICmdList, *ResidentPtr, TargetVertices, TargetIndices);
 		});
-	FlushRenderingCommands();
+	CSMesh_CountedFlush();
 
 	++ResidentPtr->Generation;
 	OnMeshChanged.Broadcast(this);
@@ -1114,7 +1256,7 @@ bool UCSMesh::ShrinkCapacitySync(int32 InVertexCapacity, int32 InIndexCapacity, 
 		{
 			CSMesh_ReallocateResident(RHICmdList, *ResidentPtr, TargetVertices, TargetIndices);
 		});
-	FlushRenderingCommands();
+	CSMesh_CountedFlush();
 
 	++ResidentPtr->Generation;
 	OnMeshChanged.Broadcast(this);
@@ -1135,7 +1277,7 @@ bool UCSMesh::SetStreamLayoutSync(const FCSMeshStreamLayout& Layout)
 	// Build and validate the whole declaration before touching the mesh: half an applied layout
 	// on an allocated mesh is a buffer set nothing can draw from.
 	TArray<FCSGpuStreamDesc> Descs;
-	CSMesh_BuildStandardDescs(Descs, NumIndirectDraws);
+	CSMesh_BuildStandardDescs(Descs, NumIndirectDraws, Layout.NumTexCoordSets);
 	for (const FCSGpuStreamDesc& Extra : Layout.ExtraStreams) if (!CSMesh_AppendUniqueStreamDesc(Descs, Extra)) return false;
 
 	// Re-declaring the same layout is how a consumer binds without having to know whether it is
@@ -1168,7 +1310,7 @@ bool UCSMesh::SetStreamLayoutSync(const FCSMeshStreamLayout& Layout)
 		{
 			CSMesh_ReallocateResidentWithDescs(RHICmdList, *ResidentPtr, Descs, VertexCapacity, IndexCapacity);
 		});
-	FlushRenderingCommands();
+	CSMesh_CountedFlush();
 
 	++ResidentPtr->Generation;
 	OnMeshChanged.Broadcast(this);
@@ -1268,7 +1410,7 @@ bool UCSMesh::ResizeStreamsSync(const TArray<FCSMeshStreamResize>& Resizes)
 		{
 			CSMesh_ReallocateStreams(RHICmdList, *ResidentPtr, Reallocate);
 		});
-	FlushRenderingCommands();
+	CSMesh_CountedFlush();
 
 	++ResidentPtr->Generation;
 	OnMeshChanged.Broadcast(this);
@@ -1322,7 +1464,7 @@ bool UCSMesh::EnsureIndirectDrawCapacitySync(int32 NumArgSets)
 		{
 			CSMesh_ReallocateIndirectArgs(RHICmdList, *ResidentPtr, WantSets);
 		});
-	FlushRenderingCommands();
+	CSMesh_CountedFlush();
 
 	++ResidentPtr->Generation;
 	OnMeshChanged.Broadcast(this);

@@ -1,0 +1,362 @@
+<svg viewBox="0 0 1360 1160" width="1360" height="1160" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Microsoft YaHei, sans-serif">
+  <defs>
+    <pattern id="autoobject-dot-bg" patternUnits="userSpaceOnUse" width="12" height="12">
+      <rect width="12" height="12" fill="#cffafe"/>
+      <circle cx="3" cy="3" r="1.25" fill="#0891b2" opacity="0.256281"/>
+      <circle cx="9" cy="9" r="1.25" fill="#0891b2" opacity="0.256281"/>
+    </pattern>
+    <pattern id="buffer-owner-stripe-bg" patternUnits="userSpaceOnUse" width="10" height="10">
+      <rect width="10" height="10" fill="#e2e8f0"/>
+      <rect y="1" width="10" height="2" fill="#334155" opacity="0.291429"/>
+      <rect y="6" width="10" height="1.5" fill="#334155" opacity="0.291429"/>
+    </pattern>
+    <pattern id="csmesh-resident-cross-bg" patternUnits="userSpaceOnUse" width="12" height="12">
+      <rect width="12" height="12" fill="#f3e8ff"/>
+      <path d="M0 6H12" stroke="#7c3aed" stroke-width="1" opacity="0.293103"/>
+      <path d="M6 0V12" stroke="#7c3aed" stroke-width="1" opacity="0.293103"/>
+    </pattern>
+    <pattern id="readback-dot-bg" patternUnits="userSpaceOnUse" width="12" height="12">
+      <rect width="12" height="12" fill="#ede9fe"/>
+      <circle cx="3" cy="3" r="1.25" fill="#7c3aed" opacity="0.291429"/>
+      <circle cx="9" cy="9" r="1.25" fill="#7c3aed" opacity="0.291429"/>
+    </pattern>
+
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#475569"/>
+    </marker>
+    <marker id="arrowo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#b45309"/>
+    </marker>
+    <marker id="arrowr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#b91c1c"/>
+    </marker>
+    <marker id="arrowv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#7c3aed"/>
+    </marker>
+  </defs>
+
+  <style>
+    .title   { font-size: 17px; font-weight: 700; fill: #0f172a; }
+    .sub     { font-size: 11.5px; fill: #475569; }
+    .panel   { fill: #ffffff; stroke: #94a3b8; stroke-width: 1; }
+    .phead   { fill: #e2e8f0; stroke: #94a3b8; stroke-width: 1; }
+    .ptext   { font-size: 12px; font-weight: 700; fill: #0f172a; }
+    .h       { font-size: 10.5px; font-weight: 700; fill: #0f172a; }
+    .t       { font-size: 9.5px;  fill: #334155; }
+    .s       { font-size: 9px;    fill: #64748b; }
+    .warn    { font-size: 9.5px;  fill: #b91c1c; }
+    .good    { font-size: 9.5px;  fill: #0e7490; }
+    .box     { fill: #f8fafc; stroke: #64748b; stroke-width: 1; }
+    .card    { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1; }
+    .core    { fill: url(#autoobject-dot-bg); stroke: #0e7490; stroke-width: 1.6; }
+    .owner   { fill: url(#buffer-owner-stripe-bg); stroke: #475569; stroke-width: 1; }
+    .resident{ fill: url(#csmesh-resident-cross-bg); stroke: #7c3aed; stroke-width: 1; }
+    .readback{ fill: url(#readback-dot-bg); stroke: #7c3aed; stroke-width: 1; stroke-dasharray: 4 3; }
+    .flow    { stroke: #475569; stroke-width: 1.4; fill: none; marker-end: url(#arrow); }
+    .flowv   { stroke: #7c3aed; stroke-width: 1.1; fill: none; stroke-dasharray: 4 3; marker-end: url(#arrowv); }
+    .grid    { stroke: #94a3b8; stroke-width: 1; fill: none; }
+    .gridin  { stroke: #cbd5e1; stroke-width: 1; fill: none; }
+    .level   { stroke: #0e7490; stroke-width: 2; fill: none; }
+    .leveld  { stroke: #0e7490; stroke-width: 1.4; fill: none; stroke-dasharray: 5 3; }
+    .chord   { stroke: #b45309; stroke-width: 1.8; fill: none; stroke-dasharray: 6 3; }
+    .road    { fill: #b45309; opacity: 0.13; }
+    .block   { fill: #cbd5e1; stroke: #334155; stroke-width: 1.2; }
+    .block2  { fill: #e8edf3; stroke: #64748b; stroke-width: 1; }
+    .blockx  { fill: #fee2e2; stroke: #b91c1c; stroke-width: 1.2; }
+    .axo     { stroke: #b45309; stroke-width: 1.6; fill: none; marker-end: url(#arrowo); }
+    .bad     { stroke: #b91c1c; stroke-width: 1.6; fill: none; stroke-dasharray: 4 3; }
+    .badm    { stroke: #b91c1c; stroke-width: 1.4; fill: none; marker-end: url(#arrowr); }
+    .hi      { fill: #ffffff; stroke: #0e7490; stroke-width: 1.6; }
+    .lo      { fill: #ffffff; stroke: #94a3b8; stroke-width: 1.4; }
+    .nodex   { fill: #ffffff; stroke: #b91c1c; stroke-width: 1.3; }
+    .nodeh   { fill: #cffafe; stroke: #0e7490; stroke-width: 1.5; }
+    .pebble  { fill: #b45309; stroke: #78350f; stroke-width: 0.8; }
+  </style>
+
+  <text x="26" y="30" class="title">CSGroundStairs：石阶的 GPU 逻辑（marching squares · 100% GPU 决策 · 零回读）</text>
+  <text x="26" y="49" class="sub">一线程一格，从解析高度场直接推导等值线段，每段出一级石阶并直接写 packed 实例行。CPU 全程不知道有几级台阶 —— 不排记录、不求曲线、不回读一个字节。</text>
+
+  <!-- ============================================================ 带 1：管线 -->
+  <rect x="24" y="62" width="1312" height="202" rx="6" class="panel"/>
+  <rect x="24" y="62" width="1312" height="26" rx="6" class="phead"/>
+  <text x="38" y="80" class="ptext">① 管线：CPU 只递交「扫哪块矩形、格多大、阈值多少」，实例数只有 GPU 知道</text>
+
+  <rect x="556" y="96" width="182" height="46" rx="5" class="resident"/>
+  <text x="566" y="114" class="h">GroundResident 常驻色流</text>
+  <text x="566" y="131" class="t">道路权重 = 笔刷双写的权威投影</text>
+
+  <rect x="750" y="96" width="182" height="46" rx="5" class="box"/>
+  <text x="760" y="114" class="h">ShaperParams float4[]</text>
+  <text x="760" y="131" class="t">塑形物场：解析高度，不采图</text>
+
+  <path d="M647 142 L664 160" class="flow"/>
+  <path d="M841 142 L812 160" class="flow"/>
+
+  <rect x="36" y="162" width="176" height="62" rx="5" class="box"/>
+  <text x="46" y="180" class="h">ACSGroundActor</text>
+  <text x="46" y="196" class="t">::RebuildStairs()</text>
+  <text x="46" y="212" class="s">注册 / 加载 / 改配置 / 每 dab</text>
+
+  <rect x="228" y="162" width="186" height="62" rx="5" class="owner"/>
+  <text x="238" y="180" class="h">EnsureBuffers()</text>
+  <text x="238" y="196" class="t">容量一次定死，只涨不缩</text>
+  <text x="238" y="212" class="s">交互期一次 enqueue 都不发</text>
+
+  <rect x="430" y="162" width="160" height="62" rx="5" class="box"/>
+  <text x="440" y="180" class="h">Scan()</text>
+  <text x="440" y="196" class="t">清零 counter → 1 dispatch</text>
+  <text x="440" y="212" class="s">录完 pass 即返回，不阻塞</text>
+
+  <rect x="606" y="162" width="246" height="62" rx="5" class="core"/>
+  <text x="616" y="180" class="h">ScanGroundStairsCS</text>
+  <text x="616" y="196" class="t">一线程一格（8×8 线程组）</text>
+  <text x="616" y="212" class="s">CPU 全程不知道有几级台阶</text>
+
+  <rect x="868" y="162" width="222" height="62" rx="5" class="owner"/>
+  <text x="878" y="180" class="h">PackedInstances（5 行/实例）</text>
+  <text x="878" y="196" class="t">Counter[0] = 活跃数</text>
+  <text x="878" y="212" class="s">越界静默丢弃（容量恒定）</text>
+
+  <rect x="1106" y="162" width="218" height="62" rx="5" class="box"/>
+  <text x="1116" y="180" class="h">UCSGpuInstancedMesh</text>
+  <text x="1116" y="196" class="t">SetInstanceSourceGPU</text>
+  <text x="1116" y="212" class="s">石子：另一网格 ⇒ 另一套组件</text>
+
+  <path d="M212 193 H226" class="flow"/>
+  <path d="M414 193 H428" class="flow"/>
+  <path d="M590 193 H604" class="flow"/>
+  <path d="M852 193 H866" class="flow"/>
+  <path d="M1090 193 H1104" class="flow"/>
+
+  <rect x="36" y="230" width="800" height="28" rx="5" class="readback"/>
+  <text x="46" y="248" class="t">DebugReadInstancesSync()：仅测试 / 诊断的阻塞回读 —— 运行路径一个字节都不读，摆位判定全在 GPU 上</text>
+  <path d="M978 224 V244 H848" class="flowv"/>
+
+  <!-- ============================================================ 带 2 左：八步 -->
+  <rect x="24" y="276" width="536" height="490" rx="6" class="panel"/>
+  <rect x="24" y="276" width="536" height="26" rx="6" class="phead"/>
+  <text x="38" y="294" class="ptext">② 单格 kernel：ScanGroundStairsCS 的八步</text>
+
+  <rect x="40" y="314" width="504" height="40" rx="4" class="card"/>
+  <text x="52" y="331" class="h">① 四角高度</text>
+  <text x="52" y="347" class="t">GroundShaperHeightAtXY(P) 解析求值 —— 不采 heightmap（TG 要采）</text>
+
+  <rect x="40" y="360" width="504" height="40" rx="4" class="card"/>
+  <text x="52" y="377" class="h">② 两道早退</text>
+  <text x="52" y="393" class="t">L1 &lt; L0（整格落在同一层区间）→ return；格心道路权重 &lt; 阈值 → return</text>
+
+  <rect x="40" y="406" width="504" height="40" rx="4" class="card"/>
+  <text x="52" y="423" class="h">③ 层循环</text>
+  <text x="52" y="439" class="t">L0 = ⌊HMin/Step⌋+1 … L1 = ⌊HMax/Step⌋，再按 StairMaxLayers 钳位</text>
+
+  <rect x="40" y="452" width="504" height="40" rx="4" class="card"/>
+  <text x="52" y="469" class="h">④ marching squares</text>
+  <text x="52" y="485" class="t">Case 四位；min(Case, 15−Case) 收成六支；Case 5/10 鞍点看格心消歧</text>
+
+  <rect x="40" y="498" width="504" height="40" rx="4" class="card"/>
+  <text x="52" y="515" class="h">⑤ 解穿越点</text>
+  <text x="52" y="531" class="t">CSStairs_SolveEdge：线性插值 + 2 次割线精化 → 弦的两端 A、B</text>
+
+  <rect x="40" y="544" width="504" height="40" rx="4" class="card"/>
+  <text x="52" y="561" class="h">⑥ 组正交基</text>
+  <text x="52" y="577" class="t">Z = 世界 +Z（踏面必水平）、Y = 切线、X = Z×Y 并按 −∇h 定向到下坡</text>
+
+  <rect x="40" y="590" width="504" height="40" rx="4" class="card"/>
+  <text x="52" y="607" class="h">⑦ S2 逐实例抖动</text>
+  <text x="52" y="623" class="t">种子 = 格身份 CellSeed(Cell, L, Seg, Salt)，不是 InterlockedAdd 的槽位</text>
+
+  <rect x="40" y="636" width="504" height="40" rx="4" class="card"/>
+  <text x="52" y="653" class="h">⑧ 领槽 + 写行</text>
+  <text x="52" y="669" class="t">InterlockedAdd → 越界静默丢弃 → 5 行 packed；再按 15% 撒一颗石子</text>
+
+  <rect x="40" y="690" width="504" height="60" rx="4" class="box"/>
+  <text x="52" y="708" class="warn">⚠️ 格边长必须 ≈ 石阶长度（StairCellSize）</text>
+  <text x="52" y="724" class="t">每条穿越边出一级，间距完全由格密度决定：太密穿模、太疏断续。这正是 TG 把</text>
+  <text x="52" y="740" class="t">contouring 格单开一个维度、而不复用 heightmap 分辨率的原因（本工程地面格 50 cm）。</text>
+
+  <!-- ============================================================ 带 2 右：一格的几何 -->
+  <rect x="572" y="276" width="764" height="490" rx="6" class="panel"/>
+  <rect x="572" y="276" width="764" height="26" rx="6" class="phead"/>
+  <text x="586" y="294" class="ptext">③ 一格里发生了什么：等值线段 → 一级石阶</text>
+
+  <text x="586" y="322" class="t">扫描格铺在合成后的高度场上（全部塑形物重叠取 max）。等值线在两座相接土台的接缝处只是普通的一格 —— 旧路的星形闭式解正是在那里断掉。</text>
+  <text x="586" y="344" class="s">高 ←—— 上坡</text>
+  <text x="1326" y="344" class="s" text-anchor="end">下坡 ——→ 低</text>
+  <rect x="586" y="358" width="16" height="10" class="road"/>
+  <rect x="586" y="358" width="16" height="10" fill="none" stroke="#b45309" stroke-width="0.6"/>
+  <text x="608" y="368" class="t">道路权重 ≥ StairRoadThreshold 的格才长石阶（与 D6 门洞同一种语言）</text>
+
+  <path d="M660 392 C 780 378, 900 400, 1080 386 L 1080 646 C 940 656, 800 614, 660 592 Z" class="road"/>
+
+  <rect x="660" y="400" width="420" height="280" class="grid" fill="none"/>
+  <path d="M800 400 V680 M940 400 V680 M660 540 H1080" class="gridin"/>
+
+  <rect x="800" y="400" width="140" height="140" fill="#ecfeff" opacity="0.7"/>
+
+  <!-- 石阶块：焦点格 + 下邻格 + 另一层的两块 -->
+  <g transform="translate(823,472) rotate(-5.71)"><rect x="-15" y="-70" width="30" height="140" rx="2" class="block"/></g>
+  <g transform="translate(833,611) rotate(-2.45)"><rect x="-15" y="-70" width="30" height="140" rx="2" class="block2"/></g>
+  <g transform="translate(971,472) rotate(-5.71)"><rect x="-15" y="-70" width="30" height="140" rx="2" class="block2"/></g>
+  <g transform="translate(982,611) rotate(-2.45)"><rect x="-15" y="-70" width="30" height="140" rx="2" class="block2"/></g>
+
+  <path d="M838 400 C 858 450, 836 500, 852 540 C 866 580, 842 640, 858 680" class="level"/>
+  <path d="M986 400 C 1006 452, 984 502, 1000 540 C 1014 582, 992 640, 1008 680" class="leveld"/>
+
+  <rect x="800" y="400" width="140" height="140" fill="none" stroke="#0e7490" stroke-width="2"/>
+
+  <!-- 弦、穿越点、轴 -->
+  <path d="M838 400 L852 540" class="chord"/>
+  <path d="M845 470 L889 465" class="axo"/>
+  <path d="M845 470 L827 472" class="badm"/>
+  <circle cx="845" cy="470" r="2.6" fill="#334155"/>
+  <circle cx="850" cy="516" r="3.4" class="pebble"/>
+
+  <circle cx="838" cy="400" r="4.5" class="hi"/>
+  <circle cx="852" cy="540" r="4.5" class="hi"/>
+  <circle cx="800" cy="400" r="4" fill="#0e7490"/>
+  <circle cx="800" cy="540" r="4" fill="#0e7490"/>
+  <circle cx="940" cy="400" r="4" class="lo"/>
+  <circle cx="940" cy="540" r="4" class="lo"/>
+
+  <text x="816" y="394" class="good">A</text>
+  <text x="860" y="558" class="good">B（与下邻格共用的穿越点）</text>
+  <text x="895" y="462" class="s">X → 下坡</text>
+  <text x="855" y="494" class="warn">Embed</text>
+  <text x="858" y="520" class="s">15% 石子</text>
+
+  <text x="672" y="458" class="s">整格落在同一层区间</text>
+  <text x="672" y="473" class="s">（L1 &lt; L0）→ return</text>
+  <text x="672" y="626" class="s">格心路权 &lt; 阈值</text>
+  <text x="672" y="641" class="s">→ return</text>
+
+  <text x="806" y="698" class="good">Level = (L+1)·StepHeight</text>
+  <text x="954" y="698" class="good">Level = L·StepHeight</text>
+
+  <!-- 右侧说明 -->
+  <rect x="1100" y="440" width="226" height="86" rx="5" class="box"/>
+  <text x="1110" y="458" class="h">正交基（GPU 组装）</text>
+  <text x="1110" y="474" class="t">Z = 世界 +Z ⇒ 踏面恒水平</text>
+  <text x="1110" y="490" class="t">Y = 等值线切线 = 长度轴</text>
+  <text x="1110" y="506" class="t">X = Z×Y，按 −∇h 翻到下坡</text>
+  <text x="1110" y="521" class="s">段表给的是边序，X 必须自己定向</text>
+
+  <rect x="1100" y="536" width="226" height="60" rx="5" class="box"/>
+  <text x="1110" y="554" class="h">Embed / Rise</text>
+  <text x="1110" y="570" class="t">Embed 用抖动前的最陡方向</text>
+  <text x="1110" y="586" class="t">Rise 随 Z 抖动同步缩放</text>
+
+  <rect x="1100" y="606" width="226" height="74" rx="5" class="box"/>
+  <text x="1110" y="624" class="h">石子（TG 15% 支线）</text>
+  <text x="1110" y="640" class="t">落点 = 弦上随机点 lerp(A,B,r)</text>
+  <text x="1110" y="656" class="t">高度重新求场，不用 Level</text>
+  <text x="1110" y="672" class="s">弦中段真实地面比 Level 低几厘米</text>
+
+  <circle cx="592" cy="716" r="4" fill="#0e7490"/>
+  <text x="602" y="720" class="t">h &gt; Level（上坡侧）</text>
+  <circle cx="716" cy="716" r="4" class="lo"/>
+  <text x="726" y="720" class="t">h &lt; Level（下坡侧）</text>
+  <text x="850" y="720" class="t">相邻格的石阶在共用穿越点上自然接上 —— 这就是换 marching squares 的全部收益</text>
+
+  <text x="586" y="740" class="t">中心差分求 ∇h（不用解析导数）：高度场是「全部塑形物重叠取 max」，接缝处不可导，而接缝正是本次改造要修好的地方。</text>
+  <text x="586" y="758" class="t">SolveEdge 的两次割线精化不是精修而是必需：格 100 cm 比地面格还粗，裙边剖面是 smoothstep，线性插值误差可达十几厘米。</text>
+
+  <!-- ============================================================ ④ 鞍点 -->
+  <rect x="24" y="778" width="430" height="362" rx="6" class="panel"/>
+  <rect x="24" y="778" width="430" height="26" rx="6" class="phead"/>
+  <text x="38" y="796" class="ptext">④ 鞍点消歧（Case 5 / 10）</text>
+
+  <rect x="96" y="828" width="140" height="140" class="grid" fill="#f8fafc"/>
+  <text x="66" y="824" class="s">c3 −</text>
+  <text x="240" y="824" class="s">c2 +</text>
+  <text x="66" y="986" class="s">c0 +</text>
+  <text x="240" y="986" class="s">c1 −</text>
+  <path d="M96 880 Q 130 898, 148 828" class="level"/>
+  <path d="M236 916 Q 202 898, 184 968" class="level"/>
+  <path d="M96 916 Q 140 898, 148 968" class="bad"/>
+  <path d="M236 880 Q 192 898, 184 828" class="bad"/>
+  <circle cx="166" cy="898" r="3" fill="#0f172a"/>
+  <text x="174" y="902" class="s">格心</text>
+
+  <text x="252" y="856" class="good">实线 = 格心判据选中的接法</text>
+  <text x="252" y="874" class="warn">虚线 = 另一种同样自洽的接法</text>
+  <text x="252" y="892" class="warn">接错 ⇒ 两条弧交叉成 X</text>
+  <text x="252" y="918" class="t">格心在层上方 ⇒</text>
+  <text x="252" y="934" class="t">「高」的一侧在中间连通</text>
+
+  <text x="40" y="1012" class="t">四条边全穿，两种接法都自洽 ⇒ 必须消歧。判据取格心高度，</text>
+  <text x="40" y="1028" class="t">与四角同一个解析求值器，不引入第二条真源。</text>
+  <text x="40" y="1054" class="t">16 个 case 成对镜像（Case 与 15−Case 穿越边完全相同、只是</text>
+  <text x="40" y="1070" class="t">内外互换）⇒ 只需按 min(Case, 15−Case) 分六支。</text>
+  <text x="40" y="1096" class="s">TG 那份全展开的 if-else 链，正是它 163 KB 的由来；</text>
+  <text x="40" y="1112" class="s">本 kernel 六支 + 一支鞍点，一张两行的段表就够。</text>
+
+  <!-- ============================================================ ⑤ 长度 -->
+  <rect x="466" y="778" width="430" height="362" rx="6" class="panel"/>
+  <rect x="466" y="778" width="430" height="26" rx="6" class="phead"/>
+  <text x="480" y="796" class="ptext">⑤ 长度必须跟弦长走（S1 → S2 的关键订正）</text>
+
+  <text x="482" y="824" class="s">S1 定长块：长度 ≡ 格距</text>
+
+  <rect x="500" y="838" width="96" height="96" class="grid" fill="#f8fafc"/>
+  <rect x="536" y="838" width="24" height="96" rx="2" class="block"/>
+  <path d="M548 838 V934" class="level"/>
+  <text x="500" y="952" class="good">0°：弦 = 格距 ✓</text>
+
+  <rect x="676" y="838" width="96" height="96" class="grid" fill="#f8fafc"/>
+  <path d="M676 934 L772 838" class="level"/>
+  <g transform="translate(724,886) rotate(45)"><rect x="-12" y="-48" width="24" height="96" rx="2" class="blockx"/></g>
+  <path d="M676 934 L689 921" class="badm"/>
+  <path d="M772 838 L759 851" class="badm"/>
+  <text x="640" y="952" class="warn">45°：弦 = √2·格距 ⇒ 两端各露 0.21·格距</text>
+
+  <text x="482" y="984" class="s">S2 弦长驱动：WantY = max(弦长, 名义) × Bloat × (1 + Jitter·J)</text>
+
+  <rect x="500" y="998" width="96" height="96" class="grid" fill="#f8fafc"/>
+  <path d="M500 1094 L596 998" class="level"/>
+  <g transform="translate(548,1046) rotate(45)"><rect x="-12" y="-70" width="24" height="140" rx="2" class="block"/></g>
+
+  <text x="612" y="1016" class="good">长度跟着弦长伸缩 ⇒ 缝恒为非正</text>
+  <text x="612" y="1034" class="t">末端越过共用点的距离</text>
+  <text x="612" y="1050" class="t">= (k−1)·|A−X| / 2，与拐角无关</text>
+  <text x="612" y="1072" class="warn">抖动只许单侧加长：对称抖会</text>
+  <text x="612" y="1088" class="warn">打破 k ≥ 1，两块同时缩就露缝</text>
+
+  <text x="482" y="1114" class="s">任何常数系数都盖不住一个随走向变化 √2 倍的量 —— 这正是石阶与门框砖的关键差别</text>
+  <text x="482" y="1130" class="s">（门框砖的槽距由 SolveBlockLayout 定成近恒定，×1.1 必然负缝）。</text>
+
+  <!-- ============================================================ ⑥ 随机源 -->
+  <rect x="908" y="778" width="428" height="362" rx="6" class="panel"/>
+  <rect x="908" y="778" width="428" height="26" rx="6" class="phead"/>
+  <text x="922" y="796" class="ptext">⑥ 随机源 = 格身份，不是 InterlockedAdd 的槽位</text>
+
+  <text x="922" y="822" class="warn">✗ 用槽位当种子（S1 在 .w 上栽过的那一枪）</text>
+  <rect x="922" y="830" width="400" height="100" rx="5" fill="#fef2f2" stroke="#fecaca"/>
+  <text x="934" y="850" class="t">dispatch #1　线程组完成顺序 → 槽位</text>
+  <rect x="934" y="858" width="44" height="20" rx="3" class="nodeh"/><text x="944" y="872" class="s">本块</text>
+  <path d="M980 868 H1000" class="flow"/>
+  <rect x="1006" y="858" width="44" height="20" rx="3" class="nodex"/><text x="1017" y="872" class="s">槽 0</text>
+  <rect x="1080" y="858" width="44" height="20" rx="3" class="lo"/><text x="1090" y="872" class="s">邻块</text>
+  <path d="M1126 868 H1146" class="flow"/>
+  <rect x="1152" y="858" width="44" height="20" rx="3" class="nodex"/><text x="1163" y="872" class="s">槽 1</text>
+
+  <text x="934" y="898" class="t">dispatch #2　同一份世界状态，重扫一次</text>
+  <rect x="934" y="904" width="44" height="20" rx="3" class="nodeh"/><text x="944" y="918" class="s">本块</text>
+  <path d="M980 914 H1000" class="flow"/>
+  <rect x="1006" y="904" width="44" height="20" rx="3" class="nodex"/><text x="1017" y="918" class="s">槽 2</text>
+  <rect x="1080" y="904" width="44" height="20" rx="3" class="lo"/><text x="1090" y="918" class="s">邻块</text>
+  <path d="M1126 914 H1146" class="flow"/>
+  <rect x="1152" y="904" width="44" height="20" rx="3" class="nodex"/><text x="1163" y="918" class="s">槽 0</text>
+
+  <text x="922" y="950" class="warn">槽位由线程组完成顺序决定 ⇒ 同一块石阶重掷随机数</text>
+
+  <text x="922" y="976" class="good">✓ 用格身份当种子</text>
+  <rect x="922" y="984" width="400" height="76" rx="5" fill="#ecfeff" stroke="#a5f3fc"/>
+  <text x="934" y="1004" class="t">CSStairs_CellSeed(Cell.xy, L, Seg, Salt) ^ JitterSeed</text>
+  <text x="934" y="1022" class="t">四条通道各取独立的盐：长度 11 / 进深 23 / 高 37 / 偏航 53</text>
+  <text x="934" y="1040" class="t">石子另取 89 / 97 / 101 / 103；PerInstanceRandom 取 71</text>
+
+  <text x="922" y="1080" class="t">重扫是每一 dab 一次的（EdMode FlushPaintToGpu → RebuildStairs）。</text>
+  <text x="922" y="1096" class="t">拿槽位当种子的症状：画一笔路，整片石阶跟着乱跳、整片换色，</text>
+  <text x="922" y="1112" class="warn">而且不会有任何断言报红 —— 只在有人盯着画面时才显形。</text>
+  <text x="922" y="1132" class="s">格身份在 CPU 侧可精确复算 ⇒ 可断言：GroundStairs.JitterIsCellDeterministic</text>
+</svg>

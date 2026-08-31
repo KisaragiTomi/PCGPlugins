@@ -238,7 +238,9 @@ float CSMeshBooleanParity_Determinant2(float A, float D, float B, float C)
 		float XHi, XLo, YHi, YLo;
 		Split(X, XHi, XLo);
 		Split(Y, YHi, YLo);
-		E = ((XHi * YHi - P) + XHi * YLo + XLo * YHi) + XLo * YLo;
+		// 交叉项的那对括号与 shader 里的一样是承重的：IEEE 加法可交换但不可结合，
+		// 分开累加会让 TwoProduct(a,b) 与 TwoProduct(b,a) 差一个 ulp，u×u 于是不再精确为零。
+		E = ((XHi * YHi - P) + (XHi * YLo + XLo * YHi)) + XLo * YLo;
 	};
 	float P1, E1, P2, E2;
 	TwoProduct(A, D, P1, E1);
@@ -608,6 +610,10 @@ bool FCSMeshBooleanGpuParityTest::RunTest(const FString& Parameters)
 	FirstCube->GetStaticMeshComponent()->SetStaticMesh(CubeMesh);
 	SecondCube->SetActorTransform(FTransform(FRotator(0.0, 20.0, 0.0), FVector(60.0, 45.0, 30.0)));
 	SecondCube->GetStaticMeshComponent()->SetStaticMesh(CubeMesh);
+	// 布尔的场景收集是白名单制（RequiredActorTags 默认 { Pick, Ref }）：没打标签的 actor
+	// 根本不进 soup。测试方块必须挂 Pick，否则收集为空、管线静默早退。
+	FirstCube->Tags.Add(TEXT("Pick"));
+	SecondCube->Tags.Add(TEXT("Pick"));
 
 	AComputeShaderMeshBoolean* Generator = World->SpawnActor<AComputeShaderMeshBoolean>();
 	if (!TestNotNull(TEXT("Mesh boolean generator"), Generator)) return false;

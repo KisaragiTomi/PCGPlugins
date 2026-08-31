@@ -11,6 +11,7 @@
 
 #include "ComputeShaderMeshGenerator.h"
 #include "MeshGeneratorInternal.h"
+#include "CSMesh.h"   // UCSMesh::CountedBlockingFlush —— 阻塞刷新的唯一计数入口
 
 #include "Engine/TextureRenderTarget2D.h"
 #include "Engine/World.h"
@@ -280,7 +281,7 @@ bool AComputeShaderMeshGenerator::CaptureLandscapeHeightmapToDepth(
 		bAnySuccess = true;
 	}
 
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 
 	for (UTextureRenderTarget2D* TempRT : TempRTs)
 	{
@@ -401,7 +402,7 @@ bool AComputeShaderMeshGenerator::CaptureLandscapeHeightmapGPU(
 		bAnySuccess = true;
 	}
 
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 
 	for (UTextureRenderTarget2D* TempRT : TempRTs)
 	{
@@ -463,7 +464,7 @@ bool AComputeShaderMeshGenerator::RenderLandscapeToNormalHeightRT(
 		GraphBuilder.Execute();
 	});
 
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 
 	TempRT->MarkAsGarbage();
 	return true;
@@ -556,7 +557,7 @@ FCSTriangleMeshData AComputeShaderMeshGenerator::CaptureLandscapeTrianglesGPU(in
 		bRenderWorkQueued = true;
 	});
 
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 
 	if (bRenderWorkQueued)
 	{
@@ -579,7 +580,7 @@ FCSTriangleMeshData AComputeShaderMeshGenerator::CaptureLandscapeTrianglesGPU(in
 			}
 			delete VertReadback;
 		});
-		FlushRenderingCommands();
+		UCSMesh::CountedBlockingFlush();
 	}
 	else
 	{

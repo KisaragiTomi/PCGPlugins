@@ -77,9 +77,19 @@ public:
 	 * AssetPathAndName 留空则由落盘层兜底到当前关卡旁的 AutoResult 目录。
 	 * bSaveAsset=false（默认）只把资产标脏，留给手动保存。
 	 * bBakeToLocalSpace=false 表示常驻数据本来就是局部空间的，别再变换（此时 BakeSpace 不参与）。
+	 *
+	 * bEnableNanite 一路透传到 BuildFromMeshDescriptions —— 必须在那次构建之前设置，建完再改只会
+	 * 标脏、不会真的产出 Nanite 数据。默认 false 保持既有行为；GPU 生成的网格常是百万级三角的一次性
+	 * 产物，需要时由生产方显式打开。
+	 *
+	 * SourceMeshOverride 指定要存的几何，留空则用本组件当前绑定的那份。
+	 * **生产方若把 UCSMesh 存在自己身上（AComputeShaderMeshGenerator::DirectGpuMesh 就是），
+	 * 必须显式传进来**：组件的绑定是渲染用的，解绑（SetGpuMesh(nullptr)）只该让它不再显示，
+	 * 不该让生产方连自己的几何都存不出来 —— 而这正是"不需要任何东西正在渲染"这条契约的含义。
 	 */
 	UStaticMesh* SaveToStaticMesh(const FTransform& BakeSpace, const FString& AssetPathAndName = TEXT(""),
-		bool bReplaceExistingAsset = true, bool bSaveAsset = false, bool bBakeToLocalSpace = true);
+		bool bReplaceExistingAsset = true, bool bSaveAsset = false, bool bBakeToLocalSpace = true,
+		bool bEnableNanite = false, UCSMesh* SourceMeshOverride = nullptr);
 #endif
 
 	//~ UPrimitiveComponent interface

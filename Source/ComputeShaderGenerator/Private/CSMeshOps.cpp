@@ -4,6 +4,7 @@
 #include "CSBoxSceneCollection.h"
 #include "CSGpuMeshComponent.h"
 #include "CSGpuTriangleUtilities.h"
+#include "CSGroundShaperField.h"
 #include "ComputeShaderGenerateHelper.h"
 #include "ComputeShaderMeshBoolean.h"
 #include "ComputeShaderMeshGenerator.h"
@@ -25,6 +26,7 @@
 #include "ShaderParameterStruct.h"
 #include "StaticMeshResources.h"
 #include "UDynamicMesh.h"
+#include "UObject/Package.h"   // GetTransientPackage() 的 UPackage 完整定义；unity 构建下靠邻居 TU 兜住
 
 DEFINE_LOG_CATEGORY_STATIC(LogCSMeshOps, Log, All);
 
@@ -290,6 +292,54 @@ class FCSMeshOpsSetColorsCS : public FGlobalShader
 	CSGEN_SHADER_PERM_SM5_GROUPSIZE_X(64)
 };
 
+class FCSMeshOpsPaintColorsCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FCSMeshOpsPaintColorsCS);
+	SHADER_USE_PARAMETER_STRUCT(FCSMeshOpsPaintColorsCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, InMeshCounters)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float>, BrushSrcPositions)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_Colors)
+		SHADER_PARAMETER(FVector4f, ConstantColor)
+		SHADER_PARAMETER(FVector4f, BrushChannelMask)
+		SHADER_PARAMETER(FVector3f, BrushCenter)
+		SHADER_PARAMETER(float, BrushRadius)
+		SHADER_PARAMETER(float, BrushFalloff)
+		SHADER_PARAMETER(float, BrushStrength)
+		SHADER_PARAMETER(uint32, PaintBlendOp)
+		SHADER_PARAMETER(FUintVector4, BrushRegion)     // 规则网格时的格点闭区间 (x0, y0, x1, y1)
+		SHADER_PARAMETER(uint32, BrushGridVertsX)       // 0 = 全网格派发（非规则网格）
+		SHADER_PARAMETER(uint32, BrushGridVertsY)
+		SHADER_PARAMETER(uint32, ThreadCount)
+	END_SHADER_PARAMETER_STRUCT()
+
+	CSGEN_SHADER_PERM_SM5_GROUPSIZE_X(64)
+};
+
+class FCSMeshOpsDisplaceGroundCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FCSMeshOpsDisplaceGroundCS);
+	SHADER_USE_PARAMETER_STRUCT(FCSMeshOpsDisplaceGroundCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, InMeshCounters)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, GroundShaperParams)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, RW_Positions)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_Tangents)
+		SHADER_PARAMETER(FVector2f, GroundOriginXY)
+		SHADER_PARAMETER(float, GroundCellSize)
+		SHADER_PARAMETER(float, GroundBaseZ)
+		SHADER_PARAMETER(uint32, GroundShaperCount)
+		SHADER_PARAMETER(uint32, GroundVertsX)
+		SHADER_PARAMETER(uint32, GroundVertsY)
+		SHADER_PARAMETER(FUintVector4, GroundRegion)
+		SHADER_PARAMETER(uint32, ThreadCount)
+	END_SHADER_PARAMETER_STRUCT()
+
+	CSGEN_SHADER_PERM_SM5_GROUPSIZE_X(64)
+};
+
 class FCSMeshOpsMaterialHistogramCS : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FCSMeshOpsMaterialHistogramCS);
@@ -379,6 +429,8 @@ IMPLEMENT_GLOBAL_SHADER(FCSMeshOpsTransformCS, "/Plugin/PCGPlugins/Shaders/Priva
 IMPLEMENT_GLOBAL_SHADER(FCSMeshOpsFlipWindingCS, "/Plugin/PCGPlugins/Shaders/Private/CSMeshOps.usf", "FlipNormalsCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FCSMeshOpsNegateNormalsCS, "/Plugin/PCGPlugins/Shaders/Private/CSMeshOps.usf", "NegateNormalsCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FCSMeshOpsSetColorsCS, "/Plugin/PCGPlugins/Shaders/Private/CSMeshOps.usf", "SetVertexColorsCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FCSMeshOpsPaintColorsCS, "/Plugin/PCGPlugins/Shaders/Private/CSMeshOps.usf", "PaintVertexColorsSphereCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FCSMeshOpsDisplaceGroundCS, "/Plugin/PCGPlugins/Shaders/Private/CSMeshOps.usf", "DisplaceGroundShapersCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FCSMeshOpsWeldCounterCS, "/Plugin/PCGPlugins/Shaders/Private/CSMeshOps.usf", "BuildWeldCounterCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FCSMeshOpsWeldSoupCS, "/Plugin/PCGPlugins/Shaders/Private/CSMeshOps.usf", "BuildWeldSoupCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FCSMeshOpsWeldRemapCS, "/Plugin/PCGPlugins/Shaders/Private/CSMeshOps.usf", "RemapIndicesByWeldCS", SF_Compute);
@@ -672,11 +724,10 @@ UStaticMesh* UCSMeshOps::CopyToStaticMesh(
 	FCSGpuMeshConvertOptions ConvertOptions;
 	ConvertOptions.TargetTransform = Options.TargetTransform;
 	ConvertOptions.bBakeToLocalSpace = Options.bBakeToLocalSpace;
-	// 【未实装】这条赋值目前是死路：FCSGpuMeshConvertOptions::bRecomputeNormals 全模块没有任何
-	// 读取方，StaticMesh 转换（UCSGpuMeshComponent::BuildGpuMeshDescription）一律直接用快照里
-	// 的法线。也就是说在 BP 里勾上 CopyToStaticMesh 的 bRecomputeNormals 不会有任何效果，
-	// 而且不报错。保留字段本身（删 UPROPERTY 会在加载旧资产时静默丢值），先把谎言标出来。
-	ConvertOptions.bRecomputeNormals = Options.bRecomputeNormals;
+	// 【未实装】Options.bRecomputeNormals（BP 面的 UPROPERTY，保留以免加载旧资产时静默丢值）在
+	// StaticMesh 这条出口上没有任何效果：UCSGpuMeshComponent::BuildGpuMeshDescription 一律直接用
+	// 快照里的法线。转发目标 FCSGpuMeshConvertOptions::bRecomputeNormals 已经删除——它全模块无人
+	// 读取，留着只是让这条赋值看起来像在做事。DynamicMesh 那条出口是真读它的，不受影响。
 
 	FCSGpuMeshAssetOptions AssetOptions;
 	AssetOptions.AssetPath = Options.AssetPath.TrimStartAndEnd();
@@ -987,9 +1038,10 @@ FCSMeshBoxSceneOptions UCSMeshOps::MakeGeneratorBoxSceneOptions(
 // Snapshot upload (the mirror of ReadbackMeshSync)
 // -----------------------------------------------------------------------------
 
-bool UCSMeshOps::CopyFromMeshSnapshot(UCSMesh* Target, const FCSGpuMeshCPUData& Snapshot)
+bool UCSMeshOps::BuildUploadPayload(const FCSGpuMeshCPUData& Snapshot, FCSMeshUploadPayload& OutPayload,
+	int32 NumTexCoordSets)
 {
-	if (!Target || !Snapshot.IsValid()) return false;
+	if (!Snapshot.IsValid()) return false;
 
 	const int32 SourceIndexCount = Snapshot.Indices.Num();
 	const int32 SourceTriangleCount = SourceIndexCount / 3;
@@ -1011,15 +1063,19 @@ bool UCSMeshOps::CopyFromMeshSnapshot(UCSMesh* Target, const FCSGpuMeshCPUData& 
 	if (VertexCount < 3 || SourceTriangleCount < 1) return false;
 
 	// --- pack the CPU side into the exact stream layouts
-	TArray<FVector3f> Positions;
-	TArray<uint32> Tangents;
-	TArray<FVector2f> TexCoords;
-	TArray<uint32> Colors;
-	TArray<uint32> Indices;
-	TArray<uint32> MaterialIds;
+	TArray<FVector3f>& Positions = OutPayload.Positions;
+	TArray<uint32>& Tangents = OutPayload.Tangents;
+	TArray<FVector2f>& TexCoords = OutPayload.TexCoords;
+	TArray<uint32>& Colors = OutPayload.Colors;
+	TArray<uint32>& Indices = OutPayload.Indices;
+	TArray<uint32>& MaterialIds = OutPayload.MaterialIds;
 	Positions.SetNumUninitialized(VertexCount);
 	Tangents.SetNumUninitialized(VertexCount * 2);
-	TexCoords.SetNumUninitialized(VertexCount);
+	// 多组 UV 交错：一条流承载 N 组，长度 = 顶点数 × N（N=1 时与单组逐位相同）。
+	// 组数由**目标网格**的声明决定，不是快照说了算 —— 流的宽度是网格的属性。
+	const int32 NumSets = FMath::Clamp(NumTexCoordSets, 1, FCSGpuMeshCPUData::MaxTexCoordChannels);
+	OutPayload.NumTexCoordSets = NumSets;
+	TexCoords.SetNumUninitialized(VertexCount * NumSets);
 	Colors.SetNumUninitialized(VertexCount);
 	Indices.SetNumUninitialized(SourceIndexCount);
 	MaterialIds.SetNumUninitialized(SourceTriangleCount);
@@ -1059,7 +1115,12 @@ bool UCSMeshOps::CopyFromMeshSnapshot(UCSMesh* Target, const FCSGpuMeshCPUData& 
 		Tangents[Vertex * 2 + 0] = CSMeshOps_PackSnorm8888(FVector4f(Tangent, 0.0f));
 		Tangents[Vertex * 2 + 1] = CSMeshOps_PackSnorm8888(FVector4f(Normal, BinormalSign));
 
-		TexCoords[Vertex] = Snapshot.TexCoords().IsValidIndex(UVIndex) ? Snapshot.TexCoords()[UVIndex] : FVector2f::ZeroVector;
+		for (int32 Set = 0; Set < NumSets; ++Set)
+		{
+			const TArray<FVector2f>& Channel = Snapshot.TexCoordChannels[Set];
+			const int32 ChannelIndex = AttributeIndex(Channel.Num(), PositionIndex, AttrCorner);
+			TexCoords[Vertex * NumSets + Set] = Channel.IsValidIndex(ChannelIndex) ? Channel[ChannelIndex] : FVector2f::ZeroVector;
+		}
 
 		const int32 ColorIndex = AttributeIndex(Snapshot.Colors.Num(), PositionIndex, AttrCorner);
 		Colors[Vertex] = Snapshot.Colors.IsValidIndex(ColorIndex)
@@ -1077,32 +1138,97 @@ bool UCSMeshOps::CopyFromMeshSnapshot(UCSMesh* Target, const FCSGpuMeshCPUData& 
 			: 0u;
 	}
 
-	FBox WorldBounds(ForceInit);
-	for (const FVector3f& Position : Positions) WorldBounds += FVector(Position);
+	OutPayload.WorldBounds = FBox(ForceInit);
+	for (const FVector3f& Position : Positions) OutPayload.WorldBounds += FVector(Position);
+	OutPayload.VertexCount = VertexCount;
+	OutPayload.IndexCount = SourceIndexCount;
+	return true;
+}
 
-	Target->EnsureCapacitySync(VertexCount, SourceIndexCount);
-	return Target->EditMeshSync([&](FCSMeshEditContext& Context)
+int32 UCSMeshOps::GetTexCoordSets(const UCSMesh* Target)
+{
+	if (!Target) return 1;
+	const FCSMeshResident* Resident = Target->GetResidentPtr();
+	if (!Resident) return 1;
+	const FCSMeshResident::FStream* Stream = Resident->FindStream(ECSGpuStreamRole::TexCoord, 0);
+	if (!Stream) return 1;
+	return FMath::Max(int32(Stream->Desc.ElementsPerUnit) / 2, 1);
+}
+
+bool UCSMeshOps::EnsureTexCoordSets(UCSMesh* Target, int32 NumTexCoordSets)
+{
+	if (!Target) return false;
+	const int32 Want = FMath::Clamp(NumTexCoordSets, 1, FCSGpuMeshCPUData::MaxTexCoordChannels);
+	if (GetTexCoordSets(Target) == Want) return true;   // 已是这个组数：一点布局工作都不做
+
+	FCSMeshStreamLayout Layout;
+	Layout.NumTexCoordSets = uint32(Want);
+
+	if (const FCSMeshResident* Resident = Target->GetResidentPtr())
 	{
-		if (!CSMeshOps_HasVertexStreams(Context)) return;
-		FRDGBuilder& GraphBuilder = Context.GraphBuilder;
+		// NumIndirectDraws 必须沿用当前值：这条路只想改 UV 组数，顺手把分段用的 arg set 数
+		// 打回 1 会让已经建好的材质分段静默失效（症状是网格只画一个材质，且不报任何错）。
+		Layout.NumIndirectDraws = FMath::Max(Resident->NumIndirectDraws, 1u);
 
-		auto Upload = [&GraphBuilder](FRDGBufferRef Buffer, const void* Data, uint64 Bytes)
+		// 已声明的非标准流必须原样带过去。重新声明布局是**整套重建**，漏掉谁谁就没了，
+		// 而调用方根本不知道那些流是哪个消费者加的（症状是那边报"额外流不在常驻集里"）。
+		TArray<FCSGpuStreamDesc> Standard;
+		CSGpuMeshStreams::FStandardStreamOptions Options;
+		Options.NumIndirectDraws = Layout.NumIndirectDraws;
+		Options.bMaterialIds = true;
+		Options.bReadbackColors = true;
+		Options.NumTexCoordSets = uint32(Want);
+		CSGpuMeshStreams::BuildStandardTriangleStreamDescs(Standard, Options);
+
+		for (const FCSMeshResident::FStream& Stream : Resident->Streams)
 		{
-			if (!Buffer || Bytes == 0) return;
-			void* Copy = GraphBuilder.Alloc(Bytes, 16);
-			FMemory::Memcpy(Copy, Data, Bytes);
-			GraphBuilder.QueueBufferUpload(Buffer, Copy, Bytes, ERDGInitialDataFlags::None);
-		};
+			const bool bStandard = Standard.ContainsByPredicate([&Stream](const FCSGpuStreamDesc& D)
+			{
+				// TexCoordIndex 兼任通用槽位号（FindStream / FCSMeshEditContext::Find 都以它为键）。
+				return D.Role == Stream.Desc.Role && D.TexCoordIndex == Stream.Desc.TexCoordIndex;
+			});
+			if (!bStandard) Layout.ExtraStreams.Add(Stream.Desc);
+		}
+	}
+	return Target->SetStreamLayoutSync(Layout);
+}
 
-		Upload(Context.Positions(), Positions.GetData(), Positions.Num() * sizeof(FVector3f));
-		Upload(Context.Tangents(), Tangents.GetData(), Tangents.Num() * sizeof(uint32));
-		Upload(Context.TexCoords(), TexCoords.GetData(), TexCoords.Num() * sizeof(FVector2f));
-		Upload(Context.Colors(), Colors.GetData(), Colors.Num() * sizeof(uint32));
-		Upload(Context.Indices(), Indices.GetData(), Indices.Num() * sizeof(uint32));
-		Upload(Context.MaterialIds(), MaterialIds.GetData(), MaterialIds.Num() * sizeof(uint32));
+void UCSMeshOps::AddCopyFromSnapshotPasses(FCSMeshEditContext& Context, const FCSMeshUploadPayload& Payload)
+{
+	if (!CSMeshOps_HasVertexStreams(Context) || !Payload.IsValid()) return;
+	FRDGBuilder& GraphBuilder = Context.GraphBuilder;
 
-		AddSetCountersPass(Context, uint32(VertexCount), uint32(SourceIndexCount));
-		Context.Resident.WorldBounds = WorldBounds;
+	auto Upload = [&GraphBuilder](FRDGBufferRef Buffer, const void* Data, uint64 Bytes)
+	{
+		if (!Buffer || Bytes == 0) return;
+		void* Copy = GraphBuilder.Alloc(Bytes, 16);
+		FMemory::Memcpy(Copy, Data, Bytes);
+		GraphBuilder.QueueBufferUpload(Buffer, Copy, Bytes, ERDGInitialDataFlags::None);
+	};
+
+	Upload(Context.Positions(), Payload.Positions.GetData(), Payload.Positions.Num() * sizeof(FVector3f));
+	Upload(Context.Tangents(), Payload.Tangents.GetData(), Payload.Tangents.Num() * sizeof(uint32));
+	Upload(Context.TexCoords(), Payload.TexCoords.GetData(), Payload.TexCoords.Num() * sizeof(FVector2f));
+	Upload(Context.Colors(), Payload.Colors.GetData(), Payload.Colors.Num() * sizeof(uint32));
+	Upload(Context.Indices(), Payload.Indices.GetData(), Payload.Indices.Num() * sizeof(uint32));
+	Upload(Context.MaterialIds(), Payload.MaterialIds.GetData(), Payload.MaterialIds.Num() * sizeof(uint32));
+
+	AddSetCountersPass(Context, uint32(Payload.VertexCount), uint32(Payload.IndexCount));
+	Context.Resident.WorldBounds = Payload.WorldBounds;
+}
+
+bool UCSMeshOps::CopyFromMeshSnapshot(UCSMesh* Target, const FCSGpuMeshCPUData& Snapshot)
+{
+	if (!Target) return false;
+
+	FCSMeshUploadPayload Payload;
+	// 按**目标网格已声明的**组数打包 —— 上传路径不碰布局。
+	if (!BuildUploadPayload(Snapshot, Payload, GetTexCoordSets(Target))) return false;
+
+	Target->EnsureCapacitySync(Payload.VertexCount, Payload.IndexCount);
+	return Target->EditMeshSync([&Payload](FCSMeshEditContext& Context)
+	{
+		AddCopyFromSnapshotPasses(Context, Payload);
 	});
 }
 
@@ -1227,34 +1353,34 @@ UCSMesh* UCSMeshOps::WeldVertices(UCSMesh* Target, float WeldDistance)
 // In-place operators
 // -----------------------------------------------------------------------------
 
+void UCSMeshOps::AddTransformPasses(FCSMeshEditContext& Context, const FTransform& Transform)
+{
+	FRDGBuilder& GraphBuilder = Context.GraphBuilder;
+	if (!Context.Positions() || !Context.Tangents() || !Context.Counters()) return;
+
+	const uint32 VertexCapacity = Context.Resident.VertexCapacity;
+	if (VertexCapacity == 0) return;
+
+	FCSMeshOpsTransformCS::FParameters* Params = GraphBuilder.AllocParameters<FCSMeshOpsTransformCS::FParameters>();
+	Params->InMeshCounters = CSMeshOps_SRV(GraphBuilder, Context.Counters(), PF_R32_UINT);
+	Params->RW_Positions = CSMeshOps_UAV(GraphBuilder, Context.Positions(), PF_R32_FLOAT);
+	Params->RW_Tangents = CSMeshOps_UAV(GraphBuilder, Context.Tangents(), PF_R32_UINT);
+	Params->SrcLocalToWorld = FMatrix44f(Transform.ToMatrixWithScale());
+	Params->SrcNormalToWorld = FMatrix44f(Transform.ToMatrixWithScale().Inverse().GetTransposed());
+	Params->ThreadCount = VertexCapacity;
+
+	TShaderMapRef<FCSMeshOpsTransformCS> Shader(CSMeshOps_ShaderMap());
+	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CSMeshOps.Transform"), Shader, Params,
+		FComputeShaderUtils::GetGroupCountWrapped(int32(VertexCapacity), CSMeshOps_GroupSize));
+
+	if (Context.Resident.WorldBounds.IsValid)
+		Context.Resident.WorldBounds = Context.Resident.WorldBounds.TransformBy(Transform);
+}
+
 UCSMesh* UCSMeshOps::TransformMesh(UCSMesh* Target, const FTransform& Transform)
 {
 	if (!Target) return Target;
-
-	const FMatrix44f LocalToWorld(Transform.ToMatrixWithScale());
-	const FMatrix44f NormalToWorld(Transform.ToMatrixWithScale().Inverse().GetTransposed());
-	const uint32 VertexCapacity = uint32(FMath::Max(Target->GetVertexCapacity(), 0));
-
-	Target->EditMeshSync([LocalToWorld, NormalToWorld, VertexCapacity, &Transform](FCSMeshEditContext& Context)
-	{
-		FRDGBuilder& GraphBuilder = Context.GraphBuilder;
-		if (!Context.Positions() || !Context.Tangents() || !Context.Counters()) return;
-
-		FCSMeshOpsTransformCS::FParameters* Params = GraphBuilder.AllocParameters<FCSMeshOpsTransformCS::FParameters>();
-		Params->InMeshCounters = CSMeshOps_SRV(GraphBuilder, Context.Counters(), PF_R32_UINT);
-		Params->RW_Positions = CSMeshOps_UAV(GraphBuilder, Context.Positions(), PF_R32_FLOAT);
-		Params->RW_Tangents = CSMeshOps_UAV(GraphBuilder, Context.Tangents(), PF_R32_UINT);
-		Params->SrcLocalToWorld = LocalToWorld;
-		Params->SrcNormalToWorld = NormalToWorld;
-		Params->ThreadCount = VertexCapacity;
-
-		TShaderMapRef<FCSMeshOpsTransformCS> Shader(CSMeshOps_ShaderMap());
-		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CSMeshOps.Transform"), Shader, Params,
-			FComputeShaderUtils::GetGroupCountWrapped(int32(VertexCapacity), CSMeshOps_GroupSize));
-
-		if (Context.Resident.WorldBounds.IsValid)
-			Context.Resident.WorldBounds = Context.Resident.WorldBounds.TransformBy(Transform);
-	});
+	Target->EditMeshSync([&Transform](FCSMeshEditContext& Context) { AddTransformPasses(Context, Transform); });
 	return Target;
 }
 
@@ -1325,36 +1451,155 @@ UCSMesh* UCSMeshOps::SetVertexColors(UCSMesh* Target, FLinearColor Color)
 	return Target;
 }
 
+UCSMesh* UCSMeshOps::PaintVertexColorsSphere(
+	UCSMesh* Target, FVector Center, float Radius, float Falloff, float Strength,
+	FLinearColor Color, FLinearColor ChannelMask, ECSMeshPaintBlendOp BlendOp)
+{
+	// 全网格派发 = 区域版退化情形（VertsX/Y = 0），公式与 kernel 完全共用。
+	return PaintVertexColorsSphereInRegion(Target, Center, Radius, Falloff, Strength, Color, ChannelMask, BlendOp,
+		0, 0, FIntPoint::ZeroValue, FIntPoint::ZeroValue);
+}
+
+UCSMesh* UCSMeshOps::PaintVertexColorsSphereInRegion(
+	UCSMesh* Target, FVector Center, float Radius, float Falloff, float Strength,
+	FLinearColor Color, FLinearColor ChannelMask, ECSMeshPaintBlendOp BlendOp,
+	int32 VertsX, int32 VertsY, FIntPoint RegionMin, FIntPoint RegionMax)
+{
+	if (!Target || Radius <= 0.0f || Strength <= 0.0f) return Target;
+
+	// 区域派发：把 (x, y) 闭区间 clamp 进网格，线程数 = 矩形面积；否则退回全顶点容量。
+	const bool bRegional = VertsX >= 2 && VertsY >= 2;
+	FIntPoint Min = FIntPoint::ZeroValue;
+	FIntPoint Max = FIntPoint::ZeroValue;
+	uint32 ThreadCount = uint32(FMath::Max(Target->GetVertexCapacity(), 0));
+	if (bRegional)
+	{
+		Min = FIntPoint(FMath::Clamp(RegionMin.X, 0, VertsX - 1), FMath::Clamp(RegionMin.Y, 0, VertsY - 1));
+		Max = FIntPoint(FMath::Clamp(RegionMax.X, Min.X, VertsX - 1), FMath::Clamp(RegionMax.Y, Min.Y, VertsY - 1));
+		ThreadCount = uint32(Max.X - Min.X + 1) * uint32(Max.Y - Min.Y + 1);
+	}
+	if (ThreadCount == 0) return Target;
+
+	FCSMeshPaintSphereDab Dab;
+	Dab.Center = Center;
+	Dab.Radius = Radius;
+	Dab.Falloff = Falloff;
+	Dab.Strength = Strength;
+	Dab.Color = Color;
+	Dab.ChannelMask = ChannelMask;
+	Dab.BlendOp = BlendOp;
+	Dab.VertsX = bRegional ? VertsX : 0;
+	Dab.VertsY = bRegional ? VertsY : 0;
+	Dab.RegionMin = Min;
+	Dab.RegionMax = Max;
+
+	Target->EditMeshSync([&Dab](FCSMeshEditContext& Context) { AddPaintSpherePasses(Context, Dab); });
+	return Target;
+}
+
+void UCSMeshOps::AddPaintSpherePasses(FCSMeshEditContext& Context, const FCSMeshPaintSphereDab& Dab)
+{
+	FRDGBuilder& GraphBuilder = Context.GraphBuilder;
+	if (!Context.Positions() || !Context.Colors() || !Context.Counters()) return;
+	if (Dab.Radius <= 0.0f || Dab.Strength <= 0.0f) return;
+
+	const bool bRegional = Dab.VertsX >= 2 && Dab.VertsY >= 2;
+	uint32 ThreadCount = Context.Resident.VertexCapacity;
+	if (bRegional) ThreadCount = uint32(Dab.RegionMax.X - Dab.RegionMin.X + 1) * uint32(Dab.RegionMax.Y - Dab.RegionMin.Y + 1);
+	if (ThreadCount == 0) return;
+
+	FCSMeshOpsPaintColorsCS::FParameters* Params = GraphBuilder.AllocParameters<FCSMeshOpsPaintColorsCS::FParameters>();
+	Params->InMeshCounters = CSMeshOps_SRV(GraphBuilder, Context.Counters(), PF_R32_UINT);
+	Params->BrushSrcPositions = CSMeshOps_SRV(GraphBuilder, Context.Positions(), PF_R32_FLOAT);
+	Params->RW_Colors = CSMeshOps_UAV(GraphBuilder, Context.Colors(), PF_R32_UINT);
+	Params->ConstantColor = FVector4f(Dab.Color.R, Dab.Color.G, Dab.Color.B, Dab.Color.A);
+	Params->BrushChannelMask = FVector4f(Dab.ChannelMask.R, Dab.ChannelMask.G, Dab.ChannelMask.B, Dab.ChannelMask.A);
+	Params->BrushCenter = FVector3f(Dab.Center);   // resident positions are world-space floats
+	Params->BrushRadius = Dab.Radius;
+	Params->BrushFalloff = FMath::Clamp(Dab.Falloff, 0.0f, 1.0f);
+	Params->BrushStrength = FMath::Clamp(Dab.Strength, 0.0f, 1.0f);
+	Params->PaintBlendOp = uint32(Dab.BlendOp);
+	Params->BrushRegion = FUintVector4(uint32(Dab.RegionMin.X), uint32(Dab.RegionMin.Y), uint32(Dab.RegionMax.X), uint32(Dab.RegionMax.Y));
+	Params->BrushGridVertsX = bRegional ? uint32(Dab.VertsX) : 0u;
+	Params->BrushGridVertsY = bRegional ? uint32(Dab.VertsY) : 0u;
+	Params->ThreadCount = ThreadCount;
+
+	TShaderMapRef<FCSMeshOpsPaintColorsCS> Shader(CSMeshOps_ShaderMap());
+	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CSMeshOps.PaintVertexColorsSphere"), Shader, Params,
+		FComputeShaderUtils::GetGroupCountWrapped(int32(ThreadCount), CSMeshOps_GroupSize));
+}
+
+UCSMesh* UCSMeshOps::DisplaceGroundShapers(
+	UCSMesh* Target, const TArray<FVector4f>& ShaperParams,
+	const FVector2f& GridOriginXY, float CellSize, float BaseZ,
+	int32 VertsX, int32 VertsY, FIntPoint RegionMin, FIntPoint RegionMax)
+{
+	if (!Target || VertsX < 2 || VertsY < 2 || CellSize <= 0.0f) return Target;
+
+	// 空 palette 也要跑：塑形物被删掉时正是"全 0 高度场"把隆起抹平的那一趟。
+	const int32 ShaperCount = ShaperParams.Num() / CSGroundShaperField::Float4sPerShaper;
+	TArray<FVector4f> UploadParams = ShaperParams;
+	if (UploadParams.IsEmpty()) UploadParams.Add(FVector4f::Zero());   // 结构化 buffer 不能是 0 长度
+
+	const FIntPoint Min(FMath::Clamp(RegionMin.X, 0, VertsX - 1), FMath::Clamp(RegionMin.Y, 0, VertsY - 1));
+	const FIntPoint Max(FMath::Clamp(RegionMax.X, Min.X, VertsX - 1), FMath::Clamp(RegionMax.Y, Min.Y, VertsY - 1));
+	const uint32 RegionW = uint32(Max.X - Min.X + 1);
+	const uint32 RegionH = uint32(Max.Y - Min.Y + 1);
+	const uint32 ThreadCount = RegionW * RegionH;
+	if (ThreadCount == 0) return Target;
+
+	Target->EditMeshSync([&](FCSMeshEditContext& Context)
+	{
+		FRDGBuilder& GraphBuilder = Context.GraphBuilder;
+		if (!Context.Positions() || !Context.Tangents() || !Context.Counters()) return;
+
+		CSHelper::FRDGStructuredBufferRefs ShaperRefs = CSHelper::CreateUploadedStructuredBuffer<FVector4f>(
+			GraphBuilder, UploadParams, TEXT("CSMeshOps.GroundShaperParams"), false, true);
+		if (!ShaperRefs.SRV) return;
+
+		FCSMeshOpsDisplaceGroundCS::FParameters* Params = GraphBuilder.AllocParameters<FCSMeshOpsDisplaceGroundCS::FParameters>();
+		Params->InMeshCounters = CSMeshOps_SRV(GraphBuilder, Context.Counters(), PF_R32_UINT);
+		Params->GroundShaperParams = ShaperRefs.SRV;
+		Params->RW_Positions = CSMeshOps_UAV(GraphBuilder, Context.Positions(), PF_R32_FLOAT);
+		Params->RW_Tangents = CSMeshOps_UAV(GraphBuilder, Context.Tangents(), PF_R32_UINT);
+		Params->GroundOriginXY = GridOriginXY;
+		Params->GroundCellSize = CellSize;
+		Params->GroundBaseZ = BaseZ;
+		Params->GroundShaperCount = uint32(FMath::Max(ShaperCount, 0));
+		Params->GroundVertsX = uint32(VertsX);
+		Params->GroundVertsY = uint32(VertsY);
+		Params->GroundRegion = FUintVector4(uint32(Min.X), uint32(Min.Y), uint32(Max.X), uint32(Max.Y));
+		Params->ThreadCount = ThreadCount;
+
+		TShaderMapRef<FCSMeshOpsDisplaceGroundCS> Shader(CSMeshOps_ShaderMap());
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CSMeshOps.DisplaceGroundShapers"), Shader, Params,
+			FComputeShaderUtils::GetGroupCountWrapped(int32(ThreadCount), CSMeshOps_GroupSize));
+
+		// 位移只动 Z：包围盒按调用方已知的台高上界加宽即可，不值得为它跑一次 ComputeWorldBoundsSync。
+		if (Context.Resident.WorldBounds.IsValid)
+		{
+			float MaxTop = 0.0f;
+			for (int32 Index = 0; Index + CSGroundShaperField::Float4sPerShaper <= ShaperParams.Num(); Index += CSGroundShaperField::Float4sPerShaper)
+			{
+				// 峰值而不是台高：二次抬升在台顶又加了一档，按台高收边会把最顶那圈顶点裁掉。
+				MaxTop = FMath::Max(MaxTop, CSGroundShaperField::PeakHeight(ShaperParams[Index + 1]));
+			}
+			Context.Resident.WorldBounds.Min.Z = FMath::Min(Context.Resident.WorldBounds.Min.Z, double(BaseZ) - 1.0);
+			Context.Resident.WorldBounds.Max.Z = FMath::Max(Context.Resident.WorldBounds.Max.Z, double(BaseZ + MaxTop) + 1.0);
+		}
+	});
+	return Target;
+}
+
 // -----------------------------------------------------------------------------
 // Draw batches
 // -----------------------------------------------------------------------------
 
-UCSMesh* UCSMeshOps::BuildMaterialSections(UCSMesh* Target)
+bool UCSMeshOps::AddMaterialSectionPasses(FCSMeshEditContext& Context, int32 NumSlots)
 {
-	if (!Target) return Target;
-
-	// One slot minimum: a mesh with no material table still ends up with arg set 0 covering the
-	// whole (single-slot) mesh, which is what an unsectioned mesh draws with anyway.
-	const int32 NumSlots = FMath::Max(Target->Materials.Num(), 1);
-
-	// Growing the args buffer changes its identity, which bumps AllocationGeneration and drops
-	// the section table — so it has to happen before the args are written, and the table can only
-	// be published after. Get the order wrong and the sections vanish with no symptom but a mesh
-	// that draws one material.
-	if (!Target->EnsureIndirectDrawCapacitySync(NumSlots))
-	{
-		UE_LOG(LogCSMeshOps, Warning,
-			TEXT("[CSMeshOps] BuildMaterialSections: the mesh cannot carry %d indirect arg sets; leaving it unsectioned."), NumSlots);
-		return Target;
-	}
-
-	// Set inside the edit, read after EditMeshSync's flush. Publishing sections for a sort that
-	// never ran would point them at arg sets nothing wrote.
-	bool bSorted = false;
-	Target->EditMeshSync([NumSlots, &bSorted](FCSMeshEditContext& Context)
 	{
 		FRDGBuilder& GraphBuilder = Context.GraphBuilder;
-		if (!Context.Indices() || !Context.MaterialIds() || !Context.Counters() || !Context.IndirectArgs()) return;
+		if (!Context.Indices() || !Context.MaterialIds() || !Context.Counters() || !Context.IndirectArgs()) return false;
 
 		const int32 IndexCapacity = int32(FMath::Max(Context.Resident.IndexCapacity, 3u));
 		const int32 TriangleCapacity = FMath::Max(IndexCapacity / 3, 1);
@@ -1431,10 +1676,13 @@ UCSMesh* UCSMeshOps::BuildMaterialSections(UCSMesh* Target)
 		}
 
 		// The sort moves triangles around but adds and removes none, so the counters still hold.
-		bSorted = true;
-	});
+	}
+	return true;
+}
 
-	if (!bSorted) return Target;
+void UCSMeshOps::PublishMaterialSections(UCSMesh* Target)
+{
+	if (!Target) return;
 
 	// A mesh with no material table publishes an empty table rather than a one-entry one: both
 	// draw identically (empty means one whole-mesh batch from arg set 0, which is exactly what the
@@ -1451,7 +1699,37 @@ UCSMesh* UCSMeshOps::BuildMaterialSections(UCSMesh* Target)
 		Section.MaterialIndex = Slot;
 	}
 	Target->SetSections(Sections);
+}
 
+UCSMesh* UCSMeshOps::BuildMaterialSections(UCSMesh* Target)
+{
+	if (!Target) return Target;
+
+	// One slot minimum: a mesh with no material table still ends up with arg set 0 covering the
+	// whole (single-slot) mesh, which is what an unsectioned mesh draws with anyway.
+	const int32 NumSlots = FMath::Max(Target->Materials.Num(), 1);
+
+	// Growing the args buffer changes its identity, which bumps AllocationGeneration and drops
+	// the section table — so it has to happen before the args are written, and the table can only
+	// be published after. Get the order wrong and the sections vanish with no symptom but a mesh
+	// that draws one material.
+	if (!Target->EnsureIndirectDrawCapacitySync(NumSlots))
+	{
+		UE_LOG(LogCSMeshOps, Warning,
+			TEXT("[CSMeshOps] BuildMaterialSections: the mesh cannot carry %d indirect arg sets; leaving it unsectioned."), NumSlots);
+		return Target;
+	}
+
+	// Set inside the edit, read after EditMeshSync's flush. Publishing sections for a sort that
+	// never ran would point them at arg sets nothing wrote. (An ASYNC caller cannot read it here —
+	// see PublishMaterialSections.)
+	bool bSorted = false;
+	Target->EditMeshSync([NumSlots, &bSorted](FCSMeshEditContext& Context)
+	{
+		bSorted = AddMaterialSectionPasses(Context, NumSlots);
+	});
+
+	if (bSorted) PublishMaterialSections(Target);
 	return Target;
 }
 
@@ -1534,7 +1812,7 @@ UCSMesh* UCSMeshOps::ComputeWorldBoundsSync(UCSMesh* Target)
 			}
 			delete Readback;
 		});
-	FlushRenderingCommands();
+	UCSMesh::CountedBlockingFlush();
 
 	if (!bEnqueued)
 	{

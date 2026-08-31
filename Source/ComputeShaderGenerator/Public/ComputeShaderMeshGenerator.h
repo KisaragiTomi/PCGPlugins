@@ -668,8 +668,8 @@ public:
 	FCSTriangleMeshData CaptureLandscapeTrianglesGPU(int32 TextureSize = 128);
 
 	/** Generic: rasterize an indexed GPU triangle mesh into OutHeightmap via top-down orthographic
-	 *  projection (texel.x = CameraHeight - WorldZ). Extracts a triangle soup from the position/index
-	 *  buffers (FExtractStaticMeshTrianglesCS) then runs RasterizeTriangleSoupToHeightmapRDG. Adds
+	 *  projection (texel.x = CameraHeight - WorldZ). A fused kernel (IndexedMeshToHeightmapCS) reads
+	 *  the position/index buffers and rasterizes directly — no intermediate triangle soup. Adds
 	 *  passes to GraphBuilder; the caller executes. Must be called on the render thread.
 	 *  @param PositionSRV      Buffer<float> SRV, xyz per vertex (stride 3 floats).
 	 *  @param IndexSRV         Buffer<uint>  SRV, triangle-list indices.
@@ -890,7 +890,7 @@ public:
 	 *  只有一个 actor 要同时产出多份互不覆盖的结果时才需要传 NameSuffix。
 	 *  关卡没有内容路径时返回空串，调用方应据此退回 transient 或显式路径。 */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Generator|Mesh")
-	FString BuildResultAssetPath(const FString& NameSuffix = TEXT(""));
+	virtual FString BuildResultAssetPath(const FString& NameSuffix = TEXT(""));
 
 	/**
 	 * 生成一个承载 Mesh 的结果 StaticMeshActor，挂在本 actor 下。

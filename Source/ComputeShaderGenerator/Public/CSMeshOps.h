@@ -189,6 +189,23 @@ struct COMPUTESHADERGENERATOR_API FCSMeshBoxSceneOptions
 	bool bComputeExactBounds = true;
 };
 
+/** How PaintVertexColorsSphere combines the brush colour with what a vertex already holds.
+ *  The formulas are the contract: any CPU mirror of a painted mesh must apply exactly these
+ *  (per masked channel, E = falloff weight × strength):
+ *    Replace  C' = lerp(C, Paint, E)
+ *    Add      C' = C + Paint × E
+ *    Max      C' = max(C, Paint × E)
+ *    Erase    C' = C × (1 − E)
+ */
+UENUM(BlueprintType)
+enum class ECSMeshPaintBlendOp : uint8
+{
+	Replace,
+	Add,
+	Max,
+	Erase,
+};
+
 UCLASS()
 class COMPUTESHADERGENERATOR_API UCSMeshOps : public UBlueprintFunctionLibrary
 {
@@ -311,6 +328,16 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "CS GpuMesh|Transform")
 	static UPARAM(DisplayName = "Target") UCSMesh* TransformMesh(UCSMesh* Target, const FTransform& Transform);
 
+	/**
+	 * Records the transform pass into an existing edit context.
+	 *
+	 * Exists for the same reason as the other AddXxxPasses: moving a mesh is an INTERACTIVE hot
+	 * path (dragging an actor whose resident streams are world-space), and the hot path is not
+	 * allowed a single device sync. Leaves the section table alone — the pass rewrites positions
+	 * and tangents only, so the material split still describes the same triangles.
+	 */
+	static void AddTransformPasses(FCSMeshEditContext& Context, const FTransform& Transform);
+
 	UFUNCTION(BlueprintCallable, Category = "CS GpuMesh|Transform")
 	static UPARAM(DisplayName = "Target") UCSMesh* TranslateMesh(UCSMesh* Target, FVector Translation);
 
@@ -321,6 +348,91 @@ public:
 	/** Sets every vertex colour to a constant. */
 	UFUNCTION(BlueprintCallable, Category = "CS GpuMesh|Colors")
 	static UPARAM(DisplayName = "Target") UCSMesh* SetVertexColors(UCSMesh* Target, FLinearColor Color);
+
+	/**
+	 * Sphere brush over the colour stream: every vertex within Radius of Center (positions are
+	 * world space, like the resident streams themselves) blends toward Color with a falloff
+	 * weight, on the channels ChannelMask selects (mask > 0 = affected, typically 0 or 1).
+	 *
+	 * Falloff is the fraction of the radius the weight fades over: 0 paints hard to the rim,
+	 * 1 fades from the centre out; the fade is smoothstep-shaped. Strength scales the whole
+	 * stroke sample. Blend formulas are documented on ECSMeshPaintBlendOp — a caller keeping a
+	 * CPU mirror of the colours (ground paint does) must reproduce them bit-for-bit from the
+	 * same stored 8-bit values.
+	 *
+	 * Touches only the colour stream: counts, sections, bounds all stay as they were.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CS GpuMesh|Colors")
+	static UPARAM(DisplayName = "Target") UCSMesh* PaintVertexColorsSphere(
+		UCSMesh* Target, FVector Center, float Radius, float Falloff, float Strength,
+		FLinearColor Color, FLinearColor ChannelMask,
+		ECSMeshPaintBlendOp BlendOp = ECSMeshPaintBlendOp::Replace);
+
+	/**
+	 * 区域版球刷：只对行主序规则网格上 [RegionMin, RegionMax] 闭区间内的格点派发线程，
+	 * 混合公式与上面那条逐位相同（同一个 kernel，只是 id 解码方式不同）。
+	 *
+	 * 存在的理由是 dispatch 规模：全网格版的 ThreadCount = 顶点容量，一次默认半径 300 /
+	 * 格距 50 的落笔只改 13×13 = 169 个格点，却要在 1024² 地面上开 105 万线程 —— 派发量
+	 * 随地面尺寸线性膨胀而实际工作量恒定。区域版把它钉死在 169。
+	 *
+	 * 网格顶点编号必须是 Id = Y * VertsX + X（地面镜像的行主序约定，同 DisplaceGroundShapers）。
+	 * VertsX/VertsY < 2 时退回全网格派发 —— 非规则网格（房体三角汤等）走的就是这条。
+	 * 区域只影响派发范围，不影响判定：球外的格点照样被距离剔除，所以调用方给的矩形宁可大不可小。
+	 */
+	static UCSMesh* PaintVertexColorsSphereInRegion(
+		UCSMesh* Target, FVector Center, float Radius, float Falloff, float Strength,
+		FLinearColor Color, FLinearColor ChannelMask, ECSMeshPaintBlendOp BlendOp,
+		int32 VertsX, int32 VertsY, FIntPoint RegionMin, FIntPoint RegionMax);
+
+	/** One brush dab, in the form the recorder wants. Plain data — safe to own inside a lambda. */
+	struct FCSMeshPaintSphereDab
+	{
+		FVector Center = FVector::ZeroVector;
+		float Radius = 0.0f;
+		float Falloff = 0.5f;
+		float Strength = 1.0f;
+		FLinearColor Color = FLinearColor::White;
+		FLinearColor ChannelMask = FLinearColor::White;
+		ECSMeshPaintBlendOp BlendOp = ECSMeshPaintBlendOp::Replace;
+		int32 VertsX = 0;          // 0 = dispatch over the whole mesh
+		int32 VertsY = 0;
+		FIntPoint RegionMin = FIntPoint::ZeroValue;
+		FIntPoint RegionMax = FIntPoint::ZeroValue;
+	};
+
+	/**
+	 * Records one dab into an existing edit context.
+	 *
+	 * Recording several of these into ONE EditMeshAsync is what takes a stroke's device syncs to
+	 * zero: the blends are `lerp`/`add`/`max`/`erase` on the colour a dab reads, so replaying a
+	 * frame's dabs in order inside one graph gives bit-for-bit what applying them one at a time
+	 * would have. (Tiny Glade's own CPU→GPU traffic is likewise all incremental sub-range writes
+	 * into persistent buffers, with zero device syncs.)
+	 */
+	static void AddPaintSpherePasses(FCSMeshEditContext& Context, const FCSMeshPaintSphereDab& Dab);
+
+	// -------------------------------------------------------------------------
+	// Height field（TinyGladeHouse D9 地形塑形物）
+	// -------------------------------------------------------------------------
+
+	/**
+	 * 位移一块规则网格地面的高度：位置 Z 与切线按塑形物高度场重写，**只在 GPU 线程上跑**
+	 * （一个 compute pass，没有 CPU 快照、没有整网格重传）。
+	 *
+	 * ShaperParams 每 `CSGroundShaperField::Float4sPerShaper` 项 = 一座塑形物（圆盘 + 羽化裙边
+	 * + 裙边噪声 + 二次抬升，布局与公式见 Public/CSGroundShaperField.h）。多座重叠取 max，
+	 * 基底恒 0 —— 与 ACSGroundShaperActor::SampleShapeHeight / ACSGroundActor 的 CPU 镜像
+	 * 同一公式，镜像与画面因此不会分叉（同顶点色笔刷的双写纪律）。
+	 *
+	 * RegionMin/RegionMax 是要更新的格点闭区间；只更新受影响的矩形即可，法线在 kernel 里
+	 * 用同一场解析差分得到，不依赖邻居顶点，所以矩形不需要为法线额外外扩一圈。
+	 * 网格顶点编号必须是 Id = Y * VertsX + X（地面镜像的行主序约定）。
+	 */
+	static UCSMesh* DisplaceGroundShapers(
+		UCSMesh* Target, const TArray<FVector4f>& ShaperParams,
+		const FVector2f& GridOriginXY, float CellSize, float BaseZ,
+		int32 VertsX, int32 VertsY, FIntPoint RegionMin, FIntPoint RegionMax);
 
 	// -------------------------------------------------------------------------
 	// Draw batches
@@ -406,4 +518,92 @@ public:
 	 *  the resident streams are strictly per-vertex; the StaticMesh build merges identical
 	 *  vertices again on the way out. Not a UFUNCTION: FCSGpuMeshCPUData is not reflected. */
 	static bool CopyFromMeshSnapshot(UCSMesh* Target, const FCSGpuMeshCPUData& Snapshot);
+
+	/**
+	 * A snapshot already packed into the exact resident stream layouts, plus the counts and bounds
+	 * derived from it. Splitting this out is what lets one upload be recorded from a render-thread
+	 * lambda: the packing is ordinary game-thread CPU work, and an async edit's EditFunc is OWNED,
+	 * so everything it reads has to be owned too (a pointer into the caller's frame — the pattern
+	 * EditMeshSync's flush makes safe — is a use-after-free there).
+	 */
+	struct FCSMeshUploadPayload
+	{
+		TArray<FVector3f> Positions;
+		TArray<uint32> Tangents;
+		TArray<FVector2f> TexCoords;
+		TArray<uint32> Colors;
+		TArray<uint32> Indices;
+		TArray<uint32> MaterialIds;
+		FBox WorldBounds = FBox(ForceInit);
+		int32 VertexCount = 0;
+		int32 IndexCount = 0;
+
+		/** UV 组数。TexCoords 按 [v0.uv0, v0.uv1, v1.uv0, v1.uv1, …] **交错**存放（引擎的
+		 *  manual fetch 就是这么索引的），所以它的长度是 VertexCount × NumTexCoordSets。 */
+		int32 NumTexCoordSets = 1;
+
+		bool IsValid() const { return VertexCount >= 3 && IndexCount >= 3; }
+	};
+
+	/**
+	 * Packs a CPU snapshot into the resident layouts. Pure CPU, no RHI — safe anywhere.
+	 *
+	 * NumTexCoordSets must be what the TARGET MESH declares, not what the snapshot happens to
+	 * carry: the stream's width is the mesh's property, and a snapshot is in no position to
+	 * re-declare it. Snapshot channels past that count are dropped; channels it does not have
+	 * are written as zero.
+	 */
+	static bool BuildUploadPayload(const FCSGpuMeshCPUData& Snapshot, FCSMeshUploadPayload& OutPayload,
+		int32 NumTexCoordSets = 1);
+
+	/** How many UV sets a mesh's TexCoord stream currently carries. 1 for anything that never asked. */
+	static int32 GetTexCoordSets(const UCSMesh* Target);
+
+	/**
+	 * Declares how many UV sets the mesh's TexCoord stream carries (see
+	 * FStandardStreamOptions::NumTexCoordSets — it is a per-mesh variant, not a global setting).
+	 *
+	 * **The mesh's OWNER calls this, once — never an upload path.** Re-declaring a layout rebuilds
+	 * the whole stream set, and a caller who only knows about UV sets cannot know what else the
+	 * mesh declared; getting that wrong silently drops those streams (the symptom is a consumer
+	 * whose aux stream "is not in the resident set"). This function therefore carries every
+	 * non-standard stream it finds on the mesh back into the new declaration.
+	 *
+	 * Already-that-count is an early true with no layout work at all. Game thread; blocks only
+	 * when the count actually changes.
+	 */
+	static bool EnsureTexCoordSets(UCSMesh* Target, int32 NumTexCoordSets);
+
+	// -------------------------------------------------------------------------
+	// Pass recorders
+	//
+	// Every operator here has the same two-part shape: an internal AddXxxPasses that records into
+	// an existing edit context, and a thin outer entry point that wraps it in EditMeshSync. The
+	// split exists so a caller can put SEVERAL operators into ONE EditMeshAsync — one graph, one
+	// fence — instead of paying a FlushRenderingCommands per operator. Recording each operator as
+	// its own async edit does NOT work: the second is refused while the first is in flight.
+	// -------------------------------------------------------------------------
+
+	/** Records the stream uploads + counter write for an already-packed payload. */
+	static void AddCopyFromSnapshotPasses(FCSMeshEditContext& Context, const FCSMeshUploadPayload& Payload);
+
+	/**
+	 * Records the material sort (histogram / scan / scatter) that fills the indirect arg sets.
+	 * Returns whether the passes were actually recorded — the caller must NOT publish sections
+	 * for a sort that never ran, or they point at arg sets nothing wrote.
+	 *
+	 * The caller is responsible for EnsureIndirectDrawCapacitySync BEFORE recording (growing the
+	 * args buffer changes its identity, bumps AllocationGeneration and drops the section table)
+	 * and PublishMaterialSections AFTER the graph has executed.
+	 */
+	static bool AddMaterialSectionPasses(FCSMeshEditContext& Context, int32 NumSlots);
+
+	/**
+	 * Publishes the section table for a sort that has completed. **Game thread, and strictly
+	 * after the graph ran.** Under EditMeshAsync this belongs in the completion callback: the
+	 * recorder runs on the render thread, so a game-thread read of its result taken any earlier
+	 * sees the pre-sort value — and the symptom is a mesh that silently draws one material with
+	 * no error at all (the proxy does not verify used materials).
+	 */
+	static void PublishMaterialSections(UCSMesh* Target);
 };

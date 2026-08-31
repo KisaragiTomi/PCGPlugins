@@ -1,0 +1,277 @@
+<svg viewBox="0 0 1180 800" width="1180" height="800" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Microsoft YaHei, sans-serif">
+  <defs>
+    <pattern id="live-dot-bg" patternUnits="userSpaceOnUse" width="12" height="12">
+      <rect width="12" height="12" fill="#cffafe"/>
+      <circle cx="3" cy="3" r="1.25" fill="#0891b2" opacity="0.256281"/>
+      <circle cx="9" cy="9" r="1.25" fill="#0891b2" opacity="0.256281"/>
+    </pattern>
+    <pattern id="missing-hatch-bg" patternUnits="userSpaceOnUse" width="10" height="10" patternTransform="rotate(45)">
+      <rect width="10" height="10" fill="#f1f5f9"/>
+      <rect x="0" y="0" width="10" height="2" fill="#64748b" opacity="0.361702"/>
+    </pattern>
+    <pattern id="gpu-stripe-bg" patternUnits="userSpaceOnUse" width="10" height="10">
+      <rect width="10" height="10" fill="#fef3c7"/>
+      <rect y="1" width="10" height="2" fill="#d97706" opacity="0.264249"/>
+      <rect y="6" width="10" height="1.5" fill="#d97706" opacity="0.264249"/>
+    </pattern>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <style>
+    .title    { font-size: 17px; font-weight: 700; fill: #0f172a; }
+    .sub      { font-size: 11.5px; fill: #475569; }
+    .bandhead { fill: #e2e8f0; stroke: #94a3b8; stroke-width: 1; rx: 5; }
+    .bandtext { font-size: 12px; font-weight: 700; fill: #0f172a; }
+    .bandnote { font-size: 10.5px; fill: #475569; }
+    .n        { stroke: #64748b; stroke-width: 1; rx: 6; }
+    .plain    { fill: #f8fafc; }
+    .live-dot { fill: url(#live-dot-bg); }
+    .missing  { fill: url(#missing-hatch-bg); }
+    .gpu      { fill: url(#gpu-stripe-bg); }
+    .h        { font-size: 10.5px; font-weight: 700; fill: #0f172a; }
+    .t        { font-size: 9.5px;  fill: #334155; }
+    .s        { font-size: 9.5px;  fill: #64748b; }
+    .edge     { stroke: #475569; stroke-width: 1.2; fill: none; marker-end: url(#arrow); }
+    .wrap     { stroke: #94a3b8; stroke-width: 1.1; fill: none; stroke-dasharray: 4 3; marker-end: url(#arrow); }
+    .badge    { fill: #1e293b; rx: 4; }
+    .badge-r  { fill: #b91c1c; rx: 4; }
+    .badge-t  { font-size: 9.5px; font-weight: 700; fill: #ffffff; }
+  </style>
+
+  <text x="30" y="30" class="title">TinyGlade.hip /obj/geo1 → ACSGroundShaperActor：三条链的对照</text>
+  <text x="30" y="50" class="sub">灰底 = Houdini 原型节点（左→右为 cook 顺序）；青点底 = UE 已落地；斜纹底 = UE 未实现；琥珀条纹 = GPU pass</text>
+
+  <rect x="30" y="70" width="1120" height="26" class="bandhead"/>
+  <text x="42" y="88" class="bandtext">链 A　高度场与地面隆起</text>
+  <text x="240" y="88" class="bandnote">road 顶点属性在这里被刷上，后面两条链都靠它分流</text>
+
+  <g>
+    <rect x="40"  y="106" width="132" height="38" class="n plain"/>
+    <text x="48"  y="121" class="h">grid1</text>
+    <text x="48"  y="135" class="t">10×10 单位，50×50</text>
+    <line x1="172" y1="125" x2="192" y2="125" class="edge"/>
+
+    <rect x="196" y="106" width="132" height="38" class="n plain"/>
+    <text x="204" y="121" class="h">attribpaint1</text>
+    <text x="204" y="135" class="t">刷 f@road</text>
+    <line x1="328" y1="125" x2="348" y2="125" class="edge"/>
+
+    <rect x="352" y="106" width="132" height="38" class="n plain"/>
+    <text x="360" y="121" class="h">deformbyinfluence1</text>
+    <text x="360" y="135" class="t">dist = ramp(d / 0.67)</text>
+    <line x1="484" y1="125" x2="504" y2="125" class="edge"/>
+
+    <rect x="508" y="106" width="132" height="38" class="n plain"/>
+    <text x="516" y="121" class="h">noisebysourcestress1</text>
+    <text x="516" y="135" class="t">dist −= |turb·(1−dist)|</text>
+    <line x1="640" y1="125" x2="660" y2="125" class="edge"/>
+
+    <rect x="664" y="106" width="132" height="38" class="n plain"/>
+    <text x="672" y="121" class="h">attribwrangle1</text>
+    <text x="672" y="135" class="t">@P.y += f@dist</text>
+    <line x1="796" y1="125" x2="816" y2="125" class="edge"/>
+
+    <rect x="820" y="106" width="150" height="38" class="n plain"/>
+    <text x="828" y="121" class="h">attribwrangle5 → normal3</text>
+    <text x="828" y="135" class="t">二次抬升 pow 1.5</text>
+  </g>
+
+  <line x1="590" y1="146" x2="590" y2="164" class="edge"/>
+  <rect x="40" y="164" width="1076" height="56" class="n live-dot"/>
+  <rect x="52" y="172" width="52" height="15" class="badge"/>
+  <text x="58" y="183" class="badge-t">已落地</text>
+  <text x="116" y="183" class="h">CSGroundShaperField.h ／ CSGroundShaperField.ush（同一公式的 CPU 孪生与 GPU 权威，逐顶点一致性有断言守着）</text>
+  <text x="52" y="204" class="t">h = Top · (S + 0.021·S^1.5)，S = smoothstep(1 − Skirt/Falloff)，再减去 |turb·(1−S)|·Amount；盘内恒 Top、重叠取 max，噪声加在 max 之前。</text>
+
+  <rect x="30" y="236" width="1120" height="26" class="bandhead"/>
+  <text x="42" y="254" class="bandtext">链 B　侧面碎石（Voronoi 切割）</text>
+  <text x="300" y="254" class="bandnote">只长在「没有路」的坡面上：blast10 先把 road&gt;0 的点删掉</text>
+
+  <g>
+    <rect x="40"  y="272" width="132" height="38" class="n plain"/>
+    <text x="48"  y="287" class="h">attribwrangle2</text>
+    <text x="48"  y="301" class="t">f@dot = dot(N, +Y)</text>
+    <line x1="172" y1="291" x2="192" y2="291" class="edge"/>
+
+    <rect x="196" y="272" width="132" height="38" class="n plain"/>
+    <text x="204" y="287" class="h">blast10</text>
+    <text x="204" y="301" class="t">删 @road&gt;0</text>
+    <line x1="328" y1="291" x2="348" y2="291" class="edge"/>
+
+    <rect x="352" y="272" width="132" height="38" class="n plain"/>
+    <text x="360" y="287" class="h">blast1</text>
+    <text x="360" y="301" class="t">留 @dot&lt;1（坡面）</text>
+    <line x1="484" y1="291" x2="504" y2="291" class="edge"/>
+
+    <rect x="508" y="272" width="132" height="38" class="n plain"/>
+    <text x="516" y="287" class="h">scatter1 → fuse1</text>
+    <text x="516" y="301" class="t">15 点，tol 0.59 稀释</text>
+    <line x1="640" y1="291" x2="660" y2="291" class="edge"/>
+
+    <rect x="664" y="272" width="132" height="38" class="n plain"/>
+    <text x="672" y="287" class="h">Findmargin2 → add1</text>
+    <text x="672" y="301" class="t">边界等距种子</text>
+    <line x1="796" y1="291" x2="816" y2="291" class="edge"/>
+
+    <rect x="820" y="272" width="132" height="38" class="n plain"/>
+    <text x="828" y="287" class="h">merge3</text>
+    <text x="828" y="301" class="t">内部 + 边界种子</text>
+    <line x1="952" y1="291" x2="972" y2="291" class="edge"/>
+
+    <rect x="976" y="272" width="132" height="38" class="n plain"/>
+    <text x="984" y="287" class="h">Voronoiscatter1</text>
+    <text x="984" y="301" class="t">最近种子分片 + 松边</text>
+  </g>
+
+  <polyline points="1108,291 1160,291 1160,320 20,320 20,349 36,349" class="wrap"/>
+
+  <g>
+    <rect x="40"  y="330" width="132" height="38" class="n plain"/>
+    <text x="48"  y="345" class="h">connectivity1</text>
+    <text x="48"  y="359" class="t">i@class 逐块</text>
+    <line x1="172" y1="349" x2="192" y2="349" class="edge"/>
+
+    <rect x="196" y="330" width="132" height="38" class="n plain"/>
+    <text x="204" y="345" class="h">attribpromote1</text>
+    <text x="204" y="359" class="t">v@center 块心</text>
+    <line x1="328" y1="349" x2="348" y2="349" class="edge"/>
+
+    <rect x="352" y="330" width="132" height="38" class="n plain"/>
+    <text x="360" y="345" class="h">attribwrangle3</text>
+    <text x="360" y="359" class="t">外扩 .072 / 内推 .051</text>
+    <line x1="484" y1="349" x2="504" y2="349" class="edge"/>
+
+    <rect x="508" y="330" width="132" height="38" class="n plain"/>
+    <text x="516" y="345" class="h">polyextrude1</text>
+    <text x="516" y="359" class="t">厚 0.12，带 ramp</text>
+    <line x1="640" y1="349" x2="660" y2="349" class="edge"/>
+
+    <rect x="664" y="330" width="132" height="38" class="n plain"/>
+    <text x="672" y="345" class="h">Findmargin1 分流</text>
+    <text x="672" y="359" class="t">边界原样 / 内部 remesh</text>
+    <line x1="796" y1="349" x2="816" y2="349" class="edge"/>
+
+    <rect x="820" y="330" width="132" height="38" class="n plain"/>
+    <text x="828" y="345" class="h">polyreduce1</text>
+    <text x="828" y="359" class="t">减到 56.4%</text>
+    <line x1="952" y1="349" x2="972" y2="349" class="edge"/>
+
+    <rect x="976" y="330" width="132" height="38" class="n plain"/>
+    <text x="984" y="345" class="h">normal2</text>
+    <text x="984" y="359" class="t">cusp 29.9° 硬边</text>
+  </g>
+
+  <line x1="590" y1="370" x2="590" y2="388" class="edge"/>
+  <rect x="40" y="388" width="1076" height="56" class="n missing"/>
+  <rect x="52" y="396" width="52" height="15" class="badge-r"/>
+  <text x="58" y="407" class="badge-t">未实现</text>
+  <text x="116" y="407" class="h">UE 侧一行代码都没有。方案已定为 Tiny Glade 式披挂岩壳，几何归地面 actor 持有（计划 D9 裁决二，推翻 :504 的岩石那一半）。</text>
+  <text x="52" y="428" class="t">后果：坡面只有「有路」那一半的产物（石阶），没路的那一半是光秃的插值面 —— 原型里 road 是把坡面一分为二的开关，UE 只接了一半。</text>
+
+  <rect x="30" y="460" width="1120" height="26" class="bandhead"/>
+  <text x="42" y="478" class="bandtext">链 C　石阶</text>
+  <text x="170" y="478" class="bandnote">只长在「有路」的坡面上：blast8 只保留 @road&gt;0，与链 B 互补</text>
+
+  <g>
+    <rect x="40"  y="496" width="132" height="38" class="n plain"/>
+    <text x="48"  y="511" class="h">line1</text>
+    <text x="48"  y="525" class="t">竖线，高 = 台高 1.7</text>
+    <line x1="172" y1="515" x2="192" y2="515" class="edge"/>
+
+    <rect x="196" y="496" width="132" height="38" class="n plain"/>
+    <text x="204" y="511" class="h">attribwrangle6</text>
+    <text x="204" y="525" class="t">pscale 底 1 → 顶 .378</text>
+    <line x1="328" y1="515" x2="348" y2="515" class="edge"/>
+
+    <rect x="352" y="496" width="132" height="38" class="n plain"/>
+    <text x="360" y="511" class="h">resample1</text>
+    <text x="360" y="525" class="t">每 0.2 一层</text>
+    <line x1="484" y1="515" x2="504" y2="515" class="edge"/>
+
+    <rect x="508" y="496" width="132" height="38" class="n plain"/>
+    <text x="516" y="511" class="h">blast7</text>
+    <text x="516" y="525" class="t">删最顶一层</text>
+    <line x1="640" y1="515" x2="660" y2="515" class="edge"/>
+
+    <rect x="664" y="496" width="132" height="38" class="n plain"/>
+    <text x="672" y="511" class="h">transform2</text>
+    <text x="672" y="525" class="t">整体下移一层</text>
+  </g>
+
+  <polyline points="796,515 1160,515 1160,544 20,544 20,573 36,573" class="wrap"/>
+
+  <g>
+    <rect x="40"  y="554" width="132" height="38" class="n plain"/>
+    <text x="48"  y="569" class="h">transform1</text>
+    <text x="48"  y="583" class="t">基环 R×1.5875</text>
+    <line x1="172" y1="573" x2="192" y2="573" class="edge"/>
+
+    <rect x="196" y="554" width="132" height="38" class="n plain"/>
+    <text x="204" y="569" class="h">copytopoints2</text>
+    <text x="204" y="583" class="t">逐层套环（线性锥）</text>
+    <line x1="328" y1="573" x2="348" y2="573" class="edge"/>
+
+    <rect x="352" y="554" width="132" height="38" class="n plain"/>
+    <text x="360" y="569" class="h">resample2</text>
+    <text x="360" y="583" class="t">环上每 0.278 一点</text>
+    <line x1="484" y1="573" x2="504" y2="573" class="edge"/>
+
+    <rect x="508" y="554" width="132" height="38" class="n plain"/>
+    <text x="516" y="569" class="h">ray1</text>
+    <text x="516" y="583" class="t">投到地面 + 取 road</text>
+    <line x1="640" y1="573" x2="660" y2="573" class="edge"/>
+
+    <rect x="664" y="554" width="132" height="38" class="n plain"/>
+    <text x="672" y="569" class="h">orientalongcurve1</text>
+    <text x="672" y="583" class="t">环切向基</text>
+  </g>
+
+  <polyline points="796,573 1160,573 1160,602 20,602 20,631 36,631" class="wrap"/>
+
+  <g>
+    <rect x="40"  y="612" width="132" height="38" class="n plain"/>
+    <text x="48"  y="627" class="h">attribwrangle7</text>
+    <text x="48"  y="641" class="t">Noffset .163 内推</text>
+    <line x1="172" y1="631" x2="192" y2="631" class="edge"/>
+
+    <rect x="196" y="612" width="132" height="38" class="n plain"/>
+    <text x="204" y="627" class="h">blast8</text>
+    <text x="204" y="641" class="t">只留 @road&gt;0</text>
+    <line x1="328" y1="631" x2="348" y2="631" class="edge"/>
+
+    <rect x="352" y="612" width="150" height="38" class="n plain"/>
+    <text x="360" y="627" class="h">copytopoints1</text>
+    <text x="360" y="641" class="t">摆 Step 盒（单一尺寸）</text>
+  </g>
+
+  <line x1="305" y1="652" x2="305" y2="670" class="edge"/>
+  <line x1="570" y1="701" x2="586" y2="701" class="edge"/>
+  <rect x="40" y="670" width="530" height="62" class="n live-dot"/>
+  <rect x="52" y="678" width="52" height="15" class="badge"/>
+  <text x="58" y="689" class="badge-t">已落地</text>
+  <text x="116" y="689" class="h">CPU：BuildStepPlan</text>
+  <text x="52" y="708" class="t">闭式环半径（smoothstep 反函数）替掉「线性锥 + ray」；</text>
+  <text x="52" y="722" class="t">弧段切分 + SolveBlockLayout 变长铺装替掉单一 Step 盒。</text>
+
+  <rect x="586" y="670" width="530" height="62" class="n gpu"/>
+  <rect x="598" y="678" width="52" height="15" class="badge"/>
+  <text x="604" y="689" class="badge-t">已落地</text>
+  <text x="662" y="689" class="h">GPU：RDG_SmoothSpline → CSGroundSteps.usf</text>
+  <text x="598" y="708" class="t">曲线求值与实例行组装全在渲染线程，直写</text>
+  <text x="598" y="722" class="t">UCSGpuInstancedMeshComponent，CPU 零回读。</text>
+
+  <rect x="30" y="750" width="1120" height="38" class="n plain"/>
+  <rect x="46"  y="761" width="26" height="16" class="n plain"/>
+  <text x="80"  y="774" class="s">Houdini 原型节点</text>
+  <rect x="200" y="761" width="26" height="16" class="n live-dot"/>
+  <text x="234" y="774" class="s">UE 已落地</text>
+  <rect x="330" y="761" width="26" height="16" class="n gpu"/>
+  <text x="364" y="774" class="s">GPU pass</text>
+  <rect x="450" y="761" width="26" height="16" class="n missing"/>
+  <text x="484" y="774" class="s">UE 未实现</text>
+  <line x1="600" y1="769" x2="632" y2="769" class="wrap"/>
+  <text x="642" y="774" class="s">链在此换行续接</text>
+  <text x="800" y="774" class="s">单位为 Houdini 场景单位；UE 对照值见 CSGroundShaper.md 参数对照表</text>
+</svg>

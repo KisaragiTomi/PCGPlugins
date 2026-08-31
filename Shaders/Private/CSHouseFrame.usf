@@ -1,0 +1,227 @@
+// 门框砖的 **100% GPU 解析推导**（TinyGladeHouse D6；2026-08-30「裁决一」选乙）。
+//
+// **一线程一砖**：线程 i 直接从「拱参数 + 墙框架」算出第 i 块砖的位置与朝向，中间没有样条、
+// 没有逐砖记录、没有原子累加。与已删的 `CSGroundSteps.usf` 那条路的差别不是"少一步"：
+//   · 那边每条曲线先跑一次 `RDG_SmoothSpline`（一个 dispatch）求值出采样点，再跑一次散布
+//     （又一个 dispatch）按记录里的 alpha 在采样点之间插值；这里**整栋房子一个 dispatch**。
+//   · 那边的槽位靠 `InterlockedAdd` 抢 ⇒ 逐实例随机数由线程组完成顺序决定（S1 栽过一次：
+//     "画一笔路全场变色"且没有任何断言会红）；这里槽位**恒等于砖序号**，随机数是砖身份的
+//     纯函数。
+//   · 那边的实例数随砖数走 ⇒ 容量要能扩 ⇒ 扩容那一趟是阻塞刷新；这里容量恒定，超了就少摆。
+//
+// 砖路的解析形状与「为什么骑在 clip 场那条曲线上」都写在 `CSHouseFrame.h` 的文件头，
+// 这里不重复。**`FrameEvalPath` 是 `CSHouseFrame::EvalPath` 的逐字翻译，两处必须一起改** ——
+// 写不一样的症状是"单测说砖在这儿、画面上砖在那儿"，而两边各自都自洽（同 `CSHouse_ClipKeeps`
+// 与材质那对判据的纪律）。
+//
+// 逐路常量 = 6 个 float4（`CSHouseFrame_Flatten` 是 CPU 侧的同一份定义）：
+//   [0] Origin.xyz（墙空间原点的世界坐标）    | CenterS
+//   [1] AxisU.xyz（沿边，单位）               | Radius
+//   [2] AxisV.xyz（竖直，单位）               | TopZ
+//   [3] BaseZ | LeftS | RightS | MidMeasure（圆弧 = 扫角，平顶 = 长度）
+//   [4] asuint 位标志 | asuint 砖序起点 | asuint 砖数 | Pitch（相邻砖中心距）
+//   [5] HalfLen（首块砖的弧长）| LayoutScale（长度轴铺装缩放）| asuint 随机数基 | _
+//
+// packed 行布局照抄 CSGpuInstancedMesh.usf：前三行是被缩放过的基（**矩阵的行**），第 4 行是
+// 原点 + 每实例随机数，第 5 行是剔除球（必须包住变换后的基础网格，否则实例会在视锥边缘闪掉）。
+// 基的约定与已删的 `CSGroundSteps.usf` **逐字相同**，迁移前后砖的朝向因此逐块一致：
+//   +X = 面内朝外（砖的进深 FrameBrickDepth）
+//   +Y = 路径切向的**反向**（砖的长度轴；旧 kernel 的 `AxisY = cross(N, AxisX)` 在翻号之后
+//        恒等于 −T，这里直接写成 −T，省掉那三步"求径向 + 投影 + 判号"）
+//   +Z = X × Y，恒等于墙外法线（对称砖盒下符号无关紧要，但行列式必须为正，否则实例是镜像、
+//        法线朝里、光照当场坏掉）
+
+#include "/Engine/Public/Platform.ush"
+
+#ifndef THREADGROUPSIZE_X
+#define THREADGROUPSIZE_X 64
+#endif
+
+#define FRAME_PATH_STRIDE 6
+
+#define FRAME_FLAG_LEFT_JAMB  1u
+#define FRAME_FLAG_RIGHT_JAMB 2u
+#define FRAME_FLAG_MID_ARC    4u
+#define FRAME_FLAG_MID_FLAT   8u
+#define FRAME_FLAG_SILL       16u
+
+StructuredBuffer<float4> FramePaths;   // 6 个 float4 / 砖路
+
+RWBuffer<float4> RWFrameInstances;     // 5 个 float4 / 实例
+RWBuffer<uint>   RWFrameCounter;       // [0] = 活跃实例数
+
+float4x4 FrameWorldToComponent;
+float3   FrameBaseSphereCentre;        // 基础网格局部包围球心（未缩放）
+float3   FrameBlockSize;               // 三轴块尺寸（TG 的 brick 是 100³ 居中盒 ⇒ 非均匀缩放就是砖尺寸）
+float    FrameBaseSphereRadius;
+uint     FramePathCount;
+uint     FrameBrickTotal;
+uint     FrameMaxInstances;
+
+/** 与 CSGpuInstancedMesh.usf:120-126 同一份哈希，CPU/GPU 两条路的 PerInstanceRandom 才对得上。 */
+float FrameInstanceRandom(uint Index)
+{
+	uint H = Index * 747796405u + 2891336453u;
+	H = ((H >> ((H >> 28) + 4u)) ^ H) * 277803737u;
+	return float((H >> 22 ^ H) & 0xFFFFFFu) / float(0x1000000u);
+}
+
+/**
+ * 弧长 → 墙空间 (S, Z) 与单位切向。**`CSHouseFrame::EvalPath` 的逐字翻译。**
+ *
+ * 分支顺序即段序，每段都带"我存在吗"与"我后面还有段吗"的前置判断：退化路径
+ * （只有中段的圆洞 / 只有左段的墩）因此不会掉进后面那段的公式里去算出一个看着合理的错位置。
+ */
+void FrameEvalPath(uint Flags, float BaseZ, float TopZ, float LeftS, float RightS,
+	float CenterS, float Radius, float MidMeasure, float Arc,
+	out float2 OutSZ, out float2 OutTangent)
+{
+	const float JambLen = max(TopZ - BaseZ, 0.0f);
+	const bool bLeft = (Flags & FRAME_FLAG_LEFT_JAMB) != 0u;
+	const bool bRight = (Flags & FRAME_FLAG_RIGHT_JAMB) != 0u;
+	const float L0 = bLeft ? JambLen : 0.0f;
+	const float L2 = bRight ? JambLen : 0.0f;
+	float L1 = 0.0f;
+	if (Flags & FRAME_FLAG_MID_ARC)  L1 = max(Radius, 0.0f) * MidMeasure;
+	if (Flags & FRAME_FLAG_MID_FLAT) L1 = max(MidMeasure, 0.0f);
+	// 窗台底边（第四段）。两侧门樘缺一不可 —— 与 `FPath::SillLen()` 逐字对应。
+	const float L3 = (((Flags & FRAME_FLAG_SILL) != 0u) && bLeft && bRight) ? max(RightS - LeftS, 0.0f) : 0.0f;
+
+	const float Total = L0 + L1 + L2 + L3;
+	const float A = clamp(Arc, 0.0f, max(Total, 0.0f));
+
+	if (L0 > 0.0f && (A <= L0 || (L1 <= 0.0f && L2 <= 0.0f && L3 <= 0.0f)))
+	{
+		OutSZ = float2(LeftS, BaseZ + min(A, L0));
+		OutTangent = float2(0.0f, 1.0f);
+		return;
+	}
+	if (L1 > 0.0f && (A <= L0 + L1 || (L2 <= 0.0f && L3 <= 0.0f)))
+	{
+		const float T = min(A - L0, L1);
+		if (Flags & FRAME_FLAG_MID_ARC)
+		{
+			const float Theta = Radius > 1e-4f ? T / Radius : 0.0f;
+			float SinT, CosT;
+			sincos(Theta, SinT, CosT);
+			OutSZ = float2(CenterS - Radius * CosT, TopZ + Radius * SinT);
+			OutTangent = float2(SinT, CosT);   // θ=0 → (0,1)，θ=π → (0,−1)：与两侧竖直段切向连续
+		}
+		else
+		{
+			OutSZ = float2(LeftS + T, TopZ);
+			OutTangent = float2(1.0f, 0.0f);
+		}
+		return;
+	}
+	if (L2 > 0.0f && (A <= L0 + L1 + L2 || L3 <= 0.0f))
+	{
+		OutSZ = float2(RightS, TopZ - min(A - L0 - L1, L2));
+		OutTangent = float2(0.0f, -1.0f);
+		return;
+	}
+	if (L3 > 0.0f)
+	{
+		// 窗台底边：从右樘底走回左樘底。切向朝 −S ⇒ 面内朝外法线朝下（背离洞），
+		// 与另外三段"法线一律指出洞外"的口径一致。走反了砖会整排翻身。
+		OutSZ = float2(RightS - min(A - L0 - L1 - L2, L3), BaseZ);
+		OutTangent = float2(-1.0f, 0.0f);
+		return;
+	}
+	OutSZ = float2(LeftS, BaseZ);
+	OutTangent = float2(0.0f, 1.0f);
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void ScatterHouseFrameCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint Brick = DispatchThreadId.x;
+	if (Brick >= FrameBrickTotal) return;
+
+	// counter 由 0 号线程直接写死 —— 砖数是 CPU 算好的标量（`CSHouseFrame::SolveRun`），
+	// 不需要原子累加。组件永远不会替我们清 counter，所以这一句是必需的而不是优化。
+	if (Brick == 0u) RWFrameCounter[0] = min(FrameBrickTotal, FrameMaxInstances);
+	if (Brick >= FrameMaxInstances) return;   // 越界写是静默的：宁可少摆一块，也不能踩出 buffer
+
+	// 找到自己属于哪条砖路。一面墙上的砖路数是"洞数 × 2"量级（默认参数下整栋房子 ≤ 32），
+	// 线性扫比二分短、也没有边界条件可写错；而且这一步与砖数无关，砖再多也不变慢。
+	uint Path = FramePathCount;
+	uint Begin = 0u;
+	for (uint K = 0u; K < FramePathCount; ++K)
+	{
+		const uint4 Ints = asuint(FramePaths[K * FRAME_PATH_STRIDE + 4u]);
+		if (Brick >= Ints.y && Brick < Ints.y + Ints.z)
+		{
+			Path = K;
+			Begin = Ints.y;
+			break;
+		}
+	}
+	if (Path >= FramePathCount) return;   // 砖序与元素表对不上（不该发生）：宁可少摆
+
+	const uint Base = Path * FRAME_PATH_STRIDE;
+	const float4 R0 = FramePaths[Base + 0u];
+	const float4 R1 = FramePaths[Base + 1u];
+	const float4 R2 = FramePaths[Base + 2u];
+	const float4 R3 = FramePaths[Base + 3u];
+	const float4 R4 = FramePaths[Base + 4u];
+	const float4 R5 = FramePaths[Base + 5u];
+
+	const float3 Origin = R0.xyz;
+	const float3 AxisU = R1.xyz;
+	const float3 AxisV = R2.xyz;
+	const uint Flags = asuint(R4.x);
+	const float Pitch = R4.w;
+	const float HalfLen = R5.x;
+	const float LayoutScale = max(R5.y, 1e-4f);
+	// 随机数序号来自**路**而不是槽位（`CSHouseFrame::FElement::RandomBase`）。门框砖填的就是
+	// BrickBegin ⇒ 逐位等于旧写法的全局槽位；接缝砖填的是接缝身份哈希，两栋房各画一份重叠的
+	// 砖时才能拿到同一个值（裁决二：接缝零归属，两边都画）。
+	const uint RandomIndex = asuint(R5.z) + (Brick - Begin);
+
+	// 第 i 块砖的弧长：首块居中在 HalfLen，之后每块推进一个中心距。
+	// **与 `CSShaperSteps` 那条路的 `Cursor += BlockLength + Gap*Scale` 逐字等价**，
+	// 只是不再需要把它折成一个样条参数 alpha 再插值回来。
+	const float Arc = HalfLen + float(Brick - Begin) * Pitch;
+
+	float2 SZ, TangentSZ;
+	FrameEvalPath(Flags, R3.x, R2.w, R3.y, R3.z, R0.w, R1.w, R3.w, Arc, SZ, TangentSZ);
+
+	// 面内朝外法线 = 切向逆时针转 90°。旧 kernel 要靠"减去曲线中心求径向 + 投影掉平面法线
+	// + 判号翻转"三步才得到同一个方向，那三步在拱心退化时会翻错号；这里没有可翻错的号。
+	const float2 OutwardSZ = float2(-TangentSZ.y, TangentSZ.x);
+
+	const float3 WorldPos = Origin + AxisU * SZ.x + AxisV * SZ.y;
+	const float3 AxisX = AxisU * OutwardSZ.x + AxisV * OutwardSZ.y;
+	const float3 AxisY = -(AxisU * TangentSZ.x + AxisV * TangentSZ.y);
+	const float3 AxisZ = cross(AxisX, AxisY);   // 恒等于墙外法线；用叉积保证行列式为正
+
+	const float3 LocalX = mul(float4(AxisX, 0.0f), FrameWorldToComponent).xyz;
+	const float3 LocalY = mul(float4(AxisY, 0.0f), FrameWorldToComponent).xyz;
+	const float3 LocalZ = mul(float4(AxisZ, 0.0f), FrameWorldToComponent).xyz;
+	const float3 LocalOrigin = mul(float4(WorldPos, 1.0f), FrameWorldToComponent).xyz;
+
+	// 长度轴额外吃铺装缩放（`SolveRun` 把整条路恰好铺满就靠它）。
+	float3 BlockScale = FrameBlockSize;
+	if (dot(BlockScale, BlockScale) < 1e-8f) BlockScale = float3(1.0f, 1.0f, 1.0f);
+	BlockScale.y *= LayoutScale;
+
+	const float3 ScaledX = LocalX * BlockScale.x;
+	const float3 ScaledY = LocalY * BlockScale.y;
+	const float3 ScaledZ = LocalZ * BlockScale.z;
+
+	const uint Row = Brick * 5u;
+	RWFrameInstances[Row + 0u] = float4(ScaledX, 0.0f);   // .w 必须是 0：引擎拿它做选中/hitproxy
+	RWFrameInstances[Row + 1u] = float4(ScaledY, 0.0f);
+	RWFrameInstances[Row + 2u] = float4(ScaledZ, 0.0f);
+	RWFrameInstances[Row + 3u] = float4(LocalOrigin, FrameInstanceRandom(RandomIndex));
+
+	const float3 SphereCentre = LocalOrigin
+		+ ScaledX * FrameBaseSphereCentre.x
+		+ ScaledY * FrameBaseSphereCentre.y
+		+ ScaledZ * FrameBaseSphereCentre.z;
+	// 剔除球必须包住**变换后**的基础网格：基向量是单位长，所以按最大轴缩放放大即可。
+	// 少放大一点点就会在视锥边缘闪掉实例，而且只在斜看时出现，最难复现。
+	const float MaxAxisScale = max(BlockScale.x, max(BlockScale.y, BlockScale.z));
+	RWFrameInstances[Row + 4u] = float4(SphereCentre, FrameBaseSphereRadius * max(MaxAxisScale, 1e-3f));
+}

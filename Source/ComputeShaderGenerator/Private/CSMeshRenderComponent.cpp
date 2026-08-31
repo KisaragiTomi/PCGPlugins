@@ -79,9 +79,21 @@ UCSMeshRenderComponent::UCSMeshRenderComponent()
 	SetUsingAbsoluteRotation(true);
 	SetUsingAbsoluteScale(true);
 
-	// GPU-Scene instance culling overrides the custom indirect args in the Virtual Shadow Map
-	// pass, so indirect-drawn meshes cannot cast VSM shadows (same limitation as road/display).
-	CastShadow = false;
+	// 2026-08-30 实测（出图对照）：房体 / 地面 / 柱子这条路与实例化那条**结论完全一样** ——
+	// CSM（r.Shadow.Virtual.Enable 0）下投影正常、自阴影与屋檐投墙都对；VSM（项目级设置 =1）
+	// 下一点影子都没有。两条路失效于同一个地方，只是理由不同：
+	//   · 这条路用引擎自己的 FLocalVertexFactory，它**声明**了 SupportsPrimitiveIdStream，
+	//     于是 MeshPassProcessor.cpp:1304 的 bDoOverrideArgs 为 true，VSM 会拿 GPU-Scene 的
+	//     DrawIndirectArgsRDG 顶掉我们写的那份；而我们是 dynamic relevance +
+	//     FDynamicPrimitiveUniformBuffer，GPU-Scene 里没有对应实例 ⇒ 实例数 0。
+	//   · 实例化那条（UCSGpuInstancedMeshComponent）不声明该 flag，args 不被覆盖，
+	//     但同样进不了 VSM 的实例剔除表 —— 详见那边的注释。
+	// 所以"实例化路能投影、非实例化路不能"这条**推断被实测推翻**：在 VSM 下两条都不能，
+	// 在 CSM 下两条都能。
+	//
+	// 留 true 而不是退回 false：CSM 下确凿正确，VSM 下一个影子像素都画不出来
+	// （改前/改后同机位逐像素比过）。
+	CastShadow = true;
 	bReceivesDecals = false;
 }
 
@@ -115,23 +127,28 @@ bool UCSMeshRenderComponent::HasGeneratedGeometry() const
 
 #if WITH_EDITOR
 UStaticMesh* UCSMeshRenderComponent::SaveToStaticMesh(const FTransform& BakeSpace,
-	const FString& AssetPathAndName, bool bReplaceExistingAsset, bool bSaveAsset, bool bBakeToLocalSpace)
+	const FString& AssetPathAndName, bool bReplaceExistingAsset, bool bSaveAsset, bool bBakeToLocalSpace,
+	bool bEnableNanite, UCSMesh* SourceMeshOverride)
 {
-	if (!GpuMesh) return nullptr;
+	// 要存的几何优先取调用方给的那份：本组件的绑定只决定"画什么"，而落盘读的是网格对象。
+	// 生产方自己持有 UCSMesh 时（generator 的 DirectGpuMesh），组件被解绑不该连累落盘。
+	UCSMesh* SourceMesh = SourceMeshOverride ? SourceMeshOverride : GpuMesh.Get();
+	if (!SourceMesh) return nullptr;
 
 	FCSMeshToStaticMeshOptions Options;
 	Options.AssetPath = AssetPathAndName.TrimStartAndEnd();
 	Options.bTransient = false; // this entry point's whole purpose is to produce an asset
 	Options.bReplaceExisting = bReplaceExistingAsset;
 	Options.bSaveToDisk = bSaveAsset;
+	Options.bEnableNanite = bEnableNanite;
 	// 烘回 BakeSpace 的局部空间，资产摆在那个变换上就能复现画面上的东西。
 	// GetComponentTransform() 在这里是错的而且错得无声：本组件以绝对变换渲染，组件变换恒为单位，
 	// 按它烘等于把几何冻结在世界坐标上。
 	Options.TargetTransform = BakeSpace;
 	Options.bBakeToLocalSpace = bBakeToLocalSpace;
 
-	// 读的是网格对象而不是 scene proxy：隐藏的、或当前没在渲染的组件，存出来的东西完全一样。
-	return UCSMeshOps::CopyToStaticMesh(GpuMesh, this, GetOwner(), Options);
+	// 读的是网格对象而不是 scene proxy：隐藏的、未注册的、甚至已经解绑的组件，存出来的东西完全一样。
+	return UCSMeshOps::CopyToStaticMesh(SourceMesh, this, GetOwner(), Options);
 }
 #endif
 

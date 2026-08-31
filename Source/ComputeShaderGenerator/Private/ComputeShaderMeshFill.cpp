@@ -4,6 +4,7 @@
 #include "ComputeShaderBasicFunction.h"
 #include "ComputeShaderGenerateHelper.h"
 #include "CSRangeGeneratorActor.h"
+#include "CSMesh.h"   // UCSMesh::CountedBlockingFlush —— 阻塞刷新的唯一计数入口
 #include "GlobalShader.h"
 #include "MaterialShader.h"
 
@@ -451,13 +452,13 @@ void ACSFillTarget::Generate(int32 NumIteration, float InSpawnSize)
 
 	{
 		CaptureMeshsInBox();
-		FlushRenderingCommands();
+		UCSMesh::CountedBlockingFlush();
 	}
 
 	{
 		SCOPE_CYCLE_COUNTER(STAT_CSGenerate_Execute);
 		FillTargetCal(GenerateDatas);
-		FlushRenderingCommands();
+		UCSMesh::CountedBlockingFlush();
 	}
 	
 	TArray<FLinearColor> LinearSamples;

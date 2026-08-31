@@ -1,0 +1,432 @@
+// 石阶：100% GPU 决策 + 零回读（计划「石阶改造：marching squares」的 S1/S2/S3）。
+//
+// 一线程一格，从**解析高度场**直接推导等值线段，每段等值线出一级石阶，直接写
+// UCSGpuInstancedMeshComponent 的 packed 实例行。CPU 全程不知道有几级台阶 ——
+// 不排记录、不求曲线、不回读一个字节。形状照 Tiny Glade 的 `_rocky_terrain_stairs_stairs.cs`。
+//
+// **全项目唯一的一条石阶路**：旧路（`CSGroundSteps.usf` + `ACSGroundShaperActor::BuildStepPlan`）
+// 已随 2026-08-30「裁决一」整条删除（S3）。删它的直接理由，也是本次改造的意义：旧路的等高线
+// 用「关于本座塑形物中心的星形」闭式解求半径，**两座相接土台的接合处那段等高线不是星形的**，
+// 旧路在那里直接断掉。marching squares 扫的是合成后的场，接合处只是普通的一格，天然连续。
+//
+// ⚠️ **格边长必须 ≈ 石阶长度**（StairCellSize）：每条穿越边出一级，间距完全由格密度决定。
+// 格太密石阶互相穿模，格太疏断断续续。这正是 TG 把 contouring 格单开一个维度、而不是复用
+// heightmap 分辨率的原因 —— 本工程地面格是 50 cm，直接拿它扫会密一倍。
+//
+// 本 kernel 出**两种**实例，各写各的 buffer：等值线段上的石阶，以及 TG 那条 15% 概率的小石子
+// （`_rocky_terrain_stairs_stairs.cs:511-547`）。两者是两张基础网格，而一个实例组件只绑一张，
+// 所以必须两套实例源 —— TG 自己也是另一条 indirect draw。
+//
+// packed 行布局照抄 CSGpuInstancedMesh.usf（那份才是权威，与已删的 CSGroundSteps.usf 也一致）：
+//   前三行 = 被缩放过的基，第 4 行 = 原点 + 每实例随机数，第 5 行 = 剔除球。
+// 基的约定：+X 径向朝外（踏面进深）、+Y 沿等值线（长度轴）、+Z 世界上。
+//   为什么 +Z 是**世界上**而不是地形法线：石阶的踏面必须是水平的，贴着坡面倾斜的是岩壳不是
+//   台阶；TG 的旋转基也是「等值线方向 × Y-up」。地形法线在这里只用来定"哪边是下坡"。
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/CSGroundShaperField.ush"
+
+#ifndef THREADGROUPSIZE_X
+#define THREADGROUPSIZE_X 8
+#endif
+#ifndef THREADGROUPSIZE_Y
+#define THREADGROUPSIZE_Y 8
+#endif
+
+Buffer<uint> StairGroundColors;    // 地面常驻色流，packed BGRA / 顶点，V = Y * VertsX + X
+
+RWBuffer<float4> RWStairInstances; // 5 个 float4 / 实例
+RWBuffer<uint>   RWStairCounter;   // [0] = 活跃实例数（只有 GPU 知道这个数）
+
+float4x4 StairWorldToComponent;
+
+float2 StairGridOriginXY;          // 扫描格 (0,0) 角的世界 XY
+float  StairCellSize;              // 扫描格边长 ≈ 石阶长度（见上面的 ⚠️）
+uint2  StairGridDims;              // 扫描**格数**（不是顶点数）
+
+float2 StairGroundOriginXY;        // 地面镜像格点 (0,0) 的世界 XY —— 只用于取道路权重
+float  StairGroundCellSize;
+uint2  StairGroundVerts;
+float  StairGroundBaseZ;           // 地面 actor 的世界 Z
+
+float  StairStepHeight;            // 每层升高（等距分层：石阶语义要求等高，不学 TG 的非等距）
+float  StairRoadThreshold;         // 道路权重门控，与岩壳的隐藏阈值同一个数
+float  StairEmbed;                 // 沿坡**向上**推进，让踏面扎进坡里（负值则向外挑出）
+float  StairRise;                  // = -基础网格局部包围盒 Min.Z × 缩放：把块抬起半个身位，
+                                   // 否则盒心落在等值线上、石块一半埋在地里（旧路的实测修正）
+float  StairZOffset;               // 全局微调
+uint   StairMaxLayers;             // 单格最多跨几层：LiftHeight 越大层越多，必须有上限防爆
+uint   StairMaxInstances;          // 固定容量。越界静默丢弃 —— 宁可少摆一级也不能踩出 buffer
+
+float3 StairBaseSphereCentre;      // 基础网格局部包围球（未缩放）
+float  StairBaseSphereRadius;
+float3 StairBlockSize;             // 三轴块尺寸（喂居中单位立方体时它就是想要的尺寸 / 网格尺寸）
+
+// --- S2：逐实例抖动 ---------------------------------------------------------
+float  StairBaseSizeY;             // 基础网格局部 Y 尺寸，把"想要的世界长度"换算回缩放
+float  StairLengthBloat;           // 长度轴胀大系数（负缝的来源，见 ComposeStairScale 的注释）
+float  StairLengthJitter;          // 长度轴抖动幅度，**单侧**（只增不减）
+float  StairSizeJitter;            // 进深 / 高度的对称抖动幅度
+float  StairYawJitter;             // 绕世界 +Z 的偏航抖动，弧度，±
+uint   StairJitterSeed;            // 用户种子
+
+// --- 小石子（TG 的 15% 支线，`_rocky_terrain_stairs_stairs.cs:511-547`）--------
+//
+// 石子与石阶是**两张网格**，而一个实例组件只有一张基础网格 ⇒ 必须两套实例源。TG 也是这么做的
+// （另一条 indirect draw + `pebble_buffer_offset`），这不是本项目的额外复杂度。
+RWBuffer<float4> RWStairPebbles;
+RWBuffer<uint>   RWStairPebbleCounter;
+float  StairPebbleChance;          // 出石子的概率（TG 实测 0.15）。**0 = 整条支线不写一个字节**
+float2 StairPebbleScale;           // 均匀缩放的 [min, max]，已在 CPU 侧换算成"乘在基础网格上的系数"
+float3 StairPebbleSphereCentre;    // 石子基础网格的局部包围球（未缩放）
+float  StairPebbleSphereRadius;
+uint   StairMaxPebbles;            // 石子的固定容量（与石阶各自一套，越界静默丢弃）
+
+/** 与 CSGpuInstancedMesh.usf:120-126 同一份哈希的**收尾段**（uint → [0,1)）。 */
+float CSStairs_Hash01(uint H)
+{
+	H = ((H >> ((H >> 28) + 4u)) ^ H) * 277803737u;
+	return float((H >> 22 ^ H) & 0xFFFFFFu) / float(0x1000000u);
+}
+
+/**
+ * 按**序号**取随机 —— 已删旧路（`CSGroundSteps.usf`）那份的逐字复制。
+ *
+ * ⚠️ **本文件从 S2 起就不再调用它，S3 删掉旧路之后它连"可比对的原件"这个理由也没了** ——
+ * 也就是说这是一段**没有任何调用方**的死代码，留在这里只为不越出裁决一点名的范围。
+ * 序号在这条路上是 `InterlockedAdd` 的槽位，而槽位不是稳定身份（理由见下面的
+ * `CSStairs_CellSeed`），所以它**永远不该**被重新接回来。下一次动这个文件时可以直接删掉。
+ */
+float StairInstanceRandom(uint Index)
+{
+	return CSStairs_Hash01(Index * 747796405u + 2891336453u);
+}
+
+/**
+ * S2 的随机源：**格身份**（格坐标 + 层号 + 段号 + 用户种子），不是 InterlockedAdd 的槽位。
+ *
+ * ⚠️ **绝对不能拿槽位当种子**（S1 的 `.w` 就是那么写的，本轮一并订正）：槽位由线程组的完成
+ * 顺序决定，同一份世界状态两次 dispatch 可以把同一块石阶放进不同的槽。而这条路上重扫是
+ * **每一 dab 一次**的（EdMode 每帧 FlushPaintToGpu → RebuildStairs），症状就是"画一笔路，
+ * 整片石阶跟着乱跳"。换成格身份之后同一格同一层恒等：别处加减石阶、槽位怎么重排，本块一动不动。
+ *
+ * 与 TG 的口径对照（`_rocky_terrain_stairs_stairs.cs:504` 与对应 VS `:105`）：TG 的种子是
+ * `uint((Tx + Ty + Tz) * 100)` —— 实例**平移量之和量化到 cm**，同样是位置派生、与槽位无关。
+ * 这里改用格身份而不是位置，是因为拖塑形物时高度场在动、等值线跟着滑，位置派生的种子会让
+ * 石阶在整个拖动过程里不停重掷；格身份只在"这一格这一层还长不长石阶"真的变化时才变。
+ * 顺带好处：格身份在 CPU 侧可精确复算，所以"抖动只由格身份决定"这条纪律**是可断言的**
+ * （GroundStairs.JitterIsCellDeterministic）。
+ */
+uint CSStairs_CellSeed(uint2 Cell, int Level, uint Seg, uint Salt)
+{
+	uint H = Cell.x * 0x9E3779B1u;
+	H ^= Cell.y * 0x85EBCA77u;
+	H ^= uint(Level + 1048576) * 0xC2B2AE3Du;   // 层号可为负；平移到正区间再散
+	H ^= Seg * 0x27D4EB2Fu;
+	H ^= Salt * 0x165667B1u;
+	H ^= StairJitterSeed * 0x9E3779B9u;
+	return H;
+}
+
+/** 道路权重 = 色流的 R 通道。色流是 packed BGRA（同 CSMeshOps.usf 的 PackColorBGRA）。 */
+float CSStairs_ReadRoad(uint X, uint Y)
+{
+	return float((StairGroundColors[Y * StairGroundVerts.x + X] >> 16u) & 0xFFu) / 255.0f;
+}
+
+/**
+ * 与 ACSGroundActor::SampleRoadWeight 同一口径的双线性采样，出界为 0。
+ *
+ * **为什么直接读 GPU 色流而不是让 CPU 上传一份**：色流就是笔刷双写的那一份权威投影，
+ * 读它意味着"画面上看到的路"与"长石阶的判据"构造上同源。上传一份镜像拷贝则是第三条路，
+ * 迟早与另外两条错开一帧，而症状（石阶比路慢一笔）只在快速涂抹时才看得见。
+ */
+float CSStairs_SampleRoad(float2 P)
+{
+	if (StairGroundVerts.x < 2u || StairGroundVerts.y < 2u) return 0.0f;
+	const float2 G = (P - StairGroundOriginXY) / max(StairGroundCellSize, 1e-3f);
+	if (G.x < 0.0f || G.y < 0.0f || G.x > float(StairGroundVerts.x - 1u) || G.y > float(StairGroundVerts.y - 1u)) return 0.0f;
+
+	const uint X0 = min(uint(floor(G.x)), StairGroundVerts.x - 2u);
+	const uint Y0 = min(uint(floor(G.y)), StairGroundVerts.y - 2u);
+	const float Fx = saturate(G.x - float(X0));
+	const float Fy = saturate(G.y - float(Y0));
+
+	const float R00 = CSStairs_ReadRoad(X0, Y0);
+	const float R10 = CSStairs_ReadRoad(X0 + 1u, Y0);
+	const float R01 = CSStairs_ReadRoad(X0, Y0 + 1u);
+	const float R11 = CSStairs_ReadRoad(X0 + 1u, Y0 + 1u);
+	return lerp(lerp(R00, R10, Fx), lerp(R01, R11, Fx), Fy);
+}
+
+/**
+ * 水平梯度 ∇h，指向**上坡**。
+ *
+ * 用中心差分而不是解析导数，理由同岩壳裁决三：高度场是"全部塑形物重叠取 max"，接缝处不可导，
+ * 解析导数在那里会给出错误的陡峭度 —— 而接缝正是本次改造要修好的地方。差分跨距取地面格距，
+ * 这样求出的法线与地面网格自己的法线（DisplaceGroundShapersCS 的中心差分）尽量同形。
+ */
+float2 CSStairs_GradientXY(float2 P)
+{
+	const float D = max(StairGroundCellSize, 1e-3f);
+	const float Dx = GroundShaperHeightAtXY(P + float2(D, 0.0f)) - GroundShaperHeightAtXY(P - float2(D, 0.0f));
+	const float Dy = GroundShaperHeightAtXY(P + float2(0.0f, D)) - GroundShaperHeightAtXY(P - float2(0.0f, D));
+	return float2(Dx, Dy) / (2.0f * D);
+}
+
+/**
+ * 一条穿越边上等值点的位置：先线性插值定位，再两次割线精化（TG 同样做 2 次）。
+ *
+ * **精化不是精修而是必需**：格边长 ≈ 石阶长度（默认 100 cm）比地面格还粗，而裙边剖面是
+ * smoothstep（三次），线性插值在这个跨度上的位置误差能到十几厘米 —— 表现为同一层的石阶沿
+ * 等值线左右错开、接缝处对不齐。调用方保证 H0、H1 分居 Level 两侧，因此分母非零。
+ */
+float2 CSStairs_SolveEdge(float2 P0, float H0, float2 P1, float H1, float Level)
+{
+	float T0 = 0.0f, T1 = 1.0f;
+	float A = H0, B = H1;
+	float T = saturate((Level - A) / (B - A));
+	[unroll] for (uint It = 0u; It < 2u; ++It)
+	{
+		const float Hm = GroundShaperHeightAtXY(lerp(P0, P1, T));
+		// 把新采样点收进保持异号的那一半；A/B 始终是 T0/T1 处的高度。
+		if ((Hm > Level) == (B > Level)) { T1 = T; B = Hm; }
+		else                             { T0 = T; A = Hm; }
+		const float Denom = B - A;
+		T = abs(Denom) > 1e-6f ? clamp(T0 + (Level - A) * (T1 - T0) / Denom, T0, T1) : 0.5f * (T0 + T1);
+	}
+	return lerp(P0, P1, T);
+}
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, 1)]
+void ScanGroundStairsCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x >= StairGridDims.x || Id.y >= StairGridDims.y) return;
+
+	// 1) 四角高度 —— 解析求值，不需要高度纹理（TG 要采 heightmap，我们不用）。
+	//    角序逆时针：c0=(0,0) c1=(1,0) c2=(1,1) c3=(0,1)；边 eK = cK → c(K+1)。
+	const float2 Base = StairGridOriginXY + float2(Id.xy) * StairCellSize;
+	float2 P[4];
+	P[0] = Base;
+	P[1] = Base + float2(StairCellSize, 0.0f);
+	P[2] = Base + float2(StairCellSize, StairCellSize);
+	P[3] = Base + float2(0.0f, StairCellSize);
+
+	float H[4];
+	[unroll] for (uint c = 0u; c < 4u; ++c) H[c] = GroundShaperHeightAtXY(P[c]);
+
+	// 2) 早退：整格落在同一层区间（绝大多数格都在这里退掉），或路权重不过阈。
+	const float Step = max(StairStepHeight, 1e-2f);
+	const float HMin = min(min(H[0], H[1]), min(H[2], H[3]));
+	const float HMax = max(max(H[0], H[1]), max(H[2], H[3]));
+	const int L0 = (int)floor(HMin / Step) + 1;
+	int L1 = (int)floor(HMax / Step);
+	if (L1 < L0) return;
+
+	const float2 Centre = Base + 0.5f * StairCellSize;
+	if (CSStairs_SampleRoad(Centre) < StairRoadThreshold) return;   // 画路穿台才长石阶（同 D6 门洞的语言）
+
+	// 层数上限：LiftHeight 一大层数就线性膨胀，没有这个钳位一格就能把固定容量吃光。
+	L1 = min(L1, L0 + (int)max(StairMaxLayers, 1u) - 1);
+
+	// 3) 层循环只跑本格真正跨过的层。
+	for (int L = L0; L <= L1; ++L)
+	{
+		const float Level = float(L) * Step;
+		const uint Case =
+			  (H[0] > Level ? 1u : 0u)
+			| (H[1] > Level ? 2u : 0u)
+			| (H[2] > Level ? 4u : 0u)
+			| (H[3] > Level ? 8u : 0u);
+		if (Case == 0u || Case == 15u) continue;
+
+		// 段表：每段 = 两条穿越边。16 个 case 成对镜像（Case 与 15−Case 穿越边完全相同，
+		// 只是内外互换），所以只需按 min(Case, 15−Case) 分六支。
+		uint2 Seg[2];
+		uint SegCount = 1u;
+		if (Case == 5u || Case == 10u)
+		{
+			// 鞍点：四条边全穿，两种接法都自洽，必须消歧（TG 也把这两个 case 单列 —— 那份
+			// 全展开 if-else 链正是它 163 KB 的由来）。判据是格心：格心在层上方 ⇒ "高"的一侧
+			// 在中间连通，等值线各自围住两个"低"角；反之亦然。接错的症状是两条弧在鞍点交叉成 X。
+			const bool bCentreAbove = GroundShaperHeightAtXY(Centre) > Level;
+			const bool bCutCorner02 = (Case == 5u) ? !bCentreAbove : bCentreAbove;
+			Seg[0] = bCutCorner02 ? uint2(3u, 0u) : uint2(0u, 1u);
+			Seg[1] = bCutCorner02 ? uint2(1u, 2u) : uint2(2u, 3u);
+			SegCount = 2u;
+		}
+		else
+		{
+			const uint M = min(Case, 15u - Case);
+			uint2 Pair = uint2(3u, 0u);            // M == 1：只有 c0 在一侧
+			if      (M == 2u) Pair = uint2(0u, 1u);   // 只有 c1
+			else if (M == 3u) Pair = uint2(3u, 1u);   // c0 + c1：左右两条边
+			else if (M == 4u) Pair = uint2(1u, 2u);   // 只有 c2
+			else if (M == 6u) Pair = uint2(0u, 2u);   // c1 + c2：上下两条边
+			else if (M == 7u) Pair = uint2(2u, 3u);   // c0+c1+c2 对 c3
+			Seg[0] = Pair;
+			Seg[1] = Pair;
+		}
+
+		for (uint s = 0u; s < SegCount; ++s)
+		{
+			const uint Ea = Seg[s].x;
+			const uint Eb = Seg[s].y;
+			const float2 A = CSStairs_SolveEdge(P[Ea], H[Ea], P[(Ea + 1u) & 3u], H[(Ea + 1u) & 3u], Level);
+			const float2 B = CSStairs_SolveEdge(P[Eb], H[Eb], P[(Eb + 1u) & 3u], H[(Eb + 1u) & 3u], Level);
+
+			const float2 Delta = B - A;
+			if (dot(Delta, Delta) < 1e-6f) continue;   // 退化段（两点撞在同一个角上）
+
+			// 4) 变换在 GPU 组装。
+			const float2 Mid = 0.5f * (A + B);
+			const float3 AxisZ = float3(0.0f, 0.0f, 1.0f);          // 踏面水平（见文件头）
+			const float3 Tangent = float3(normalize(Delta), 0.0f);  // 等值线方向 = 长度轴
+			float3 AxisX = normalize(cross(Tangent, AxisZ));        // 水平且 ⟂ 等值线 = 最陡方向
+
+			// 等值线段的走向是任意的（段表给的是边序，不是绕序），所以 +X 必须自己定向：
+			// 强制指向**下坡**，块才不会背朝外。判据用中心差分梯度，接缝处也成立。
+			const float2 Grad = CSStairs_GradientXY(Mid);
+			if (dot(AxisX.xy, -Grad) < 0.0f) AxisX = -AxisX;
+			float3 AxisY = cross(AxisZ, AxisX);                     // 右手系：X × Y = Z
+
+			// StairEmbed 要用**抖动前**的最陡方向：偏航是块自己歪一点，不该把它推到坡的别处去，
+			// 否则 embed 就退化成一个随机的水平位移，踏面前缘的悬空量跟着乱跳。
+			const float2 EmbedDir = AxisX.xy;
+
+			// --- S2：逐实例抖动 -------------------------------------------------------
+			// 四条通道各取一份独立的盐，避免"长的那块一定也偏得多"这种可见的相关性。
+			const float JLen   = CSStairs_Hash01(CSStairs_CellSeed(Id.xy, L, s, 11u));            // [0,1) 单侧
+			const float JDepth = CSStairs_Hash01(CSStairs_CellSeed(Id.xy, L, s, 23u)) * 2.0f - 1.0f;
+			const float JHigh  = CSStairs_Hash01(CSStairs_CellSeed(Id.xy, L, s, 37u)) * 2.0f - 1.0f;
+			const float JYaw   = CSStairs_Hash01(CSStairs_CellSeed(Id.xy, L, s, 53u)) * 2.0f - 1.0f;
+
+			// **只抖 yaw，不抖 pitch/roll**：踏面必须水平（见文件头）。绕 +Z 转不动 AxisZ，
+			// 所以"踏面水平"这条不变量在抖动之后按构造仍然成立，可以直接断言。
+			{
+				float SinY, CosY;
+				sincos(StairYawJitter * JYaw, SinY, CosY);
+				const float3 RotX = AxisX * CosY + AxisY * SinY;
+				AxisY = AxisY * CosY - AxisX * SinY;                // (X') × (Y') 仍是 +Z
+				AxisX = RotX;
+			}
+
+			float3 BlockScale = StairBlockSize;
+			if (dot(BlockScale, BlockScale) < 1e-8f) BlockScale = float3(1.0f, 1.0f, 1.0f);
+
+			// 长度轴（+Y，沿等值线）—— **负缝就出在这一行**。
+			//
+			// 相邻两块石阶来自相邻的两格：它们的等值线段共用同一个穿越点 X（同一条格边，两格
+			// 各解一次，差在 float 噪声量级）。段 A→X 的块以中点为心、长度取弦长 k 倍时，末端
+			// 越过 X 的距离是 (k−1)·|A−X|/2 —— **与拐弯角度无关**。所以只要 k ≥ 1，缝就恒为
+			// 非正；k > 1 时严格为负。TG 是 k ≡ 1（`_rocky_terrain_stairs_stairs.cs:509` 把
+			// X 轴缩放直接写成 `distance(A, B)`，靠自身不规则轮廓 + VS 的 bevel 噪声藏接缝），
+			// 我们用的是光板方盒，零缝会读成一条折痕，所以再叠一个常数胀大。
+			//
+			// ⚠️ **常数胀大单独用是不够的**（这是石阶与门框砖的关键差别）：门框砖的槽距由
+			//    SolveBlockLayout 定成近恒定，×1.1 必然负缝；石阶的槽距是几何决定的，等值线
+			//    与格成 45° 时弦长 = √2·格距，定长块（S1）在那里会露出 0.41·格距 的**正缝**。
+			//    任何常数系数都盖不住一个随走向变化 √2 倍的量 —— 必须让长度跟着弦长走。
+			//
+			// 抖动只许**单侧加长**：对称抖动会把上面那条不等式的 k ≥ 1 打破（两块同时缩就露缝），
+			// 与门框砖"只胀有邻居的那一轴、且只增不减"是同一条纪律。
+			const float ChordLen = length(Delta);
+			const float NominalY = BlockScale.y * StairBaseSizeY;
+			const float WantY = max(ChordLen, NominalY) * StairLengthBloat * (1.0f + StairLengthJitter * JLen);
+			if (StairBaseSizeY > 1e-3f) BlockScale.y = WantY / StairBaseSizeY;
+
+			// 进深（+X）与高（+Z）沿等值线方向都没有邻居，可以对称抖 —— 镜像门框砖那条
+			// "没邻居的轴胀了只会漂移一个被标定过的尺寸"的理由，反过来说就是：没邻居才敢双向抖。
+			const float ZFactor = 1.0f + StairSizeJitter * JHigh;
+			BlockScale.x *= 1.0f + StairSizeJitter * JDepth;
+			BlockScale.z *= ZFactor;
+
+			// Rise 是"−局部包围盒 Min.Z × Z 缩放"，抖了 Z 就必须跟着抖，否则块底不再钉在
+			// 等值线上（症状：一部分石阶浮起来、一部分陷进去，而且只在斜看时看得出）。
+			const float3 Position = float3(
+				Mid - EmbedDir * StairEmbed,
+				StairGroundBaseZ + Level + StairRise * ZFactor + StairZOffset);
+
+			// 5) 领槽位；越界静默丢弃（容量一次性定死、永不重算，这是零回读的代价与保证）。
+			uint Slot;
+			InterlockedAdd(RWStairCounter[0], 1u, Slot);
+			if (Slot >= StairMaxInstances) return;
+
+			const float3 LocalX = mul(float4(AxisX, 0.0f), StairWorldToComponent).xyz;
+			const float3 LocalY = mul(float4(AxisY, 0.0f), StairWorldToComponent).xyz;
+			const float3 LocalZ = mul(float4(AxisZ, 0.0f), StairWorldToComponent).xyz;
+			const float3 Origin = mul(float4(Position, 1.0f), StairWorldToComponent).xyz;
+
+			const float3 ScaledX = LocalX * BlockScale.x;
+			const float3 ScaledY = LocalY * BlockScale.y;
+			const float3 ScaledZ = LocalZ * BlockScale.z;
+
+			const uint Row = Slot * 5u;
+			RWStairInstances[Row + 0u] = float4(ScaledX, 0.0f);   // .w 必须是 0：引擎拿它做选中/hitproxy
+			RWStairInstances[Row + 1u] = float4(ScaledY, 0.0f);
+			RWStairInstances[Row + 2u] = float4(ScaledZ, 0.0f);
+			// .w 是顶点工厂读的 PerInstanceRandom。**种子同样必须是格身份**：材质拿它做颜色/
+			// 磨损变化，用槽位的话每 dab 全场变色，而且这一条不会有任何断言报红。
+			RWStairInstances[Row + 3u] = float4(Origin, CSStairs_Hash01(CSStairs_CellSeed(Id.xy, L, s, 71u)));
+
+			const float3 SphereCentre = Origin
+				+ ScaledX * StairBaseSphereCentre.x
+				+ ScaledY * StairBaseSphereCentre.y
+				+ ScaledZ * StairBaseSphereCentre.z;
+			// 剔除球必须包住**变换后**的基础网格：基向量是单位长，按最大轴缩放放大即可。
+			// 少放大一点点就会在视锥边缘闪掉实例，而且只在斜看时出现，最难复现。
+			const float MaxAxisScale = max(BlockScale.x, max(BlockScale.y, BlockScale.z));
+			RWStairInstances[Row + 4u] = float4(SphereCentre, StairBaseSphereRadius * max(MaxAxisScale, 1e-3f));
+
+			// 6) TG 的 15% 支线：这一段等值线上再随机撒一颗小石子。
+			//
+			// ⚠️ **随机源必须与上面同一套格身份哈希**，只换盐。拿 `Slot`（InterlockedAdd 的
+			//    槽位）当种子是 S1 在 `.w` 上栽过的那一枪：槽位由线程组完成顺序决定，每 dab
+			//    重扫一次就重掷 ⇒ 画一笔路，石子整片换位置/换大小，**而且不会有任何断言报红**
+			//    （它只在接上材质变化或有人盯着画面时才显形）。格身份则只在"这一格这一层
+			//    还长不长石阶"真的变化时才变。
+			//
+			// 三条通道各取独立的盐，与上面四条一样：共用一条会让"大的那颗一定也靠右"。
+			if (CSStairs_Hash01(CSStairs_CellSeed(Id.xy, L, s, 89u)) < StairPebbleChance)
+			{
+				// 落点：弦上的随机点（TG `:544` 的 `mix(A, B, rand)`）。
+				const float2 PebbleXY = lerp(A, B, CSStairs_Hash01(CSStairs_CellSeed(Id.xy, L, s, 97u)));
+				// **高度重新求一次场，不用 Level**：弦是两个穿越点之间的直线，等值线在格内是弯的
+				// ⇒ 弦中段的真实地面比 Level 低几厘米。石阶那边无所谓（它按设计就是"块底钉在该层
+				// 高度"），石子若照抄就会浮在半空 —— 一颗孤立的小球浮 3 cm 是看得出来的。
+				const float PebbleZ = StairGroundBaseZ + GroundShaperHeightAtXY(PebbleXY) + StairZOffset;
+				const float PebbleScale = lerp(StairPebbleScale.x, StairPebbleScale.y,
+					CSStairs_Hash01(CSStairs_CellSeed(Id.xy, L, s, 101u)));
+
+				// 越界只跳过这一颗，**不能 return**：石子的容量与石阶各自一套，石子满了不该
+				// 把本格剩下的层与段（以及它们的石阶）一起丢掉。
+				uint PSlot;
+				InterlockedAdd(RWStairPebbleCounter[0], 1u, PSlot);
+				if (PSlot < StairMaxPebbles)
+				{
+					// 姿态直接复用这一级石阶（已抖过偏航）的基，与 TG 同构 —— 它的石子用的也是
+					// 石阶那份 `_4451`。石子是均匀缩放的团块，单给它一条随机朝向买不到任何东西。
+					const float3 PLocalX = mul(float4(AxisX, 0.0f), StairWorldToComponent).xyz * PebbleScale;
+					const float3 PLocalY = mul(float4(AxisY, 0.0f), StairWorldToComponent).xyz * PebbleScale;
+					const float3 PLocalZ = mul(float4(AxisZ, 0.0f), StairWorldToComponent).xyz * PebbleScale;
+					// 原点落在地表点上、**不抬半个身位**（石阶那条 StairRise 是为"块底钉在等值线"
+					// 服务的）。TG 给石阶补了半个单位的下沉、给石子没补 —— 一颗半埋进路面的石头
+					// 正是想要的读法，整颗浮在地表上会读成"掉了个道具"。
+					const float3 POrigin = mul(float4(PebbleXY, PebbleZ, 1.0f), StairWorldToComponent).xyz;
+
+					const uint PRow = PSlot * 5u;
+					RWStairPebbles[PRow + 0u] = float4(PLocalX, 0.0f);   // .w 必须是 0：引擎拿它做选中/hitproxy
+					RWStairPebbles[PRow + 1u] = float4(PLocalY, 0.0f);
+					RWStairPebbles[PRow + 2u] = float4(PLocalZ, 0.0f);
+					RWStairPebbles[PRow + 3u] = float4(POrigin, CSStairs_Hash01(CSStairs_CellSeed(Id.xy, L, s, 103u)));
+
+					const float3 PSphereCentre = POrigin
+						+ PLocalX * StairPebbleSphereCentre.x
+						+ PLocalY * StairPebbleSphereCentre.y
+						+ PLocalZ * StairPebbleSphereCentre.z;
+					RWStairPebbles[PRow + 4u] = float4(PSphereCentre, StairPebbleSphereRadius * max(PebbleScale, 1e-3f));
+				}
+			}
+		}
+	}
+}

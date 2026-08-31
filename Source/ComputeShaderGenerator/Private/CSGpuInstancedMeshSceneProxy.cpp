@@ -420,15 +420,21 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 	const FConvexVolume& Frustum = View.GetCullingFrustum();
 	for (int32 i = 0; i < 6; ++i)
 	{
-		// Fewer than six planes means an unbounded side; a plane that rejects nothing keeps the
-		// shader loop uniform.
-		FPlane Plane = Frustum.Planes.IsValidIndex(i) ? Frustum.Planes[i] : FPlane(0.0, 0.0, 1.0, -UE_BIG_NUMBER);
-		Plane = Plane.TransformBy(WorldToLocal);
+		// Fewer than six planes means an unbounded side (an editor viewport's culling frustum
+		// routinely has four). The shader tests dot(N, C) - W <= Radius, so a plane that rejects
+		// nothing needs W = +BIG, not -BIG: with -BIG the test reads dot + BIG <= Radius and
+		// rejects EVERY instance, which silently blanked the whole component in those views.
+		if (!Frustum.Planes.IsValidIndex(i))
+		{
+			FrustumPlanes[i] = FVector4f(0.0f, 0.0f, 1.0f, UE_BIG_NUMBER);
+			continue;
+		}
 
+		FPlane Plane = Frustum.Planes[i].TransformBy(WorldToLocal);
 		const FVector Normal(Plane.X, Plane.Y, Plane.Z);
 		const double Length = Normal.Size();
 		if (Length > UE_DOUBLE_SMALL_NUMBER) FrustumPlanes[i] = FVector4f(FVector3f(Normal / Length), float(Plane.W / Length));
-		else FrustumPlanes[i] = FVector4f(0.0f, 0.0f, 1.0f, -UE_BIG_NUMBER);
+		else FrustumPlanes[i] = FVector4f(0.0f, 0.0f, 1.0f, UE_BIG_NUMBER);
 	}
 
 	const FVector4 ViewOriginLocal4 = WorldToLocal.TransformPosition(View.ViewMatrices.GetViewOrigin());
@@ -613,6 +619,7 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 			}
 			DiagnosticReadback->Unlock();
 		}
+
 		delete DiagnosticReadback;
 		DiagnosticReadback = nullptr;
 		DiagnosticState = EDiagnosticState::Done;

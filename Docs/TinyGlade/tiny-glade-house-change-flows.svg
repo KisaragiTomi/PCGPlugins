@@ -1,0 +1,172 @@
+<svg viewBox="0 0 1360 850" width="1360" height="850" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Microsoft YaHei, sans-serif">
+  <defs>
+    <pattern id="pickable-domain-cross-bg" patternUnits="userSpaceOnUse" width="12" height="12">
+      <rect width="12" height="12" fill="#e0e7ff"/>
+      <path d="M0 6H12" stroke="#4f46e5" stroke-width="1" opacity="0.316770"/>
+      <path d="M6 0V12" stroke="#4f46e5" stroke-width="1" opacity="0.316770"/>
+    </pattern>
+    <pattern id="buffer-owner-stripe-bg" patternUnits="userSpaceOnUse" width="10" height="10">
+      <rect width="10" height="10" fill="#e2e8f0"/>
+      <rect y="1" width="10" height="2" fill="#334155" opacity="0.291429"/>
+      <rect y="6" width="10" height="1.5" fill="#334155" opacity="0.291429"/>
+    </pattern>
+    <pattern id="csmesh-resident-cross-bg" patternUnits="userSpaceOnUse" width="12" height="12">
+      <rect width="12" height="12" fill="#f3e8ff"/>
+      <path d="M0 6H12" stroke="#7c3aed" stroke-width="1" opacity="0.293103"/>
+      <path d="M6 0V12" stroke="#7c3aed" stroke-width="1" opacity="0.293103"/>
+    </pattern>
+    <pattern id="sv-stripe-bg" patternUnits="userSpaceOnUse" width="10" height="10">
+      <rect width="10" height="10" fill="#dbeafe"/>
+      <rect y="1" width="10" height="2" fill="#0284c7" opacity="0.235023"/>
+      <rect y="6" width="10" height="1.5" fill="#0284c7" opacity="0.235023"/>
+    </pattern>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10Z" fill="#475569"/>
+    </marker>
+  </defs>
+  <style>
+    .box    { fill:#f8fafc; stroke:#94a3b8; stroke-width:1.2; }
+    .future { fill:#f8fafc; stroke:#94a3b8; stroke-width:1.2; stroke-dasharray:6 4; }
+    .core   { fill:url(#pickable-domain-cross-bg); stroke:#4f46e5; stroke-width:1.6; }
+    .owner  { fill:url(#buffer-owner-stripe-bg); stroke:#334155; stroke-width:1.2; }
+    .resident { fill:url(#csmesh-resident-cross-bg); stroke:#7c3aed; stroke-width:1.2; }
+    .sv-stripe { fill:url(#sv-stripe-bg); stroke:#0284c7; stroke-width:1.2; }
+    .t  { font-size:13.5px; font-weight:600; fill:#0f172a; }
+    .b  { font-size:12px; fill:#334155; }
+    .m  { font-size:12px; fill:#64748b; }
+    .h  { font-size:12.5px; font-weight:600; fill:#64748b; }
+    .flow { stroke:#475569; stroke-width:1.4; fill:none; marker-end:url(#arrow); }
+    .tag-hit  { font-weight:700; fill:#dc2626; }
+    .tag-may  { font-weight:700; fill:#d97706; }
+    .tag-skip { font-weight:700; fill:#64748b; }
+  </style>
+
+  <text x="30" y="38" font-size="20" font-weight="700" fill="#0f172a">TinyGlade 房屋：地面变化 vs 房子移动，各自改什么</text>
+  <text x="30" y="60" class="m">v1 全量直推（不用 dirty）· ReevaluateSite 幂等哈希守卫 · 道路笔刷已实装，地形塑形物 = D9（不可见高度影响体），subsystem / 房屋为 P2+ 设计 · 配 TinyGladeHouse_Plan.md D3/D4/D6/D7/D9</text>
+
+  <text x="30"  y="96" class="h">A · 地面被改变（道路笔刷 / 地形塑形物）</text>
+  <text x="710" y="96" class="h">B · 房子移动（gizmo / 蓝图 / 任意来源）</text>
+  <line x1="680" y1="86" x2="680" y2="728" stroke="#e2e8f0" stroke-width="1.5"/>
+
+  <!-- ================= A 地面被改变 ================= -->
+  <rect x="30" y="108" width="300" height="96" rx="8" class="box"/>
+  <text x="44" y="130" class="t">道路笔刷逐笔落笔（已实装）</text>
+  <text x="44" y="150" class="b">FCSGroundPaintEdMode 落笔 →</text>
+  <text x="44" y="167" class="b">ApplyPaintStroke 写 Colors（R=道路）</text>
+  <text x="44" y="184" class="m">stroke 期间每次鼠标移动一笔</text>
+
+  <rect x="350" y="108" width="300" height="96" rx="8" class="box"/>
+  <text x="364" y="130" class="t">地形塑形物增删移改（D9）</text>
+  <text x="364" y="150" class="b">不可见的高度影响体，放在地面上：</text>
+  <text x="364" y="167" class="b">足迹 + 羽化裙边（参考道路影响地形）</text>
+  <text x="364" y="184" class="m">移动 / 改高 → 重导出受影响 Heights</text>
+
+  <path class="flow" d="M180 204V210H334V214"/>
+  <path class="flow" d="M500 204V210H346V214"/>
+
+  <rect x="30" y="216" width="620" height="120" rx="8" class="owner"/>
+  <text x="44" y="238" class="t">ACSGroundActor 更新权威镜像 + GPU 投影 + 直推</text>
+  <text x="44" y="260" class="b">Colors ← 笔刷双写：CPU 镜像 + GPU Color 流（同公式 8-bit 孪生）</text>
+  <text x="44" y="278" class="b">Heights ← 基底 + 相交塑形物合成重导出（含羽化裙边 · D9）+ 区域法线重算</text>
+  <text x="44" y="298" class="b">每次变更：OnGroundChanged.Broadcast(this, 变更世界盒) —— 直推，不等松手</text>
+  <text x="44" y="316" class="m">权威只有镜像：gameplay 查询（道路权重 / 地面高度）不回读 GPU</text>
+
+  <path class="flow" d="M340 336V350"/>
+
+  <rect x="30" y="354" width="620" height="56" rx="8" class="sv-stripe"/>
+  <text x="44" y="376" class="t">UCSHouseSubsystem 分发</text>
+  <text x="44" y="398" class="b">无条件唤醒全部注册房屋——v1 不过滤变更盒，"必然更新"</text>
+
+  <path class="flow" d="M340 410V424"/>
+
+  <rect x="30" y="428" width="620" height="54" rx="8" class="core"/>
+  <text x="44" y="450" class="t">ACSHouseActor::ReevaluateSite() —— 每栋房屋各自执行</text>
+  <text x="44" y="470" class="m">override 自 ACSTinyGlade；同一入口，变的是哪个通道决定哪份 desc 变</text>
+
+  <path class="flow" d="M340 482V488H180V496"/>
+  <path class="flow" d="M340 482V488H500V496"/>
+
+  <text x="180" y="514" class="h" text-anchor="middle">变化的是 Colors（道路权重）</text>
+  <text x="500" y="514" class="h" text-anchor="middle">变化的是 Heights（地形形状）</text>
+
+  <rect x="30" y="522" width="300" height="78" rx="8" class="resident"/>
+  <text x="44" y="544"><tspan class="tag-hit" font-size="13.5">「变」</tspan><tspan class="t"> 房体网格 —— 门洞重判</tspan></text>
+  <text x="44" y="564" class="b">边缘线段等分为子段，逐段采样道路</text>
+  <text x="44" y="581" class="b">→ 点亮子段出拱 cutter → 布尔重切</text>
+
+  <rect x="350" y="522" width="300" height="78" rx="8" class="resident"/>
+  <text x="364" y="544"><tspan class="tag-hit" font-size="13.5">「变」</tspan><tspan class="t"> 房子落座 + 柱组件</tspan></text>
+  <text x="364" y="564" class="b">房底 Z = max(支撑点高度) + 偏移</text>
+  <text x="364" y="581" class="b">柱随坡伸缩（纯 CPU，无布尔）→ 门需重判</text>
+
+  <rect x="30" y="608" width="300" height="54" rx="8" class="future"/>
+  <text x="44" y="630"><tspan class="tag-skip" font-size="13.5">「不变」</tspan><tspan class="t"> 柱组件</tspan></text>
+  <text x="44" y="650" class="b">Heights 没动 → 柱 desc 哈希短路</text>
+
+  <rect x="350" y="608" width="300" height="54" rx="8" class="resident"/>
+  <text x="364" y="630"><tspan class="tag-may" font-size="13.5">「可能变」</tspan><tspan class="t"> 房体网格 —— 门需贴地</tspan></text>
+  <text x="364" y="650" class="b">落差超阈门消失；仅落座则整体平移</text>
+
+  <rect x="30" y="672" width="620" height="50" rx="8" class="resident"/>
+  <text x="44" y="694"><tspan class="tag-may" font-size="13.5">「可能变」</tspan><tspan class="t"> 链接砖墙 —— 仅 Heights 分支间接触发</tspan></text>
+  <text x="44" y="714" class="b">Colors：不动；Heights：房子落座 Z 变 → 快扫 → 接触段底高变 → 重建</text>
+
+  <!-- ================= B 房子移动 ================= -->
+  <rect x="710" y="108" width="620" height="72" rx="8" class="box"/>
+  <text x="724" y="130" class="t">房子被移动（标准 transform gizmo / 蓝图 / 任意来源）</text>
+  <text x="724" y="152" class="b">检测：编辑器 PostEditMove + UCSHouseSubsystem 每 tick 变换哈希快扫</text>
+  <text x="724" y="169" class="m">快扫兜底一切移动来源，不依赖移动委托的完备性</text>
+
+  <path class="flow" d="M1020 180V198"/>
+
+  <rect x="710" y="200" width="620" height="54" rx="8" class="core"/>
+  <text x="724" y="222" class="t">ACSHouseActor::ReevaluateSite() —— 被移动的房屋自身</text>
+  <text x="724" y="242" class="m">同一个入口：门洞 / 柱是状态谓词，与"怎么变的"无关</text>
+
+  <path class="flow" d="M1020 254V272"/>
+
+  <rect x="710" y="274" width="620" height="66" rx="8" class="resident"/>
+  <text x="724" y="296"><tspan class="tag-may" font-size="13.5">「可能变」</tspan><tspan class="t"> 房体网格 —— 门随位置开合</tspan></text>
+  <text x="724" y="316" class="b">新 footprint 下重新采样道路：挪到路上 → 开门；离开道路 → 门合拢</text>
+  <text x="724" y="333" class="b">房体 desc 变才重建 + 布尔重切；没跨过路 → 哈希短路零成本</text>
+
+  <rect x="710" y="350" width="620" height="66" rx="8" class="resident"/>
+  <text x="724" y="372"><tspan class="tag-may" font-size="13.5">「可能变」</tspan><tspan class="t"> 柱组件 —— 悬空生柱 / 落地消柱</tspan></text>
+  <text x="724" y="392" class="b">新位置采样支撑点地面高度 → 先落座（Z = max + 偏移）再判柱，gap 超阈的点生柱</text>
+  <text x="724" y="409" class="b">独立第二网格：纯 CPU 盒子 + 快照上传，完全不碰布尔链</text>
+
+  <path class="flow" d="M1020 416V434"/>
+
+  <rect x="710" y="436" width="620" height="58" rx="8" class="sv-stripe"/>
+  <text x="724" y="458" class="t">UCSHouseSubsystem 接触检测</text>
+  <text x="724" y="480" class="b">该房 × 空间哈希粗筛出的邻居，逐墙面对判定：近反平行 + 间距 + 重叠段</text>
+
+  <path class="flow" d="M1020 494V512"/>
+
+  <rect x="710" y="514" width="620" height="78" rx="8" class="resident"/>
+  <text x="724" y="536"><tspan class="tag-hit" font-size="13.5">「变」</tspan><tspan class="t"> 链接砖墙 —— 中立归属 ACSHouseLinkActor</tspan></text>
+  <text x="724" y="556" class="b">新接触 → subsystem 生成（transient，沿接触段按 PanelCell 砌砖）</text>
+  <text x="724" y="573" class="b">接触段变化 → 重建；分离 / 任一房被删 → 销毁</text>
+  <text x="724" y="588" class="m">key = 两房 GUID 无序对，不属于任何一方</text>
+
+  <rect x="710" y="608" width="620" height="44" rx="8" class="resident"/>
+  <text x="724" y="628"><tspan class="tag-may" font-size="13.5">「部分变」</tspan><tspan class="t"> 地面 —— 镜像不变，装饰重生成</tspan></text>
+  <text x="724" y="645" class="b">权威镜像不消费；复杂度场+摆件/植被全局重生成（D12，不广播故无环）</text>
+
+  <!-- ================= 底部共用机制 ================= -->
+  <rect x="30" y="738" width="1300" height="64" rx="8" class="box"/>
+  <text x="44" y="760" class="t">幂等守卫 —— 两条流共用的收敛机制</text>
+  <text x="44" y="781" class="b">目标状态 = F(自身参数, 地面镜像, 邻居注册表, 特征标记列表)；重求值三步：落座（Z = max(支撑点高度) + 用户偏移）→ 房体 desc → 柱 desc，各自哈希谁变重建谁</text>
+  <text x="44" y="795" class="m">重复 / 自发唤醒（含逐笔直推的高频广播）哈希不变即短路为零成本——直推因此可以"必然更新"而不出错</text>
+
+  <rect x="30"  y="816" width="18" height="12" class="core"/>
+  <text x="54"  y="826" class="m">重求值入口</text>
+  <rect x="150" y="816" width="18" height="12" class="owner"/>
+  <text x="174" y="826" class="m">CPU 权威数据（双写）</text>
+  <rect x="330" y="816" width="18" height="12" class="sv-stripe"/>
+  <text x="354" y="826" class="m">subsystem 分发 / 检测</text>
+  <rect x="510" y="816" width="18" height="12" class="resident"/>
+  <text x="534" y="826" class="m">UCSMesh 重建产物</text>
+  <rect x="670" y="816" width="18" height="12" class="future"/>
+  <text x="694" y="826" class="m">本流不发生（哈希短路）</text>
+</svg>

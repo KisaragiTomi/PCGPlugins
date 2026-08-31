@@ -16,16 +16,42 @@
 #include "StaticMeshAttributes.h"
 #include "StaticMeshOperations.h"
 #include "TimerManager.h"
+#include "UObject/SoftObjectPath.h"
 
 
 void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 {
 	if (InCSSWActor == nullptr) return;
 
+	// 文件夹与编号都来自基类的结果资产命名（AComputeShaderMeshGenerator）：关卡同级的 CSSWData
+	// 目录 + actor 自己的稳定编号，重复烘焙因此始终写同一批资产名。
+	const FString AssetFolderPath = InCSSWActor->GetResultAssetFolderPath();
+	if (AssetFolderPath.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[CSSW] Bake failed: %s 所在关卡没有内容路径（地图未保存？）。"),
+			*InCSSWActor->GetActorNameOrLabel());
+		return;
+	}
+	const int32 ActorId = InCSSWActor->EnsureSWUniqueID();
+
+	// 输出资产路径要在选源之前算出来：烘焙结果本身绝不能再当源网格。上一次烘焙后
+	// ShowBakedResult 会清空 SimVis 实例并把结果网格挂到 ReusltMesh 上，若不排除，
+	// 第二次烘焙就会拿"只剩湿区的稀疏网格"当源、再对自己取样，最终三角数归零，
+	// 落到下面的"没有三角"分支把上一次的好资产删掉——症状就是"bake 不再生成 StaticMesh"。
+	const FString DuplicateMeshPath = InCSSWActor->BuildResultAssetPath(); // <关卡目录>/CSSWData/CSSW_<编号>_SM
+	const FString MeshAssetName = FPackageName::GetLongPackageAssetName(DuplicateMeshPath);
+
+	auto IsBakedResult = [&](const UStaticMesh* Mesh) -> bool
+	{
+		if (!Mesh) return true;
+		if (Mesh == InCSSWActor->BakedResultMesh) return true;
+		return FSoftObjectPath(Mesh).GetLongPackageName() == DuplicateMeshPath;
+	};
+
 	UStaticMesh* SourceMesh = nullptr;
 	TArray<FTransform> InstanceTransforms;
 	const bool bUseISM = InCSSWActor->SimVisHISM
-		&& InCSSWActor->SimVisHISM->GetStaticMesh()
+		&& !IsBakedResult(InCSSWActor->SimVisHISM->GetStaticMesh())
 		&& InCSSWActor->SimVisHISM->GetInstanceCount() > 0;
 
 	if (bUseISM)
@@ -42,23 +68,23 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 	}
 	else
 	{
-		SourceMesh = InCSSWActor->ReusltMesh->GetStaticMesh();
-		if (!SourceMesh) return;
+		// SimVis 网格覆盖整个捕获域，单位变换即可（与 StartSolver 把它挂到 ReusltMesh 时
+		// 强制 Scale=1 的约定一致）。
+		UStaticMesh* Candidate = InCSSWActor->SimulationPreviewMesh;
+		if (IsBakedResult(Candidate)) Candidate = InCSSWActor->SimVisHISM ? InCSSWActor->SimVisHISM->GetStaticMesh() : nullptr;
+		if (IsBakedResult(Candidate)) Candidate = InCSSWActor->ReusltMesh ? InCSSWActor->ReusltMesh->GetStaticMesh() : nullptr;
+		if (IsBakedResult(Candidate))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[CSSW] Bake aborted on %s: 找不到可用的源网格（当前挂的是上一次的烘焙结果）。")
+				TEXT("请先设置 SimulationPreviewMesh 或重新 StartSolver 生成仿真网格。已保留现有烘焙资产。"),
+				*InCSSWActor->GetActorNameOrLabel());
+			return;
+		}
+		SourceMesh = Candidate;
 		InstanceTransforms.Add(FTransform::Identity);
 	}
 
 	if (!SourceMesh) return;
-
-	// 文件夹与编号都来自基类的结果资产命名（AComputeShaderMeshGenerator）：关卡同级的 CSSWData
-	// 目录 + actor 自己的稳定编号，重复烘焙因此始终写同一批资产名。
-	const FString AssetFolderPath = InCSSWActor->GetResultAssetFolderPath();
-	if (AssetFolderPath.IsEmpty())
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[CSSW] Bake failed: %s 所在关卡没有内容路径（地图未保存？）。"),
-			*InCSSWActor->GetActorNameOrLabel());
-		return;
-	}
-	const int32 ActorId = InCSSWActor->EnsureSWUniqueID();
 
 	TArray<FFloat16Color> Pixels;
 	int32 RTWidth = 0, RTHeight = 0;
@@ -93,8 +119,21 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 		}
 	}
 
-	const FString DuplicateMeshPath = InCSSWActor->BuildResultAssetPath(); // <关卡目录>/CSSWData/SM_CSSW_Water_<编号>
-	const FString MeshAssetName = FPackageName::GetLongPackageAssetName(DuplicateMeshPath);
+	// DepthWet 只是"湿度覆盖"的二次筛选，而这张 RT 很容易在最后一次求解之后被重置
+	//（SetMaterialParameter 是 BlueprintNativeEvent，蓝图侧会清它；CaptureAll / 构造脚本
+	//  都会间接触发）。此时整张图都是清屏值，逐三角的 alpha 判据会把**所有**三角判成干的，
+	//  于是烘焙产出空网格——这正是"bake 不再生成 StaticMesh"的现场。
+	//  所以先判断这张图到底有没有有效数据：没有就整条判据停用，只按 VelHeight 的水面高度筛。
+	bool bHasDepthWetData = false;
+	for (const FFloat16Color& Px : DepthWetPixels)
+	{
+		if (Px.A.GetFloat() > 0.f) { bHasDepthWetData = true; break; }
+	}
+	const bool bUseDepthWetFilter = bHasDepthWetData && DWWidth > 0 && DWHeight > 0;
+	if (!bUseDepthWetFilter && DepthWetPixels.Num() > 0)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[CSSW] RT_ResultDepthWet 无有效湿度数据（求解后被重置？），本次烘焙跳过湿度筛选。"));
+	}
 
 	const FStaticMeshRenderData* RenderData = SourceMesh->GetRenderData();
 	if (!RenderData || RenderData->LODResources.Num() == 0)
@@ -131,7 +170,8 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 		SrcNumVerts, SrcNumTris, InstanceTransforms.Num());
 
 	UStaticMesh* NewMesh = nullptr;
-	if (UEditorAssetLibrary::DoesAssetExist(DuplicateMeshPath))
+	const bool bAssetExistedBefore = UEditorAssetLibrary::DoesAssetExist(DuplicateMeshPath);
+	if (bAssetExistedBefore)
 	{
 		NewMesh = Cast<UStaticMesh>(UEditorAssetLibrary::LoadAsset(DuplicateMeshPath));
 	}
@@ -291,7 +331,7 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 					LocalHeights[v] = FallbackLocalHeight;
 			}
 
-			if (DepthWetPixels.Num() > 0 && DWWidth > 0 && DWHeight > 0)
+			if (bUseDepthWetFilter)
 			{
 				bool bAllTransparent = true;
 				for (int32 v = 0; v < 3; v++)
@@ -340,7 +380,7 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 				float Foam = FMath::Clamp(Px.A.GetFloat(), 0.f, 1.f);
 
 				float DepthWetA = 0.f;
-				if (DepthWetPixels.Num() > 0 && DWWidth > 0 && DWHeight > 0)
+				if (bUseDepthWetFilter)
 				{
 					int32 DPX = FMath::Clamp(FMath::FloorToInt32(U * DWWidth), 0, DWWidth - 1);
 					int32 DPY = FMath::Clamp(FMath::FloorToInt32(V * DWHeight), 0, DWHeight - 1);
@@ -372,6 +412,13 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 
 	if (DbgCreated == 0)
 	{
+		// 已经存在的烘焙资产不能因为这次没跑出三角就删掉：那会让"仿真没水"这种可恢复的
+		// 操作失误直接毁掉上一次的好结果（关卡里引用它的组件也跟着变空）。
+		if (bAssetExistedBefore)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[CSSW] No triangles created (仿真结果全是干的？)，保留现有烘焙资产 %s。"), *DuplicateMeshPath);
+			return;
+		}
 		UE_LOG(LogTemp, Warning, TEXT("[CSSW] No triangles created, skipping mesh output."));
 		NewMesh->ConditionalBeginDestroy();
 		UEditorAssetLibrary::DeleteAsset(DuplicateMeshPath);
@@ -393,44 +440,59 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 
 	NewMesh->CommitMeshDescription(0);
 
-	UMaterialInterface* BakeMaterial = InCSSWActor->WaterMaterial;
+	// 贴图先落盘：水面与焦散两个 MIC 共用同一批贴图，所以放在材质分支之外生成。
+	// 资产名统一由 actor 的 BuildBakedAssetPath 决定（CSSW_<编号>_<后缀>），这里只取末段名字：
+	// 落盘接口收的是"名字 + 文件夹"，而不是完整包路径。
+	auto BakedAssetName = [InCSSWActor](const TCHAR* Suffix)
+	{
+		return FPackageName::GetLongPackageAssetName(InCSSWActor->BuildBakedAssetPath(Suffix));
+	};
+
+	FString VelHeightTexName = BakedAssetName(TEXT("VelHeight"));
+	UTexture2D* VelHeightTex = InCSSWActor->RT_ResultVelHeight
+		? UCSAssetProcess::ConveretAndSaveRTAsset(VelHeightTexName, AssetFolderPath, InCSSWActor->RT_ResultVelHeight)
+		: nullptr;
+	if (VelHeightTex)
+	{
+		VelHeightTex->MarkPackageDirty();
+	}
+
+	FString DepthWetTexName = BakedAssetName(TEXT("DepthWet"));
+	UTexture2D* DepthWetTex = InCSSWActor->RT_ResultDepthWet
+		? UCSAssetProcess::ConveretAndSaveRTAsset(DepthWetTexName, AssetFolderPath, InCSSWActor->RT_ResultDepthWet)
+		: nullptr;
+	if (DepthWetTex)
+	{
+		DepthWetTex->MarkPackageDirty();
+	}
+
+	// 把烘焙贴图与仿真域参数写进一个 MIC 资产。运行时那套 MID 绑的是 transient render target，
+	// 关卡重开就没画面，所以烘焙产物必须是落盘的 MIC。
+	auto BakeMaterialInstance = [&](UMaterialInterface* Parent, const TCHAR* NameSuffix) -> UMaterialInterface*
+	{
+		if (!Parent) return nullptr;
+		const FString MIName = BakedAssetName(NameSuffix);
+		UMaterialInstance* MI = UCSAssetProcess::FindOrCreateMaterialInstanceAsset(MIName, AssetFolderPath, Parent);
+		UMaterialInstanceConstant* MIC = Cast<UMaterialInstanceConstant>(MI);
+		if (!MIC) return Parent;
+
+		if (VelHeightTex) UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(MIC, FName("CSSW_VelHeight"), VelHeightTex);
+		if (DepthWetTex) UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(MIC, FName("CSSW_DepthWet"), DepthWetTex);
+		UMaterialEditingLibrary::SetMaterialInstanceVectorParameterValue(MIC, FName("CSSW_SimCenter"),
+			FLinearColor(InCSSWActor->SimUVCenter.X, InCSSWActor->SimUVCenter.Y, 0, 0));
+		UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(MIC, FName("CSSW_SimInvSize"), InCSSWActor->SimUVInvSize);
+		UMaterialEditingLibrary::SetMaterialInstanceStaticSwitchParameterValue(MIC, FName("SwithSim"), true);
+		MIC->PostEditChange();
+		UEditorAssetLibrary::SaveLoadedAsset(MIC, false);
+		MIC->MarkPackageDirty();
+		return MIC;
+	};
+
+	UMaterialInterface* BakeMaterial = BakeMaterialInstance(InCSSWActor->WaterMaterial, TEXT("Water"));
+	UMaterialInterface* BakeDecalMaterial = BakeMaterialInstance(InCSSWActor->DecalMaterial, TEXT("Decal"));
+
 	if (BakeMaterial)
 	{
-		FString VelHeightTexName = FString::Printf(TEXT("T_CSSW_VelHeight_%d"), ActorId);
-		UTexture2D* VelHeightTex = InCSSWActor->RT_ResultVelHeight
-			? UCSAssetProcess::ConveretAndSaveRTAsset(VelHeightTexName, AssetFolderPath, InCSSWActor->RT_ResultVelHeight)
-			: nullptr;
-		if (VelHeightTex)
-		{
-			VelHeightTex->MarkPackageDirty();
-		}
-
-		FString DepthWetTexName = FString::Printf(TEXT("T_CSSW_DepthWet_%d"), ActorId);
-		UTexture2D* DepthWetTex = InCSSWActor->RT_ResultDepthWet
-			? UCSAssetProcess::ConveretAndSaveRTAsset(DepthWetTexName, AssetFolderPath, InCSSWActor->RT_ResultDepthWet)
-			: nullptr;
-		if (DepthWetTex)
-		{
-			DepthWetTex->MarkPackageDirty();
-		}
-
-		FString WaterMIName = FString::Printf(TEXT("MI_CSSW_Water_%d"), ActorId);
-		UMaterialInstance* WaterMI = UCSAssetProcess::FindOrCreateMaterialInstanceAsset(WaterMIName, AssetFolderPath, BakeMaterial);
-		UMaterialInstanceConstant* WaterMIC = Cast<UMaterialInstanceConstant>(WaterMI);
-		if (WaterMIC)
-		{
-			if (VelHeightTex) UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(WaterMIC, FName("CSSW_VelHeight"), VelHeightTex);
-			if (DepthWetTex) UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(WaterMIC, FName("CSSW_DepthWet"), DepthWetTex);
-			UMaterialEditingLibrary::SetMaterialInstanceVectorParameterValue(WaterMIC, FName("CSSW_SimCenter"),
-				FLinearColor(InCSSWActor->SimUVCenter.X, InCSSWActor->SimUVCenter.Y, 0, 0));
-			UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(WaterMIC, FName("CSSW_SimInvSize"), InCSSWActor->SimUVInvSize);
-			UMaterialEditingLibrary::SetMaterialInstanceStaticSwitchParameterValue(WaterMIC, FName("SwithSim"), true);
-			WaterMIC->PostEditChange();
-			UEditorAssetLibrary::SaveLoadedAsset(WaterMIC, false);
-			WaterMIC->MarkPackageDirty();
-			BakeMaterial = WaterMIC;
-		}
-
 		TArray<FStaticMaterial>& Materials = NewMesh->GetStaticMaterials();
 		if (Materials.Num() > 0)
 			Materials[0].MaterialInterface = BakeMaterial;
@@ -448,17 +510,21 @@ void UCSShallowWaterProcess::SaveSWData(ACSShallowWaterCapture* InCSSWActor)
 		InCSSWActor->Modify();
 		InCSSWActor->ReusltMesh->Modify();
 
+		// 记住这次烘焙用的源网格：下一次烘焙要靠它才能避开"拿烘焙结果当源"的死循环。
 		if (!InCSSWActor->SimulationPreviewMesh)
-			InCSSWActor->SimulationPreviewMesh = InCSSWActor->ReusltMesh->GetStaticMesh();
+			InCSSWActor->SimulationPreviewMesh = SourceMesh;
 
 		InCSSWActor->BakedResultMesh = NewMesh;
+		InCSSWActor->BakedWaterMaterial = BakeMaterial;
+		InCSSWActor->BakedDecalMaterial = BakeDecalMaterial;
 		InCSSWActor->bUseBakedResultMesh = true;
 
 		InCSSWActor->ReusltMesh->SetStaticMesh(NewMesh);
 		InCSSWActor->ReusltMesh->SetRelativeScale3D(FVector::OneVector);
-		if (BakeMaterial)
-			InCSSWActor->ReusltMesh->SetMaterial(0, BakeMaterial);
 		InCSSWActor->ReusltMesh->MarkRenderStateDirty();
+
+		// 贴烘焙 MIC 的活交给随后的 OnBakeComplete -> ShowBakedResult（它内部会调 ApplyBakedMaterials），
+		// 这里不再重复调用一次。
 	}
 }
 

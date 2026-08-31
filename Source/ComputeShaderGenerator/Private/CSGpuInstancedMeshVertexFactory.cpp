@@ -40,6 +40,38 @@ void FCSGpuInstancedMeshVertexFactory::InitRHI(FRHICommandListBase& RHICmdList)
 	// attributes are not vertex streams here — they are fetched from InstanceVF.
 	FLocalVertexFactory::InitRHI(RHICmdList);
 
+	// 两件事同时挂在这条断言上，而两件事的失效都是无声的：
+	//  ① 实例变换必须从 InstanceVF 的 SRV 里手取 —— 有了 primitive-id 流，
+	//     LocalVertexFactory.ush 会改走 GPU Scene，而 GPU Scene 的实例数据只能从 CPU 灌，
+	//     整个 cull-on-GPU 的前提就没了。
+	//  ② UCSGpuInstancedMeshComponent 的 CastShadow = true 在 CSM 下能有影子（2026-08-30 实测），
+	//     **全靠**这个索引是 -1：MeshPassProcessor.cpp:1304 的 bDoOverrideArgs 要求
+	//     PrimitiveIdStreamIndex >= 0，一旦 >= 0，阴影通路就用 GPU-Scene 的 args 顶掉 cull pass
+	//     写的那份，而我们在 GPU-Scene 里没有实例 ⇒ 实例数 0 ⇒ 阴影里画 0 个三角形。
+	//     （VSM 另有一道更靠前的关卡，两条 gpumesh 路都过不去，见 CSGpuInstancedMeshComponent.cpp
+	//      构造函数的注释；那一条不是这个 flag 能救的。）
+	// 症状会是"主 pass 一切正常，只是影子没了"，没人会回到注册宏或基类的 InitRHI 上找原因。
+	checkf(GetPrimitiveIdStreamIndex(GetFeatureLevel(), EVertexInputStreamType::Default) == INDEX_NONE,
+		TEXT("FCSGpuInstancedMeshVertexFactory picked up a primitive-id stream. Manual-fetch instancing ")
+		TEXT("and VSM shadow casting both depend on it being absent - see the EVertexFactoryFlags list ")
+		TEXT("at the bottom of this file."));
+
+	// 深度预通道的**入场券**，它没了的症状是「实例只在天空背景上看得见」—— 见头文件里
+	// SupportsPositionOnlyStream / SupportsPositionAndNormalOnlyStream 那两条 override 的长注释。
+	//
+	// 断言的是引擎那条**两套口径**的契约：`FDepthPassMeshProcessor::ShouldRender` 按**实例**的
+	// SupportsPositionOnlyStream() 选 position-only 着色器，而 `TDepthOnlyVS<true>` 只为声明了
+	// `EVertexFactoryFlags::SupportsPositionOnly` 的**类型**编译。两者一旦不一致，
+	// GetDepthPassShaders 取不到着色器，整个 batch 就被**静默地**踢出深度预通道 ——
+	// 没有日志、没有断言，只有"后画的不透明物把它整片盖掉"这一个远端症状。
+	//
+	// 这一条会在删掉那两条 override（或反过来只给类型加 flag）时立刻报红。
+	checkf(!SupportsPositionOnlyStream() && !SupportsPositionAndNormalOnlyStream(),
+		TEXT("FCSGpuInstancedMeshVertexFactory advertises a position-only vertex stream. The depth ")
+		TEXT("prepass then asks for TDepthOnlyVS<true>, which is only compiled for vertex factory ")
+		TEXT("types flagged SupportsPositionOnly - this one is not - so the batch is dropped from ")
+		TEXT("the prepass without a word and the instances stop occupying depth."));
+
 	FInstancedStaticMeshVertexFactoryUniformShaderParameters UniformParameters;
 	UniformParameters.VertexFetch_InstanceOriginBuffer = InstanceOriginSRV;
 	UniformParameters.VertexFetch_InstanceTransformBuffer = InstanceTransformSRV;

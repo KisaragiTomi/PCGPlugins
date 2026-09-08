@@ -171,7 +171,7 @@ private:
 	/** 向地面注销（销毁路径）。bRefreshGround 时让地面把自己的隆起抹掉。 */
 	void UnregisterFromGround(bool bRefreshGround);
 
-	/** 按 Radius/LiftHeight 摆正编辑器示意圆柱（底面贴 z=0，直径 = 2×Radius）。 */
+	/** 按 Radius/LiftHeight 摆正编辑器示意圆柱（底面贴 z=0，直径 = 2×Radius），并把图标顶到台顶上方 1m。 */
 	void UpdateEditorShape();
 
 	/** 台顶相对地面基面的高度（= 自身 Z 偏移 + LiftHeight，钳到 ≥ 0）。 */

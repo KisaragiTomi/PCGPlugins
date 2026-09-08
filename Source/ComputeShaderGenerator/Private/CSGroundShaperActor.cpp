@@ -129,6 +129,12 @@ void ACSGroundShaperActor::RebuildTerrain()
 
 void ACSGroundShaperActor::UpdateEditorShape()
 {
+#if WITH_EDITORONLY_DATA
+	// 图标浮在台顶上方 1m：示意圆柱底面贴 z=0、高 LiftHeight，图标搁原点就埋在土台里点不着了。
+	constexpr double SpriteClearance = 100.0;
+	if (SpriteComponent) SpriteComponent->SetRelativeLocation(FVector(0, 0, LiftHeight + SpriteClearance));
+#endif
+
 	if (!EditorShapeComponent) return;
 	if (EditorShapeComponent->GetStaticMesh() != EditorShapeMesh) EditorShapeComponent->SetStaticMesh(EditorShapeMesh);
 	if (!EditorShapeMesh) return;

@@ -1,0 +1,162 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="1184" viewBox="0 0 980 1184" font-family="'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif">
+  <defs>
+    <marker id="arw" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0L7 3.5L0 7Z" fill="#475569"/></marker>
+    <marker id="arw-hot" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0L7 3.5L0 7Z" fill="#b45309"/></marker>
+    <pattern id="buffer-owner-stripe-bg" patternUnits="userSpaceOnUse" width="10" height="10">
+      <rect width="10" height="10" fill="#e2e8f0"/>
+      <rect y="1" width="10" height="2" fill="#334155" opacity="0.291429"/>
+      <rect y="6" width="10" height="1.5" fill="#334155" opacity="0.291429"/>
+    </pattern>
+    <pattern id="pickable-domain-cross-bg" patternUnits="userSpaceOnUse" width="12" height="12">
+      <rect width="12" height="12" fill="#e0e7ff"/>
+      <path d="M0 6H12" stroke="#4f46e5" stroke-width="1" opacity="0.316770"/>
+      <path d="M6 0V12" stroke="#4f46e5" stroke-width="1" opacity="0.316770"/>
+    </pattern>
+    <style>
+      .lane { font-size: 13px; font-weight: 600; fill: #475569; }
+      .bt   { font-size: 13px; font-weight: 600; fill: #1e293b; }
+      .tx   { font-size: 12px; fill: #334155; }
+      .cap  { font-size: 12px; fill: #64748b; }
+      .quiet  { fill: #f8fafc; stroke: #94a3b8; stroke-width: 0.8; }
+      .owner  { fill: url(#buffer-owner-stripe-bg); stroke: #334155; stroke-width: 1.2; }
+      .core   { fill: url(#pickable-domain-cross-bg); stroke: #4f46e5; stroke-width: 1.2; }
+      .hot    { fill: #fef3c7; stroke: #b45309; stroke-width: 1; }
+      .hott   { font-size: 12px; font-weight: 600; fill: #78350f; }
+      .flow   { stroke: #475569; stroke-width: 1.4; fill: none; marker-end: url(#arw); }
+      .hotflow{ stroke: #b45309; stroke-width: 1.6; stroke-dasharray: 5 3; fill: none; marker-end: url(#arw-hot); }
+    </style>
+  </defs>
+
+  <rect width="980" height="1184" fill="#ffffff"/>
+  <text x="40" y="34" font-size="17" font-weight="700" fill="#0f172a">TG 树冠着色链路：从 prefab 卡片到专用延迟光照</text>
+
+  <!-- ① 资产层 -->
+  <text x="40" y="62" class="lane">① 资产层</text>
+  <text x="150" y="62" class="cap">卡片几何、逐实例数据、四张贴图</text>
+
+  <rect x="40" y="74" width="312" height="128" rx="6" class="owner"/>
+  <text x="52" y="96" class="bt">central_tree.glb · canopy slot</text>
+  <text x="52" y="120" class="tx">488 tris / 976 顶点 = 244 张四边形卡片</text>
+  <text x="52" y="140" class="tx">COLOR_0.xy = 角码兼 UV，.z = 0 冠 / 1 干</text>
+  <text x="52" y="160" class="tx">prim_center · prim_normals · appear_pos · age</text>
+  <text x="52" y="180" class="cap">由 recalculate_canopy_quad_attribs 加载时重算</text>
+
+  <rect x="368" y="74" width="312" height="128" rx="6" class="owner"/>
+  <text x="380" y="96" class="bt">PlacementData SSBO（间接索引）</text>
+  <text x="380" y="120" class="tx">position · scale · rotation_angle · id</text>
+  <text x="380" y="140" class="tx">custom0 = billboard 附加半径（量级待抓帧）</text>
+  <text x="380" y="160" class="tx">anim_t_packed = 生长 t | 挖洞强度</text>
+  <text x="380" y="180" class="tx">bend_vector = 整树弯曲　pad0 = 树种 id</text>
+
+  <rect x="700" y="74" width="250" height="128" rx="6" class="owner"/>
+  <text x="712" y="96" class="bt">贴图 4 张</text>
+  <text x="712" y="120" class="tx">canopy_alpha 256²</text>
+  <text x="712" y="139" class="tx">　R 剪影 · G height · B AO</text>
+  <text x="712" y="162" class="tx">canopy_color 512²</text>
+  <text x="712" y="181" class="tx">　色板，随机 UV 取色 ≠ 叶片图</text>
+
+  <path d="M196 202V240" class="flow"/>
+  <path d="M524 202V240" class="flow"/>
+
+  <!-- ② 主 pass VS -->
+  <text x="40" y="232" class="lane">② 主 pass VS</text>
+  <text x="230" y="232" class="cap">八段串行，任一段判否即写 NaN</text>
+
+  <rect x="40" y="244" width="640" height="248" rx="6" class="core"/>
+  <text x="52" y="266" class="bt">_clearing_tree_canopy.raster · b903e43ffb3da915 · vs_main</text>
+  <text x="52" y="292" class="tx">① 生长　mix(appear_pos, pos, ease-back)，逐顶点按 age 错峰；g &lt; 0.01 → NaN</text>
+  <text x="52" y="312" class="tx">② 摇摆　amp = y·0.03，四个互质频率相乘；不吃 wind_strength</text>
+  <text x="52" y="332" class="tx">③ 锥剔　k ≥ 0.3 → NaN；fade 让快被剔的叶簇先缩成一点，无 pop</text>
+  <text x="52" y="352" class="tx">④ 展开　mesh 四角 + view-aligned billboard · custom0 · g</text>
+  <text x="52" y="372" class="tx">　　　　再绕视线轴随机 roll，θ ∈ [−0.5, −0.2] rad</text>
+  <text x="52" y="392" class="tx">⑤ 弯曲　xz += bend_vector · smoothstep(3, 20, localY)</text>
+  <rect x="52" y="404" width="616" height="24" rx="4" class="hot"/>
+  <text x="64" y="421" class="hott">⑥ 深度前推　3.2 m 外整张卡片拉近 1.6 m，前推强度存进 C12</text>
+  <text x="52" y="448" class="tx">⑦ 噪声　C10 波长 20 m 的地域色变；C8 开花标志（≈36%，只在冠上部）</text>
+  <text x="52" y="468" class="tx">⑧ 输出　C1…C12 共 12 个插值器槽</text>
+
+  <rect x="700" y="244" width="250" height="248" rx="6" class="quiet"/>
+  <text x="712" y="266" class="bt">阴影变体 f0adff76827e73ff</text>
+  <text x="712" y="292" class="tx">PS 为空 ⇒ 树影是实心四边形，</text>
+  <text x="712" y="312" class="tx">没有叶隙（TG 树影总是软块状）</text>
+  <text x="712" y="340" class="tx">VS 砍掉 billboard / roll /</text>
+  <text x="712" y="360" class="tx">缩放淡出 / 深度前推</text>
+  <text x="712" y="388" class="tx">pos += Vertex_Normal</text>
+  <text x="712" y="408" class="tx">　沿卡片法线外扩 1 单位，</text>
+  <text x="712" y="428" class="tx">　补偿主 pass 的 1.6 m 凸起</text>
+  <text x="712" y="456" class="tx">背面阈值 0.15（主 pass 0.3）</text>
+
+  <path d="M196 492V530" class="flow"/>
+
+  <!-- ③ 主 pass PS -->
+  <text x="40" y="522" class="lane">③ 主 pass PS</text>
+  <text x="230" y="522" class="cap">挖洞、花的高度合成、三档取色、打包</text>
+
+  <rect x="40" y="534" width="640" height="200" rx="6" class="core"/>
+  <text x="52" y="556" class="bt">…ps_main　贴图全部在这里采</text>
+  <text x="52" y="582" class="tx">① 挖洞　椭圆锥 vec3(0.75,1,1) + 蓝噪声抖边；受 render_overrides bit1 控制</text>
+  <text x="52" y="602" class="tx">② 花　高度域合成：flowerH &gt; leafH 才显示；仅 C10 &lt; 0.6 区域成片开花</text>
+  <text x="52" y="622" class="tx">③ 叶色　三档 theme。mode 1/2 随机 UV 采两次色板 canopy_color，</text>
+  <text x="52" y="642" class="tx">　　　　mode 0 直接在 ColorLibrary 两色间 hash 插值 —— 全程零叶片贴图</text>
+  <text x="52" y="662" class="tx">④ 打包　uvec2：.x = 法线(8:8:8)|AO(8)，.y = sqrt(色)(8:8:8)|height(8)</text>
+  <rect x="52" y="678" width="616" height="24" rx="4" class="hot"/>
+  <text x="64" y="695" class="hott">⑤ 深度　gl_FragDepth 按 (1 − height) 把前推量推回；layout(depth_less)</text>
+  <text x="52" y="722" class="cap">alpha 测试 canopy_alpha.R &lt; 0.2 discard；花像素强制 alpha = 1</text>
+
+  <rect x="700" y="534" width="250" height="200" rx="6" class="quiet"/>
+  <text x="712" y="556" class="bt">height：一个通道三用</text>
+  <text x="712" y="582" class="tx">① 深度浮雕（本图橙块与橙线）</text>
+  <text x="712" y="602" class="tx">② 花的高度域合成</text>
+  <text x="712" y="622" class="tx">③ 间接光 cavity 遮蔽</text>
+  <text x="712" y="650" class="tx">来源：canopy_alpha.G</text>
+  <text x="712" y="670" class="tx">去向：G-buffer .y 的高 8 位</text>
+  <text x="712" y="698" class="cap">⚠ 有花的卡片先减 0.3 再参与</text>
+
+  <path d="M150 734V772" class="flow"/>
+  <path d="M450 734V772" class="hotflow"/>
+
+  <!-- ④ 缓冲 -->
+  <text x="40" y="764" class="lane">④ 落盘</text>
+
+  <rect x="40" y="776" width="312" height="104" rx="6" class="owner"/>
+  <text x="52" y="798" class="bt">G-buffer（uvec2，两个 R32_UINT）</text>
+  <text x="52" y="822" class="tx">.x = normal(8:8:8) | AO(8)</text>
+  <text x="52" y="842" class="tx">.y = sqrt(color)(8:8:8) | height(8)</text>
+  <text x="52" y="864" class="cap">AO = clamp(alpha.B − 1/256, 0, 1)</text>
+
+  <rect x="368" y="776" width="312" height="104" rx="6" class="hot"/>
+  <text x="380" y="798" class="bt">深度缓冲：卡片变成叶球</text>
+  <text x="380" y="822" class="hott">平面四边形 → 1.6 m 厚的体积</text>
+  <text x="380" y="842" class="tx">两树卡片相交得到弯曲交线，</text>
+  <text x="380" y="862" class="tx">SSAO 与遮挡关系全部跟着走</text>
+
+  <rect x="700" y="776" width="250" height="104" rx="6" class="quiet"/>
+  <text x="712" y="798" class="bt">图例</text>
+  <rect x="712" y="810" width="16" height="12" rx="2" class="core"/>
+  <text x="736" y="820" class="tx">GPU pass</text>
+  <rect x="712" y="832" width="16" height="12" rx="2" class="owner"/>
+  <text x="736" y="842" class="tx">数据持有者</text>
+  <rect x="712" y="854" width="16" height="12" rx="2" class="hot"/>
+  <text x="736" y="864" class="tx">深度浮雕的四处落点</text>
+
+  <path d="M196 880V918" class="flow"/>
+  <path d="M524 880V952" class="hotflow"/>
+
+  <!-- ⑤ 延迟光照 -->
+  <text x="40" y="910" class="lane">⑤ 专用延迟光照</text>
+
+  <rect x="40" y="922" width="910" height="232" rx="6" class="core"/>
+  <text x="52" y="944" class="bt">_deferred_canopy_light_sun_sky（全屏三角）　这份 G-buffer 有 44 个生产者、只有 2 个消费者　非 PBR：无 BRDF LUT</text>
+  <rect x="52" y="956" width="886" height="24" rx="4" class="hot"/>
+  <text x="64" y="973" class="hott">还原　world_pos += view_ray · height · 1.6　⇒ 阴影与 GI 用卡片真平面位置，深度缓冲里只保留凸起</text>
+  <text x="52" y="1002" class="tx">(A) 直接漫反射　albedo/π · wrap · sun · shadow　　wrap = mix(0.2, 1, smoothstep(−0.2, 1, N·L)) · 0.8　⇒ 背光不死黑</text>
+  <text x="52" y="1024" class="tx">(B) 光泽 + 逆光　F · D_GGX(α²=0.5)/π · sun · dist_fade · shadow · 1.5　　逆光时 N·L 与 cavity 被双双旁路 ⇒ 叶缘发亮</text>
+  <text x="52" y="1046" class="tx">(C) 间接漫反射　mix(0.3, 1, cavity) · albedo · SH_L1(N) · 1.3　　cavity = exp(−(1 − 2·height) · (N·V))</text>
+  <text x="52" y="1068" class="tx">(D) 间接镜面　　SH_L1(R) · 0.04 · mix(cavity, 0.75·cavity + 0.75, gi²) · 2.0　　R 用抖动法线，随机种子是 AO 字节</text>
+  <text x="52" y="1098" class="cap">阴影自采 shadow_map：3 级联 · 6 抽样黄金角螺旋 PCF · exp(−Δ·1024) 的 ESM 风格软过渡，不是硬比较</text>
+  <text x="52" y="1118" class="cap">间接光为标准 L1 SH（0.886227 = π·Y₀，1.023327 = π·⅔·Y₁）+ 一个从 L1 幅度推的伪 L2 项，半分辨率 3→6 抽样上采</text>
+  <text x="52" y="1140" class="cap">⚠ 另一个消费者 grass pass 把这两个高 8 位读成八面体第二法线 —— 同一份 G-buffer 两种拆法，两个 pass 必然按区域分开跑（机制推测是 stencil）</text>
+
+  <!-- 深度浮雕贯穿线：VS ⑥ → PS ⑤ -->
+  <path d="M52 416H26V690H48" class="hotflow"/>
+</svg>

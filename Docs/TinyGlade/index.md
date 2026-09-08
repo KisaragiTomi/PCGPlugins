@@ -9,7 +9,8 @@
 - **要接着推进** → 读 [`TinyGlade_模块对照与进度.md` 卷零](TinyGlade_模块对照与进度.md#vol-0)：自监督循环的状态文件，含模块状态表、待拍板清单、验收门与「踩过的坑」。
 - **要动任何"砖"** → 读 [`TinyGlade_模块对照与进度.md` 卷五](TinyGlade_模块对照与进度.md#vol-5)：门框 / 拱圈石 / 转角 / 墙裙 / 承重柱 / 接缝 / 垛口 / 上沿在 TG 里是不是一套，以及唯一一处真 SplineMesh 在哪。
 - **要动窗（D8）** → 只读 [`TinyGladeWindow.md`](TinyGladeWindow.md)：计划 D8 整章 + TG 侧对照 + 时间线已在 2026-09-06 合到这一篇，开头有「现状速查表」（每条带日期与验证它的单测 / 回归断言名）。原文各处只剩存根。
-- **要重构编排层** → 先读 [`../../TinyGlade_结构审查.md`](../../TinyGlade_结构审查.md)：2026-09-06 的整体结构审查，含实例化产物管线复制、`ReevaluateSite` 隐式数据流与哈希缺口清单、矩形假设与两套墙体的待拍板项。
+- **要重构编排层** → 先读 [`../../TinyGlade_结构审查.md`](../../TinyGlade_结构审查.md)：2026-09-06 的整体结构审查，含实例化产物管线复制、`ReevaluateSite` 隐式数据流与哈希缺口清单、矩形假设与两套墙体的待拍板项；2026-09-07 追加「GPU 基座与打包契约」（21–25）与「生命周期与持久化」（26–30）两节。
+- **要做树／树叶** → 读 [`TinyGlade_树冠着色.md`](TinyGlade_树冠着色.md)：TG 树冠的 shader 侧全链路（VS 八段变形、深度浮雕、专用延迟光照），几何侧仍由 `build_tree.py` / `Tree.hip` owner。
 - **想翻某条已定结论** → 先查 [`TinyGlade_对比逆向报告.md`](TinyGlade_对比逆向报告.md) 的「被否条目」与「看似该抄其实不该抄」，别重复推翻。
 
 ## 文档清单
@@ -22,8 +23,12 @@
 | [`TinyGlade_对比逆向报告.md`](TinyGlade_对比逆向报告.md) | 两卷合卷：两轮多 agent 对比逆向评审的原始报告 | 2 份 |
 | [`CSGroundShaper.md`](CSGroundShaper.md) | 地形塑形物（D9）：Houdini 原型 → UE 的逐节点对照与算法替换 | 原在 `Docs/` |
 | [`CSRockShellPattern.md`](CSRockShellPattern.md) | 披挂岩壳（D9 链 B）：烘焙件的通道契约与五条实测订正 | 原在 `Docs/` |
+| [`TinyGlade_树冠着色.md`](TinyGlade_树冠着色.md) | **树冠着色专卷**：叶卡片的 VS 变形、紧凑 G-buffer、树冠专用延迟光照，含深度浮雕与逆光旁路两条核心机制、其它叶类（藤蔓叶／灌木／背景树／落叶粒子）对照、移植到 UE 的四条缺口 | *（2026-09-07 新增）* |
 | [`CSGroundTuning.md`](CSGroundTuning.md) | 地面派生链（地被 / 石阶 / 石阶材质 / 岩壳）的默认值：2026-09-06 那轮改了什么，以及演示关卡那套岩壳覆盖值的留档 | *（2026-09-06 新增）* |
 | [`CSRockShellEdgeBevel.md`](CSRockShellEdgeBevel.md) | 岩壳假倒角：TG 像素层缺口的机制证据与 UE 落地。**运行时壳 = v3**（邻接进 UV + 逐趟披挂重写，走 `M_TG_Texture` 的静态开关 `RockShellBevel`）；**直摆资产 = v2**（顶点色载荷，走 `M_TinyGladeRockShell`，legacy 但仍在用） | *（2026-09-01 新增，09-04 落地 v3，09-05 重整）* |
+| [`TinyGlade_结构审查_附录A_墙体剖面.md`](TinyGlade_结构审查_附录A_墙体剖面.md) | 结构审查的子代理报告 A（深挖 C）：16 行洞曲线消费者对照表、`CLIP_HLSL` 逐语句对照、逐函数的矩形假设清单与折线升级规模；结论已并入 `TinyGlade_结构审查.md` 大问题 3、4 | *（2026-09-07 新增）* |
+| [`TinyGlade_结构审查_附录B_GPU基座.md`](TinyGlade_结构审查_附录B_GPU基座.md) | 结构审查的子代理报告 B：GPU 基座与九条打包路的布局对照表、31 处阻塞点计数表、容量 / 确定性契约；结论已并入插件根的 `TinyGlade_结构审查.md` 第 21–25 条 | *（2026-09-07 新增）* |
+| [`TinyGlade_结构审查_附录C_生命周期.md`](TinyGlade_结构审查_附录C_生命周期.md) | 结构审查的子代理报告 C（深挖 G）：六个类的状态分类表（权威 / 派生 / 持久记忆 / 拖动期临时 / 跨 actor 登记）、六条生命周期路径矩阵、钩子对称性矩阵、既有结论校核表；结论已并入插件根的 `TinyGlade_结构审查.md` 第 26–30 条并订正第 12 条 | *（2026-09-07 新增）* |
 
 合卷各卷的入口锚点：
 
@@ -45,12 +50,16 @@
 | [`tiny-glade-house-change-flows.svg`](tiny-glade-house-change-flows.svg) | 地面变化 vs 房子移动各自改什么（D3/D4/D6/D7/D9 的直推链） | 计划 D3 |
 | [`tiny-glade-decor-placement-flow.svg`](tiny-glade-decor-placement-flow.svg) | 摆件／植被放置流程：场在 GPU、异步回读、diff 应用 | 计划 D12 |
 | [`tiny-glade-reevaluate-hidden-dataflow.svg`](tiny-glade-reevaluate-hidden-dataflow.svg) | `ReevaluateSite` 的隐式数据流：11 步靠成员变量传中间结果，写 / 读 / 读写逐一标出，顺序约束只在注释里 | 结构审查 大问题 2 |
+| [`tiny-glade-module-interaction.svg`](tiny-glade-module-interaction.svg) | 模块交互图：房子 / 地面 / 子系统 / 标记 / 抓手 / 塑形物 / 编辑器模块 / 遗留藤蔓之间的同步调用、委托广播、世界扫描三种边，圈码对应审查小节 | 结构审查 深挖 D（8–19） |
+| [`tiny-glade-undo-chain.svg`](tiny-glade-undo-chain.svg) | 撤销链路：一次细节面板改 `FootprintSize` 的记录期、`FTransaction::Apply` 四步（`PreEditUndo` → 全部 `Restore` → 组件优先排序 → 逐个 `PostEditUndo`）、插件钩子的扇出（同一次 Ctrl+Z 四次进 `ReevaluateSite`），底栏是事务看不见的状态 | 结构审查 深挖 G（27） |
 | [`CSGroundShaper_PrototypeMapping.svg`](CSGroundShaper_PrototypeMapping.svg) | `TinyGlade.hip /obj/geo1` 三条链 → `ACSGroundShaperActor` 的逐节点对照 | `CSGroundShaper.md` |
 | [`CSGroundShaper_Algorithms.svg`](CSGroundShaper_Algorithms.svg) | UE 端怎么替掉 Houdini 的解法：四处算法替换 | `CSGroundShaper.md`、计划 D9 |
 | [`CSGroundStairs_Logic.svg`](CSGroundStairs_Logic.svg) | 石阶的 GPU 逻辑：marching squares、100% GPU 决策、零回读 | 合卷卷零「石阶 S1」 |
 | [`CSHouseDoor_Logic.svg`](CSHouseDoor_Logic.svg) | 门洞的当前逻辑：闭环求解、弦长即门宽、转角配成墩；末栏是「已修 / 仍开着」的现状 | 计划 D6 |
 | [`CSRockShellEdgeBevel_Logic.svg`](CSRockShellEdgeBevel_Logic.svg) | 缺口法线的生成：顶点色慢变量 → 逐像素噪声倒角 → 折痕截面的法线弯折。⚠️ 只画 **v2**（直摆资产）那条链路，运行时壳的 v3 走 UV 载荷 | `CSRockShellEdgeBevel.md` |
 | [`CSRockShellEdgeBevel_TGNormals.svg`](CSRockShellEdgeBevel_TGNormals.svg) | TG 原版法线流转：逐三角 SSBO 字段，CS 每帧重算写回、PS 按 id 查自己与邻面 | `CSRockShellEdgeBevel.md` |
+| [`TinyGlade_树冠着色_Pipeline.svg`](TinyGlade_树冠着色_Pipeline.svg) | 树冠着色链路：资产层 → VS 八段 → PS 四段 → G-buffer/深度 → 专用延迟光照；橙块与橙线是贯穿三处的深度浮雕 | `TinyGlade_树冠着色.md` |
+| [`TinyGlade_树冠着色_深度浮雕.svg`](TinyGlade_树冠着色_深度浮雕.svg) | 深度浮雕的入门解释：平卡片相交是直线 → 按厚度图谎报深度 → 交线沿叶簇轮廓弯曲；末栏是「只有深度是假的」这条代价 | `TinyGlade_树冠着色.md` |
 | [`CSRockShellPattern.preview.png`](CSRockShellPattern.preview.png) | 岩壳原件碎裂图案（TG `rocky_terrain_shell.glb`，609 胞腔） | `CSRockShellPattern.md` |
 | [`CSRockShellPattern.fallback.preview.png`](CSRockShellPattern.fallback.preview.png) | 后备生成器的图案（真 Voronoi + Lloyd × 6） | `CSRockShellPattern.md` |
 | [`img/TG_continuous_arches.png`](img/TG_continuous_arches.png) | 连续拱之间没有「墙」这个表面的实拍裁决 | 计划 D6、`CSHouseProfile.h` |
@@ -113,7 +122,7 @@
 | `Plugins/PCGPlugins/Source/ComputeShaderGenerator/` | `CSHouse*` / `CSGround*` 的类注释 | 逐字段口径以源码注释为准，MD 不复述 |
 | `/PCGPlugins/HouseTest/` | `L_HouseGroundDemo`、`L_TerrainOpsDemo` 两张演示关卡 | UE 资产 |
 | `doc/index.md` | 项目级文档索引 | 已收录本目录 |
-| `Plugins/PCGPlugins/TinyGlade_结构审查.md` | 2026-09-06 整体结构审查：编排层复制、隐式数据流与哈希缺口、矩形假设、两套墙体、建议顺序与待拍板 | 审查结论放插件根，与 `README.md` 并列，首屏可见 |
+| `Plugins/PCGPlugins/TinyGlade_结构审查.md` | 2026-09-06 整体结构审查：编排层复制、隐式数据流与哈希缺口、矩形假设、两套墙体、建议顺序与待拍板；09-06 晚追加模块交互 / 冗余代码两节（8–20），09-07 追加 GPU 基座与打包契约（21–25，子代理报告见本目录附录 B）与生命周期 / 持久化（26–30，子代理报告见本目录附录 C） | 审查结论放插件根，与 `README.md` 并列，首屏可见 |
 
 ## 目录布局
 
@@ -128,8 +137,12 @@ Docs/TinyGlade/
 ├─ CSRockShellPattern.md                 # 披挂岩壳烘焙件契约
 ├─ CSRockShellEdgeBevel.md               # 岩壳假倒角（像素层缺口）落地
 ├─ CSGroundTuning.md                     # 地面派生链的默认值与调参裁决记录
+├─ TinyGlade_树冠着色.md                  # 树冠 shader 侧全链路（几何侧在 build_tree.py / Tree.hip）
+├─ TinyGlade_结构审查_附录A_墙体剖面.md    # 结构审查子代理报告 A（深挖 C：墙体 / 剖面契约 / 矩形假设）
+├─ TinyGlade_结构审查_附录B_GPU基座.md    # 结构审查子代理报告 B（GPU 基座与打包契约）
+├─ TinyGlade_结构审查_附录C_生命周期.md    # 结构审查子代理报告 C（生命周期与持久化）
 ├─ geo/                                  # 壳源数据：rocky_terrain.json / *.glb / *.FBX；bevel/ 下为倒角烘焙件
-├─ *.svg                                 # 9 张流程／算法图
+├─ *.svg                                 # 11 张流程／算法图
 ├─ CSRockShellPattern*.preview.png       # 2 张图案预览（脚本功能性输出路径）
 └─ img/                                  # 实拍参考图（1 张裁决图 + 5 张 TG 参考）
 ```

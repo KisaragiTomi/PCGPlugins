@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="520" viewBox="0 0 980 520" font-family="'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif">
+  <defs>
+    <marker id="dim" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#b45309"/></marker>
+    <marker id="dimr" markerWidth="8" markerHeight="8" refX="1" refY="4" orient="auto"><path d="M8 0L0 4L8 8Z" fill="#b45309"/></marker>
+    <marker id="arw" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0L7 3.5L0 7Z" fill="#475569"/></marker>
+    <style>
+      .lane { font-size: 13px; font-weight: 600; fill: #475569; }
+      .bt   { font-size: 13px; font-weight: 600; fill: #1e293b; }
+      .tx   { font-size: 12px; fill: #334155; }
+      .cap  { font-size: 12px; fill: #64748b; }
+      .card { fill: #dcfce7; fill-opacity: 0.85; stroke: #16a34a; stroke-width: 1.2; }
+      .blob { fill: #dcfce7; fill-opacity: 0.85; stroke: #16a34a; stroke-width: 1.2; }
+      .badline  { stroke: #b91c1c; stroke-width: 3; fill: none; }
+      .goodline { stroke: #b45309; stroke-width: 3; fill: none; }
+      .real { stroke: #16a34a; stroke-width: 1.6; stroke-dasharray: 4 3; fill: none; }
+      .bulge{ stroke: #b45309; stroke-width: 2.2; fill: #fef3c7; fill-opacity: 0.7; }
+      .dimline { stroke: #b45309; stroke-width: 1.2; marker-start: url(#dimr); marker-end: url(#dim); }
+      .hott { font-size: 12px; font-weight: 600; fill: #78350f; }
+      .bad  { font-size: 12px; font-weight: 600; fill: #b91c1c; }
+      .cam  { fill: #475569; }
+      .flow { stroke: #475569; stroke-width: 1.4; fill: none; marker-end: url(#arw); }
+    </style>
+  </defs>
+
+  <rect width="980" height="520" fill="#ffffff"/>
+  <text x="40" y="34" font-size="17" font-weight="700" fill="#0f172a">深度浮雕：为什么树冠不是"一堆纸板"</text>
+  <text x="40" y="56" class="cap">几何自始至终是平的四边形卡片，被改的只有「写进深度缓冲的那个数」</text>
+
+  <!-- ① 问题 -->
+  <text x="40" y="96" class="lane">① 问题：卡片是平的</text>
+
+  <g transform="rotate(-11 135 210)"><rect x="62" y="126" width="146" height="168" rx="4" class="card"/></g>
+  <g transform="rotate(15 240 225)"><rect x="166" y="140" width="146" height="168" rx="4" class="card"/></g>
+  <path d="M174 146L204 296" class="badline"/>
+  <text x="212" y="318" class="bad">交线是直线</text>
+
+  <text x="40" y="356" class="tx">两块平面相交，交线一定是一条直线。</text>
+  <text x="40" y="376" class="tx">两棵树的叶子叠在一起时，屏幕上就出现</text>
+  <text x="40" y="396" class="tx">一道笔直的硬边 —— 一眼看穿是贴图纸板，</text>
+  <text x="40" y="416" class="tx">不像两团有厚度的叶子。</text>
+
+  <!-- ② 做法 -->
+  <text x="360" y="96" class="lane">② 做法：让这张卡片谎报深度</text>
+
+  <text x="368" y="130" class="cap">（侧视图，相机在左）</text>
+  <path d="M382 214L406 198V230Z" class="cam"/>
+  <circle cx="378" cy="214" r="7" class="cam"/>
+  <text x="368" y="252" class="tx">相机</text>
+
+  <path d="M560 140Q440 214 560 288" class="bulge"/>
+  <path d="M560 140V288" class="real"/>
+
+  <path d="M500 214H556" class="dimline"/>
+  <text x="470" y="206" class="hott">1.6 m</text>
+
+  <text x="576" y="146" class="tx">← 卡片真实位置</text>
+  <text x="576" y="164" class="cap">　顶点没动过</text>
+  <text x="430" y="318" class="hott">橙色 = 写进深度缓冲的形状</text>
+  <text x="430" y="336" class="cap">按 canopy_alpha.G（叶簇厚度图）鼓出来</text>
+
+  <text x="360" y="356" class="tx">渲染这张卡片时，每个像素不写"我在平面上的</text>
+  <text x="360" y="376" class="tx">真实距离"，而写一个假的：叶簇中间厚的地方</text>
+  <text x="360" y="396" class="tx">报"我离相机近 1.6 m"，边缘薄的地方老实报。</text>
+  <text x="360" y="416" class="tx">深度缓冲于是以为那里有一个鼓包。</text>
+
+  <!-- ③ 结果 -->
+  <text x="680" y="96" class="lane">③ 结果：交线弯了</text>
+
+  <ellipse cx="762" cy="212" rx="66" ry="84" class="blob"/>
+  <ellipse cx="862" cy="228" rx="66" ry="84" class="blob"/>
+  <path d="M812 148Q790 214 806 306" class="goodline"/>
+  <text x="700" y="326" class="hott">交线沿叶簇轮廓弯曲</text>
+
+  <text x="680" y="356" class="tx">交线变成一条随叶簇轮廓起伏的曲线，</text>
+  <text x="680" y="376" class="tx">看起来就是两团有体积的叶子互相穿插。</text>
+  <text x="680" y="396" class="tx">所有读深度缓冲的效果（SSAO、雾、景深）</text>
+  <text x="680" y="416" class="tx">也一起以为那里真有个 1.6 m 厚的球。</text>
+
+  <!-- 底部：代价 -->
+  <rect x="40" y="444" width="900" height="56" rx="6" fill="#fef3c7" stroke="#b45309" stroke-width="1"/>
+  <text x="54" y="466" class="hott">代价：这是"假"的 —— 只有深度被改，几何还在原处。所以光照必须用真实位置，否则阴影会算错。</text>
+  <text x="54" y="488" class="tx">延迟光照那一步于是把它推回去：world_pos += view_ray · height · 1.6。深度缓冲里留凸起（管遮挡），光照拿平面（管明暗）。</text>
+</svg>

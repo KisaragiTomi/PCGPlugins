@@ -63,6 +63,23 @@ enum class ECSGpuStreamRole : uint8
 	AuxVertex,     // extension slot: per-vertex data with no built-in VF role
 };
 
+/**
+ * One DrawIndexedIndirect arg set as the CPU last saw it: the three fields that describe WHICH
+ * indices a draw covers, mirrored out of the GPU args buffer. (The other two args are the
+ * instance count, which a cull pass owns, and StartInstanceLocation, which is always 0 here.)
+ *
+ * Exists solely to feed a shadow-depth batch, which cannot read the GPU args — see
+ * FCSMeshResident::GetDrawArgs for the full reason. Any other consumer wants the args buffer.
+ */
+struct FCSGpuDrawArgs
+{
+	uint32 IndexCount = 0;       // IndexCountPerInstance
+	uint32 FirstIndex = 0;       // StartIndexLocation
+	int32 BaseVertexIndex = 0;   // BaseVertexLocation
+
+	bool IsDrawable() const { return IndexCount >= 3; }
+};
+
 // How a stream's element count scales. PerVertex/PerIndex multiply the base
 // VertexCapacity/IndexCapacity; Fixed uses ElementsPerUnit verbatim.
 enum class ECSGpuCountSource : uint8

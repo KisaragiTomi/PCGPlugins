@@ -58,9 +58,16 @@ void FCSMeshRenderSceneProxy::GetDynamicMeshElements(const TArray<const FSceneVi
 	for (int32 BatchIndex = 0; BatchIndex < BatchMaterials.Num(); ++BatchIndex)
 	{
 		FMaterialRenderProxy* MaterialProxy = BatchMaterials[BatchIndex]->GetRenderProxy();
+		// The shadow copy is taken per arg set for the same reason the draw is: each section owns
+		// a run of the index buffer and its own arg set describes it. A shadow batch built from
+		// another section's args would cast the wrong slice of the mesh.
+		FCSGpuDrawArgs ShadowArgs;
+		const bool bHaveShadowArgs = GetShadowDrawArgs(BatchIndex, ShadowArgs);
+
 		SubmitGpuBufferDraw(*this, Views, VisibilityMap, Collector, *VertexFactory, *MaterialProxy,
 			*DrawDesc.IndexBuffer, PT_TriangleList, DrawDesc.NumPrimitives, DrawDesc.MaxVertexIndex,
-			bBatchCastShadow, DrawDesc.IndirectArgsBuffer, DrawDesc.IndirectArgsOffset + uint32(BatchIndex) * IndirectArgsSetBytes);
+			bBatchCastShadow, DrawDesc.IndirectArgsBuffer, DrawDesc.IndirectArgsOffset + uint32(BatchIndex) * IndirectArgsSetBytes,
+			bHaveShadowArgs ? &ShadowArgs : nullptr);
 	}
 }
 
@@ -81,17 +88,20 @@ UCSMeshRenderComponent::UCSMeshRenderComponent()
 
 	// 2026-08-30 实测（出图对照）：房体 / 地面 / 柱子这条路与实例化那条**结论完全一样** ——
 	// CSM（r.Shadow.Virtual.Enable 0）下投影正常、自阴影与屋檐投墙都对；VSM（项目级设置 =1）
-	// 下一点影子都没有。两条路失效于同一个地方，只是理由不同：
-	//   · 这条路用引擎自己的 FLocalVertexFactory，它**声明**了 SupportsPrimitiveIdStream，
-	//     于是 MeshPassProcessor.cpp:1304 的 bDoOverrideArgs 为 true，VSM 会拿 GPU-Scene 的
-	//     DrawIndirectArgsRDG 顶掉我们写的那份；而我们是 dynamic relevance +
-	//     FDynamicPrimitiveUniformBuffer，GPU-Scene 里没有对应实例 ⇒ 实例数 0。
+	// 下一点影子都没有。两条路都进不了 VSM，但**卡在两道不同的关卡上**（2026-09-07 读源码定位，
+	// 此前把两条都归因于"进不了实例剔除表"，那对本条路是错的）：
+	//   · 这条路用引擎自己的 FLocalVertexFactory，它声明了 SupportsPrimitiveIdStream ⇒ 顺利
+	//     通过 VSM 的准入（ShadowDepthRendering.cpp:2145），实例也确实进了 GPU-Scene ——
+	//     阴影视图有自己的 DynamicPrimitiveCollector（ShadowSetup.cpp:2806），
+	//     FMeshElementCollector::AddMesh 会把 FDynamicPrimitiveUniformBuffer 传上去。
+	//     真正拦住它的是 MeshPassProcessor.cpp:1304 的 bDoOverrideArgs：VSM 下 args 被换成
+	//     实例剔除按 NumPrimitives*3 现造的那份（InstanceCullingContext.cpp:256），而带
+	//     IndirectArgsBuffer 的 batch 必须把 NumPrimitives 填 0 ⇒ 索引数 0 ⇒ 画 0 个三角形。
+	//     **已修**：阴影视图改发直接绘制，计数走 FCSMeshResident::GetDrawArgs 的 CPU 副本。
 	//   · 实例化那条（UCSGpuInstancedMeshComponent）不声明该 flag，args 不被覆盖，
-	//     但同样进不了 VSM 的实例剔除表 —— 详见那边的注释。
-	// 所以"实例化路能投影、非实例化路不能"这条**推断被实测推翻**：在 VSM 下两条都不能，
-	// 在 CSM 下两条都能。
+	//     但因此连 VSM 的准入都过不去 —— 详见那边的注释。那条**未修**。
 	//
-	// 留 true 而不是退回 false：CSM 下确凿正确，VSM 下一个影子像素都画不出来
+	// 留 true 而不是退回 false：CSM 下确凿正确，VSM 下在上述修复前一个影子像素都画不出来
 	// （改前/改后同机位逐像素比过）。
 	CastShadow = true;
 	bReceivesDecals = false;

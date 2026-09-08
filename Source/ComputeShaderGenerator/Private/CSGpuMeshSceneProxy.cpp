@@ -8,6 +8,7 @@
 #include "MaterialShared.h"
 #include "MeshBatch.h"
 #include "SceneManagement.h"
+#include "SceneView.h"   // GetDynamicMeshElementsShadowCullFrustum: the shadow-depth-view test
 #include "SceneInterface.h"
 #include "RHICommandList.h"
 #include "RenderGraphBuilder.h"
@@ -65,10 +66,19 @@ void FCSGpuMeshSceneProxy::GetDynamicMeshElements(const TArray<const FSceneView*
 {
 	if (!DrawDesc.bValid || DrawDesc.IndexBuffer == nullptr || !VertexFactory) return;
 
+	FCSGpuDrawArgs ShadowArgs;
+	const bool bHaveShadowArgs = GetShadowDrawArgs(0, ShadowArgs);
+
 	FMaterialRenderProxy* MaterialProxy = Material->GetRenderProxy();
 	SubmitGpuBufferDraw(*this, Views, VisibilityMap, Collector, *VertexFactory, *MaterialProxy,
 		*DrawDesc.IndexBuffer, PT_TriangleList, DrawDesc.NumPrimitives, DrawDesc.MaxVertexIndex,
-		bBatchCastShadow, DrawDesc.IndirectArgsBuffer, DrawDesc.IndirectArgsOffset);
+		bBatchCastShadow, DrawDesc.IndirectArgsBuffer, DrawDesc.IndirectArgsOffset,
+		bHaveShadowArgs ? &ShadowArgs : nullptr);
+}
+
+bool FCSGpuMeshSceneProxy::GetShadowDrawArgs(int32 ArgSetIndex, FCSGpuDrawArgs& OutArgs) const
+{
+	return ExternalResident.IsValid() && ExternalResident->GetDrawArgs(ArgSetIndex, OutArgs);
 }
 
 void FCSGpuMeshSceneProxy::SubmitGpuBufferDraw(
@@ -84,12 +94,26 @@ void FCSGpuMeshSceneProxy::SubmitGpuBufferDraw(
 	uint32 MaxVertexIndex,
 	bool bCastShadow,
 	FRHIBuffer* IndirectArgsBuffer,
-	uint32 IndirectArgsOffset)
+	uint32 IndirectArgsOffset,
+	const FCSGpuDrawArgs* ShadowArgs)
 {
 
 	for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ++ViewIndex)
 	{
 		if ((VisibilityMap & (1 << ViewIndex)) == 0) continue;
+
+		// A shadow-depth gather is the one caller that cannot use our indirect args, and this is
+		// how it identifies itself: FProjectedShadowInfo::GatherDynamicMeshElements sets the cull
+		// frustum on its view before every gather (ShadowSetup.cpp:2763/2770/2778) and nothing
+		// else in the renderer ever sets it — FSceneView leaves it null (SceneView.cpp:861).
+		// Preferred over asking "is this a VSM": the direct batch is equally correct for a plain
+		// shadow map, and a proxy cannot see which kind of shadow map it is being gathered for.
+		const bool bShadowDepthView = Views[ViewIndex]->GetDynamicMeshElementsShadowCullFrustum() != nullptr;
+		// No CPU copy yet ⇒ fall back to the indirect form, which is the pre-existing behaviour:
+		// right in a cascaded shadow map, empty in a virtual one. Better than drawing a guessed
+		// count, because index slots past the real end hold whatever the last, larger mesh left
+		// there — garbage triangles in the shadow map instead of a missing shadow.
+		const bool bDirectShadowDraw = bShadowDepthView && ShadowArgs != nullptr && ShadowArgs->IsDrawable();
 
 		FMeshBatch& Mesh = Collector.AllocateMesh();
 		Mesh.VertexFactory = &InVertexFactory;
@@ -105,7 +129,21 @@ void FCSGpuMeshSceneProxy::SubmitGpuBufferDraw(
 		BatchElement.FirstIndex = 0;
 		BatchElement.MinVertexIndex = 0;
 		BatchElement.MaxVertexIndex = MaxVertexIndex;
-		if (IndirectArgsBuffer)
+		// The two forms are mutually exclusive, and the engine enforces it in both directions
+		// (MeshPassProcessor.cpp:930/934): an args buffer demands NumPrimitives == 0, and a
+		// non-zero NumPrimitives demands no args buffer.
+		if (bDirectShadowDraw)
+		{
+			// FirstIndex has to come across too, and not only for the direct draw: instance
+			// culling copies it into the args it substitutes (AllocateIndirectArgs,
+			// InstanceCullingContext.cpp:275). A section drawing from arg set i starts at that
+			// set's own StartIndexLocation, so taking the count alone would cast every section's
+			// shadow from the front of the mesh.
+			BatchElement.NumPrimitives = ShadowArgs->IndexCount / 3u;
+			BatchElement.FirstIndex = ShadowArgs->FirstIndex;
+			BatchElement.BaseVertexIndex = uint32(FMath::Max(ShadowArgs->BaseVertexIndex, 0));
+		}
+		else if (IndirectArgsBuffer)
 		{
 			BatchElement.IndirectArgsBuffer = IndirectArgsBuffer;
 			BatchElement.IndirectArgsOffset = IndirectArgsOffset;

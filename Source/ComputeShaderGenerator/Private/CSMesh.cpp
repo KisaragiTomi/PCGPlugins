@@ -5,6 +5,7 @@
 #include "CSGpuMemoryBudget.h"
 #include "Async/Async.h"
 #include "Materials/MaterialInterface.h"
+#include "Misc/CoreDelegates.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
 #include "RenderingThread.h"
@@ -61,6 +62,14 @@ FVector3f CSMesh_UnpackSnorm8888XYZ(uint32 PackedValue)
  *  render-thread path cannot drift away from it. */
 void CSMesh_FinalizeGraph(FRDGBuilder& GraphBuilder, FCSMeshEditContext& Context)
 {
+	// Every owned-graph edit ends here, which makes this the one place that cannot forget to
+	// refresh the CPU-side copy of the arg sets' index counts — the counts a virtual shadow map
+	// needs because it will not read the GPU ones (FCSMeshResident::GetArgIndexCount).
+	//
+	// Before RestoreStreamAccess, so the copy is an ordinary pass in this graph: RDG transitions
+	// the args to CopySrc for it and back to IndirectArgs in the epilogue. Added after, the copy
+	// would be reading a buffer the epilogue has already handed away.
+	Context.Resident.RequestDrawArgsReadback(GraphBuilder, Context.IndirectArgs());
 	Context.RestoreStreamAccess();
 	GraphBuilder.Execute();
 }
@@ -389,7 +398,180 @@ void FCSMeshResident::ReleaseBuffers()
 void FCSMeshResident::MarkBuffersChanged()
 {
 	Sections.Reset();
+	// The counts describe arg sets that are about to stop existing. Keeping them would put the
+	// previous geometry's triangle count into the next shadow pass — which draws whatever the
+	// index buffer happens to hold that far in, not nothing.
+	DiscardDrawArgs();
 	++AllocationGeneration;
+}
+
+// -----------------------------------------------------------------------------
+// Draw-args readback pump
+// -----------------------------------------------------------------------------
+//
+// Why a pump instead of polling where the answer is used: FRHIGPUBufferReadback::Lock() goes
+// through the immediate command list, so it may only be touched on the render thread — and
+// GetDynamicMeshElements, the only consumer, never runs on it. Not even the "serial" gather
+// pass does: it is a task tagged EParallelRenderingThread (ShadowSetup.cpp:4777 in 5.7.4).
+// FCoreDelegates::OnEndFrameRT is the render thread, once per frame, and costs nothing while
+// no readback is outstanding — the delegate is only registered while the list below is
+// non-empty, so a project that never edits a GPU mesh never pays for this at all.
+
+namespace
+{
+/** Sets with a readback in flight. Registration, the walk, and removal all happen on the render
+ *  thread, which is what makes the raw pointers safe: a set can only die there too. */
+TArray<FCSMeshResident*> GCSMeshDrawArgsPending;
+FDelegateHandle GCSMeshDrawArgsPumpHandle;
+
+void CSMesh_PumpDrawArgs();
+
+void CSMesh_SetDrawArgsPumpRegistered(bool bRegistered)
+{
+	if (bRegistered == GCSMeshDrawArgsPumpHandle.IsValid()) return;
+	// Unregistering when the last readback lands rather than at module shutdown: a delegate
+	// outliving the module it points into is a crash on hot reload, and this way there is no
+	// shutdown hook that can be forgotten.
+	if (bRegistered) GCSMeshDrawArgsPumpHandle = FCoreDelegates::OnEndFrameRT.AddStatic(&CSMesh_PumpDrawArgs);
+	else
+	{
+		FCoreDelegates::OnEndFrameRT.Remove(GCSMeshDrawArgsPumpHandle);
+		GCSMeshDrawArgsPumpHandle.Reset();
+	}
+}
+
+void CSMesh_PumpDrawArgs()
+{
+	check(IsInRenderingThread());
+	for (int32 Index = GCSMeshDrawArgsPending.Num() - 1; Index >= 0; --Index)
+		if (GCSMeshDrawArgsPending[Index]->TryPublishDrawArgs()) GCSMeshDrawArgsPending.RemoveAtSwap(Index);
+	CSMesh_SetDrawArgsPumpRegistered(GCSMeshDrawArgsPending.Num() > 0);
+}
+
+void CSMesh_TrackDrawArgsPending(FCSMeshResident* Resident, bool bPending)
+{
+	if (bPending) GCSMeshDrawArgsPending.AddUnique(Resident);
+	else GCSMeshDrawArgsPending.RemoveSingleSwap(Resident);
+	CSMesh_SetDrawArgsPumpRegistered(GCSMeshDrawArgsPending.Num() > 0);
+}
+}
+
+FCSMeshResident::~FCSMeshResident()
+{
+	// Deliberately not check(IsInRenderingThread()): the readback view UCSGpuMeshComponent builds
+	// on the stack is a game-thread FCSMeshResident that never requests counts, and asserting here
+	// would make that legitimate use illegal. A set that does hold a readback can only have got it
+	// on the render thread and can only be released there, so the cleanup below is on it.
+	if (DrawArgsReadback == nullptr) return;
+	CSMesh_TrackDrawArgsPending(this, false);
+	delete DrawArgsReadback;
+	DrawArgsReadback = nullptr;
+}
+
+bool FCSMeshResident::GetDrawArgs(int32 ArgSetIndex, FCSGpuDrawArgs& OutArgs) const
+{
+	FScopeLock Lock(&PublishedDrawArgsLock);
+	if (!PublishedDrawArgs.IsValidIndex(ArgSetIndex)) return false;
+	OutArgs = PublishedDrawArgs[ArgSetIndex];
+	return true;
+}
+
+void FCSMeshResident::RequestDrawArgsReadback(FRDGBuilder& GraphBuilder, FRDGBufferRef IndirectArgsBuffer)
+{
+	check(IsInRenderingThread());
+	if (IndirectArgsBuffer == nullptr) return;
+
+	const uint32 WantBytes = FMath::Max(NumIndirectDraws, 1u) * CSMesh_IndirectArgsUintsPerSet * sizeof(uint32);
+	// NumIndirectDraws and the args descriptor are kept in step by every path that moves either,
+	// but this copy is a GPU read: clamping costs one Min and turns a drift bug into short counts
+	// instead of a read past the end of the buffer.
+	const uint32 Bytes = FMath::Min<uint32>(WantBytes, IndirectArgsBuffer->GetSize());
+	if (Bytes < sizeof(uint32) * CSMesh_IndirectArgsUintsPerSet) return;
+
+	// The edit about to execute makes what was published describe geometry that will no longer be
+	// there, so it is retired NOW rather than left standing until its replacement lands. The
+	// asymmetry is what forces this: an over-count is not a slightly wrong shadow, it is a wrong
+	// one — the index slots past the new end still hold the previous generation's indices, which
+	// now point at re-used vertex slots, so a mesh that shrinks would cast a shadow of scrambled
+	// triangles for the two or three frames the readback is in flight. Undercounting to nothing
+	// costs those same frames of shadow and is invisible.
+	{
+		FScopeLock Lock(&PublishedDrawArgsLock);
+		PublishedDrawArgs.Reset();
+	}
+
+	// A request that arrives while one is in flight SUPERSEDES it rather than being dropped, and
+	// reuses the same object to do so: EnqueueCopy clears the fence and keeps its staging buffer
+	// (RHIGPUReadback.cpp:38), so this costs no allocation and IsReady() stays false until the
+	// newest copy lands. Dropping was the obvious policy and it was wrong in a way worth
+	// recording: a mesh is normally GROWN and then FILLED by two separate graphs, so the drop
+	// published the allocation graph's freshly zeroed args and the fill's real counts were never
+	// asked for at all — a mesh that would then never cast a virtual shadow.
+	if (DrawArgsReadback == nullptr) DrawArgsReadback = new FRHIGPUBufferReadback(TEXT("CSMesh.DrawArgs"));
+	AddEnqueueCopyPass(GraphBuilder, DrawArgsReadback, IndirectArgsBuffer, Bytes);
+	CSMesh_TrackDrawArgsPending(this, true);
+}
+
+bool FCSMeshResident::TryPublishDrawArgs()
+{
+	check(IsInRenderingThread());
+	if (DrawArgsReadback == nullptr) return true;
+	if (!DrawArgsReadback->IsReady()) return false;
+
+	const uint32 NumSets = FMath::Max(NumIndirectDraws, 1u);
+	const uint64 Bytes = FMath::Min<uint64>(
+		uint64(NumSets) * CSMesh_IndirectArgsUintsPerSet * sizeof(uint32), DrawArgsReadback->GetGPUSizeBytes());
+	const uint32 ReadableSets = uint32(Bytes / (CSMesh_IndirectArgsUintsPerSet * sizeof(uint32)));
+
+	TArray<FCSGpuDrawArgs> Published;
+	if (ReadableSets > 0)
+	{
+		if (const uint32* Args = static_cast<const uint32*>(DrawArgsReadback->Lock(uint32(Bytes))))
+		{
+			// Everything except the instance count (arg 1, the cull pass's) and
+			// StartInstanceLocation (arg 4, always 0 here). StartIndexLocation is not optional:
+			// with sections each set points at its own run, and a batch that took only the count
+			// would draw that many triangles from the start of the mesh instead.
+			Published.Reserve(int32(ReadableSets));
+			for (uint32 Set = 0; Set < ReadableSets; ++Set)
+			{
+				const uint32* Args5 = Args + Set * CSMesh_IndirectArgsUintsPerSet;
+				FCSGpuDrawArgs& Out = Published.AddDefaulted_GetRef();
+				Out.IndexCount = Args5[0];
+				Out.FirstIndex = Args5[2];
+				Out.BaseVertexIndex = int32(Args5[3]);
+			}
+			DrawArgsReadback->Unlock();
+		}
+	}
+
+	delete DrawArgsReadback;
+	DrawArgsReadback = nullptr;
+
+	// A read that produced nothing publishes nothing, which leaves the set in the same "unknown"
+	// state RequestDrawArgsReadback put it in: the shadow batch keeps falling back to the indirect
+	// form until some later edit's readback succeeds. A mesh that really emptied is a different
+	// case and lands here with real zeroes, which do get published.
+	if (Published.IsEmpty()) return true;
+
+	FScopeLock Lock(&PublishedDrawArgsLock);
+	PublishedDrawArgs = MoveTemp(Published);
+	return true;
+}
+
+void FCSMeshResident::DiscardDrawArgs()
+{
+	if (DrawArgsReadback != nullptr)
+	{
+		check(IsInRenderingThread());
+		CSMesh_TrackDrawArgsPending(this, false);
+		// Not waited on. The RHI defers the staging buffer's destruction until the copy that
+		// targets it has retired, so abandoning one mid-flight is a release, not a hazard.
+		delete DrawArgsReadback;
+		DrawArgsReadback = nullptr;
+	}
+	FScopeLock Lock(&PublishedDrawArgsLock);
+	PublishedDrawArgs.Reset();
 }
 
 bool FCSMeshResident::IsAllocated() const

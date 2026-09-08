@@ -48,8 +48,9 @@ void FCSGpuInstancedMeshVertexFactory::InitRHI(FRHICommandListBase& RHICmdList)
 	//     **全靠**这个索引是 -1：MeshPassProcessor.cpp:1304 的 bDoOverrideArgs 要求
 	//     PrimitiveIdStreamIndex >= 0，一旦 >= 0，阴影通路就用 GPU-Scene 的 args 顶掉 cull pass
 	//     写的那份，而我们在 GPU-Scene 里没有实例 ⇒ 实例数 0 ⇒ 阴影里画 0 个三角形。
-	//     （VSM 另有一道更靠前的关卡，两条 gpumesh 路都过不去，见 CSGpuInstancedMeshComponent.cpp
-	//      构造函数的注释；那一条不是这个 flag 能救的。）
+	//     （VSM 另有一道更靠前的关卡，本条路过不去，见 CSGpuInstancedMeshComponent.cpp
+	//      构造函数的注释；那一条恰恰**要**这个索引 >= 0，与①直接冲突，所以不是这个 flag 能救的。
+	//      非实例化那条路没有①这个约束，2026-09-07 已用另一条办法修好。）
 	// 症状会是"主 pass 一切正常，只是影子没了"，没人会回到注册宏或基类的 InitRHI 上找原因。
 	checkf(GetPrimitiveIdStreamIndex(GetFeatureLevel(), EVertexInputStreamType::Default) == INDEX_NONE,
 		TEXT("FCSGpuInstancedMeshVertexFactory picked up a primitive-id stream. Manual-fetch instancing ")

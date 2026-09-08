@@ -69,7 +69,16 @@ public:
 	void BuildResidentView(struct FCSMeshResident& OutResident) const;
 
 	/** Submit an indexed GPU-buffer draw for every visible view. This is shared by the base
-	 *  triangle path and leaf-owned debug geometry; it never maps or reads either buffer. */
+	 *  triangle path and leaf-owned debug geometry; it never maps or reads either buffer.
+	 *
+	 *  ShadowArgs is the escape hatch for virtual shadow maps and is used for NOTHING else. A VSM
+	 *  refuses to draw from the args buffer this path normally hands it — its non-Nanite raster
+	 *  goes through GPU-Scene instance culling, which substitutes args built on the CPU from
+	 *  FMeshDrawCommand::NumPrimitives, and a batch carrying an IndirectArgsBuffer must report
+	 *  NumPrimitives as 0. So a shadow-depth view gets a direct-draw batch built from this CPU
+	 *  copy of the arg set instead, and every other view keeps the exact GPU-decided indirect
+	 *  draw. Pass null (the default) when no copy is available: the shadow batch then falls back
+	 *  to the indirect form, which is today's behaviour — correct everywhere except in a VSM. */
 	static void SubmitGpuBufferDraw(
 		const FPrimitiveSceneProxy& SceneProxy,
 		const TArray<const FSceneView*>& Views,
@@ -83,7 +92,8 @@ public:
 		uint32 MaxVertexIndex,
 		bool bCastShadow = false,
 		FRHIBuffer* IndirectArgsBuffer = nullptr,
-		uint32 IndirectArgsOffset = 0);
+		uint32 IndirectArgsOffset = 0,
+		const FCSGpuDrawArgs* ShadowArgs = nullptr);
 
 protected:
 	// The pooled-buffer render-resource wrappers live in CSGpuMeshTypes.h so debug geometry
@@ -164,6 +174,13 @@ protected:
 
 	/** SRV of a registered stream (only streams whose desc set SrvFormat have one). */
 	FRHIShaderResourceView* GetStreamSRV(ECSGpuStreamRole Role, uint8 Index = 0) const;
+
+	/** One DrawIndexedIndirect arg set as the CPU last saw it; false when it is not known. Only
+	 *  the external-streams mode can have one: it lives on the resident set, refreshed a few
+	 *  frames behind every edit (FCSMeshResident::GetDrawArgs). Feed it to SubmitGpuBufferDraw's
+	 *  ShadowArgs and nowhere else — it is stale by construction, and every pass except a virtual
+	 *  shadow map already reads the exact values out of the args buffer. */
+	bool GetShadowDrawArgs(int32 ArgSetIndex, FCSGpuDrawArgs& OutArgs) const;
 
 	// -------------------------------------------------------------------------
 	// Vertex-factory hooks

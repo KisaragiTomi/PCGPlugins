@@ -89,12 +89,17 @@ UCSGpuInstancedMeshComponent::UCSGpuInstancedMeshComponent()
 	// 所以旧注释里那句"GPU-Scene 覆盖 indirect args"在这条路上根本不成立
 	// （MeshPassProcessor.cpp:1304 的 bDoOverrideArgs 要求 PrimitiveIdStreamIndex >= 0，
 	//  而本工厂注册时就没有 SupportsPrimitiveIdStream），拦住它的是另一件事：
-	// VSM 的非 Nanite 光栅整条走 GPU-Scene 实例剔除
-	// （VirtualShadowMapArray.cpp 的 AddRasterPass → FParallelMeshDrawCommandPass::Draw
-	//  带 InstanceCullingDrawParams；InstanceCullingContext.cpp:1509/1590 只为带
-	//  HasPrimitiveIdStreamIndex 的命令追加实例），而我们是 dynamic relevance +
-	// FDynamicPrimitiveUniformBuffer，压根没有 GPU-Scene 实例可剔。【机制系源码阅读，标推测；
-	// "VSM 不画 / CSM 画"是实测】
+	// **本 batch 连 VSM 的准入都过不去**。ShadowDepthRendering.cpp:2145 对 VSM 的
+	// MeshSelectionMask 只收 `MeshBatch.VertexFactory->SupportsGPUScene()` 为真的 batch，
+	// 而那个函数正是 `SupportsPrimitiveIdStream() && PrimitiveIdStreamIndex != INDEX_NONE`
+	// （VertexFactory.h:754）—— 本工厂两个条件都不满足，于是 Process() 根本不被调用，
+	// 一条 draw command 都不会生成。（2026-09-07 读源码修正：此前写成"进不了实例剔除表"，
+	// 方向对但关卡找错了一道。）
+	//
+	// ⚠️ 这一条**没有**被 2026-09-07 那次修复覆盖。非实例化路（UCSMeshRenderComponent）是靠
+	// 给阴影 batch 一个 CPU 侧计数、改发直接绘制绕过 args 被顶掉的问题；本条路的病因不同，
+	// 那个办法在这里无效 —— 要进 VSM 就得有 primitive-id 流，而那与本工厂手取实例变换的前提
+	// 互斥（见 InitRHI 里那条 checkf）。【机制系源码阅读；"VSM 不画 / CSM 画"是实测】
 	//
 	// 留 true 而不是退回 false：它在 CSM 下确凿正确，在 VSM 下**一个影子像素都画不出来**
 	// （改前/改后同机位逐像素比过，差异只有纹理采样噪声，没有任何影子形状），

@@ -7,6 +7,7 @@
 #include "CSMesh.generated.h"
 
 class FRDGBuilder;
+class FRHIGPUBufferReadback;
 class UMaterialInterface;
 
 // -----------------------------------------------------------------------------
@@ -118,6 +119,48 @@ struct COMPUTESHADERGENERATOR_API FCSMeshResident
 	int32 KnownVertexCount = INDEX_NONE;
 	int32 KnownIndexCount = INDEX_NONE;
 
+	// -------------------------------------------------------------------------
+	// GPU-decided draw args, mirrored back to the CPU for the shadow path
+	// -------------------------------------------------------------------------
+	//
+	// Why a CPU copy exists at all when the counts are already in the arg sets the draw reads:
+	// a VIRTUAL shadow map does not read them. Its non-Nanite raster puts every batch through
+	// GPU-Scene instance culling (ShadowSetup.cpp:2587 forces EBatchProcessingMode::Generic for
+	// any shadow with a VSM), and that path SUBSTITUTES the batch's indirect args with ones it
+	// builds on the CPU from FMeshDrawCommand::NumPrimitives — see bDoOverrideArgs,
+	// MeshPassProcessor.cpp:1304, and AllocateIndirectArgs, InstanceCullingContext.cpp:256
+	// (5.7.4). A batch that supplies an IndirectArgsBuffer is *required* to set NumPrimitives to
+	// 0 (checkf, MeshPassProcessor.cpp:930/934), so the substituted args say "draw 0 indices".
+	// The measured symptom is exactly that: CSM shadows correct, VSM shadows entirely absent,
+	// and unaffected by every r.Shadow.Virtual.* switch (2026-08-30 image comparison).
+	//
+	// Escaping the substitution by dropping the vertex factory's primitive-id stream does not
+	// work either: without it FShadowDepthPassMeshProcessor::AddMeshBatch refuses the batch for
+	// a VSM outright (ShadowDepthRendering.cpp:2145). Supplying a CPU-side count is the only
+	// way through, which is what these are for.
+
+	/** DrawIndexedIndirect arg set ArgSetIndex as last read back from the GPU. False when no
+	 *  readback has landed for that set yet, and OutArgs is left alone. Safe to call from the
+	 *  mesh-element gather, which runs on task threads rather than on the render thread. */
+	bool GetDrawArgs(int32 ArgSetIndex, FCSGpuDrawArgs& OutArgs) const;
+
+	/** Adds a copy of the whole IndirectArgs buffer to GraphBuilder and registers this set with
+	 *  the end-of-frame pump that publishes the result. Every owned-graph edit calls this for
+	 *  you (CSMesh_FinalizeGraph); a request made while one is already in flight is dropped
+	 *  rather than queued, so a mesh edited every frame costs one readback in flight, not a
+	 *  growing pile. Render thread, and only from inside a graph that has the args registered. */
+	void RequestDrawArgsReadback(FRDGBuilder& GraphBuilder, FRDGBufferRef IndirectArgsBuffer);
+
+	/** Publishes a completed readback, or does nothing if it has not landed. Returns true when
+	 *  nothing is in flight any more (published or abandoned) and the pump may forget this set.
+	 *  Render thread only — the readback's Lock() goes through the immediate command list. */
+	bool TryPublishDrawArgs();
+
+	/** Forgets the published counts and abandons any readback in flight. Called wherever the arg
+	 *  sets stop meaning what they meant (reallocation), because a count left over from the
+	 *  previous geometry would put stale triangles in the shadow map. Render thread. */
+	void DiscardDrawArgs();
+
 	/** Registers the standard triangle streams: the seven the render base uses, plus a
 	 *  per-triangle material-id stream, and with vertex colours included in the readback
 	 *  set. Records InNumIndirectDraws as the mesh's draw count. Replaces any previous
@@ -164,6 +207,23 @@ struct COMPUTESHADERGENERATOR_API FCSMeshResident
 	 *  pre-flight twin of GetAllocatedBytes: the budget has to be consulted before the
 	 *  allocation exists, not after. Game-thread safe for the same reason. */
 	int64 GetRequiredBytes(uint32 InVertexCapacity, uint32 InIndexCapacity) const;
+
+	/** Only cleans up the arg-count readback. The pooled buffers are dropped by ReleaseBuffers()
+	 *  and by the TSharedPtr's own render-thread destruction — this destructor adds no rule of
+	 *  its own about which thread frees them. */
+	~FCSMeshResident();
+
+private:
+	/** In flight, or null. Owned and touched on the render thread alone: FRHIGPUBufferReadback's
+	 *  Lock() runs through the immediate command list, which is why the gather threads read the
+	 *  published array instead of polling this. */
+	FRHIGPUBufferReadback* DrawArgsReadback = nullptr;
+
+	/** Published arg sets, one per DrawIndexedIndirect set. Written by the pump on the render
+	 *  thread and read from the mesh-element gather on task threads, which is what the lock is
+	 *  for — an unsynchronised TArray would be read while a reallocation resizes it. */
+	mutable FCriticalSection PublishedDrawArgsLock;
+	TArray<FCSGpuDrawArgs> PublishedDrawArgs;
 };
 
 /**

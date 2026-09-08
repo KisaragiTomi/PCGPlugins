@@ -1085,6 +1085,151 @@ bool FCSGpuMeshSectionInvalidationTest::RunTest(const FString& Parameters)
 }
 
 // -----------------------------------------------------------------------------
+// The CPU mirror of the DrawIndexedIndirect arg sets (the VSM shadow path)
+// -----------------------------------------------------------------------------
+
+namespace
+{
+/** Forces the in-flight arg-set readback to completion and publishes it.
+ *
+ * Production code never does this: the pump polls on FCoreDelegates::OnEndFrameRT and simply
+ * skips a readback that has not landed, so nothing ever blocks. A test cannot wait for frames
+ * that an automation run does not necessarily tick, so it blocks on the GPU instead — which
+ * changes only WHEN TryPublishDrawArgs sees the data, not what it reads. */
+void CSGpuMeshTests_ForcePublishDrawArgs(UCSMesh* Mesh)
+{
+	FCSMeshResident* Resident = Mesh ? Mesh->GetResident().Get() : nullptr;
+	if (!Resident) return;
+
+	ENQUEUE_RENDER_COMMAND(CSGpuMeshTestsPublishDrawArgs)(
+		[Resident](FRHICommandListImmediate& RHICmdList)
+		{
+			// The edit's flush only waited for the render thread; its copy pass is still in flight.
+			RHICmdList.SubmitAndBlockUntilGPUIdle();
+			Resident->TryPublishDrawArgs();
+		});
+	FlushRenderingCommands();
+}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSGpuMeshDrawArgsMirrorTest,
+	"PCGPlugins.ComputeShaderGenerator.GpuMeshObject.DrawArgsMirror",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter | EAutomationTestFlags::NonNullRHI)
+
+bool FCSGpuMeshDrawArgsMirrorTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	const TArray<int32> Slots = { 0, 1, 2, 0, 1, 2 };
+	FCSGpuMeshCPUData Soup;
+	CSGpuMeshTests_BuildTaggedSoup(Slots, Soup);
+
+	UCSMesh* GpuMesh = UCSMeshOps::AllocateGpuMesh(World, 3, 3);
+	if (!TestNotNull(TEXT("GPU mesh object"), GpuMesh)) return false;
+	// Oversized up front so the operators below cannot reallocate: a reallocation legitimately
+	// discards the mirror, which would make every assertion here pass for the wrong reason.
+	if (!TestTrue(TEXT("Capacity reserved up front"), GpuMesh->EnsureCapacitySync(4096, 4096))) return false;
+	CSGpuMeshTests_MakeDistinctMaterials(World, 3, GpuMesh->Materials);
+	if (!TestTrue(TEXT("Snapshot upload"), UCSMeshOps::CopyFromMeshSnapshot(GpuMesh, Soup))) return false;
+
+	const FCSMeshResident* Resident = GpuMesh->GetResidentPtr();
+	if (!TestNotNull(TEXT("Resident set available"), Resident)) return false;
+
+	// --- 1) nothing is published until a readback lands. This is what makes the shadow batch fall
+	//        back to the indirect draw for the first frames after an edit rather than draw a guess.
+	FCSGpuDrawArgs Args;
+	TestFalse(TEXT("No arg set is published before the readback lands"), Resident->GetDrawArgs(0, Args));
+
+	// --- 2) the single whole-mesh arg set mirrors what the GPU wrote.
+	CSGpuMeshTests_ForcePublishDrawArgs(GpuMesh);
+
+	TArray<uint32> RawArgs;
+	if (!TestTrue(TEXT("Indirect args readable"),
+		CSGpuMeshTests_ReadStreamUints(GpuMesh, ECSGpuStreamRole::IndirectArgs, 0, RawArgs)) || RawArgs.Num() < 5)
+	{
+		return false;
+	}
+	if (!TestTrue(TEXT("Arg set 0 published"), Resident->GetDrawArgs(0, Args))) return false;
+	TestEqual(TEXT("Mirrored IndexCountPerInstance matches the GPU args"), Args.IndexCount, RawArgs[0]);
+	TestEqual(TEXT("Mirrored StartIndexLocation matches the GPU args"), Args.FirstIndex, RawArgs[2]);
+	// The whole point of the mirror: this is the triangle count a shadow batch draws with, and it
+	// has to be the mesh's, not the capacity it was allocated at.
+	TestEqual(TEXT("The mirrored count is the uploaded index count"), int32(Args.IndexCount), Soup.Indices.Num());
+	TestTrue(TEXT("The mirrored count is well under the 4096 capacity"), Args.IndexCount < 4096u);
+
+	// --- 3) an edit retires the publication immediately, before its replacement has landed.
+	//        Leaving the old counts up for the two or three frames the readback is in flight would
+	//        let a mesh that SHRANK cast a shadow built from index slots that now hold the previous
+	//        generation's indices pointing at re-used vertices — scrambled triangles, not a
+	//        slightly large shadow. Half the soup, so the count really does fall.
+	const TArray<int32> HalfSlots = { 0, 1, 2 };
+	FCSGpuMeshCPUData SmallerSoup;
+	CSGpuMeshTests_BuildTaggedSoup(HalfSlots, SmallerSoup);
+	if (!TestTrue(TEXT("Shrinking re-upload"), UCSMeshOps::CopyFromMeshSnapshot(GpuMesh, SmallerSoup))) return false;
+	TestFalse(TEXT("An edit retires the previous publication rather than leaving it stale"),
+		Resident->GetDrawArgs(0, Args));
+
+	CSGpuMeshTests_ForcePublishDrawArgs(GpuMesh);
+	if (!TestTrue(TEXT("Arg set 0 republished after the shrink"), Resident->GetDrawArgs(0, Args))) return false;
+	TestEqual(TEXT("The republished count is the shrunk index count"), int32(Args.IndexCount), SmallerSoup.Indices.Num());
+
+	// --- 4) with sections, each set carries its own run. A shadow batch that took only set 0's
+	//        values would cast every section's shadow from the front of the index buffer.
+	if (!TestTrue(TEXT("Snapshot restored"), UCSMeshOps::CopyFromMeshSnapshot(GpuMesh, Soup))) return false;
+	UCSMeshOps::BuildMaterialSections(GpuMesh);
+	if (!TestEqual(TEXT("Sections published"), GpuMesh->GetSections().Num(), 3)) return false;
+	CSGpuMeshTests_ForcePublishDrawArgs(GpuMesh);
+
+	if (!TestTrue(TEXT("Sectioned indirect args readable"),
+		CSGpuMeshTests_ReadStreamUints(GpuMesh, ECSGpuStreamRole::IndirectArgs, 0, RawArgs)) || RawArgs.Num() < 15)
+	{
+		return false;
+	}
+	TArray<int32> MirroredFirstIndices;
+	for (int32 Set = 0; Set < 3; ++Set)
+	{
+		if (!TestTrue(*FString::Printf(TEXT("Arg set %d published"), Set), Resident->GetDrawArgs(Set, Args))) return false;
+		TestEqual(*FString::Printf(TEXT("Set %d mirrors IndexCountPerInstance"), Set), Args.IndexCount, RawArgs[Set * 5 + 0]);
+		TestEqual(*FString::Printf(TEXT("Set %d mirrors StartIndexLocation"), Set), Args.FirstIndex, RawArgs[Set * 5 + 2]);
+		MirroredFirstIndices.Add(int32(Args.FirstIndex));
+	}
+	// Two triangles per material in this soup, so the runs must be distinct and adjacent — the
+	// property a per-set FirstIndex exists to preserve.
+	TestEqual(TEXT("The three section runs start at three different offsets"),
+		TSet<int32>(MirroredFirstIndices).Num(), 3);
+
+	// --- 5) a reallocation retires the mirror. The arg sets it described are gone, and a count
+	//        left standing would index into whatever the new buffers happen to hold.
+	if (!TestTrue(TEXT("Capacity grown"), GpuMesh->EnsureCapacitySync(16384, 16384))) return false;
+	TestFalse(TEXT("A reallocation discards the mirrored arg sets"), Resident->GetDrawArgs(0, Args));
+
+	// --- 6) the path costs no device sync, and that is checked rather than claimed. The request
+	//        rides in the edit's own graph and the pump only ever polls IsReady(), so neither can
+	//        block: measured against the module's blocking-flush counter, the same one the "no
+	//        device sync on an interactive path" discipline is enforced with. An async edit is the
+	//        honest probe because it has no flush of its own to hide behind — and it doubles as the
+	//        check that async edits are mirrored at all, since they reach the same finalize point.
+	UCSMesh* AsyncMesh = UCSMeshOps::AllocateGpuMesh(World, 4096, 4096);
+	if (!TestNotNull(TEXT("Async mesh"), AsyncMesh)) return false;
+	const FCSMeshResident* AsyncResident = AsyncMesh->GetResidentPtr();
+	if (!TestNotNull(TEXT("Async resident set"), AsyncResident)) return false;
+
+	const int64 FlushesBeforeAsyncEdit = UCSMesh::GetBlockingFlushCount();
+	const bool bAsyncAccepted = AsyncMesh->EditMeshAsync(
+		[](FCSMeshEditContext& Context) { UCSMeshOps::AddSetCountersPass(Context, 9u, 9u); });
+	if (!TestTrue(TEXT("Async edit accepted"), bAsyncAccepted)) return false;
+	TestEqual(TEXT("Requesting the arg-set readback costs no blocking flush"),
+		UCSMesh::GetBlockingFlushCount(), FlushesBeforeAsyncEdit);
+
+	CSGpuMeshTests_ForcePublishDrawArgs(AsyncMesh);
+	if (!TestTrue(TEXT("An async edit publishes its arg set too"), AsyncResident->GetDrawArgs(0, Args))) return false;
+	TestEqual(TEXT("The async edit's index count reached the CPU"), Args.IndexCount, 9u);
+	return true;
+}
+
+// -----------------------------------------------------------------------------
 // ComputeWorldBoundsSync: the ordered-float reduction
 // -----------------------------------------------------------------------------
 

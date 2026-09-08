@@ -1,5 +1,6 @@
 #include "CSGroundCover.h"
 
+#include "CSGpuInstancedMeshComponent.h"   // CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS
 #include "CSGpuMeshTypes.h"
 #include "CSGroundShaperField.h"
 #include "CSMesh.h"                    // UCSMesh::CountedBlockingFlush —— 阻塞刷新的唯一计数入口
@@ -34,6 +35,7 @@ class FCSGroundCoverScatterCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, CoverGroundColors)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RWCoverInstances)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RWCoverCounter)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, RWCoverCustomData)
 
 		SHADER_PARAMETER(FMatrix44f, CoverWorldToComponent)
 		SHADER_PARAMETER(FVector2f, CoverGridOriginXY)
@@ -56,6 +58,12 @@ class FCSGroundCoverScatterCS : public FGlobalShader
 		SHADER_PARAMETER(float, CoverHeightJitter)
 		SHADER_PARAMETER(float, CoverLeanMaxRad)
 		SHADER_PARAMETER(float, CoverAlignToNormal)
+		SHADER_PARAMETER(float, CoverClumpSize)
+		SHADER_PARAMETER(float, CoverClumpRadialChance)
+		SHADER_PARAMETER(float, CoverClumpAlignment)
+		SHADER_PARAMETER(float, CoverScaleClumpShare)
+		SHADER_PARAMETER(FVector2f, CoverBendRange)
+		SHADER_PARAMETER(float, CoverRadialBendScale)
 		SHADER_PARAMETER(uint32, CoverSeed)
 		SHADER_PARAMETER(uint32, CoverSalt)
 		SHADER_PARAMETER(uint32, CoverMaxInstances)
@@ -73,6 +81,12 @@ class FCSGroundCoverScatterCS : public FGlobalShader
 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
 		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), CSCover_GroupSizeX);
 		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Y"), CSCover_GroupSizeY);
+		// custom data 的步长**注入**而不是在 .usf 里再写一份常量。
+		// ⚠️ 这个数目前在工程里已经有两份拷贝（`CSGpuInstancedMeshComponent.h:24` 与
+		// `CSGpuInstancedMesh.usf:23`），而 `CSHouseVine.usf:65` 干脆硬编码成 `* 2u` ——
+		// 哪天要改步长，那三处必须一起改，漏掉藤蔓那处会让它按 2 写、按新步长读，
+		// 叶子的 SpawnTime/弧长静默错位。本文件不参与制造第四份。
+		OutEnvironment.SetDefine(TEXT("CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS"), CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS);
 	}
 };
 
@@ -140,6 +154,11 @@ bool EnsureBuffers(FCoverBuffers& Buffers, uint32 Capacity)
 				FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), Want * 5u), TEXT("CSGroundCover.PackedInstances"));
 			Work.Counter = AllocatePooledBuffer(
 				FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1), TEXT("CSGroundCover.Counter"));
+			// custom data **恒分配**：剔除 pass 的 UAV 是无条件绑定的（RDG 不接受空参数），
+			// 而且组件那边只看 `CustomData.IsValid()` 决定要不要把 SRV 交给顶点工厂。
+			Work.CustomData = AllocatePooledBuffer(
+				FRDGBufferDesc::CreateBufferDesc(sizeof(float), Want * uint32(CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS)),
+				TEXT("CSGroundCover.CustomData"));
 			Work.Capacity = Want;
 		});
 	// **必须走计数通道**：裸 FlushRenderingCommands 不进 CSMesh 的计数器，"交互期零阻塞"的
@@ -176,8 +195,10 @@ bool Scatter(
 
 			TArray<FRDGBufferRef> PackedRefs;
 			TArray<FRDGBufferRef> CounterRefs;
+			TArray<FRDGBufferRef> CustomRefs;
 			TArray<FRDGBufferUAVRef> PackedUAVs;
 			TArray<FRDGBufferUAVRef> CounterUAVs;
+			TArray<FRDGBufferUAVRef> CustomUAVs;
 			PackedRefs.Reserve(Work.Num());
 			CounterRefs.Reserve(Work.Num());
 			PackedUAVs.Reserve(Work.Num());
@@ -187,8 +208,11 @@ bool Scatter(
 			{
 				FRDGBufferRef PackedRef = GraphBuilder.RegisterExternalBuffer(One.PackedInstances, TEXT("CSGroundCover.PackedInstances"));
 				FRDGBufferRef CounterRef = GraphBuilder.RegisterExternalBuffer(One.Counter, TEXT("CSGroundCover.Counter"));
+				FRDGBufferRef CustomRef = GraphBuilder.RegisterExternalBuffer(One.CustomData, TEXT("CSGroundCover.CustomData"));
 				PackedRefs.Add(PackedRef);
 				CounterRefs.Add(CounterRef);
+				CustomRefs.Add(CustomRef);
+				CustomUAVs.Add(GraphBuilder.CreateUAV(FRDGBufferUAVDesc(CustomRef, PF_R32_FLOAT)));
 				PackedUAVs.Add(GraphBuilder.CreateUAV(FRDGBufferUAVDesc(PackedRef, PF_A32B32G32R32F)));
 				CounterUAVs.Add(GraphBuilder.CreateUAV(FRDGBufferUAVDesc(CounterRef, PF_R32_UINT)));
 				// 组件永远不会替你清 counter：不先清零，每次重扫都在上一趟的值上继续叠，表现是
@@ -230,6 +254,7 @@ bool Scatter(
 						PassParams->CoverGroundColors = ColorSRV;
 						PassParams->RWCoverInstances = PackedUAVs[Index];
 						PassParams->RWCoverCounter = CounterUAVs[Index];
+						PassParams->RWCoverCustomData = CustomUAVs[Index];
 						PassParams->CoverWorldToComponent = P.WorldToComponent;
 						PassParams->CoverGridOriginXY = P.GridOriginXY;
 						PassParams->CoverCellSize = P.CellSize;
@@ -257,6 +282,17 @@ bool Scatter(
 						PassParams->CoverHeightJitter = FMath::Clamp(P.HeightJitter, 0.0f, 0.95f);
 						PassParams->CoverLeanMaxRad = FMath::Max(P.LeanMaxRad, 0.0f);
 						PassParams->CoverAlignToNormal = FMath::Clamp(P.AlignToNormal, 0.0f, 1.0f);
+						// 簇格 ≤ 0 会让 kernel 里的 floor 除以零 —— 钳到 1 cm（等价于"每叶自成一簇"，
+						// 也就是退回逐叶随机，而不是把整趟散布写成 NaN）。
+						PassParams->CoverClumpSize = FMath::Max(P.ClumpSize, 1.0f);
+						PassParams->CoverClumpRadialChance = FMath::Clamp(P.ClumpRadialChance, 0.0f, 1.0f);
+						PassParams->CoverClumpAlignment = FMath::Clamp(P.ClumpAlignment, 0.0f, 1.0f);
+						PassParams->CoverScaleClumpShare = FMath::Clamp(P.ScaleClumpShare, 0.0f, 1.0f);
+						// 下限不许超上限，同 ScaleRange 那条：lerp 照样算，只是"大的反而小"，无断言可见。
+						PassParams->CoverBendRange = FVector2f(
+							FMath::Max(P.BendRange.X, 0.0f),
+							FMath::Max(P.BendRange.Y, FMath::Max(P.BendRange.X, 0.0f)));
+						PassParams->CoverRadialBendScale = FMath::Max(P.RadialBendScale, 0.0f);
 						PassParams->CoverSeed = P.Seed;
 						PassParams->CoverSalt = P.Salt;
 						PassParams->CoverMaxInstances = Work[Index].Capacity;
@@ -273,6 +309,7 @@ bool Scatter(
 			// 剔除 pass 只读这两个 buffer，且明说不负责恢复它们的状态 —— producer 自己留在 SRVMask。
 			for (FRDGBufferRef Ref : PackedRefs) GraphBuilder.SetBufferAccessFinal(Ref, ERHIAccess::SRVMask);
 			for (FRDGBufferRef Ref : CounterRefs) GraphBuilder.SetBufferAccessFinal(Ref, ERHIAccess::SRVMask);
+			for (FRDGBufferRef Ref : CustomRefs) GraphBuilder.SetBufferAccessFinal(Ref, ERHIAccess::SRVMask);
 
 			GraphBuilder.Execute();
 		});
@@ -282,7 +319,7 @@ bool Scatter(
 
 void ReleaseOnRenderThread(FCoverBuffers& Buffers)
 {
-	if (!Buffers.PackedInstances.IsValid() && !Buffers.Counter.IsValid())
+	if (!Buffers.PackedInstances.IsValid() && !Buffers.Counter.IsValid() && !Buffers.CustomData.IsValid())
 	{
 		Buffers.Reset();
 		return;
@@ -296,22 +333,27 @@ void ReleaseOnRenderThread(FCoverBuffers& Buffers)
 	Buffers.Reset();
 }
 
-int32 DebugReadInstancesSync(const FCoverBuffers& Buffers, TArray<FVector>* OutOrigins, TArray<FVector4f>* OutRows)
+int32 DebugReadInstancesSync(const FCoverBuffers& Buffers, TArray<FVector>* OutOrigins, TArray<FVector4f>* OutRows,
+	TArray<float>* OutCustomData)
 {
 	if (OutOrigins) OutOrigins->Reset();
 	if (OutRows) OutRows->Reset();
+	if (OutCustomData) OutCustomData->Reset();
 	if (!Buffers.IsValid()) return 0;
 
 	int32 Count = 0;
 	TArray<FVector4f> Rows;
+	TArray<float> Custom;
 	ENQUEUE_RENDER_COMMAND(CSGroundCoverDebugReadback)(
-		[&Count, &Rows, Work = Buffers, bWantRows = (OutOrigins != nullptr || OutRows != nullptr)](FRHICommandListImmediate& RHICmdList)
+		[&Count, &Rows, &Custom, Work = Buffers, bWantCustom = (OutCustomData != nullptr),
+		 bWantRows = (OutOrigins != nullptr || OutRows != nullptr)](FRHICommandListImmediate& RHICmdList)
 		{
 			FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("CSGroundCover.DebugReadback"));
 			FRDGBufferRef CounterRef = GraphBuilder.RegisterExternalBuffer(Work.Counter, TEXT("CSGroundCover.Counter"));
 
 			FRHIGPUBufferReadback CounterReadback(TEXT("CSGroundCover.CounterReadback"));
 			FRHIGPUBufferReadback RowReadback(TEXT("CSGroundCover.RowReadback"));
+			FRHIGPUBufferReadback CustomReadback(TEXT("CSGroundCover.CustomReadback"));
 			AddEnqueueCopyPass(GraphBuilder, &CounterReadback, CounterRef, sizeof(uint32));
 
 			// 这些 buffer 被 Scatter 留在 SRVMask（给剔除 pass 用）；回读要 CopySrc，
@@ -323,6 +365,13 @@ int32 DebugReadInstancesSync(const FCoverBuffers& Buffers, TArray<FVector>* OutO
 				FRDGBufferRef PackedRef = GraphBuilder.RegisterExternalBuffer(Work.PackedInstances, TEXT("CSGroundCover.PackedInstances"));
 				AddEnqueueCopyPass(GraphBuilder, &RowReadback, PackedRef, RowBytes);
 				GraphBuilder.SetBufferAccessFinal(PackedRef, ERHIAccess::SRVMask);
+			}
+			const uint32 CustomBytes = Work.Capacity * uint32(CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS) * sizeof(float);
+			if (bWantCustom)
+			{
+				FRDGBufferRef CustomRef = GraphBuilder.RegisterExternalBuffer(Work.CustomData, TEXT("CSGroundCover.CustomData"));
+				AddEnqueueCopyPass(GraphBuilder, &CustomReadback, CustomRef, CustomBytes);
+				GraphBuilder.SetBufferAccessFinal(CustomRef, ERHIAccess::SRVMask);
 			}
 			GraphBuilder.Execute();
 
@@ -339,6 +388,14 @@ int32 DebugReadInstancesSync(const FCoverBuffers& Buffers, TArray<FVector>* OutO
 				{
 					Rows.Append(Data, int32(Work.Capacity) * 5);
 					RowReadback.Unlock();
+				}
+			}
+			if (bWantCustom && Count > 0)
+			{
+				if (const float* Data = static_cast<const float*>(CustomReadback.Lock(CustomBytes)))
+				{
+					Custom.Append(Data, int32(Work.Capacity) * CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS);
+					CustomReadback.Unlock();
 				}
 			}
 		});
@@ -359,6 +416,10 @@ int32 DebugReadInstancesSync(const FCoverBuffers& Buffers, TArray<FVector>* OutO
 	{
 		// 只带出活跃实例那一段：容量之外是上一趟的残值，谁读谁误判。
 		OutRows->Append(Rows.GetData(), Count * 5);
+	}
+	if (OutCustomData && Custom.Num() >= Count * CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS)
+	{
+		OutCustomData->Append(Custom.GetData(), Count * CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS);
 	}
 	return Count;
 }

@@ -149,9 +149,60 @@ struct COMPUTESHADERGENERATOR_API FCSGroundCoverSpecies
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Shape", meta = (ClampMin = "0.0", ClampMax = "0.95"))
 	float HeightJitter = 0.25f;
 
-	/** 最大倾倒角（度，±）。草有（TG 的叶片是歪的），花基本为 0。 */
+	/**
+	 * 最大倾倒角（度）。**单侧 [0, 本值]，而且整簇共用** —— 不是逐叶对称抖动。
+	 * TG 实测 `hash01(簇id 派生) × 0.3`，换算成 0°–27°（VS 里 `−byte/255 × 1.5696 rad`）。
+	 * 倾倒方向 = 株的朝向，与基础网格的弯曲方向同向。
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Shape", meta = (ClampMin = "0.0", ClampMax = "80.0"))
-	float LeanDegrees = 12.0f;
+	float LeanDegrees = 27.0f;
+
+	// --- 簇朝向：TG 的"朝向丰富"就出在这三条（`_generate_grass:270-300` / `:391-416`）---
+	//
+	// 叶片先在 3×3 邻域里找最近的**抖动站点**（jittered-grid Worley），得到簇心与簇 id；
+	// **整簇共用一个朝向和一个倾倒角**，逐叶再 slerp 一个纯随机方向进去。三层叠起来才像草：
+	// 全逐叶随机读成噪声，全对齐读成梳过的地毯。⚠️ 成簇的是**朝向**，不是位置 —— 撒点仍然
+	// 是分层抖动网格（均匀不扎堆）。
+
+	/** 簇格边长（cm）。TG = 2.5 单位 = 250 cm。调小 = 朝向变化更碎，调大 = 大片同向。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Clump", meta = (ClampMin = "1.0"))
+	float ClumpSize = 250.0f;
+
+	/** 整簇"从簇心向外辐射"的概率，其余是"整簇共用一个随机朝向"。TG 实测 0.30。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Clump", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float ClumpRadialChance = 0.30f;
+
+	/**
+	 * 簇朝向在 slerp 里占的权重**上限**（实际权重再减 `0.2 × 逐叶随机`，沿用 TG 的抖动量）。
+	 * 0 = 完全逐叶随机（成簇关掉），1 = 完全跟簇。TG = 0.5 ⇒ 实际权重 0.3–0.5。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Clump", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float ClumpAlignment = 0.5f;
+
+	/**
+	 * `ScaleRange` 的取样有多少来自**簇**（1 = 整簇同高，0 = 完全逐叶）。
+	 * TG 的高度基准就是簇共享的（`hash01(簇id*13)*1.5 + 0.5`），逐叶只叠一个高斯抖动 ——
+	 * 所以整簇高矮成片而不是逐株乱跳。设 0 与加这条之前逐位相同。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Clump", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float ScaleClumpShare = 1.0f;
+
+	// --- 弯曲：写进逐实例 custom data[0]，材质用 `Per Instance Custom Data` 读 ---
+	//
+	// 本家族的 custom data 语义：**[0] = 弯曲幅度、[1] = 该株的世界高度 cm**。
+	// 语义是逐组件的 —— 藤蔓那一家在同样的 [0]/[1] 上放 SpawnTime 与弧长，互不干扰，
+	// 也**不需要**为地被扩步长（`CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS`）。
+
+	/** 弯曲幅度区间，逐叶均匀取样。TG = `hash*1.5 + 0.5` ⇒ [0.5, 2.0]。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Bend", meta = (ClampMin = "0.0"))
+	FVector2D BendRange = FVector2D(0.5, 2.0);
+
+	/**
+	 * **辐射簇**的弯曲幅度倍率。TG 实测 0.5 —— 朝外辐射的那 30% 簇同时也更挺。
+	 * 给成 1.0 的话辐射簇会读成"一朵塌下去的花"而不是"一丛支棱着的草"。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Bend", meta = (ClampMin = "0.0", ClampMax = "2.0"))
+	float RadialBendScale = 0.5f;
 
 	/** 0 = 一律世界上（TG 的草就是这样），1 = 完全贴地形法线。花插在坡上时给一点更自然。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Shape", meta = (ClampMin = "0.0", ClampMax = "1.0"))
@@ -1346,6 +1397,33 @@ public:
 	/** **诊断专用，阻塞**：某个物种的实例世界原点（已按 GPU counter 截断）。 */
 	int32 DebugReadGroundCoverOriginsSync(int32 SpeciesIndex, TArray<FVector>& OutWorldOrigins) const;
 
+	/**
+	 * **诊断 / 验收专用，阻塞**：实例的世界原点 + **水平朝向**（单位向量）。
+	 *
+	 * 朝向从 packed 行的第 2 行（`LocalY`，= 株的朝向轴 = 基础网格的弯曲方向）取，去掉缩放
+	 * 与 Z 分量再单位化。存在的理由是"朝向成簇"这条**只能量、不能看**：肉眼分不清
+	 * "逐叶随机"和"簇权重 0.15"，而两者的画面差别恰恰是这一轮要复刻的东西。
+	 * 判据配方见 `Scripts/TinyGladeVerifyCoverOrientation.py`。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CS Ground|Cover", meta = (DevelopmentOnly))
+	int32 DebugReadGroundCoverFacingsSync(int32 SpeciesIndex, TArray<FVector>& OutWorldOrigins,
+		TArray<FVector2D>& OutFacingXY) const;
+
+	/**
+	 * **诊断 / 验收专用，阻塞**：逐实例 custom data 的两个通道 + 该实例的世界原点。
+	 *
+	 * `OutBendAmp` = custom data[0]（弯曲幅度）、`OutReserved` = custom data[1]（保留，应恒 0）、
+	 * `OutWorldOrigins` = packed 行第 4 行的原点。
+	 *
+	 * 带出原点是为了让"custom data 与 packed 行**逐实例配对**"这条**可断言**：弯曲幅度的公式
+	 * 末尾有 `× (1 − 遮罩)`，所以每一株都必须满足
+	 * `BendAmp ≤ BendRange.Max × (1 − 遮罩(该株原点))`。下标错位的症状是数值张冠李戴、
+	 * 剔除一变就换一批 —— 光看数值范围是绝对看不出来的，必须有一条把两块缓冲绑在一起的判据。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CS Ground|Cover", meta = (DevelopmentOnly))
+	int32 DebugReadGroundCoverCustomDataSync(int32 SpeciesIndex, TArray<float>& OutBendAmp,
+		TArray<float>& OutReserved, TArray<FVector>& OutWorldOrigins) const;
+
 	/** 顶点色全部铺回 BaseColor（高度不动），并重建。 */
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "CS Ground")
 	void ResetPaint();
@@ -1633,6 +1711,7 @@ private:
 
 	/** 坐底修正 = −局部包围盒 Min.Z（未缩放）。`bSeatOnBase` 关掉时传 0，见该属性的注释。 */
 	TArray<float> CoverBaseRises;
+
 
 	/** 上次交给组件的容量/包围盒：只有它们真变了才需要再走一次阻塞的 `SetInstanceSourceGPU`。 */
 	TArray<uint32> CoverHandedCapacities;

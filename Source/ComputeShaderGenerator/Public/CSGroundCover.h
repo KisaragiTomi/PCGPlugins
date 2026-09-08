@@ -50,9 +50,23 @@ struct FCoverBuffers
 {
 	TRefCountPtr<FRDGPooledBuffer> PackedInstances;   // Buffer<float4>，5 个 / 实例
 	TRefCountPtr<FRDGPooledBuffer> Counter;           // Buffer<uint>，[0] = 活跃数（只有 GPU 知道）
+	/**
+	 * 逐实例 custom data，`Buffer<float>`，`CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS` 个 / 实例。
+	 * 材质侧就是 `Per Instance Custom Data` 节点。
+	 *
+	 * **地被这一家的语义**：`[0]` = 弯曲幅度（TG 的 `_997`），`[1]` **保留、恒写 0**
+	 * —— 它曾经存"该株世界高度"，但那是冗余的（材质能从逐实例 Local→World 推出来，
+	 * 理由写在 `CSGroundCover.usf` 的对应注释里）。
+	 * ⚠️ 语义是**逐组件**的：藤蔓那一家在同样的 `[0]/[1]` 上放的是 SpawnTime 与弧长
+	 * （见 `CSGpuInstancedMeshComponent.h`），两家互不干扰，也**不需要**为此扩步长。
+	 *
+	 * 走并列缓冲而不是把 packed 行加宽，理由见 `FCSGpuInstanceSourceGPU::CustomData`：
+	 * 那个 `* 5u` 的步长散在两个 .usf 与四处 CPU 路径里，动它的代价与风险都不对等。
+	 */
+	TRefCountPtr<FRDGPooledBuffer> CustomData;
 	uint32 Capacity = 0;
 
-	bool IsValid() const { return PackedInstances.IsValid() && Counter.IsValid() && Capacity > 0; }
+	bool IsValid() const { return PackedInstances.IsValid() && Counter.IsValid() && CustomData.IsValid() && Capacity > 0; }
 	void Reset() { *this = FCoverBuffers(); }
 };
 
@@ -89,8 +103,29 @@ struct FScatterParams
 
 	FVector2f ScaleRange = FVector2f(0.85f, 1.2f);
 	float HeightJitter = 0.25f;
+	/** 最大倾倒角，**单侧 [0, max]，整簇共用**（TG：0.3 × 90° = 27°）。 */
 	float LeanMaxRad = 0.0f;
 	float AlignToNormal = 0.0f;
+
+	// --- 簇朝向（TG `_generate_grass:270-300` / `:391-416`）---
+	/** 簇格边长（cm）。TG = 2.5 单位 = 250 cm。 */
+	float ClumpSize = 250.0f;
+	/** 整簇"从簇心向外辐射"的概率，其余是"整簇共用一个随机朝向"。TG = 0.30。 */
+	float ClumpRadialChance = 0.30f;
+	/** 簇朝向在 slerp 里的权重上限（实际再减 0.2·rand）。TG = 0.5 ⇒ 权重 0.3–0.5。 */
+	float ClumpAlignment = 0.5f;
+
+	/**
+	 * 缩放取样有多少来自**簇**（1 = 完全簇共享，0 = 完全逐叶）。TG 的高度基准是簇共享的
+	 * （`hash01(簇id*13)*1.5 + 0.5`），逐叶只叠一个高斯抖动 —— 所以整簇高矮成片，而不是逐株乱跳。
+	 */
+	float ScaleClumpShare = 1.0f;
+
+	// --- 弯曲幅度：写进 custom data[0]，供材质做 WPO（TG `_945`/`_997`）---
+	/** 弯曲幅度区间，逐叶均匀取样。TG = `hash*1.5 + 0.5` ⇒ [0.5, 2.0]。 */
+	FVector2f BendRange = FVector2f(0.5f, 2.0f);
+	/** **辐射簇**的弯曲幅度倍率。TG 实测 0.5 —— 朝外辐射的那 30% 簇同时也更挺。 */
+	float RadialBendScale = 0.5f;
 
 	uint32 Seed = 0;
 	/** 物种盐。**同一份 Site 里两个物种撞盐会让它们逐格完全相关** —— 花就永远长在草心里。 */
@@ -135,7 +170,8 @@ COMPUTESHADERGENERATOR_API bool Scatter(
 
 COMPUTESHADERGENERATOR_API void ReleaseOnRenderThread(FCoverBuffers& Buffers);
 
-/** 诊断 / 验收专用，**阻塞**：GPU counter（按容量钳过）。行内容按需带出。 */
+/** 诊断 / 验收专用，**阻塞**：GPU counter（按容量钳过）。行内容与 custom data 按需带出。 */
 COMPUTESHADERGENERATOR_API int32 DebugReadInstancesSync(
-	const FCoverBuffers& Buffers, TArray<FVector>* OutOrigins, TArray<FVector4f>* OutRows);
+	const FCoverBuffers& Buffers, TArray<FVector>* OutOrigins, TArray<FVector4f>* OutRows,
+	TArray<float>* OutCustomData = nullptr);
 }

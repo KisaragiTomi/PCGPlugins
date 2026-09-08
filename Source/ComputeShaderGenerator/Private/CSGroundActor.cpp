@@ -1936,6 +1936,13 @@ uint32 ACSGroundActor::CoverInputHash(const TArray<const FCSGroundCoverSpecies*>
 		Hash = HashFloat(Hash, One->HeightJitter);
 		Hash = HashFloat(Hash, One->LeanDegrees);
 		Hash = HashFloat(Hash, One->AlignToNormal);
+		Hash = HashFloat(Hash, One->ClumpSize);
+		Hash = HashFloat(Hash, One->ClumpRadialChance);
+		Hash = HashFloat(Hash, One->ClumpAlignment);
+		Hash = HashFloat(Hash, One->ScaleClumpShare);
+		Hash = HashFloat(Hash, float(One->BendRange.X));
+		Hash = HashFloat(Hash, float(One->BendRange.Y));
+		Hash = HashFloat(Hash, One->RadialBendScale);
 		Hash = HashFloat(Hash, One->Sink);
 		Hash = HashCombine(Hash, ::GetTypeHash(One->bSeatOnBase));
 		Hash = HashCombine(Hash, ::GetTypeHash(One->bCastShadow));
@@ -2123,6 +2130,12 @@ void ACSGroundActor::RebuildGroundCover()
 		P.HeightJitter = One.HeightJitter;
 		P.LeanMaxRad = FMath::DegreesToRadians(FMath::Max(One.LeanDegrees, 0.0f));
 		P.AlignToNormal = One.AlignToNormal;
+		P.ClumpSize = One.ClumpSize;
+		P.ClumpRadialChance = One.ClumpRadialChance;
+		P.ClumpAlignment = One.ClumpAlignment;
+		P.ScaleClumpShare = One.ScaleClumpShare;
+		P.BendRange = FVector2f(float(One.BendRange.X), float(One.BendRange.Y));
+		P.RadialBendScale = One.RadialBendScale;
 		P.Seed = uint32(GroundCoverSeed);
 		// 盐里混进下标：两行花配了同一个 Salt 时仍然分得开。用户填的 Salt 仍然生效
 		// （它决定"同一下标下换个花样"），只是不再是唯一的分离手段。
@@ -2174,6 +2187,9 @@ void ACSGroundActor::RebuildGroundCover()
 		FCSGpuInstanceSourceGPU Source;
 		Source.PackedInstances = CoverBuffers[Index].PackedInstances;   // 保留自己的引用，重散还要用
 		Source.Counter = CoverBuffers[Index].Counter;
+		// 逐实例 custom data：组件只看它是否有效来决定要不要把 SRV 交给顶点工厂，
+		// 不交的话材质里的 `Per Instance Custom Data` 恒读 0 —— 弯曲整条静默失效。
+		Source.CustomData = CoverBuffers[Index].CustomData;
 		Source.Capacity = CoverBuffers[Index].Capacity;
 		Source.LocalBounds = LocalBounds;
 		CoverComponents[Index]->SetInstanceSourceGPU(Source);
@@ -2240,6 +2256,59 @@ int32 ACSGroundActor::DebugReadGroundCoverOriginsSync(int32 SpeciesIndex, TArray
 	// kernel 写的是**组件空间**的原点（packed 行按组件空间存），带出来的要是世界坐标才好断言。
 	const FTransform Transform = GetActorTransform();
 	for (FVector& One : OutWorldOrigins) One = Transform.TransformPosition(One);
+	return Count;
+}
+
+int32 ACSGroundActor::DebugReadGroundCoverFacingsSync(int32 SpeciesIndex, TArray<FVector>& OutWorldOrigins,
+	TArray<FVector2D>& OutFacingXY) const
+{
+	OutWorldOrigins.Reset();
+	OutFacingXY.Reset();
+	if (!CoverBuffers.IsValidIndex(SpeciesIndex)) return -1;
+
+	TArray<FVector4f> Rows;
+	const int32 Count = CSGroundCover::DebugReadInstancesSync(CoverBuffers[SpeciesIndex], nullptr, &Rows);
+	const FTransform Transform = GetActorTransform();
+	OutWorldOrigins.Reserve(Count);
+	OutFacingXY.Reserve(Count);
+	for (int32 Index = 0; Index < Count; ++Index)
+	{
+		const int32 Base = Index * 5;
+		if (!Rows.IsValidIndex(Base + 3)) break;
+		// 第 4 行 = 原点（组件空间）；第 2 行 = LocalY = 朝向轴（已被均匀缩放乘过）。
+		OutWorldOrigins.Add(Transform.TransformPosition(FVector(Rows[Base + 3].X, Rows[Base + 3].Y, Rows[Base + 3].Z)));
+		// 只取水平分量：倾倒会把 Z 掰出来，而"朝向"这件事说的就是水平那一半。
+		const FVector2D Flat(Rows[Base + 1].X, Rows[Base + 1].Y);
+		const double Len = Flat.Size();
+		OutFacingXY.Add(Len > UE_KINDA_SMALL_NUMBER ? (Flat / Len) : FVector2D::ZeroVector);
+	}
+	return Count;
+}
+
+int32 ACSGroundActor::DebugReadGroundCoverCustomDataSync(int32 SpeciesIndex, TArray<float>& OutBendAmp,
+	TArray<float>& OutReserved, TArray<FVector>& OutWorldOrigins) const
+{
+	OutBendAmp.Reset();
+	OutReserved.Reset();
+	OutWorldOrigins.Reset();
+	if (!CoverBuffers.IsValidIndex(SpeciesIndex)) return -1;
+
+	TArray<FVector4f> Rows;
+	TArray<float> Custom;
+	const int32 Count = CSGroundCover::DebugReadInstancesSync(CoverBuffers[SpeciesIndex], nullptr, &Rows, &Custom);
+	const FTransform Transform = GetActorTransform();
+	OutBendAmp.Reserve(Count);
+	OutReserved.Reserve(Count);
+	OutWorldOrigins.Reserve(Count);
+	for (int32 Index = 0; Index < Count; ++Index)
+	{
+		const int32 CBase = Index * CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS;
+		const int32 RBase = Index * 5 + 3;   // 第 4 行 = 原点（组件空间）+ 每实例随机数
+		if (!Custom.IsValidIndex(CBase + 1) || !Rows.IsValidIndex(RBase)) break;
+		OutBendAmp.Add(Custom[CBase + 0]);
+		OutReserved.Add(Custom[CBase + 1]);
+		OutWorldOrigins.Add(Transform.TransformPosition(FVector(Rows[RBase].X, Rows[RBase].Y, Rows[RBase].Z)));
+	}
 	return Count;
 }
 

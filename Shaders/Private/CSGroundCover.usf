@@ -21,7 +21,11 @@
 // packed 行布局照抄 CSGpuInstancedMesh.usf（那份才是权威，石阶/门框砖/裙边摆件都用它）：
 //   前三行 = 被缩放过的基，第 4 行 = 原点 + 每实例随机数，第 5 行 = 剔除球。
 // 基的约定：+Z 是株的"上"（受 CoverAlignToNormal 控制在世界上 ↔ 地形法线之间插值），
-// +X/+Y 是水平的两轴，绕 +Z 的偏航由格身份哈希给。
+// **+Y 是株的朝向**（= 基础网格的弯曲方向，也是倾倒方向），+X = Y × Z。
+//
+// ⚠️ **位置不成簇，朝向成簇** —— 两件事别混：撒点仍是分层抖动网格（均匀、不扎堆），
+// 但**朝向**照 TG 走一层 2.5 m 的簇结构（见下面 `CoverClumpSize` 那一段）。
+// TG 的草看起来"朝向丰富"正是这个：全随机读成噪声，全对齐读成梳过的地毯，成簇才像草。
 
 #include "/Engine/Public/Platform.ush"
 #include "/Plugin/PCGPlugins/Shaders/Private/CSGroundShaperField.ush"
@@ -75,8 +79,36 @@ float  CoverRise;
 
 float2 CoverScaleRange;              // 均匀缩放 [min, max]
 float  CoverHeightJitter;            // Z 轴额外抖动（±），只改高矮不改粗细
-float  CoverLeanMaxRad;              // 最大倾倒角（绕水平轴），草有、花基本没有
+float  CoverLeanMaxRad;              // 最大倾倒角，**单侧 [0, max]**，整簇共用（见下面的簇朝向）
 float  CoverAlignToNormal;           // 0 = 世界上（TG 的草就是世界上），1 = 完全贴地形法线
+
+// --- 簇朝向（照抄 TG `_generate_grass:270-300` + `:391-416`）----------------
+//
+// TG 的草朝向**不是逐叶随机**，而是一层 2.5 m 的簇结构：叶片先在 3×3 邻域里找最近的
+// **抖动站点**（jittered-grid Worley），得到"簇心"与"簇 id"；整簇共用一个朝向与一个倾倒角，
+// 逐叶再 slerp 一个纯随机方向进去。丰富感就来自这三层的叠加 ——
+// 全随机会读成噪声，全对齐会读成梳过的地毯。
+float  CoverClumpSize;               // 簇格边长（cm）。TG = 2.5 单位 = 250 cm
+float  CoverClumpRadialChance;       // 整簇"从簇心向外辐射"的概率。TG = 0.30
+float  CoverClumpAlignment;          // 簇朝向在 slerp 里的权重上限。TG = 0.5（实际 0.3–0.5）
+float  CoverScaleClumpShare;        // 缩放取样有多少来自簇（1 = 完全簇共享）。TG 的高度基准就是簇共享的
+
+// --- 逐实例 custom data（材质侧的 `Per Instance Custom Data` 节点）------------
+//
+// 地被这一家的语义：**[0] = 弯曲幅度，[1] 保留（恒写 0）**。
+// 语义是**逐组件**的 —— 藤蔓那一家在同样的 [0]/[1] 上放 SpawnTime 与弧长，互不干扰。
+// 步长 `CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS` 由 C++ 侧 `ModifyCompilationEnvironment` 注入，
+// 本文件**不再写第三份常量**（工程里已经有两份，外加 CSHouseVine.usf 的一处硬编码）。
+//
+// ⚠️ **`[1]` 曾经存"该株的世界高度 cm"，2026-09-07 拆掉了 —— 它是冗余的**：本工厂强制
+// `USE_INSTANCING`（`CSGpuInstancedMeshVertexFactory.cpp:28`），因此材质里的 Local→World 走的是
+// `Parameters.InstanceLocalToWorld`（`MaterialTemplate.ush:1702-1708`）＝**逐实例**矩阵，于是
+// `length(TransformVector(float3(0,0,1), Local→World))` 恰好就是高度缩放（AxisZ 是单位向量，
+// actor 只允许平移所以 WorldToComponent 正交），再乘网格局部高度就是世界高度。
+// 槽位留空而不是留旧值：**恒写 0** 才能把"这一格没人用"做成可断言的事实。
+RWBuffer<float> RWCoverCustomData;
+float2 CoverBendRange;              // 弯曲幅度区间，逐叶均匀取样。TG = [0.5, 2.0]
+float  CoverRadialBendScale;        // **辐射簇**的弯曲倍率。TG = 0.5（朝外辐射的那 30% 簇更挺）
 
 uint   CoverSeed;                    // 用户种子
 uint   CoverSalt;                    // 物种盐：同一格上草与各种花必须掷出不同的数
@@ -157,6 +189,46 @@ float2 CSCover_GradientXY(float2 P)
 	return float2(Dx, Dy) / (2.0f * D);
 }
 
+/**
+ * 簇站点：把格坐标 + R2 低差异序列抖动成一个点。R2 常数 `(0.75487, 0.56984)` 与撒叶用的是
+ * **同一组**（TG 也是），所以簇的分布与叶的分布同源，不会出现"簇边界正好压在一排叶子上"。
+ */
+float2 CSCover_ClumpSite(int2 Cell)
+{
+	// TG 用 `id = cx + cy*577` 把二维格压成一个整数再取 R2 —— 577 是质数，保证相邻格不撞。
+	const uint Id = uint(Cell.x + Cell.y * 577) & 0xFFFFu;
+	const float2 Jitter = frac(float2(0.75487768650054931640625f, 0.56984031200408935546875f) * float(Id) + 0.5f) - 0.5f;
+	// ⚠️ 比 TG 多一个 `+0.5`：TG 的站点以格**角**为心（`cell*2.5 + jitter*2.5`），能伸出本格 1.25；
+	// 这里以格**心**为心，站点恒在自己格内 —— 这样 3×3 邻域搜索**保证**能找到真正的最近站点。
+	// TG 那种摆法配 3×3 只是"绝大多数情况下对"，边界上会偶尔认错簇（症状是一条格宽的朝向断层）。
+	return (float2(Cell) + 0.5f + Jitter) * CoverClumpSize;
+}
+
+/** 簇 id → 稳定哈希种子。与叶身份的哈希分开：整簇共用的量必须只由簇身份决定。 */
+uint CSCover_ClumpSeed(int2 Cell, uint Channel)
+{
+	uint H = uint(Cell.x + Cell.y * 577) * 0x9E3779B1u;
+	H ^= Channel * 0x27D4EB2Fu;
+	H ^= CoverSalt * 0xC2B2AE3Du;
+	H ^= CoverSeed * 0x9E3779B9u;
+	return H;
+}
+
+/**
+ * 2D 单位向量 slerp。**必须是 slerp 不是 lerp+normalize**：两个方向接近反向时 lerp 的中间结果
+ * 会塌到零向量再被 normalize 放大成噪声，表现是"某些簇的边缘朝向乱跳"。TG 同样走 slerp
+ * 并且带同一个退化分支。
+ */
+float2 CSCover_Slerp2D(float2 A, float2 B, float T)
+{
+	const float D = dot(A, B);
+	// 几乎同向 / 几乎反向：acos 在这里没有可用的精度，直接按权重挑一边（同 TG 的退化分支）。
+	if (D > 0.9999f || D < -0.9999f) return (T <= 0.5f) ? A : B;
+	const float Omega = acos(D);
+	const float S = sin(Omega);
+	return (A * sin((1.0f - T) * Omega) + B * sin(T * Omega)) / S;
+}
+
 [numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, 1)]
 void ScatterGroundCoverCS(uint3 Id : SV_DispatchThreadID)
 {
@@ -188,41 +260,109 @@ void ScatterGroundCoverCS(uint3 Id : SV_DispatchThreadID)
 	const float3 Normal = normalize(float3(-Grad, 1.0f));
 	if (Normal.z < CoverMinSlopeCos) return;
 
-	// 5) 姿态。+Z 在世界上与地形法线之间插值：TG 的草是**世界上**（`_grass.raster` 的基
-	//    第二列写死 `vec3(0,1,0)`），贴坡的是岩壳不是草；但花插在坡上时贴一点法线更自然，
-	//    所以留成参数而不是写死。
+	// 5) 簇：3×3 邻域找最近的抖动站点，得到簇心与簇格坐标（jittered-grid Worley）。
+	//    ⚠️ 用 `floor` 而不是 TG 的 `int()` 截断：截断在原点两侧会把 0 那一格算两次，
+	//    正负交界处出一条一格宽的接缝。TG 的世界是个不跨原点的圆盘所以看不出来，我们跨。
+	const float ClumpCell = max(CoverClumpSize, 1.0f);
+	const int2 HomeCell = int2(floor(P / ClumpCell));
+	int2 ClumpCellId = HomeCell;
+	float2 ClumpSite = CSCover_ClumpSite(HomeCell);
+	float ClumpBest = 1e30f;
+	[unroll] for (int Cx = -1; Cx <= 1; ++Cx)
+	{
+		[unroll] for (int Cy = -1; Cy <= 1; ++Cy)
+		{
+			const int2 Cand = HomeCell + int2(Cx, Cy);
+			const float2 Site = CSCover_ClumpSite(Cand);
+			const float2 Delta = Site - P;
+			const float D2 = dot(Delta, Delta);
+			if (D2 < ClumpBest)
+			{
+				ClumpBest = D2;
+				ClumpSite = Site;
+				ClumpCellId = Cand;
+			}
+		}
+	}
+
+	// 簇朝向：70% 整簇共用一个随机方位角，30% 从簇心向外辐射（TG 实测的 0.7 分支）。
+	// 两条都只由**簇身份**决定 ⇒ 同一簇的叶子共享同一个基准方向，这是"成丛"的来源。
+	// 辐射与否整簇一个结论，后面算弯曲幅度还要用它，所以提成变量。
+	const bool bRadialClump = CSCover_Hash01(CSCover_ClumpSeed(ClumpCellId, 2u)) < CoverClumpRadialChance;
+	float2 ClumpDir;
+	if (bRadialClump)
+	{
+		const float2 Out = P - ClumpSite;
+		const float OutLen = length(Out);
+		// 叶子正好落在簇心上时没有径向方向可言，退回该簇的随机朝向（而不是留个零向量）。
+		float SinR, CosR;
+		sincos(CSCover_Hash01(CSCover_ClumpSeed(ClumpCellId, 5u)) * CSCOVER_TWO_PI, SinR, CosR);
+		ClumpDir = (OutLen > 1e-3f) ? (Out / OutLen) : float2(CosR, SinR);
+	}
+	else
+	{
+		float SinC, CosC;
+		sincos(CSCover_Hash01(CSCover_ClumpSeed(ClumpCellId, 5u)) * CSCOVER_TWO_PI, SinC, CosC);
+		ClumpDir = float2(CosC, SinC);
+	}
+
+	// 逐叶纯随机方向，再按权重 slerp 回簇朝向。TG 的权重是 0.5 − 0.2·rand ∈ [0.3, 0.5]，
+	// 这里把上限做成参数、抖动量沿用 TG 的 0.2 —— 参数取默认 0.5 时与 TG 逐位同形。
+	float SinB, CosB;
+	sincos(CSCover_Hash01(CSCover_CellSeed(Cell, 23u)) * CSCOVER_TWO_PI, SinB, CosB);
+	const float2 BladeDir = float2(CosB, SinB);
+	const float ClumpWeight = saturate(CoverClumpAlignment - 0.2f * CSCover_Hash01(CSCover_CellSeed(Cell, 43u)));
+	// slerp(叶随机, 簇朝向, 簇权重)：权重 0 = 完全逐叶随机，1 = 完全跟簇。
+	const float2 Facing = CSCover_Slerp2D(BladeDir, ClumpDir, ClumpWeight);
+
+	// 姿态。+Z 在世界上与地形法线之间插值：TG 的草是**世界上**（`_grass.raster` 的基
+	// 第二列写死 `vec3(0,1,0)`），贴坡的是岩壳不是草；但花插在坡上时贴一点法线更自然，
+	// 所以留成参数而不是写死。
 	float3 AxisZ = normalize(lerp(float3(0.0f, 0.0f, 1.0f), Normal, saturate(CoverAlignToNormal)));
 
-	// 偏航：整圈随机。草叶是片状的，没有偏航的话整片草会朝同一个方向，从某个角度看会集体消失。
-	float SinYaw, CosYaw;
-	sincos(CSCover_Hash01(CSCover_CellSeed(Cell, 23u)) * CSCOVER_TWO_PI, SinYaw, CosYaw);
-	float3 AxisX = float3(CosYaw, SinYaw, 0.0f);
-	// AxisZ 被法线拉歪之后 AxisX 不再与它正交，先投影回切平面再单位化。
-	AxisX = AxisX - AxisZ * dot(AxisX, AxisZ);
-	const float LenX = length(AxisX);
-	AxisX = (LenX > 1e-4f) ? (AxisX / LenX) : normalize(cross(float3(0.0f, 1.0f, 0.0f), AxisZ));
-	float3 AxisY = cross(AxisZ, AxisX);
+	// ⚠️ **朝向要放在 AxisY 上，不是 AxisX**：基础网格（`SM_TG_GrassBlade`）的弯曲是朝
+	// **局部 +Y** 的（顶点 y = 18·t²），而 TG 的叶片弯曲方向与倾倒方向是**同一个方向**
+	// （VS 里局部 +Z 既是 bend 轴又是 `_329` 的第三列 = dir）。摆成 AxisX 的话弯曲与倾倒
+	// 差 90°，叶子会"朝一边倒、朝另一边弯"——偏航随机时看不出来，成丛之后一眼就是错的。
+	float3 AxisY = float3(Facing, 0.0f);
+	AxisY = AxisY - AxisZ * dot(AxisY, AxisZ);   // AxisZ 被法线拉歪后要投影回切平面
+	const float LenY = length(AxisY);
+	AxisY = (LenY > 1e-4f) ? (AxisY / LenY) : normalize(cross(AxisZ, float3(1.0f, 0.0f, 0.0f)));
+	float3 AxisX = cross(AxisY, AxisZ);          // 右手系：X = Y × Z
 
-	// 倾倒：绕 AxisY 转一个随机角，让株不是根根笔直（TG 在 `packed0 >> 16` 里存的
-	// `_1378` 就是这条，VS 里换算成绕 X 的 0..−90° 旋转）。绕 **Y** 而不是绕 X 只是取
-	// "倾倒方向 = AxisX"这一个约定；偏航已经随机，倾倒方向跟着一起随机。
+	// 倾倒：绕 AxisX 把 AxisZ 朝 AxisY（= 朝向）转过去，与弯曲同向。
+	// **单侧 [0, max] 且整簇共用**（TG 的 `_962 = hash01(簇id 派生) × 0.3`，换算成 0°–27°）——
+	// 对称抖动 + 逐叶种子会把成丛效果洗掉，那正是这一轮要修的。
 	if (CoverLeanMaxRad > 1e-5f)
 	{
-		const float Lean = CoverLeanMaxRad * (CSCover_Hash01(CSCover_CellSeed(Cell, 29u)) * 2.0f - 1.0f);
+		const float Lean = CoverLeanMaxRad * CSCover_Hash01(CSCover_ClumpSeed(ClumpCellId, 29u));
 		float SinL, CosL;
 		sincos(Lean, SinL, CosL);
-		const float3 RotZ = AxisZ * CosL + AxisX * SinL;
-		AxisX = AxisX * CosL - AxisZ * SinL;
-		AxisZ = RotZ;                                   // (X') × (Y) 仍是 (Z')，右手系不破
+		const float3 RotZ = AxisZ * CosL + AxisY * SinL;
+		AxisY = AxisY * CosL - AxisZ * SinL;      // 绕 AxisX 的旋转，X 不动、右手系不破
+		AxisZ = RotZ;
 	}
 
 	// 6) 缩放。均匀缩放定粗细，Z 再单独抖一次定高矮 —— 两者共用一个哈希的话，"高的那株一定
 	//    也粗"，一片草会读成"几种尺寸的同一株"而不是"长短不齐的一片"。
-	const float Uniform = lerp(CoverScaleRange.x, CoverScaleRange.y, CSCover_Hash01(CSCover_CellSeed(Cell, 31u)));
+	//
+	//    取样在**簇**与**逐叶**之间插值：TG 的高度基准是簇共享的（`hash01(簇id*13)*1.5+0.5`），
+	//    逐叶只叠一个高斯抖动 —— 所以整簇高矮成片。`CoverScaleClumpShare = 0` 退回纯逐叶，
+	//    与加这条之前逐位相同。
+	const float ClumpS = CSCover_Hash01(CSCover_ClumpSeed(ClumpCellId, 31u));
+	const float BladeS = CSCover_Hash01(CSCover_CellSeed(Cell, 31u));
+	const float Uniform = lerp(CoverScaleRange.x, CoverScaleRange.y, lerp(BladeS, ClumpS, CoverScaleClumpShare));
 	float HeightScale = Uniform * (1.0f + CoverHeightJitter * (CSCover_Hash01(CSCover_CellSeed(Cell, 37u)) * 2.0f - 1.0f));
 	// 遮罩压高：TG 在路上把草高乘 (1 − path × 0.7)，路边因此是"矮草过渡"而不是一刀切。
 	HeightScale *= saturate(1.0f - Mask * CoverMaskShorten);
 	if (HeightScale < 1e-4f) return;                    // 压到看不见就干脆不占槽位
+
+	// 弯曲幅度（TG `_945`/`_997`）：逐叶均匀取样 × 辐射簇倍率 × (1 − 遮罩)。
+	// **辐射簇更挺**这一条不是装饰：朝外辐射的那 30% 簇如果和别的一样弯，整簇会读成一朵
+	// 塌下去的花，而 TG 里它读起来是一丛支棱着的草。路上那一项让残存的草不再弯（同 TG 的 `1 − path`）。
+	float BendAmp = lerp(CoverBendRange.x, CoverBendRange.y, CSCover_Hash01(CSCover_CellSeed(Cell, 47u)));
+	if (bRadialClump) BendAmp *= CoverRadialBendScale;
+	BendAmp *= saturate(1.0f - Mask);
 
 	// 7) 落高。**重新求一次场**而不是复用格角：格距可以比地面格粗，格心的真实地面能差几厘米，
 	//    而一株浮空 3 cm 的草是看得出来的（石子那条踩过同一个坑）。
@@ -256,4 +396,11 @@ void ScatterGroundCoverCS(uint3 Id : SV_DispatchThreadID)
 	// 少放大一点点就会在视锥边缘闪掉实例，而且只在斜看时出现，最难复现。
 	const float MaxAxisScale = max(Uniform, HeightScale);
 	RWCoverInstances[Row + 4u] = float4(SphereCentre, CoverBaseSphereRadius * max(MaxAxisScale, 1e-3f));
+
+	// 逐实例 custom data。**下标必须是 Slot（源序）**：剔除 pass 负责把它搬到压缩后的槽位
+	// （`CSGpuInstancedMesh.usf:236-244`，那里源用 Instance、目标用 Dst）。这里若擅自按别的
+	// 序号写，症状是"数值张冠李戴、剔除一变就换一批"，而且没有任何断言会响。
+	const uint CustomBase = Slot * CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS;
+	RWCoverCustomData[CustomBase + 0u] = BendAmp;
+	RWCoverCustomData[CustomBase + 1u] = 0.0f;   // 保留槽位，见上面的 ⚠️
 }

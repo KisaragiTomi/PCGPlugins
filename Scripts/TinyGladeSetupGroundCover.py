@@ -20,6 +20,11 @@
   · ❌ **不要用** `meadow_lowpoly_flowers` / `clover_flowers` / `clover`：它们是 TG 的
     **整片预散布网格**（130 m 见方、几万个三角），一个实例就铺满全场，不是单株。
 
+逐实例 custom data（材质里用 `Per Instance Custom Data` 节点读）：
+  **[0] = 弯曲幅度**（TG `_945`/`_997`：均匀[0.5,2] × 辐射簇 0.5 倍 × (1−遮罩)）
+  **[1] = 该株的世界高度 cm**（材质做风加权要用：TG 是 `smoothstep(-0.2, 0.5, h/50*0.2)`，矮草几乎不摆）
+语义是**逐组件**的 —— 藤蔓那一家在同样的 [0]/[1] 上放 SpawnTime 与弧长，互不干扰。
+
 材质：TG 的 clutter 把颜色全烘在**顶点流**里，所以花一律走 `M_TG_VertexColor`，草走
 `MI_TG_Grass`（`M_TG_Grass` 的实例，两面 foliage + 程序化风，无贴图 —— 与 TG 的草
 "PS 一张贴图都不采、纯顶点色 + 解析法线"同路）。
@@ -77,7 +82,8 @@ def ensure_instanced_flag(mat, tag):
 
 
 def make_species(mesh, mat, density, cap, lo, hi, lean, seat, salt,
-                 height_jitter=0.25, align=0.0, sink=2.0):
+                 height_jitter=0.25, align=0.0, sink=2.0,
+                 clump_size=250.0, clump_radial=0.30, clump_align=0.5):
     # ⚠️ 一律用 **C++ 属性名**（同 `TinyGladeSetupStairs.py` 的既有约定）：python 侧的 snake_case
     #    对 `b` 前缀布尔另有一套改名规则（`bSeatOnBase` → `seat_on_base`），猜错会抛异常。
     s = unreal.CSGroundCoverSpecies()
@@ -91,6 +97,15 @@ def make_species(mesh, mat, density, cap, lo, hi, lean, seat, salt,
     s.set_editor_property("AlignToNormal", align)
     s.set_editor_property("Sink", sink)
     s.set_editor_property("bSeatOnBase", seat)
+    # 簇朝向：默认就是 TG 实测的那一组（2.5 m 簇、30% 辐射、权重上限 0.5）。
+    s.set_editor_property("ClumpSize", clump_size)
+    s.set_editor_property("ClumpRadialChance", clump_radial)
+    s.set_editor_property("ClumpAlignment", clump_align)
+    # 高度基准整簇共享（TG 的 `hash01(簇id*13)*1.5+0.5`），逐叶只叠 HeightJitter。
+    s.set_editor_property("ScaleClumpShare", 1.0)
+    # 弯曲幅度 → 逐实例 custom data[0]，供材质做 WPO。TG：均匀[0.5,2] × (辐射簇 ? 0.5 : 1)。
+    s.set_editor_property("BendRange", unreal.Vector2D(0.5, 2.0))
+    s.set_editor_property("RadialBendScale", 0.5)
     s.set_editor_property("Salt", salt)
     return s
 
@@ -111,7 +126,7 @@ if not flower_mat:
 ensure_instanced_flag(grass_mat, "grass")
 ensure_instanced_flag(flower_mat, "flower")
 
-grass = make_species(grass_mesh, grass_mat, 50.0, CAP, 0.85, 1.25, 12.0, True, 1)
+grass = make_species(grass_mesh, grass_mat, 50.0, CAP, 0.85, 1.25, 27.0, True, 1)   # 27° = TG 的 0.3 × 90°
 
 flowers = []
 for path, density, cap, lo, hi, lean, seat, salt in FLOWER_SPECS:

@@ -2397,6 +2397,11 @@ uint32 ACSHouseActor::BuildQuoinBricks(TArray<CSHouseFrame::FElement>& InOutElem
 	Params.Gap = FMath::Max(FrameBrickGap, 0.0f);
 	// **与门框砖 / 接缝砖共用同一份常驻容量**：角石只是同一个组件里排在最后的那些行。
 	Params.MaxBricks = EffectiveFrameCapacity();
+	// 逐砖横向随机偏移 —— **只有角石这一路开**。门框砖、接缝砖、包边石传的 params 里
+	// 这一格保持 0，所以它们逐位不变（`House.QuoinSharesTheColumnEmitter` 也因此照旧成立：
+	// 那条断言拿同一份 params 喂角石与接缝柱，同一份进去两边拿到的 Jitter 恒等）。
+	Params.Jitter = FMath::Max(QuoinJitter, 0.0f);
+	Params.SplitJitter = FMath::Max(QuoinSplitJitter, 0.0f);
 
 	// 与房体面板、门框砖、藤蔓同一个变换口径（只取 yaw）。换口径就会在有 pitch/roll 的房子上
 	// 与它们错开 —— 那正是「已知潜伏问题」里 `GetBuildTransform()` vs `ToInverseMatrixWithScale()`

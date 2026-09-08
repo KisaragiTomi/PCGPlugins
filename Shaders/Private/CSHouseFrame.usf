@@ -39,7 +39,8 @@
 #define THREADGROUPSIZE_X 64
 #endif
 
-#define FRAME_PATH_STRIDE 7
+// ⚠️ 与 `CSHouseFrame.cpp` 的 `CSHouseFrame_PathStride` 是**同一个数的两份**，改一处必须改另一处。
+#define FRAME_PATH_STRIDE 8
 
 #define FRAME_FLAG_LEFT_JAMB  1u
 #define FRAME_FLAG_RIGHT_JAMB 2u
@@ -173,6 +174,7 @@ void ScatterHouseFrameCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	const float4 R4 = FramePaths[Base + 4u];
 	const float4 R5 = FramePaths[Base + 5u];
 	const float4 R6 = FramePaths[Base + 6u];
+	const float4 R7 = FramePaths[Base + 7u];
 
 	const float3 Origin = R0.xyz;
 	const float3 AxisU = R1.xyz;
@@ -189,7 +191,48 @@ void ScatterHouseFrameCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	// 第 i 块砖的弧长：首块居中在 HalfLen，之后每块推进一个中心距。
 	// **与 `CSShaperSteps` 那条路的 `Cursor += BlockLength + Gap*Scale` 逐字等价**，
 	// 只是不再需要把它折成一个样条参数 alpha 再插值回来。
-	const float Arc = HalfLen + float(Brick - Begin) * Pitch;
+	float Arc = HalfLen + float(Brick - Begin) * Pitch;
+	// 分层随机化之后每块砖的长度不再相同，这一格记的是"相对等分那版要乘多少"（1 = 不变）。
+	float SplitLenMul = 1.0f;
+
+	// ---- 分层随机化（`FElement::SplitJitter`，走 R7）：TG `utils::random_splits` 的逐砖形态 ----
+	//
+	// TG 是 CPU 上一次算出整条 `Vec<f32>` 分点；我们一线程一砖，所以改成**每块砖现算自己的两个
+	// 边界**（第 i 与第 i+1 个分点）。数学完全一样，只是不落数组 —— 这也正是本 kernel 一贯的
+	// "从参数解析推导，不排记录"的形态。
+	//
+	// TG 原式（VA 0x140C90050，常量全部实读自 .rdata）：
+	//     step = 1/(splits-1);  amp = min(jitter, 0.495*step)
+	//     s_0 = 0;  s_k = k*step + (rand_k - 0.5)*amp;  s_{splits-1} = 1
+	// 这里 `splits-1` = 本条路的砖数 `Count`，所以边界 k = 0..Count，砖 i 吃 [s_i, s_{i+1}]。
+	//
+	// ⚠️ **0.495 不能写成 0.5**：它把抖幅夹到不到半个间距，保证分点永远保序、相邻间距
+	//    最小 `0.505*step > 0`，**不会退化出零厚度的砖**。TG 留这一丝余量是有意的。
+	// ⚠️ 边界的随机数用**另一条盐**（+0x9E3779B9），不能与逐砖随机数同源 —— 同源会让
+	//    "这块砖多高"与"它横向偏多少"完全相关，读起来像有规律，而不是两次独立的随机。
+	const float SplitJitterCm = R7.x;
+	const float PathTotalLen = R7.y;
+	if (SplitJitterCm > 0.0f && Count >= 2u && PathTotalLen > 1e-3f)
+	{
+		const uint I = Brick - Begin;
+		const float Step = 1.0f / float(Count);
+		// cm → 归一化；再夹到 0.495 个间距。
+		const float Amp = min(SplitJitterCm / PathTotalLen, 0.495f * Step);
+		const uint SplitSalt = asuint(R5.z) + 0x9E3779B9u;
+		// 两端固定为 0 与 1（TG 显式写死 out[0]=0 / out[last]=1）。
+		const float S0 = (I == 0u) ? 0.0f
+			: (float(I) * Step + (FrameInstanceRandom(SplitSalt + I) - 0.5f) * Amp);
+		const float S1 = (I + 1u >= Count) ? 1.0f
+			: (float(I + 1u) * Step + (FrameInstanceRandom(SplitSalt + I + 1u) - 0.5f) * Amp);
+
+		// 缝宽保持等分那版的绝对值：`Pitch = (Length+Gap)*Scale`、`HalfLen = Length*Scale/2`
+		// ⇒ `Gap*Scale = Pitch - 2*HalfLen`。只让砖身随区间伸缩，缝不跟着抖。
+		const float GapWorld = max(Pitch - 2.0f * HalfLen, 0.0f);
+		const float SpanLen = (S1 - S0) * PathTotalLen;
+		const float BodyLen = max(SpanLen - GapWorld, 0.05f * max(2.0f * HalfLen, 1e-3f));
+		Arc = 0.5f * (S0 + S1) * PathTotalLen;
+		SplitLenMul = BodyLen / max(2.0f * HalfLen, 1e-3f);
+	}
 
 	float2 SZ, TangentSZ;
 	FrameEvalPath(Flags, R3.x, R2.w, R3.y, R3.z, R0.w, R1.w, R3.w, Arc, SZ, TangentSZ);
@@ -208,10 +251,28 @@ void ScatterHouseFrameCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	const float3 LocalZ = mul(float4(AxisZ, 0.0f), FrameWorldToComponent).xyz;
 	float3 LocalOrigin = mul(float4(WorldPos, 1.0f), FrameWorldToComponent).xyz;
 
+	// 逐砖**横向随机偏移**（`FElement::Jitter`，走 R6.w）。沿 `AxisX` —— 柱路上它就是那条
+	// 朝外的角平分线（`ColumnFrame` 取 `AxisU = −Outward`，而本 kernel 对竖直路算出
+	// `OutwardSZ = (−1, 0)` ⇒ `AxisX = +Outward`），所以偏移读起来正是角石的"进退"。
+	//
+	// 公式照 TG 的 `utils::wall_corners::add_wall_corners`（VA 0x141215540）：那里每层取一次
+	// `fastrand::Rng::f32`，算的是 `K*(1−r)` 与 `K*r` 相减 ⇒ **`K × (2r − 1)`**，
+	// `K` 是 `.rdata` 常量 **0.16**（TG 单位 = m ⇒ 16 cm）。
+	//
+	// ⚠️ **不是"一进一出"的确定性交替**：那个函数里没有任何对砖序号的奇偶判定
+	// （4 处 `testb $1` 全是 Rust bool 参数）。随机才是原样。
+	// ⚠️ 随机数取的是**这块砖自己的逐实例随机数**（序号来自路的 `RandomBase`，不是槽位）——
+	// 与砖的身份同源，所以重扫不会重掷。取槽位的症状是"改一处全场角石重排"且无断言可见。
+	const float FrameJitter = R6.w;
+	if (FrameJitter > 0.0f)
+	{
+		LocalOrigin += LocalX * (FrameJitter * (2.0f * FrameInstanceRandom(RandomIndex) - 1.0f));
+	}
+
 	// 长度轴额外吃铺装缩放（`SolveRun` 把整条路恰好铺满就靠它）。
 	float3 BlockScale = FrameBlockSize;
 	if (dot(BlockScale, BlockScale) < 1e-8f) BlockScale = float3(1.0f, 1.0f, 1.0f);
-	BlockScale.y *= LayoutScale;
+	BlockScale.y *= LayoutScale * SplitLenMul;
 	// 横截面缩放（柱头 / 柱础）：进深轴与墙法线轴同乘。≤ 0 = 旧数据没填这一格，按 1 处理。
 	const float CrossScale = R5.w > 1e-4f ? R5.w : 1.0f;
 	BlockScale.x *= CrossScale;

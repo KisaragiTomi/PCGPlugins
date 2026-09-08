@@ -297,6 +297,16 @@ struct FWallFrame
 /** 砖的排布参数（尺寸不在这里 —— 那是 `FPaletteBuffers::BlockSize` 的事）。 */
 struct FBrickParams
 {
+	/**
+	 * **逐砖横向随机偏移的幅度（cm）**，见 `FElement::Jitter`。默认 0 = 关。
+	 * 放在 params 里而不是做成 `AppendColumn` 的新形参，是为了让
+	 * `House.QuoinSharesTheColumnEmitter`（同一组输入喂角石与接缝柱、逐字段比 `FElement`）
+	 * 天然继续成立 —— 同一份 params 进去，两边拿到的 `Jitter` 恒等。
+	 */
+	float Jitter = 0.0f;
+	/** **分层随机化的抖动幅度（cm）**，见 `FElement::SplitJitter`。默认 0 = 等分。 */
+	float SplitJitter = 0.0f;
+
 	float Length = 26.0f;
 	float Gap = 0.0f;
 	/** 全部砖路加起来的硬上限 = 常驻容量。**超了就截断，绝不扩容**（零阻塞纪律）。 */
@@ -364,6 +374,39 @@ struct FElement
 	 */
 	float ShearAtS0 = 0.0f;
 	float ShearAtS1 = 0.0f;
+	/**
+	 * **逐砖横向随机偏移的幅度（cm）**，沿本条路的法线轴（`AxisZ`；柱路上就是那条朝外的
+	 * 角平分线）。kernel 里按 `Jitter × (2r − 1)` 施加，`r` 是这块砖自己的逐实例随机数。
+	 * `<= 0` = 不抖（默认，所有既有砖路逐位不变）。走 `R6.w`（那一格原本空着）。
+	 *
+	 * 出处是 TG 的 `system_wall_constructor::utils::wall_corners::add_wall_corners`
+	 * （VA 0x141215540）：那里对每一层角砖取一次 `fastrand::Rng::f32`，算的正是
+	 * `K*(1−r)` 与 `K*r` 相减 ⇒ **`K × (2r − 1)`**，`K` 是 `.rdata` 里的常量 **0.16**
+	 * （TG 单位 = m ⇒ 16 cm）。
+	 *
+	 * ⚠️ **TG 的角砖不是"一进一出"的确定性交替**（`TinyGlade_模块对照与进度.md` 里那条
+	 * 措辞已按二进制订正）：全函数没有任何对砖序号的奇偶判定，进退是**对称随机**的。
+	 */
+	float Jitter = 0.0f;
+	/**
+	 * **分层随机化的抖动幅度（cm）**，沿路的弧长方向。`<= 0` = 等分（默认，既有砖路逐位不变）。
+	 * 走 `R7.x`；`R7.y` 同时带上本条路的总弧长（kernel 要拿它把 cm 归一化）。
+	 *
+	 * 照抄 TG 的 `utils::random_splits`（VA 0x140C90350 → 真身 0x140C90050）：
+	 *
+	 *     assert(splits >= 2);                  // panic 消息原文 "assertion failed: splits >= 2"
+	 *     if (splits < 3) return {0, 1};
+	 *     step = 1 / (splits - 1);
+	 *     amp  = min(jitter, 0.495 * step);     // ← .rdata 常量 0.495
+	 *     out[0] = 0;
+	 *     for (i = 1 .. splits-2) out[i] = i*step + (rng.f32() - 0.5) * amp;
+	 *     out[splits-1] = 1;
+	 *
+	 * ⚠️ **那个 0.495 是关键**（不是 0.5）：抖幅被夹到**不到半个间距**，于是分点永远保序、
+	 * 相邻间距最小 `0.505·step > 0` —— **不可能退化成零厚度的层**。0.495 是刻意留的余量。
+	 * 这也比"标称层高 ×(1±抖动)"稳：那种写法会改总长度，这个只动分界、总长恒定。
+	 */
+	float SplitJitter = 0.0f;
 };
 
 /**
@@ -455,6 +498,8 @@ inline int32 AppendColumn(const FVector2D& Point, const FVector2D& Outward, floa
 	Element.HalfLen = Length * Scale * 0.5f;
 	Element.LayoutScale = Scale;
 	Element.RandomBase = RandomBase;
+	Element.Jitter = FMath::Max(Params.Jitter, 0.0f);
+	Element.SplitJitter = FMath::Max(Params.SplitJitter, 0.0f);
 	InOutElements.Add(Element);
 	InOutCursor += Count;
 	return Count;

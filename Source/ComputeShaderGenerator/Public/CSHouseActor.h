@@ -890,6 +890,36 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Quoin", meta = (ClampMin = "-50.0", ClampMax = "100.0"))
 	float QuoinInset = 0.0f;
 
+	/**
+	 * 角石**逐砖横向随机偏移**的幅度（cm），沿角平分线 ±。0 = 关（等截面柱，加这条之前的样子）。
+	 *
+	 * 默认 16 cm 来自 TG 的二进制：`system_wall_constructor::utils::wall_corners::add_wall_corners`
+	 * （VA 0x141215540）里每层角砖取一次 `fastrand::Rng::f32`，算 `K*(1−r)` 与 `K*r` 相减
+	 * ⇒ **`K × (2r − 1)`**，`K` 是 `.rdata` 常量 **0.16**（TG 单位 = m ⇒ 16 cm）。
+	 *
+	 * ⚠️ **TG 的角砖不是"一进一出"**：那个函数里没有任何对砖序号的奇偶判定（4 处 `testb $1`
+	 * 全是 Rust bool 参数）。进退是**对称随机**的 —— `TinyGlade_模块对照与进度.md` 里原先
+	 * 那条"TG 的 quoin 是一进一出的"是肉眼观感，已按二进制订正。
+	 *
+	 * ⚠️ 16 cm 是**照搬 TG 的绝对值**，没有按本项目的墙厚/砖长折算过。觉得过头就往下调。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Quoin", meta = (ClampMin = "0.0"))
+	float QuoinJitter = 16.0f;
+
+	/**
+	 * 角石**分层随机化**的抖动幅度（cm），沿柱高方向。0 = 等分（加这条之前的样子）。
+	 *
+	 * 对位 TG 的 `utils::random_splits`：它在 [0,1] 上均匀分点再叠对称抖动，**抖幅被夹到
+	 * `0.495 × 间距`** ⇒ 分点永远保序、不会出现零厚度的层。kernel 里是逐砖现算自己的两个
+	 * 分界（不落数组），数学与 TG 一致。
+	 *
+	 * 默认 21 cm 取自 TG 在 `add_wall_corners` 里传给 `random_splits` 的那个 `0.21`
+	 * （TG 单位 = m）。⚠️ 与 `QuoinJitter` 一样是**照搬绝对值**，没按本项目的砖长折算过。
+	 * 真正生效的幅度还会被上面那条 0.495 夹一道，所以调大到一定程度就不再有变化。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Quoin", meta = (ClampMin = "0.0"))
+	float QuoinSplitJitter = 21.0f;
+
 	// -------------------------------------------------------------------------
 	// Trim（包边石，D7 的第三样；合卷卷一 A8 / 卷五 A11）
 	//

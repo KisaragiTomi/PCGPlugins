@@ -16,7 +16,10 @@ namespace
 constexpr int32 CSHouseFrame_GroupSize = 64;
 
 /** 逐路常量占几个 float4。**与 `CSHouseFrame.usf` 的 `FRAME_PATH_STRIDE` 必须一致。** */
-constexpr int32 CSHouseFrame_PathStride = 7;
+// ⚠️ 与 `CSHouseFrame.usf` 的 `FRAME_PATH_STRIDE` 是**同一个数的两份**，改一处必须改另一处。
+// 消费者只有本文件与那个 .usf（`FramePaths` 全工程只有它读），所以扩行是局部的 —— 与 packed
+// **实例**行那 5 个 float4 完全是两码事，那份才是四家 + 剔除 pass 共用的契约、动不得。
+constexpr int32 CSHouseFrame_PathStride = 8;
 
 /** Row4.x 的位。与 kernel 里那几个 `FRAME_FLAG_*` 逐字对应。 */
 constexpr uint32 CSHouseFrame_FlagLeftJamb = 1u << 0;
@@ -89,7 +92,9 @@ void CSHouseFrame_Flatten(const TArray<CSHouseFrame::FElement>& In, TArray<FVect
 		// [6] 剔除高度（世界 Z，≤ 0 = 不剔）| 首块砖剪切 | 末块砖剪切 | 保留。
 		// 单开一行而不是挤进上面某一格：六行里没有一格是空的，而这份 stride 只有本文件与
 		// `CSHouseFrame.usf` 两个消费者。
-		Out.Add(FVector4f(E.CullBelowZ, E.ShearAtS0, E.ShearAtS1, 0.0f));
+		Out.Add(FVector4f(E.CullBelowZ, E.ShearAtS0, E.ShearAtS1, E.Jitter));
+		// [7] 分层抖动幅度（cm，≤ 0 = 等分）| 本条路的总弧长（kernel 拿它把 cm 归一化）| 保留 ×2。
+		Out.Add(FVector4f(E.SplitJitter, E.Path.TotalLen(), 0.0f, 0.0f));
 	}
 }
 }

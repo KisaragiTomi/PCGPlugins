@@ -98,8 +98,11 @@ struct FScatterParams
 	/** 地形法线 .z 的下限。由 `ACSGroundActor` 从"最大坡度角"换算（cos）。 */
 	float MinSlopeCos = 0.5f;
 	float Sink = 2.0f;
-	/** 坐底修正 = −基础网格局部包围盒 Min.Z（未缩放）。轴心不在底部的网格靠它落地，见 kernel 注释。 */
-	float Rise = 0.0f;
+	/**
+	 * 整个物种的世界 Z 偏移（cm，可正可负），**不乘高度缩放**。垂直方向只有这一个旋钮 ——
+	 * 网格原点即落点，没有"按包围盒自动坐底"那一层（理由见 `FCSGroundCoverSpecies::HeightOffset`）。
+	 */
+	float HeightOffset = 0.0f;
 
 	FVector2f ScaleRange = FVector2f(0.85f, 1.2f);
 	float HeightJitter = 0.25f;

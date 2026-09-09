@@ -10,11 +10,12 @@
     `clamp(2.5(1−t²),0,1) × 0.04 × 0.72` 逐位对上。密度取 TG 的满密度实测值 50 株/m²。
 
   · 花 = `lowpoly_flower`（**5 个三角**，36 × 38 × 15 cm）。TG 里唯一一件"单株"花；
-    ⚠️ 它的包围盒**离原点 30 cm 才开始**，所以必须靠 `bSeatOnBase` 坐底，否则整片花悬空 30 cm
-    （而实例数 / 包围盒 / 剔除球全都看不见这个错）。
+    ⚠️ 它的包围盒**离原点 30 cm 才开始**。2026-09-09 起地被**不再自动坐底**（`bSeatOnBase`
+    已拆，理由见 `FCSGroundCoverSpecies::HeightOffset`：花高出地面可能正是想要的），
+    所以这 30 cm 现在写成明面上的 `HeightOffset = -30`。想让它浮起来就把这个数往 0 调。
 
   · 薰衣草 = `garden_flower_01_lavender`（88 三角，40 × 40 × 182 cm）。它的茎**向下伸 1 m**
-    （Min.Z = −100 cm），所以 `bSeatOnBase` 必须**关掉** —— 坐底会把整根茎顶出地面。
+    （Min.Z = −100 cm），本来就该埋一截，`HeightOffset = 0`（不自动坐底之后正好不用管它）。
     原尺寸比房子还扎眼，缩到 0.35–0.5。
 
   · ❌ **不要用** `meadow_lowpoly_flowers` / `clover_flowers` / `clover`：它们是 TG 的
@@ -44,13 +45,15 @@ GRASS_MESH = "%s/Meshes/SM_TG_GrassBlade" % ASSET
 GRASS_MAT_CANDIDATES = ["%s/Materials/MI_TG_Grass" % ASSET, "%s/Materials/M_TG_Grass" % ASSET]
 FLOWER_MAT = "%s/Materials/M_TG_VertexColor" % ASSET
 
-# (网格, 密度株/m², 容量, 缩放下限, 缩放上限, 倾倒角, 坐底, 盐)
+# (网格, 密度株/m², 容量, 缩放下限, 缩放上限, 倾倒角, 高度偏移 cm, 盐)
+# ⚠️ 「高度偏移」= `HeightOffset`：**网格原点就是落点**，没有自动坐底那一层。可正可负，
+#    不乘逐株缩放（整片一起挪这么多厘米）。`lowpoly_flower` 的 −30 就是从前自动坐底那 30 cm。
 # 容量一律顶到 ClampMax：它是**天花板不是预算**，显存按实际格数分配（密度说了算），
 # 所以调高只是把"密度自动退让"的触发点推远，密度用不到的时候一个字节都不多花。
 CAP = 1048576
 FLOWER_SPECS = [
-    ("%s/Meshes/lowpoly_flower" % ASSET,            1.2,  CAP, 0.9,  1.6,  8.0,  True,  3),
-    ("%s/Meshes/garden_flower_01_lavender" % ASSET, 0.25, CAP, 0.35, 0.55, 5.0,  False, 5),
+    ("%s/Meshes/lowpoly_flower" % ASSET,            1.2,  CAP, 0.9,  1.6,  8.0,  -30.0, 3),
+    ("%s/Meshes/garden_flower_01_lavender" % ASSET, 0.25, CAP, 0.35, 0.55, 5.0,    0.0, 5),
 ]
 
 
@@ -81,11 +84,11 @@ def ensure_instanced_flag(mat, tag):
     return mat
 
 
-def make_species(mesh, mat, density, cap, lo, hi, lean, seat, salt,
+def make_species(mesh, mat, density, cap, lo, hi, lean, height_offset, salt,
                  height_jitter=0.25, align=0.0, sink=2.0,
                  clump_size=250.0, clump_radial=0.30, clump_align=0.5):
     # ⚠️ 一律用 **C++ 属性名**（同 `TinyGladeSetupStairs.py` 的既有约定）：python 侧的 snake_case
-    #    对 `b` 前缀布尔另有一套改名规则（`bSeatOnBase` → `seat_on_base`），猜错会抛异常。
+    #    对 `b` 前缀布尔另有一套改名规则（`bCastShadow` → `cast_shadow`），猜错会抛异常。
     s = unreal.CSGroundCoverSpecies()
     s.set_editor_property("Mesh", mesh)
     s.set_editor_property("Material", mat)
@@ -96,7 +99,8 @@ def make_species(mesh, mat, density, cap, lo, hi, lean, seat, salt,
     s.set_editor_property("LeanDegrees", lean)
     s.set_editor_property("AlignToNormal", align)
     s.set_editor_property("Sink", sink)
-    s.set_editor_property("bSeatOnBase", seat)
+    # 垂直方向唯一的旋钮：网格原点即落点，不存在按包围盒自动坐底那一层。
+    s.set_editor_property("HeightOffset", height_offset)
     # 簇朝向：默认就是 TG 实测的那一组（2.5 m 簇、30% 辐射、权重上限 0.5）。
     s.set_editor_property("ClumpSize", clump_size)
     s.set_editor_property("ClumpRadialChance", clump_radial)
@@ -126,21 +130,24 @@ if not flower_mat:
 ensure_instanced_flag(grass_mat, "grass")
 ensure_instanced_flag(flower_mat, "flower")
 
-grass = make_species(grass_mesh, grass_mat, 50.0, CAP, 0.85, 1.25, 27.0, True, 1)   # 27° = TG 的 0.3 × 90°
+# 草的 `SM_TG_GrassBlade` Min.Z 正好是 0，所以高度偏移给 0 就是贴地（从前开不开坐底都一样）。
+grass = make_species(grass_mesh, grass_mat, 50.0, CAP, 0.85, 1.25, 27.0, 0.0, 1)   # 27° = TG 的 0.3 × 90°
 
 flowers = []
-for path, density, cap, lo, hi, lean, seat, salt in FLOWER_SPECS:
+for path, density, cap, lo, hi, lean, height_offset, salt in FLOWER_SPECS:
     mesh = load(path)
     if not mesh:
         # 缺一种花不算失败：TG 提取件的成色不一，缺了就少一种，草与其余的照长。
         unreal.log_warning("COVERSET 跳过缺失的花：%s" % path)
         continue
     box = mesh.get_bounding_box()
-    unreal.log("COVERSET flower %-26s tris=%d 尺寸=%.0f×%.0f×%.0f cm minZ=%.1f seat=%s"
+    # minZ 与 HeightOffset 一起打出来：两者相加就是"花底离地多少 cm"，
+    # 而这一条现在**只由配置决定**，不再被包围盒偷偷改写。
+    unreal.log("COVERSET flower %-26s tris=%d 尺寸=%.0f×%.0f×%.0f cm minZ=%.1f 高度偏移=%.1f 底离地=%.1f"
                % (mesh.get_name(), mesh.get_num_triangles(0),
                   box.max.x - box.min.x, box.max.y - box.min.y, box.max.z - box.min.z,
-                  box.min.z, seat))
-    flowers.append(make_species(mesh, flower_mat, density, cap, lo, hi, lean, seat, salt))
+                  box.min.z, height_offset, box.min.z + height_offset))
+    flowers.append(make_species(mesh, flower_mat, density, cap, lo, hi, lean, height_offset, salt))
 
 
 def apply(obj, where):

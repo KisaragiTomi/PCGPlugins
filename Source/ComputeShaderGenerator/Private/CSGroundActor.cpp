@@ -1944,7 +1944,7 @@ uint32 ACSGroundActor::CoverInputHash(const TArray<const FCSGroundCoverSpecies*>
 		Hash = HashFloat(Hash, float(One->BendRange.Y));
 		Hash = HashFloat(Hash, One->RadialBendScale);
 		Hash = HashFloat(Hash, One->Sink);
-		Hash = HashCombine(Hash, ::GetTypeHash(One->bSeatOnBase));
+		Hash = HashFloat(Hash, One->HeightOffset);
 		Hash = HashCombine(Hash, ::GetTypeHash(One->bCastShadow));
 		Hash = HashCombine(Hash, ::GetTypeHash(One->Salt));
 	}
@@ -1970,7 +1970,6 @@ bool ACSGroundActor::EnsureCoverComponents(const TArray<const FCSGroundCoverSpec
 		CoverMeshesBuiltFrom.Reset();
 		CoverBaseSphereCentres.Reset();
 		CoverBaseSphereRadii.Reset();
-		CoverBaseRises.Reset();
 		CoverHandedCapacities.Reset();
 		CoverHandedLocalBounds = FBox(ForceInit);
 		return false;
@@ -2012,7 +2011,6 @@ bool ACSGroundActor::EnsureCoverComponents(const TArray<const FCSGroundCoverSpec
 
 	CoverBaseSphereCentres.SetNum(Species.Num());
 	CoverBaseSphereRadii.SetNum(Species.Num());
-	CoverBaseRises.SetNum(Species.Num());
 	CoverBuffers.SetNum(Species.Num());
 	CoverHandedCapacities.SetNum(Species.Num());
 
@@ -2035,9 +2033,8 @@ bool ACSGroundActor::EnsureCoverComponents(const TArray<const FCSGroundCoverSpec
 		const FBox Local = One.Mesh->GetBoundingBox();
 		CoverBaseSphereCentres[Index] = Local.IsValid ? FVector3f(Local.GetCenter()) : FVector3f::ZeroVector;
 		CoverBaseSphereRadii[Index] = Local.IsValid ? float(Local.GetExtent().Size()) : 0.0f;
-		// 坐底修正与石阶那条 `StairRise` 是同一个量：−局部包围盒 Min.Z。这里不乘缩放 ——
-		// 高度缩放是逐株抖出来的，只有 kernel 知道，乘在这里会让抖过的那些株重新浮起/陷下去。
-		CoverBaseRises[Index] = (Local.IsValid && One.bSeatOnBase) ? float(-Local.Min.Z) : 0.0f;
+		// ⚠️ 这里**不再**按包围盒算坐底修正（原先的 `bSeatOnBase`，2026-09-09 拆掉）：网格原点
+		// 就是落点，高出地面是作者摆的、也可能正是想要的，要挪走 `HeightOffset` 那个显式旋钮。
 	}
 	return true;
 }
@@ -2125,7 +2122,7 @@ void ACSGroundActor::RebuildGroundCover()
 		// 最大坡度角 → 法线 .z 的下限。角度是给人看的，kernel 要的是 cos。
 		P.MinSlopeCos = FMath::Cos(FMath::DegreesToRadians(FMath::Clamp(One.MaxSlopeDegrees, 0.0f, 89.0f)));
 		P.Sink = FMath::Max(One.Sink, 0.0f);
-		P.Rise = CoverBaseRises[Index];
+		P.HeightOffset = One.HeightOffset;
 		P.ScaleRange = FVector2f(float(One.ScaleRange.X), float(One.ScaleRange.Y));
 		P.HeightJitter = One.HeightJitter;
 		P.LeanMaxRad = FMath::DegreesToRadians(FMath::Max(One.LeanDegrees, 0.0f));
@@ -2147,10 +2144,11 @@ void ACSGroundActor::RebuildGroundCover()
 		// 包围盒会随落笔漂移，`bNeedHandover` 每一笔都成立，阻塞的 SetInstanceSourceGPU
 		// 会把"交互期零阻塞"整条纪律退化掉（拉石阶尺寸那一轮踩过）。
 		const float WorstScale = P.ScaleRange.Y * (1.0f + P.HeightJitter);
-		// 坐底修正也要算进去：它把原点整体上下挪 `Rise × 高度缩放`（`lowpoly_flower` 是 −30 cm），
-		// 漏掉它的症状是俯视时边缘那一圈花被剔掉 —— 只在特定机位出现，最难复现。
+		// `HeightOffset` 把整片上下挪，必须算进去（不乘缩放，它就是厘米数）；取绝对值是因为
+		// 它可正可负而包围盒两头都要留。漏掉这类整体位移的症状是俯视时边缘那一圈花被剔掉 ——
+		// 只在特定机位出现，最难复现。
 		WorstReach = FMath::Max(WorstReach,
-			double(P.BaseSphereRadius) * double(WorstScale) + double(FMath::Abs(P.Rise)) * double(WorstScale) + double(P.Sink));
+			double(P.BaseSphereRadius) * double(WorstScale) + double(P.Sink) + double(FMath::Abs(P.HeightOffset)));
 
 		AllParams.Add(P);
 	}

@@ -53,7 +53,7 @@ class FCSGroundCoverScatterCS : public FGlobalShader
 		SHADER_PARAMETER(float, CoverJitter)
 		SHADER_PARAMETER(float, CoverMinSlopeCos)
 		SHADER_PARAMETER(float, CoverSink)
-		SHADER_PARAMETER(float, CoverRise)
+		SHADER_PARAMETER(float, CoverHeightOffset)
 		SHADER_PARAMETER(FVector2f, CoverScaleRange)
 		SHADER_PARAMETER(float, CoverHeightJitter)
 		SHADER_PARAMETER(float, CoverLeanMaxRad)
@@ -273,7 +273,7 @@ bool Scatter(
 						PassParams->CoverJitter = FMath::Clamp(P.Jitter, 0.0f, 1.0f);
 						PassParams->CoverMinSlopeCos = FMath::Clamp(P.MinSlopeCos, 0.0f, 1.0f);
 						PassParams->CoverSink = P.Sink;
-						PassParams->CoverRise = P.Rise;
+						PassParams->CoverHeightOffset = P.HeightOffset;
 						// 下限不许超过上限：lerp 照样算，但结果是"最大的反而最小"，一个断言都不会红，
 						// 只在画面上表现为尺寸分布反着来（同石子那条）。
 						PassParams->CoverScaleRange = FVector2f(

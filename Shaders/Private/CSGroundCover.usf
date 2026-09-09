@@ -71,11 +71,13 @@ float  CoverChance;                  // 一格出一株的概率（草 ≈ 1，�
 float  CoverJitter;                  // 落点抖动幅度，格距的比例（0 = 规则网格，1 = 整格）
 float  CoverMinSlopeCos;             // 地形法线 .z 的下限：比这更陡的坡不长（岩壁不长草）
 float  CoverSink;                    // 根部沉入地表的深度（cm）——浮在地表上会读成"掉了个道具"
-// 坐底修正 = −基础网格局部包围盒 Min.Z（**未缩放**，kernel 里乘高度缩放）。
-// ⚠️ 不是可有可无的美化：TG 提取出来的 `lowpoly_flower` 的包围盒**离原点 30 cm 才开始**，
-// 不补这一项，整片花会齐刷刷悬空 30 cm —— 而剔除球、包围盒、实例数全都看不见它。
-// 与石阶那条 `StairRise`（"块底钉在等值线上"）是同一个量、同一个理由。
-float  CoverRise;
+// 整个物种的世界 Z 偏移（cm，可正可负），垂直方向唯一的旋钮。
+// **基础网格的原点就是落点**：这里刻意**没有**"按包围盒把网格底面钉到地表"那一层
+// （石阶的 `StairRise` 有，地被 2026-09-09 起没有）—— 网格离原点多高是作者摆的，花本来
+// 就可能有意高出地面，自动坐底会把那个意图抹掉，而且换一张网格就让全片花无声地跳一次高度。
+// **不乘高度缩放**：本条表达"整片一起挪这么多厘米"，乘了缩放高的那株就挪得更多，
+// 一片花不再落在同一个平面上。
+float  CoverHeightOffset;
 
 float2 CoverScaleRange;              // 均匀缩放 [min, max]
 float  CoverHeightJitter;            // Z 轴额外抖动（±），只改高矮不改粗细
@@ -368,7 +370,7 @@ void ScatterGroundCoverCS(uint3 Id : SV_DispatchThreadID)
 	//    而一株浮空 3 cm 的草是看得出来的（石子那条踩过同一个坑）。
 	//    坐底修正跟着高度缩放走 —— 抖了 Z 却不抖 Rise，株底就不再钉在地面上（症状是一部分
 	//    浮起来、一部分陷进去，而且只在斜看时看得出，同石阶那条）。
-	const float Z = CoverGroundBaseZ + GroundShaperHeightAtXY(P) + CoverRise * HeightScale - CoverSink;
+	const float Z = CoverGroundBaseZ + GroundShaperHeightAtXY(P) - CoverSink + CoverHeightOffset;
 
 	// 8) 领槽位；越界静默丢弃（容量一次性定死、永不重算，这是零回读的代价与保证）。
 	uint Slot;

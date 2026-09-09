@@ -213,17 +213,26 @@ struct COMPUTESHADERGENERATOR_API FCSGroundCoverSpecies
 	float Sink = 2.0f;
 
 	/**
-	 * 把网格的**包围盒底面**钉到地表（原点抬 −Min.Z × 高度缩放），而不是把网格原点钉到地表。
+	 * 整个物种的**世界 Z 偏移（cm，可正可负）**：正 = 整片抬高，负 = 整片压低。
+	 * 垂直方向就这一个整体旋钮 —— 换一朵花、或者想让花冠浮在草尖之上时调它。
 	 *
-	 * ⚠️ **默认开是有实测依据的**：TG 提取出来的 `lowpoly_flower`，包围盒离原点 **30 cm 才开始**
-	 * —— 不补这一项，整片花会齐刷刷悬空 30 cm，而剔除球 / 包围盒 / 实例数**全都看不见它**。
-	 * `SM_TG_GrassBlade` 的 Min.Z 恰好是 0，所以草开不开都一样。
+	 * **网格原点即落点，不做任何自动修正**（2026-09-09 用户裁定，推翻了原先的 `bSeatOnBase`）：
+	 * 从前这里会把网格的包围盒底面自动钉到地表（原点抬 −Min.Z × 高度缩放），依据是
+	 * "`lowpoly_flower` 的包围盒离原点 30 cm 才开始 ⇒ 不补这一项整片花会悬空"。**那条依据是
+	 * 错的** —— 花有时候就是该高出地面，那 30 cm 是网格作者摆出来的，不是缺陷。自动修正把
+	 * 作者的意图抹掉了，而且它是**逐网格**的：换一张花的网格，全片花的高度会跟着新包围盒
+	 * 无声地跳一次。现在的约定是**网格摆在哪儿就是哪儿**，要挪就在这里显式挪 —— 数字写在
+	 * 面板上，看得见也 diff 得出来。
 	 *
-	 * 关掉它的场合：网格**本来就该埋一截**（`garden_flower_01_lavender` 的茎向下伸 1 m），
-	 * 坐底会把整根茎顶出地面。
+	 * ⚠️ **不乘高度缩放**：它表达的是"整片一起挪这么多厘米"。乘了缩放的话高的那株挪得更多，
+	 * 一片花就不再落在同一个平面上，读起来像是随机浮空而不是整体抬高。
+	 *
+	 * 与 `Sink` 不重复：`Sink` 只往下、钳在 ≥ 0，语义是"根埋进土里"；本条可正可负，是整体位移。
+	 * 上下界只是 UI 滑条范围（`UIMin/UIMax`），不是硬钳位 —— 输入框里能填更大的值；
+	 * 保守包围盒会把它算进最坏伸展，所以填多大都不会在边缘被剔掉。
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Shape")
-	bool bSeatOnBase = true;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Shape", meta = (UIMin = "-100.0", UIMax = "100.0"))
+	float HeightOffset = 0.0f;
 
 	/**
 	 * 这个物种投不投阴影。**默认关**（2026-09-06 用户裁决：草和花不要投影）。
@@ -1708,10 +1717,6 @@ private:
 	/** 每个物种基础网格的局部包围球（未缩放），剔除球从它按最大轴缩放放大。 */
 	TArray<FVector3f> CoverBaseSphereCentres;
 	TArray<float> CoverBaseSphereRadii;
-
-	/** 坐底修正 = −局部包围盒 Min.Z（未缩放）。`bSeatOnBase` 关掉时传 0，见该属性的注释。 */
-	TArray<float> CoverBaseRises;
-
 
 	/** 上次交给组件的容量/包围盒：只有它们真变了才需要再走一次阻塞的 `SetInstanceSourceGPU`。 */
 	TArray<uint32> CoverHandedCapacities;

@@ -23,7 +23,7 @@
 | [`TinyGlade_对比逆向报告.md`](TinyGlade_对比逆向报告.md) | 两卷合卷：两轮多 agent 对比逆向评审的原始报告 | 2 份 |
 | [`CSGroundShaper.md`](CSGroundShaper.md) | 地形塑形物（D9）：Houdini 原型 → UE 的逐节点对照与算法替换 | 原在 `Docs/` |
 | [`CSRockShellPattern.md`](CSRockShellPattern.md) | 披挂岩壳（D9 链 B）：烘焙件的通道契约与五条实测订正 | 原在 `Docs/` |
-| [`TinyGlade_树冠着色.md`](TinyGlade_树冠着色.md) | **树冠着色专卷**：叶卡片的 VS 变形、紧凑 G-buffer、树冠专用延迟光照，含深度浮雕与逆光旁路两条核心机制、其它叶类（藤蔓叶／灌木／背景树／落叶粒子）对照、移植到 UE 的四条缺口 | *（2026-09-07 新增）* |
+| [`TinyGlade_树冠着色.md`](TinyGlade_树冠着色.md) | **树冠着色专卷**：叶卡片的 VS 变形、紧凑 G-buffer、树冠专用延迟光照，含深度浮雕与逆光旁路两条核心机制、其它叶类（藤蔓叶／灌木／背景树／落叶粒子）对照、移植到 UE 的四条缺口（**2026-09-09 已落地为 `M_TinyGladeCanopy`**，建图脚本 `TinyGladeMakeCanopyMaterial.py`、验收 `TinyGladeShotCanopy.py`） | *（2026-09-07 新增，09-09 落地）* |
 | [`CSGroundTuning.md`](CSGroundTuning.md) | 地面派生链（地被 / 石阶 / 石阶材质 / 岩壳）的默认值：2026-09-06 那轮改了什么，以及演示关卡那套岩壳覆盖值的留档 | *（2026-09-06 新增）* |
 | [`CSRockShellEdgeBevel.md`](CSRockShellEdgeBevel.md) | 岩壳假倒角：TG 像素层缺口的机制证据与 UE 落地。**运行时壳 = v3**（邻接进 UV + 逐趟披挂重写，走 `M_TG_Texture` 的静态开关 `RockShellBevel`）；**直摆资产 = v2**（顶点色载荷，走 `M_TinyGladeRockShell`，legacy 但仍在用） | *（2026-09-01 新增，09-04 落地 v3，09-05 重整）* |
 | [`TinyGlade_结构审查_附录A_墙体剖面.md`](TinyGlade_结构审查_附录A_墙体剖面.md) | 结构审查的子代理报告 A（深挖 C）：16 行洞曲线消费者对照表、`CLIP_HLSL` 逐语句对照、逐函数的矩形假设清单与折线升级规模；结论已并入 `TinyGlade_结构审查.md` 大问题 3、4 | *（2026-09-07 新增）* |

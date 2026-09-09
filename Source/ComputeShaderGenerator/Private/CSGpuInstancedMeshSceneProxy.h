@@ -108,6 +108,10 @@ protected:
 	virtual void BuildGeometry(FRHICommandListBase& RHICmdList) override {}
 	virtual TUniquePtr<FLocalVertexFactory> CreateVertexFactory(ERHIFeatureLevel::Type InFeatureLevel, const char* InDebugName) const override;
 	virtual void OnStreamsAllocated(FRHICommandListBase& RHICmdList) override;
+	/** No BLAS: the resident streams hold the source mesh once and the instance transforms live in
+	 *  a GPU buffer (FCSGpuInstanceSourceGPU), which a single-instance BLAS cannot express. Ray
+	 *  tracing for this leaf needs GPU-side TLAS instance data and is a separate piece of work. */
+	virtual bool WantsRayTracingGeometry() const override { return false; }
 
 private:
 	/** The buffer set this proxy borrows, held as the shared reference so either teardown order is

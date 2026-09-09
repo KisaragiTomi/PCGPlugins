@@ -10,6 +10,9 @@
 class UPrimitiveComponent;
 class UMaterialInterface;
 class FRHIGPUBufferReadback;
+class FRayTracingGeometry;
+class FRayTracingInstanceCollector;
+class FMaterialRenderProxy;
 
 /**
  * Base scene proxy that draws a GPU-resident mesh directly through the render
@@ -28,6 +31,11 @@ class FRHIGPUBufferReadback;
  * generator, ...): buffer allocation, vertex-factory binding, the draw path, teardown,
  * and the CPU readback used by save-to-StaticMesh. Adding a new buffer is one more
  * AddStream(...) in RegisterStreams(); the alloc / VF-bind / readback code is untouched.
+ *
+ * Ray tracing: the base also owns a BLAS over the Position and Index streams, so hardware Lumen,
+ * ray traced shadows and reflections see the mesh. It is built from the draw-args mirror the
+ * resident set publishes (the only CPU copy of a GPU-decided triangle count) by an end-of-frame
+ * pump, and rebuilt whenever a new readback lands. See RefreshRayTracingGeometry for the rules.
  */
 class COMPUTESHADERGENERATOR_API FCSGpuMeshSceneProxy : public FPrimitiveSceneProxy
 {
@@ -49,6 +57,28 @@ public:
 	virtual FPrimitiveViewRelevance GetViewRelevance(const FSceneView* View) const override;
 	virtual bool CanBeOccluded() const override;
 	// GetTypeHash() stays pure-virtual: each concrete proxy must return its own unique hash.
+
+#if RHI_RAYTRACING
+	//~ Ray tracing. Relevance follows WantsRayTracingGeometry(); a leaf that cannot be expressed as
+	//  one BLAS instance (the GPU-instanced leaf) opts out there rather than here.
+	virtual bool IsRayTracingRelevant() const override { return WantsRayTracingGeometry(); }
+	virtual bool HasRayTracingRepresentation() const override { return WantsRayTracingGeometry(); }
+	virtual void GetDynamicRayTracingInstances(FRayTracingInstanceCollector& Collector) override;
+
+	/** The current BLAS, or null while no counts are known. Render thread only; for tests. */
+	const FRayTracingGeometry* GetRayTracingGeometryForTest() const { return RayTracingGeometry.Get(); }
+	/** GetDrawArgsPublishSerial() value the current BLAS was built from; 0 = never built. For tests. */
+	uint32 GetRayTracingBuiltSerialForTest() const { return RayTracingBuiltSerial; }
+
+	/** One pass of the end-of-frame BLAS refresh over every live proxy. Production code reaches it
+	 *  only through the OnEndFrameRT pump; tests call it directly because a synchronous test never
+	 *  reaches the end of a frame. Render thread only. */
+	static void PumpRayTracingGeometries_RenderThread();
+#endif
+
+	/** Module start / stop hooks for the end-of-frame BLAS pump. No-ops without RHI_RAYTRACING. */
+	static void RegisterRayTracingPump();
+	static void UnregisterRayTracingPump();
 
 	// -------------------------------------------------------------------------
 	// Readback API (used by UCSGpuMeshComponent::ReadbackMeshSync). Render thread only.
@@ -196,6 +226,18 @@ protected:
 	 *  the vertex factory it created. */
 	virtual void OnStreamsAllocated(FRHICommandListBase& RHICmdList) {}
 
+	/** Whether this proxy's geometry is one mesh drawn once, which is what a BLAS instance can
+	 *  express. The GPU-instanced leaf returns false: its buffers hold the source mesh once and the
+	 *  instance transforms live in a GPU buffer, so a BLAS built here would put a single phantom
+	 *  copy of the source mesh at the component origin. Read at scene-add time and by the pump. */
+	virtual bool WantsRayTracingGeometry() const { return true; }
+
+	/** The material of every draw batch, batch i drawing from arg set i — the same split
+	 *  GetDynamicMeshElements uses, restated for the ray tracing instance so each BLAS segment gets
+	 *  the material of the batch it mirrors. The base draws one batch of Material; a leaf with a
+	 *  section table returns one entry per section. Render thread. */
+	virtual void GetRayTracingBatchMaterials(TArray<FMaterialRenderProxy*, TInlineAllocator<8>>& OutMaterials) const;
+
 	// Shared vertex factory; created by CreateVertexFactory() and configured by the base from
 	// the registered streams. Heap-held so leaves can substitute a subclass.
 	TUniquePtr<FLocalVertexFactory> VertexFactory;
@@ -235,4 +277,25 @@ private:
 	const FCSGpuStreamRuntime* FindStream(ECSGpuStreamRole Role, uint8 Index = 0) const;
 
 	TArray<TUniquePtr<FCSGpuStreamRuntime>> Streams;
+
+#if RHI_RAYTRACING
+	/** Rebuilds the BLAS when the published draw args have advanced since the last build, drops
+	 *  it when ray tracing is off or the mesh is empty, and keeps it while a readback is in flight.
+	 *  Called by the end-of-frame pump on the render thread. */
+	void RefreshRayTracingGeometry(FRHICommandListBase& RHICmdList);
+	void ReleaseRayTracingGeometry();
+
+	/** One arg set per draw batch, from the published mirror (external mode) or from the direct
+	 *  draw description (a leaf that draws a CPU-known count). False while nothing is known yet.
+	 *  OutSerial identifies the publication the args came from and is never 0 on success. */
+	bool GatherRayTracingDrawArgs(TArray<FCSGpuDrawArgs, TInlineAllocator<8>>& OutArgs, uint32& OutSerial) const;
+
+	/** Owned BLAS over the Position and Index streams; null until the first publish lands. */
+	TUniquePtr<FRayTracingGeometry> RayTracingGeometry;
+	/** Publication the current BLAS (or the current "empty, nothing to build") came from. */
+	uint32 RayTracingBuiltSerial = 0;
+	/** Arg sets the current BLAS was built from, in segment order. The instance's mesh batches
+	 *  must describe these, not whatever the mirror holds by the time the gather runs. */
+	TArray<FCSGpuDrawArgs, TInlineAllocator<8>> RayTracingBuiltArgs;
+#endif
 };

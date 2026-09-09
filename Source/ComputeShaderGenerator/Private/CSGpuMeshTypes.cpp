@@ -134,7 +134,13 @@ ERHIAccess FinalAccessForRole(ECSGpuStreamRole Role)
 	switch (Role)
 	{
 	case ECSGpuStreamRole::Index:
-		return ERHIAccess::VertexOrIndexBuffer;
+		// Drawn from as an index buffer AND read as a plain shader resource by an acceleration
+		// structure build: a BLAS build reads its index and vertex inputs in SRV state (the
+		// engine's own dynamic-geometry path transitions UAVCompute -> SRVMask right before it
+		// builds, RayTracingDynamicGeometryUpdateManager.cpp:938 in 5.7.4) and the RHI does not
+		// transition build inputs for you. Without SRVMask here the BLAS FCSGpuMeshSceneProxy
+		// builds would read the index buffer in a state it was never put in.
+		return ERHIAccess::VertexOrIndexBuffer | ERHIAccess::SRVMask;
 	case ECSGpuStreamRole::IndirectArgs:
 		return ERHIAccess::IndirectArgs;
 	case ECSGpuStreamRole::MeshCounters:

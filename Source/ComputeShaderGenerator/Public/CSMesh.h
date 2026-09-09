@@ -144,6 +144,14 @@ struct COMPUTESHADERGENERATOR_API FCSMeshResident
 	 *  mesh-element gather, which runs on task threads rather than on the render thread. */
 	bool GetDrawArgs(int32 ArgSetIndex, FCSGpuDrawArgs& OutArgs) const;
 
+	/** Advances by one every time a landed readback replaces the published arg sets; 0 until the
+	 *  first one lands. A consumer that derives something expensive from the counts (the scene
+	 *  proxy's ray tracing BLAS) compares this with the value it last consumed instead of diffing
+	 *  the args: a landed readback also means the buffers behind the counts have been rewritten,
+	 *  so equal counts are not a reason to skip. A read that publishes nothing does not advance
+	 *  it. Same lock and thread rules as GetDrawArgs. */
+	uint32 GetDrawArgsPublishSerial() const;
+
 	/** Adds a copy of the whole IndirectArgs buffer to GraphBuilder and registers this set with
 	 *  the end-of-frame pump that publishes the result. Every owned-graph edit calls this for
 	 *  you (CSMesh_FinalizeGraph); a request made while one is already in flight is dropped
@@ -224,6 +232,7 @@ private:
 	 *  for — an unsynchronised TArray would be read while a reallocation resizes it. */
 	mutable FCriticalSection PublishedDrawArgsLock;
 	TArray<FCSGpuDrawArgs> PublishedDrawArgs;
+	uint32 DrawArgsPublishSerial = 0;   // under PublishedDrawArgsLock; see GetDrawArgsPublishSerial
 };
 
 /**

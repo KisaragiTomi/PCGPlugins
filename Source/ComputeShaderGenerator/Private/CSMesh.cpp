@@ -556,7 +556,14 @@ bool FCSMeshResident::TryPublishDrawArgs()
 
 	FScopeLock Lock(&PublishedDrawArgsLock);
 	PublishedDrawArgs = MoveTemp(Published);
+	++DrawArgsPublishSerial;
 	return true;
+}
+
+uint32 FCSMeshResident::GetDrawArgsPublishSerial() const
+{
+	FScopeLock Lock(&PublishedDrawArgsLock);
+	return DrawArgsPublishSerial;
 }
 
 void FCSMeshResident::DiscardDrawArgs()

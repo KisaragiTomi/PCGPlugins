@@ -8,6 +8,9 @@
 #include "CSMeshOps.h"
 #include "CSMeshPool.h"
 #include "CSMeshRenderComponent.h"
+#include "CSGpuMeshSceneProxy.h"
+#include "RayTracingGeometry.h"
+#include "RHI.h"
 #include "ComputeShaderMeshGenerator.h"
 
 #include "Components/BoxComponent.h"
@@ -44,8 +47,9 @@ bool FCSGpuMeshStreamContractTest::RunTest(const FString& Parameters)
 	// The access states are what keep a mesh drawable after an operator has written it.
 	// RDG's default epilogue (SRVMask) is illegal for index / indirect usage, so these three
 	// must never silently become the default.
-	TestEqual(TEXT("Index streams stay index-readable"),
-		CSGpuMeshStreams::FinalAccessForRole(ECSGpuStreamRole::Index), ERHIAccess::VertexOrIndexBuffer);
+	// Index streams are also BLAS build inputs, which the RHI reads in SRV state.
+	TestEqual(TEXT("Index streams stay index-readable and BLAS-readable"),
+		CSGpuMeshStreams::FinalAccessForRole(ECSGpuStreamRole::Index), ERHIAccess::VertexOrIndexBuffer | ERHIAccess::SRVMask);
 	TestEqual(TEXT("Indirect args stay indirect-readable"),
 		CSGpuMeshStreams::FinalAccessForRole(ECSGpuStreamRole::IndirectArgs), ERHIAccess::IndirectArgs);
 	TestEqual(TEXT("Counters stay copyable for readback"),
@@ -1228,6 +1232,119 @@ bool FCSGpuMeshDrawArgsMirrorTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("The async edit's index count reached the CPU"), Args.IndexCount, 9u);
 	return true;
 }
+
+// -----------------------------------------------------------------------------
+// Ray tracing: the BLAS follows the published draw args
+// -----------------------------------------------------------------------------
+
+#if RHI_RAYTRACING
+namespace
+{
+/** What the proxy's BLAS looks like after one run of the end-of-frame pump. */
+struct FCSGpuMeshRayTracingProbe
+{
+	bool bHasGeometry = false;
+	bool bValid = false;
+	uint32 TotalPrimitives = 0;
+	int32 NumSegments = 0;
+	uint32 Segment0Primitives = 0;
+	uint32 Segment0FirstPrimitive = 0;
+	uint32 BuiltSerial = 0;
+};
+
+FCSGpuMeshRayTracingProbe CSGpuMeshTests_ProbeRayTracing(UCSMeshRenderComponent* Component)
+{
+	TSharedRef<FCSGpuMeshRayTracingProbe, ESPMode::ThreadSafe> Probe = MakeShared<FCSGpuMeshRayTracingProbe, ESPMode::ThreadSafe>();
+	FCSGpuMeshSceneProxy* Proxy = static_cast<FCSGpuMeshSceneProxy*>(Component->GetSceneProxy());
+	ENQUEUE_RENDER_COMMAND(CSGpuMeshTestsProbeRayTracing)(
+		[Proxy, Probe](FRHICommandListImmediate& RHICmdList)
+		{
+			// The pump normally runs at OnEndFrameRT, which a synchronous test never reaches.
+			FCSGpuMeshSceneProxy::PumpRayTracingGeometries_RenderThread();
+			if (!Proxy) return;
+			Probe->BuiltSerial = Proxy->GetRayTracingBuiltSerialForTest();
+			const FRayTracingGeometry* Geometry = Proxy->GetRayTracingGeometryForTest();
+			if (!Geometry) return;
+			Probe->bHasGeometry = true;
+			Probe->bValid = Geometry->IsValid();
+			Probe->TotalPrimitives = Geometry->Initializer.TotalPrimitiveCount;
+			Probe->NumSegments = Geometry->Initializer.Segments.Num();
+			if (Probe->NumSegments == 0) return;
+			Probe->Segment0Primitives = Geometry->Initializer.Segments[0].NumPrimitives;
+			Probe->Segment0FirstPrimitive = Geometry->Initializer.Segments[0].FirstPrimitive;
+		});
+	FlushRenderingCommands();
+	return *Probe;
+}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSGpuMeshRayTracingGeometryTest,
+	"PCGPlugins.ComputeShaderGenerator.GpuMeshObject.RayTracingGeometry",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter | EAutomationTestFlags::NonNullRHI)
+
+bool FCSGpuMeshRayTracingGeometryTest::RunTest(const FString& Parameters)
+{
+	if (!IsRayTracingEnabled())
+	{
+		AddInfo(TEXT("Ray tracing is not enabled on this RHI; the BLAS path has nothing to build."));
+		return true;
+	}
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	UStaticMesh* CubeMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	if (!TestNotNull(TEXT("Engine cube mesh"), CubeMesh)) return false;
+	const uint32 SourceTriangles = uint32(CubeMesh->GetRenderData()->LODResources[0].GetNumTriangles());
+
+	UCSMesh* GpuMesh = UCSMeshOps::AllocateGpuMesh(World, 4096, 4096);
+	if (!TestNotNull(TEXT("GPU mesh"), GpuMesh)) return false;
+	UCSMeshOps::CopyFromStaticMesh(GpuMesh, CubeMesh, FCSMeshFromStaticMeshOptions());
+
+	AActor* HostActor = World->SpawnActor<AActor>();
+	if (!TestNotNull(TEXT("Host actor"), HostActor)) return false;
+	UCSMeshRenderComponent* RenderComponent = NewObject<UCSMeshRenderComponent>(HostActor);
+	HostActor->SetRootComponent(RenderComponent);
+	RenderComponent->RegisterComponent();
+	RenderComponent->SetGpuMesh(GpuMesh);
+	World->UpdateWorldComponents(true, false);
+	FlushRenderingCommands();
+	if (!TestNotNull(TEXT("Scene proxy"), RenderComponent->GetSceneProxy())) return false;
+
+	// The BLAS is built from the published mirror, so it exists exactly when the mirror does.
+	// Nothing has published yet (no frame has ended), and a count must never be guessed.
+	const FCSGpuMeshRayTracingProbe BeforePublish = CSGpuMeshTests_ProbeRayTracing(RenderComponent);
+	TestFalse(TEXT("No BLAS before the first readback lands"), BeforePublish.bHasGeometry);
+
+	CSGpuMeshTests_ForcePublishDrawArgs(GpuMesh);
+	const FCSGpuMeshRayTracingProbe AfterPublish = CSGpuMeshTests_ProbeRayTracing(RenderComponent);
+	if (!TestTrue(TEXT("A landed readback produces a BLAS"), AfterPublish.bHasGeometry)) return false;
+	TestTrue(TEXT("The BLAS is a valid geometry"), AfterPublish.bValid);
+	TestEqual(TEXT("One segment per draw batch"), AfterPublish.NumSegments, 1);
+	// The whole point: the BLAS covers the mesh's triangles, not the 4096 capacity it was allocated at.
+	TestEqual(TEXT("The BLAS covers exactly the uploaded triangles"), AfterPublish.TotalPrimitives, SourceTriangles);
+	TestEqual(TEXT("Segment 0 covers exactly the uploaded triangles"), AfterPublish.Segment0Primitives, SourceTriangles);
+	TestEqual(TEXT("Segment 0 starts at the first triangle"), AfterPublish.Segment0FirstPrimitive, 0u);
+
+	// An edit retires the mirror until its own readback lands; the BLAS is baked and stays.
+	UCSMeshOps::TranslateMesh(GpuMesh, FVector(100.0, 0.0, 0.0));
+	FlushRenderingCommands();
+	const FCSGpuMeshRayTracingProbe DuringEdit = CSGpuMeshTests_ProbeRayTracing(RenderComponent);
+	TestTrue(TEXT("The BLAS survives while the next readback is in flight"), DuringEdit.bHasGeometry);
+	TestEqual(TEXT("The surviving BLAS is the same build"), DuringEdit.BuiltSerial, AfterPublish.BuiltSerial);
+
+	// When that readback lands the BLAS is rebuilt even though the counts did not change: the
+	// positions behind them did.
+	CSGpuMeshTests_ForcePublishDrawArgs(GpuMesh);
+	const FCSGpuMeshRayTracingProbe AfterEdit = CSGpuMeshTests_ProbeRayTracing(RenderComponent);
+	TestTrue(TEXT("The BLAS is rebuilt once the edit's readback lands"), AfterEdit.BuiltSerial > AfterPublish.BuiltSerial);
+	TestEqual(TEXT("The rebuilt BLAS still covers exactly the uploaded triangles"), AfterEdit.TotalPrimitives, SourceTriangles);
+
+	HostActor->Destroy();
+	return true;
+}
+#endif // RHI_RAYTRACING
 
 // -----------------------------------------------------------------------------
 // ComputeWorldBoundsSync: the ordered-float reduction

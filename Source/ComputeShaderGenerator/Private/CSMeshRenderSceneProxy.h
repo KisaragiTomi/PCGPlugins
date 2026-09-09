@@ -35,6 +35,8 @@ protected:
 	//~ FCSGpuMeshSceneProxy interface — unused in external mode.
 	virtual void RegisterStreams() override {}
 	virtual void BuildGeometry(FRHICommandListBase& RHICmdList) override {}
+	/** BatchMaterials in batch order, so BLAS segment i carries the material of arg set i. */
+	virtual void GetRayTracingBatchMaterials(TArray<FMaterialRenderProxy*, TInlineAllocator<8>>& OutMaterials) const override;
 
 private:
 	/** One DrawIndexedIndirect arg set: IndexCountPerInstance, InstanceCount, StartIndexLocation,

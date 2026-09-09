@@ -71,6 +71,14 @@ void FCSMeshRenderSceneProxy::GetDynamicMeshElements(const TArray<const FSceneVi
 	}
 }
 
+void FCSMeshRenderSceneProxy::GetRayTracingBatchMaterials(TArray<FMaterialRenderProxy*, TInlineAllocator<8>>& OutMaterials) const
+{
+	// The same fallback GetDynamicMeshElements takes: no batch list, one batch of the base material.
+	if (BatchMaterials.Num() == 0) return FCSGpuMeshSceneProxy::GetRayTracingBatchMaterials(OutMaterials);
+	OutMaterials.Reset(BatchMaterials.Num());
+	for (UMaterialInterface* Mat : BatchMaterials) OutMaterials.Add(Mat->GetRenderProxy());
+}
+
 // -----------------------------------------------------------------------------
 // UCSMeshRenderComponent
 // -----------------------------------------------------------------------------

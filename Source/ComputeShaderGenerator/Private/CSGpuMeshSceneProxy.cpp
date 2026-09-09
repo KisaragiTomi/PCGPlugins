@@ -15,6 +15,17 @@
 #include "RenderGraphUtils.h"
 #include "RenderUtils.h"      // VelocityIncludeStationaryPrimitives
 #include "RHIGPUReadback.h"
+#include "HAL/IConsoleManager.h"
+#include "Misc/CoreDelegates.h"
+#include "PrimitiveUniformShaderParametersBuilder.h"
+#include "RayTracingGeometry.h"
+#include "RayTracingInstance.h"
+#include "RenderingThread.h"
+#include "RHI.h"
+
+#if RHI_RAYTRACING
+namespace { void CSGpuMesh_TrackRayTracingProxy(FCSGpuMeshSceneProxy* Proxy, bool bTrack); }
+#endif
 
 FCSGpuMeshSceneProxy::FCSGpuMeshSceneProxy(const UPrimitiveComponent* Component, UMaterialInterface* InMaterial, const char* DebugName)
 	: FPrimitiveSceneProxy(Component)
@@ -26,6 +37,14 @@ FCSGpuMeshSceneProxy::FCSGpuMeshSceneProxy(const UPrimitiveComponent* Component,
 
 	bVerifyUsedMaterials = false;
 	bSupportsDistanceFieldRepresentation = false;
+
+	// Lumen decides whether to track a primitive from HasRayTracingRepresentation() and the
+	// distance-field flags, and the base constructor evaluated that before this class's overrides
+	// existed. Every engine proxy that changes those answers recomputes here
+	// (StaticMeshSceneProxy.cpp:476, BaseDynamicMeshSceneProxy.cpp:70 in 5.7.4). A leaf that
+	// overrides WantsRayTracingGeometry() is not visible from this constructor either and must
+	// recompute again in its own.
+	UpdateVisibleInLumenScene();
 }
 
 FCSGpuMeshSceneProxy::~FCSGpuMeshSceneProxy()
@@ -46,10 +65,22 @@ void FCSGpuMeshSceneProxy::CreateRenderThreadResources(FRHICommandListBase& RHIC
 {
 	FPrimitiveSceneProxy::CreateRenderThreadResources(RHICmdList);
 	InitGpuGeometry(RHICmdList);
+#if RHI_RAYTRACING
+	// Only registered here, not built: this can run on a parallel task, and the pump (render thread
+	// proper, end of this frame) builds from whatever the mirror already holds — a proxy recreated
+	// over a mesh with published counts gets its BLAS back one frame later, not never.
+	if (WantsRayTracingGeometry()) CSGpuMesh_TrackRayTracingProxy(this, true);
+#endif
 }
 
 void FCSGpuMeshSceneProxy::DestroyRenderThreadResources()
 {
+#if RHI_RAYTRACING
+	// First: once this returns the proxy may be deleted, so the pump must no longer be able to
+	// reach it. The BLAS goes before the buffers it was built over.
+	CSGpuMesh_TrackRayTracingProxy(this, false);
+	ReleaseRayTracingGeometry();
+#endif
 	// Release the vertex factory before the buffers it streams from (matches the
 	// original per-proxy teardown order).
 	if (VertexFactory)
@@ -420,3 +451,314 @@ void FCSGpuMeshSceneProxy::ReleaseGpuGeometry()
 	}
 	Streams.Reset();
 }
+
+// -----------------------------------------------------------------------------
+// Ray tracing: a BLAS over the raster buffers, rebuilt when the draw-args mirror lands
+// -----------------------------------------------------------------------------
+//
+// Why the BLAS follows the published mirror and not the buffers directly: an acceleration
+// structure build needs its primitive count on the CPU (FRayTracingGeometrySegment::NumPrimitives
+// — the RHI has no indirect BLAS build, only indirect TLAS instance data), and for a GPU-decided
+// mesh the only CPU copy of that count is the draw-args mirror FCSMeshResident publishes. So the
+// BLAS is (re)built when a readback lands, which is also exactly when the buffers behind the counts
+// have finished changing. While a readback is in flight the previous BLAS stays: it is a baked
+// structure and does not read the buffers again, so a mesh edited every frame keeps last frame's
+// ray tracing shape until the edits pause, rather than vanishing or being rebuilt per frame. (The
+// mirror's supersede-in-flight policy, CSMesh.cpp RequestDrawArgsReadback, is what makes this a
+// natural throttle: continuous edits starve the publish until they stop.)
+//
+// Why an end-of-frame pump and not the gather or CreateRenderThreadResources: both of those can
+// run inside a ParallelFor (RayTracing.cpp:1185 in 5.7.4), and creating / releasing render
+// resources from there needs more care than this deserves. FCoreDelegates::OnEndFrameRT is the
+// render thread proper, once per frame, and runs after the draw-args pump in CSMesh.cpp has
+// published (it was registered later), so a landed readback becomes a BLAS in the same frame.
+//
+// What it costs: one full fast-build per landed edit, over the whole mesh, whatever changed. A
+// vertex-colour paint rebuilds a million-triangle ground exactly like a displacement does. Refit
+// (bAllowUpdate + EAccelerationStructureBuildMode::Update) would make same-count edits an order of
+// magnitude cheaper, but FRayTracingGeometryManager::RequestBuildAccelerationStructure ignores the
+// build mode in 5.7.4, so that needs its own scratch-managed build call — deferred to the frame
+// quota work (Docs/FrameQuotaScheduler_Plan.md).
+
+#if RHI_RAYTRACING
+
+static TAutoConsoleVariable<int32> CVarCSGpuMeshRayTracing(
+	TEXT("r.CSGpuMesh.RayTracing"),
+	1,
+	TEXT("Build a ray tracing BLAS for GPU-resident meshes so hardware Lumen, ray traced shadows and reflections see them.\n")
+	TEXT("0 drops every existing BLAS at the next end of frame and builds no new ones."),
+	ECVF_RenderThreadSafe);
+
+namespace
+{
+/** Proxies with live render-thread resources. Registration and removal come from
+ *  Create/DestroyRenderThreadResources, which the scene may run from parallel tasks, hence the
+ *  lock; removal precedes the proxy's deletion, which is what keeps the raw pointers valid. */
+FCriticalSection GCSGpuMeshRayTracingProxiesLock;
+TArray<FCSGpuMeshSceneProxy*> GCSGpuMeshRayTracingProxies;
+FDelegateHandle GCSGpuMeshRayTracingPumpHandle;
+
+void CSGpuMesh_TrackRayTracingProxy(FCSGpuMeshSceneProxy* Proxy, bool bTrack)
+{
+	FScopeLock Lock(&GCSGpuMeshRayTracingProxiesLock);
+	if (bTrack) GCSGpuMeshRayTracingProxies.AddUnique(Proxy);
+	else GCSGpuMeshRayTracingProxies.RemoveSingleSwap(Proxy);
+}
+}
+
+void FCSGpuMeshSceneProxy::RegisterRayTracingPump()
+{
+	// The delegate itself is only touched on the render thread: TMulticastDelegate is not safe
+	// against a concurrent broadcast, and OnEndFrameRT broadcasts there. Before the rendering
+	// thread exists this runs inline, which is the same thread.
+	ENQUEUE_RENDER_COMMAND(CSGpuMeshRegisterRayTracingPump)([](FRHICommandListImmediate&)
+	{
+		if (GCSGpuMeshRayTracingPumpHandle.IsValid()) return;
+		GCSGpuMeshRayTracingPumpHandle = FCoreDelegates::OnEndFrameRT.AddStatic(&FCSGpuMeshSceneProxy::PumpRayTracingGeometries_RenderThread);
+	});
+}
+
+void FCSGpuMeshSceneProxy::UnregisterRayTracingPump()
+{
+	ENQUEUE_RENDER_COMMAND(CSGpuMeshUnregisterRayTracingPump)([](FRHICommandListImmediate&)
+	{
+		if (!GCSGpuMeshRayTracingPumpHandle.IsValid()) return;
+		FCoreDelegates::OnEndFrameRT.Remove(GCSGpuMeshRayTracingPumpHandle);
+		GCSGpuMeshRayTracingPumpHandle.Reset();
+	});
+	// The pump points into this module: it has to be gone before the module is (hot reload).
+	FlushRenderingCommands();
+}
+
+/** `CSGpuMesh.DumpRayTracing`: logs every tracked proxy's BLAS state from the render thread, so a
+ *  live editor can be asked "is the mesh actually in the ray tracing scene right now" without a
+ *  debugger. Companion of r.CSGpuMesh.RayTracing. */
+static FAutoConsoleCommand GCSGpuMeshDumpRayTracingCmd(
+	TEXT("CSGpuMesh.DumpRayTracing"),
+	TEXT("Log the ray tracing BLAS state of every live GPU-mesh scene proxy (segments, primitives, publish serial)."),
+	FConsoleCommandDelegate::CreateLambda([]()
+	{
+		ENQUEUE_RENDER_COMMAND(CSGpuMeshDumpRayTracing)([](FRHICommandListImmediate&)
+		{
+			FScopeLock Lock(&GCSGpuMeshRayTracingProxiesLock);
+			UE_LOG(LogTemp, Display, TEXT("[CSGpuMesh.RT] %d tracked proxies, r.CSGpuMesh.RayTracing=%d, IsRayTracingAllowed=%d"),
+				GCSGpuMeshRayTracingProxies.Num(), CVarCSGpuMeshRayTracing.GetValueOnRenderThread(), IsRayTracingAllowed() ? 1 : 0);
+			for (const FCSGpuMeshSceneProxy* Proxy : GCSGpuMeshRayTracingProxies)
+			{
+				const FRayTracingGeometry* Geometry = Proxy->GetRayTracingGeometryForTest();
+				if (!Geometry)
+				{
+					UE_LOG(LogTemp, Display, TEXT("[CSGpuMesh.RT]   %s: no BLAS (serial %u)"), *Proxy->GetOwnerName().ToString(), Proxy->GetRayTracingBuiltSerialForTest());
+					continue;
+				}
+				uint32 Enabled = 0;
+				for (const FRayTracingGeometrySegment& Segment : Geometry->Initializer.Segments) Enabled += Segment.bEnabled ? 1u : 0u;
+				UE_LOG(LogTemp, Display, TEXT("[CSGpuMesh.RT]   %s: BLAS valid=%d segments=%d (enabled %u) primitives=%u serial=%u pendingBuild=%d"),
+					*Proxy->GetOwnerName().ToString(), Geometry->IsValid() ? 1 : 0, Geometry->Initializer.Segments.Num(), Enabled,
+					Geometry->Initializer.TotalPrimitiveCount, Proxy->GetRayTracingBuiltSerialForTest(), Geometry->HasPendingBuildRequest() ? 1 : 0);
+			}
+		});
+	}));
+
+void FCSGpuMeshSceneProxy::PumpRayTracingGeometries_RenderThread()
+{
+	check(IsInRenderingThread());
+	FScopeLock Lock(&GCSGpuMeshRayTracingProxiesLock);
+	if (GCSGpuMeshRayTracingProxies.IsEmpty()) return;
+	FRHICommandListImmediate& RHICmdList = GetImmediateCommandList_ForRenderCommand();
+	for (FCSGpuMeshSceneProxy* Proxy : GCSGpuMeshRayTracingProxies) Proxy->RefreshRayTracingGeometry(RHICmdList);
+}
+
+void FCSGpuMeshSceneProxy::GetRayTracingBatchMaterials(TArray<FMaterialRenderProxy*, TInlineAllocator<8>>& OutMaterials) const
+{
+	OutMaterials.Reset(1);
+	OutMaterials.Add(Material->GetRenderProxy());
+}
+
+bool FCSGpuMeshSceneProxy::GatherRayTracingDrawArgs(TArray<FCSGpuDrawArgs, TInlineAllocator<8>>& OutArgs, uint32& OutSerial) const
+{
+	OutArgs.Reset();
+	if (ExternalResident.IsValid())
+	{
+		// External mode: the counts are the resident set's mirror, one arg set per draw batch.
+		const uint32 Serial = ExternalResident->GetDrawArgsPublishSerial();
+		if (Serial == 0) return false;
+
+		TArray<FMaterialRenderProxy*, TInlineAllocator<8>> Materials;
+		GetRayTracingBatchMaterials(Materials);
+		for (int32 BatchIndex = 0; BatchIndex < Materials.Num(); ++BatchIndex)
+		{
+			// A set the mirror does not cover (retired by an edit in flight, or a table longer than
+			// the args) makes the whole mesh unknown: a BLAS with a guessed segment is a wrong BLAS.
+			if (!ExternalResident->GetDrawArgs(BatchIndex, OutArgs.AddDefaulted_GetRef())) return false;
+		}
+		OutSerial = Serial;
+		return OutArgs.Num() > 0;
+	}
+
+	// Owned mode. A leaf that draws a CPU-known count is fully described by DrawDesc and never
+	// changes for the proxy's life; a leaf that draws indirect has no mirror to read the count from.
+	if (DrawDesc.IndirectArgsBuffer != nullptr || DrawDesc.NumPrimitives == 0) return false;
+	FCSGpuDrawArgs& Args = OutArgs.AddDefaulted_GetRef();
+	Args.IndexCount = DrawDesc.NumPrimitives * 3u;
+	Args.FirstIndex = DrawDesc.FirstIndex;
+	Args.BaseVertexIndex = 0;
+	OutSerial = 1;
+	return true;
+}
+
+void FCSGpuMeshSceneProxy::ReleaseRayTracingGeometry()
+{
+	if (RayTracingGeometry)
+	{
+		RayTracingGeometry->ReleaseResource();
+		RayTracingGeometry.Reset();
+	}
+	RayTracingBuiltArgs.Reset();
+	RayTracingBuiltSerial = 0;
+}
+
+void FCSGpuMeshSceneProxy::RefreshRayTracingGeometry(FRHICommandListBase& RHICmdList)
+{
+	if (CVarCSGpuMeshRayTracing.GetValueOnRenderThread() == 0 || !IsRayTracingAllowed() || !WantsRayTracingGeometry())
+	{
+		ReleaseRayTracingGeometry();
+		return;
+	}
+	if (!DrawDesc.bValid || DrawDesc.IndexBuffer == nullptr) return;
+
+	TArray<FCSGpuDrawArgs, TInlineAllocator<8>> Args;
+	uint32 Serial = 0;
+	if (!GatherRayTracingDrawArgs(Args, Serial)) return;   // counts unknown: keep the baked BLAS we have
+	if (Serial == RayTracingBuiltSerial) return;           // nothing landed since the last build
+
+	const FCSGpuStreamRuntime* PositionStream = FindStream(ECSGpuStreamRole::Position);
+	const FCSGpuStreamRuntime* IndexStream = FindStream(ECSGpuStreamRole::Index);
+	if (!PositionStream || !IndexStream || !PositionStream->Pooled.IsValid() || !IndexStream->Pooled.IsValid()) return;
+
+	// The Position stream is VET_Float3 at 12 bytes (BuildStandardTriangleStreamDescs); read the
+	// stride from the descriptor anyway so a layout change cannot silently misread positions.
+	const uint32 VertexStride = PositionStream->Desc.BytesPerElement * PositionStream->Desc.ElementsPerUnit;
+
+	FRayTracingGeometryInitializer Initializer;
+	Initializer.DebugName = FName(VertexFactoryDebugName);
+	Initializer.IndexBuffer = IndexStream->Pooled->GetRHI();
+	Initializer.GeometryType = RTGT_Triangles;
+	// Rebuilt on every landed edit: build speed over trace speed, same choice as the engine's
+	// procedural mesh and landscape geometries.
+	Initializer.bFastBuild = true;
+	Initializer.bAllowUpdate = false;
+
+	uint32 TotalPrimitives = 0;
+	for (const FCSGpuDrawArgs& BatchArgs : Args)
+	{
+		const uint32 BaseVertex = uint32(FMath::Max(BatchArgs.BaseVertexIndex, 0));
+		FRayTracingGeometrySegment& Segment = Initializer.Segments.AddDefaulted_GetRef();
+		Segment.VertexBuffer = PositionStream->Pooled->GetRHI();
+		Segment.VertexBufferElementType = VET_Float3;
+		Segment.VertexBufferStride = VertexStride;
+		Segment.VertexBufferOffset = BaseVertex * VertexStride;
+		// Conservative: the whole capacity past the base vertex. The RHI only needs it to cover
+		// the largest index the segment can reference, and the capacity does by construction.
+		Segment.MaxVertices = FMath::Max(VertexCapacity - FMath::Min(BaseVertex, VertexCapacity), 1u);
+		Segment.FirstPrimitive = BatchArgs.FirstIndex / 3u;
+		Segment.NumPrimitives = BatchArgs.IndexCount / 3u;
+		// An empty section keeps its slot so segment i stays batch i (materials are matched by
+		// index) but contributes nothing to the build.
+		Segment.bEnabled = Segment.NumPrimitives > 0;
+		TotalPrimitives += Segment.NumPrimitives;
+	}
+	Initializer.TotalPrimitiveCount = TotalPrimitives;
+
+	if (TotalPrimitives == 0)
+	{
+		// A mesh that really emptied. Remember the publication so this does not rebuild "nothing"
+		// every frame until the next edit.
+		ReleaseRayTracingGeometry();
+		RayTracingBuiltSerial = Serial;
+		return;
+	}
+
+	// Same object across rebuilds, as the engine's procedural mesh does on a section update: the
+	// RHI keeps the previous BLAS alive for any frame still in flight.
+	if (RayTracingGeometry) RayTracingGeometry->ReleaseResource();
+	else RayTracingGeometry = MakeUnique<FRayTracingGeometry>();
+	RayTracingGeometry->SetInitializer(MoveTemp(Initializer));
+	RayTracingGeometry->InitResource(RHICmdList);
+	RayTracingBuiltArgs = Args;
+	RayTracingBuiltSerial = Serial;
+}
+
+void FCSGpuMeshSceneProxy::GetDynamicRayTracingInstances(FRayTracingInstanceCollector& Collector)
+{
+	if (!RayTracingGeometry || !RayTracingGeometry->IsValid()) return;
+	if (!DrawDesc.bValid || DrawDesc.IndexBuffer == nullptr || !VertexFactory) return;
+
+	TArray<FMaterialRenderProxy*, TInlineAllocator<8>> Materials;
+	GetRayTracingBatchMaterials(Materials);
+	// Segment i is matched to material i by index. A split that changed under a BLAS the pump has
+	// not caught up with yet would pair them wrong; skipping a frame is the honest answer.
+	if (Materials.Num() != RayTracingBuiltArgs.Num()) return;
+
+	FRayTracingInstance Instance;
+	Instance.Geometry = RayTracingGeometry.Get();
+	Instance.InstanceTransforms.Add(GetLocalToWorld());
+
+	// One primitive uniform buffer for the instance, shared by every segment's batch — the same
+	// dynamic-primitive route the raster path takes, because this proxy has no GPU-Scene slot of
+	// its own to point a cached uniform buffer at.
+	FDynamicPrimitiveUniformBuffer& DynamicPrimitiveUniformBuffer = Collector.AllocateOneFrameResource<FDynamicPrimitiveUniformBuffer>();
+	FPrimitiveUniformShaderParametersBuilder Builder;
+	BuildUniformShaderParameters(Builder);
+	DynamicPrimitiveUniformBuffer.Set(Collector.GetRHICommandList(), Builder);
+
+	// One instance per visible view, as the engine's own proxies do; the geometry and batches are
+	// shared, and the shadow flag comes from the first active view like the mesh-element path.
+	TConstArrayView<const FSceneView*> Views = Collector.GetViews();
+	const uint32 VisibilityMap = Collector.GetVisibilityMap();
+	const int32 FirstActiveViewIndex = FMath::CountTrailingZeros(VisibilityMap);
+	if (!Views.IsValidIndex(FirstActiveViewIndex)) return;
+	const bool bCastRayTracedShadow = bBatchCastShadow && IsShadowCast(Views[FirstActiveViewIndex]);
+	Instance.Materials.Reserve(Materials.Num());
+	for (int32 SegmentIndex = 0; SegmentIndex < Materials.Num(); ++SegmentIndex)
+	{
+		const FCSGpuDrawArgs& BatchArgs = RayTracingBuiltArgs[SegmentIndex];
+		FMeshBatch& Mesh = Instance.Materials.AddDefaulted_GetRef();
+		Mesh.VertexFactory = VertexFactory.Get();
+		Mesh.MaterialRenderProxy = Materials[SegmentIndex];
+		Mesh.ReverseCulling = IsLocalToWorldDeterminantNegative();
+		Mesh.Type = PT_TriangleList;
+		Mesh.DepthPriorityGroup = SDPG_World;
+		Mesh.bCanApplyViewModeOverrides = false;
+		Mesh.CastRayTracedShadow = bCastRayTracedShadow;
+		Mesh.SegmentIndex = SegmentIndex;
+
+		FMeshBatchElement& BatchElement = Mesh.Elements[0];
+		BatchElement.IndexBuffer = DrawDesc.IndexBuffer;
+		BatchElement.FirstIndex = BatchArgs.FirstIndex;
+		BatchElement.NumPrimitives = BatchArgs.IndexCount / 3u;
+		BatchElement.BaseVertexIndex = uint32(FMath::Max(BatchArgs.BaseVertexIndex, 0));
+		BatchElement.MinVertexIndex = 0;
+		BatchElement.MaxVertexIndex = DrawDesc.MaxVertexIndex;
+		BatchElement.PrimitiveUniformBufferResource = &DynamicPrimitiveUniformBuffer.UniformBuffer;
+	}
+
+	for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ++ViewIndex)
+	{
+		if ((VisibilityMap & (1u << ViewIndex)) == 0) continue;
+		Collector.AddRayTracingInstance(ViewIndex, Instance);
+	}
+}
+
+#else // RHI_RAYTRACING
+
+void FCSGpuMeshSceneProxy::RegisterRayTracingPump() {}
+void FCSGpuMeshSceneProxy::UnregisterRayTracingPump() {}
+
+void FCSGpuMeshSceneProxy::GetRayTracingBatchMaterials(TArray<FMaterialRenderProxy*, TInlineAllocator<8>>& OutMaterials) const
+{
+	OutMaterials.Reset(1);
+	OutMaterials.Add(Material->GetRenderProxy());
+}
+
+#endif // RHI_RAYTRACING

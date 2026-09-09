@@ -5,6 +5,7 @@
 #include "ShaderCore.h"
 #include "GDFSampleService.h"
 #include "CSDepthBrushSampleService.h"
+#include "CSGpuMeshSceneProxy.h"
 
 #include "Interfaces/IPluginManager.h"
 
@@ -19,6 +20,9 @@ void FComputeShaderGeneratorModule::StartupModule()
 		const FString ShaderDirectory = FPaths::Combine(Plugin->GetBaseDir(), TEXT("Shaders/Private"));
 		AddShaderSourceDirectoryMapping(TEXT("/Plugin/PCGPlugins/Shaders/Private"), ShaderDirectory);
 	}
+
+	// End-of-frame BLAS refresh for GPU-resident meshes; a no-op frame while no proxy is alive.
+	FCSGpuMeshSceneProxy::RegisterRayTracingPump();
 }
 
 void FComputeShaderGeneratorModule::ShutdownModule()
@@ -27,6 +31,7 @@ void FComputeShaderGeneratorModule::ShutdownModule()
 	// we call this function before unloading the module.
 	FGDFSampleService::Get().Shutdown();
 	FCSDepthBrushSampleService::Get().Shutdown();
+	FCSGpuMeshSceneProxy::UnregisterRayTracingPump();
 }
 
 #undef LOCTEXT_NAMESPACE

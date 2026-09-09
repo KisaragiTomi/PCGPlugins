@@ -236,6 +236,11 @@ FCSGpuInstancedMeshSceneProxy::FCSGpuInstancedMeshSceneProxy(UCSGpuInstancedMesh
 	// the component can be destroyed first, or the mesh object can be collected first.
 	SetExternalStreams(InResident);
 
+	// The base recomputed Lumen visibility in its own constructor, where this leaf's
+	// WantsRayTracingGeometry() override was not yet visible; recompute with it in place so an
+	// instanced primitive without a BLAS is not reported to Lumen as traceable.
+	UpdateVisibleInLumenScene();
+
 	const FBox& BaseBounds = Component->GetBaseMeshSnapshot().LocalBounds;
 	BaseSphereCentre = FVector3f(BaseBounds.GetCenter());
 	BaseSphereRadius = float(BaseBounds.GetExtent().Size());

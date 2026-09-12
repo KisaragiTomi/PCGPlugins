@@ -9,7 +9,7 @@
 | 路线 | 载荷 | 消费材质 | 子图 | 状态 |
 | --- | --- | --- | --- | --- |
 | **B 运行时壳** | UV1..UV6，逐趟披挂由 kernel 重写 | `MI_rocky_terrain`（母材质 `M_TG_Texture`） | `add_bevel_subgraph_v3` | **v3，现役** |
-| **A 直摆资产** | 顶点色 R/G/B/A，离线烘死 | `M_TinyGladeRockShell` | `add_bevel_subgraph` | **v2，legacy，仍在用** |
+| **A 直摆资产** | 顶点色 R/G/B/A，离线烘死 | `M_TinyGladeRockShell`（2026-09-11 已删，重跑下面的构建脚本即重建） | `add_bevel_subgraph` | **v2，legacy，当前无消费材质** |
 
 两份子图都由 `Scripts/BuildRockShellBevelMaterial.py` 构建（幂等，可重跑）。通道字典的权威都在
 `CSGroundRockShell.h`：v2 看 `VertexColor` 注释，v3 看 `namespace TexCoord`。本文不复述逐位定义。
@@ -330,7 +330,7 @@ A = 外向方向角            # atan2(外向) / 2π，盖侧法线弯的目标
 共享母材质的其它 MI 逐像素不变。
 
 消费材质 `/PCGPlugins/HouseTest/M_TinyGladeRockShell`，由 `M_TinyGladeStone` 复制后加装 v2 子图
-（`build_rockshell_bevel_material()`）。复制时把 Stone 的明度抖动
+（`build_rockshell_bevel_material()`；资产 2026-09-11 已删，下面是重跑脚本时的建法）。复制时把 Stone 的明度抖动
 `lerp(0.88, 1.12, PerInstanceRandom + VertexColor.A)` 改成只读 `PerInstanceRandom`：字典 v2 的
 A 是外向角 θ，再让它进明度会绕每块石头扫出一圈明暗和一道接缝。Stone 原来接在 Normal 上的
 三平面法线贴图随之被顶掉，直摆看图不需要它。
@@ -380,7 +380,8 @@ BevelHalfDihedral     = 45     # 度：满强度时相对自己的面倒过去�
   跳过重导）。
 - **直摆资产必看**：盖三角绕序朝下（运行时 kernel 自己翻，直摆没人翻）—— StaticMesh 直接
   放场景要给 actor `scale.z = -1`（Z 镜像不动 XY ⇒ θ 语义不变），否则从上方整张被背面剔除。
-- 逐通道诊断材质留档：`/PCGPlugins/HouseTest/M_RockShellChannelDebug`（unlit，Emissive=G）。
+- 逐通道诊断材质 `/PCGPlugins/HouseTest/M_RockShellChannelDebug`（unlit，Emissive=G）2026-09-11 已删；
+  要用从插件 git 取回：`git checkout 4820ca3 -- Content/HouseTest/M_RockShellChannelDebug.uasset`。
 - 烘焙实测基线（原件）：609 胞腔全部有盖、轮廓线段 10,988 条、折痕距离中位 0.195 m
   （= 裙圈 19.5 cm 错开，数据自洽）、25 cm 带内顶点 62.6%。
 

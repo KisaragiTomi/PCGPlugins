@@ -1020,6 +1020,8 @@ RGB 是纯白 255**（上 12 texel、左 6 + 右 4 texel）。地面材质只接
 而这个属性随"洞口内壁"作废时已从 C++ 删掉，**UE Python 对不存在的属性是抛异常不是静默忽略**
 ⇒ 脚本跑到那两行就挂，CDO 与关卡实例的材质一个都赋不上。已清理。
 ⚠️ 但材质资产 `M_TinyGladeReveal` **不能删** —— 它现在是 `PillarMaterial`，关卡还引用着。
+**（2026-09-11 更新：柱子早已由 `TinyGladeSetupPillar.py` 改挂 `M_TinyGladeBrick`，它已无任何引用，
+已删除；`TinyGladeMakeWallMaterials.py` 同步不再建它、也不再写 `PillarMaterial`。）**
 
 **机制已核实，结论待实测。** 引擎侧真正会走岔的是
 `MeshPassProcessor.cpp:1304` 的 `bDoOverrideArgs`，它要求 `PrimitiveIdStreamIndex >= 0`；
@@ -2177,7 +2179,8 @@ P3 `above_to_below` / `below_to_above` 过渡与「哪儿铺灰泥」的片边�
 - 标记 **`AttachToActor`** + 写相对变换 ⇒ 整栋移动 / 旋转 / 落座由场景图带走，只有 footprint / 墙高变化要通知。
 - **被拒 ⇒ 隐藏 mesh，标记留着**（对位 `validate_blueprints` 不实例化）。
 - **两层 P1 收窄**：④ 作废（见下），洞缘全靠 ①②③ 的几何贴合。
-- `CSHouseFrame` 的窗台砖分支（`bSill`）随之**退役**；门樘 / 拱圈石不受影响。
+- `CSHouseFrame` 的窗台砖分支（`bSill`）随之**退役**；门樘 / 拱圈石不受影响。**2026-09-10 已删**：
+  `FPath::bSill` / `SillLen`、`CSHouse_SillMinZ` 与 usf 第四段一并移除，窗周围不走砖头补全。
 - **卷二 A9 玻璃母材质提前变成必需**：窗有 mesh 就得有材质，`M_TG_Glass` 是 unlit 且只许 gallery 用（裁决六）。
 - 补 `PostEditUndo` ⇒ 顺手关掉 09-05 列的"移动-撤销后登记不刷新"疑点。
 - 卷二 W2「窗框资产引用放标记 actor 上、由房子另开实例通路」→ 后半作废：**标记自己就是实例通路**。
@@ -2550,7 +2553,7 @@ HandleDrag(bFinished);
 | **离屏 capture 有了 ViewState 之后，Lumen 单帧间接光恒为零** | 凡是没被太阳直射的 lit 表面**精确 (0,0,0)**，看着像"几何有洞/材质坏了"。**坑 ⑧ 与本条方向相反**：修了 ⑧ 才会触发 ⑨ | 导出前 `capture_scene()` 预热 ≥16 次（本项目取 32）。Lumen 的最终聚集靠**帧间历史**，一帧抓不出来 |
 | **母材质没勾 `bUsedWithInstancedStaticMeshes`** | 引擎**静默换成默认材质**，症状与"没绑材质"**逐像素相同**。`M_TG_Texture`（gallery 看图材质）就没勾 | 走实例路的材质必须勾。把它纳入 `IsXxxDrawable` 的执行面，别只查"材质非空" |
 | **注释可能在撒谎，别只读注释** | `RebuildGpuMesh` 的 `!IsRegistered()` 分支注释写着"省一次渲染往返"，**实际调了 `ReleaseGpuMesh()`** —— 每帧白付 3 次阻塞刷新，而且与容量/包围盒/实例数全都无关 | 追性能问题时**读代码不读注释**；改属性 ⇒ `RerunConstructionScripts` ⇒ **卸载全部组件**，这条链是很多"莫名其妙每帧重建"的根 |
-| **`-ExecutePythonScript` 没有 tick 去泵 GameThread AsyncTask** | 刚拖完读到的三角形数**落后一代**，看着像"改动没生效" | 异步编辑收尾（`PendingBodySnapshot` → `OnBodyEditComplete`）需要 tick；脚本里要显式 settle。编辑器里有 tick 故非缺陷。**旧代码每帧的阻塞刷新无意中替它做了同步 —— 消掉阻塞才暴露出来** |
+| **`-ExecutePythonScript` 没有 tick 去泵 GameThread AsyncTask** | 刚拖完读到的三角形数**落后一代**，看着像"改动没生效" | 异步编辑收尾（`BodySlot.Pending` → `OnBodyEditComplete`）需要 tick；脚本里要显式 settle。编辑器里有 tick 故非缺陷。**旧代码每帧的阻塞刷新无意中替它做了同步 —— 消掉阻塞才暴露出来** |
 | **拿 TG 贴图前先确认它是干什么用的** | `grass_patch_summer` 是草叶**卡片**贴图，形状全在 alpha 里、RGB 空白边是纯白 —— 当地面贴图用会在每个平铺边界糊出白线 | 提取资产按**用途**核对，不按名字猜；地面用 `dirtpath_grass` 这类不透明无缝图 |
 | `unreal.Rotator(a,b,c)` 是 `(roll, pitch, yaw)` | 相机朝正上方看天，出图一张纯渐变，像"渲染没出来" | 一律用关键字参数。判别：拍一张俯视，地平线**竖着**就是 roll 被当成了 pitch |
 | `-ExecutePythonScript` 跑完即退编辑器 | tick 回调永远不触发 | 需要 tick 的脚本用真编辑器 + `-ExecCmds="py <脚本>"` |
@@ -3859,7 +3862,7 @@ D12 现在只写了「边界翻转 churn……不可接受再给已存在实例�
 | **A2** | **`QueryFeaturePlacement` 返回 `FCSFeaturePlacement`**（`bAccepted` + `Reason` + `SnappedWorld`）。计划已给结构体，只是没落地；P2 让拒绝原因从锦上添花变必需品 | `CSHouseActor.h/.cpp` ~40 行 + 单测；调用点只有 `ComputeDoors:316` 一处 | 无（纯加法，计划已裁决过形态） |
 | **A3** | **`CSHouse_OpeningCell` 按 `Type` 分流墩宽**（门 `PierWidth`、窗 `csh.WindowPierWidth` 默认 0）+ `csh.WindowMinSillZ` 下限守卫 | `CSHouseProfile.h` ~10 行 + 两处调用点同步 + 单测 | 无（W3/W6/P3） |
 | **A4** | **`CurrentOpenings.Sort` 末位加 `SourceId`**，让同 `(EdgeIndex, CenterS)` 的两个洞有全序 —— 幂等短路的正确性条件 | 1 行 + 一条单测 | 无（P4；与楼梯对照第二节「pull 不 push」同一条纪律） |
-| ~~**A5**~~ | ~~窗洞冒烟测~~ **已做**（`House.WindowPredicateMatchesGeometry` / `House.FrameWindowSill` + `demo_house_window`）。⚠️ 判据里的「墙板 + 窗台盒」两项会随 2026-09-05 的两层重做失效，届时改判「砖层洞缘贴合 + 灰泥覆盖度」 | — | — |
+| ~~**A5**~~ | ~~窗洞冒烟测~~ **已做**（`House.WindowPredicateMatchesGeometry` / `House.FrameSkipsWindows`（原 `FrameWindowSill`）+ `demo_house_window`）。⚠️ 判据里的「墙板 + 窗台盒」两项会随 2026-09-05 的两层重做失效，届时改判「砖层洞缘贴合 + 灰泥覆盖度」 | — | — |
 | **A6** | **`ACSHouseFeatureMarker` + `ACSWindowMarker`**（D8 主体）。TG 侧形态已逐条对上（第 2.2 节），照计划实现即可；`DecoratorBackup` 印证了「弹回最后被答应位置」的做法 | 新 actor ~350 行 + 编辑器 tick 那几个坑（计划已列全） | 无（**C1 已于 2026-08-30 拍板选甲**，前置裁决已解除） |
 | ~~**A7**~~ | ~~**面板垂直细分**（C1 的乙案）：同一 S 区间上下两块面板各带一个 clip 场~~ **作废** —— C1 于 2026-08-30 拍板选甲（谓词降维），不做垂直细分 | — | — |
 | ~~**A8**~~ | ~~矩形窗的框不走曲线铺砖，改摆四条直边~~ **已做**（`CSHouseFrame.cpp:119` 的 `Rect` 分支），**且已被 2026-09-05 两层裁决吸收**：框砖并入砖层，矩形洞的四条直边就是砖层里被贴合过的那几列砖 | — | — |

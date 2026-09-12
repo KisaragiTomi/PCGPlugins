@@ -33,7 +33,7 @@
 | 1 | **附属物自带 mesh，房子只挖洞**：窗 = 附属 actor 自带的预制 StaticMesh，房子不砌窗框砖 / 窗台盒 | 2026-09-06 | 单测 `House.WindowMarker`；`CSHouseFeatureMarker.{h,cpp}` 的 `MeshComponent`；默认资产 `decorators_window_cottage_1x1`（78 × 17 × 160、32 三角） |
 | 2 | **锚点是权威**：`FCSWallAnchor(EdgeIndex, CornerSide, DistFromCorner, SillZ)` 是唯一序列化权威，actor 变换派生 | 2026-09-06 | 单测 `House.WallAnchor`：近角选择 / 往返 / **拉尺寸后世界位置不动**（含「绝对弧长会滑 100」的反证）/ 夹取 / 不动点 |
 | 3 | **三个具名组件只有 `OpeningMesh` 定洞**，`LintelMesh` / `SillMesh` 不承担任何机制；组件恒在、网格可空 | 2026-09-06 | 单测 `House.WindowMarker` 新增段：给 `LintelMesh` / `SillMesh` 挂**故意超大**的假件（引擎 100³ Cube）后 `GetDemandSize` 与窗洞数**逐位不变**；探针 `probe_window_bps.py` |
-| 4 | **窗不出框砖，门照旧出**（`BuildEdgeElements` 里的 `Type != Window`） | 2026-09-06 | 单测 `House.FrameWindowSill`（同一个洞只换 `Type` 送两遍）+ `House.WindowPredicateMatchesGeometry`（`WindowBricks==0` 且 `DoorPaths>0`）；回归 `demo_house_window` `bricks=130 (was 130)` |
+| 4 | **窗不出框砖，门照旧出**（`BuildEdgeElements` 里的 `Type != Window`）；窗周围不走任何砖头补全，砖路恒为三段（窗台底边第四段已删） | 2026-09-06 / 09-10 | 单测 `House.FrameSkipsWindows`（原 `FrameWindowSill`；同一个洞只换 `Type` 送两遍）+ `House.WindowPredicateMatchesGeometry`（`WindowBricks==0` 且 `DoorPaths>0`）；回归 `demo_house_window` `bricks=130 (was 130)` |
 | 5 | **转角窗不做**：窗恒锚单条边，距角过紧**直接不生成**，不吸附 / 不改形 / 不越角 / 不缩窄 | 2026-09-05 | 谓词 `NearCorner`（`S0() < CornerMargin \|\| S1() > Len − CornerMargin`）；TG 的 `generate_cottage_corner_windows` 一族永久退出范围 |
 | 6 | **不需要玻璃材质**（TG 里窗也不是透明的） | 2026-09-06 | 资产自带 `MI_window_colors_layer00` 实测 = `M_TG_Texture` 的实例、`MSM_DefaultLit` + `BLEND_Opaque`；四个候选 `MI_*` 实测同结论 ⇒ 卷二 ~~A9~~ 作废 |
 | 7 | **蓝图分层**：总蓝图调参、子蓝图换网格，`bAutoSizeFromMesh` 默认开 ⇒ 换档不动一行 C++ | 2026-09-06 | `/PCGPlugins/HouseTest/` 的 `BP_TinyGladeWindow` / `BP_Window_Cottage_1x1` / `BP_Window_Gothic_1x1`；实测 cottage 洞 78 × 160、gothic 洞 **69.4 × 203.6**（帽子 94.2 宽**没有**污染洞） |
@@ -194,10 +194,11 @@ TG 资产表是判据，一条都不用推：`setdressing_` 前缀下与洞有�
 ⚠️ **已知代价（接受）**：属性面板 `Windows` 那一份没有标记、没有网格 ⇒ 从此是**裸洞**。那条路在文档里
 一直写着是"授权 / 测试用的便利入口"，真正的来源是标记。
 
-`MakeOpeningPath` **一个字没动** —— 它的第四段（窗台底边）是 2026-08-30 特意补回来的，头文件里写着
-"别再把它删掉"。判据：单测 `House.FrameWindowSill` 把同一个洞**只换 `Type`** 送两遍（第四段由 `Z0 > 0`
-决定，与类型无关），门那一遍照铺满、窗那一遍**恰好零块零条路**；扫描测试 `House.WindowPredicate…` 同样
-一次验两头（窗为零、门非零）—— 只验前一半的话，把整条产线掐死也能全绿。
+窗周围**不走 TG 的砖头补全**（2026-09-10 用户裁决）：`MakeOpeningPath` 的第四段（窗台底边）连同
+`FPath::bSill`、`CSHouse_SillMinZ` 与 `CSHouseFrame.usf` 里那一段已整条删除，砖路恒为三段。判据：单测
+`House.FrameSkipsWindows`（原 `FrameWindowSill`）把同一个洞**只换 `Type`** 送两遍，门那一遍照铺满、
+窗那一遍**恰好零块零条路**；扫描测试 `House.WindowPredicate…` 同样一次验两头（窗为零、门非零）——
+只验前一半的话，把整条产线掐死也能全绿。
 
 #### 落地与本节的三处出入（2026-09-06 实现时改的）
 
@@ -881,7 +882,7 @@ D8 剩下的最后一件事。谓词（`CSHouse_QueryOpening`）、clip 场、�
 
 | 判据 | 位置 | 实测 |
 | --- | --- | --- |
-| 窗零块、门照铺 | `House.FrameWindowSill`（同一个洞只换 `Type` 送两遍） | 绿 |
+| 窗零块、门照铺 | `House.FrameSkipsWindows`（原 `FrameWindowSill`；同一个洞只换 `Type` 送两遍） | 绿 |
 | 扫描一次验两头 | `House.WindowPredicateMatchesGeometry`（`WindowBricks==0` 且 `DoorPaths>0`） | 绿 |
 | 开关窗砖数不变 | `demo_house_window` | `bricks=130 (was 130)` |
 | 门那边没被误伤 | 同一次回归 | `open arches grow frame bricks bricks=152`、`seam=24` |

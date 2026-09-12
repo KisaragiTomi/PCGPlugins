@@ -49,7 +49,7 @@
   </style>
 
   <text x="20" y="36" font-size="20" font-weight="700" fill="#0f172a">TinyGlade 复刻：模块交互图（谁包含谁、谁调谁、谁通知谁）</text>
-  <text x="20" y="58" class="m" font-size="12px">读法：箭头指向被调方 / 被通知方；每个框里列的是本审查核实到的交互相关状态；圈码 ⑧–⑲ = TinyGlade_结构审查.md 深挖 D / E 的小节号</text>
+  <text x="20" y="58" class="m" font-size="12px">读法：箭头指向被调方 / 被通知方；每个框里列的是本审查核实到的交互相关状态；圈码 ⑧–⑲ = TinyGlade_结构审查.md 深挖 D / E 的小节号；按 2026-09-11 代码更新</text>
 
   <line x1="20" y1="84" x2="60" y2="84" class="w"/>
   <text x="66" y="88" class="n">同步直接调用</text>
@@ -76,7 +76,7 @@
   <text x="28" y="146" class="m">花名册 + 0.25 s 兜底快扫（编辑器 world 也 tick）</text>
   <text x="28" y="164" class="b">Tracked: TMap&lt;FGuid, {House, Hash}&gt;</text>
   <text x="28" y="178" class="b">Tick：逐栋 GetTrackingHash ≠ 基线</text>
-  <text x="28" y="192" class="m">→ ReevaluateSite（同步；唯一的延后入口）</text>
+  <text x="28" y="192" class="m">→ ReevaluateSite（同步；延后入口之一）</text>
   <text x="28" y="208" class="b">PickHouse / PickHouseNear → 房子解析求交</text>
   <text x="28" y="222" class="b">PlaceMarkerAlongRay：生成 + AdoptAnchor</text>
   <text x="28" y="240" class="m">⑬ 键 = HouseId，复制房子撞键 → 只剩一栋在册</text>
@@ -115,10 +115,10 @@
   <text x="28" y="412" class="m">Host：transient 弱引用</text>
   <text x="28" y="426" class="m">+ attach 父 = 第三份宿主关系 ⑫</text>
   <text x="28" y="446" class="b">Tick（拖动期）→ HandleDrag(false)</text>
-  <text x="28" y="460" class="m">→ RegisterAnchor → 房子同步重求值 ⑨</text>
+  <text x="28" y="460" class="m">→ RegisterAnchor → 房子只标脏、合批 ⑨</text>
   <text x="28" y="480" class="b">RegisterAnchor：</text>
-  <text x="28" y="494" class="m">探针裁决 → 登记 → 回写探针 ⑪</text>
-  <text x="28" y="508" class="m">（最终裁决已在登记内推过，被盖掉）</text>
+  <text x="28" y="494" class="m">探针裁决 → 登记（只标脏）→ 回写探针 ⑪</text>
+  <text x="28" y="508" class="m">（最终裁决合批后才到；记账仍按探针）</text>
   <text x="28" y="528" class="b">MarkerId：构造期 NewGuid</text>
   <text x="28" y="542" class="m">复制 actor 不重掷 ⑬</text>
   <text x="28" y="562" class="m">读 Host->FootprintSize / WallThickness</text>
@@ -126,10 +126,10 @@
   <text x="28" y="592" class="m">无宿主自毁只在最终裁决（基类纪律 ④ ✔）</text>
 
   <rect x="420" y="340" width="300" height="270" rx="8" class="core"/>
-  <text x="428" y="360" class="t">ACSHouseActor（4541 + 2456 行）</text>
-  <text x="428" y="378" class="b">ReevaluateSite()：10 处同步入口 + 子系统 1 处 ⑨</text>
-  <text x="428" y="392" class="m">地面直推 / 标记登记 / 抓手推拉 / 构造脚本 /</text>
-  <text x="428" y="406" class="m">PostRegister / PostEditMove / Undo / RebuildHouse</text>
+  <text x="428" y="360" class="t">ACSHouseActor（4247 + 2538 行）</text>
+  <text x="428" y="378" class="b">ReevaluateSite()：同步 7 处 + 自 Tick 合批 + 子系统 ⑨</text>
+  <text x="428" y="392" class="m">只标脏：地面广播 / 标记登记；同步：抓手推拉 /</text>
+  <text x="428" y="406" class="m">构造脚本 / PostRegister / Move / Undo / Rebuild</text>
   <text x="428" y="426" class="b">MarkerWindows：{Id, Window, Anchor 副本, Marker}</text>
   <text x="428" y="440" class="m">锚点存两份、宿主关系三份 ⑫</text>
   <text x="428" y="460" class="b">ResizeHandles：4 锥 + 1 框，RF_Transient</text>
@@ -142,7 +142,7 @@
   <text x="428" y="592" class="m">HouseId：UPROPERTY()，复制 actor 不重掷 ⑬</text>
 
   <rect x="920" y="340" width="300" height="270" rx="8" class="resident"/>
-  <text x="928" y="360" class="t">ACSGroundActor（2447 + 1654 行）</text>
+  <text x="928" y="360" class="t">ACSGroundActor（2321 + 1745 行）</text>
   <text x="928" y="378" class="b">Mirror.Heights / Colors：CPU 权威镜像</text>
   <text x="928" y="398" class="b">Shapers：世界扫描 + 登记两路写同一张表 ⑩</text>
   <text x="928" y="412" class="m">顺序不随关卡保存（CSGroundDecor.h 自述）</text>
@@ -159,7 +159,7 @@
 
   <rect x="1380" y="340" width="250" height="200" rx="8" class="box"/>
   <text x="1388" y="360" class="t">ACSGroundShaperActor ×N</text>
-  <text x="1388" y="378" class="b">ACSTinyGlade 子类：网格底座从不使用 ⑲</text>
+  <text x="1388" y="378" class="b">ACSTinyGlade 子类：只借基类 OnConstruction ⑲</text>
   <text x="1388" y="398" class="b">RebuildTerrain 触发点 ×4：</text>
   <text x="1388" y="412" class="m">OnConstruction / PostRegister /</text>
   <text x="1388" y="426" class="m">PostEditChangeProperty / PostEditMove</text>
@@ -219,8 +219,8 @@
   <path d="M260 470 H418" class="w"/>
   <text x="268" y="450" class="n">探针裁决 QueryFeatureReject</text>
   <text x="268" y="464" class="n">→ RegisterFeatureMarker ⑪</text>
-  <text x="268" y="486" class="n">→ 同步 ReevaluateSite</text>
-  <text x="268" y="500" class="n">拖动期每帧一次 ⑨</text>
+  <text x="268" y="486" class="n">→ RequestReevaluate（合批）</text>
+  <text x="268" y="500" class="n">拖动期每帧一次，N 个合一 ⑨</text>
   <path d="M420 550 H262" class="w"/>
   <text x="268" y="530" class="n">NotifyMarkersRebuilt 每轮末</text>
   <text x="268" y="544" class="n">ApplyHostVerdict 回执</text>
@@ -230,8 +230,8 @@
   <!-- 边：房子 ↔ 地面 -->
   <path d="M920 385 H722" class="d"/>
   <text x="728" y="367" class="nd">OnGroundChanged 广播</text>
-  <text x="728" y="399" class="nd">→ 无条件 ReevaluateSite ⑨</text>
-  <text x="728" y="413" class="nd">每 dab / 每帧拖地面 / 每次刷新</text>
+  <text x="728" y="399" class="nd">→ RequestReevaluate（只标脏）⑨</text>
+  <text x="728" y="413" class="nd">每帧每栋至多一次（09-10 起）</text>
   <path d="M720 455 H918" class="w"/>
   <text x="728" y="437" class="n">SampleHeight / SampleRoadWeight</text>
   <text x="728" y="469" class="n">落座 ≈220 + 门 ≈340 次 / 轮</text>

@@ -227,3 +227,21 @@ EditMeshAsync：RT lambda 持 ResidentRef + WeakThis；执行后 AsyncTask(GT) �
 - `CSMeshBooleanParityTests` 与 TG 无关，只确认其裸 `FlushRenderingCommands` 不在回归窗口。
 - 回归脚本是否当前能跑到各 `flushes=0` 断言（记忆里门 / 拱段是既存红且提前中止）未验证；本文只以脚本注释里记录的历史实测作为佐证。
 - `UCSMeshPool` 只通读，未在本层发现问题（`RequestMesh` 走 `EnsureCapacitySync + Reset`，两次计数 flush）。
+
+## 2026-09-10 复核与修复记录
+
+复核基准：2026-09-10 工作区（含未提交的交接收敛 `HandOverInstanceSources`、网格槽 `ACSTinyGlade` 与 Nanite / GPU-Scene 实例路）。逐条状态与本轮改动：
+
+| 条目 | 复核时现状 | 本轮改动 |
+| --- | --- | --- |
+| B1 扩容不清零、早退门不看容量 | 交接判据已统一按容量比（`HandOverInstanceSources`），但 `GrowTo` 不清零；门框砖 / 藤 / 摆件 / 裙边摆件的早退门仍只看哈希与数量 | `CSShaperSteps_GrowTo` 三条 buffer 分配即清零；`Ensure*` 返回 `EHandoverResult`，`HandedOver` 时 `Rebuild*` 不许早退（门框砖仅在有砖时强制，免得空房每轮再交再撤）；柱子不再交从未写过的 CustomData |
+| B2 异步编辑无栅栏 | 分段表已改在完成回调发布；`WorldBounds` 六处、`KnownCounts`、`InvalidateSections` 仍在渲染线程直写 | `FCSMeshEditContext` 新增 `SetWorldBounds` / `GetWorldBounds` / `InvalidateSections`，与 `SetKnownCounts` 一起：同步通道直写、异步通道暂存到完成回调在游戏线程 `ApplyTo`、借图通道拒绝；全部十二处写点改经它 |
+| B3 布局魔数 | 未修且变多（Nanite writer 第三份 CUSTOM_DATA_FLOATS，行 stride 约 24 处） | 新增 `Shaders/Private/CSGpuSharedLayout.ush`，C++ 与 .usf 共 include；行 stride / custom data 步长 / LOD 上限 / 门框砖路 stride 与位标志 / 塑形物场步长全部改从它取 |
+| B4b 超容量静默丢 | 未修 | 石阶 / 地被 / 组件的诊断回读在 counter > 容量时打 Warning；截断本身不变 |
+| B5 包围盒口径 | 只有门框砖过 BuildToComponent；石阶 / 地被的盒含未量化的 `MaxAbsHeight` | 五家交接盒统一经 `CSHouse_BuildBoundsToComponent`；石阶 / 地被的 `MaxAbsHeight` 过 `QuantizeUp` |
+| B7 GC 滞留、错误的释放模型 | actor 级已有 `ReleaseTinyGladeGpu`；组件级不释放；三处 `ReleaseOnRenderThread` 与 `CSMesh.h` 的注释仍传"必须在渲染线程释放" | `OnComponentDestroyed` 撤源并释放常驻网格（构造脚本建的组件只撂下引用，避免改属性路径多出 flush）；点刷三处 `ClearInstances` 改 `ClearInstanceSourceGPU`；注释改写为真实模型 |
+| B8 前缀拷贝 | 未修 | `CSMesh_ReallocateResidentWithDescs` 只拷贝逐单元步长没变的流，新增流与加宽的流清零 |
+| B9 交接必阻塞 | 经典路未修；GPU-Scene 路上已无 | 未动：随实例化叶子的路线拍板一起定 |
+| B10 哈希九份 | 未修 | 未动：与 `CSHash.h / .ush` 对一起做 |
+| 点刷点源引用泄漏 | 未修 | 已修（见 B7） |
+| L0 回读层 | 从未建 | `GpuTriangleUnified_Plan.md` 标为历史文档 |

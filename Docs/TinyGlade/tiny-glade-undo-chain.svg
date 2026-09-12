@@ -32,7 +32,7 @@
     .wr { stroke:#dc2626; stroke-width:1.5; fill:none; marker-end:url(#arrow-r); }
   </style>
 
-  <text x="20" y="34" font-size="20" font-weight="700" fill="#0f172a">TinyGlade 复刻：撤销链路（一次细节面板改 FootprintSize 的记录、回放与扇出）</text>
+  <text x="20" y="34" font-size="20" font-weight="700" fill="#0f172a">TinyGlade 复刻：撤销链路（一次细节面板改 FootprintSize 的记录、回放与扇出）· 按 2026-09-11 代码</text>
   <text x="20" y="56" class="m" font-size="12px">读法：三栏从左到右是时间顺序；引擎行号为 UE 5.7.4；红框 / 红字 = 失同步发生处；底栏是事务看不见的状态，撤销后仍保持撤销前的值。括号里的 26 / 27 = TinyGlade_结构审查.md 深挖 G 小节号，C3 / C4 … = 附录 C 编号</text>
 
   <!-- 三条泳道 -->
@@ -41,7 +41,7 @@
   <rect x="984" y="70" width="502" height="500" rx="6" class="lane"/>
   <text x="20" y="92" class="h">① 记录期：细节面板把 FootprintSize.X 600 → 1000</text>
   <text x="476" y="92" class="h">② Ctrl+Z：FTransaction::Apply（EditorTransaction.cpp:814–957）</text>
-  <text x="990" y="92" class="h">③ 插件钩子的扇出：同一次 Ctrl+Z 四次进 ReevaluateSite</text>
+  <text x="990" y="92" class="h">③ 插件钩子的扇出：同一次 Ctrl+Z 三次进 ReevaluateSite</text>
 
   <!-- ① 记录期 -->
   <rect x="20" y="104" width="406" height="58" rx="4" class="box"/>
@@ -58,10 +58,10 @@
   <path class="w" d="M223 248V262"/>
 
   <rect x="20" y="262" width="406" height="72" rx="4" class="box"/>
-  <text x="30" y="280" class="t">ReanchorMarkersToPreserveWorld（CSHouseActor.cpp:301）</text>
+  <text x="30" y="280" class="t">ReanchorMarkersToPreserveWorld（CSHouseActor.cpp:308）</text>
   <text x="30" y="296" class="b">bMarkerRefValid &amp;&amp; bGeomChanged ⇒ 锚点重表达到新墙上（世界位置守恒）</text>
   <text x="30" y="310" class="r">随后 MarkerRef*（Footprint / Thickness / Build）← 新值：非 UPROPERTY</text>
-  <text x="30" y="324" class="b">不进任何记录（CSHouseActor.h:1957–1960；见底栏）</text>
+  <text x="30" y="324" class="b">不进任何记录（CSHouseActor.h:2038–2041；见底栏）</text>
   <path class="w" d="M223 334V348"/>
 
   <rect x="20" y="348" width="406" height="58" rx="4" class="box"/>
@@ -72,7 +72,7 @@
   <rect x="20" y="428" width="406" height="72" rx="4" class="ext"/>
   <text x="30" y="446" class="t">对照：gizmo 拉尺寸 / 调高度（26 / C1）</text>
   <text x="30" y="462" class="b">PushEdge / PushHeight 直写 FootprintSize 与位置，全文件零 Modify()；</text>
-  <text x="30" y="476" class="b">抓手 RF_Transient（:1189）；gizmo 只 Modify 被拖 actor 及其 attach 子级</text>
+  <text x="30" y="476" class="b">抓手 RF_Transient（:1212）；gizmo 只 Modify 被拖 actor 及其 attach 子级</text>
   <text x="30" y="490" class="r">⇒ 事务里只有记录 #2（标记），根本没有房子：Ctrl+Z 只回滚窗的锚点</text>
 
   <!-- ① → ② -->
@@ -108,50 +108,45 @@
   <rect x="476" y="428" width="476" height="58" rx="4" class="ext"/>
   <text x="486" y="446" class="t">对照：撤销不走 PostEditMove，但走 PostEditChangeProperty（属性为空）</text>
   <text x="486" y="462" class="b">PostEditUndo → PostEditChange()（Obj.cpp:847–851）→ PostEditChangeProperty(nullptr)</text>
-  <text x="486" y="476" class="b">房子 / 地面 / 标记三个 PostEditUndo 覆写的注释都只写了前半句（27 / C4、C9）</text>
+  <text x="486" y="476" class="b">房子 / 地面的 PostEditUndo 注释只写了前半句（27 / C4；房子那处 09-10 已改）</text>
 
   <!-- ② → ③ -->
-  <path class="w" d="M952 366H968V147H990"/>
-  <text x="972" y="141" class="b">先</text>
-  <path class="w" d="M952 388H978V340H990"/>
-  <text x="981" y="334" class="b">后</text>
+  <path class="w" d="M952 366H968V140H990"/>
+  <text x="972" y="134" class="b">先</text>
+  <path class="w" d="M952 388H978V219H990"/>
+  <text x="981" y="213" class="b">后</text>
 
   <!-- ③ 扇出 -->
-  <rect x="990" y="104" width="490" height="86" rx="4" class="core"/>
+  <rect x="990" y="104" width="490" height="72" rx="4" class="box"/>
   <text x="1000" y="122" class="t">标记 PostEditUndo（CSHouseFeatureMarker.cpp:175）</text>
   <text x="1000" y="138" class="b">Super 先走 PostEditChange() → 本类 PostEditChangeProperty(空)（:238）</text>
   <text x="1000" y="152" class="b">→ HandleDrag(false) 从当前变换重新射线、覆写刚恢复的 Anchor（C9）</text>
-  <text x="1000" y="166" class="b">再 RegisterAnchor(*Host) → 房子 RegisterFeatureMarker</text>
-  <text x="1000" y="180" class="t">→ ReevaluateSite #1</text>
-  <path class="wr" d="M1235 190V204"/>
+  <text x="1000" y="166" class="b">再 RegisterAnchor → 房子 RegisterFeatureMarker → RequestReevaluate：只置脏</text>
+  <path class="w" d="M1235 176V190"/>
 
-  <rect x="990" y="204" width="490" height="86" rx="4" class="bad"/>
-  <text x="1000" y="222" class="t">ReanchorMarkersToPreserveWorld 再跑一次（27 / C3）</text>
-  <text x="1000" y="238" class="b">FootprintSize 已是旧值 600，MarkerRefFootprint 仍是新值 1000（底栏）</text>
-  <text x="1000" y="252" class="b">⇒ bGeomChanged（CSHouseActor.cpp:307–310）</text>
-  <text x="1000" y="266" class="r">⇒ 把已恢复的旧锚点当「新墙上的锚点」再重表达一次 ⇒ 窗沿墙滑</text>
-  <text x="1000" y="280" class="b">之后 MarkerRef* ← 旧值，参照系「有效」了：下面三次重求值都不再纠正</text>
-  <path class="w" d="M1235 290V304"/>
+  <rect x="990" y="190" width="490" height="58" rx="4" class="box"/>
+  <text x="1000" y="208" class="t">房子 PostEditUndo（CSHouseActor.cpp:4237）→ Super::PostEditUndo()</text>
+  <text x="1000" y="224" class="b">UObject::PostEditUndo → PostEditChange() → PostEditChangeProperty(空属性)</text>
+  <text x="1000" y="238" class="b">→ Unregister → RerunConstructionScripts → Reregister（ActorEditor.cpp:172–243）</text>
+  <path class="wr" d="M1235 248V262"/>
 
-  <rect x="990" y="304" width="490" height="72" rx="4" class="box"/>
-  <text x="1000" y="322" class="t">房子 PostEditUndo（CSHouseActor.cpp:4532）→ Super::PostEditUndo()</text>
-  <text x="1000" y="338" class="b">UObject::PostEditUndo → PostEditChange() → PostEditChangeProperty(空属性)</text>
-  <text x="1000" y="352" class="b">→ UnregisterAllComponents → RerunConstructionScripts → ReregisterAllComponents</text>
-  <text x="1000" y="366" class="b">（ActorEditor.cpp:172–243；ActorConstruction.cpp:266–287, 1005）</text>
-  <path class="w" d="M1235 376V390"/>
+  <rect x="990" y="262" width="490" height="100" rx="4" class="bad"/>
+  <text x="1000" y="280" class="t">基类 OnConstruction（CSTinyGlade.cpp:276）→ ReevaluateSite #1（27 / C3）</text>
+  <text x="1000" y="296" class="b">入口清掉标记置的脏，先跑 ReanchorMarkersToPreserveWorld：</text>
+  <text x="1000" y="310" class="b">FootprintSize 已是旧值 600，MarkerRefFootprint 仍是新值 1000（底栏）</text>
+  <text x="1000" y="324" class="b">⇒ bGeomChanged（CSHouseActor.cpp:314–317）</text>
+  <text x="1000" y="338" class="r">⇒ 把已恢复的旧锚点当「新墙上的锚点」再重表达一次 ⇒ 窗沿墙滑</text>
+  <text x="1000" y="352" class="b">之后 MarkerRef* ← 旧值，参照系「有效」了：后两次重求值都不再纠正</text>
+  <path class="w" d="M1235 362V376"/>
 
-  <rect x="990" y="390" width="490" height="36" rx="4" class="core"/>
-  <text x="1000" y="413" class="t">OnConstruction（:4456）→ ReevaluateSite #2</text>
-  <path class="w" d="M1235 426V440"/>
+  <rect x="990" y="376" width="490" height="36" rx="4" class="core"/>
+  <text x="1000" y="399" class="t">PostRegisterAllComponents（CSHouseActor.cpp:4167）→ ReevaluateSite #2</text>
+  <path class="w" d="M1235 412V426"/>
 
-  <rect x="990" y="440" width="490" height="36" rx="4" class="core"/>
-  <text x="1000" y="463" class="t">PostRegisterAllComponents（:4462）→ ReevaluateSite #3</text>
-  <path class="w" d="M1235 476V490"/>
-
-  <rect x="990" y="490" width="490" height="58" rx="4" class="core"/>
-  <text x="1000" y="508" class="t">回到覆写本体：再 ReevaluateSite #4（27 / C4）</text>
-  <text x="1000" y="524" class="b">覆写注释：「AActor::PostEditUndo 不调 PostEditMove、不保证跑构造脚本」——</text>
-  <text x="1000" y="538" class="b">前半句对，后半句在 5.7.4 里不成立：上面两次就是构造脚本链跑出来的</text>
+  <rect x="990" y="426" width="490" height="58" rx="4" class="core"/>
+  <text x="1000" y="444" class="t">回到覆写本体：再 ReevaluateSite #3（27 / C4）</text>
+  <text x="1000" y="460" class="b">覆写注释 09-10 已改对；地面那处仍写「不保证跑构造脚本」</text>
+  <text x="1000" y="474" class="b">09-07 是四次：标记那次 09-10 起只置脏；房子这三次仍全部同步</text>
 
   <!-- 底栏：事务看不见的状态 -->
   <rect x="14" y="586" width="1472" height="186" rx="6" class="untracked"/>
@@ -159,15 +154,15 @@
 
   <text x="24" y="634" class="t">房子（ACSHouseActor）</text>
   <text x="24" y="652" class="b">MarkerRefFootprint / MarkerRefThickness / MarkerRefBuild / bMarkerRefValid</text>
-  <text x="24" y="666" class="r">非 UPROPERTY（.h:1957–1960）—— 27 / C3 的根因，缺 PreEditUndo</text>
+  <text x="24" y="666" class="r">非 UPROPERTY（.h:2038–2041）—— 27 / C3 的根因，缺 PreEditUndo</text>
   <text x="24" y="686" class="b">MarkerWindows（登记表）—— 非 UPROPERTY；撤销 spawn 后 garbage 标记</text>
   <text x="24" y="700" class="b">还能重新登记进来，NotifyMarkersRebuilt 到一轮末尾才按 IsStale 清（C6）</text>
-  <text x="24" y="720" class="b">*Handed* / *DescHash / Current* —— 非 UPROPERTY；靠 HasInstanceSourceGPU()</text>
+  <text x="24" y="720" class="b">FHandoverCache / *DescHash / Current* —— 非 UPROPERTY；靠 HasInstanceSourceGPU()</text>
   <text x="24" y="734" class="b">与 bForceFullRebuild 兜底，撤销后第一次重求值全量对齐</text>
   <text x="24" y="754" class="b">FootprintSize / WallHeight（gizmo 路）—— UPROPERTY 但从未 Modify() ⇒ 没进记录（26）</text>
 
   <text x="520" y="634" class="t">持久记忆（NonTransactional，有意豁免）</text>
-  <text x="520" y="652" class="b">DoorRunMemory / PierSpanIsPier（CSHouseActor.h:2203, 2213）</text>
+  <text x="520" y="652" class="b">DoorRunMemory / PierSpanIsPier（CSHouseActor.h:2284, 2294）</text>
   <text x="520" y="666" class="b">撤销后三次重求值继承的是撤销「期间」写进去的状态 ⇒ 收敛到操作后的迟回态，</text>
   <text x="520" y="680" class="b">不是操作前的画面（已知但不算结构问题；修法：PostEditUndo 先清再算）</text>
   <text x="520" y="700" class="b">Mirror（地面高度 / 颜色，CSGroundActor.h）</text>

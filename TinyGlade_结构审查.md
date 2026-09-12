@@ -37,7 +37,7 @@
 | --- | --- | --- |
 | 1 实例化产物管线 | 部分修 | 交接判据与动作已收成一份（`CSShaperSteps::HandOverInstanceSources` / `EHandoverResult`），其余五类样板仍逐家手写；实为 9 家（原文漏数柱砖）；门框砖仍漏 `ReserveCount` |
 | 2 隐式数据流与哈希覆盖 | 成立 | 顺序与约束原样；已核实的哈希缺口 15 → 12 条（F4 / D1 / D2 已修），新增 31；A2 已修，A1 仍在 |
-| 3 矩形 footprint | 成立（09-12 已拍板要改） | 代码零变化；计数改为带模式的 35 行 / 13 文件与 72 行 / 14 文件。2026-09-12 裁决升闭合折线，排建议顺序第 3 步，分六期；剩凸 / 凹一条分叉待定 |
+| 3 矩形 footprint | 部分修（09-12 起在做） | 2026-09-12 裁决升闭合折线，排建议顺序第 3 步。3a-1（折线成为边框架唯一算法，逐位等价）与 3b（墙那一路按 `NumEdges()` 走，含房体三角汤）已落地；屋面 / 接缝 / 角 / 拉尺寸四组原样。剩凸 / 凹一条分叉待定 |
 | 4 墙体两套表示 | 成立 | 窗台砖第四段与 `CSHouse_SillMinZ` 已删，窗台盒只剩字面量 `0.5f`；「容量 512」原结论有误 |
 | 5 变换契约 | 成立 | 编辑钩子仍不钉 pitch / roll / scale；交接盒已统一映射，算缓解 |
 | 6 一次改动两次重求值 | 成立 | 改属性 2 次、gizmo 松手 2 次、抓手 2 次、撤销 3 次，全部同步 |
@@ -330,7 +330,14 @@ struct FCSInstancedFamily {
 
 ### 3. 矩形 footprint 硬编码已渗透到 14 个文件
 
-**现状（09-12）：已拍板要改，代码尚未动。** 2026-09-12 用户裁决 footprint 升闭合折线，本条从「方向待拍板」变成待排期的重构，排在建议顺序第 3 步（族结构之后、`FCSHouseSiteState` 之前）。下面的计数与清单因此从「问题描述」变成「工作量清单」：机械 22 处、天然可推广 0 行、必须重写 5 组，逐函数表在附录 A。剩下唯一未定的是凸 / 凹（见「待拍板」首条），它只改④⑤两组的做法，不改①②③与分期。
+**现状（09-12）：已拍板要改，3a-1 与 3b 已落地。** 2026-09-12 用户裁决 footprint 升闭合折线，本条从「方向待拍板」变成在做的重构，排在建议顺序第 3 步（族结构之后、`FCSHouseSiteState` 之前）。下面的计数与清单因此从「问题描述」变成「工作量清单」：机械 22 处、天然可推广 0 行、必须重写 5 组，逐函数表在附录 A。
+
+已经不成立的部分（两个提交，整模块 118 条测试全绿）：
+
+- `CSHouse_GetEdge` 的 `switch (EdgeIndex & 3)` 与四条边各自硬编码的 `In` 都没了（`b91ff61`）。折线是唯一算法，矩形是特例，逐位等价由 `House.FootprintPolylineMatchesRect` 钉住。
+- 墙那一路（射线 / 就近 / 三个锚点函数 / 谓词 site / 房体 desc / 包边 / 砖层）不再假定四条边，`CSHouse_BuildBodySoup` 按 `NumEdges()` 砌墙（`6e06034`）。**附录 A 判定「天然可推广」的那一整类至此确实一行未改** —— 这条预测得到了验证。
+
+仍成立的部分：屋面 / 瓦 / 檐口锚点、接缝三函数、角石与转角墩、拉尺寸与两族抓手全部原样，下表的行数与分类对它们照旧有效。剩下未定的是凸 / 凹（见「待拍板」首条），它只改④⑤两组的做法，不改分期。
 
 **现状（09-11）：成立，代码零变化。** 两种口径在基线（`2229775`）与工作区逐文件相同。
 
@@ -1006,8 +1013,10 @@ class ACSHouseCanonicalHandleActor : public ACSHouseHandleActor
    - 29 的幂等 `Teardown()` 只管解绑 / 注销，不再承担 GPU 释放。
 3. **footprint 升闭合折线（2026-09-12 裁决）。** 排在这里而不是更后：第 2 步的族结构与墙的形状正交，可以先做；而原第 3 步的 `FCSHouseSiteState` 要把几何参数拍成只读切片、切片即哈希输入，表示还要变的话那套类型与哈希口径得定两次。逐函数清单与规模见附录 A，内部分六期，每期自带判据：
 
-   - **3a 段框架提供者（一切的前置，约 80 行）**：`FootprintSize`（`FVector2D`）→ 闭合折线 + 任意边数；`CSHouse_GetEdge` 从 `switch (EdgeIndex & 3)` 变查表；**换掉「东西两面缩短 `2T`」的直角对接约定**（非 90° 角要斜接），同步改 `CSHouse_BuildBodySoup` 的面板端面。Quoin、HeightHandle 与测试夹具都默认这条约定，一起动。判据：矩形折线（4 顶点）下逐顶点复现今天的房体三角汤。
-   - **3b 机械改动（约 22 处 / 60 行）**：`RayHitWall` / `NearestWall` 的 `Edge < 4`、锚点与谓词的 `<= 3` / `& 3`、`FootprintCorners` / `Reach`、`BuildCorners` 改 N×M、`ComputePillars`、循环上界、`CornerPierTopZ[4]` 变 `TArray`、顶点表进哈希、`Reach = max(X, Y) · 0.6` 五处、`EdgeIndex` 的 `ClampMax = "3"`。`ComputeDoors` 已是闭合周界求解，是最接近折线的一段。
+   - **3a-1 折线成为边框架的唯一算法（已完成，`b91ff61`）**：新增 `FCSHouseFootprint`（逆时针闭合折线）与唯一的几何核 `CSHouse_MakeEdgeFrame`；`In` 从四条边各自硬编码的常量变成逆时针性质的推论 `Perp(U)`；`CSHouse_GetEdge` 两个重载都走这个核，矩形只是「四顶点折线」这个特例。转角约定抽成具名的 `CSHouse_EdgeInsetsBothEnds`。67 个调用点一个没动。判据是**逐位**复现（`House.FootprintPolylineMatchesRect`：冻结一份改动前的 switch，扫 6 尺寸 × 4 墙厚 × 4 边，`==` 而不是 `IsNearlyEqual`，因为墙长进哈希）。
+   - **3b 墙那一路不再假定四条边（已完成，`6e06034`）**：`ACSHouseActor::GetFootprint()`；`RayHitWall` / `NearestWall` / 三个锚点函数 / `FCSOpeningSite` / `FCSHouseBodyDesc` / `CSHouseTrim` / `CSHouseBrickWall` 改吃折线；`CSHouse_BuildBodySoup` 的墙板循环改成 `NumEdges()`；`MakeWallAnchor` 的 `EdgeIndex & 3` 去掉；`MarkerRefFootprint` 跟着变折线（比较走 `EqualsApprox`，顶点数不同即不同）。**房体三角汤至此与边数无关** —— 喂一个五边形折线就砌五面墙。整模块 118 条测试全绿。
+   - **3a-2 转角换斜接 + 折线成为序列化权威（未做，约 80 行）**：把 `CSHouse_EdgeInsetsBothEnds` 换成逐端的让出量（斜接：转角方块沿角平分线一分为二，直角处各让 `T/2`，而不是今天的 0 或 `T`），同步改 `CSHouse_BuildBodySoup` 的面板端面（盒子变棱台）；`FootprintSize` 退役、折线本身可编辑可存盘，并处理锚点迁移（边 1/3 的 `S` 原点会移动 `T`）。⚠️ 这一期**会**改几何：矩形的外壳与内壳不变（同一个实心环），变的是转角处的面板划分与三角汤，所以判据不再是逐位复现，而是「同一实心体 + 转角处两条边各拿一半」。3a-1 那条测试届时连同冻结副本一起删。
+   - **3b-2 剩下的机械改动（未做）**：`FootprintCorners` / `Reach`、`BuildCorners` 改 N×M、`ComputePillars`、`CornerPierTopZ[4]` 变 `TArray`、顶点表进哈希、`Reach = max(X, Y) · 0.6` 五处、`EdgeIndex` 的 `ClampMax = "3"`、`CSHouseDecor::MaxRecordsBound` 的周长。`ComputeDoors` 已是闭合周界求解，是最接近折线的一段。
    - **3c 角的重定义（约 120 行）**：角石的 `Diag = 1/√2` 与内缩量换成随内角变的角平分线（`T / (2·sin(θ/2))`）、凹角不出角石；`ResolvePierSpans` 的「跨度 = 墙厚」是直角 butt joint 的推论，要重推。
    - **3d 接缝（约 120 行）**：`Intersects` 的两轴 SAT 换成全边法线（凸）或分解（凹）；`CutOnEdge` 的 Liang–Barsky 换 Cyrus–Beck，`FCSWallCut` 改多区间表 —— `CSHouse_BuildBodySoup` 已经会并重叠段，接得上。
    - **3e 屋面 + 瓦 + 檐口锚点（约 300 行，最大单项）**：凸多边形下 `InsetDistance` 可机械改成「到各边支撑线距离的 min」，脊 / 角脊 / 脊高 / 法线要从高度场重推；含凹则要真直骨架。瓦的逐坡铺设与角斜脊、`CSHouseDecor` 的檐口锚点跟着走。

@@ -653,24 +653,134 @@ struct FCSHouseEdgeFrame
 };
 
 /**
- * 周界四墙：0 南(+X 向) 1 东(+Y 向) 2 北(-X 向) 3 西(-Y 向)。东西两面缩短 2T 避免转角重叠。
+ * 房屋 footprint：**闭合折线**（2026-09-12 用户裁决，取代原来的 `FVector2D` 矩形）。
+ *
+ * 顶点按**逆时针**排列；边 `i` 从 `Verts[i]` 走到 `Verts[(i + 1) % N]`，`0` 号边的起点就是
+ * `Verts[0]`。矩形由 `MakeRect` 造出来时与老口径同序（0 南 1 东 2 北 3 西），所以边号的含义
+ * 一个字都没变。
+ *
+ * ⚠️ **逆时针不是风格选择，是 `In` 的来源**：逆时针多边形的内部恒在行进方向的**左**手侧，
+ * 于是 `In = Perp(U) = (-U.y, U.x)` 对任意边都成立 —— 这一条取代了原来四条边各自硬编码的
+ * `In`，也是折线化之所以能不碰下游那一整类纯函数（clip 场、谓词、门段、包边、砖层、藤条、
+ * 摆件锚点、门扇）的原因：它们只认 `(Start, U, In, Len)`，不认边数。
+ *
+ * 本类型目前**还不是序列化的权威** —— `ACSHouseActor::FootprintSize` 仍是被编辑的那个量，
+ * 折线由它派生（3a-1 的边界）。让折线本身可编辑、可存盘是 3a-2 的事。
+ */
+USTRUCT(BlueprintType)
+struct COMPUTESHADERGENERATOR_API FCSHouseFootprint
+{
+	GENERATED_BODY()
+
+	/** 逆时针闭合折线的顶点（局部空间，房心为原点）。末顶点与首顶点自动相连，不要重复首点。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House")
+	TArray<FVector2D> Verts;
+
+	int32 NumEdges() const { return Verts.Num(); }
+	bool IsValidFootprint() const { return Verts.Num() >= 3; }
+
+	/** 边 `i` 的两个端点（外皮线上）。越界或退化时返回 false，出参不动。 */
+	bool GetEdgeVerts(int32 EdgeIndex, FVector2D& OutA, FVector2D& OutB) const
+	{
+		const int32 N = Verts.Num();
+		if (N < 3 || EdgeIndex < 0 || EdgeIndex >= N) return false;
+		OutA = Verts[EdgeIndex];
+		OutB = Verts[(EdgeIndex + 1) % N];
+		return true;
+	}
+
+	/**
+	 * 轴对齐矩形折线，与 `CSHouse_GetEdge` 的老口径逐位同序：
+	 * 0 号边从 (−HX, −HY) 走到 (+HX, −HY)（南，+X 向），其余按逆时针。
+	 */
+	static FCSHouseFootprint MakeRect(const FVector2D& Size)
+	{
+		const double HX = Size.X * 0.5, HY = Size.Y * 0.5;
+		FCSHouseFootprint FP;
+		FP.Verts.Reserve(4);
+		FP.Verts.Add({ -HX, -HY });
+		FP.Verts.Add({ HX, -HY });
+		FP.Verts.Add({ HX, HY });
+		FP.Verts.Add({ -HX, HY });
+		return FP;
+	}
+};
+
+/**
+ * 转角对接归谁：**过渡期的直角约定**，`true` = 这条边两端各让出一个墙厚 `T`。
+ *
+ * ⚠️ **这是 3a-2 要换掉的东西，不要在它上面盖新逻辑。** 今天的语义是「偶数边吃下两个转角
+ * 方块，奇数边缩进去抵住它们」（矩形上就是南北墙通长、东西墙缩 2T）。它只在**偶数条边且
+ * 全为直角**的多边形上成立 —— 奇数边会有一个转角两边都想让，非直角处让出的量也不该是 T。
+ * 折线的终局是**斜接**：转角方块沿角平分线一分为二，两条边各拿一半，让出的量是
+ * `T / (2·tan(θ/2))`，对直角恰好退化成 `T/2`（而不是今天的 0 或 T）。
+ *
+ * 斜接落地时这个函数删掉，`CSHouse_MakeEdgeFrame` 的 `bInsetBothEnds` 换成逐端的让出量。
+ */
+inline bool CSHouse_EdgeInsetsBothEnds(int32 EdgeIndex)
+{
+	return (EdgeIndex & 1) != 0;
+}
+
+/**
+ * 一条边的框架：外皮线段 `A → B`，按转角约定让出两端，`In` 由逆时针性质导出。
+ *
+ * 所有 `CSHouse_GetEdge` 重载共用这一份 —— 矩形那条也走它，所以「矩形是折线的特例」不是
+ * 说法而是代码事实。
+ */
+inline FCSHouseEdgeFrame CSHouse_MakeEdgeFrame(const FVector2D& A, const FVector2D& B, bool bInsetBothEnds, float T)
+{
+	FCSHouseEdgeFrame F;
+	const FVector2D D = B - A;
+	const double Len0 = D.Size();
+	if (Len0 <= UE_DOUBLE_SMALL_NUMBER) return F;   // 退化边：零长框架，调用方按 Len <= 0 跳过
+
+	F.U = D / Len0;
+	// 逆时针 ⇒ 内部在左手侧。原来四条边各写一份 In 的地方就是这一行。
+	F.In = FVector2D(-F.U.Y, F.U.X);
+	// ⚠️ **先转 float 再减**，与老口径 `float(Footprint.Y) - 2 * T` 的舍入逐位一致；
+	// 在 double 里减完再转会差 1 ULP，而墙长进哈希。
+	F.Len = bInsetBothEnds ? (float(Len0) - 2 * T) : float(Len0);
+	F.Start = bInsetBothEnds ? (A + F.U * T) : A;
+	return F;
+}
+
+/**
+ * 周界某一面墙。折线版：边号即顶点号，`In` 由逆时针导出，两端按转角约定让出。
  *
  * **住在头文件里而不是 CSHouseActor.cpp 的匿名命名空间里**：墙板、门框砖、藤蔓、摆件、
  * 以及下面那条谓词全都要问"这面墙在哪、有多长"，各抄一份的症状是"藤悬在离墙半个墙厚的
  * 空中"这类只在改过 WallThickness 之后才显形的错位。单测也要拿它算墙长。
  */
+inline FCSHouseEdgeFrame CSHouse_GetEdge(int32 EdgeIndex, const FCSHouseFootprint& Footprint, float T)
+{
+	FVector2D A, B;
+	if (!Footprint.GetEdgeVerts(EdgeIndex, A, B)) return FCSHouseEdgeFrame();
+	return CSHouse_MakeEdgeFrame(A, B, CSHouse_EdgeInsetsBothEnds(EdgeIndex), T);
+}
+
+/**
+ * 周界四墙的矩形口径：0 南(+X 向) 1 东(+Y 向) 2 北(-X 向) 3 西(-Y 向)，东西两面缩短 2T。
+ *
+ * 与折线版**逐位等价**（`House.FootprintPolylineMatchesRect` 钉住）：这里不重排顶点、不走
+ * `TArray`，只是把 `MakeRect` 的四个顶点就地算出来喂同一个核，免掉热路径上的堆分配
+ * （门框砖 / 藤条 / 摆件都在逐实例的循环里问边框架）。
+ *
+ * 3a-1 期间调用方可以继续传 `FVector2D`；能产出非矩形 footprint 之后，这个重载随
+ * `ACSHouseActor::FootprintSize` 一起退役。
+ */
 inline FCSHouseEdgeFrame CSHouse_GetEdge(int32 EdgeIndex, const FVector2D& Footprint, float T)
 {
 	const double HX = Footprint.X * 0.5, HY = Footprint.Y * 0.5;
-	FCSHouseEdgeFrame F;
+	FVector2D A, B;
 	switch (EdgeIndex & 3)
 	{
-	case 0: F.Start = { -HX, -HY };     F.U = { 1, 0 };  F.In = { 0, 1 };  F.Len = float(Footprint.X); break;
-	case 1: F.Start = { HX, -HY + T };  F.U = { 0, 1 };  F.In = { -1, 0 }; F.Len = float(Footprint.Y) - 2 * T; break;
-	case 2: F.Start = { HX, HY };       F.U = { -1, 0 }; F.In = { 0, -1 }; F.Len = float(Footprint.X); break;
-	default:F.Start = { -HX, HY - T };  F.U = { 0, -1 }; F.In = { 1, 0 };  F.Len = float(Footprint.Y) - 2 * T; break;
+	case 0:  A = { -HX, -HY }; B = { HX, -HY };  break;
+	case 1:  A = { HX, -HY };  B = { HX, HY };   break;
+	case 2:  A = { HX, HY };   B = { -HX, HY };  break;
+	default: A = { -HX, HY };  B = { -HX, -HY }; break;
 	}
-	return F;
+	return CSHouse_MakeEdgeFrame(A, B, CSHouse_EdgeInsetsBothEnds(EdgeIndex), T);
 }
 
 /**

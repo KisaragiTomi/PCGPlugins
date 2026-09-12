@@ -4607,4 +4607,126 @@ bool FCSHouseMarkerDragBatchTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+// -----------------------------------------------------------------------------
+// footprint 折线化（3a-1）：折线是唯一算法，矩形是它的特例且逐位复现
+// -----------------------------------------------------------------------------
+
+namespace
+{
+/**
+ * 折线化之前 `CSHouse_GetEdge` 的**原样冻结副本**，只服务下面那条等价性断言。
+ *
+ * 冻结而不是调产线代码：要证的正是「换了实现之后这四条边一位都没动」，拿产线自己比自己
+ * 等于什么都没证。3a-2 换成斜接、四条边**应当**改变时，这条测试会红 —— 那时连同本副本
+ * 一起删掉，换成斜接自己的判据（转角方块沿角平分线均分）。
+ */
+FCSHouseEdgeFrame CSHouseTest_LegacyGetEdge(int32 EdgeIndex, const FVector2D& Footprint, float T)
+{
+	const double HX = Footprint.X * 0.5, HY = Footprint.Y * 0.5;
+	FCSHouseEdgeFrame F;
+	switch (EdgeIndex & 3)
+	{
+	case 0: F.Start = { -HX, -HY };     F.U = { 1, 0 };  F.In = { 0, 1 };  F.Len = float(Footprint.X); break;
+	case 1: F.Start = { HX, -HY + T };  F.U = { 0, 1 };  F.In = { -1, 0 }; F.Len = float(Footprint.Y) - 2 * T; break;
+	case 2: F.Start = { HX, HY };       F.U = { -1, 0 }; F.In = { 0, -1 }; F.Len = float(Footprint.X); break;
+	default:F.Start = { -HX, HY - T };  F.U = { 0, -1 }; F.In = { 1, 0 };  F.Len = float(Footprint.Y) - 2 * T; break;
+	}
+	return F;
+}
+
+/** 逐位相等（不是 IsNearlyEqual）：墙长与起点都进哈希，1 ULP 的漂移就会让幂等短路失效。 */
+bool CSHouseTest_FramesIdentical(const FCSHouseEdgeFrame& A, const FCSHouseEdgeFrame& B)
+{
+	return A.Start.X == B.Start.X && A.Start.Y == B.Start.Y
+		&& A.U.X == B.U.X && A.U.Y == B.U.Y
+		&& A.In.X == B.In.X && A.In.Y == B.In.Y
+		&& A.Len == B.Len;
+}
+}   // namespace
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseFootprintPolylineMatchesRectTest,
+	"PCGPlugins.ComputeShaderGenerator.House.FootprintPolylineMatchesRect",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseFootprintPolylineMatchesRectTest::RunTest(const FString& Parameters)
+{
+	// 尺寸扫一遍：正方形（脊长为 0）、长宽比悬殊、非整数、以及墙厚接近半短边的极端档。
+	const FVector2D Sizes[] = {
+		{ 600.0, 400.0 }, { 400.0, 600.0 }, { 500.0, 500.0 },
+		{ 1000.0, 210.0 }, { 233.7, 417.3 }, { 200.0, 200.0 },
+	};
+	const float Thicknesses[] = { 24.0f, 1.0f, 60.0f, 12.5f };
+
+	for (const FVector2D& Size : Sizes)
+	{
+		for (const float T : Thicknesses)
+		{
+			const FCSHouseFootprint FP = FCSHouseFootprint::MakeRect(Size);
+			TestEqual(TEXT("MakeRect gives four edges"), FP.NumEdges(), 4);
+
+			for (int32 Edge = 0; Edge < 4; ++Edge)
+			{
+				const FCSHouseEdgeFrame Legacy = CSHouseTest_LegacyGetEdge(Edge, Size, T);
+				const FCSHouseEdgeFrame Rect = CSHouse_GetEdge(Edge, Size, T);
+				const FCSHouseEdgeFrame Poly = CSHouse_GetEdge(Edge, FP, T);
+
+				// ① 新的矩形重载没有改变任何一位 —— 下游 67 个消费点因此不用跟着动。
+				TestTrue(*FString::Printf(TEXT("Rect overload is bit-identical to the frozen legacy switch (size %s, T %.2f, edge %d)"),
+					*Size.ToString(), T, Edge), CSHouseTest_FramesIdentical(Rect, Legacy));
+
+				// ② 折线走的是同一个核：矩形只是「四个顶点的闭合折线」，不是另一条实现。
+				TestTrue(*FString::Printf(TEXT("Polyline overload is bit-identical to the rect overload (size %s, T %.2f, edge %d)"),
+					*Size.ToString(), T, Edge), CSHouseTest_FramesIdentical(Poly, Rect));
+
+				// ③ In 是逆时针性质的推论，不再是四条边各自硬编码的常量。
+				TestTrue(*FString::Printf(TEXT("In is the left-hand perpendicular of U (edge %d)"), Edge),
+					Rect.In.X == -Rect.U.Y && Rect.In.Y == Rect.U.X);
+			}
+		}
+	}
+
+	// 非矩形折线：本轮还没有生产者能造出它，但核必须已经能吃 —— 这是 3a-2 的接口保证。
+	// 取一个正五边形（外接半径 300），逐边验 U 是单位向量、In ⊥ U 且指向房心一侧、Len > 0。
+	{
+		FCSHouseFootprint Penta;
+		for (int32 i = 0; i < 5; ++i)
+		{
+			const double Angle = 2.0 * UE_DOUBLE_PI * double(i) / 5.0;
+			Penta.Verts.Add(FVector2D(300.0 * FMath::Cos(Angle), 300.0 * FMath::Sin(Angle)));
+		}
+		TestEqual(TEXT("Pentagon has five edges"), Penta.NumEdges(), 5);
+
+		for (int32 Edge = 0; Edge < 5; ++Edge)
+		{
+			const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Penta, 24.0f);
+			TestTrue(*FString::Printf(TEXT("Pentagon edge %d has positive length"), Edge), F.Len > 0.0f);
+			TestTrue(*FString::Printf(TEXT("Pentagon edge %d has a unit U"), Edge),
+				FMath::IsNearlyEqual(F.U.Size(), 1.0, 1.0e-9));
+			TestTrue(*FString::Printf(TEXT("Pentagon edge %d has In perpendicular to U"), Edge),
+				FMath::IsNearlyZero(FVector2D::DotProduct(F.U, F.In), 1.0e-9));
+			// 逆时针 ⇒ 内法线指向房心：边中点沿 In 走一步必须更靠近原点。
+			FVector2D A, B;
+			Penta.GetEdgeVerts(Edge, A, B);
+			const FVector2D Mid = (A + B) * 0.5;
+			TestTrue(*FString::Printf(TEXT("Pentagon edge %d has In pointing inward"), Edge),
+				(Mid + F.In).Size() < Mid.Size());
+		}
+	}
+
+	// 退化输入不许炸：顶点不足三个时返回零长框架，调用方按 Len <= 0 跳过（同零长边）。
+	{
+		FCSHouseFootprint Degenerate;
+		Degenerate.Verts.Add(FVector2D::ZeroVector);
+		Degenerate.Verts.Add(FVector2D(100.0, 0.0));
+		TestFalse(TEXT("Two vertices is not a valid footprint"), Degenerate.IsValidFootprint());
+		TestTrue(TEXT("Degenerate footprint yields a zero-length frame"),
+			CSHouse_GetEdge(0, Degenerate, 24.0f).Len == 0.0f);
+		TestTrue(TEXT("Out-of-range edge yields a zero-length frame"),
+			CSHouse_GetEdge(9, FCSHouseFootprint::MakeRect(FVector2D(600.0, 400.0)), 24.0f).Len == 0.0f);
+	}
+
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR

@@ -308,10 +308,11 @@ double ACSHouseActor::ComputeSeatZ() const
 void ACSHouseActor::ReanchorMarkersToPreserveWorld()
 {
 	const FTransform Build = GetBuildTransform();
+	const FCSHouseFootprint Footprint = GetFootprint();
 
 	// **只在墙几何变了的时候做。** 纯平移 / 旋转不做 —— 标记 attach 在房子下，场景图已经带着
 	// 它一起走了；这时再"守恒世界位置"等于把窗从房子上扯下来留在原地。
-	const bool bGeomChanged = !MarkerRefFootprint.Equals(FootprintSize, 0.01)
+	const bool bGeomChanged = !MarkerRefFootprint.EqualsApprox(Footprint, 0.01)
 		|| !FMath::IsNearlyEqual(MarkerRefThickness, WallThickness, 0.01f);
 
 	if (bMarkerRefValid && bGeomChanged)
@@ -329,7 +330,7 @@ void ACSHouseActor::ReanchorMarkersToPreserveWorld()
 
 			// ② 投到新墙上，只取**沿墙**分量。法向那一维故意丢掉：墙沿自己的法线挪时窗必须跟着走
 			//    （否则窗会留在半空），要守恒的只有"窗在这面墙上的哪个位置"。
-			const FCSHouseEdgeFrame NewF = CSHouse_GetEdge(A.EdgeIndex, FootprintSize, WallThickness);
+			const FCSHouseEdgeFrame NewF = CSHouse_GetEdge(A.EdgeIndex, Footprint, WallThickness);
 			const FVector NewStart = Build.TransformPosition(FVector(NewF.Start.X, NewF.Start.Y, 0.0));
 			const FVector NewU = Build.TransformVectorNoScale(FVector(NewF.U.X, NewF.U.Y, 0.0)).GetSafeNormal();
 			const float NewS = FMath::Clamp(float(FVector::DotProduct(OldWorld - NewStart, NewU)), 0.0f, NewF.Len);
@@ -343,7 +344,7 @@ void ACSHouseActor::ReanchorMarkersToPreserveWorld()
 		}
 	}
 
-	MarkerRefFootprint = FootprintSize;
+	MarkerRefFootprint = Footprint;
 	MarkerRefThickness = WallThickness;
 	MarkerRefBuild = Build;
 	bMarkerRefValid = true;
@@ -353,6 +354,9 @@ void ACSHouseActor::BuildWindowOpenings(TArray<FCSWallOpening>& OutCandidates) c
 {
 	OutCandidates.Reset();
 	if (!bWindowsEnabled) return;
+
+	// 循环外取一次：标记那半要逐条把锚点解成弧长，每条都重建一遍折线没有意义。
+	const FCSHouseFootprint Footprint = GetFootprint();
 
 	OutCandidates.Reserve(Windows.Num());
 	for (int32 Index = 0; Index < Windows.Num(); ++Index)
@@ -396,7 +400,7 @@ void ACSHouseActor::BuildWindowOpenings(TArray<FCSWallOpening>& OutCandidates) c
 		// 的函数，缓存下来一改尺寸就过期，而没有任何东西会去刷新它 —— 症状是框跑到新位置、洞
 		// 留在原地，再复评多少次都不会自愈。宽/高/形状/窗台高与 footprint 无关，照旧用缓存的。
 		Opening.CenterS = Entry.Anchor.IsValidAnchor()
-			? CSHouse_AnchorS(Entry.Anchor, FootprintSize, WallThickness)
+			? CSHouse_AnchorS(Entry.Anchor, Footprint, WallThickness)
 			: Entry.Window.CenterS;
 		Opening.Width = Entry.Window.Width;
 		Opening.Z0 = Entry.Window.SillZ;
@@ -414,20 +418,20 @@ FCSWallHit ACSHouseActor::RayHitWall(const FVector& WorldOrigin, const FVector& 
 	return CSHouse_RayHitWall(
 		Build.InverseTransformPosition(WorldOrigin),
 		Build.InverseTransformVectorNoScale(WorldDir.GetSafeNormal()),
-		FootprintSize, WallThickness, WallHeight, MaxDistance);
+		GetFootprint(), WallThickness, WallHeight, MaxDistance);
 }
 
 FCSWallHit ACSHouseActor::NearestWall(const FVector& WorldPoint, float MaxDistance) const
 {
 	return CSHouse_NearestWall(
 		GetBuildTransform().InverseTransformPosition(WorldPoint),
-		FootprintSize, WallThickness, WallHeight, MaxDistance);
+		GetFootprint(), WallThickness, WallHeight, MaxDistance);
 }
 
 FTransform ACSHouseActor::AnchorToWorld(const FCSWallAnchor& InAnchor, float HalfHeight, float Standoff) const
 {
 	// `A * B` = 先 A 后 B ⇒ 局部到世界是 `Local * Build`。写反了房子一旦离开原点，窗就飞了。
-	return CSHouse_AnchorToLocal(InAnchor, FootprintSize, WallThickness, HalfHeight, Standoff)
+	return CSHouse_AnchorToLocal(InAnchor, GetFootprint(), WallThickness, HalfHeight, Standoff)
 		* GetBuildTransform();
 }
 
@@ -478,7 +482,7 @@ void ACSHouseActor::UnregisterFeatureMarker(const FGuid& MarkerId)
 FCSOpeningSite ACSHouseActor::MakeOpeningSite() const
 {
 	FCSOpeningSite Site;
-	Site.Footprint = FootprintSize;
+	Site.Footprint = GetFootprint();
 	Site.WallThickness = WallThickness;
 	Site.WallHeight = WallHeight;
 	Site.LintelBand = LintelBand;
@@ -886,6 +890,7 @@ float ACSHouseActor::ComputeDoorWidthScale(float GapMax, float GapFull, float Ga
 FCSRoofDesc ACSHouseActor::GetRoofDesc() const
 {
 	FCSRoofDesc Desc;
+	// 屋面还认矩形：直骨架的内距公式是 `min(HX − |x|, HY − |y|)`，折线化排在 3e。
 	Desc.Footprint = FootprintSize;
 	Desc.EaveZ = WallHeight + RoofHeightOffset;
 	Desc.Pitch = RoofPitch;
@@ -1340,7 +1345,7 @@ void CSHouse_BuildBodySoup(const FCSHouseBodyDesc& Desc, FCSGpuMeshCPUData& S)
 	// 这是 Tiny Glade 原版的开洞方式：CPU 只提供解析参数，洞形在像素阶段成立。洞缘因此是
 	// 解析精确曲线（无限分辨率），而不是受弦高容差限制的折线。代价是 discard 只丢像素、
 	// 不生成表面 —— 洞缘的厚度断口由门框砖块填满，见下面的说明。
-	for (int32 Edge = 0; Edge < 4; ++Edge)
+	for (int32 Edge = 0; Edge < Desc.Footprint.NumEdges(); ++Edge)
 	{
 		const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Desc.Footprint, T);
 		const FVector U(F.U.X, F.U.Y, 0), In(F.In.X, F.In.Y, 0), Up(0, 0, 1);
@@ -1480,7 +1485,7 @@ void CSHouse_BuildBodySoup(const FCSHouseBodyDesc& Desc, FCSGpuMeshCPUData& S)
 void ACSHouseActor::RebuildBodyMesh()
 {
 	FCSHouseBodyDesc Desc;
-	Desc.Footprint = FootprintSize;
+	Desc.Footprint = GetFootprint();
 	Desc.WallThickness = WallThickness;
 	Desc.WallHeight = WallHeight;
 	Desc.PierWidth = PierWidth;
@@ -2315,7 +2320,7 @@ int32 ACSHouseActor::GetBrickWallBrickBudget() const
 {
 	const CSHouseBrickWall::FCourses Courses =
 		CSHouseBrickWall::PlanCourses(WallHeight, BrickWallCourseHeight);
-	return CSHouseBrickWall::EstimateBricks(FootprintSize, WallThickness, Courses,
+	return CSHouseBrickWall::EstimateBricks(GetFootprint(), WallThickness, Courses,
 		FMath::Max(FrameBrickLength, 1.0f));
 }
 
@@ -2347,7 +2352,7 @@ uint32 ACSHouseActor::BuildBrickWallBricks(TArray<CSHouseFrame::FElement>& InOut
 	// 哈希只记标量：层高 + 每层的砖数与各段的 (边号, S 区间)。逐砖位置是它们的纯函数。
 	// ⚠️ 必须逐层记，不能只记总砖数：把一扇窗左右挪半米，总数可以一块不差而位置全变了。
 	H.Append({ Courses.Count, CSHouse_Q(Courses.Height, 0.5) });
-	const int32 Added = CSHouseBrickWall::BuildWall(World, FootprintSize, WallThickness, Courses,
+	const int32 Added = CSHouseBrickWall::BuildWall(World, GetFootprint(), WallThickness, Courses,
 		Clearance, MakeArrayView(CurrentOpenings), Seed, Params, Runs, InOutElements,
 		[&H](int32 CourseIndex, const CSHouseTrim::FBand& Band, int32 CourseBricks,
 			const TArray<CSHouseTrim::FRun>& CourseRuns)
@@ -2399,7 +2404,7 @@ uint32 ACSHouseActor::BuildTrimBricks(TArray<CSHouseFrame::FElement>& InOutEleme
 		CSHouseTrim::FBand Band;
 		Band.CenterZ = CenterZ;
 		Band.HalfHeight = HalfHeight;
-		const int32 Added = CSHouseTrim::BuildBand(World, FootprintSize, WallThickness, Band, Clearance,
+		const int32 Added = CSHouseTrim::BuildBand(World, GetFootprint(), WallThickness, Band, Clearance,
 			MakeArrayView(CurrentOpenings), Seed, Salt, Params, Runs, InOutElements);
 		OutRunCount = Runs.Num();
 		CurrentTrimBrickCount += Added;

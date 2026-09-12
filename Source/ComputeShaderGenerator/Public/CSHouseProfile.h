@@ -690,6 +690,20 @@ struct COMPUTESHADERGENERATOR_API FCSHouseFootprint
 	}
 
 	/**
+	 * 形状是否一致（顶点数相同且逐顶点在容差内）。参照系比较用它 —— 顶点数变了就是变了，
+	 * 不比坐标：加一个顶点而其余不动，墙的段划分已经换了一套。
+	 */
+	bool EqualsApprox(const FCSHouseFootprint& Other, double Tolerance) const
+	{
+		if (Verts.Num() != Other.Verts.Num()) return false;
+		for (int32 i = 0; i < Verts.Num(); ++i)
+		{
+			if (!Verts[i].Equals(Other.Verts[i], Tolerance)) return false;
+		}
+		return true;
+	}
+
+	/**
 	 * 轴对齐矩形折线，与 `CSHouse_GetEdge` 的老口径逐位同序：
 	 * 0 号边从 (−HX, −HY) 走到 (+HX, −HY)（南，+X 向），其余按逆时针。
 	 */
@@ -814,13 +828,13 @@ struct FCSWallHit
  */
 inline FCSWallHit CSHouse_RayHitWall(
 	const FVector& LocalOrigin, const FVector& LocalDir,
-	const FVector2D& Footprint, float T, float WallHeight, float MaxDistance)
+	const FCSHouseFootprint& Footprint, float T, float WallHeight, float MaxDistance)
 {
 	FCSWallHit Best;
 	Best.Distance = MaxDistance;
 
 	const FVector2D Dir2(LocalDir.X, LocalDir.Y);
-	for (int32 Edge = 0; Edge < 4; ++Edge)
+	for (int32 Edge = 0; Edge < Footprint.NumEdges(); ++Edge)
 	{
 		const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Footprint, T);
 		if (F.Len <= UE_KINDA_SMALL_NUMBER) continue;
@@ -853,13 +867,13 @@ inline FCSWallHit CSHouse_RayHitWall(
  * S / Z 都夹到墙面内，所以它返回的永远是墙上一个**合法**位置，谓词那关照旧另判。
  */
 inline FCSWallHit CSHouse_NearestWall(
-	const FVector& LocalPoint, const FVector2D& Footprint, float T, float WallHeight, float MaxDistance)
+	const FVector& LocalPoint, const FCSHouseFootprint& Footprint, float T, float WallHeight, float MaxDistance)
 {
 	FCSWallHit Best;
 	Best.Distance = MaxDistance;
 
 	const FVector2D P2(LocalPoint.X, LocalPoint.Y);
-	for (int32 Edge = 0; Edge < 4; ++Edge)
+	for (int32 Edge = 0; Edge < Footprint.NumEdges(); ++Edge)
 	{
 		const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Footprint, T);
 		if (F.Len <= UE_KINDA_SMALL_NUMBER) continue;
@@ -940,7 +954,7 @@ struct COMPUTESHADERGENERATOR_API FCSWallAnchor
  * `SillZ` 由调用方给：命中点的 `Z` 是窗**心**高度，洞底要再减半个窗高（口径与
  * `ACSWindowMarker::MakeDemand` 一致，两处必须同源，否则窗会整体偏高半扇）。
  */
-inline FCSWallAnchor CSHouse_MakeWallAnchor(const FCSWallHit& Hit, const FVector2D& Footprint, float T, float SillZ)
+inline FCSWallAnchor CSHouse_MakeWallAnchor(const FCSWallHit& Hit, const FCSHouseFootprint& Footprint, float T, float SillZ)
 {
 	FCSWallAnchor A;
 	if (!Hit.bHit) return A;
@@ -948,7 +962,8 @@ inline FCSWallAnchor CSHouse_MakeWallAnchor(const FCSWallHit& Hit, const FVector
 	const FCSHouseEdgeFrame F = CSHouse_GetEdge(Hit.EdgeIndex, Footprint, T);
 	const float S = FMath::Clamp(Hit.S, 0.0f, FMath::Max(F.Len, 0.0f));
 
-	A.EdgeIndex = Hit.EdgeIndex & 3;
+	// 边号原样收下（原来是 `& 3`）：命中本来就来自逐边遍历，折线化之后边数不再是 4。
+	A.EdgeIndex = Hit.EdgeIndex;
 	// 正中间（S == Len/2）归**起点角**：判据要给出确定的一侧，`>` 而不是 `>=` 就是这个用意。
 	A.bFromEndCorner = (S > F.Len * 0.5f);
 	A.DistFromCorner = A.bFromEndCorner ? (F.Len - S) : S;
@@ -962,7 +977,7 @@ inline FCSWallAnchor CSHouse_MakeWallAnchor(const FCSWallHit& Hit, const FVector
  * 墙缩短到锚点越界时**夹到 `[0, Len]`** 而不是留在墙外：谓词那关照旧会判 `NearCorner` 把它拒掉，
  * 但夹住能保证派生变换永远落在墙面上 —— 标记不会飞到墙外的空中去。
  */
-inline float CSHouse_AnchorS(const FCSWallAnchor& A, const FVector2D& Footprint, float T)
+inline float CSHouse_AnchorS(const FCSWallAnchor& A, const FCSHouseFootprint& Footprint, float T)
 {
 	const FCSHouseEdgeFrame F = CSHouse_GetEdge(A.EdgeIndex, Footprint, T);
 	const float Len = FMath::Max(F.Len, 0.0f);
@@ -988,7 +1003,7 @@ inline float CSHouse_AnchorS(const FCSWallAnchor& A, const FVector2D& Footprint,
  * `HalfHeight` = 窗高的一半：锚点存的是洞底，而标记本体锚在窗**心**（口径同 `MakeDemand`）。
  */
 inline FTransform CSHouse_AnchorToLocal(
-	const FCSWallAnchor& A, const FVector2D& Footprint, float T, float HalfHeight, float Standoff)
+	const FCSWallAnchor& A, const FCSHouseFootprint& Footprint, float T, float HalfHeight, float Standoff)
 {
 	const FCSHouseEdgeFrame F = CSHouse_GetEdge(A.EdgeIndex, Footprint, T);
 	const float S = CSHouse_AnchorS(A, Footprint, T);
@@ -1027,7 +1042,7 @@ enum class ECSFeatureReject : uint8
 /** 谓词的全部输入。房子只是把自己的属性填进来 —— 抽出来是为了让纯 CPU 单测能调**同一条**判据。 */
 struct FCSOpeningSite
 {
-	FVector2D Footprint = FVector2D(600.0, 400.0);
+	FCSHouseFootprint Footprint = FCSHouseFootprint::MakeRect(FVector2D(600.0, 400.0));
 	float WallThickness = 24.0f;
 	float WallHeight = 300.0f;
 	float LintelBand = 40.0f;

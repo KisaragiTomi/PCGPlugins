@@ -1791,7 +1791,7 @@ struct FCSHouseTestBodyCase
 FCSHouseBodyDesc CSHouseTest_MakeBody(const FCSHouseTestBodyCase& Case)
 {
 	FCSHouseBodyDesc Body;
-	Body.Footprint = FVector2D(Case.SizeX, Case.SizeY);
+	Body.Footprint = FCSHouseFootprint::MakeRect(FVector2D(Case.SizeX, Case.SizeY));
 	Body.WallHeight = Case.WallHeight;
 	Body.WallThickness = Case.WallThickness;
 	return Body;   // World = Identity ⇒ 三角汤就是局部坐标
@@ -2215,7 +2215,7 @@ bool FCSHouseWindowPredicateMatchesGeometryTest::RunTest(const FString& Paramete
 	}
 
 	FCSOpeningSite Site;
-	Site.Footprint = Foot;
+	Site.Footprint = FCSHouseFootprint::MakeRect(Foot);
 	Site.WallThickness = Case.WallThickness;
 	Site.WallHeight = Case.WallHeight;
 	Site.LintelBand = CDO->LintelBand;
@@ -2807,7 +2807,7 @@ bool FCSHouseSeamGeometryTest::RunTest(const FString& Parameters)
 	// 拿房体三角汤直接验：接缝那一段的三角形数**不许减少**（不生成面板就是一个真几何洞），
 	// 而裁剪判据必须在那一段上说"丢掉"。两条一起才说得清"洞在渲染层、不在几何里"。
 	FCSHouseBodyDesc Desc;
-	Desc.Footprint = A.Footprint;
+	Desc.Footprint = FCSHouseFootprint::MakeRect(A.Footprint);
 	Desc.WallThickness = A.WallThickness;
 	Desc.WallHeight = A.WallHeight;
 	Desc.PierWidth = 40.0f;
@@ -3126,7 +3126,7 @@ bool FCSHouseTrimTilesPerimeterTest::RunTest(const FString& Parameters)
 	Params.MaxBricks = 512;
 
 	TArray<CSHouseFrame::FElement> Elements;
-	const int32 Bricks = CSHouseTrim::BuildBand(FTransform::Identity, Footprint, T, Band, 6.0f,
+	const int32 Bricks = CSHouseTrim::BuildBand(FTransform::Identity, FCSHouseFootprint::MakeRect(Footprint), T, Band, 6.0f,
 		TArrayView<const FCSWallOpening>(), 0x99u, CSHouseFrame::EPathFamily::TrimTop, Params, Runs, Elements);
 
 	TestEqual(TEXT("a hole-free rectangle yields one run per edge"), Runs.Num(), 4);
@@ -3199,7 +3199,7 @@ bool FCSHouseTrimAvoidsOpeningsTest::RunTest(const FString& Parameters)
 		Band.CenterZ = CenterZ;
 		Band.HalfHeight = 10.0f;
 		TArray<CSHouseFrame::FElement> Elements;
-		CSHouseTrim::BuildBand(FTransform::Identity, Footprint, T, Band, 6.0f,
+		CSHouseTrim::BuildBand(FTransform::Identity, FCSHouseFootprint::MakeRect(Footprint), T, Band, 6.0f,
 			MakeArrayView(Openings), 0x77u, Salt, Params, OutRuns, Elements);
 		return Band;
 	};
@@ -3243,7 +3243,7 @@ bool FCSHouseTrimAvoidsOpeningsTest::RunTest(const FString& Parameters)
 		Band.HalfHeight = 10.0f;
 		TArray<CSHouseTrim::FRun> Runs;
 		TArray<CSHouseFrame::FElement> Elements;
-		CSHouseTrim::BuildBand(FTransform::Identity, Footprint, T, Band, 6.0f,
+		CSHouseTrim::BuildBand(FTransform::Identity, FCSHouseFootprint::MakeRect(Footprint), T, Band, 6.0f,
 			MakeArrayView(HighOnly), 0x77u, CSHouseFrame::EPathFamily::TrimTop, Params, Runs, Elements);
 
 		int32 Cut = 0;
@@ -3263,7 +3263,7 @@ bool FCSHouseTrimAvoidsOpeningsTest::RunTest(const FString& Parameters)
 		Band.HalfHeight = 10.0f;
 		TArray<CSHouseTrim::FRun> Runs;
 		TArray<CSHouseFrame::FElement> Elements;
-		CSHouseTrim::BuildBand(FTransform::Identity, Footprint, T, Band, 6.0f,
+		CSHouseTrim::BuildBand(FTransform::Identity, FCSHouseFootprint::MakeRect(Footprint), T, Band, 6.0f,
 			MakeArrayView(Overlap), 0x77u, CSHouseFrame::EPathFamily::TrimBase, Params, Runs, Elements);
 
 		for (const CSHouseTrim::FRun& R : Runs)
@@ -3301,7 +3301,7 @@ bool FCSHouseWallPickTest::RunTest(const FString& Parameters)
 	// 边 0 的外表面是 y = -HY = -200，外法线 (0,-1)。从外面朝 +Y 打过去必须命中它。
 	{
 		const FCSWallHit Hit = CSHouse_RayHitWall(
-			FVector(0.0, -400.0, 150.0), FVector(0.0, 1.0, 0.0), Footprint, T, WallHeight, 1000.0f);
+			FVector(0.0, -400.0, 150.0), FVector(0.0, 1.0, 0.0), FCSHouseFootprint::MakeRect(Footprint), T, WallHeight, 1000.0f);
 		TestTrue(TEXT("ray from outside hits the south wall"), Hit.bHit);
 		TestEqual(TEXT("it is edge 0"), Hit.EdgeIndex, 0);
 		// 边 0 的 Start = (-HX, -HY)、U = (+1, 0) ⇒ x = 0 处的 S 就是半个 footprint.X。
@@ -3317,28 +3317,28 @@ bool FCSHouseWallPickTest::RunTest(const FString& Parameters)
 	// 贴到背面那堵墙上，而画面上看起来只是"窗跑到对面去了"。
 	{
 		const FCSWallHit Hit = CSHouse_RayHitWall(
-			FVector::ZeroVector, FVector(0.0, -1.0, 0.0), Footprint, T, WallHeight, 1000.0f);
+			FVector::ZeroVector, FVector(0.0, -1.0, 0.0), FCSHouseFootprint::MakeRect(Footprint), T, WallHeight, 1000.0f);
 		TestFalse(TEXT("a ray leaving from inside hits nothing"), Hit.bHit);
 	}
 
 	// 打在墙顶以上 ⇒ 不命中（Z 越界）。这条守的是"窗贴到屋顶上"。
 	{
 		const FCSWallHit Hit = CSHouse_RayHitWall(
-			FVector(0.0, -400.0, WallHeight + 50.0), FVector(0.0, 1.0, 0.0), Footprint, T, WallHeight, 1000.0f);
+			FVector(0.0, -400.0, WallHeight + 50.0), FVector(0.0, 1.0, 0.0), FCSHouseFootprint::MakeRect(Footprint), T, WallHeight, 1000.0f);
 		TestFalse(TEXT("a ray above the eave hits nothing"), Hit.bHit);
 	}
 
 	// 够不着 ⇒ 不命中。MaxDistance 就是标记的探针长度，这条守的是"隔着半张地图也能咬上"。
 	{
 		const FCSWallHit Hit = CSHouse_RayHitWall(
-			FVector(0.0, -400.0, 150.0), FVector(0.0, 1.0, 0.0), Footprint, T, WallHeight, 100.0f);
+			FVector(0.0, -400.0, 150.0), FVector(0.0, 1.0, 0.0), FCSHouseFootprint::MakeRect(Footprint), T, WallHeight, 100.0f);
 		TestFalse(TEXT("a ray that falls short hits nothing"), Hit.bHit);
 	}
 
 	// 就近版：贴在南墙外一点点、朝向随便，必须找到边 0 并把 S/Z 夹进墙面内。
 	{
 		const FCSWallHit Hit = CSHouse_NearestWall(
-			FVector(0.0, -230.0, 150.0), Footprint, T, WallHeight, 200.0f);
+			FVector(0.0, -230.0, 150.0), FCSHouseFootprint::MakeRect(Footprint), T, WallHeight, 200.0f);
 		TestTrue(TEXT("a point just outside the wall snaps to it"), Hit.bHit);
 		TestEqual(TEXT("it is edge 0"), Hit.EdgeIndex, 0);
 		TestTrue(FString::Printf(TEXT("perpendicular distance (%.1f)"), Hit.Distance),
@@ -3347,7 +3347,7 @@ bool FCSHouseWallPickTest::RunTest(const FString& Parameters)
 	// 太远 ⇒ 不吸附。两条都空才轮到标记自毁，所以这条界限是承重的。
 	{
 		const FCSWallHit Hit = CSHouse_NearestWall(
-			FVector(0.0, -1000.0, 150.0), Footprint, T, WallHeight, 200.0f);
+			FVector(0.0, -1000.0, 150.0), FCSHouseFootprint::MakeRect(Footprint), T, WallHeight, 200.0f);
 		TestFalse(TEXT("a far point snaps to nothing"), Hit.bHit);
 	}
 	return true;
@@ -3406,7 +3406,7 @@ bool FCSHouseBrickWallTest::RunTest(const FString& Parameters)
 		TArray<CSHouseTrim::FRun> Runs;
 		TArray<CSHouseFrame::FElement> Elements;
 		int32 CoursesSeen = 0;
-		NoHoleBricks = CSHouseBrickWall::BuildWall(FTransform::Identity, Footprint, T, Courses,
+		NoHoleBricks = CSHouseBrickWall::BuildWall(FTransform::Identity, FCSHouseFootprint::MakeRect(Footprint), T, Courses,
 			3.0f, TArrayView<const FCSWallOpening>(), 0x1234u, Params, Runs, Elements,
 			[&](int32, const CSHouseTrim::FBand&, int32, const TArray<CSHouseTrim::FRun>& R)
 			{
@@ -3416,7 +3416,7 @@ bool FCSHouseBrickWallTest::RunTest(const FString& Parameters)
 		TestEqual(TEXT("every course was emitted"), CoursesSeen, Courses.Count);
 		TestTrue(TEXT("bricks were emitted at all"), NoHoleBricks > 0);
 
-		const int32 Budget = CSHouseBrickWall::EstimateBricks(Footprint, T, Courses, Params.Length);
+		const int32 Budget = CSHouseBrickWall::EstimateBricks(FCSHouseFootprint::MakeRect(Footprint), T, Courses, Params.Length);
 		TestTrue(FString::Printf(TEXT("the estimate is an upper bound (%d <= %d)"), NoHoleBricks, Budget),
 			NoHoleBricks <= Budget);
 		// 上界就是"周长 / 砖长 × 层数"，别留魔数：这里现算一遍对答案。
@@ -3451,7 +3451,7 @@ bool FCSHouseBrickWallTest::RunTest(const FString& Parameters)
 		TArray<CSHouseFrame::FElement> Elements;
 		int32 CutCourses = 0;
 
-		const int32 Total = CSHouseBrickWall::BuildWall(FTransform::Identity, Footprint, T, Courses,
+		const int32 Total = CSHouseBrickWall::BuildWall(FTransform::Identity, FCSHouseFootprint::MakeRect(Footprint), T, Courses,
 			Clearance, MakeArrayView(Openings), 0x1234u, Params, Runs, Elements,
 			[&](int32 Index, const CSHouseTrim::FBand& Band, int32, const TArray<CSHouseTrim::FRun>& R)
 			{
@@ -3511,7 +3511,7 @@ bool FCSHouseBrickWallTest::RunTest(const FString& Parameters)
 	//
 	// 所以这里从**比砖距还窄**（10 cm，砖距 26）一路扫到很宽，单洞与三洞各来一遍。
 	{
-		const int32 Budget = CSHouseBrickWall::EstimateBricks(Footprint, T, Courses, Params.Length);
+		const int32 Budget = CSHouseBrickWall::EstimateBricks(FCSHouseFootprint::MakeRect(Footprint), T, Courses, Params.Length);
 		const float Widths[8] = { 10.0f, 13.0f, 20.0f, 26.0f, 40.0f, 78.0f, 100.0f, 150.0f };
 		int32 Worst = 0;
 		float WorstWidth = 0.0f;
@@ -3539,7 +3539,7 @@ bool FCSHouseBrickWallTest::RunTest(const FString& Parameters)
 
 				TArray<CSHouseTrim::FRun> SweepRuns;
 				TArray<CSHouseFrame::FElement> SweepElements;
-				const int32 Built = CSHouseBrickWall::BuildWall(FTransform::Identity, Footprint, T, Courses,
+				const int32 Built = CSHouseBrickWall::BuildWall(FTransform::Identity, FCSHouseFootprint::MakeRect(Footprint), T, Courses,
 					3.0f, MakeArrayView(Many), 0x1234u, Params, SweepRuns, SweepElements, Noop);
 				if (Built > Worst)
 				{
@@ -3599,7 +3599,7 @@ bool FCSHouseBrickWallTest::RunTest(const FString& Parameters)
 		TArray<CSHouseFrame::FElement> Elements;
 		float PrevSpan = TNumericLimits<float>::Max();
 		int32 Narrowing = 0;
-		CSHouseBrickWall::BuildWall(FTransform::Identity, Footprint, T, Courses, 0.0f,
+		CSHouseBrickWall::BuildWall(FTransform::Identity, FCSHouseFootprint::MakeRect(Footprint), T, Courses, 0.0f,
 			MakeArrayView(Openings), 0x1234u, Params, Runs, Elements,
 			[&](int32, const CSHouseTrim::FBand& Band, int32, const TArray<CSHouseTrim::FRun>&)
 			{
@@ -3621,7 +3621,7 @@ bool FCSHouseBrickWallTest::RunTest(const FString& Parameters)
 		Tight.MaxBricks = 100;
 		TArray<CSHouseTrim::FRun> Runs;
 		TArray<CSHouseFrame::FElement> Elements;
-		const int32 Total = CSHouseBrickWall::BuildWall(FTransform::Identity, Footprint, T, Courses,
+		const int32 Total = CSHouseBrickWall::BuildWall(FTransform::Identity, FCSHouseFootprint::MakeRect(Footprint), T, Courses,
 			3.0f, TArrayView<const FCSWallOpening>(), 0x1234u, Tight, Runs, Elements, Noop);
 		TestTrue(FString::Printf(TEXT("the wall is truncated at capacity (%d <= 100)"), Total),
 			Total <= 100);
@@ -3657,19 +3657,19 @@ bool FCSHouseWallAnchorTest::RunTest(const FString& Parameters)
 	// ---- 锚到**近**的那个角 ----
 	{
 		// 边 0 长 600。S = 100 靠起点角。
-		const FCSWallAnchor A = CSHouse_MakeWallAnchor(MakeHit(0, 100.0f, 150.0f), Footprint, T, 95.0f);
+		const FCSWallAnchor A = CSHouse_MakeWallAnchor(MakeHit(0, 100.0f, 150.0f), FCSHouseFootprint::MakeRect(Footprint), T, 95.0f);
 		TestTrue(TEXT("anchor is valid"), A.IsValidAnchor());
 		TestFalse(TEXT("S=100 on a 600 wall anchors to the start corner"), A.bFromEndCorner);
 		TestTrue(TEXT("and records 100 from it"), FMath::IsNearlyEqual(A.DistFromCorner, 100.0f, 0.01f));
 
 		// S = 500 靠终点角。
-		const FCSWallAnchor B = CSHouse_MakeWallAnchor(MakeHit(0, 500.0f, 150.0f), Footprint, T, 95.0f);
+		const FCSWallAnchor B = CSHouse_MakeWallAnchor(MakeHit(0, 500.0f, 150.0f), FCSHouseFootprint::MakeRect(Footprint), T, 95.0f);
 		TestTrue(TEXT("S=500 anchors to the end corner"), B.bFromEndCorner);
 		TestTrue(TEXT("and records 100 from it"), FMath::IsNearlyEqual(B.DistFromCorner, 100.0f, 0.01f));
 
 		// 正中间归**起点角** —— 判据要给出确定的一侧，否则同一个位置两次算出两个锚点，
 		// 而两者在墙不变时给出同一个 S ⇒ 差异要等到第一次拉尺寸才显形。
-		const FCSWallAnchor M = CSHouse_MakeWallAnchor(MakeHit(0, 300.0f, 150.0f), Footprint, T, 95.0f);
+		const FCSWallAnchor M = CSHouse_MakeWallAnchor(MakeHit(0, 300.0f, 150.0f), FCSHouseFootprint::MakeRect(Footprint), T, 95.0f);
 		TestFalse(TEXT("dead centre is deterministic (start corner)"), M.bFromEndCorner);
 	}
 
@@ -3679,9 +3679,9 @@ bool FCSHouseWallAnchorTest::RunTest(const FString& Parameters)
 		{
 			const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Footprint, T);
 			const float S = F.Len * 0.3f;
-			const FCSWallAnchor A = CSHouse_MakeWallAnchor(MakeHit(Edge, S, 150.0f), Footprint, T, 95.0f);
+			const FCSWallAnchor A = CSHouse_MakeWallAnchor(MakeHit(Edge, S, 150.0f), FCSHouseFootprint::MakeRect(Footprint), T, 95.0f);
 			TestTrue(FString::Printf(TEXT("edge %d round-trips S=%.1f"), Edge, S),
-				FMath::IsNearlyEqual(CSHouse_AnchorS(A, Footprint, T), S, 0.01f));
+				FMath::IsNearlyEqual(CSHouse_AnchorS(A, FCSHouseFootprint::MakeRect(Footprint), T), S, 0.01f));
 		}
 	}
 
@@ -3706,11 +3706,11 @@ bool FCSHouseWallAnchorTest::RunTest(const FString& Parameters)
 
 		// 窗在边 2 的 S = 500 处 ⇒ 靠终点角（= 世界里不动的那个角）。
 		const float SBefore = 500.0f;
-		const FCSWallAnchor A = CSHouse_MakeWallAnchor(MakeHit(2, SBefore, 150.0f), Before, T, 95.0f);
+		const FCSWallAnchor A = CSHouse_MakeWallAnchor(MakeHit(2, SBefore, 150.0f), FCSHouseFootprint::MakeRect(Before), T, 95.0f);
 		TestTrue(TEXT("it anchored to the corner that will not move"), A.bFromEndCorner);
 
 		const double XBefore = WorldXOnEdge2(SBefore, Before, 0.0);
-		const double XAfter = WorldXOnEdge2(CSHouse_AnchorS(A, After, T), After, CentreShift);
+		const double XAfter = WorldXOnEdge2(CSHouse_AnchorS(A, FCSHouseFootprint::MakeRect(After), T), After, CentreShift);
 		TestTrue(FString::Printf(TEXT("the window holds its world position across the resize (%.1f -> %.1f)"),
 				XBefore, XAfter),
 			FMath::IsNearlyEqual(XBefore, XAfter, 0.01));
@@ -3721,20 +3721,20 @@ bool FCSHouseWallAnchorTest::RunTest(const FString& Parameters)
 			FMath::IsNearlyEqual(XAbsolute - XBefore, 100.0, 0.01));
 
 		// 而靠**会动**的那个角的窗，本来就该随墙走：+X 面从 300 挪到 400。
-		const FCSWallAnchor Near = CSHouse_MakeWallAnchor(MakeHit(2, 100.0f, 150.0f), Before, T, 95.0f);
+		const FCSWallAnchor Near = CSHouse_MakeWallAnchor(MakeHit(2, 100.0f, 150.0f), FCSHouseFootprint::MakeRect(Before), T, 95.0f);
 		TestFalse(TEXT("a window near the pushed corner anchors to it"), Near.bFromEndCorner);
 		TestTrue(TEXT("and travels with that corner"),
 			FMath::IsNearlyEqual(
-				WorldXOnEdge2(CSHouse_AnchorS(Near, After, T), After, CentreShift)
+				WorldXOnEdge2(CSHouse_AnchorS(Near, FCSHouseFootprint::MakeRect(After), T), After, CentreShift)
 					- WorldXOnEdge2(100.0f, Before, 0.0),
 				100.0, 0.01));
 	}
 
 	// ---- 墙缩到锚点越界 ⇒ 夹回墙面内（谓词照旧会判 NearCorner，但位置不许飞出去） ----
 	{
-		const FCSWallAnchor A = CSHouse_MakeWallAnchor(MakeHit(0, 100.0f, 150.0f), Footprint, T, 95.0f);
+		const FCSWallAnchor A = CSHouse_MakeWallAnchor(MakeHit(0, 100.0f, 150.0f), FCSHouseFootprint::MakeRect(Footprint), T, 95.0f);
 		const FVector2D Tiny(50.0, 400.0);
-		const float S = CSHouse_AnchorS(A, Tiny, T);
+		const float S = CSHouse_AnchorS(A, FCSHouseFootprint::MakeRect(Tiny), T);
 		TestTrue(FString::Printf(TEXT("S clamps into the shortened wall (%.1f)"), S), S >= 0.0f && S <= 50.0f);
 	}
 
@@ -3749,18 +3749,18 @@ bool FCSHouseWallAnchorTest::RunTest(const FString& Parameters)
 		{
 			const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Footprint, T);
 			const float S = F.Len * 0.4f;
-			const FCSWallAnchor A = CSHouse_MakeWallAnchor(MakeHit(Edge, S, 150.0f), Footprint, T, 150.0f - WinHeight * 0.5f);
+			const FCSWallAnchor A = CSHouse_MakeWallAnchor(MakeHit(Edge, S, 150.0f), FCSHouseFootprint::MakeRect(Footprint), T, 150.0f - WinHeight * 0.5f);
 
-			const FTransform Local = CSHouse_AnchorToLocal(A, Footprint, T, WinHeight * 0.5f, Standoff);
+			const FTransform Local = CSHouse_AnchorToLocal(A, FCSHouseFootprint::MakeRect(Footprint), T, WinHeight * 0.5f, Standoff);
 			const FCSWallHit Back = CSHouse_RayHitWall(
-				Local.GetLocation(), Local.GetRotation().GetForwardVector(), Footprint, T, WallHeight, 600.0f);
+				Local.GetLocation(), Local.GetRotation().GetForwardVector(), FCSHouseFootprint::MakeRect(Footprint), T, WallHeight, 600.0f);
 
 			TestTrue(FString::Printf(TEXT("edge %d: the derived transform still sees its own wall"), Edge), Back.bHit);
 			TestEqual(FString::Printf(TEXT("edge %d: same edge"), Edge), Back.EdgeIndex, Edge);
 			TestTrue(FString::Printf(TEXT("edge %d: same S (%.2f vs %.2f)"), Edge, Back.S, S),
 				FMath::IsNearlyEqual(Back.S, S, 0.01f));
 
-			const FCSWallAnchor Round = CSHouse_MakeWallAnchor(Back, Footprint, T, Back.Z - WinHeight * 0.5f);
+			const FCSWallAnchor Round = CSHouse_MakeWallAnchor(Back, FCSHouseFootprint::MakeRect(Footprint), T, Back.Z - WinHeight * 0.5f);
 			TestTrue(FString::Printf(TEXT("edge %d: the anchor is a fixed point of resolve"), Edge), Round == A);
 		}
 	}
@@ -4022,7 +4022,7 @@ bool FCSHouseWindowBrushPlacementTest::RunTest(const FString& Parameters)
 		const float HalfHeight = Marker->GetDemandHalfHeight();
 		TestTrue(TEXT("the marker reports a sane demand height to begin with"), HalfHeight > 1.0f);
 		const float SillZ = FMath::Max(0.0f, Hit.Z - HalfHeight);
-		const FCSWallAnchor Want = CSHouse_MakeWallAnchor(Hit, Footprint, T, SillZ);
+		const FCSWallAnchor Want = CSHouse_MakeWallAnchor(Hit, FCSHouseFootprint::MakeRect(Footprint), T, SillZ);
 		if (!TestTrue(TEXT("the hand-built anchor is valid"), Want.IsValidAnchor())) return false;
 
 		Marker->AdoptAnchor(House, Want);
@@ -4044,7 +4044,7 @@ bool FCSHouseWindowBrushPlacementTest::RunTest(const FString& Parameters)
 		// 的函数（`S = bFromEndCorner ? Len − Dist : Dist`），硬编 120 只在这一个尺寸下成立，
 		// 房子一改尺寸就变成一条骗人的绿灯。顺便钉一次它此刻确实**就是** 120，
 		// 免得两边一起写错还互相印证。
-		const float WantS = CSHouse_AnchorS(Want, Footprint, T);
+		const float WantS = CSHouse_AnchorS(Want, FCSHouseFootprint::MakeRect(Footprint), T);
 		TestTrue(FString::Printf(TEXT("the anchor really points at the spot we aimed at (S=%.2f)"), WantS),
 			FMath::IsNearlyEqual(WantS, 120.0f, 0.01f));
 

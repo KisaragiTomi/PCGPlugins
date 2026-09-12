@@ -70,7 +70,7 @@ bool FCSWindowBrushEdMode::TraceCandidatePoint(const FVector& Start, const FVect
 	// （`Standoff = 0`、`HalfHeight = 0` ⇒ 恰好落在命中高度上）。
 	// ⚠️ 不直接用 `GetBuildTransform()` 自己拼 —— 它是 private，而且"构建空间只取 yaw"这条
 	// 口径必须只有一处实现（三处写岔的症状是房子一转窗就贴到旁边去）。
-	const FCSWallAnchor Probe = CSHouse_MakeWallAnchor(Hit, House->FootprintSize, House->WallThickness, Hit.Z);
+	const FCSWallAnchor Probe = CSHouse_MakeWallAnchor(Hit, House->GetFootprint(), House->WallThickness, Hit.Z);
 	if (!Probe.IsValidAnchor()) return false;
 
 	const FTransform WallFrame = House->AnchorToWorld(Probe, 0.0f, 0.0f);

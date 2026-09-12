@@ -384,7 +384,7 @@ bool ACSHouseFeatureMarker::OnHandleDrag(bool bFinal)
 
 	// `Modify()` 让锚点进事务 —— 撤销要能把它一起回滚，否则 `PostEditUndo` 拿到的是新锚点。
 	Modify();
-	Anchor = CSHouse_MakeWallAnchor(Hit, Found->FootprintSize, Found->WallThickness, SillZ);
+	Anchor = CSHouse_MakeWallAnchor(Hit, Found->GetFootprint(), Found->WallThickness, SillZ);
 
 	RegisterAnchor(*Found);
 
@@ -418,7 +418,7 @@ FCSHouseWindow ACSWindowMarker::MakeDemand(const FCSWallAnchor& InAnchor, const 
 	Out.EdgeIndex = InAnchor.EdgeIndex;
 	// **诉求的弧长从锚点现算**，不是存下来的 —— 房子一改尺寸，同一个锚点算出来的就是新墙上
 	// 的新弧长。这正是"推第 e 条边，e+1 那面墙没动窗却滑了 Δ"那个 bug 的修法。
-	Out.CenterS = CSHouse_AnchorS(InAnchor, InHost.FootprintSize, InHost.WallThickness);
+	Out.CenterS = CSHouse_AnchorS(InAnchor, InHost.GetFootprint(), InHost.WallThickness);
 	Out.Width = DemandWidth;
 	Out.Height = DemandHeight;
 	Out.Shape = Shape;

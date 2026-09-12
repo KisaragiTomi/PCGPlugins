@@ -69,8 +69,8 @@ struct FCSDoorRunMemory
 
 struct FCSHouseBodyDesc
 {
-	/** 底面尺寸 cm（局部 X/Y）。 */
-	FVector2D Footprint = FVector2D(600.0, 400.0);
+	/** 底面轮廓（闭合折线，局部空间）。墙板数 = 边数，`CSHouse_BuildBodySoup` 不再假定 4。 */
+	FCSHouseFootprint Footprint = FCSHouseFootprint::MakeRect(FVector2D(600.0, 400.0));
 
 	float WallThickness = 24.0f;
 	/** 墙顶高。四坡屋顶下四面墙顶都平在这个高度上（= 屋面求值器的 EaveZ）。 */
@@ -245,6 +245,19 @@ public:
 	/** 底面尺寸 cm（X=长边候选，Y=短边候选）；位置/朝向用 actor transform（支持任意 yaw）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House", meta = (ClampMin = "100.0"))
 	FVector2D FootprintSize = FVector2D(600.0, 400.0);
+
+	/**
+	 * footprint 的**折线视图**（2026-09-12 裁决：矩形不是终局）。
+	 *
+	 * ⚠️ 3b 期间它是**派生量**：被编辑、被序列化、被 `PushEdge` 推的仍然是上面那个
+	 * `FootprintSize`，这里只是把它翻成四顶点闭合折线。让折线本身可编辑（于是能画出非矩形
+	 * 的房子）是 3a-2 的事，那时这两个量调个个儿：折线成为权威，`FootprintSize` 退役。
+	 *
+	 * **按值返回**：四个顶点一次小分配。逐实例的热路径问的是 `CSHouse_GetEdge`（它在矩形
+	 * 重载里就地算顶点、不碰堆），不是这个 —— 调用方在循环外取一次即可。
+	 */
+	UFUNCTION(BlueprintPure, Category = "CS House")
+	FCSHouseFootprint GetFootprint() const { return FCSHouseFootprint::MakeRect(FootprintSize); }
 
 	/** 檐口高 cm。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House", meta = (ClampMin = "100.0"))
@@ -2035,7 +2048,7 @@ private:
 	 * 而锚点自己不知道这件事。不存在一种静态编码能在所有推法下都保持世界位置不变 —— 只能拿
 	 * 「上一次的墙」把同一个物理点重新表达一次。
 	 */
-	FVector2D MarkerRefFootprint = FVector2D::ZeroVector;
+	FCSHouseFootprint MarkerRefFootprint;
 	float MarkerRefThickness = 0.0f;
 	FTransform MarkerRefBuild = FTransform::Identity;
 	bool bMarkerRefValid = false;

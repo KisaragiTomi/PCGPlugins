@@ -224,7 +224,7 @@ ACSHouseFeatureMarker* UCSHouseSubsystem::PlaceMarkerAlongRay(
 	// 命中点是窗**心**的高度，锚点存的是**洞底** ⇒ 减半个窗高（口径与 `OnHandleDrag` 同源；
 	// 两处写岔的症状是"窗整体偏高半扇"，而且贴檐口时会莫名判 `AboveEave`）。
 	const float SillZ = FMath::Max(0.0f, Hit.Z - Marker->GetDemandHalfHeight());
-	Marker->AdoptAnchor(House, CSHouse_MakeWallAnchor(Hit, House->FootprintSize, House->WallThickness, SillZ));
+	Marker->AdoptAnchor(House, CSHouse_MakeWallAnchor(Hit, House->GetFootprint(), House->WallThickness, SillZ));
 	return Marker;
 }
 

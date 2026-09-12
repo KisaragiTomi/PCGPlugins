@@ -77,13 +77,13 @@ inline FCourses PlanCourses(float WallHeight, float RequestedHeight)
  * 只用来对预算与写断言 —— 真实值一定不大于它（洞只会让砖变少），而且每段不足半块砖时
  * `AppendFlatRun` 直接不出，所以短段还会再少一点。
  */
-inline int32 EstimateBricks(const FVector2D& Footprint, float WallThickness, const FCourses& Courses, float BrickLength)
+inline int32 EstimateBricks(const FCSHouseFootprint& Footprint, float WallThickness, const FCourses& Courses, float BrickLength)
 {
 	if (Courses.Count <= 0) return 0;
 	const float Length = FMath::Max(BrickLength, 1.0f);
 
 	float Perimeter = 0.0f;
-	for (int32 Edge = 0; Edge < 4; ++Edge)
+	for (int32 Edge = 0; Edge < Footprint.NumEdges(); ++Edge)
 	{
 		Perimeter += FMath::Max(CSHouse_GetEdge(Edge, Footprint, WallThickness).Len, 0.0f);
 	}
@@ -102,7 +102,7 @@ inline int32 EstimateBricks(const FVector2D& Footprint, float WallThickness, con
  * 跟着槽位走就会在改门的那一刻让整面墙的随机色重新洗一遍。
  */
 template <typename FCourseSink>
-inline int32 BuildWall(const FTransform& World, const FVector2D& Footprint, float WallThickness,
+inline int32 BuildWall(const FTransform& World, const FCSHouseFootprint& Footprint, float WallThickness,
 	const FCourses& Courses, float Clearance, TArrayView<const FCSWallOpening> AllOpenings,
 	uint32 Seed, const CSHouseFrame::FBrickParams& Params,
 	TArray<CSHouseTrim::FRun>& OutRuns, TArray<CSHouseFrame::FElement>& InOutElements,

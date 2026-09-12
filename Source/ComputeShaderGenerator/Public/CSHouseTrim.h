@@ -133,7 +133,7 @@ inline int32 SplitEdge(int32 EdgeIndex, float EdgeLen, const FBand& Band, float 
  * 逐实例随机数从 **房子身份 + 家族盐 + 段序号** 派生，不从槽位派生：包边排在砖序最后，
  * 前面任何一段（开一扇门、来一个邻居）都会把它的槽位整体推走。
  */
-inline int32 BuildTrimElements(const FTransform& World, const FVector2D& Footprint, float WallThickness,
+inline int32 BuildTrimElements(const FTransform& World, const FCSHouseFootprint& Footprint, float WallThickness,
 	const TArray<FRun>& Runs, const FBand& Band, uint32 Seed, uint32 FamilySalt,
 	const CSHouseFrame::FBrickParams& Params, TArray<CSHouseFrame::FElement>& InOutElements)
 {
@@ -165,7 +165,7 @@ inline int32 BuildTrimElements(const FTransform& World, const FVector2D& Footpri
  *
  * `AllOpenings` 是整栋房子的洞表（已按 `(边, CenterS)` 排序）。
  */
-inline int32 BuildBand(const FTransform& World, const FVector2D& Footprint, float WallThickness,
+inline int32 BuildBand(const FTransform& World, const FCSHouseFootprint& Footprint, float WallThickness,
 	const FBand& Band, float Clearance, TArrayView<const FCSWallOpening> AllOpenings,
 	uint32 Seed, uint32 FamilySalt, const CSHouseFrame::FBrickParams& Params,
 	TArray<FRun>& OutRuns, TArray<CSHouseFrame::FElement>& InOutElements)
@@ -173,7 +173,7 @@ inline int32 BuildBand(const FTransform& World, const FVector2D& Footprint, floa
 	OutRuns.Reset();
 	const float MinRun = FMath::Max(Params.Length, 1.0f) * 0.5f;
 
-	for (int32 Edge = 0; Edge < 4; ++Edge)
+	for (int32 Edge = 0; Edge < Footprint.NumEdges(); ++Edge)
 	{
 		const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Footprint, WallThickness);
 		if (F.Len <= MinRun) continue;

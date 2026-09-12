@@ -1,4 +1,5 @@
 #include "CSGpuInstancedMeshVertexFactory.h"
+#include "CSGpuSharedLayout.ush"   // CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS（unity 构建下靠邻居带进来，-SingleFile 会露馅）
 
 #include "MeshBatch.h"
 #include "MeshDrawShaderBindings.h"

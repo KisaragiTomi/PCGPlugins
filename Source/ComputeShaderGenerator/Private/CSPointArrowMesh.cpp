@@ -201,7 +201,7 @@ bool BuildPointArrowGeometryIntoMesh(UCSMesh* Target, const FCSPointArrowBuildPa
 		UCSMeshOps::InvalidateSections(Context);
 		// 画几个箭头由 GPU 计数决定（InCounter[0]），游戏线程不能声称自己知道输出大小。
 		Context.InvalidateKnownCounts();
-		Context.Resident.WorldBounds = WorldBounds;
+		Context.SetWorldBounds(WorldBounds);
 		bBuilt = true;
 
 		// 这里没有 SetStandardStreamAccessFinal，也没有 GraphBuilder.Execute()：两件事都归

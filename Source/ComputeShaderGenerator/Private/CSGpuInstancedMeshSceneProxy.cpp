@@ -150,6 +150,35 @@ IMPLEMENT_GLOBAL_SHADER(FCSInstancedClusterCullCS, "/Plugin/PCGPlugins/Shaders/P
 IMPLEMENT_GLOBAL_SHADER(FCSInstancedInstanceCullCS, "/Plugin/PCGPlugins/Shaders/Private/CSGpuInstancedMesh.usf", "InstanceCullCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FCSInstancedBuildArgsCS, "/Plugin/PCGPlugins/Shaders/Private/CSGpuInstancedMesh.usf", "BuildArgsCS", SF_Compute);
 
+void CSGpuInstancedAddPackPointsPass(
+	FRDGBuilder& GraphBuilder,
+	FGlobalShaderMap* ShaderMap,
+	const FCSGpuInstancePointSourceGPU& Points,
+	FRDGBufferRef InstanceCount,
+	FRDGBufferRef OutPackedInstances,
+	const FMatrix44f& WorldToComponent,
+	const FVector3f& BaseSphereCentre,
+	float BaseSphereRadius,
+	uint32 MaxSourceInstances)
+{
+	FCSInstancedPackPointsCS::FParameters* Params = GraphBuilder.AllocParameters<FCSInstancedPackPointsCS::FParameters>();
+	Params->SrcPointPositions = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(GraphBuilder.RegisterExternalBuffer(Points.Positions), PF_A32B32G32R32F));
+	Params->SrcPointNormals = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(GraphBuilder.RegisterExternalBuffer(Points.Normals), PF_A32B32G32R32F));
+	Params->SrcInstanceCount = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(InstanceCount, PF_R32_UINT));
+	Params->RWPackedInstances = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OutPackedInstances, PF_A32B32G32R32F));
+	// Point positions are absolute world space. The component sits at ordinary level
+	// coordinates, so a float matrix keeps sub-millimetre accuracy over the level.
+	Params->WorldToComponent = WorldToComponent;
+	Params->BaseSphereCentre = BaseSphereCentre;
+	Params->BaseSphereRadius = BaseSphereRadius;
+	Params->PointInstanceScale = Points.InstanceScale;
+	Params->MaxSourceInstances = MaxSourceInstances;
+
+	TShaderMapRef<FCSInstancedPackPointsCS> Shader(ShaderMap);
+	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("PackPointInstances"), Shader, Params,
+		FComputeShaderUtils::GetGroupCount(MaxSourceInstances, CullGroupSize));
+}
+
 // -----------------------------------------------------------------------------
 // Shared per-frame cull driver
 //
@@ -240,6 +269,9 @@ FCSGpuInstancedMeshSceneProxy::FCSGpuInstancedMeshSceneProxy(UCSGpuInstancedMesh
 	// WantsRayTracingGeometry() override was not yet visible; recompute with it in place so an
 	// instanced primitive without a BLAS is not reported to Lumen as traceable.
 	UpdateVisibleInLumenScene();
+	// Same story for the base's surface-cache setup: it turned off redundant-transform skipping so
+	// its capture batches follow every edit, but this leaf never registers any.
+	SetCanSkipRedundantTransformUpdates(true);
 
 	const FBox& BaseBounds = Component->GetBaseMeshSnapshot().LocalBounds;
 	BaseSphereCentre = FVector3f(BaseBounds.GetCenter());
@@ -255,7 +287,7 @@ FCSGpuInstancedMeshSceneProxy::FCSGpuInstancedMeshSceneProxy(UCSGpuInstancedMesh
 	// per slot (3+1+1 float4). Still worth a warning even though the mesh's VRAM pre-flight now
 	// refuses an allocation past the device's share outright: a request that fits is not the same
 	// as a request that was a good idea, and it is measured against the ratcheted capacity.
-	const uint64 VisibleBytes = uint64(Layout.InstanceCapacity) * Layout.NumLODs * 5ull * sizeof(FVector4f);
+	const uint64 VisibleBytes = uint64(Layout.InstanceCapacity) * Layout.NumLODs * uint64(CS_GPU_INSTANCED_ROW_FLOAT4S) * sizeof(FVector4f);
 	if (VisibleBytes > 64ull * 1024ull * 1024ull)
 	{
 		UE_LOG(LogCSGpuInstancedProxy, Warning,
@@ -359,7 +391,7 @@ void CSGpuInstancedBuildAuxStreamDescs(
 	// The packed rows are supplied directly by a packed GPU source; for a point source the cull
 	// builds them itself each frame, so it needs the room.
 	AddAux(TEXT("CSGpuInstanced.SourceInstances"), ECSGpuInstancedAuxSlot::SourceInstances, sizeof(FVector4f), PF_A32B32G32R32F,
-		bExternalPackedSource ? 1u : Layout.InstanceCapacity * 5u);
+		bExternalPackedSource ? 1u : Layout.InstanceCapacity * CS_GPU_INSTANCED_ROW_FLOAT4S);
 	AddAux(TEXT("CSGpuInstanced.ClusterBounds"), ECSGpuInstancedAuxSlot::ClusterBounds, sizeof(FVector4f), PF_A32B32G32R32F, ClusterCapacity);
 	AddAux(TEXT("CSGpuInstanced.ClusterVisible"), ECSGpuInstancedAuxSlot::ClusterVisible, sizeof(uint32), PF_R32_UINT, ClusterCapacity);
 	AddAux(TEXT("CSGpuInstanced.VisibleTransforms"), ECSGpuInstancedAuxSlot::VisibleTransforms, sizeof(FVector4f), PF_A32B32G32R32F, VisibleSlots * 3u);
@@ -540,22 +572,8 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 	// rows are always rebuilt from whatever the point buffer holds right now.
 	if (GpuPointSource.IsValid())
 	{
-		FCSInstancedPackPointsCS::FParameters* Params = GraphBuilder.AllocParameters<FCSInstancedPackPointsCS::FParameters>();
-		Params->SrcPointPositions = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(GraphBuilder.RegisterExternalBuffer(GpuPointSource.Positions), PF_A32B32G32R32F));
-		Params->SrcPointNormals = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(GraphBuilder.RegisterExternalBuffer(GpuPointSource.Normals), PF_A32B32G32R32F));
-		Params->SrcInstanceCount = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(InstanceCount, PF_R32_UINT));
-		Params->RWPackedInstances = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(SourceInstances, PF_A32B32G32R32F));
-		// Point positions are absolute world space. The component sits at ordinary level
-		// coordinates, so a float matrix keeps sub-millimetre accuracy over the level.
-		Params->WorldToComponent = FMatrix44f(WorldToLocal);
-		Params->BaseSphereCentre = BaseSphereCentre;
-		Params->BaseSphereRadius = BaseSphereRadius;
-		Params->PointInstanceScale = GpuPointSource.InstanceScale;
-		Params->MaxSourceInstances = Layout.InstanceCapacity;
-
-		TShaderMapRef<FCSInstancedPackPointsCS> Shader(ShaderMap);
-		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("PackPointInstances"), Shader, Params,
-			FComputeShaderUtils::GetGroupCount(Layout.InstanceCapacity, CullGroupSize));
+		CSGpuInstancedAddPackPointsPass(GraphBuilder, ShaderMap, GpuPointSource, InstanceCount, SourceInstances,
+			FMatrix44f(WorldToLocal), BaseSphereCentre, BaseSphereRadius, Layout.InstanceCapacity);
 	}
 
 	// Coarse level.

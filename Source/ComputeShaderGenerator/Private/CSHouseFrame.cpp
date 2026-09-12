@@ -1,5 +1,7 @@
 #include "CSHouseFrame.h"
 
+#include "CSGpuSharedLayout.ush"   // CS_HOUSE_FRAME_PATH_FLOAT4S / CS_HOUSE_FRAME_FLAG_*（与 CSHouseFrame.usf 同一份）
+
 #include "ComputeShaderGenerateHelper.h"
 #include "DataDrivenShaderPlatformInfo.h"
 #include "GlobalShader.h"
@@ -15,18 +17,17 @@ namespace
 
 constexpr int32 CSHouseFrame_GroupSize = 64;
 
-/** 逐路常量占几个 float4。**与 `CSHouseFrame.usf` 的 `FRAME_PATH_STRIDE` 必须一致。** */
-// ⚠️ 与 `CSHouseFrame.usf` 的 `FRAME_PATH_STRIDE` 是**同一个数的两份**，改一处必须改另一处。
-// 消费者只有本文件与那个 .usf（`FramePaths` 全工程只有它读），所以扩行是局部的 —— 与 packed
-// **实例**行那 5 个 float4 完全是两码事，那份才是四家 + 剔除 pass 共用的契约、动不得。
-constexpr int32 CSHouseFrame_PathStride = 8;
+/** 逐路常量占几个 float4。与 `CSHouseFrame.usf` 共用 CSGpuSharedLayout.ush 里的同一份 #define ——
+ *  以前是两侧各写一份字面量，改一处忘另一处的症状是砖全在别处而不报错（2026-09-07 审查 B3）。
+ *  消费者只有本文件与那个 .usf（`FramePaths` 全工程只有它读），所以扩行是局部的 —— 与 packed
+ *  **实例**行那 CS_GPU_INSTANCED_ROW_FLOAT4S 个 float4 完全是两码事，那份才是九家 + 剔除 pass 共用的契约。 */
+constexpr int32 CSHouseFrame_PathStride = CS_HOUSE_FRAME_PATH_FLOAT4S;
 
-/** Row4.x 的位。与 kernel 里那几个 `FRAME_FLAG_*` 逐字对应。 */
-constexpr uint32 CSHouseFrame_FlagLeftJamb = 1u << 0;
-constexpr uint32 CSHouseFrame_FlagRightJamb = 1u << 1;
-constexpr uint32 CSHouseFrame_FlagMidArc = 1u << 2;
-constexpr uint32 CSHouseFrame_FlagMidFlat = 1u << 3;
-constexpr uint32 CSHouseFrame_FlagSill = 1u << 4;
+/** Row4.x 的位。与 kernel 里那几个 `FRAME_FLAG_*` 是同一份 #define。 */
+constexpr uint32 CSHouseFrame_FlagLeftJamb = CS_HOUSE_FRAME_FLAG_LEFT_JAMB;
+constexpr uint32 CSHouseFrame_FlagRightJamb = CS_HOUSE_FRAME_FLAG_RIGHT_JAMB;
+constexpr uint32 CSHouseFrame_FlagMidArc = CS_HOUSE_FRAME_FLAG_MID_ARC;
+constexpr uint32 CSHouseFrame_FlagMidFlat = CS_HOUSE_FRAME_FLAG_MID_FLAT;
 
 class FCSHouseFrameScatterCS : public FGlobalShader
 {
@@ -71,7 +72,6 @@ void CSHouseFrame_Flatten(const TArray<CSHouseFrame::FElement>& In, TArray<FVect
 		if (E.Path.bRightJamb) Flags |= CSHouseFrame_FlagRightJamb;
 		if (E.Path.MidKind == CSHouseFrame::EMidKind::Arc) Flags |= CSHouseFrame_FlagMidArc;
 		if (E.Path.MidKind == CSHouseFrame::EMidKind::Flat) Flags |= CSHouseFrame_FlagMidFlat;
-		if (E.Path.bSill) Flags |= CSHouseFrame_FlagSill;
 
 		// Arc 存扫角、Flat 存长度：两者不会同时有意义，共用一个槽省一行 float4。
 		const float MidMeasure = E.Path.MidKind == CSHouseFrame::EMidKind::Arc ? E.Path.MidSweep : E.Path.FlatLen;
@@ -156,13 +156,6 @@ bool MakeOpeningPath(const FCSWallOpening& Opening, FPath& OutPath)
 		OutPath.bRightJamb = true;
 		break;
 	}
-
-	// 窗台底边（第四段）：洞底离地时下边界也是一条 clip 边，没砖骑上去就是一条裸露的裁剪断口。
-	// 阈值与房体那块窗台实心盒**共用 `CSHouse_SillMinZ`** —— 一处砌盒、一处砌砖，各写一个数
-	// 会出现"有盒没砖"（断口裸着）或"有砖没盒"（砖悬在半空）。
-	// 圆洞自动排除：它不出门樘（`BaseZ == TopZ`，那一圈砖本来就闭合），而窗台底边的两个端点
-	// 就是两条竖直段的底 —— 没有樘就没有可接的端点。
-	OutPath.bSill = OutPath.bLeftJamb && OutPath.bRightJamb && Opening.Z0 > CSHouse_SillMinZ;
 
 	return OutPath.TotalLen() > UE_KINDA_SMALL_NUMBER;
 }
@@ -257,10 +250,7 @@ int32 BuildEdgeElements(const FWallFrame& Frame, TArrayView<const FCSWallOpening
 		// **窗不出框砖**（2026-09-06 用户裁决「附属物自己持有 mesh」的直接后果）：窗的洞缘由
 		// 附属物自带的预制框盖住（`ACSWindowMarker::OpeningMesh`），房子再沿洞缘砌一圈就是
 		// **双份几何** —— TG 那边窗洞周围同样一条砖路都没有（卷二 §1.2：洞缘靠预制框兜底）。
-		//
-		// ⚠️ 只掐**产线**这一路，`MakeOpeningPath` 本身一个字不动：它的第四段（窗台底边）是
-		// 2026-08-30 特意补回来的，头文件里写着"别再把它删掉"，而单测 `House.FrameWindowSill`
-		// 直接调它、继续覆盖着那段逻辑。将来窗要改回房子出砖，掀掉这一行就行。
+		// 窗周围的砖头补全（曾经沿洞底补的窗台底边第四段）已于 2026-09-10 整条删除，不是留着待回滚。
 		//
 		// ⚠️ 代价（已知并接受）：属性面板 `Windows` 那份没有标记、没有网格 ⇒ 从此是**裸洞**。
 		// 那条路在文档里一直写着是"授权 / 测试用的便利入口"，真正的来源是标记。

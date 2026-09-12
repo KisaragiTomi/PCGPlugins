@@ -517,9 +517,9 @@ void CSMeshOps_BuildTriangleMaterialIds(const FStaticMeshLODResources& LOD, TArr
 
 void UCSMeshOps::InvalidateSections(FCSMeshEditContext& Context)
 {
-	// Written on the render thread inside the edit, exactly like WorldBounds, and read on the
-	// game thread once the edit's flush has completed.
-	Context.Resident.Sections.Reset();
+	// The context decides how the drop reaches the game thread: behind the flush of a synchronous
+	// edit, from the completion hop of an asynchronous one — never straight from the render thread.
+	Context.InvalidateSections();
 }
 
 void UCSMeshOps::AddSetCountersPass(FCSMeshEditContext& Context, uint32 VertexCount, uint32 IndexCount)
@@ -699,7 +699,7 @@ UCSMesh* UCSMeshOps::CopyFromStaticMesh(UCSMesh* Target, UStaticMesh* Source, co
 		}
 
 		AddSetCountersPass(Context, uint32(SourceVertexCount), uint32(SourceIndexCount));
-		Context.Resident.WorldBounds = SourceBounds;
+		Context.SetWorldBounds(SourceBounds);
 	});
 
 	return Target;
@@ -1007,7 +1007,7 @@ UCSMesh* UCSMeshOps::AppendBoxSceneTriangles(
 		Context.InvalidateKnownCounts();
 		// The query box is the only bound available without asking the GPU, and it stands as the
 		// fallback if the exact reduction below is off or fails.
-		Context.Resident.WorldBounds += QueryBox;
+		Context.SetWorldBounds(Context.GetWorldBounds() + QueryBox);
 	});
 
 	if (Options.bComputeExactBounds) ComputeWorldBoundsSync(Target);
@@ -1214,7 +1214,7 @@ void UCSMeshOps::AddCopyFromSnapshotPasses(FCSMeshEditContext& Context, const FC
 	Upload(Context.MaterialIds(), Payload.MaterialIds.GetData(), Payload.MaterialIds.Num() * sizeof(uint32));
 
 	AddSetCountersPass(Context, uint32(Payload.VertexCount), uint32(Payload.IndexCount));
-	Context.Resident.WorldBounds = Payload.WorldBounds;
+	Context.SetWorldBounds(Payload.WorldBounds);
 }
 
 bool UCSMeshOps::CopyFromMeshSnapshot(UCSMesh* Target, const FCSGpuMeshCPUData& Snapshot)
@@ -1373,8 +1373,8 @@ void UCSMeshOps::AddTransformPasses(FCSMeshEditContext& Context, const FTransfor
 	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CSMeshOps.Transform"), Shader, Params,
 		FComputeShaderUtils::GetGroupCountWrapped(int32(VertexCapacity), CSMeshOps_GroupSize));
 
-	if (Context.Resident.WorldBounds.IsValid)
-		Context.Resident.WorldBounds = Context.Resident.WorldBounds.TransformBy(Transform);
+	const FBox Bounds = Context.GetWorldBounds();
+	if (Bounds.IsValid) Context.SetWorldBounds(Bounds.TransformBy(Transform));
 }
 
 UCSMesh* UCSMeshOps::TransformMesh(UCSMesh* Target, const FTransform& Transform)
@@ -1576,7 +1576,8 @@ UCSMesh* UCSMeshOps::DisplaceGroundShapers(
 			FComputeShaderUtils::GetGroupCountWrapped(int32(ThreadCount), CSMeshOps_GroupSize));
 
 		// 位移只动 Z：包围盒按调用方已知的台高上界加宽即可，不值得为它跑一次 ComputeWorldBoundsSync。
-		if (Context.Resident.WorldBounds.IsValid)
+		FBox Bounds = Context.GetWorldBounds();
+		if (Bounds.IsValid)
 		{
 			float MaxTop = 0.0f;
 			for (int32 Index = 0; Index + CSGroundShaperField::Float4sPerShaper <= ShaperParams.Num(); Index += CSGroundShaperField::Float4sPerShaper)
@@ -1584,8 +1585,9 @@ UCSMesh* UCSMeshOps::DisplaceGroundShapers(
 				// 峰值而不是台高：二次抬升在台顶又加了一档，按台高收边会把最顶那圈顶点裁掉。
 				MaxTop = FMath::Max(MaxTop, CSGroundShaperField::PeakHeight(ShaperParams[Index + 1]));
 			}
-			Context.Resident.WorldBounds.Min.Z = FMath::Min(Context.Resident.WorldBounds.Min.Z, double(BaseZ) - 1.0);
-			Context.Resident.WorldBounds.Max.Z = FMath::Max(Context.Resident.WorldBounds.Max.Z, double(BaseZ + MaxTop) + 1.0);
+			Bounds.Min.Z = FMath::Min(Bounds.Min.Z, double(BaseZ) - 1.0);
+			Bounds.Max.Z = FMath::Max(Bounds.Max.Z, double(BaseZ + MaxTop) + 1.0);
+			Context.SetWorldBounds(Bounds);
 		}
 	});
 	return Target;
@@ -1855,7 +1857,7 @@ UCSMesh* UCSMeshOps::ComputeWorldBoundsSync(UCSMesh* Target)
 	// Through EditMeshSync rather than by writing the resident set directly: the bounds are part
 	// of what a render consumer draws with, and this is what broadcasts the change to it.
 	const FBox Bounds(Min, Max);
-	Target->EditMeshSync([Bounds](FCSMeshEditContext& Context) { Context.Resident.WorldBounds = Bounds; });
+	Target->EditMeshSync([Bounds](FCSMeshEditContext& Context) { Context.SetWorldBounds(Bounds); });
 
 	return Target;
 }

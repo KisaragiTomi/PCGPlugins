@@ -1,5 +1,11 @@
 # GPU 三角形统一规划：可拓展储存 + 单一 readback
 
+> ⚠️ **历史文档（2026-09-10 标注）。** 本文的 L0 通用回读层（`CSGpuReadback.h` / `FCSGpuReadbackRequest` /
+> `AddCopies`）与 sink B 从未按此落地：之后的「`UCSMesh` 网格对象 + `UCSMeshOps` 算子库 +
+> `UCSMeshRenderComponent`」对象层把回读收进了 `CSMeshReadback::ReadbackResidentSync`（作用在
+> `FCSMeshResident` 上，不需要 scene proxy），藤蔓 M1–M3 也随 GPU 常驻化整体完成并删掉了旧路。
+> 当前形态见 README「GPU 网格对象 · CSMesh」一节；本文只保留作为设计脉络与三种储存形态的盘点。
+
 承接项目文档 [`gpu-triangle-buffer-unification.md`](../../../doc/gpu-triangle-buffer-unification.md)（第一轮：direct + road 并入 `CSGpuMesh` 基座）。本文规划第二轮：把 `AComputeShaderMeshGenerator` 与 vine 剩余的散装 GPU→CPU 回读收进一套分层 readback，把 build/save 归一到统一 CPU 快照，并给 vine 叶子迁移收尾。方案经四路代码盘点 + 三路对抗评审（结论均为 sound-with-changes），评审修正已并入本文；所有行号为 2026-07-24 现状。
 
 ## 结论

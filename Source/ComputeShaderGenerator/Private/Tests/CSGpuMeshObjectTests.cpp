@@ -9,7 +9,11 @@
 #include "CSMeshPool.h"
 #include "CSMeshRenderComponent.h"
 #include "CSGpuMeshSceneProxy.h"
+#include "MeshCardBuild.h"
+#include "PrimitiveSceneInfo.h"
 #include "RayTracingGeometry.h"
+#include "SceneInterface.h"
+#include "StaticMeshBatch.h"
 #include "RHI.h"
 #include "ComputeShaderMeshGenerator.h"
 
@@ -536,6 +540,76 @@ bool FCSGpuMeshRenderComponentTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("The component sees the edited geometry"),
 		AfterEdit.Positions.Num() == ViaObject.Positions.Num()
 		&& !AfterEdit.Positions[0].Equals(ViaObject.Positions[0], 0.01f));
+
+	HostActor->Destroy();
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// Render component: 自己的网格自己还显存，借来的网格一个字节都不动
+//
+// 2026-09-11 用户裁决"让 gpumesh 自己释放自己的"：删除时的显存不该由拥有方 actor 在 Destroyed 里
+// 替组件收拾。三条判据：
+//   ① Outer 是组件的网格，组件销毁时当场交出常驻集合（游戏线程上立刻看得见），且**不阻塞**；
+//   ② Outer 不是组件的网格（生产方挂在自己身上、只借组件显示的那种）原封不动；
+//   ③ 交出去之后网格对象照样能用 —— 撤销删除复活的正是同一个对象，拥有方要能在上面重建。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSGpuMeshRenderComponentReleasesOwnedMeshTest,
+	"PCGPlugins.ComputeShaderGenerator.GpuMeshObject.RenderComponentReleasesOwnedMesh",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter | EAutomationTestFlags::NonNullRHI)
+
+bool FCSGpuMeshRenderComponentReleasesOwnedMeshTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+	UStaticMesh* CubeMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	if (!TestNotNull(TEXT("Engine cube mesh"), CubeMesh)) return false;
+
+	AActor* HostActor = World->SpawnActor<AActor>();
+	if (!TestNotNull(TEXT("Host actor"), HostActor)) return false;
+
+	auto MakeComponent = [HostActor]()
+	{
+		UCSMeshRenderComponent* Component = NewObject<UCSMeshRenderComponent>(HostActor);
+		Component->RegisterComponent();
+		return Component;
+	};
+	auto IsAllocated = [](const UCSMesh* Mesh)
+	{
+		const FCSMeshResident* Resident = Mesh ? Mesh->GetResidentPtr() : nullptr;
+		return Resident && Resident->IsAllocated();
+	};
+
+	UCSMeshRenderComponent* Owner = MakeComponent();
+	UCSMeshRenderComponent* Borrower = MakeComponent();
+	UCSMesh* Owned = UCSMeshOps::AllocateGpuMesh(Owner, 3, 3);      // Outer = 组件 ⇒ 归组件
+	UCSMesh* Borrowed = UCSMeshOps::AllocateGpuMesh(World, 3, 3);   // Outer = world ⇒ 只是借给组件画
+	UCSMeshOps::CopyFromStaticMesh(Owned, CubeMesh, FCSMeshFromStaticMeshOptions());
+	UCSMeshOps::CopyFromStaticMesh(Borrowed, CubeMesh, FCSMeshFromStaticMeshOptions());
+	Owner->SetGpuMesh(Owned);
+	Borrower->SetGpuMesh(Borrowed);
+	World->UpdateWorldComponents(true, false);
+	FlushRenderingCommands();
+	if (!TestTrue(TEXT("Both meshes start out allocated"), IsAllocated(Owned) && IsAllocated(Borrowed))) return false;
+
+	// ① 自己的：销毁即交出，不阻塞。
+	const int64 FlushesBefore = UCSMesh::GetBlockingFlushCount();
+	Owner->DestroyComponent();
+	TestFalse(TEXT("Destroying the component hands its own mesh's GPU memory back"), IsAllocated(Owned));
+	TestEqual(TEXT("...without a blocking flush"), UCSMesh::GetBlockingFlushCount(), FlushesBefore);
+
+	// ② 借来的：原封不动。
+	Borrower->DestroyComponent();
+	TestTrue(TEXT("A borrowed mesh is left alone"), IsAllocated(Borrowed));
+
+	// 让渲染线程那一跳真的跑完（放掉的是一套已经没有代理在借的流）。
+	FlushRenderingCommands();
+
+	// ③ 交出去之后网格照样能用。
+	UCSMeshOps::CopyFromStaticMesh(Owned, CubeMesh, FCSMeshFromStaticMeshOptions());
+	TestTrue(TEXT("The released mesh can be rebuilt in place"), IsAllocated(Owned));
 
 	HostActor->Destroy();
 	return true;
@@ -1340,6 +1414,166 @@ bool FCSGpuMeshRayTracingGeometryTest::RunTest(const FString& Parameters)
 	const FCSGpuMeshRayTracingProbe AfterEdit = CSGpuMeshTests_ProbeRayTracing(RenderComponent);
 	TestTrue(TEXT("The BLAS is rebuilt once the edit's readback lands"), AfterEdit.BuiltSerial > AfterPublish.BuiltSerial);
 	TestEqual(TEXT("The rebuilt BLAS still covers exactly the uploaded triangles"), AfterEdit.TotalPrimitives, SourceTriangles);
+
+	HostActor->Destroy();
+	return true;
+}
+#endif // RHI_RAYTRACING
+
+// -----------------------------------------------------------------------------
+// Lumen surface cache: cards from the bounds, capture batches from the published counts
+// -----------------------------------------------------------------------------
+
+#if RHI_RAYTRACING
+namespace
+{
+/** What the scene holds for the component's proxy once a frame's worth of scene updates ran. */
+struct FCSGpuMeshSurfaceCacheProbe
+{
+	const FPrimitiveSceneProxy* Proxy = nullptr;   // identity only; never dereferenced off the render thread
+	bool bLumenTracked = false;
+	bool bHasCards = false;
+	int32 NumCards = 0;
+	FBox CardBounds = FBox(ForceInit);
+	int32 NumStaticBatches = 0;
+	uint32 Batch0Primitives = 0;
+	uint32 Batch0FirstIndex = 0;
+	bool bBatch0UseForMaterial = false;
+	bool bBatch0CastShadow = true;
+	bool bBatch0UseForDepthPass = true;
+	uint32 BatchSerial = 0;
+};
+
+FCSGpuMeshSurfaceCacheProbe CSGpuMeshTests_ProbeSurfaceCache(UCSMeshRenderComponent* Component)
+{
+	// What the end of a frame does: pending transform updates and render-state recreations go to
+	// the scene, and the scene applies them — which is where static batches are collected.
+	UWorld* World = Component->GetWorld();
+	World->SendAllEndOfFrameUpdates();
+
+	TSharedRef<FCSGpuMeshSurfaceCacheProbe, ESPMode::ThreadSafe> Probe = MakeShared<FCSGpuMeshSurfaceCacheProbe, ESPMode::ThreadSafe>();
+	FSceneInterface* Scene = World->Scene;
+	FCSGpuMeshSceneProxy* Proxy = static_cast<FCSGpuMeshSceneProxy*>(Component->GetSceneProxy());
+	Probe->Proxy = Proxy;
+	ENQUEUE_RENDER_COMMAND(CSGpuMeshTestsProbeSurfaceCache)(
+		[Scene, Proxy, Probe](FRHICommandListImmediate& RHICmdList)
+		{
+			Scene->UpdateAllPrimitiveSceneInfos(RHICmdList);
+			if (!Proxy) return;
+			Probe->bLumenTracked = Proxy->IsVisibleInLumenScene();
+			if (const FCardRepresentationData* Cards = Proxy->GetMeshCardRepresentation())
+			{
+				Probe->bHasCards = true;
+				Probe->NumCards = Cards->MeshCardsBuildData.CardBuildData.Num();
+				Probe->CardBounds = Cards->MeshCardsBuildData.Bounds;
+			}
+			Probe->BatchSerial = Proxy->GetSurfaceCacheBatchSerialForTest();
+			const FPrimitiveSceneInfo* SceneInfo = Proxy->GetPrimitiveSceneInfo();
+			if (!SceneInfo) return;
+			Probe->NumStaticBatches = SceneInfo->StaticMeshes.Num();
+			if (Probe->NumStaticBatches == 0) return;
+			const FStaticMeshBatch& Batch = SceneInfo->StaticMeshes[0];
+			Probe->Batch0Primitives = Batch.Elements[0].NumPrimitives;
+			Probe->Batch0FirstIndex = Batch.Elements[0].FirstIndex;
+			Probe->bBatch0UseForMaterial = Batch.bUseForMaterial;
+			Probe->bBatch0CastShadow = Batch.CastShadow;
+			Probe->bBatch0UseForDepthPass = Batch.bUseForDepthPass;
+		});
+	FlushRenderingCommands();
+	return *Probe;
+}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSGpuMeshSurfaceCacheTest,
+	"PCGPlugins.ComputeShaderGenerator.GpuMeshObject.SurfaceCache",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter | EAutomationTestFlags::NonNullRHI)
+
+bool FCSGpuMeshSurfaceCacheTest::RunTest(const FString& Parameters)
+{
+	if (!IsRayTracingEnabled())
+	{
+		AddInfo(TEXT("Ray tracing is not enabled on this RHI; only hardware Lumen can see a GPU mesh, so there is no surface cache to build."));
+		return true;
+	}
+	if (!FCSGpuMeshSceneProxy::IsSurfaceCacheEnabled())
+	{
+		AddInfo(TEXT("r.CSGpuMesh.SurfaceCache is 0; nothing to test."));
+		return true;
+	}
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	UStaticMesh* CubeMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	if (!TestNotNull(TEXT("Engine cube mesh"), CubeMesh)) return false;
+	const uint32 SourceTriangles = uint32(CubeMesh->GetRenderData()->LODResources[0].GetNumTriangles());
+
+	UCSMesh* GpuMesh = UCSMeshOps::AllocateGpuMesh(World, 4096, 4096);
+	if (!TestNotNull(TEXT("GPU mesh"), GpuMesh)) return false;
+	UCSMeshOps::CopyFromStaticMesh(GpuMesh, CubeMesh, FCSMeshFromStaticMeshOptions());
+	const FCSMeshResident* Resident = GpuMesh->GetResidentPtr();
+	if (!TestNotNull(TEXT("Resident set"), Resident)) return false;
+
+	AActor* HostActor = World->SpawnActor<AActor>();
+	if (!TestNotNull(TEXT("Host actor"), HostActor)) return false;
+	UCSMeshRenderComponent* RenderComponent = NewObject<UCSMeshRenderComponent>(HostActor);
+	HostActor->SetRootComponent(RenderComponent);
+	RenderComponent->RegisterComponent();
+	RenderComponent->SetGpuMesh(GpuMesh);
+	World->UpdateWorldComponents(true, false);
+	FlushRenderingCommands();
+	if (!TestNotNull(TEXT("Scene proxy"), RenderComponent->GetSceneProxy())) return false;
+
+	// --- 1) Before any readback lands. The cards only need bounds, so they exist from the start; the
+	//        capture batches need counts, and a count is never guessed.
+	const FCSGpuMeshSurfaceCacheProbe BeforePublish = CSGpuMeshTests_ProbeSurfaceCache(RenderComponent);
+	if (!BeforePublish.bLumenTracked)
+	{
+		AddInfo(TEXT("Lumen does not track this primitive here (not hardware Lumen); the surface cache path is not reachable."));
+		HostActor->Destroy();
+		return true;
+	}
+	const FBox BoundsBefore = RenderComponent->CalcBounds(FTransform::Identity).GetBox();
+	TestTrue(TEXT("Cards exist before any count is known"), BeforePublish.bHasCards);
+	TestEqual(TEXT("Six cards, one per axis direction"), BeforePublish.NumCards, 6);
+	TestTrue(TEXT("The cards cover exactly the component's bounds"), BeforePublish.CardBounds.Equals(BoundsBefore, 0.01));
+	TestEqual(TEXT("No capture batch before the first readback lands"), BeforePublish.NumStaticBatches, 0);
+	TestEqual(TEXT("...and the proxy says it built none"), BeforePublish.BatchSerial, 0u);
+
+	// --- 2) The readback lands; the component's poll pushes a transform update, and the scene
+	//        collects the capture batches again — now with the counts. Same proxy.
+	CSGpuMeshTests_ForcePublishDrawArgs(GpuMesh);
+	RenderComponent->TickSurfaceCacheRefreshForTest();
+	const FCSGpuMeshSurfaceCacheProbe AfterPublish = CSGpuMeshTests_ProbeSurfaceCache(RenderComponent);
+	TestTrue(TEXT("Unchanged bounds refresh the batches in place, without a new proxy"), AfterPublish.Proxy == BeforePublish.Proxy);
+	if (!TestEqual(TEXT("One capture batch per draw batch"), AfterPublish.NumStaticBatches, 1)) return false;
+	TestEqual(TEXT("The capture batch draws exactly the uploaded triangles"), AfterPublish.Batch0Primitives, SourceTriangles);
+	TestEqual(TEXT("The capture batch starts at the first index"), AfterPublish.Batch0FirstIndex, 0u);
+	TestTrue(TEXT("It is a material batch (the card capture only takes those)"), AfterPublish.bBatch0UseForMaterial);
+	TestFalse(TEXT("It is never a shadow caster"), AfterPublish.bBatch0CastShadow);
+	TestFalse(TEXT("It is never a depth-pass batch"), AfterPublish.bBatch0UseForDepthPass);
+	TestEqual(TEXT("It was built from the landed publication"), AfterPublish.BatchSerial, Resident->GetDrawArgsPublishSerial());
+
+	// --- 3) An edit retires the counts. Its own transform update collects the batches again and
+	//        finds nothing to build from: withdrawn, never stale counts over rewritten indices.
+	UCSMeshOps::TranslateMesh(GpuMesh, FVector(100.0, 0.0, 0.0));
+	FlushRenderingCommands();
+	const FCSGpuMeshSurfaceCacheProbe DuringEdit = CSGpuMeshTests_ProbeSurfaceCache(RenderComponent);
+	const FBox BoundsAfter = RenderComponent->CalcBounds(FTransform::Identity).GetBox();
+	TestFalse(TEXT("The translation really moved the bounds"), BoundsAfter.Equals(BoundsBefore, 1.0));
+	TestEqual(TEXT("No capture batch while the edit's readback is in flight"), DuringEdit.NumStaticBatches, 0);
+	TestTrue(TEXT("The proxy's cards follow its new bounds"), DuringEdit.CardBounds.Equals(BoundsAfter, 0.01));
+
+	// --- 4) That readback lands, and the geometry now lies outside the card set Lumen built for the
+	//        old bounds. Lumen only ever moves a card set, so the poll replaces the proxy.
+	CSGpuMeshTests_ForcePublishDrawArgs(GpuMesh);
+	RenderComponent->TickSurfaceCacheRefreshForTest();
+	const FCSGpuMeshSurfaceCacheProbe AfterEdit = CSGpuMeshTests_ProbeSurfaceCache(RenderComponent);
+	TestTrue(TEXT("Geometry that outgrew its cards gets a new proxy"), AfterEdit.Proxy != DuringEdit.Proxy);
+	TestTrue(TEXT("The new proxy's cards cover the new bounds"), AfterEdit.CardBounds.Equals(BoundsAfter, 0.01));
+	if (!TestEqual(TEXT("The new proxy registered its capture batch"), AfterEdit.NumStaticBatches, 1)) return false;
+	TestEqual(TEXT("...over exactly the uploaded triangles"), AfterEdit.Batch0Primitives, SourceTriangles);
 
 	HostActor->Destroy();
 	return true;

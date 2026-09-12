@@ -403,7 +403,7 @@ bool BuildRoadGeometryIntoMesh(UCSMesh* Target, const FRoadBuildInput& Input, co
 		// Junction count and corner sample count are decided on the GPU, so the emitted size is too
 		// -- the game thread must not claim to know it.
 		Context.InvalidateKnownCounts();
-		Context.Resident.WorldBounds = InputBounds;
+		Context.SetWorldBounds(InputBounds);
 		bBuilt = true;
 	});
 	if (!bBuilt) return false;

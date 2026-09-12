@@ -1,6 +1,7 @@
 #include "CSGroundStairs.h"
 
 #include "CSGpuMeshTypes.h"
+#include "CSGpuSharedLayout.ush"       // CS_GPU_INSTANCED_ROW_FLOAT4S（与 .usf 同一份）
 #include "CSGroundShaperField.h"
 #include "CSMesh.h"                    // UCSMesh::CountedBlockingFlush —— 阻塞刷新的唯一计数入口
 #include "ComputeShaderGenerateHelper.h"
@@ -11,6 +12,8 @@
 #include "RenderingThread.h"
 #include "RHIGPUReadback.h"
 #include "ShaderParameterStruct.h"
+
+DEFINE_LOG_CATEGORY_STATIC(LogCSGroundStairs, Log, All);
 
 namespace
 {
@@ -113,7 +116,7 @@ bool EnsureBuffers(FStairBuffers& Buffers, uint32 Capacity, uint32 PebbleCapacit
 			if (!Work.PackedInstances.IsValid() || Work.Capacity < Want)
 			{
 				Work.PackedInstances = AllocatePooledBuffer(
-					FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), Want * 5u), TEXT("CSGroundStairs.PackedInstances"));
+					FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), Want * CS_GPU_INSTANCED_ROW_FLOAT4S), TEXT("CSGroundStairs.PackedInstances"));
 				Work.Counter = AllocatePooledBuffer(
 					FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1), TEXT("CSGroundStairs.Counter"));
 				Work.Capacity = Want;
@@ -121,7 +124,7 @@ bool EnsureBuffers(FStairBuffers& Buffers, uint32 Capacity, uint32 PebbleCapacit
 			if (!Work.PebbleInstances.IsValid() || Work.PebbleCapacity < WantPebbles)
 			{
 				Work.PebbleInstances = AllocatePooledBuffer(
-					FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), WantPebbles * 5u), TEXT("CSGroundStairs.PebbleInstances"));
+					FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), WantPebbles * CS_GPU_INSTANCED_ROW_FLOAT4S), TEXT("CSGroundStairs.PebbleInstances"));
 				Work.PebbleCounter = AllocatePooledBuffer(
 					FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1), TEXT("CSGroundStairs.PebbleCounter"));
 				Work.PebbleCapacity = WantPebbles;
@@ -299,7 +302,7 @@ int32 DebugReadInstancesSync(const FStairBuffers& Buffers, TArray<FVector>* OutO
 			// 这些 buffer 被 Scan 留在 SRVMask（给剔除 pass 用）；回读要 CopySrc，
 			// 所以读完必须自己把它们放回去，否则下一帧的剔除 pass 会在错误的状态上撞见它们。
 			GraphBuilder.SetBufferAccessFinal(CounterRef, ERHIAccess::SRVMask);
-			const uint32 RowBytes = SrcCapacity * 5u * sizeof(FVector4f);
+			const uint32 RowBytes = SrcCapacity * CS_GPU_INSTANCED_ROW_FLOAT4S * sizeof(FVector4f);
 			if (bWantRows)
 			{
 				FRDGBufferRef PackedRef = GraphBuilder.RegisterExternalBuffer(SrcRows, TEXT("CSGroundStairs.PackedInstances"));
@@ -311,7 +314,15 @@ int32 DebugReadInstancesSync(const FStairBuffers& Buffers, TArray<FVector>* OutO
 			RHICmdList.SubmitAndBlockUntilGPUIdle();
 			if (const uint32* Value = static_cast<const uint32*>(CounterReadback.Lock(sizeof(uint32))))
 			{
-				// GPU 的 counter 会数到越界丢弃的那些（InterlockedAdd 先加后判），按容量钳。
+				// GPU 的 counter 会数到越界丢弃的那些（InterlockedAdd 先加后判），按容量钳 —— 但超容量本身
+				// 要出声：丢了哪些格由线程组完成顺序决定，"格身份决定一切"在超容量那一刻已经失效，而钳过的
+				// 计数对所有断言都像"刚好装满"（2026-09-07 审查 B4b）。
+				if (*Value > SrcCapacity)
+				{
+					UE_LOG(LogCSGroundStairs, Warning,
+						TEXT("[CSGroundStairs] %s 散布超容量：counter=%u capacity=%u，超出的格被静默丢弃（丢哪些不确定）。"),
+						bPebbles ? TEXT("石子") : TEXT("石阶"), *Value, SrcCapacity);
+				}
 				Count = int32(FMath::Min(*Value, SrcCapacity));
 				CounterReadback.Unlock();
 			}
@@ -319,7 +330,7 @@ int32 DebugReadInstancesSync(const FStairBuffers& Buffers, TArray<FVector>* OutO
 			{
 				if (const FVector4f* Data = static_cast<const FVector4f*>(RowReadback.Lock(RowBytes)))
 				{
-					Rows.Append(Data, int32(SrcCapacity) * 5);
+					Rows.Append(Data, int32(SrcCapacity) * CS_GPU_INSTANCED_ROW_FLOAT4S);
 					RowReadback.Unlock();
 				}
 			}
@@ -333,15 +344,15 @@ int32 DebugReadInstancesSync(const FStairBuffers& Buffers, TArray<FVector>* OutO
 		OutOrigins->Reserve(Count);
 		for (int32 Index = 0; Index < Count; ++Index)
 		{
-			const int32 Row = Index * 5 + 3;   // 第 4 行 = 原点 + 每实例随机数
+			const int32 Row = Index * CS_GPU_INSTANCED_ROW_FLOAT4S + 3;   // 第 4 行 = 原点 + 每实例随机数
 			if (!Rows.IsValidIndex(Row)) break;
 			OutOrigins->Add(FVector(Rows[Row].X, Rows[Row].Y, Rows[Row].Z));
 		}
 	}
-	if (OutRows && Rows.Num() >= Count * 5)
+	if (OutRows && Rows.Num() >= Count * CS_GPU_INSTANCED_ROW_FLOAT4S)
 	{
 		// 只带出活跃实例那一段：容量之外是上一趟的残值，谁读谁误判。
-		OutRows->Append(Rows.GetData(), Count * 5);
+		OutRows->Append(Rows.GetData(), Count * CS_GPU_INSTANCED_ROW_FLOAT4S);
 	}
 	return Count;
 }

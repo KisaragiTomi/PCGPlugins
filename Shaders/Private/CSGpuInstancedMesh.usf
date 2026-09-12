@@ -17,10 +17,8 @@
 
 #include "/Engine/Public/Platform.ush"
 
-#define CS_INSTANCED_MAX_LODS 4
-// ⚠️ 与 C++ 的 `CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS` 是**同一个数的两份**（同 MAX_LODS 的
-// 写法）。两边不一致的症状是 custom data 整体错位读，画面上只是"数值不对"，不报错。
-#define CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS 2
+// 行 stride / custom data 步长 / LOD 上限：与 C++ 共用同一份 #define（理由见那个文件头）。
+#include "/Plugin/PCGPlugins/Shaders/Private/CSGpuSharedLayout.ush"
 
 // ── source ───────────────────────────────────────────────────────────────────
 // 5 float4 per instance: [0..2] rows of the instance-to-component 3x3 (.w = 0),
@@ -155,7 +153,7 @@ void PackPointInstancesCS(uint3 Id : SV_DispatchThreadID)
 	const float3 Y = cross(Z, X);
 
 	const float Scale = max(PointInstanceScale, 1e-6f);
-	const uint Base = Instance * 5u;
+	const uint Base = Instance * CS_GPU_INSTANCED_ROW_FLOAT4S;
 
 	// Rows of the instance-to-component 3x3, exactly what LocalVertexFactory.ush's
 	// GetInstanceTransform() reconstructs. Row 0's .w is hitproxy/selection — must stay 0.
@@ -203,7 +201,7 @@ void InstanceCullCS(uint3 Id : SV_DispatchThreadID)
 		if (RWClusterVisible[Cluster] == 0u) return;
 	}
 
-	const uint Base = Instance * 5u;
+	const uint Base = Instance * CS_GPU_INSTANCED_ROW_FLOAT4S;
 	const float4 Sphere = SrcInstances[Base + 4u];
 	if (!PassesViewTests(Sphere.xyz, Sphere.w)) return;
 
@@ -247,12 +245,12 @@ void InstanceCullCS(uint3 Id : SV_DispatchThreadID)
 // -----------------------------------------------------------------------------
 // One DrawIndexedIndirect arg set per LOD
 // -----------------------------------------------------------------------------
-[numthreads(CS_INSTANCED_MAX_LODS, 1, 1)]
+[numthreads(CS_GPU_INSTANCED_MAX_LODS, 1, 1)]
 void BuildArgsCS(uint3 Id : SV_DispatchThreadID)
 {
 	const uint Lod = Id.x;
 
-	// Bounded by NumLods, not by CS_INSTANCED_MAX_LODS. The args buffer is one of the mesh's declared
+	// Bounded by NumLods, not by CS_GPU_INSTANCED_MAX_LODS. The args buffer is one of the mesh's declared
 	// streams and holds exactly NumLods arg sets, so a thread for an inactive LOD wrote five uints
 	// past the end of it — silently dropped by a typed UAV's bounds check, which is not something to
 	// keep relying on. There is nothing to zero either: a set past NumLods does not exist.

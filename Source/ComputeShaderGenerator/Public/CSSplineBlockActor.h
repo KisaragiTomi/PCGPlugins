@@ -19,10 +19,11 @@ class UStaticMesh;
  *
  * 数据流：BlockPalette 每个 StaticMesh 提取一次 CPU 三角（LOD0 渲染缓冲，重心移到
  * 原点）→ 逐块烘上样条世界变换 append 进一份 FCSGpuMeshCPUData → 基类
- * UploadTinyGladeSnapshot 上传；多材质槽时补一次 BuildMaterialSections。
+ * UploadTinyGladeSnapshot 上传（多材质槽时它自己补 BuildMaterialSections）。
  *
  * 常驻流是世界空间（渲染组件绝对变换），所以拖 spline 点、移动 actor 都必须全量
- * 重建 —— 两条路径都会重跑构造脚本，OnConstruction 是统一触发点。
+ * 重建 —— 两条路径都会重跑构造脚本，基类 OnConstruction → ReevaluateSite（= RebuildBlocks）
+ * 是统一触发点。
  *
  * 绕序：StaticMesh 三角进常驻流时按 CopyFromStaticMesh 的翻转口径处理（交换角点
  * 1/2，顶点法线不取反）—— 两边的面法线口径差一个负号，见 CSMeshBuild.h。
@@ -80,8 +81,8 @@ public:
 		const TArray<float>& PaletteLengths, FRandomStream& Rand,
 		TArray<int32>& OutSequence);
 
-	//~ AActor interface
-	virtual void OnConstruction(const FTransform& Transform) override;
+	/** 声明式入口（基类语义）：等价于 RebuildBlocks。基类的 OnConstruction 与调试按钮都走它。 */
+	virtual void ReevaluateSite() override;
 
 private:
 	/** 排布参照的样条。拖它的点 / 移动 actor 都会重跑构造脚本 → RebuildBlocks。 */

@@ -2378,9 +2378,10 @@ bool FCSHouseWindowPredicateMatchesGeometryTest::RunTest(const FString& Paramete
 					for (const CSHouseFrame::FElement& E : Elements)
 					{
 						if (E.BrickCount <= 0) continue;
-						// 窗那条路的指纹：同一个 S **且带第四段**。门落地没有第四段，墩也没有 ——
-						// 少了 `bSill` 这一半，一根正好骑在窗中线上的墩会被误判成"窗又长砖了"。
-						if (FMath::IsNearlyEqual(E.Path.CenterS, Window.CenterS, 0.01f) && E.Path.bSill)
+						// 窗那条路的指纹：同一个 S **且从窗台起砌**（`BaseZ` = 洞底）。门与墩都从地面起砌 ——
+						// 少了离地这一半，一根正好骑在窗中线上的墩会被误判成"窗又长砖了"。
+						if (FMath::IsNearlyEqual(E.Path.CenterS, Window.CenterS, 0.01f)
+							&& FMath::IsNearlyEqual(E.Path.BaseZ, Window.Z0, 0.01f))
 						{
 							++WindowBricks;
 							if (FirstFailure.IsEmpty())
@@ -2470,29 +2471,23 @@ bool FCSHouseWindowPredicateMatchesGeometryTest::RunTest(const FString& Paramete
 }
 
 // -----------------------------------------------------------------------------
-// 门框砖的**第四段**：窗台底边
+// 门框砖对窗**一块不出**（2026-09-06 裁决「附属物持有 mesh」）
 //
-// 背景（别再把它删掉）：已删的样条旧路对 `Z0 > 0` 的洞会额外出一条下边界曲线（当时的
-// `bAnySill`），门框迁到 100% GPU 解析推导时它跟着旧路一起没了 —— 那一轮零回归，因为
-// **当时没有任何东西产出非落地的洞**。窗一上线就露馅：洞的下边界同样是一条 clip 边，
-// 没有砖骑在上面，窗台正面就是一条裸露的裁剪断口。
-//
-// 三条判据：
-//   ① **门一步不动**（回归护栏）：`Z0 = 0` 的拱不出第四段，弧长仍是 2×樘 + πR。
-//   ② **砖骑在 clip 场的零等值线上、朝外的那一面真的朝外**：沿整条路密扫，往面内朝外法线挪
-//      ε 必须落在洞外（保留）、往反方向挪 ε 必须落在洞内（被 discard）。
-//      ⚠️ 拱洞的窗台段是**例外，而且是故意的**：`FCSOpeningClipField` 的拱判据在起拱线以下
-//      无下界（注释写明了理由 —— 洞底那条直线的量化不可见，交给几何承担），所以"往下 ε 保留"
-//      对拱窗不成立。那一段只判"往上 ε 被裁掉"；下界由洞面板的底承担，由上一条测试钉住。
-//   ③ **底边真的被砖盖满**：窗台段上的砖首尾各自够到两樘，相邻砖心距不超过一个铺装间距。
+// 窗的洞缘由附属物自带的预制框盖住，窗周围不走任何砖头补全 —— 曾经沿洞底补的「窗台底边」
+// 第四段已于 2026-09-10 整条删除（本条的前身是 `House.FrameWindowSill`）。三条判据：
+//   ① **门一步不动**（回归护栏）：落地拱的弧长仍是 2×樘 + πR。
+//   ② **离地洞的砖路仍骑在 clip 场的零等值线上**：`MakeOpeningPath` 对矩形 / 拱照旧出三段路，
+//      沿整条路密扫，往面内朝外法线挪 ε 必须落在洞外（保留）、往反方向挪 ε 必须落在洞内
+//      （被 discard）。
+//   ③ **同一个洞只换 `Type` 送两遍**：按门送进去照铺砖，按窗送进去一块砖、一条空路都不出。
 // -----------------------------------------------------------------------------
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FCSHouseFrameWindowSillTest,
-	"PCGPlugins.ComputeShaderGenerator.House.FrameWindowSill",
+	FCSHouseFrameSkipsWindowsTest,
+	"PCGPlugins.ComputeShaderGenerator.House.FrameSkipsWindows",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
-bool FCSHouseFrameWindowSillTest::RunTest(const FString& Parameters)
+bool FCSHouseFrameSkipsWindowsTest::RunTest(const FString& Parameters)
 {
 	const ACSHouseActor* CDO = GetDefault<ACSHouseActor>();
 	CSHouseFrame::FBrickParams Params;
@@ -2501,15 +2496,13 @@ bool FCSHouseFrameWindowSillTest::RunTest(const FString& Parameters)
 	Params.MaxBricks = 4096;
 	CSHouseFrame::FWallFrame Frame;   // S 对 +X、Z 对 +Z：墙空间 = 世界空间
 
-	// ---- ① 门：不出第四段，弧长逐位等于改动之前 ----
+	// ---- ① 门：弧长 = 两樘 + 半圆 ----
 	{
 		const FCSWallOpening Door = CSHouseTest_DemoArch(300.0f);
 		CSHouseFrame::FPath Path;
 		TestTrue(TEXT("A door still yields a path"), CSHouseFrame::MakeOpeningPath(Door, Path));
-		TestFalse(TEXT("A door has no sill course (its bottom edge is the ground)"), Path.bSill);
-		TestEqual(TEXT("A door's sill length is zero"), Path.SillLen(), 0.0f);
 		const float Jamb = FMath::Max(Door.Z1 - Door.HalfWidth(), Door.Z0) - Door.Z0;
-		TestTrue(TEXT("A door's arc length is unchanged: two jambs plus a half circle"),
+		TestTrue(TEXT("A door's arc length is two jambs plus a half circle"),
 			FMath::IsNearlyEqual(Path.TotalLen(), 2.0f * Jamb + PI * Door.HalfWidth(), 0.001f));
 	}
 
@@ -2534,28 +2527,16 @@ bool FCSHouseFrameWindowSillTest::RunTest(const FString& Parameters)
 
 		CSHouseFrame::FPath Path;
 		TestTrue(FString::Printf(TEXT("%s yields a path"), C.What), CSHouseFrame::MakeOpeningPath(Window, Path));
-		TestTrue(FString::Printf(TEXT("%s carries the sill course"), C.What), Path.bSill);
-		TestTrue(FString::Printf(TEXT("%s's sill spans the full opening width (%.2f vs %.2f)"),
-			C.What, Path.SillLen(), C.Width), FMath::IsNearlyEqual(Path.SillLen(), C.Width, 0.01f));
 
-		// 闭合：整条路走完必须回到起点（左樘底）。没有第四段时终点停在**右**樘底，差一整个洞宽。
-		FVector2f Start, StartT, End, EndT;
-		CSHouseFrame::EvalPath(Path, 0.0f, Start, StartT);
-		CSHouseFrame::EvalPath(Path, Path.TotalLen(), End, EndT);
-		TestTrue(FString::Printf(TEXT("%s's path closes back onto its own start ((%.2f, %.2f) vs (%.2f, %.2f))"),
-			C.What, End.X, End.Y, Start.X, Start.Y),
-			FMath::IsNearlyEqual(End.X, Start.X, 0.01f) && FMath::IsNearlyEqual(End.Y, Start.Y, 0.01f));
-
-		// ---- ② 砖骑在零等值线上、法线朝外 ----
+		// ---- ② 砖路骑在零等值线上、法线朝外 ----
 		const FCSOpeningClipField Field = CSHouse_ComputeClipField(Window);
 		constexpr float Eps = 0.75f;      // 远大于 float 噪声，远小于一块砖
-		constexpr float Corner = 2.0f;    // 折角两侧各让开这么多弧长，理由见下
-		int32 OutsideBad = 0, InsideBad = 0, Samples = 0, SillSamples = 0;
+		constexpr float Corner = 2.0f;    // 接缝两侧各让开这么多弧长，理由见下
+		int32 OutsideBad = 0, InsideBad = 0, Samples = 0;
 		const float Total = Path.TotalLen();
-		// 段与段的接缝处切向转 90°，法线在那一点没有定义 —— 在折角上取样等于问"这个角朝哪边"，
-		// 两个答案都对。所以把四个折角（0 / L0 / L0+L1 / L0+L1+L2 / Total）各让开 2 cm。
-		const float Junctions[5] = { 0.0f, Path.LeftLen(), Path.LeftLen() + Path.MidLen(),
-			Path.LeftLen() + Path.MidLen() + Path.RightLen(), Total };
+		// 矩形洞平顶两端的接缝处切向转 90°，法线在那一点没有定义 —— 在折角上取样等于问"这个角
+		// 朝哪边"，两个答案都对。所以把各接缝（0 / L0 / L0+L1 / Total）各让开 2 cm。
+		const float Junctions[4] = { 0.0f, Path.LeftLen(), Path.LeftLen() + Path.MidLen(), Total };
 		for (int32 K = 0; K <= 400; ++K)
 		{
 			const float Arc = Total * float(K) / 400.0f;
@@ -2566,28 +2547,21 @@ bool FCSHouseFrameWindowSillTest::RunTest(const FString& Parameters)
 			CSHouseFrame::EvalPath(Path, Arc, SZ, Tangent);
 			// 面内朝外法线 = 切向逆时针转 90°（`CSHouseFrame.usf` 里那一行的 CPU 对照）。
 			const FVector2f Outward(-Tangent.Y, Tangent.X);
-			const bool bOnSill = FMath::IsNearlyEqual(SZ.Y, Path.BaseZ, 0.01f) && Tangent.X < -0.5f;
 			++Samples;
-			if (bOnSill) ++SillSamples;
 
 			// 往洞里挪：必须被裁掉 —— 否则砖是骑在实墙上，洞缘那条断口根本没被盖住。
 			if (CSHouse_ClipKeeps(Field, Field.Eval(SZ.X - Outward.X * Eps, SZ.Y - Outward.Y * Eps))) ++InsideBad;
-			// 往洞外挪：必须保留。⚠️ 拱洞的窗台段是**故意的例外**（拱判据在起拱线以下无下界）。
-			const bool bArchBelowSpring = Window.Shape == ECSOpeningShape::Arch && bOnSill;
-			if (!bArchBelowSpring
-				&& !CSHouse_ClipKeeps(Field, Field.Eval(SZ.X + Outward.X * Eps, SZ.Y + Outward.Y * Eps))) ++OutsideBad;
+			// 往洞外挪：必须保留。
+			if (!CSHouse_ClipKeeps(Field, Field.Eval(SZ.X + Outward.X * Eps, SZ.Y + Outward.Y * Eps))) ++OutsideBad;
 		}
-		TestTrue(FString::Printf(TEXT("%s: the sweep really walks the sill course (%d of %d samples)"),
-			C.What, SillSamples, Samples), SillSamples > 20);
+		TestTrue(FString::Printf(TEXT("%s: the sweep really walks the path (%d samples)"), C.What, Samples), Samples > 300);
 		TestEqual(FString::Printf(TEXT("%s: every path point has the opening on its inward side"), C.What), InsideBad, 0);
 		TestEqual(FString::Printf(TEXT("%s: and solid wall on its outward side"), C.What), OutsideBad, 0);
 
-		// ---- ③ 底边被砖盖满 ----
+		// ---- ③ 同一个洞只换 `Type`：门照铺，窗零块 ----
 		//
-		// ⚠️ 这里**故意按门那一档送进去**：窗自 2026-09-06 起不出框砖，但 `MakeOpeningPath` 的
-		// 第四段仍然为门服务，本段验的是那一段到底有没有被 `SolveRun` 铺满 —— 与洞的类型无关。
-		// 第四段由 `Z0 > 0` 决定而不是类型（见上面门那一档：落地 ⇒ 无第四段），所以只换 `Type`
-		// 就能拿到同一条四段路。
+		// 对照组先行：几何一模一样、按门送进去 ⇒ 照铺。没有它，下面的"零块"可能只是这个洞本来
+		// 就铺不出砖。
 		FCSWallOpening AsDoor = Window;
 		AsDoor.Type = ECSOpeningType::Door;
 		TArray<CSHouseFrame::FElement> Elements;
@@ -2597,58 +2571,10 @@ bool FCSHouseFrameWindowSillTest::RunTest(const FString& Parameters)
 
 		// **退役本身的判据**：几何一模一样、只是类型是窗 ⇒ 一块砖都不出。用"恰好为零"而不是
 		// "少一些"，是为了让"把窗重新接回框砖"的改动没法悄悄通过。
-		{
-			TArray<CSHouseFrame::FElement> AsWindow;
-			const int32 WindowBricks = CSHouseFrame::BuildEdgeElements(Frame, MakeArrayView(&Window, 1), Params, AsWindow);
-			TestEqual(FString::Printf(TEXT("%s lays no frame bricks as a window"), C.What), WindowBricks, 0);
-			TestEqual(FString::Printf(TEXT("%s: not even an empty path"), C.What), AsWindow.Num(), 0);
-		}
-
-		if (Elements.Num() != 1) continue;
-
-		const CSHouseFrame::FElement& E = Elements[0];
-		TArray<float> SillS;
-		for (int32 K = 0; K < E.BrickCount; ++K)
-		{
-			FVector2f SZ, Tangent;
-			CSHouseFrame::EvalPath(E.Path, E.HalfLen + K * E.Pitch, SZ, Tangent);
-			if (FMath::IsNearlyEqual(SZ.Y, Path.BaseZ, 0.01f) && Tangent.X < -0.5f) SillS.Add(SZ.X);
-		}
-		SillS.Sort();
-		TestTrue(FString::Printf(TEXT("%s: the sill course carries bricks (%d)"), C.What, SillS.Num()), SillS.Num() >= 2);
-		if (SillS.Num() >= 2)
-		{
-			float WorstGap = 0.0f;
-			for (int32 K = 1; K < SillS.Num(); ++K) WorstGap = FMath::Max(WorstGap, SillS[K] - SillS[K - 1]);
-			TestTrue(FString::Printf(TEXT("%s: the sill bricks run without a gap (worst %.2f vs pitch %.2f)"),
-				C.What, WorstGap, E.Pitch), WorstGap <= E.Pitch + 0.01f);
-			TestTrue(FString::Printf(TEXT("%s: the sill reaches the right jamb (%.2f vs %.2f)"),
-				C.What, SillS.Last(), Path.RightS), Path.RightS - SillS.Last() <= E.Pitch + 0.01f);
-			TestTrue(FString::Printf(TEXT("%s: the sill reaches the left jamb (%.2f vs %.2f)"),
-				C.What, SillS[0], Path.LeftS), SillS[0] - Path.LeftS <= E.Pitch + 0.01f);
-		}
-
-		// ---- 对照组：把第四段单独摘掉，看差异是不是**恰好**它 ----
-		//
-		// ⚠️ 别拿"把窗台压到地面（`Z0 = 0`）"当对照：那样两条门樘会从 110 长到 200，砖数
-		// **不减反增**（实测 14 → 18）—— 差异里混进了樘长，测不出第四段。摘的必须只有第四段。
-		CSHouseFrame::FPath NoSill = Path;
-		NoSill.bSill = false;
-		TestTrue(FString::Printf(TEXT("%s: dropping the fourth course shortens the path by exactly one opening width (%.2f vs %.2f)"),
-			C.What, Path.TotalLen() - NoSill.TotalLen(), C.Width),
-			FMath::IsNearlyEqual(Path.TotalLen() - NoSill.TotalLen(), C.Width, 0.01f));
-		FVector2f NoSillEnd, NoSillT;
-		CSHouseFrame::EvalPath(NoSill, NoSill.TotalLen(), NoSillEnd, NoSillT);
-		TestTrue(FString::Printf(TEXT("%s: without it the path stops dead at the right jamb foot (%.2f vs %.2f)"),
-			C.What, NoSillEnd.X, Path.RightS), FMath::IsNearlyEqual(NoSillEnd.X, Path.RightS, 0.01f));
-
-		// 落地的同一个洞（门那一档）不出第四段 —— 与上面 ① 的门是同一条不变量，换个形状再验一次。
-		FCSWallOpening Grounded = Window;
-		Grounded.Z0 = 0.0f;
-		CSHouseFrame::FPath GroundedPath;
-		TestTrue(FString::Printf(TEXT("%s grounded still yields a path"), C.What),
-			CSHouseFrame::MakeOpeningPath(Grounded, GroundedPath));
-		TestFalse(FString::Printf(TEXT("%s: a ground-level opening has no sill course"), C.What), GroundedPath.bSill);
+		TArray<CSHouseFrame::FElement> AsWindow;
+		const int32 WindowBricks = CSHouseFrame::BuildEdgeElements(Frame, MakeArrayView(&Window, 1), Params, AsWindow);
+		TestEqual(FString::Printf(TEXT("%s lays no frame bricks as a window"), C.What), WindowBricks, 0);
+		TestEqual(FString::Printf(TEXT("%s: not even an empty path"), C.What), AsWindow.Num(), 0);
 	}
 
 	return true;
@@ -2687,7 +2613,7 @@ bool CSHouseTest_ElementBitEqual(const CSHouseFrame::FElement& A, const CSHouseF
 		&& A.Path.CenterS == B.Path.CenterS && A.Path.Radius == B.Path.Radius
 		&& A.Path.MidSweep == B.Path.MidSweep && A.Path.FlatLen == B.Path.FlatLen
 		&& A.Path.MidKind == B.Path.MidKind && A.Path.bLeftJamb == B.Path.bLeftJamb
-		&& A.Path.bRightJamb == B.Path.bRightJamb && A.Path.bSill == B.Path.bSill
+		&& A.Path.bRightJamb == B.Path.bRightJamb
 		&& SameVec(A.Frame.Origin, B.Frame.Origin) && SameVec(A.Frame.AxisU, B.Frame.AxisU)
 		&& SameVec(A.Frame.AxisV, B.Frame.AxisV)
 		&& A.BrickBegin == B.BrickBegin && A.BrickCount == B.BrickCount
@@ -3225,7 +3151,7 @@ bool FCSHouseTrimTilesPerimeterTest::RunTest(const FString& Parameters)
 	for (const CSHouseFrame::FElement& E : Elements)
 	{
 		TestTrue(TEXT("every trim path is a flat run"), E.Path.MidKind == CSHouseFrame::EMidKind::Flat);
-		TestFalse(TEXT("a trim path has no jambs"), E.Path.bLeftJamb || E.Path.bRightJamb || E.Path.bSill);
+		TestFalse(TEXT("a trim path has no jambs"), E.Path.bLeftJamb || E.Path.bRightJamb);
 		TestEqual(TEXT("the path sits at the band height"), E.Path.TopZ, Band.CenterZ);
 		TestTrue(TEXT("the path length is the run span"), E.Path.TotalLen() > 0.0f);
 	}
@@ -4553,6 +4479,131 @@ bool FCSHouseHeightHandleTest::RunTest(const FString& Parameters)
 		}
 	}
 
+	return true;
+}
+
+
+// -----------------------------------------------------------------------------
+// 合批（2026-09-10）：一帧里动 N 个窗标记 ⇒ 房子只重求值一次，与 N 无关
+//
+// 合批之前，每个标记的每一次 `RegisterFeatureMarker` 都同步走一趟完整 `ReevaluateSite`：
+// 算门（约 340 次镜像双线性）、接缝、砖、藤、瓦、尖顶、门扇、摆件各跑一遍，收尾的
+// `NotifyMarkersRebuilt` 还要对**每个**标记吸附一次 ⇒ 一帧 N 次重建 + N² 次吸附。
+// 而前 N−1 次的结果全被后一次盖掉：第 k 次跑的时候，第 k+1..N 个标记这一帧的新诉求还没写进来。
+//
+// ⚠️ 判据只能是**次数**。合批坏掉的症状是"画面全对，就是卡" —— 几何有别的用例守着，
+// 而次数没人数的话，这条纪律迟早被某个"顺手改成直接调 ReevaluateSite"的补丁悄悄拆掉。
+// 第二条断言（诉求一个都没丢）钉的是另一半：合批不许把最后那次唤醒吞掉。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseMarkerDragBatchTest,
+	"PCGPlugins.ComputeShaderGenerator.House.MarkerDragBatchesRebuilds",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseMarkerDragBatchTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	ACSHouseActor* House = World->SpawnActor<ACSHouseActor>(FVector::ZeroVector, FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("House"), House)) return false;
+	// 同 `House.WindowMarker`：把道路驱动的门摘干净，本条只测标记这一环。
+	House->Windows.Reset();
+
+	// 三扇窗摆在南墙上，彼此隔开、离转角也远（`NearCorner` 会把它们判掉，那样测的就不是合批了）。
+	constexpr int32 MarkerCount = 3;
+	const double HalfY = House->FootprintSize.Y * 0.5;
+	const double SpanX = House->FootprintSize.X;
+
+	TArray<ACSWindowMarker*> Markers;
+	for (int32 Index = 0; Index < MarkerCount; ++Index)
+	{
+		ACSWindowMarker* One = World->SpawnActor<ACSWindowMarker>(FVector::ZeroVector, FRotator::ZeroRotator);
+		if (!TestNotNull(TEXT("Window marker"), One)) return false;
+		// 脚本是"先 spawn 后摆位"，spawn 那一瞬间在原点、找不到宿主 —— 开着自毁会当场自删。
+		One->bDestroyWhenHostless = false;
+		const double X = SpanX * (0.25 + 0.25 * double(Index)) - SpanX * 0.5;
+		One->SetActorLocation(FVector(X, -HalfY - 100.0, 150.0));
+		One->SetActorRotation(FRotator(0.0, 90.0, 0.0));   // +X 指向 +Y = 面向南墙
+		One->ResolveHostAndRegister(true);
+		Markers.Add(One);
+	}
+	if (!TestEqual(TEXT("all three windows landed"), House->GetWindowCount(), MarkerCount)) return false;
+
+	// ---- 这里开始就是"同一帧里拖着三个窗走"----
+	//
+	// 单测整段跑在同一个 `GFrameCounter` 里，所以这正是 gizmo 多选拖动那一帧的形状：
+	// 三个标记各自 tick、各自 `RegisterFeatureMarker`。
+	// 移动前的洞心弧长：下面要拿它证明这一轮的诉求**真的变了** —— 诉求没变的话
+	// `RegisterFeatureMarker` 自己就早退了，那样测出来的"0 次重建"是假绿。
+	auto FirstWindowS = [House]() -> float
+	{
+		for (const FCSWallOpening& O : House->GetCurrentOpenings())
+		{
+			if (O.Type == ECSOpeningType::Window) return O.CenterS;
+		}
+		return -1.0f;
+	};
+	const float BeforeS = FirstWindowS();
+
+	const int64 Before = House->GetReevaluateCount();
+	for (int32 Index = 0; Index < MarkerCount; ++Index)
+	{
+		// 真的挪一段（20 cm）：诉求没变的话 `RegisterFeatureMarker` 自己就早退了，
+		// 那样测出来的 0 次是假的。
+		Markers[Index]->SetActorLocation(Markers[Index]->GetActorLocation() + FVector(20.0, 0.0, 0.0));
+		Markers[Index]->ResolveHostAndRegister(true);
+	}
+	const int64 AfterMoves = House->GetReevaluateCount();
+
+	// ① 通知本身**一次都不重建**：只标脏。单测整段在同一帧里，房子的 Tick 插不进来，
+	//    所以这里必须是 0，不是"≤ 1"。
+	TestEqual(
+		FString::Printf(TEXT("moving %d markers only marks the house dirty (rebuilds=%lld)"),
+			MarkerCount, AfterMoves - Before),
+		AfterMoves - Before, int64(0));
+
+	// ② 兑现点之一：房子自己的 Tick。手推一帧编辑器 world（`LEVELTICK_ViewportsOnly` 正是编辑器的
+	//    tick 类型）。这条钉的是"编辑器里没人读也会更新"：构造里没开 `bCanEverTick`、没 override
+	//    `ShouldTickIfViewportsOnly`、或 Tick 里忘了兑现，编辑器画面都会停在旧洞上 —— 而下面每一条
+	//    "读"的断言照样绿，因为读会补票。
+	//
+	//    ⚠️ 每次 World->Tick 前都要推进 GFrameCounter：引擎一帧里同一个 tick 函数只执行一次
+	//    （`TickVisitedGFrameCounter`），单测整段又在同一帧里。不推的话第二次 World->Tick 根本不会
+	//    执行房子的 tick —— 下面"之后不再重建"那条就是假绿，房子忘了关 tick 也照样过。
+	TestTrue(TEXT("marking dirty switched the house's tick on"), House->IsActorTickEnabled());
+	++GFrameCounter;
+	World->Tick(LEVELTICK_ViewportsOnly, 1.0f / 30.0f);
+	const int64 AfterTick = House->GetReevaluateCount();
+	TestEqual(TEXT("the house's own tick pays the debt exactly once"), AfterTick - AfterMoves, int64(1));
+	TestFalse(TEXT("and then switches its tick off (an idle house costs nothing per frame)"), House->IsActorTickEnabled());
+
+	++GFrameCounter;
+	World->Tick(LEVELTICK_ViewportsOnly, 1.0f / 30.0f);
+	TestEqual(TEXT("a following frame does not rebuild again"), House->GetReevaluateCount() - AfterTick, int64(0));
+
+	// ③ 结果对：三个诉求一个没丢，洞心跟着挪了。已经兑现过，读不许再补一次。
+	TestEqual(TEXT("not one demand was dropped"), House->GetWindowCount(), MarkerCount);
+	const float AfterS = FirstWindowS();
+	TestTrue(
+		FString::Printf(TEXT("the batched rebuild really applied the move (S %.2f -> %.2f)"), BeforeS, AfterS),
+		BeforeS >= 0.0f && AfterS >= 0.0f && !FMath::IsNearlyEqual(BeforeS, AfterS, 1.0f));
+	TestEqual(TEXT("reads after the tick cost nothing"), House->GetReevaluateCount() - AfterTick, int64(0));
+
+	// ④ 兑现点之二：没等到 Tick 就读 —— 读前补票，恰好一次。
+	for (int32 Index = 0; Index < MarkerCount; ++Index)
+	{
+		Markers[Index]->SetActorLocation(Markers[Index]->GetActorLocation() + FVector(20.0, 0.0, 0.0));
+		Markers[Index]->ResolveHostAndRegister(true);
+	}
+	const int64 BeforeRead = House->GetReevaluateCount();
+	const int32 WindowsAfterRead = House->GetWindowCount();
+	TestEqual(TEXT("a read before the tick pays exactly one rebuild"),
+		House->GetReevaluateCount() - BeforeRead, int64(1));
+	TestEqual(TEXT("and sees every demand"), WindowsAfterRead, MarkerCount);
+
+	for (ACSWindowMarker* One : Markers) World->DestroyActor(One);
 	return true;
 }
 

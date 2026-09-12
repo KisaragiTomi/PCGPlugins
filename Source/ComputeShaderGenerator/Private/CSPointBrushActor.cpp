@@ -77,8 +77,11 @@ bool UploadBrushPointsToGPU(
 	return OutSource.IsValid();
 }
 
-// Hands the last reference to the render thread so the pool reclaims the memory behind any frame
-// still reading it, instead of dropping it out from under an in-flight draw on the game thread.
+// Drops the actor's references from a render command. Not a safety requirement: FRDGPooledBuffer is
+// atomically ref-counted and the RDG pool keeps a buffer alive for the frames still reading it
+// whichever thread drops a reference (2026-09-07 review B7). The hop only sequences the drop behind
+// the commands already queued. What actually keeps the memory alive is a reference nobody drops —
+// the instanced component's point source — which is why every caller clears that source first.
 void ReleasePooledSourceOnRenderThread(FCSGpuDebugPooledSource& Source)
 {
 	if (!Source.Positions.IsValid() && !Source.Normals.IsValid() && !Source.Counter.IsValid())
@@ -215,7 +218,9 @@ void ACSPointBrushActor::RefreshDebugDraw()
 	// InstanceMesh 决定走哪条显示路径；另一条一定清空，避免两份几何叠在一起。
 	if (!InstanceMesh)
 	{
-		if (PointInstanceComponent) PointInstanceComponent->ClearInstances();
+		// 撤的是 GPU 点源（ClearInstances 只清 CPU 实例表，组件手上那份点 buffer 引用会一直留着 —— 显存放不掉，
+	// 还可能继续画旧点；2026-09-07 审查 (ii)）。
+	if (PointInstanceComponent) PointInstanceComponent->ClearInstanceSourceGPU();
 		if (!PointArrowComponent) return;
 
 		if (!PointBuffers.IsValid())
@@ -257,7 +262,7 @@ void ACSPointBrushActor::RefreshDebugDraw()
 
 	if (!PointBuffers.IsValid())
 	{
-		PointInstanceComponent->ClearInstances();
+		PointInstanceComponent->ClearInstanceSourceGPU();
 		return;
 	}
 
@@ -279,7 +284,9 @@ void ACSPointBrushActor::RefreshDebugDraw()
 
 void ACSPointBrushActor::ReleasePointBuffer()
 {
-	if (PointInstanceComponent) PointInstanceComponent->ClearInstances();
+	// 撤的是 GPU 点源（ClearInstances 只清 CPU 实例表，组件手上那份点 buffer 引用会一直留着 —— 显存放不掉，
+	// 还可能继续画旧点；2026-09-07 审查 (ii)）。
+	if (PointInstanceComponent) PointInstanceComponent->ClearInstanceSourceGPU();
 	ClearPointArrowDisplay();
 	ReleasePooledSourceOnRenderThread(PointBuffers);
 	GpuPointCountUpperBound = 0;

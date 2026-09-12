@@ -89,7 +89,7 @@ void CSMesh_AddClearCountersPasses(FCSMeshEditContext& Context)
 	// The batches described geometry that is now gone, and the arg sets they index have just
 	// been zeroed. Keeping the table would turn "the mesh is empty" into "the mesh draws
 	// nothing for a reason nobody can find".
-	Context.Resident.Sections.Reset();
+	Context.InvalidateSections();
 }
 
 /** How many units of its CountSource a stream covers at those capacities. Fixed (indirect
@@ -232,7 +232,23 @@ void CSMesh_ReallocateResidentWithDescs(
 			Old = &Candidate;
 			break;
 		}
-		if (!Old || !Old->Pooled.IsValid()) continue;
+		// A stream the layout adds, and a stream whose per-unit stride changed, come back ZEROED
+		// instead of holding the pool's previous tenant. The prefix copy below only preserves meaning
+		// when both sides lay their units out the same way: EnsureTexCoordSets widening the
+		// interleaved UV stream from 2 to 4 floats would land vertex 1's UV0 on vertex 0's UV1, so
+		// that case is zeroed too and the caller re-uploads it — which every caller of a widening
+		// already does (2026-09-07 review B8). Fixed-count streams (indirect args, counters, the
+		// instanced leaf's aux slots) keep the prefix copy: their element count is the whole buffer,
+		// not a stride, and set 0 / the counters survive a set-count change on purpose.
+		const bool bStrideChanged = Old && NewDesc.CountSource != ECSGpuCountSource::Fixed
+			&& (Old->Desc.BytesPerElement != NewDesc.BytesPerElement
+				|| Old->Desc.ElementsPerUnit != NewDesc.ElementsPerUnit
+				|| Old->Desc.CountSource != NewDesc.CountSource);
+		if (!Old || !Old->Pooled.IsValid() || bStrideChanged)
+		{
+			if (NewDesc.Role != ECSGpuStreamRole::IndirectArgs) AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Dst, PF_R32_UINT)), 0u);
+			continue;
+		}
 
 		const uint64 CopyBytes = FMath::Min(
 			CSMesh_StreamBytes(Old->Desc, OldVertUnits, OldIdxUnits),
@@ -284,8 +300,8 @@ void CSMesh_ReallocateStreams(
 		FCSMeshResident::FStream& Stream = Resident.Streams[StreamIndex];
 		if (Stream.Desc.ElementsPerUnit == Resize.ElementCount) continue;
 
-		// Dropping the old TRefCountPtr here is what frees it, on the render thread, which is the
-		// only thread allowed to release a render resource.
+		// The old TRefCountPtr is dropped here, on the render thread, only so the pool sees it after
+		// the commands already queued; the pool itself keeps it alive for frames in flight (review B7).
 		Stream.Desc.ElementsPerUnit = Resize.ElementCount;
 		Stream.Pooled = AllocatePooledBuffer(
 			CSMesh_MakeStreamBufferDesc(Stream.Desc, VertUnits, IdxUnits), Stream.Desc.DebugName);
@@ -698,28 +714,72 @@ FRDGBufferRef FCSMeshEditContext::FindBySemantic(ECSGpuMeshSemantic Semantic) co
 	return nullptr;
 }
 
-/** The known counts are game-thread state; only EditMeshSync's flush publishes them safely. */
-static bool CSMesh_CanPublishCounts(const FCSMeshEditContext& Context, const TCHAR* What)
+/** Sections, WorldBounds and the known counts are game-thread state. A synchronous edit writes
+ *  them behind its flush, an asynchronous one stages them for the completion hop; a borrowed
+ *  render-thread graph has neither and is refused. */
+static bool CSMesh_CanPublish(const FCSMeshEditContext& Context, const TCHAR* What)
 {
 	if (Context.GetKind() != FCSMeshEditContext::EKind::BorrowedGraph) return true;
 	UE_LOG(LogCSMesh, Warning,
-		TEXT("[CSMesh] %s ignored: a render-thread edit has no flush behind which to publish counts the game thread reads."),
+		TEXT("[CSMesh] %s ignored: a render-thread edit has no flush or completion hop behind which to publish state the game thread reads."),
 		What);
 	return false;
 }
 
+FBox FCSMeshEditContext::GetWorldBounds() const
+{
+	return Staged.WorldBounds.IsSet() ? Staged.WorldBounds.GetValue() : Resident.WorldBounds;
+}
+
+void FCSMeshEditContext::SetWorldBounds(const FBox& Bounds)
+{
+	if (!CSMesh_CanPublish(*this, TEXT("SetWorldBounds"))) return;
+	if (Kind == EKind::OwnedGraphAsync)
+	{
+		Staged.WorldBounds = Bounds;
+		return;
+	}
+	Resident.WorldBounds = Bounds;
+}
+
+void FCSMeshEditContext::InvalidateSections()
+{
+	if (!CSMesh_CanPublish(*this, TEXT("InvalidateSections"))) return;
+	if (Kind == EKind::OwnedGraphAsync)
+	{
+		Staged.bInvalidateSections = true;
+		return;
+	}
+	Resident.Sections.Reset();
+}
+
 void FCSMeshEditContext::SetKnownCounts(int32 VertexCount, int32 IndexCount)
 {
-	if (!CSMesh_CanPublishCounts(*this, TEXT("SetKnownCounts"))) return;
+	if (!CSMesh_CanPublish(*this, TEXT("SetKnownCounts"))) return;
+	if (Kind == EKind::OwnedGraphAsync)
+	{
+		Staged.bSetKnownCounts = true;
+		Staged.KnownVertexCount = VertexCount;
+		Staged.KnownIndexCount = IndexCount;
+		return;
+	}
 	Resident.KnownVertexCount = VertexCount;
 	Resident.KnownIndexCount = IndexCount;
 }
 
 void FCSMeshEditContext::InvalidateKnownCounts()
 {
-	if (!CSMesh_CanPublishCounts(*this, TEXT("InvalidateKnownCounts"))) return;
-	Resident.KnownVertexCount = INDEX_NONE;
-	Resident.KnownIndexCount = INDEX_NONE;
+	SetKnownCounts(INDEX_NONE, INDEX_NONE);
+}
+
+void FCSMeshEditContext::FStagedPublish::ApplyTo(FCSMeshResident& InResident) const
+{
+	check(IsInGameThread());
+	if (bInvalidateSections) InResident.Sections.Reset();
+	if (WorldBounds.IsSet()) InResident.WorldBounds = WorldBounds.GetValue();
+	if (!bSetKnownCounts) return;
+	InResident.KnownVertexCount = KnownVertexCount;
+	InResident.KnownIndexCount = KnownIndexCount;
 }
 
 void FCSMeshEditContext::KeepAliveResource(const FShaderResourceViewRHIRef& View)
@@ -1094,9 +1154,10 @@ UCSMesh::UCSMesh()
 
 void UCSMesh::BeginDestroy()
 {
-	// Pooled buffers must die on the render thread. Handing the shared pointer to a render
-	// command (rather than letting the game thread drop the last reference) is what keeps a
-	// GC sweep from destroying render resources on the wrong thread.
+	// Not because pooled buffers must die on the render thread — they are atomically ref-counted and
+	// the pool outlives any frame still reading them (see FCSMeshResident). The hop sequences the
+	// drop behind the commands already queued and keeps ~FCSMeshResident, which deletes the
+	// render-thread-only draw-args readback, off the game thread.
 	if (Resident.IsValid())
 	{
 		FCSMeshResidentRef Doomed = MoveTemp(Resident);
@@ -1133,7 +1194,7 @@ void UCSMesh::Reset()
 	EditMeshSync([](FCSMeshEditContext& Context)
 	{
 		CSMesh_AddClearCountersPasses(Context);
-		Context.Resident.WorldBounds = FBox(ForceInit);
+		Context.SetWorldBounds(FBox(ForceInit));
 	});
 }
 
@@ -1149,6 +1210,24 @@ void UCSMesh::ReleaseSync()
 	Resident->WorldBounds = FBox(ForceInit);
 	++Resident->Generation;
 	OnMeshChanged.Broadcast(this);
+}
+
+bool UCSMesh::ReleaseDeferred()
+{
+	if (!Resident.IsValid()) return true;
+	if (bAsyncEditInFlight) return false;
+
+	FCSMeshResidentRef Doomed = MoveTemp(Resident);
+	// 先让绑着的组件换下代理（HandleMeshChanged 看到分配代数归零就重建），代理的销毁于是排在
+	// 下面那条释放之前 —— 代理借用的正是这几条流。
+	OnMeshChanged.Broadcast(this);
+	ENQUEUE_RENDER_COMMAND(CSMeshReleaseDeferred)(
+		[Doomed = MoveTemp(Doomed)](FRHICommandListImmediate&) mutable
+		{
+			if (Doomed.IsValid()) Doomed->ReleaseBuffers();
+			Doomed.Reset();
+		});
+	return true;
 }
 
 bool UCSMesh::IsEmpty() const
@@ -1277,18 +1356,23 @@ bool UCSMesh::EditMeshAsync(TFunction<void(FCSMeshEditContext&)> EditFunc, TFunc
 	ENQUEUE_RENDER_COMMAND(CSMeshEditAsync)(
 		[ResidentRef, WeakThis, EditFunc = MoveTemp(EditFunc), OnComplete = MoveTemp(OnComplete)](FRHICommandListImmediate& RHICmdList) mutable
 		{
+			FCSMeshEditContext::FStagedPublish Staged;
 			{
 				FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("CSMesh.EditAsync"));
 				FCSMeshEditContext Context(GraphBuilder, *ResidentRef, FCSMeshEditContext::EKind::OwnedGraphAsync);
 				EditFunc(Context);
 				CSMesh_FinalizeGraph(GraphBuilder, Context);
+				Staged = Context.GetStagedPublish();
 			}
 
-			// Generation, OnMeshChanged and the caller's callback are all game-thread state, and this
-			// hop is what fences the counts the operator just published: it is enqueued after the
-			// graph executed, so anything the game thread reads from inside it is already written.
-			AsyncTask(ENamedThreads::GameThread, [ResidentRef, WeakThis, OnComplete = MoveTemp(OnComplete)]() mutable
+			// Generation, OnMeshChanged and the caller's callback are all game-thread state, and so is
+			// everything the operator published (bounds, section table, counts): the context staged
+			// those instead of writing them next to a game thread that was never fenced, and this hop
+			// — enqueued after the graph executed, running on the game thread — is where they land,
+			// before Generation moves and before anybody is told the mesh changed.
+			AsyncTask(ENamedThreads::GameThread, [ResidentRef, WeakThis, Staged, OnComplete = MoveTemp(OnComplete)]() mutable
 			{
+				Staged.ApplyTo(*ResidentRef);
 				++ResidentRef->Generation;
 
 				UCSMesh* Mesh = WeakThis.Get();

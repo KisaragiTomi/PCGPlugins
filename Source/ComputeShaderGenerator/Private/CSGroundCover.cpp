@@ -13,6 +13,8 @@
 #include "RHIGPUReadback.h"
 #include "ShaderParameterStruct.h"
 
+DEFINE_LOG_CATEGORY_STATIC(LogCSGroundCover, Log, All);
+
 namespace
 {
 // Unity/jumbo 构建共享 TU，file-local 一律 CSCover_ 前缀（与 CSStairs_ / CSShaperSteps_ /
@@ -81,12 +83,8 @@ class FCSGroundCoverScatterCS : public FGlobalShader
 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
 		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), CSCover_GroupSizeX);
 		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Y"), CSCover_GroupSizeY);
-		// custom data 的步长**注入**而不是在 .usf 里再写一份常量。
-		// ⚠️ 这个数目前在工程里已经有两份拷贝（`CSGpuInstancedMeshComponent.h:24` 与
-		// `CSGpuInstancedMesh.usf:23`），而 `CSHouseVine.usf:65` 干脆硬编码成 `* 2u` ——
-		// 哪天要改步长，那三处必须一起改，漏掉藤蔓那处会让它按 2 写、按新步长读，
-		// 叶子的 SpawnTime/弧长静默错位。本文件不参与制造第四份。
-		OutEnvironment.SetDefine(TEXT("CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS"), CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS);
+		// custom data 的步长与行 stride 由 .usf 自己 include CSGpuSharedLayout.ush 取得（与 C++ 是同一份
+		// #define），不再从这里注入 —— 注入会和头里的定义撞成重复定义。
 	}
 };
 
@@ -151,7 +149,7 @@ bool EnsureBuffers(FCoverBuffers& Buffers, uint32 Capacity)
 		{
 			// typed buffer（不是 structured）：实例组件的剔除 pass 用 Buffer<float4> / Buffer<uint> 视图。
 			Work.PackedInstances = AllocatePooledBuffer(
-				FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), Want * 5u), TEXT("CSGroundCover.PackedInstances"));
+				FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), Want * CS_GPU_INSTANCED_ROW_FLOAT4S), TEXT("CSGroundCover.PackedInstances"));
 			Work.Counter = AllocatePooledBuffer(
 				FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1), TEXT("CSGroundCover.Counter"));
 			// custom data **恒分配**：剔除 pass 的 UAV 是无条件绑定的（RDG 不接受空参数），
@@ -359,7 +357,7 @@ int32 DebugReadInstancesSync(const FCoverBuffers& Buffers, TArray<FVector>* OutO
 			// 这些 buffer 被 Scatter 留在 SRVMask（给剔除 pass 用）；回读要 CopySrc，
 			// 所以读完必须自己把它们放回去，否则下一帧的剔除 pass 会在错误的状态上撞见它们。
 			GraphBuilder.SetBufferAccessFinal(CounterRef, ERHIAccess::SRVMask);
-			const uint32 RowBytes = Work.Capacity * 5u * sizeof(FVector4f);
+			const uint32 RowBytes = Work.Capacity * CS_GPU_INSTANCED_ROW_FLOAT4S * sizeof(FVector4f);
 			if (bWantRows)
 			{
 				FRDGBufferRef PackedRef = GraphBuilder.RegisterExternalBuffer(Work.PackedInstances, TEXT("CSGroundCover.PackedInstances"));
@@ -378,7 +376,14 @@ int32 DebugReadInstancesSync(const FCoverBuffers& Buffers, TArray<FVector>* OutO
 			RHICmdList.SubmitAndBlockUntilGPUIdle();
 			if (const uint32* Value = static_cast<const uint32*>(CounterReadback.Lock(sizeof(uint32))))
 			{
-				// GPU 的 counter 会数到越界丢弃的那些（InterlockedAdd 先加后判），按容量钳。
+				// GPU 的 counter 会数到越界丢弃的那些（InterlockedAdd 先加后判），按容量钳 —— 但超容量本身
+				// 要出声：丢了哪一格由线程组完成顺序决定，而钳过的计数对所有断言都像"刚好装满"（审查 B4b）。
+				if (*Value > Work.Capacity)
+				{
+					UE_LOG(LogCSGroundCover, Warning,
+						TEXT("[CSGroundCover] 地被散布超容量：counter=%u capacity=%u，超出的格被静默丢弃（丢哪些不确定）。"),
+						*Value, Work.Capacity);
+				}
 				Count = int32(FMath::Min(*Value, Work.Capacity));
 				CounterReadback.Unlock();
 			}
@@ -386,7 +391,7 @@ int32 DebugReadInstancesSync(const FCoverBuffers& Buffers, TArray<FVector>* OutO
 			{
 				if (const FVector4f* Data = static_cast<const FVector4f*>(RowReadback.Lock(RowBytes)))
 				{
-					Rows.Append(Data, int32(Work.Capacity) * 5);
+					Rows.Append(Data, int32(Work.Capacity) * CS_GPU_INSTANCED_ROW_FLOAT4S);
 					RowReadback.Unlock();
 				}
 			}
@@ -407,15 +412,15 @@ int32 DebugReadInstancesSync(const FCoverBuffers& Buffers, TArray<FVector>* OutO
 		OutOrigins->Reserve(Count);
 		for (int32 Index = 0; Index < Count; ++Index)
 		{
-			const int32 Row = Index * 5 + 3;   // 第 4 行 = 原点 + 每实例随机数
+			const int32 Row = Index * CS_GPU_INSTANCED_ROW_FLOAT4S + 3;   // 第 4 行 = 原点 + 每实例随机数
 			if (!Rows.IsValidIndex(Row)) break;
 			OutOrigins->Add(FVector(Rows[Row].X, Rows[Row].Y, Rows[Row].Z));
 		}
 	}
-	if (OutRows && Rows.Num() >= Count * 5)
+	if (OutRows && Rows.Num() >= Count * CS_GPU_INSTANCED_ROW_FLOAT4S)
 	{
 		// 只带出活跃实例那一段：容量之外是上一趟的残值，谁读谁误判。
-		OutRows->Append(Rows.GetData(), Count * 5);
+		OutRows->Append(Rows.GetData(), Count * CS_GPU_INSTANCED_ROW_FLOAT4S);
 	}
 	if (OutCustomData && Custom.Num() >= Count * CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS)
 	{

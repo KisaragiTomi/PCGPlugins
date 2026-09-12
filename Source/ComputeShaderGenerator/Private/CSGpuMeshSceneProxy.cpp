@@ -2,7 +2,9 @@
 #include "CSMesh.h"
 
 #include "Components/PrimitiveComponent.h"
+#include "ComponentRecreateRenderStateContext.h"   // r.CSGpuMesh.SurfaceCache: batches and cards are registered at scene add
 #include "Materials/Material.h"
+#include "MeshCardBuild.h"                          // FCardRepresentationData; MeshCardRepresentation::SetCardsFromBounds
 #include "Materials/MaterialRenderProxy.h"
 #include "MaterialDomain.h"
 #include "MaterialShared.h"
@@ -45,6 +47,14 @@ FCSGpuMeshSceneProxy::FCSGpuMeshSceneProxy(const UPrimitiveComponent* Component,
 	// overrides WantsRayTracingGeometry() is not visible from this constructor either and must
 	// recompute again in its own.
 	UpdateVisibleInLumenScene();
+
+	// The surface cache's capture batches are collected again on a transform update and nowhere
+	// else (RendererScene.cpp:5956-5960 in 5.7.4), and the owner sends one for exactly that — on
+	// every content edit and after every landed readback. Neither moves the transform, and after a
+	// content edit the bounds usually stay put too, which is precisely the update the engine drops
+	// by default (r.SkipRedundantTransformUpdate, RendererScene.cpp:1600): the batches would keep
+	// the old counts over rewritten indices.
+	if (IsSurfaceCacheEnabled()) SetCanSkipRedundantTransformUpdates(false);
 }
 
 FCSGpuMeshSceneProxy::~FCSGpuMeshSceneProxy()
@@ -452,6 +462,184 @@ void FCSGpuMeshSceneProxy::ReleaseGpuGeometry()
 	Streams.Reset();
 }
 
+void FCSGpuMeshSceneProxy::GetBatchMaterials(TArray<FMaterialRenderProxy*, TInlineAllocator<8>>& OutMaterials) const
+{
+	OutMaterials.Reset(1);
+	OutMaterials.Add(Material->GetRenderProxy());
+}
+
+bool FCSGpuMeshSceneProxy::GatherDrawArgs(TArray<FCSGpuDrawArgs, TInlineAllocator<8>>& OutArgs, uint32& OutSerial) const
+{
+	OutArgs.Reset();
+	if (ExternalResident.IsValid())
+	{
+		// External mode: the counts are the resident set's mirror, one arg set per draw batch.
+		const uint32 Serial = ExternalResident->GetDrawArgsPublishSerial();
+		if (Serial == 0) return false;
+
+		TArray<FMaterialRenderProxy*, TInlineAllocator<8>> Materials;
+		GetBatchMaterials(Materials);
+		for (int32 BatchIndex = 0; BatchIndex < Materials.Num(); ++BatchIndex)
+		{
+			// A set the mirror does not cover (retired by an edit in flight, or a table longer than
+			// the args) makes the whole mesh unknown: a BLAS with a guessed segment is a wrong BLAS.
+			if (!ExternalResident->GetDrawArgs(BatchIndex, OutArgs.AddDefaulted_GetRef())) return false;
+		}
+		OutSerial = Serial;
+		return OutArgs.Num() > 0;
+	}
+
+	// Owned mode. A leaf that draws a CPU-known count is fully described by DrawDesc and never
+	// changes for the proxy's life; a leaf that draws indirect has no mirror to read the count from.
+	if (DrawDesc.IndirectArgsBuffer != nullptr || DrawDesc.NumPrimitives == 0) return false;
+	FCSGpuDrawArgs& Args = OutArgs.AddDefaulted_GetRef();
+	Args.IndexCount = DrawDesc.NumPrimitives * 3u;
+	Args.FirstIndex = DrawDesc.FirstIndex;
+	Args.BaseVertexIndex = 0;
+	OutSerial = 1;
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// Lumen surface cache: cards from the bounds, capture batches from the published counts
+// -----------------------------------------------------------------------------
+//
+// What the BLAS could not do on its own (measured 2026-09-11, L_HouseGroundDemo): with the
+// project's default surface-cache lighting a hardware Lumen ray that hits a card-less primitive
+// gets bValid=false and radiance 0 (LumenSurfaceCacheSampling.ush:585), and the GI trace writes
+// that 0 straight out — there is no retrace for invalid hits on the GI side, only for reflections.
+// The GPU meshes occluded and bounced nothing; a wall facing sunlit ground sat at the same
+// brightness as one facing black.
+//
+// Why cards from the bounds rather than a real card build: the engine's card generator is an
+// editor-only offline build over a static mesh's triangles, and these triangles live on the GPU.
+// Six axis-aligned cards over the bounds is what the engine itself gives skeletal meshes
+// (SkeletalMeshSceneProxy.cpp:670). The price is coverage: a face hidden from all six directions
+// (the back of a window recess, the underside of a house on stilts) has no texels and stays as it
+// was — black — while every outward face gets real lit colour.
+//
+// Who keeps it fresh: the counts behind the batches change with every landed readback, and the
+// engine only asks for static batches when the primitive is added or its transform updated. The
+// proxy cannot make either happen from the render thread, so UCSMeshRenderComponent watches the
+// publish serial and pushes a transform update plus a surface-cache invalidation when it moves.
+
+static TAutoConsoleVariable<int32> CVarCSGpuMeshSurfaceCache(
+	TEXT("r.CSGpuMesh.SurfaceCache"),
+	1,
+	TEXT("Give GPU-resident meshes a Lumen surface cache: six mesh cards over their bounds, captured from their published triangles, so hardware Lumen rays that hit them pick up their lit colour and bounce it.\n")
+	TEXT("0 leaves them occlusion-only (hits shade black under surface-cache lighting). Changing it recreates every render state."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*)
+	{
+		// Cards and capture batches are registered when the primitive is added to the scene.
+		FGlobalComponentRecreateRenderStateContext Context;
+	}),
+	ECVF_RenderThreadSafe);
+
+bool FCSGpuMeshSceneProxy::IsSurfaceCacheEnabled()
+{
+	return CVarCSGpuMeshSurfaceCache.GetValueOnAnyThread() != 0;
+}
+
+bool FCSGpuMeshSceneProxy::WantsSurfaceCache() const
+{
+	return IsSurfaceCacheEnabled() && WantsRayTracingGeometry() && IsVisibleInLumenScene() && AffectsDynamicIndirectLighting();
+}
+
+void FCSGpuMeshSceneProxy::UpdateCardRepresentation()
+{
+	const FBox LocalBox = GetLocalBounds().GetBox();
+	if (!WantsSurfaceCache() || !LocalBox.IsValid)
+	{
+		CardRepresentation.Reset();
+		return;
+	}
+	if (CardRepresentation && CardRepresentation->MeshCardsBuildData.Bounds.Equals(LocalBox)) return;
+
+	// A fresh object rather than an edit in place: each one carries its own CardRepresentationDataId,
+	// and Lumen copies what it needs out of it when it builds the card set — nothing holds on to the
+	// old one past this point, which is the render thread (SetTransform) like every reader.
+	TUniquePtr<FCardRepresentationData> Cards = MakeUnique<FCardRepresentationData>();
+	Cards->MeshCardsBuildData.Bounds = LocalBox;
+	// Not two-sided: these meshes are closed or face outward, and the flag would add a 50-unit
+	// sampling bias meant for foliage (LumenSurfaceCacheSampling.ush:451).
+	Cards->MeshCardsBuildData.bMostlyTwoSided = false;
+	MeshCardRepresentation::SetCardsFromBounds(Cards->MeshCardsBuildData);
+	CardRepresentation = MoveTemp(Cards);
+}
+
+void FCSGpuMeshSceneProxy::OnTransformChanged(FRHICommandListBase& RHICmdList)
+{
+	FPrimitiveSceneProxy::OnTransformChanged(RHICmdList);
+	// SetTransform stores the new local bounds right before calling this, on every transform
+	// update including the first one at scene add, so the cards can never describe older bounds
+	// than the proxy's own.
+	UpdateCardRepresentation();
+}
+
+const FCardRepresentationData* FCSGpuMeshSceneProxy::GetMeshCardRepresentation() const
+{
+	return CardRepresentation.Get();
+}
+
+void FCSGpuMeshSceneProxy::DrawStaticElements(FStaticPrimitiveDrawInterface* PDI)
+{
+	SurfaceCacheBatchSerial = 0;
+	if (!WantsSurfaceCache()) return;
+	if (!DrawDesc.bValid || DrawDesc.IndexBuffer == nullptr || !VertexFactory || !VertexFactory->IsInitialized()) return;
+
+	TArray<FCSGpuDrawArgs, TInlineAllocator<8>> Args;
+	uint32 Serial = 0;
+	if (!GatherDrawArgs(Args, Serial)) return;   // counts unknown: register nothing rather than guess
+
+	TArray<FMaterialRenderProxy*, TInlineAllocator<8>> Materials;
+	GetBatchMaterials(Materials);
+	// Batch i is matched to arg set i by index; a split the args do not describe is skipped whole,
+	// exactly as the BLAS instance does.
+	if (Materials.Num() != Args.Num()) return;
+
+	PDI->ReserveMemoryForMeshes(Args.Num());
+	for (int32 BatchIndex = 0; BatchIndex < Args.Num(); ++BatchIndex)
+	{
+		const FCSGpuDrawArgs& BatchArgs = Args[BatchIndex];
+		const uint32 NumTriangles = BatchArgs.IndexCount / 3u;
+		if (NumTriangles == 0) continue;
+
+		FMeshBatch Mesh;
+		Mesh.VertexFactory = VertexFactory.Get();
+		Mesh.MaterialRenderProxy = Materials[BatchIndex];
+		Mesh.ReverseCulling = IsLocalToWorldDeterminantNegative();
+		Mesh.Type = PT_TriangleList;
+		Mesh.DepthPriorityGroup = SDPG_World;
+		Mesh.LODIndex = 0;
+		Mesh.MeshIdInPrimitive = uint16(BatchIndex);
+		Mesh.bCanApplyViewModeOverrides = false;
+		// The card capture takes a non-landscape primitive's bUseForMaterial batches
+		// (LumenSceneCardCapture.cpp:861). Every other pass this batch could be cached for is
+		// switched off, so the only cost it leaves behind is the capture command itself.
+		Mesh.bUseForMaterial = true;
+		Mesh.bUseForDepthPass = false;
+		Mesh.bUseAsOccluder = false;
+		Mesh.CastShadow = false;
+		Mesh.bSelectable = false;
+#if RHI_RAYTRACING
+		Mesh.CastRayTracedShadow = false;
+#endif
+
+		FMeshBatchElement& Element = Mesh.Elements[0];
+		Element.IndexBuffer = DrawDesc.IndexBuffer;
+		// FirstIndex and BaseVertexIndex come across with the count for the reason the shadow batch
+		// takes them: with sections, set i describes its own run of the shared index buffer.
+		Element.FirstIndex = BatchArgs.FirstIndex;
+		Element.NumPrimitives = NumTriangles;
+		Element.BaseVertexIndex = uint32(FMath::Max(BatchArgs.BaseVertexIndex, 0));
+		Element.MinVertexIndex = 0;
+		Element.MaxVertexIndex = DrawDesc.MaxVertexIndex;
+
+		PDI->DrawMesh(Mesh, 1.0f);
+	}
+	SurfaceCacheBatchSerial = Serial;
+}
+
 // -----------------------------------------------------------------------------
 // Ray tracing: a BLAS over the raster buffers, rebuilt when the draw-args mirror lands
 // -----------------------------------------------------------------------------
@@ -569,44 +757,6 @@ void FCSGpuMeshSceneProxy::PumpRayTracingGeometries_RenderThread()
 	for (FCSGpuMeshSceneProxy* Proxy : GCSGpuMeshRayTracingProxies) Proxy->RefreshRayTracingGeometry(RHICmdList);
 }
 
-void FCSGpuMeshSceneProxy::GetRayTracingBatchMaterials(TArray<FMaterialRenderProxy*, TInlineAllocator<8>>& OutMaterials) const
-{
-	OutMaterials.Reset(1);
-	OutMaterials.Add(Material->GetRenderProxy());
-}
-
-bool FCSGpuMeshSceneProxy::GatherRayTracingDrawArgs(TArray<FCSGpuDrawArgs, TInlineAllocator<8>>& OutArgs, uint32& OutSerial) const
-{
-	OutArgs.Reset();
-	if (ExternalResident.IsValid())
-	{
-		// External mode: the counts are the resident set's mirror, one arg set per draw batch.
-		const uint32 Serial = ExternalResident->GetDrawArgsPublishSerial();
-		if (Serial == 0) return false;
-
-		TArray<FMaterialRenderProxy*, TInlineAllocator<8>> Materials;
-		GetRayTracingBatchMaterials(Materials);
-		for (int32 BatchIndex = 0; BatchIndex < Materials.Num(); ++BatchIndex)
-		{
-			// A set the mirror does not cover (retired by an edit in flight, or a table longer than
-			// the args) makes the whole mesh unknown: a BLAS with a guessed segment is a wrong BLAS.
-			if (!ExternalResident->GetDrawArgs(BatchIndex, OutArgs.AddDefaulted_GetRef())) return false;
-		}
-		OutSerial = Serial;
-		return OutArgs.Num() > 0;
-	}
-
-	// Owned mode. A leaf that draws a CPU-known count is fully described by DrawDesc and never
-	// changes for the proxy's life; a leaf that draws indirect has no mirror to read the count from.
-	if (DrawDesc.IndirectArgsBuffer != nullptr || DrawDesc.NumPrimitives == 0) return false;
-	FCSGpuDrawArgs& Args = OutArgs.AddDefaulted_GetRef();
-	Args.IndexCount = DrawDesc.NumPrimitives * 3u;
-	Args.FirstIndex = DrawDesc.FirstIndex;
-	Args.BaseVertexIndex = 0;
-	OutSerial = 1;
-	return true;
-}
-
 void FCSGpuMeshSceneProxy::ReleaseRayTracingGeometry()
 {
 	if (RayTracingGeometry)
@@ -629,7 +779,7 @@ void FCSGpuMeshSceneProxy::RefreshRayTracingGeometry(FRHICommandListBase& RHICmd
 
 	TArray<FCSGpuDrawArgs, TInlineAllocator<8>> Args;
 	uint32 Serial = 0;
-	if (!GatherRayTracingDrawArgs(Args, Serial)) return;   // counts unknown: keep the baked BLAS we have
+	if (!GatherDrawArgs(Args, Serial)) return;   // counts unknown: keep the baked BLAS we have
 	if (Serial == RayTracingBuiltSerial) return;           // nothing landed since the last build
 
 	const FCSGpuStreamRuntime* PositionStream = FindStream(ECSGpuStreamRole::Position);
@@ -695,7 +845,7 @@ void FCSGpuMeshSceneProxy::GetDynamicRayTracingInstances(FRayTracingInstanceColl
 	if (!DrawDesc.bValid || DrawDesc.IndexBuffer == nullptr || !VertexFactory) return;
 
 	TArray<FMaterialRenderProxy*, TInlineAllocator<8>> Materials;
-	GetRayTracingBatchMaterials(Materials);
+	GetBatchMaterials(Materials);
 	// Segment i is matched to material i by index. A split that changed under a BLAS the pump has
 	// not caught up with yet would pair them wrong; skipping a frame is the honest answer.
 	if (Materials.Num() != RayTracingBuiltArgs.Num()) return;
@@ -754,11 +904,5 @@ void FCSGpuMeshSceneProxy::GetDynamicRayTracingInstances(FRayTracingInstanceColl
 
 void FCSGpuMeshSceneProxy::RegisterRayTracingPump() {}
 void FCSGpuMeshSceneProxy::UnregisterRayTracingPump() {}
-
-void FCSGpuMeshSceneProxy::GetRayTracingBatchMaterials(TArray<FMaterialRenderProxy*, TInlineAllocator<8>>& OutMaterials) const
-{
-	OutMaterials.Reset(1);
-	OutMaterials.Add(Material->GetRenderProxy());
-}
 
 #endif // RHI_RAYTRACING

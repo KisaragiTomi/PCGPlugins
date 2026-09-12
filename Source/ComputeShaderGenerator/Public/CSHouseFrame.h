@@ -48,29 +48,23 @@
  * 得到同一个方向，那三步在拱心退化或曲线不绕中心时会翻错号；解析式没有可翻错的号。
  *
  * -----------------------------------------------------------------------------
- * 砖路的形状：竖直段 + 中段 + 竖直段 + 窗台底边
+ * 砖路的形状：竖直段 + 中段 + 竖直段
  * -----------------------------------------------------------------------------
- * 一条砖路（`FPath`）最多四段，按弧长首尾相接，四段都可缺席：
+ * 一条砖路（`FPath`）最多三段，按弧长首尾相接，三段都可缺席：
  *
  *   ① 左竖直段：S = `LeftS`，Z 从 `BaseZ` 升到 `TopZ`，切向 (0, +1)
  *   ② 中段：圆弧（θ 从 0 扫到 `MidSweep`，S = Cs − R·cosθ、Z = TopZ + R·sinθ）
  *          或水平段（矩形洞的平顶，长 `FlatLen`，切向 (+1, 0)）
  *   ③ 右竖直段：S = `RightS`，Z 从 `TopZ` 降回 `BaseZ`，切向 (0, −1)
- *   ④ 窗台底边：Z = `BaseZ`，S 从 `RightS` 走回 `LeftS`，切向 (−1, 0)
  *
  * 洞型与段的对应：
  *   · 门（落地的拱）= 左樘 + 半圆（Sweep = π，R = 半宽，圆心在起拱线）+ 右樘
- *   · 窗（`Z0 > CSHouse_SillMinZ` 的拱或矩形）= 上面三段 **+ 窗台底边**，整条路闭合成一圈
  *   · 圆   = 只有中段，Sweep = 2π（一圈砖，起点在最左）
+ *   · 窗**不走这里**：洞缘由附属物自带的预制框盖住，`BuildEdgeElements` 对窗一块砖都不出。
+ *     窗周围的砖头补全（曾经沿洞底补的「窗台底边」第四段）已于 2026-09-10 按用户裁决整条删除。
  *
- * ⚠️ **第四段是 2026-08-30 补回来的，别再把它删掉。** 已删的样条旧路对 `Z0 > 0` 的洞会额外
- * 出一条下边界曲线（当时的 `bAnySill`），迁到解析推导时它跟着旧路一起没了 —— 那一轮零回归，
- * 因为**当时没有任何东西产出非落地的洞**。窗一上线就露馅：洞的下边界同样是一条 clip 边
- * （矩形洞 `|q.y| < 1` 上下都有界；拱洞的下界是洞面板的底 = `Z0`），没有砖骑在上面，
- * 窗台正面就是一条裸露的裁剪断口 —— 而那正是门框砖存在的全部理由。
- *
- * 接缝处切向**正交**而不是连续（半圆 θ=0 的切向恰是 (0,1)、θ=π 恰是 (0,−1)，窗台段是 (−1,0)），
- * 与矩形洞平顶那两个折角同型：砖在折角处转 90°，靠 `FrameBrickBloat` 的负缝互相咬住。
+ * 半圆两端的切向与门樘**连续**（θ=0 恰是 (0,1)、θ=π 恰是 (0,−1)）；矩形洞平顶两端则是
+ * **正交**折角：砖在折角处转 90°，靠 `FrameBrickBloat` 的负缝互相咬住。
  *
  * -----------------------------------------------------------------------------
  * 拱间墩：相邻两拱在墩上只砌**一列**砖（2026-08-30 观感缺陷）
@@ -143,8 +137,6 @@ struct FPath
 	EMidKind MidKind = EMidKind::None;
 	bool bLeftJamb = false;
 	bool bRightJamb = false;
-	/** 窗台底边（第四段）。洞底离地才有意义 —— 门永远是 false。 */
-	bool bSill = false;
 
 	float JambLen() const { return FMath::Max(TopZ - BaseZ, 0.0f); }
 	float LeftLen() const { return bLeftJamb ? JambLen() : 0.0f; }
@@ -158,15 +150,7 @@ struct FPath
 		default:             return 0.0f;
 		}
 	}
-	/**
-	 * 窗台底边的长度 = 两樘之间的净宽。
-	 *
-	 * **两侧门樘缺一不可**：这条横边的两个端点就是两条竖直段的底，少一个的话砖会从一个
-	 * 断口凭空起头。产线上不可达（墩只在 `Z0 = 0` 的落地拱之间成立，那种洞根本没有窗台），
-	 * 前置写在这里是为了让退化输入也自洽 —— 判据只该有一份，别在调用点各判一次。
-	 */
-	float SillLen() const { return (bSill && bLeftJamb && bRightJamb) ? FMath::Max(RightS - LeftS, 0.0f) : 0.0f; }
-	float TotalLen() const { return LeftLen() + MidLen() + RightLen() + SillLen(); }
+	float TotalLen() const { return LeftLen() + MidLen() + RightLen(); }
 };
 
 /**
@@ -179,19 +163,18 @@ inline void EvalPath(const FPath& Path, float Arc, FVector2f& OutSZ, FVector2f& 
 	const float L0 = Path.LeftLen();
 	const float L1 = Path.MidLen();
 	const float L2 = Path.RightLen();
-	const float L3 = Path.SillLen();
-	const float Total = L0 + L1 + L2 + L3;
+	const float Total = L0 + L1 + L2;
 	const float A = FMath::Clamp(Arc, 0.0f, FMath::Max(Total, 0.0f));
 
 	// 分支顺序即段序；每一段都带"我存在吗"与"我后面还有段吗"的前置判断，退化路径
 	// （只有中段的圆洞 / 只有左段的墩）因此不会掉进后面那段的公式里去算出一个看着合理的错位置。
-	if (L0 > 0.0f && (A <= L0 || (L1 <= 0.0f && L2 <= 0.0f && L3 <= 0.0f)))
+	if (L0 > 0.0f && (A <= L0 || (L1 <= 0.0f && L2 <= 0.0f)))
 	{
 		OutSZ = FVector2f(Path.LeftS, Path.BaseZ + FMath::Min(A, L0));
 		OutTangent = FVector2f(0.0f, 1.0f);
 		return;
 	}
-	if (L1 > 0.0f && (A <= L0 + L1 || (L2 <= 0.0f && L3 <= 0.0f)))
+	if (L1 > 0.0f && (A <= L0 + L1 || L2 <= 0.0f))
 	{
 		const float T = FMath::Min(A - L0, L1);
 		if (Path.MidKind == EMidKind::Arc)
@@ -208,21 +191,13 @@ inline void EvalPath(const FPath& Path, float Arc, FVector2f& OutSZ, FVector2f& 
 		}
 		return;
 	}
-	if (L2 > 0.0f && (A <= L0 + L1 + L2 || L3 <= 0.0f))
+	if (L2 > 0.0f)
 	{
 		OutSZ = FVector2f(Path.RightS, Path.TopZ - FMath::Min(A - L0 - L1, L2));
 		OutTangent = FVector2f(0.0f, -1.0f);
 		return;
 	}
-	if (L3 > 0.0f)
-	{
-		// 窗台底边：从右樘底走回左樘底。切向朝 −S ⇒ 面内朝外法线（切向逆时针转 90°）朝 −Z，
-		// 也就是**朝下、背离洞**，与另外三段"法线一律指出洞外"的口径一致。走反了砖会整排翻身。
-		OutSZ = FVector2f(Path.RightS - FMath::Min(A - L0 - L1 - L2, L3), Path.BaseZ);
-		OutTangent = FVector2f(-1.0f, 0.0f);
-		return;
-	}
-	// 四段全空（调用方本该早退）：给一个不会让 kernel 除零的确定值。
+	// 三段全空（调用方本该早退）：给一个不会让 kernel 除零的确定值。
 	OutSZ = FVector2f(Path.LeftS, Path.BaseZ);
 	OutTangent = FVector2f(0.0f, 1.0f);
 }

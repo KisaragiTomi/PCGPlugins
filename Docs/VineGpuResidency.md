@@ -6,15 +6,18 @@
 
 ## 现状
 
-整条链路是**一张 `FRDGBuilder` 图**：空间竞争、前缀和、concat、建网格全部记录在 `FVineMeshSceneProxy::BuildGeometry` 里，中间产物是图生命期的瞬态 buffer。
+> 2026-09-10 订正：下表「表面体素」「三角形缓存」两行按现状改写；链路现在录在 `AVineContainer::GenerateVineGPU`
+> 走的 `UCSMesh::EditMeshAsync` 图里（`FVineMeshSceneProxy` 已不存在，网格归 `VineGeometry` 这个 `UCSMesh` 所有）。
+
+整条链路是**一张 `FRDGBuilder` 图**：表面体素、空间竞争、前缀和、concat、建网格全部记录在同一次 `EditMeshAsync` 里，中间产物是图生命期的瞬态 buffer。
 
 | 阶段 | 实现 | 数据去向 |
 | --- | --- | --- |
-| 表面体素（位置/法线/目标点场） | `AComputeShaderMeshGenerator::PrepareBoxSceneSurfaceVoxelsGPU` | pooled buffer 常驻，零回读；有效数留在 `Counter[0]` |
-| 三角形缓存 | `EnsureTriangleCacheByBox` | 全程 RenderTarget，零回读 |
+| 表面体素（位置/法线/目标点场） | `AddCSSurfaceVoxelPasses`，录进生成的同一张 RDG 图 | 图内瞬态，零回读；有效数只在 GPU 计数器里（`PrepareBoxSceneSurfaceVoxelsGPU` 只剩体素调试箭头在用） |
+| 三角形缓存 | 已删除（2026-08-12，`fd95aff`） | 体素化直接吃场景三角，不再经缓存 |
 | 空间竞争生长 | `AddVineSCPasses`（每源一次） | 瞬态，紧凑计数只写进 GPU buffer |
 | 逐源计数前缀和 + concat | `AddVineFusedSCConcatPasses` | 瞬态，合并后的三条 + 总计数 |
-| 藤蔓网格 | `AddVineMeshPasses` | 直接写 `UCSGpuMeshComponent` 的常驻 stream，每帧绘制 |
+| 藤蔓网格 | `AddVineMeshPasses` | 直接写 `VineGeometry`（`UCSMesh`）的常驻流，`VineGpuMesh` 组件每帧绘制 |
 
 游戏线程只做 CPU 侧准备（`AVineContainer::PrepareVineFusedSCInputs`），把结果塞进 `FVineBuildInput::FusedSC` 就返回；解算本身在渲染线程建图时才发生。
 

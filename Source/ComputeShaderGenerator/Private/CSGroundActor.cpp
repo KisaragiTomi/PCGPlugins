@@ -1,4 +1,4 @@
-#include "CSGroundActor.h"
+﻿#include "CSGroundActor.h"
 
 #include "CSGpuInstancedMeshComponent.h"
 #include "CSGpuMeshTypes.h"
@@ -541,36 +541,29 @@ void ACSGroundActor::PostRegisterAllComponents()
 	RebuildGroundMesh();
 }
 
-void ACSGroundActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
+void ACSGroundActor::GetInstancedFamilies(TArray<FCSInstancedFamily>& OutFamilies) const
 {
-	// 显存交回渲染线程释放：在游戏线程上直接丢引用会把在途帧正在读的 buffer 抽走。
-	CSGroundStairs::ReleaseOnRenderThread(StairBuffers);
-	CSShaperSteps::ReleaseOnRenderThread(SkirtDecorGpuBuffers);
-	for (CSGroundCover::FCoverBuffers& One : CoverBuffers) CSGroundCover::ReleaseOnRenderThread(One);
-	Super::EndPlay(EndPlayReason);
+	// 诊断与烘焙用。显存不走这里：组件销毁时自己撤源，生产者那一份由 `ReleaseInstancedBuffers` 放。
+	OutFamilies.Add({ StairComponent, TEXT("石阶"), TEXT("Stairs") });
+	OutFamilies.Add({ StairPebbleComponent, TEXT("石子"), TEXT("StairPebbles") });
+	for (int32 Index = 0; Index < SkirtDecorComponents.Num(); ++Index) OutFamilies.Add({ SkirtDecorComponents[Index], FString::Printf(TEXT("裙边摆件[%d]"), Index), FString::Printf(TEXT("SkirtDecor%d"), Index), CurrentSkirtDecorInstanceCount > 0 });
+	// 地被（下标 0 = 草，1.. = 花）：组件只为网格非空的物种建，建了就有基础网格。
+	// ⚠️ 一片草能有十几万实例，烘出来的资产是几百万三角：烘焙出口是给"交付静态场景"用的。
+	for (int32 Index = 0; Index < CoverComponents.Num(); ++Index) OutFamilies.Add({ CoverComponents[Index], FString::Printf(TEXT("地被[%d]"), Index), FString::Printf(TEXT("Cover%d"), Index) });
 }
 
-void ACSGroundActor::Destroyed()
+void ACSGroundActor::ReleaseInstancedBuffers()
 {
-	if (IsValid(StairComponent)) StairComponent->ClearInstanceSourceGPU();
-	// 石子那个组件也拿着同一批 pooled buffer 的引用：漏掉它，`ReleaseOnRenderThread` 交回去的
-	// 就不是最后一份引用，显存要拖到组件自己被 GC 才放。
-	if (IsValid(StairPebbleComponent)) StairPebbleComponent->ClearInstanceSourceGPU();
+	// 只放本 actor 分配的生产者那一份（排在已入队的命令之后，见 CSShaperSteps::ReleaseOnRenderThread）。
+	// 组件手上的实例源、组件自己的常驻网格、岩壳网格的显存，各由组件在 OnComponentDestroyed 里放。
 	CSGroundStairs::ReleaseOnRenderThread(StairBuffers);
-	// 裙边摆件同理：每个 palette 的组件各拿着一份引用，全撤掉才轮得到 ReleaseOnRenderThread
-	// 交回最后一份。
-	for (const TObjectPtr<UCSGpuInstancedMeshComponent>& Component : SkirtDecorComponents)
-	{
-		if (IsValid(Component)) Component->ClearInstanceSourceGPU();
-	}
 	CSShaperSteps::ReleaseOnRenderThread(SkirtDecorGpuBuffers);
-	// 地被同理：每个物种的组件各拿着一份引用，全撤掉才轮得到 ReleaseOnRenderThread 交回最后一份。
-	for (const TObjectPtr<UCSGpuInstancedMeshComponent>& Component : CoverComponents)
-	{
-		if (IsValid(Component)) Component->ClearInstanceSourceGPU();
-	}
 	for (CSGroundCover::FCoverBuffers& One : CoverBuffers) CSGroundCover::ReleaseOnRenderThread(One);
-	Super::Destroyed();
+	// 缓冲都没了 ⇒ 交接缓存跟着作废，下次 Ensure* 按新分配的那批重交。
+	StairHandover.Reset();
+	PebbleHandover.Reset();
+	SkirtDecorHandover.Reset();
+	CoverHandover.Reset();
 }
 
 // -----------------------------------------------------------------------------
@@ -746,36 +739,20 @@ bool ACSGroundActor::EnsureStairComponent()
 {
 	// 关掉石阶：连组件带显存一起收掉。留着一个空组件只会在 details 面板里留个误导性的槽位。
 	// 石子是石阶的从属支线（它只在摆出一级台阶的那一段等值线上抽签），所以跟着一起收 ——
-	// 单独留着它会得到一地没有台阶的石头。
+	// 单独留着它会得到一地没有台阶的石头。组件手上那份实例源与它自己的显存，由组件销毁时自己放。
 	if (!StairMesh)
 	{
-		if (IsValid(StairComponent))
-		{
-			StairComponent->ClearInstanceSourceGPU();
-			StairComponent->DestroyComponent();
-		}
+		if (IsValid(StairComponent)) StairComponent->DestroyComponent();
 		StairComponent = nullptr;
-		if (IsValid(StairPebbleComponent))
-		{
-			StairPebbleComponent->ClearInstanceSourceGPU();
-			StairPebbleComponent->DestroyComponent();
-		}
+		if (IsValid(StairPebbleComponent)) StairPebbleComponent->DestroyComponent();
 		StairPebbleComponent = nullptr;
 		CSGroundStairs::ReleaseOnRenderThread(StairBuffers);
-		HandedStairCapacity = 0;
-		HandedStairBounds = FBox(ForceInit);
-		HandedPebbleCapacity = 0;
-		HandedPebbleBounds = FBox(ForceInit);
+		StairHandover.Reset();
+		PebbleHandover.Reset();
 		return false;
 	}
 
-	// 蓝图 actor 重跑构造脚本会把实例组件销毁，指针会失效 —— 先判有效再复用。
-	if (!IsValid(StairComponent))
-	{
-		StairComponent = NewObject<UCSGpuInstancedMeshComponent>(this, NAME_None, RF_Transient);
-		StairComponent->SetupAttachment(RootComponent);
-		StairComponent->RegisterComponent();   // 未注册时任何变更都会释放 GPU 网格，必须先注册再喂
-	}
+	CSShaperSteps::EnsureInstancedComponent(this, StairComponent);
 	StairComponent->InstanceMaterial = StairMaterial;
 	StairComponent->SetBaseMesh(StairMesh);    // 同一张网格时内部直接早退
 
@@ -806,12 +783,7 @@ bool ACSGroundActor::EnsureStairComponent()
 	// 与这里的缩放；留一个非零缩放配空网格，画出来的是一地引擎默认球。
 	if (StairPebbleMesh)
 	{
-		if (!IsValid(StairPebbleComponent))
-		{
-			StairPebbleComponent = NewObject<UCSGpuInstancedMeshComponent>(this, NAME_None, RF_Transient);
-			StairPebbleComponent->SetupAttachment(RootComponent);
-			StairPebbleComponent->RegisterComponent();
-		}
+		CSShaperSteps::EnsureInstancedComponent(this, StairPebbleComponent);
 		StairPebbleComponent->InstanceMaterial = StairPebbleMaterial;
 		StairPebbleComponent->SetBaseMesh(StairPebbleMesh);
 
@@ -829,14 +801,9 @@ bool ACSGroundActor::EnsureStairComponent()
 	}
 	else
 	{
-		if (IsValid(StairPebbleComponent))
-		{
-			StairPebbleComponent->ClearInstanceSourceGPU();
-			StairPebbleComponent->DestroyComponent();
-		}
+		if (IsValid(StairPebbleComponent)) StairPebbleComponent->DestroyComponent();
 		StairPebbleComponent = nullptr;
-		HandedPebbleCapacity = 0;
-		HandedPebbleBounds = FBox(ForceInit);
+		PebbleHandover.Reset();
 		StairPebbleSphereCentre = FVector3f::ZeroVector;
 		StairPebbleSphereRadius = 0.0f;
 		StairPebbleScaleMin = 0.0f;
@@ -922,63 +889,39 @@ void ACSGroundActor::RebuildStairs()
 	const float WorstScaleXZ = FMath::Max(StairBlockScale.X, StairBlockScale.Z)
 		* (1.0f + FMath::Clamp(StairSizeJitter, 0.0f, 0.5f));
 	const double Reach = double(StairBaseSphereRadius) * double(FMath::Max(WorstScaleY, WorstScaleXZ));
+	// MaxAbsHeight 随塑形**连续**变（拖 LiftHeight 时每帧都在变），直接进盒子就是每帧一次阻塞交接 ——
+	// 过一次 QuantizeUp 吸成台阶（同裙边摆件那行），拖动中绝大多数帧盒子逐位不变（2026-09-07 审查 B5）。
+	const double HeightReach = CSShaperSteps::QuantizeUp(double(MaxAbsHeight));
 	const FVector LocalMin = GetActorTransform().InverseTransformPosition(
-		FVector(Rect.Min.X, Rect.Min.Y, Origin.Z - MaxAbsHeight)) - FVector(Reach + FMath::Abs(StairEmbed));
+		FVector(Rect.Min.X, Rect.Min.Y, Origin.Z - HeightReach)) - FVector(Reach + FMath::Abs(StairEmbed));
 	const FVector LocalMax = GetActorTransform().InverseTransformPosition(
-		FVector(Rect.Max.X, Rect.Max.Y, Origin.Z + MaxAbsHeight)) + FVector(Reach + FMath::Abs(StairEmbed));
+		FVector(Rect.Max.X, Rect.Max.Y, Origin.Z + HeightReach)) + FVector(Reach + FMath::Abs(StairEmbed));
 	const FBox LocalBounds(LocalMin.ComponentMin(LocalMax), LocalMin.ComponentMax(LocalMax));
 
 	// 交接是阻塞的（内部 SetStreamLayoutSync/ResizeStreamsSync + 立刻重建 render state）。
-	// 容量固定、包围盒只跟地面尺寸与 MaxAbsHeight 走，所以画路那种高频路径上它永远不触发。
-	// 组件自己的状态要一起看：蓝图重跑构造脚本会重建组件，新组件身上没有实例源，只看缓存
-	// 就会永远画不出东西。
-	const bool bNeedHandover =
-		HandedStairCapacity != StairBuffers.Capacity
-		|| !HandedStairBounds.IsValid
-		|| !HandedStairBounds.Min.Equals(LocalBounds.Min, 1.0)
-		|| !HandedStairBounds.Max.Equals(LocalBounds.Max, 1.0)
-		|| !StairComponent->HasInstanceSourceGPU();
-	if (bNeedHandover)
-	{
-		FCSGpuInstanceSourceGPU Source;
-		Source.PackedInstances = StairBuffers.PackedInstances;   // 保留自己的引用，重扫还要用
-		Source.Counter = StairBuffers.Counter;
-		Source.Capacity = StairBuffers.Capacity;
-		Source.LocalBounds = LocalBounds;
-		StairComponent->SetInstanceSourceGPU(Source);
-		HandedStairCapacity = StairBuffers.Capacity;
-		HandedStairBounds = LocalBounds;
-		// 这一行是阻塞的那一趟的唯一痕迹。稳态下它一次都不该打 —— 画路时反复出现就说明
-		// 上面某个"没变"的判据其实每次都在变，那正是交互期掉帧的来源。
-		UE_LOG(LogTinyGladeGround, Log, TEXT("[TinyGladeGround] %s stair instance source handed over (capacity=%u)"),
-			*GetName(), StairBuffers.Capacity);
-	}
+	// 容量固定、包围盒只跟地面尺寸与量化后的 MaxAbsHeight 走，所以画路那种高频路径上它永远不触发。
+	// 两条都**不并旧盒**（不走 `MergeHandoverBounds`）：盒子完全由配置算出，本来就不随落笔
+	// 漂移，并旧盒只会让它单调变大。
+	CSShaperSteps::FHandoverSource StairSource;
+	StairSource.Component = StairComponent;
+	StairSource.PackedInstances = StairBuffers.PackedInstances;   // 保留自己的引用，重扫还要用
+	StairSource.Counter = StairBuffers.Counter;
+	StairSource.Capacity = StairBuffers.Capacity;
+	CSShaperSteps::FHandoverOptions StairOptions;
+	StairOptions.LogLabel = TEXT("石阶");
+	CSShaperSteps::HandOverInstanceSource(StairSource, LocalBounds, StairHandover, StairOptions, this);
 
-	// 石子的交接是石阶那条的逐字副本，判据也必须逐字相同（容量固定 + 包围盒只由配置算）——
-	// 石子的包围盒能直接沿用石阶那个保守盒：石子落在同一条等值线上、缩放比石阶小一个量级，
-	// 它伸不出石阶已经算进去的那圈余量。共用一个盒子还顺带保证两条交接同时稳态、同时触发。
-	if (IsValid(StairPebbleComponent))
-	{
-		const bool bNeedPebbleHandover =
-			HandedPebbleCapacity != StairBuffers.PebbleCapacity
-			|| !HandedPebbleBounds.IsValid
-			|| !HandedPebbleBounds.Min.Equals(LocalBounds.Min, 1.0)
-			|| !HandedPebbleBounds.Max.Equals(LocalBounds.Max, 1.0)
-			|| !StairPebbleComponent->HasInstanceSourceGPU();
-		if (bNeedPebbleHandover)
-		{
-			FCSGpuInstanceSourceGPU PebbleSource;
-			PebbleSource.PackedInstances = StairBuffers.PebbleInstances;
-			PebbleSource.Counter = StairBuffers.PebbleCounter;
-			PebbleSource.Capacity = StairBuffers.PebbleCapacity;
-			PebbleSource.LocalBounds = LocalBounds;
-			StairPebbleComponent->SetInstanceSourceGPU(PebbleSource);
-			HandedPebbleCapacity = StairBuffers.PebbleCapacity;
-			HandedPebbleBounds = LocalBounds;
-			UE_LOG(LogTinyGladeGround, Log, TEXT("[TinyGladeGround] %s stair pebble instance source handed over (capacity=%u)"),
-				*GetName(), StairBuffers.PebbleCapacity);
-		}
-	}
+	// 石子的判据必须与石阶逐字相同（容量固定 + 包围盒只由配置算）—— 它的包围盒能直接沿用
+	// 石阶那个保守盒：石子落在同一条等值线上、缩放比石阶小一个量级，伸不出石阶已经算进去的
+	// 那圈余量。共用一个盒子还顺带保证两条交接同时稳态、同时触发。
+	CSShaperSteps::FHandoverSource PebbleSource;
+	PebbleSource.Component = StairPebbleComponent;
+	PebbleSource.PackedInstances = StairBuffers.PebbleInstances;
+	PebbleSource.Counter = StairBuffers.PebbleCounter;
+	PebbleSource.Capacity = StairBuffers.PebbleCapacity;
+	CSShaperSteps::FHandoverOptions PebbleOptions;
+	PebbleOptions.LogLabel = TEXT("石子");
+	CSShaperSteps::HandOverInstanceSource(PebbleSource, LocalBounds, PebbleHandover, PebbleOptions, this);
 }
 
 int32 ACSGroundActor::DebugReadStairRowsSync(TArray<FVector4f>& OutRows)
@@ -1056,23 +999,6 @@ int32 ACSGroundActor::DebugReadRockShellDrawIndexCountGpuSync() const
 	return int32(FMath::Min<uint32>(Values[0], uint32(MAX_int32)));
 }
 
-FString ACSGroundActor::DebugGetGpuAssetMismatchSync() const
-{
-	auto Check = [](const UCSGpuInstancedMeshComponent* Component, const TCHAR* Label) -> FString
-	{
-		// 没有组件不算"画错了"——那是 `IsRockShellDrawable` 那一族的职责范围，
-		// 这里只答"画的是不是那个"。
-		if (!IsValid(Component)) return FString();
-		const FString Reason = Component->DebugGetDrawnAssetMismatchSync();
-		return Reason.IsEmpty() ? FString() : FString::Printf(TEXT("%s：%s"), Label, *Reason);
-	};
-
-	FString Reason = Check(StairComponent, TEXT("石阶"));
-	if (!Reason.IsEmpty()) return Reason;
-	Reason = Check(StairPebbleComponent, TEXT("石子"));
-	return Reason;
-}
-
 // -----------------------------------------------------------------------------
 // Rock Shell（计划 D9「侧面碎石：Tiny Glade 式披挂岩壳」的链 B）
 //
@@ -1119,6 +1045,7 @@ uint32 ACSGroundActor::RockShellInputHash() const
 	Hash = HashFloat(Hash, RockShellSlopeHi);
 	Hash = HashFloat(Hash, RockShellRoadFade);
 	Hash = HashFloat(Hash, RockShellRoadSink);
+	Hash = HashFloat(Hash, RockShellRoadBlurRadius);
 	Hash = HashFloat(Hash, RockShellCellJitter);
 	Hash = HashFloat(Hash, RockShellCellRelief);
 	Hash = HashFloat(Hash, RockShellNoiseAmount);
@@ -1152,14 +1079,11 @@ bool ACSGroundActor::EnsureRockShellMesh()
 	// 关掉岩壳：连组件带显存一起收掉。留着一个空组件只会在 details 面板里留个误导性的槽位。
 	if (!bRockShell)
 	{
-		if (IsValid(RockShellComponent))
-		{
-			RockShellComponent->SetGpuMesh(nullptr);
-			RockShellComponent->DestroyComponent();
-		}
+		// 岩壳网格归岩壳组件所有：组件销毁时自己把显存还掉（不阻塞），这里只撂下引用。
+		// ⚠️ 别先 SetGpuMesh(nullptr)：解绑之后组件就不知道它拥有过哪张网格了。
+		if (IsValid(RockShellComponent)) RockShellComponent->DestroyComponent();
 		RockShellComponent = nullptr;
 		RockShellMaterialInstance = nullptr;
-		if (RockShellMesh) RockShellMesh->ReleaseSync();
 		RockShellMesh = nullptr;
 		RockShellBuiltPattern = nullptr;
 		RockShellBuiltRect = FBox2D(ForceInit);
@@ -1191,23 +1115,20 @@ bool ACSGroundActor::EnsureRockShellMesh()
 	// 绘制材质 = RockShellMaterial 的动态子实例，只多带 RockShellPatternScale（假倒角把 TG 原生的
 	// 图案口径换算到世界用，见 Docs/TinyGlade/CSRockShellEdgeBevel.md）。父材质换了才重建实例，
 	// 缩放变了只改标量（值没变时 SetScalarParameterValue 自己早退，不打扰渲染线程）。母材质为空时
-	// 不造实例 —— 引擎默认材质没有这个参数，也谈不上倒角。网格的 Materials[0] 仍是资产本身（见下）。
+	// 不造实例 —— 引擎默认材质没有这个参数，也谈不上倒角。
+	UMaterialInterface* DrawMaterial = RockShellMaterial;
+	if (RockShellMaterial)
 	{
-		UMaterialInterface* DrawMaterial = RockShellMaterial;
-		if (RockShellMaterial)
-		{
-			const bool bNewInstance = !RockShellMaterialInstance || RockShellMaterialInstance->Parent != RockShellMaterial;
-			if (bNewInstance) RockShellMaterialInstance = UMaterialInstanceDynamic::Create(RockShellMaterial, this);
-			RockShellMaterialInstance->SetScalarParameterValue(FName(CSRockShell::VertexColor::PatternScaleParameterName), Scale);
-			DrawMaterial = RockShellMaterialInstance;
-		}
-		else RockShellMaterialInstance = nullptr;
-		if (RockShellComponent->MeshMaterial != DrawMaterial)
-		{
-			RockShellComponent->MeshMaterial = DrawMaterial;
-			RockShellComponent->MarkRenderStateDirty();   // 下面的早退路径上没有别的东西会重建代理
-		}
+		const bool bNewInstance = !RockShellMaterialInstance || RockShellMaterialInstance->Parent != RockShellMaterial;
+		if (bNewInstance) RockShellMaterialInstance = UMaterialInstanceDynamic::Create(RockShellMaterial, this);
+		RockShellMaterialInstance->SetScalarParameterValue(FName(CSRockShell::VertexColor::PatternScaleParameterName), Scale);
+		DrawMaterial = RockShellMaterialInstance;
 	}
+	else RockShellMaterialInstance = nullptr;
+	// 组件画 MID，网格的 Materials[0] 放资产本身（烘焙抓的是槽，transient 的 MID 不能进资产）。
+	// 在下面的早退**之前**绑、变了才写：早先槽 0 只在建壳时写，只换 RockShellMaterial 会让它停在
+	// 旧资产上（画面不受影响，GetUsedMaterials 与烘焙受影响）。
+	BindMeshSlotMaterials(RockShellComponent, RockShellMesh, { RockShellMaterial }, DrawMaterial);
 
 	const FBox2D Rect = GetWorldRect2D();
 	// **建壳是阻塞的**（声明流集 / 分配 / 上传各 flush 一次），所以只在"图案或地面矩形真的
@@ -1218,7 +1139,9 @@ bool ACSGroundActor::EnsureRockShellMesh()
 		&& RockShellBuiltRect.Min.Equals(Rect.Min, 1.0)
 		&& RockShellBuiltRect.Max.Equals(Rect.Max, 1.0)
 		&& FMath::IsNearlyEqual(RockShellBuiltScale, Scale)
-		&& RockShellComponent->GetGpuMesh() == RockShellMesh;
+		&& RockShellComponent->GetGpuMesh() == RockShellMesh
+		// 删除后撤销：网格对象复活了，显存却已被组件还掉 —— 只比指针会把空网格当成建好了。
+		&& IsSlotMeshLive(RockShellMesh);
 	if (bBuilt) return true;
 
 	// ⚠️ 缩小图案 = 地面边上一圈**无壳且无任何提示**。原件 tile 136.5 m 只在 Scale=1 时盖得住
@@ -1248,7 +1171,7 @@ bool ACSGroundActor::EnsureRockShellMesh()
 		}
 	}
 
-	if (!RockShellMesh) RockShellMesh = NewObject<UCSMesh>(this);
+	EnsureSlotMesh(RockShellComponent, RockShellMesh);   // 归岩壳组件所有：组件销毁时它自己还显存
 
 	// **包围盒按地面矩形写死**（kernel 用 NaN 关掉看不见的三角，NaN 会污染任何从顶点算出来
 	// 的包围盒）。Z 的半高刻意**只由地面尺寸推导、不看 MaxAbsHeight** —— 掺进塑形物状态的话
@@ -1267,11 +1190,8 @@ bool ACSGroundActor::EnsureRockShellMesh()
 		return false;
 	}
 
-	// 材质表与组件的 MeshMaterial 一起更新，再广播 —— 无 section 表时组件的 MeshMaterial
-	// 就是那唯一一个绘制批次的材质（同 ACSTinyGlade::BindTinyGladeMaterials 的分工）。
-	if (RockShellMesh->Materials.Num() < 1) RockShellMesh->Materials.SetNum(1);
-	RockShellMesh->Materials[0] = RockShellMaterial;
-	RockShellMesh->NotifyMaterialsChanged();
+	// 新建的网格槽表是空的：再绑一次（变了才广播），然后交给组件。
+	BindMeshSlotMaterials(RockShellComponent, RockShellMesh, { RockShellMaterial }, DrawMaterial);
 	RockShellComponent->SetGpuMesh(RockShellMesh);
 
 	RockShellBuiltPattern = PatternAsset;
@@ -1380,6 +1300,7 @@ void ACSGroundActor::RebuildRockShell()
 	Params.SlopeHi = RockShellSlopeHi;
 	Params.RoadFade = FMath::Max(RockShellRoadFade, 1.0f);
 	Params.RoadSink = FMath::Max(RockShellRoadSink, 0.0f);
+	Params.RoadBlurRadius = FMath::Max(RockShellRoadBlurRadius, 0.0f);
 	Params.CellJitter = FMath::Max(RockShellCellJitter, 0.0f);
 	Params.CellRelief = FMath::Max(RockShellCellRelief, 0.0f);
 	Params.NoiseAmp = FMath::Max(RockShellNoiseAmount, 0.0f);
@@ -1532,8 +1453,9 @@ CSHouseDecor::FParams ACSGroundActor::MakeSkirtDecorParams() const
 	return Params;
 }
 
-bool ACSGroundActor::EnsureSkirtDecorComponents()
+bool ACSGroundActor::EnsureSkirtDecorComponents(bool& bOutHandedOver)
 {
+	bOutHandedOver = false;
 	TArray<UStaticMesh*> Wanted;
 	for (const TObjectPtr<UStaticMesh>& Mesh : SkirtDecorMeshes)
 	{
@@ -1546,43 +1468,15 @@ bool ACSGroundActor::EnsureSkirtDecorComponents()
 	for (CSHouseDecor::FPaletteRange& Range : SkirtDecorPaletteRanges) Range = CSHouseDecor::FPaletteRange();
 	SkirtDecorPaletteRanges[int32(CSHouseDecor::EFamily::Skirt)] = { 0, Wanted.Num() };
 
-	// 蓝图 actor 重跑构造脚本会把实例组件销毁，指针会失效 —— 先判再补（同 EnsureStairComponent）。
 	// ⚠️ 组件数一变就必须重建基础网格快照：palette 与组件是**按下标**对齐的，少一个就全体错位。
-	bool bComponentsChanged = false;
-	while (SkirtDecorComponents.Num() > Wanted.Num())
-	{
-		TObjectPtr<UCSGpuInstancedMeshComponent> Extra = SkirtDecorComponents.Pop();
-		if (IsValid(Extra))
-		{
-			Extra->ClearInstanceSourceGPU();
-			Extra->DestroyComponent();
-		}
-		bComponentsChanged = true;
-	}
-	while (SkirtDecorComponents.Num() < Wanted.Num())
-	{
-		SkirtDecorComponents.Add(nullptr);
-		bComponentsChanged = true;
-	}
-	for (int32 Index = 0; Index < Wanted.Num(); ++Index)
-	{
-		if (!IsValid(SkirtDecorComponents[Index]))
-		{
-			UCSGpuInstancedMeshComponent* Component = NewObject<UCSGpuInstancedMeshComponent>(this, NAME_None, RF_Transient);
-			Component->SetupAttachment(RootComponent);
-			Component->RegisterComponent();   // 未注册时任何变更都会释放 GPU 网格，必须先注册再喂
-			SkirtDecorComponents[Index] = Component;
-			bComponentsChanged = true;
-		}
-		SkirtDecorComponents[Index]->InstanceMaterial = SkirtDecorMaterial;
-	}
-	if (bComponentsChanged) bSkirtDecorBaseMeshReady = false;
+	if (CSShaperSteps::EnsureInstancedComponents(this, SkirtDecorComponents, Wanted.Num())) bSkirtDecorBaseMeshReady = false;
+	for (const TObjectPtr<UCSGpuInstancedMeshComponent>& Component : SkirtDecorComponents) Component->InstanceMaterial = SkirtDecorMaterial;
 
 	if (SkirtDecorGpuBuffers.Num() != Wanted.Num())
 	{
 		CSShaperSteps::ReleaseOnRenderThread(SkirtDecorGpuBuffers);
 		SkirtDecorGpuBuffers.SetNum(Wanted.Num());
-		SkirtDecorHandedCapacities.Reset();
+		SkirtDecorHandover.Capacities.Reset();
 		bSkirtDecorBaseMeshReady = false;
 	}
 	if (Wanted.Num() == 0) return false;
@@ -1664,44 +1558,18 @@ bool ACSGroundActor::EnsureSkirtDecorComponents()
 	Top = CSShaperSteps::QuantizeUp(Top + MeshReach + 1.0);
 	// 下界取 −Reach：摆件落在**地面**上，而地面可以低于 actor 原点（被别人挖过 / 本来就有起伏）。
 	FBox LocalBounds(FVector(-Reach, -Reach, -Reach), FVector(Reach, Reach, Top));
-	if (SkirtDecorHandedLocalBounds.IsValid) LocalBounds += SkirtDecorHandedLocalBounds;
+	LocalBounds = CSShaperSteps::MergeHandoverBounds(LocalBounds, SkirtDecorHandover);
 
-	bool bNeedHandover = SkirtDecorHandedCapacities.Num() != SkirtDecorGpuBuffers.Num()
-		|| !SkirtDecorHandedLocalBounds.IsValid
-		|| !SkirtDecorHandedLocalBounds.Min.Equals(LocalBounds.Min, 1.0)
-		|| !SkirtDecorHandedLocalBounds.Max.Equals(LocalBounds.Max, 1.0);
-	for (int32 Index = 0; !bNeedHandover && Index < SkirtDecorGpuBuffers.Num(); ++Index)
-	{
-		// 蓝图重跑构造脚本会销毁并重建实例组件：新组件身上没有实例源，缓存说"已交接"就会
-		// 永远画不出东西 —— 拿组件自己的状态兜底（同 EnsureDecorComponents）。
-		bNeedHandover = SkirtDecorHandedCapacities[Index] != SkirtDecorGpuBuffers[Index].Capacity
-			|| !IsValid(SkirtDecorComponents[Index])
-			|| !SkirtDecorComponents[Index]->HasInstanceSourceGPU();
-	}
-	if (!bNeedHandover) return true;
-
+	TArray<CSShaperSteps::FHandoverSource, TInlineAllocator<8>> Sources;
 	for (int32 Index = 0; Index < SkirtDecorGpuBuffers.Num(); ++Index)
 	{
-		if (!SkirtDecorGpuBuffers[Index].IsValid() || !IsValid(SkirtDecorComponents[Index])) return false;
+		Sources.Add(CSShaperSteps::MakeHandoverSource(
+			SkirtDecorComponents.IsValidIndex(Index) ? ToRawPtr(SkirtDecorComponents[Index]) : nullptr,
+			SkirtDecorGpuBuffers[Index], /*bWithCustomData*/ false));
 	}
-
-	for (int32 Index = 0; Index < SkirtDecorGpuBuffers.Num(); ++Index)
-	{
-		FCSGpuInstanceSourceGPU Source;
-		Source.PackedInstances = SkirtDecorGpuBuffers[Index].PackedInstances;   // 保留自己的引用，重打包还要用
-		Source.Counter = SkirtDecorGpuBuffers[Index].Counter;
-		Source.Capacity = SkirtDecorGpuBuffers[Index].Capacity;
-		Source.LocalBounds = LocalBounds;
-		SkirtDecorComponents[Index]->SetInstanceSourceGPU(Source);
-	}
-
-	SkirtDecorHandedCapacities.SetNumUninitialized(SkirtDecorGpuBuffers.Num());
-	for (int32 Index = 0; Index < SkirtDecorGpuBuffers.Num(); ++Index)
-	{
-		SkirtDecorHandedCapacities[Index] = SkirtDecorGpuBuffers[Index].Capacity;
-	}
-	SkirtDecorHandedLocalBounds = LocalBounds;
-	return true;
+	const CSShaperSteps::EHandoverResult Result = CSShaperSteps::HandOverInstanceSources(Sources, LocalBounds, SkirtDecorHandover);
+	bOutHandedOver = Result == CSShaperSteps::EHandoverResult::HandedOver;
+	return Result != CSShaperSteps::EHandoverResult::NotReady;
 }
 
 void ACSGroundActor::RebuildSkirtDecor()
@@ -1723,8 +1591,7 @@ void ACSGroundActor::RebuildSkirtDecor()
 			{
 				if (IsValid(Component)) Component->ClearInstanceSourceGPU();
 			}
-			SkirtDecorHandedCapacities.Reset();
-			SkirtDecorHandedLocalBounds = FBox(ForceInit);
+			SkirtDecorHandover.Reset();
 			CurrentSkirtDecorAnchorCount = 0;
 			CurrentSkirtDecorInstanceCount = 0;
 			SkirtDecorHash = 0;
@@ -1732,7 +1599,8 @@ void ACSGroundActor::RebuildSkirtDecor()
 		return;
 	}
 	if (!Mirror.IsInitialized()) return;
-	if (!EnsureSkirtDecorComponents()) return;
+	bool bSkirtDecorHandedOver = false;
+	if (!EnsureSkirtDecorComponents(bSkirtDecorHandedOver)) return;
 
 	CSGroundDecor::FSite Site;
 	BuildSkirtDecorSite(Site);
@@ -1771,7 +1639,8 @@ void ACSGroundActor::RebuildSkirtDecor()
 
 	bool bBuffersReady = SkirtDecorGpuBuffers.Num() == SkirtDecorComponents.Num();
 	for (const CSShaperSteps::FPaletteBuffers& Buffers : SkirtDecorGpuBuffers) bBuffersReady &= Buffers.IsValid();
-	if (NewHash == SkirtDecorHash && SkirtDecorHandedCapacities.Num() == SkirtDecorGpuBuffers.Num() && bBuffersReady) return;
+	// 刚交接过（扩容换了清零的新 buffer / 包围盒变了）就必须重打包，哈希没变也不能早退（审查 B1）。
+	if (!bSkirtDecorHandedOver && NewHash == SkirtDecorHash && SkirtDecorHandover.Capacities.Num() == SkirtDecorGpuBuffers.Num() && bBuffersReady) return;
 
 	SkirtDecorHash = NewHash;
 	CurrentSkirtDecorAnchorCount = Anchors.Num();
@@ -1955,23 +1824,17 @@ uint32 ACSGroundActor::CoverInputHash(const TArray<const FCSGroundCoverSpecies*>
 bool ACSGroundActor::EnsureCoverComponents(const TArray<const FCSGroundCoverSpecies*>& Species)
 {
 	// 关掉（或一个物种都没有）：连组件带显存一起收掉。留着空组件只会在 details 面板里
-	// 留个误导性的槽位，而显存要拖到组件被 GC 才放。
+	// 留个误导性的槽位。组件那一份显存由组件销毁时自己放，这里只放生产者自己的 buffer。
 	if (Species.IsEmpty())
 	{
-		for (const TObjectPtr<UCSGpuInstancedMeshComponent>& Component : CoverComponents)
-		{
-			if (!IsValid(Component)) continue;
-			Component->ClearInstanceSourceGPU();
-			Component->DestroyComponent();
-		}
+		for (const TObjectPtr<UCSGpuInstancedMeshComponent>& Component : CoverComponents) if (IsValid(Component)) Component->DestroyComponent();
 		CoverComponents.Reset();
 		for (CSGroundCover::FCoverBuffers& One : CoverBuffers) CSGroundCover::ReleaseOnRenderThread(One);
 		CoverBuffers.Reset();
 		CoverMeshesBuiltFrom.Reset();
 		CoverBaseSphereCentres.Reset();
 		CoverBaseSphereRadii.Reset();
-		CoverHandedCapacities.Reset();
-		CoverHandedLocalBounds = FBox(ForceInit);
+		CoverHandover.Reset();
 		return false;
 	}
 
@@ -1987,32 +1850,27 @@ bool ACSGroundActor::EnsureCoverComponents(const TArray<const FCSGroundCoverSpec
 
 	if (bLayoutChanged)
 	{
-		for (const TObjectPtr<UCSGpuInstancedMeshComponent>& Component : CoverComponents)
-		{
-			if (!IsValid(Component)) continue;
-			Component->ClearInstanceSourceGPU();
-			Component->DestroyComponent();
-		}
+		for (const TObjectPtr<UCSGpuInstancedMeshComponent>& Component : CoverComponents) if (IsValid(Component)) Component->DestroyComponent();
 		CoverComponents.Reset();
 		CoverComponents.SetNum(Species.Num());
 		CoverMeshesBuiltFrom.Reset();
 		CoverMeshesBuiltFrom.SetNum(Species.Num());
-		// ⚠️ 显存必须**先交回渲染线程再缩表**：`SetNum` 缩短会在游戏线程上直接析构
-		// `TRefCountPtr`，把在途帧正在读的 buffer 抽走。物种数不变时这一趟也照做 ——
-		// 组件已经重建过了，旧 buffer 上没有任何消费者，重新分配一次是配置变更该付的代价。
+		// 先放引用再缩表。不是安全要求（`TRefCountPtr<FRDGPooledBuffer>` 在游戏线程析构只是减一次原子计数，
+		// 池子恒持一份、在途帧读的 buffer 抽不走 —— 2026-09-07 审查 B7），只是让释放排在已入队的命令之后。
+		// 物种数不变时这一趟也照做 —— 组件已经重建过了，旧 buffer 上没有任何消费者，
+		// 重新分配一次是配置变更该付的代价。
 		for (CSGroundCover::FCoverBuffers& One : CoverBuffers) CSGroundCover::ReleaseOnRenderThread(One);
 		CoverBuffers.Reset();
 		// 组件重建 ⇒ 新组件身上没有实例源，交接缓存必须一起作废，否则"缓存说交接过了"
 		// 而组件其实是空的，画面永远是空的且没有任何报错。
-		CoverHandedCapacities.Reset();
-		CoverHandedCapacities.SetNumZeroed(Species.Num());
-		CoverHandedLocalBounds = FBox(ForceInit);
+		CoverHandover.Reset();
+		CoverHandover.Capacities.SetNumZeroed(Species.Num());
 	}
 
 	CoverBaseSphereCentres.SetNum(Species.Num());
 	CoverBaseSphereRadii.SetNum(Species.Num());
 	CoverBuffers.SetNum(Species.Num());
-	CoverHandedCapacities.SetNum(Species.Num());
+	CoverHandover.Capacities.SetNum(Species.Num());
 
 	for (int32 Index = 0; Index < Species.Num(); ++Index)
 	{
@@ -2160,44 +2018,33 @@ void ACSGroundActor::RebuildGroundCover()
 	// 包围盒按"地面矩形 × MaxAbsHeight"写死（同石阶）：只有 GPU 知道摆了哪些，CPU 不能读。
 	// 全部物种共用一个盒子 —— 它已经按最坏物种放大过，共用还顺带保证所有交接同时稳态、
 	// 同时触发（各算各的话，改一个物种的缩放会让别的物种也重新交接一次）。
+	// MaxAbsHeight 过一次 QuantizeUp，理由同石阶：它随塑形连续变，不吸成台阶就是拖 LiftHeight 时每帧交接。
+	const double HeightReach = CSShaperSteps::QuantizeUp(double(MaxAbsHeight));
 	const FVector LocalMin = GetActorTransform().InverseTransformPosition(
-		FVector(Rect.Min.X, Rect.Min.Y, Origin.Z - MaxAbsHeight)) - FVector(WorstReach);
+		FVector(Rect.Min.X, Rect.Min.Y, Origin.Z - HeightReach)) - FVector(WorstReach);
 	const FVector LocalMax = GetActorTransform().InverseTransformPosition(
-		FVector(Rect.Max.X, Rect.Max.Y, Origin.Z + MaxAbsHeight)) + FVector(WorstReach);
+		FVector(Rect.Max.X, Rect.Max.Y, Origin.Z + HeightReach)) + FVector(WorstReach);
 	const FBox LocalBounds(LocalMin.ComponentMin(LocalMax), LocalMin.ComponentMax(LocalMax));
 
-	const bool bBoundsChanged =
-		!CoverHandedLocalBounds.IsValid
-		|| !CoverHandedLocalBounds.Min.Equals(LocalBounds.Min, 1.0)
-		|| !CoverHandedLocalBounds.Max.Equals(LocalBounds.Max, 1.0);
-
-	for (int32 Index = 0; Index < CoverComponents.Num(); ++Index)
+	TArray<CSShaperSteps::FHandoverSource, TInlineAllocator<8>> Sources;
+	for (int32 Index = 0; Index < CoverBuffers.Num(); ++Index)
 	{
-		if (!IsValid(CoverComponents[Index])) continue;
-		// 组件自己的状态要一起看：蓝图重跑构造脚本会重建组件，新组件身上没有实例源，
-		// 只看缓存就会永远画不出东西。
-		const bool bNeedHandover =
-			bBoundsChanged
-			|| CoverHandedCapacities[Index] != CoverBuffers[Index].Capacity
-			|| !CoverComponents[Index]->HasInstanceSourceGPU();
-		if (!bNeedHandover) continue;
-
-		FCSGpuInstanceSourceGPU Source;
-		Source.PackedInstances = CoverBuffers[Index].PackedInstances;   // 保留自己的引用，重散还要用
-		Source.Counter = CoverBuffers[Index].Counter;
+		CSShaperSteps::FHandoverSource One;
+		One.Component = CoverComponents.IsValidIndex(Index) ? ToRawPtr(CoverComponents[Index]) : nullptr;
+		One.PackedInstances = CoverBuffers[Index].PackedInstances;   // 保留自己的引用，重散还要用
+		One.Counter = CoverBuffers[Index].Counter;
 		// 逐实例 custom data：组件只看它是否有效来决定要不要把 SRV 交给顶点工厂，
 		// 不交的话材质里的 `Per Instance Custom Data` 恒读 0 —— 弯曲整条静默失效。
-		Source.CustomData = CoverBuffers[Index].CustomData;
-		Source.Capacity = CoverBuffers[Index].Capacity;
-		Source.LocalBounds = LocalBounds;
-		CoverComponents[Index]->SetInstanceSourceGPU(Source);
-		CoverHandedCapacities[Index] = CoverBuffers[Index].Capacity;
-		// 这一行是阻塞的那一趟的唯一痕迹。稳态下它一次都不该打 —— 画路时反复出现就说明
-		// 上面某个"没变"的判据其实每次都在变，那正是交互期掉帧的来源。
-		UE_LOG(LogTinyGladeGround, Log, TEXT("[TinyGladeGround] %s 地被物种 %d 实例源交接（capacity=%u）"),
-			*GetName(), Index, CoverBuffers[Index].Capacity);
+		One.CustomData = CoverBuffers[Index].CustomData;
+		One.Capacity = CoverBuffers[Index].Capacity;
+		Sources.Add(MoveTemp(One));
 	}
-	CoverHandedLocalBounds = LocalBounds;
+	// 逐物种各判各的：物种之间互不相干，一个网格没就绪不该拖住别的。**不并旧盒** ——
+	// 盒子按"地面矩形 × MaxAbsHeight"由配置算死，不会随落笔漂移。
+	CSShaperSteps::FHandoverOptions Options;
+	Options.Mode = CSShaperSteps::EHandoverMode::PerPalette;
+	Options.LogLabel = TEXT("地被物种");
+	CSShaperSteps::HandOverInstanceSources(Sources, LocalBounds, CoverHandover, Options, this);
 	CoverBuiltHash = Hash;
 }
 
@@ -2271,7 +2118,7 @@ int32 ACSGroundActor::DebugReadGroundCoverFacingsSync(int32 SpeciesIndex, TArray
 	OutFacingXY.Reserve(Count);
 	for (int32 Index = 0; Index < Count; ++Index)
 	{
-		const int32 Base = Index * 5;
+		const int32 Base = Index * CS_GPU_INSTANCED_ROW_FLOAT4S;
 		if (!Rows.IsValidIndex(Base + 3)) break;
 		// 第 4 行 = 原点（组件空间）；第 2 行 = LocalY = 朝向轴（已被均匀缩放乘过）。
 		OutWorldOrigins.Add(Transform.TransformPosition(FVector(Rows[Base + 3].X, Rows[Base + 3].Y, Rows[Base + 3].Z)));
@@ -2301,53 +2148,13 @@ int32 ACSGroundActor::DebugReadGroundCoverCustomDataSync(int32 SpeciesIndex, TAr
 	for (int32 Index = 0; Index < Count; ++Index)
 	{
 		const int32 CBase = Index * CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS;
-		const int32 RBase = Index * 5 + 3;   // 第 4 行 = 原点（组件空间）+ 每实例随机数
+		const int32 RBase = Index * CS_GPU_INSTANCED_ROW_FLOAT4S + 3;   // 第 4 行 = 原点（组件空间）+ 每实例随机数
 		if (!Custom.IsValidIndex(CBase + 1) || !Rows.IsValidIndex(RBase)) break;
 		OutBendAmp.Add(Custom[CBase + 0]);
 		OutReserved.Add(Custom[CBase + 1]);
 		OutWorldOrigins.Add(Transform.TransformPosition(FVector(Rows[RBase].X, Rows[RBase].Y, Rows[RBase].Z)));
 	}
 	return Count;
-}
-
-int32 ACSGroundActor::SaveInstancedToStaticMeshes(const FString& BakeFolder, bool bSaveAssets)
-{
-	const FString Folder = BakeFolder.TrimStartAndEnd().IsEmpty()
-		? FString::Printf(TEXT("/Game/TinyGladeBake/%s"), *GetName())
-		: BakeFolder.TrimStartAndEnd();
-
-	int32 Saved = 0;
-	auto BakeOne = [this, &Folder, bSaveAssets, &Saved](UCSGpuInstancedMeshComponent* Component, const TCHAR* Family)
-	{
-		if (!IsValid(Component)) return;
-		const FString Path = FString::Printf(TEXT("%s/SM_%s_%s"), *Folder, *GetName(), Family);
-		// 烘回本 actor 的局部空间：资产摆在同一个变换上就复现画面（同岩壳那条出口的口径）。
-		if (Component->SaveToStaticMesh(GetActorTransform(), Path, /*bReplaceExistingAsset*/ true, bSaveAssets))
-		{
-			++Saved;
-		}
-	};
-
-	BakeOne(StairComponent, TEXT("Stairs"));
-	BakeOne(StairPebbleComponent, TEXT("StairPebbles"));
-	// 裙边摆件（D12 第五家）也走这条出口 —— 裁决六 ① 要求每一类 GPU 生成物都有一条
-	// **走得通**的 `SaveToStaticMesh`。判据不是"这里写了一行"，而是
-	// `GroundDecor.SkirtPropsSurviveBake` 真烘一遍再从资产里读回来（同门框砖那条）。
-	for (int32 Index = 0; Index < SkirtDecorComponents.Num(); ++Index)
-	{
-		BakeOne(SkirtDecorComponents[Index], *FString::Printf(TEXT("SkirtDecor%d"), Index));
-	}
-	// 地被（下标 0 = 草，1.. = 花）同样要有一条走得通的出口 —— 每一类 GPU 生成物都必须能烘。
-	// ⚠️ 一片草能有十几万实例，烘出来的资产是几百万三角：这条出口是给"交付静态场景"用的，
-	// 不是给日常预览用的。
-	for (int32 Index = 0; Index < CoverComponents.Num(); ++Index)
-	{
-		BakeOne(CoverComponents[Index], *FString::Printf(TEXT("Cover%d"), Index));
-	}
-
-	UE_LOG(LogTinyGladeGround, Log, TEXT("[TinyGladeGround] %s 实例路烘焙：%d 张资产 -> %s"),
-		*GetName(), Saved, *Folder);
-	return Saved;
 }
 
 bool ACSGroundActor::DebugBakeSkirtDecorSync(const FString& AssetPath, int32& OutTriangles,

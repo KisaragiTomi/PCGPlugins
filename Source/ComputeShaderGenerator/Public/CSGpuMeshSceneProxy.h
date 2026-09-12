@@ -13,6 +13,7 @@ class FRHIGPUBufferReadback;
 class FRayTracingGeometry;
 class FRayTracingInstanceCollector;
 class FMaterialRenderProxy;
+class FCardRepresentationData;
 
 /**
  * Base scene proxy that draws a GPU-resident mesh directly through the render
@@ -36,6 +37,13 @@ class FMaterialRenderProxy;
  * ray traced shadows and reflections see the mesh. It is built from the draw-args mirror the
  * resident set publishes (the only CPU copy of a GPU-decided triangle count) by an end-of-frame
  * pump, and rebuilt whenever a new readback lands. See RefreshRayTracingGeometry for the rules.
+ *
+ * Lumen surface cache: a BLAS alone only occludes. Hardware Lumen shades a ray hit by looking the
+ * hit primitive up in its surface cache, and a primitive without mesh cards comes back black —
+ * measured 2026-09-11, hits on GPU meshes returned no bounce at all. So the base also hands Lumen
+ * a card set (six axis-aligned cards over the local bounds, the skeletal-mesh recipe) and one
+ * card-capture batch per draw batch. See DrawStaticElements for why those are static batches that
+ * nothing but the card capture ever draws.
  */
 class COMPUTESHADERGENERATOR_API FCSGpuMeshSceneProxy : public FPrimitiveSceneProxy
 {
@@ -57,6 +65,39 @@ public:
 	virtual FPrimitiveViewRelevance GetViewRelevance(const FSceneView* View) const override;
 	virtual bool CanBeOccluded() const override;
 	// GetTypeHash() stays pure-virtual: each concrete proxy must return its own unique hash.
+
+	//~ Lumen surface cache
+	/** Six cards over the local bounds, or null while the proxy takes no part in the surface cache.
+	 *  Lumen reads this once, when it builds the primitive's card set, and afterwards only moves
+	 *  those cards — a proxy whose geometry outgrew them has to be replaced, which is the owning
+	 *  component's call (UCSMeshRenderComponent does it when a landed readback finds new bounds). */
+	virtual const FCardRepresentationData* GetMeshCardRepresentation() const override;
+
+	/** The card-capture batches: one direct draw per draw batch, counts from the published mirror.
+	 *
+	 *  Static rather than dynamic because the card capture has no dynamic path at all — it walks
+	 *  the primitive's cached static mesh draw commands (LumenSceneCardCapture.cpp:856 in 5.7.4).
+	 *  Nothing else draws them: GetViewRelevance never reports static relevance, and every other
+	 *  pass only visits a static mesh through that flag (SceneVisibility.cpp:1512).
+	 *
+	 *  Direct, not indirect, for the same reason the VSM shadow batch is: cached commands go through
+	 *  GPU-Scene instance culling, which rebuilds the args from the CPU-side NumPrimitives. While the
+	 *  counts are unknown — first readback pending, or an edit in flight — nothing is registered at
+	 *  all: an empty capture is replaced on the next refresh, a capture of stale counts over fresh
+	 *  indices would bake scrambled triangles into the cards. The engine calls this again on every
+	 *  transform update (RendererScene.cpp:5956-5960), which is how a refresh reaches it. */
+	virtual void DrawStaticElements(FStaticPrimitiveDrawInterface* PDI) override;
+
+	/** Keeps the card set's bounds in step with the proxy's local bounds. */
+	virtual void OnTransformChanged(FRHICommandListBase& RHICmdList) override;
+
+	/** r.CSGpuMesh.SurfaceCache. Any thread. */
+	static bool IsSurfaceCacheEnabled();
+
+	/** GetDrawArgsPublishSerial() value the registered card-capture batches were built from;
+	 *  0 = none registered. Written from DrawStaticElements, so read it on the render thread
+	 *  after the scene has collected the static batches. For tests. */
+	uint32 GetSurfaceCacheBatchSerialForTest() const { return SurfaceCacheBatchSerial; }
 
 #if RHI_RAYTRACING
 	//~ Ray tracing. Relevance follows WantsRayTracingGeometry(); a leaf that cannot be expressed as
@@ -233,10 +274,11 @@ protected:
 	virtual bool WantsRayTracingGeometry() const { return true; }
 
 	/** The material of every draw batch, batch i drawing from arg set i — the same split
-	 *  GetDynamicMeshElements uses, restated for the ray tracing instance so each BLAS segment gets
-	 *  the material of the batch it mirrors. The base draws one batch of Material; a leaf with a
-	 *  section table returns one entry per section. Render thread. */
-	virtual void GetRayTracingBatchMaterials(TArray<FMaterialRenderProxy*, TInlineAllocator<8>>& OutMaterials) const;
+	 *  GetDynamicMeshElements uses, restated for everything that mirrors those batches outside the
+	 *  mesh-element gather: each BLAS segment and each card-capture batch gets the material of the
+	 *  batch it stands for. The base draws one batch of Material; a leaf with a section table returns
+	 *  one entry per section. Render thread, or the parallel static-mesh gather. */
+	virtual void GetBatchMaterials(TArray<FMaterialRenderProxy*, TInlineAllocator<8>>& OutMaterials) const;
 
 	// Shared vertex factory; created by CreateVertexFactory() and configured by the base from
 	// the registered streams. Heap-held so leaves can substitute a subclass.
@@ -278,17 +320,33 @@ private:
 
 	TArray<TUniquePtr<FCSGpuStreamRuntime>> Streams;
 
+	/** One arg set per draw batch, from the published mirror (external mode) or from the direct
+	 *  draw description (a leaf that draws a CPU-known count). False while nothing is known yet.
+	 *  OutSerial identifies the publication the args came from and is never 0 on success. Shared by
+	 *  the BLAS and the card-capture batches — the two consumers that need a count on the CPU. */
+	bool GatherDrawArgs(TArray<FCSGpuDrawArgs, TInlineAllocator<8>>& OutArgs, uint32& OutSerial) const;
+
+	/** Whether this proxy takes part in the Lumen surface cache: the CVar is on, Lumen tracks the
+	 *  primitive (hardware Lumen only — this proxy has no distance field for the software path), and
+	 *  the geometry is one mesh drawn once, the same condition the BLAS has. */
+	bool WantsSurfaceCache() const;
+
+	/** Rebuilds CardRepresentation from the current local bounds; drops it when the proxy takes no
+	 *  part in the surface cache. Render thread. */
+	void UpdateCardRepresentation();
+
+	/** Six axis-aligned cards over the local bounds; null when WantsSurfaceCache() is false. */
+	TUniquePtr<FCardRepresentationData> CardRepresentation;
+
+	/** See GetSurfaceCacheBatchSerialForTest. */
+	uint32 SurfaceCacheBatchSerial = 0;
+
 #if RHI_RAYTRACING
 	/** Rebuilds the BLAS when the published draw args have advanced since the last build, drops
 	 *  it when ray tracing is off or the mesh is empty, and keeps it while a readback is in flight.
 	 *  Called by the end-of-frame pump on the render thread. */
 	void RefreshRayTracingGeometry(FRHICommandListBase& RHICmdList);
 	void ReleaseRayTracingGeometry();
-
-	/** One arg set per draw batch, from the published mirror (external mode) or from the direct
-	 *  draw description (a leaf that draws a CPU-known count). False while nothing is known yet.
-	 *  OutSerial identifies the publication the args came from and is never 0 on success. */
-	bool GatherRayTracingDrawArgs(TArray<FCSGpuDrawArgs, TInlineAllocator<8>>& OutArgs, uint32& OutSerial) const;
 
 	/** Owned BLAS over the Position and Index streams; null until the first publish lands. */
 	TUniquePtr<FRayTracingGeometry> RayTracingGeometry;

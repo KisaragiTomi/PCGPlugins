@@ -19,6 +19,9 @@
 // ⚠️ **路上的壳是"沉下去"，不是"隐藏"**（裁决五）。显隐判据里**没有 road** —— TG 实测
 // `displace_rocky_terrain.cs:202-206` 只有 rocky/water。用 NaN 关掉的话画路时三角会一个一个
 // 啪地消失（popping）；连续沉降的观感才是"石头慢慢埋进土里"。
+//
+// ⚠️ **壳读的不是色流本身，是模糊过的路足迹**（用户裁决 2026-09-11：路对壳的下压太激烈）。
+// 见文件末尾的「第零趟」—— 两趟可分离高斯先把 `saturate(R × RoadFade)` 糊开，披挂只采那张场。
 
 #include "/Engine/Public/Platform.ush"
 #include "/Plugin/PCGPlugins/Shaders/Private/CSGroundShaperField.ush"
@@ -32,7 +35,7 @@ Buffer<float4> RockShellRestDir;      // RestXY.xy + DirToCentroid.xy
 Buffer<uint>   RockShellCellFlags;    // CellId | bIsTopRim<<24 | bIsCorner<<25 | bIsCapTri<<26
 Buffer<float2> RockShellCentroids;    // 逐胞腔质心 XY（图案空间），只用于 CellJitter 的半径淡入
 
-Buffer<uint>   RockShellGroundColors; // 地面常驻色流，packed BGRA / 顶点，V = Y * VertsX + X
+Buffer<float>  RockShellRoadField;    // 模糊后的路足迹 ∈ [0,1]，1 / 地面格点，V = Y * VertsX + X（第零趟写）
 
 RWBuffer<float> RW_RockShellPositions; // 3 / 顶点
 RWBuffer<uint>  RW_RockShellTangents;  // 2 / 顶点（packed 8888：[0]=TangentX，[1]=TangentZ）
@@ -48,12 +51,11 @@ float  RockShellWindingSign;       // +1 / −1，由 CPU 侧**实测**盖三角
 
 float2 RockShellGroundOriginXY;    // 地面镜像格点 (0,0) 的世界 XY —— 只用于取道路权重
 float  RockShellGroundCellSize;
-uint2  RockShellGroundVerts;
+uint2  RockShellGroundVerts;       // 第零趟与披挂共用：两边的格点身份必须是同一张网格
 float  RockShellGroundBaseZ;       // 地面 actor 的世界 Z（高度场是相对它的）
 
 float  RockShellSlopeLo;           // mask = smoothstep(Lo, Hi, |∇h|)，与 TG 同口径 0.75 / 1.25
 float  RockShellSlopeHi;
-float  RockShellRoadFade;          // road 的沉降权重（TG 用 10×：很小的路权重就足以把壳压下去）
 float  RockShellRoadSink;          // road 满值时沿地形法线的下沉量 cm（TG 合计约 1.6 m）
 float  RockShellCellJitter;        // 逐胞腔沿 DirToCentroid 的随机胀缩幅度 cm（图案空间）
 float  RockShellCellRelief;        // 壳沿地形法线的**厚度** cm —— 见 3) 的 cell_bby 一段
@@ -134,17 +136,21 @@ float2 CSRockShell_ToWorld(float2 PatternXY)
 	return RockShellWorldCentre + (PatternXY - RockShellPatternCentre) * RockShellScale;
 }
 
-/** 道路权重 = 色流的 R 通道（packed BGRA，同 CSMeshOps.usf 的 PackColorBGRA）。 */
-float CSRockShell_ReadRoad(uint X, uint Y)
+/** 第零趟写好的模糊足迹。与色流同一张格：V = Y * VertsX + X。 */
+float CSRockShell_ReadRoadField(uint X, uint Y)
 {
-	return float((RockShellGroundColors[Y * RockShellGroundVerts.x + X] >> 16u) & 0xFFu) / 255.0f;
+	return RockShellRoadField[Y * RockShellGroundVerts.x + X];
 }
 
 /**
  * 与 `ACSGroundActor::SampleRoadWeight` / `CSStairs_SampleRoad` 同一口径的双线性采样，出界为 0。
  *
- * 直接读 GPU 色流而不是让 CPU 上传一份：色流就是笔刷双写出来的那一份权威投影，读它意味着
- * "画面上看到的路"与"壳沉下去的判据"构造上同源。第三条路迟早与另外两条错开一帧。
+ * 采的是第零趟的**模糊足迹**：已经乘过 `RoadFade`、截到 [0,1]，拿到的就是沉降权重。
+ * ❗ 调用方不许再乘一次增益 —— 再乘会把刚糊开的缓坡重新压成一刀（第零趟的注释有账）。
+ *
+ * 足迹是在**同一张 RDG 图里**从 GPU 色流现糊出来的，不是 CPU 上传的一份：色流就是笔刷双写
+ * 出来的那一份权威投影，"画面上看到的路"与"壳沉下去的判据"因此构造上同源。
+ * 第三条路迟早与另外两条错开一帧。
  */
 float CSRockShell_SampleRoad(float2 P)
 {
@@ -157,10 +163,10 @@ float CSRockShell_SampleRoad(float2 P)
 	const float Fx = saturate(G.x - float(X0));
 	const float Fy = saturate(G.y - float(Y0));
 
-	const float R00 = CSRockShell_ReadRoad(X0, Y0);
-	const float R10 = CSRockShell_ReadRoad(X0 + 1u, Y0);
-	const float R01 = CSRockShell_ReadRoad(X0, Y0 + 1u);
-	const float R11 = CSRockShell_ReadRoad(X0 + 1u, Y0 + 1u);
+	const float R00 = CSRockShell_ReadRoadField(X0, Y0);
+	const float R10 = CSRockShell_ReadRoadField(X0 + 1u, Y0);
+	const float R01 = CSRockShell_ReadRoadField(X0, Y0 + 1u);
+	const float R11 = CSRockShell_ReadRoadField(X0 + 1u, Y0 + 1u);
 	return lerp(lerp(R00, R10, Fx), lerp(R01, R11, Fx), Fy);
 }
 
@@ -350,7 +356,7 @@ void DisplaceRockShellCS(uint3 Id : SV_DispatchThreadID)
 		// 只会让边缘那一圈在两个判据之间抖）。
 		const float  Slope = length(G);
 		const float  Rock  = CSRockShell_RockMask(G);
-		const float  Road  = saturate(CSRockShell_SampleRoad(XY) * RockShellRoadFade);
+		const float  Road  = CSRockShell_SampleRoad(XY);   // 已含 RoadFade 与模糊，见第零趟
 		const float3 N     = CSRockShell_SafeNormal(float3(-G.x, -G.y, 1.0f));
 
 		// ---------------------------------------------------------------------
@@ -402,7 +408,8 @@ void DisplaceRockShellCS(uint3 Id : SV_DispatchThreadID)
 		// 偏移，在平缓的小土台上照样给 —— 而缓坡正是倍数几乎给不出体积的地方。
 		//
 		// `rocky_terrain.z`（笔画自带的岩石度）本项目没有那条通道，其余逐项对应：我们的
-		// `Road` 已经乘过 `RoadFade`（= TG 的 10×），所以 `Rock − Road` 就是那条 clamp 的对位物。
+		// `Road` 已经乘过 `RoadFade`（= TG 的 10×，在第零趟模糊之前），所以 `Rock − Road`
+		// 就是那条 clamp 的对位物。
 		//
 		// ⚠️ **加在 ⑧ 之后**：⑧ 管的是"隆起不许把石头顶到地面以上"，而末端 `Rock → 0` 时本项
 		// 恰好是 −BaseSink（往地里扎），与 ⑧ 同向 —— 放在后面不会把刚夹好的末端又顶回去。
@@ -661,4 +668,87 @@ void RockShellBevelPayloadCS(uint3 Id : SV_DispatchThreadID)
 		RW_RockShellTexCoords[Base + 12u] = NSelfOct.x;
 		RW_RockShellTexCoords[Base + 13u] = NSelfOct.y;
 	}
+}
+
+// =============================================================================
+// 第零趟：路足迹的可分离高斯（用户裁决 2026-09-11：路对壳的下压太激烈）。
+// 一线程一地面格点，X / Y 两趟，**跑在披挂之前**；披挂只采 Y 趟写出的 `RockShellRoadField`。
+//
+// 病根是增益放在了采样**之后**：旧写法 `saturate(双线性(R) × RoadFade)`，RoadFade = 10 ⇒ R 到 0.1
+// 壳就沉到底，而默认笔刷的边缘从 0 爬到 0.1 只要 ~30 cm —— RoadSink 加上基准偏移那 60 cm 的
+// 全部落差挤进不到一个三角里，出图就是一道道 V 形折痕。
+//
+// 修法是**先截足迹、再糊**：X 趟读色流 R、乘 RoadFade、截到 [0,1]，然后才模糊；披挂拿到结果
+// 直接用，不再乘任何增益。⚠️ 顺序是承重的 —— 反过来「先糊原始权重、再 ×10」的话，增益只取
+// 模糊场最底下那 10% 的尾巴，缓坡又被压回一刀（只是往路外挪了一截），半径几乎白给。
+// 现在的形状：足迹边缘处沉降权重 = 0.5，内外各按高斯累积分布走完，缓坡宽度由半径直接决定。
+//
+// TG 对照：path mask 也有一趟可分离高斯（`_gauss_blur_r16f.cs`：伸展 ceil(2σ)、逐抽头
+// exp(−k²/2σ²)），但岩壳是**糊完再** `smoothstep(0.1, 0.15)` 硬阈（`displace:425`）——
+// 路缘仍是一刀，只是往路外挪了约 1.2σ。这里有意反过来，理由即上一段。TG 的 σ 由 CPU 给，没查到值。
+//
+// 核：单侧 `RockShellBlurTaps` 格（= ceil(半径 / 格距)），σ = 半径 / 3，截在 3σ（边缘权重
+// exp(−4.5) ≈ 1.1%）。TG 截在 2σ（边缘 13.5%）：σ = 2 格时核够不着的地方会断出约 3% 的台阶，
+// 乘上米级的沉降就是一道 10 cm 的坎。
+// 出界的抽头**跳过并按剩下的权重归一**（同 TG `_gauss_blur_mask.cs`）：路一直画到地面边上时，
+// 边上那圈不会因为"界外当 0"被糊淡、让壳从路边冒出来。
+//
+// ⚠️ 两趟参数结构里的每一条都被 kernel 真读（`FComputeShaderUtils::AddPass` 会清掉没读的绑定、
+// 连带抹掉那条 RDG 依赖边，藤蔓 SC pass 就是这么挂过 GPU 的）。
+// =============================================================================
+
+Buffer<uint>    RockShellGroundColors;      // X 趟：地面常驻色流，packed BGRA / 顶点，V = Y * VertsX + X
+Buffer<float>   RockShellRoadBlurRO;        // Y 趟：X 趟的输出
+RWBuffer<float> RW_RockShellRoadBlur;       // 两趟各自的输出（绑的是两块不同的 buffer）
+float           RockShellRoadFade;          // X 趟：足迹增益（TG 的 10×），**在模糊之前**乘
+uint            RockShellBlurTaps;          // 单侧抽头数；0 = 不模糊（只截足迹）
+float           RockShellBlurInvTwoSigmaSq; // 1 / (2σ²)，σ 以**格**为单位；Taps = 0 时主机给 0
+
+#ifndef ROCKSHELL_BLUR_GROUP
+#define ROCKSHELL_BLUR_GROUP 8
+#endif
+
+/** 道路权重 = 色流的 R 通道（packed BGRA，同 CSMeshOps.usf 的 PackColorBGRA）。 */
+float CSRockShell_ReadRoad(uint X, uint Y)
+{
+	return float((RockShellGroundColors[Y * RockShellGroundVerts.x + X] >> 16u) & 0xFFu) / 255.0f;
+}
+
+[numthreads(ROCKSHELL_BLUR_GROUP, ROCKSHELL_BLUR_GROUP, 1)]
+void BlurRockShellRoadXCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x >= RockShellGroundVerts.x || Id.y >= RockShellGroundVerts.y) return;
+
+	const int Taps = int(RockShellBlurTaps);
+	float Sum = 0.0f;
+	float WeightSum = 0.0f;
+	for (int K = -Taps; K <= Taps; ++K)
+	{
+		const int X = int(Id.x) + K;
+		if (X < 0 || X >= int(RockShellGroundVerts.x)) continue;
+		const float W = exp(-float(K * K) * RockShellBlurInvTwoSigmaSq);
+		Sum += saturate(CSRockShell_ReadRoad(uint(X), Id.y) * RockShellRoadFade) * W;
+		WeightSum += W;
+	}
+	// K = 0 永远在界内且权重为 1 ⇒ WeightSum ≥ 1，max 只是写给读代码的人看的。
+	RW_RockShellRoadBlur[Id.y * RockShellGroundVerts.x + Id.x] = Sum / max(WeightSum, 1e-6f);
+}
+
+[numthreads(ROCKSHELL_BLUR_GROUP, ROCKSHELL_BLUR_GROUP, 1)]
+void BlurRockShellRoadYCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x >= RockShellGroundVerts.x || Id.y >= RockShellGroundVerts.y) return;
+
+	const int Taps = int(RockShellBlurTaps);
+	float Sum = 0.0f;
+	float WeightSum = 0.0f;
+	for (int K = -Taps; K <= Taps; ++K)
+	{
+		const int Y = int(Id.y) + K;
+		if (Y < 0 || Y >= int(RockShellGroundVerts.y)) continue;
+		const float W = exp(-float(K * K) * RockShellBlurInvTwoSigmaSq);
+		Sum += RockShellRoadBlurRO[uint(Y) * RockShellGroundVerts.x + Id.x] * W;
+		WeightSum += W;
+	}
+	RW_RockShellRoadBlur[Id.y * RockShellGroundVerts.x + Id.x] = Sum / max(WeightSum, 1e-6f);
 }

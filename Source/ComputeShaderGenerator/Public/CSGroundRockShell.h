@@ -320,8 +320,16 @@ struct FDisplaceParams
 	/** mask = smoothstep(SlopeLo, SlopeHi, |∇h|)，与 TG 的 rocky_terrain.x 同口径。 */
 	float SlopeLo = 0.75f;
 	float SlopeHi = 1.25f;
-	/** road 的沉降权重（TG 用 10×：很小的路权重就足以把壳压下去）。 */
+	/**
+	 * 路足迹的增益（TG 用 10×）：`saturate(R × 本值)` 就是壳眼里的"这里有路"。
+	 * ⚠️ 乘在**模糊之前**（第零趟 X），披挂那边不再乘 —— 顺序为什么承重见 usf 的「第零趟」。
+	 */
 	float RoadFade = 10.0f;
+	/**
+	 * 路足迹进披挂之前的高斯模糊半径 cm（= 核的单侧伸展，σ = 本值 / 3）。0 = 不模糊。
+	 * 与 `ACSGroundActor::RockShellRoadBlurRadius` 同默认值，唯一调用方每次都会覆写。
+	 */
+	float RoadBlurRadius = 300.0f;
 	/** road 满值时沿地形法线的下沉量 cm（TG 合计约 1.6 m）。 */
 	float RoadSink = 160.0f;
 	/**
@@ -398,6 +406,8 @@ COMPUTESHADERGENERATOR_API bool BuildMesh(
  *
  * `GroundResident` 是地面网格的常驻流集合，只读它的色流取道路权重 —— 读的正是笔刷双写出来的
  * 那一份权威投影，所以"画面上看到的路"与"壳沉下去的判据"是构造上同源的。
+ * 色流先在同一张图里过两趟可分离高斯（`RoadFade` 截出的足迹，按 `RoadBlurRadius` 糊开），
+ * 披挂采的是糊出来的那张临时场 —— 路缘因此是一段缓坡，不是一道折痕（用户裁决 2026-09-11）。
  *
  * 两份常驻流各开一个 `FCSMeshRenderThreadEdit`（壳写、地面读），访问状态由它们各自恢复。
  * 直接写流再手工恢复是同一条规则的第二份拷贝，而漂掉的那份不会报错，只是安静地停止工作。

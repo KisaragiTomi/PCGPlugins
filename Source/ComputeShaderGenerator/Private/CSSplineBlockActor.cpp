@@ -2,7 +2,6 @@
 
 #include "CSGpuMeshTypes.h"
 #include "CSMesh.h"
-#include "CSMeshOps.h"
 #include "Components/SplineComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Materials/MaterialInterface.h"
@@ -152,10 +151,10 @@ ACSSplineBlockActor::ACSSplineBlockActor()
 	if (CubeFinder.Succeeded()) BlockPalette.Add(CubeFinder.Object);
 }
 
-void ACSSplineBlockActor::OnConstruction(const FTransform& Transform)
+void ACSSplineBlockActor::ReevaluateSite()
 {
-	Super::OnConstruction(Transform);
-	// 常驻流是世界空间：拖 spline 点、移动 actor 都会重跑构造脚本，统一从这里全量重建。
+	// 常驻流是世界空间：拖 spline 点、移动 actor 都会重跑构造脚本（→ 基类 OnConstruction → 这里），
+	// 统一从这里全量重建。
 	RebuildBlocks();
 }
 
@@ -293,11 +292,6 @@ void ACSSplineBlockActor::RebuildBlocks()
 	Snapshot.AttrLayout = FCSGpuMeshCPUData::EAttrLayout::PerVertex;
 	Snapshot.Materials = Materials;
 
-	if (!UploadTinyGladeSnapshot(Snapshot, Materials))
-	{
-		ClearBlocks();
-		return;
-	}
-	// 多槽才需要分批绘制；单槽时"整网格一个批次"本来就是正确语义。
-	if (Materials.Num() > 1) UCSMeshOps::BuildMaterialSections(GetTinyGladeMesh());
+	// 多槽时基类上传顺带分段；单槽时"整网格一个批次"本来就是正确语义。
+	if (!UploadTinyGladeSnapshot(Snapshot, Materials)) ClearBlocks();
 }

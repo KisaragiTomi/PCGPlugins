@@ -4,6 +4,8 @@
 #include "CSMeshOps.h"
 #include "CSMeshRenderSceneProxy.h"
 
+#include "Containers/Ticker.h"   // DeferMeshChanged：FTSTicker（unity 构建下别指望邻居带进来）
+#include "Engine/World.h"        // UWorld::bPostTickComponentUpdate
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialRenderProxy.h"
 #include "SceneInterface.h"
@@ -71,10 +73,10 @@ void FCSMeshRenderSceneProxy::GetDynamicMeshElements(const TArray<const FSceneVi
 	}
 }
 
-void FCSMeshRenderSceneProxy::GetRayTracingBatchMaterials(TArray<FMaterialRenderProxy*, TInlineAllocator<8>>& OutMaterials) const
+void FCSMeshRenderSceneProxy::GetBatchMaterials(TArray<FMaterialRenderProxy*, TInlineAllocator<8>>& OutMaterials) const
 {
 	// The same fallback GetDynamicMeshElements takes: no batch list, one batch of the base material.
-	if (BatchMaterials.Num() == 0) return FCSGpuMeshSceneProxy::GetRayTracingBatchMaterials(OutMaterials);
+	if (BatchMaterials.Num() == 0) return FCSGpuMeshSceneProxy::GetBatchMaterials(OutMaterials);
 	OutMaterials.Reset(BatchMaterials.Num());
 	for (UMaterialInterface* Mat : BatchMaterials) OutMaterials.Add(Mat->GetRenderProxy());
 }
@@ -180,7 +182,15 @@ FPrimitiveSceneProxy* UCSMeshRenderComponent::CreateSceneProxy()
 	ResolveBatchMaterials(BoundBatchMaterials);
 
 	if (!Resident.IsValid() || !Resident->IsAllocated()) return nullptr;
-	return new FCSMeshRenderSceneProxy(this, Resident, BoundBatchMaterials);
+	FCSMeshRenderSceneProxy* Proxy = new FCSMeshRenderSceneProxy(this, Resident, BoundBatchMaterials);
+
+	// What the new proxy's surface cache will be built from, as far as this thread can tell: its
+	// cards from this component's bounds as they are now, its capture batches from whatever the
+	// mirror holds when the scene collects them. The poll settles any difference.
+	SurfaceCacheCardBounds = CalcBounds(FTransform::Identity).GetBox();
+	SurfaceCacheServedSerial = Resident->GetDrawArgsPublishSerial();
+	ArmSurfaceCacheRefresh();
+	return Proxy;
 }
 
 void UCSMeshRenderComponent::GetUsedMaterials(TArray<UMaterialInterface*>& OutMaterials, bool bGetDebugMaterials) const
@@ -254,10 +264,86 @@ bool UCSMeshRenderComponent::IsGpuMeshProxyActive() const
 	return Resident != nullptr && Resident->IsAllocated();
 }
 
+void UCSMeshRenderComponent::OnComponentDestroyed(bool bDestroyingHierarchy)
+{
+	// 本组件**自己的**网格（Outer 是本组件）由本组件还显存：删 actor、DestroyComponent、GC 三条路
+	// 都会走到这里，而且都在代理拆掉之后。别人的网格（生产方挂在自己身上、只借本组件显示的那种，
+	// 如 generator 的 DirectGpuMesh）一个字节都不动 —— 本组件只负责画它。
+	//
+	// 只还显存、不解绑：编辑器里的删除可以撤销，复活的是同一个组件，绑定留着，拥有方重建时那张
+	// 网格照常把变化广播过来。不阻塞（ReleaseDeferred）：构造脚本建出来的组件每次重跑构造脚本都会
+	// 被销毁一遍，那条路落在"改一个属性"上。退出清场（GExitPurge）交给 UCSMesh::BeginDestroy。
+	if (!GExitPurge && GpuMesh && GpuMesh->GetOuter() == this) GpuMesh->ReleaseDeferred();
+	Super::OnComponentDestroyed(bDestroyingHierarchy);
+}
+
 void UCSMeshRenderComponent::BeginDestroy()
 {
 	UnbindMeshDelegate();
 	Super::BeginDestroy();
+}
+
+void UCSMeshRenderComponent::ArmSurfaceCacheRefresh()
+{
+	if (!FCSGpuMeshSceneProxy::IsSurfaceCacheEnabled()) return;
+	SurfaceCacheArmedAt = FPlatformTime::Seconds();
+	if (bSurfaceCacheTickerArmed) return;
+	bSurfaceCacheTickerArmed = true;
+	// FTSTicker because it is safe to arm from CreateSceneProxy, which the engine may call off the
+	// game thread; the core ticker itself fires on the game thread, outside the end-of-frame update.
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateWeakLambda(this, [this](float DeltaTime)
+	{
+		return TickSurfaceCacheRefresh(DeltaTime);
+	}));
+}
+
+bool UCSMeshRenderComponent::TickSurfaceCacheRefresh(float /*DeltaTime*/)
+{
+	const FCSMeshResident* Resident = GpuMesh ? GpuMesh->GetResidentPtr() : nullptr;
+	if (!Resident || !IsRegistered() || SceneProxy == nullptr || !FCSGpuMeshSceneProxy::IsSurfaceCacheEnabled())
+	{
+		bSurfaceCacheTickerArmed = false;
+		return false;
+	}
+
+	// A flush can pump game-thread work into the middle of the end-of-frame update, the one moment
+	// render state may not be touched (see DeferMeshChanged). Next frame is soon enough.
+	const UWorld* World = GetWorld();
+	if (World && World->bPostTickComponentUpdate) return true;
+
+	// Every arg set is retired together when an edit starts (FCSMeshResident::RequestDrawArgsReadback),
+	// so set 0 answers for all of them.
+	FCSGpuDrawArgs Args;
+	if (!Resident->GetDrawArgs(0, Args))
+	{
+		if (FPlatformTime::Seconds() - SurfaceCacheArmedAt < 10.0) return true;
+		bSurfaceCacheTickerArmed = false;
+		return false;
+	}
+
+	// The flag drops before anything below can re-arm: RecreateRenderState_Concurrent reaches
+	// CreateSceneProxy, and a flag still up would make that re-arm a no-op right before this ticker
+	// removes itself.
+	bSurfaceCacheTickerArmed = false;
+	const uint32 Serial = Resident->GetDrawArgsPublishSerial();
+	if (Serial == SurfaceCacheServedSerial) return false;   // the live batches already hold these counts
+	SurfaceCacheServedSerial = Serial;
+
+	const FBox MeshBounds = CalcBounds(FTransform::Identity).GetBox();
+	if (!SurfaceCacheCardBounds.IsValid || !SurfaceCacheCardBounds.ExpandBy(1.0).IsInside(MeshBounds))
+	{
+		// Grown past its cards: only a new primitive gets a new card set. CreateSceneProxy records
+		// what the new proxy is built from; its batches read the landed counts directly.
+		RecreateRenderState_Concurrent();
+		return false;
+	}
+
+	// The transform update is what makes the engine collect static batches again
+	// (RendererScene.cpp:5956-5960 in 5.7.4) — this time with the landed counts. The invalidation
+	// then recaptures every mapped page of the cards from them.
+	MarkRenderTransformDirty();
+	if (FSceneInterface* ComponentScene = GetScene()) ComponentScene->InvalidateLumenSurfaceCache_GameThread(this);
+	return false;
 }
 
 void UCSMeshRenderComponent::BindMeshDelegate()
@@ -272,9 +358,29 @@ void UCSMeshRenderComponent::UnbindMeshDelegate()
 	MeshChangedHandle.Reset();
 }
 
+void UCSMeshRenderComponent::DeferMeshChanged()
+{
+	if (bMeshChangedDeferred) return;
+	bMeshChangedDeferred = true;
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateWeakLambda(this, [this](float)
+	{
+		bMeshChangedDeferred = false;
+		HandleMeshChanged(GpuMesh);
+		return false;   // 一次性
+	}));
+}
+
 void UCSMeshRenderComponent::HandleMeshChanged(UCSMesh* ChangedMesh)
 {
 	if (ChangedMesh != GpuMesh) return;
+
+	// 帧末组件更新中途被泵进来（理由见 DeferMeshChanged 的声明）：此刻不许碰渲染状态。
+	const UWorld* World = GetWorld();
+	if (World && World->bPostTickComponentUpdate)
+	{
+		DeferMeshChanged();
+		return;
+	}
 
 	const FCSMeshResident* Resident = GpuMesh ? GpuMesh->GetResidentPtr() : nullptr;
 	LocalBounds = Resident ? Resident->WorldBounds : FBox(ForceInit);
@@ -325,4 +431,6 @@ void UCSMeshRenderComponent::HandleMeshChanged(UCSMesh* ChangedMesh)
 
 	UpdateBounds();
 	MarkRenderTransformDirty();
+	// This edit retired the published counts; the capture batches come back when its readback lands.
+	ArmSurfaceCacheRefresh();
 }

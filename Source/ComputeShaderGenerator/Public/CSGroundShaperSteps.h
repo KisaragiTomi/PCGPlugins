@@ -1,10 +1,12 @@
-#pragma once
+﻿#pragma once
 
 #include "CoreMinimal.h"
 #include "RenderGraphResources.h"
 // CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS —— FPaletteBuffers::CustomData 的元素数按它算。
 // 显式写出来：unity 构建下漏 include 一声不吭，只在 -SingleFile 或 Live Coding 下炸。
 #include "CSGpuInstancedMeshComponent.h"
+
+class AActor;
 
 /**
  * GPU 实例源的**共用容器与容量管理**（TinyGladeHouse D6/D9/D12/D13）。
@@ -17,7 +19,7 @@
  * 剩下的是四条 GPU 实例路（门框砖 / 藤枝 / 藤叶 / 摆件）都在用的三样东西：
  *   · `FPaletteBuffers` —— 一个 palette 条目的 packed 实例行 + counter + 基础网格尺寸；
  *   · `ReserveCapacity` —— 注册期一次付清的定容预留（交互期因此永远走不到扩容那次阻塞）；
- *   · `ReleaseOnRenderThread` —— 把最后一份引用交回渲染线程释放。
+ *   · `ReleaseOnRenderThread` —— 在渲染命令里放掉这份引用（顺序上的讲究，不是安全要求，见它的注释）。
  *
  * 另外还留着一个 `ResampleUniform`：它**没有产线消费者**，只服务于单测
  * `House.FrameAnalyticMatchesLegacy` 里那份旧路 CPU 镜像（见它自己的注释）。
@@ -113,7 +115,7 @@ inline int32 ReserveCount(int32 Exact)
 /** 一个 palette 条目对应的 GPU 实例源（直接喂 UCSGpuInstancedMeshComponent）。 */
 struct FPaletteBuffers
 {
-	TRefCountPtr<FRDGPooledBuffer> PackedInstances;   // Buffer<float4>，5 个 / 实例
+	TRefCountPtr<FRDGPooledBuffer> PackedInstances;   // Buffer<float4>，CS_GPU_INSTANCED_ROW_FLOAT4S 个 / 实例
 	TRefCountPtr<FRDGPooledBuffer> Counter;           // Buffer<uint>，[0] = 活跃数
 	/** Buffer<float>，`CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS` 个 / 实例。**恒分配**：
 	 *  8 字节 / 实例，4096 容量也只有 32 KB，为省它多开一条"要不要分配"的分支不划算。
@@ -144,11 +146,22 @@ struct FPaletteBuffers
  * 这条纪律要求的。不预留的话，第一次真的长出砖的那一笔会当场付一次 flush，而且它出现在
  * 哪一笔完全取决于用户画到哪里，最难复现也最难归因。
  *
- * 只涨不缩；已经够大就一次 enqueue 都不发。
+ * 只涨不缩；已经够大就一次 enqueue 都不发。扩容出来的新 buffer（行 / counter / custom data）
+ * 三条都清零：池子复用的 buffer 带着上一位租客的字节，交接出去就是幽灵实例。扩容之后组件拿到的
+ * 是一份**空**实例源 —— 交接结果 `HandedOver` 就是"必须重打包一次"的信号，各家 Rebuild 的早退门
+ * 据此不许早退。
  */
 bool ReserveCapacity(TArray<FPaletteBuffers>& Palettes, uint32 MinCapacityPerPalette);
 
-/** 把最后一份引用交回渲染线程释放，避免在游戏线程上把在途帧正在读的显存抽走。 */
+/**
+ * 在渲染命令里放掉这批引用并清空表。
+ *
+ * **不是安全要求**（2026-09-07 审查 B7）：`FRDGPooledBuffer` 是原子引用计数，RDG 池子自己恒持一份、
+ * 且要等 buffer 闲置 30 帧才真释放 —— 无论哪个线程放掉引用，在途帧读的显存都不会被抽走。
+ * 这一跳只是让"放掉"排在已经入队的命令之后。真正会出事的两件是：复用的 buffer 没清零（GrowTo 已清）、
+ * 引用一直没人放 —— 各放各的：组件那一份由组件销毁时自己放（UCSGpuInstancedMeshComponent::
+ * OnComponentDestroyed），生产者这一份由生产者放（本函数，ACSTinyGlade 派生类在 ReleaseInstancedBuffers 里调）。
+ */
 void ReleaseOnRenderThread(TArray<FPaletteBuffers>& Palettes);
 
 /**
@@ -163,4 +176,139 @@ void ReleaseOnRenderThread(TArray<FPaletteBuffers>& Palettes);
  * 提前返回的那几条路走不到它。所以那些路必须在撤实例源**之前**显式调这一条。
  */
 void ZeroCounters(TArray<FPaletteBuffers>& Palettes);
+
+// --- 实例组件的建/补 ---------------------------------------------------------------------
+
+/**
+ * 建/补一个 GPU 实例组件（挂在 `Owner` 的根上、`RF_Transient`、立刻注册）。
+ *
+ * ⚠️ **必须先 `RegisterComponent` 再喂**：未注册时任何变更都会把 GPU 网格释放掉。
+ * 而"每一趟都判"是因为蓝图 actor 重跑构造脚本会把实例组件销毁、指针随之失效 ——
+ * 只在构造里建一次的话，重跑之后画面永远是空的，且没有任何报错。
+ *
+ * 返回是否**新建**了。新组件身上什么都没有，走 `SetBaseMeshFromGpuData` 的调用方要据此
+ * 作废自己那份"基础网格快照已就绪"；走 `SetBaseMesh` 的不用管（它内部同一张网格早退）。
+ */
+bool EnsureInstancedComponent(AActor* Owner, TObjectPtr<UCSGpuInstancedMeshComponent>& Component);
+
+/**
+ * 数组版：把组件表调到 `Num` 个 —— 多的销毁（组件自己撤源、放显存），缺的补建。
+ *
+ * 返回**表是否变过**（增、删、补建都算）。调色板与组件按**下标**对齐，表一变基础网格快照
+ * 就必须整批重建，少一个就全体错位。
+ */
+bool EnsureInstancedComponents(AActor* Owner, TArray<TObjectPtr<UCSGpuInstancedMeshComponent>>& Components, int32 Num);
+
+// --- 实例源交接：九处逐字重复的状态机收敛到这里 -----------------------------------------
+//
+// 每一家产物（门框砖 / 砖石柱 / 藤三调色板 / 屋瓦 / 房子摆件 / 石阶 / 石子 / 裙边摆件 /
+// 地被 N 物种）原本都在自己 `Ensure*` 的尾部手写同一段：判容量或包围盒变了没 -> 填
+// `FCSGpuInstanceSourceGPU` -> 交接 -> 回写缓存。九份副本已经分叉出过三种**都不报错**的差异：
+//   · 漏 `CustomData` => 材质里的 `Per Instance Custom Data` 恒读 0（藤叶不长、地被不弯）；
+//   · 漏 `IsValid(组件)` => 蓝图重跑构造脚本之后是空指针解引用；
+//   · 漏 `HasInstanceSourceGPU()` 兜底 => 缓存说"交接过了"而组件其实是空的，画面永远空白。
+// 三种都只在特定操作序列下显形，而画面之外没有任何信号 —— 正是必须只留一份的那类代码。
+//
+// **留在调用方的只有真正逐家不同的那件事：包围盒怎么算。** 判据、填充、回写全在这里。
+
+/**
+ * 上一次交出去的东西：逐调色板的容量 + 那只包围盒。判"要不要重交"只看这两样。
+ *
+ * 撤实例源（`ClearInstanceSourceGPU`）与组件重建都必须连它一起 `Reset` —— 缓存说"交接过了"
+ * 而组件是空的，下一趟就会被判成稳态而直接跳过，画面永远空白且没有任何报错。
+ */
+struct FHandoverCache
+{
+	TArray<uint32> Capacities;
+	FBox LocalBounds = FBox(ForceInit);
+
+	void Reset() { Capacities.Reset(); LocalBounds = FBox(ForceInit); }
+};
+
+/** 一个调色板在交接面上的样子。三种 buffers 结构都填得出来（见 `MakeHandoverSource`）。 */
+struct FHandoverSource
+{
+	UCSGpuInstancedMeshComponent* Component = nullptr;
+	TRefCountPtr<FRDGPooledBuffer> PackedInstances;
+	TRefCountPtr<FRDGPooledBuffer> Counter;
+	/**
+	 * 可空，**只有真写它的生产者才填**（藤叶/花的生长相位、地被的弯曲幅度）。
+	 *
+	 * 填了的代价是剔除 pass 多跑一趟逐可见槽的拷贝（`bHasCustomData`）；而
+	 * `FPaletteBuffers::CustomData` 是**恒分配**的，所以不写它的那几家填了也只是多抄一遍全零，
+	 * 材质两条路都读到 0。差别只在那趟拷贝，所以这是个显式开关而不是"有就交"。
+	 */
+	TRefCountPtr<FRDGPooledBuffer> CustomData;
+	uint32 Capacity = 0;
+
+	/** 组件与源都齐了才交得出去。`IsValid` 那一半是给蓝图重跑构造脚本兜底的。 */
+	bool IsReady() const
+	{
+		return ::IsValid(Component) && PackedInstances.IsValid() && Counter.IsValid() && Capacity > 0;
+	}
+};
+
+enum class EHandoverMode : uint8
+{
+	/** 任一条没准备好就整批不交 —— 调色板与组件按**下标**对齐，交一半等于错位。 */
+	AllOrNothing,
+	/** 各判各的、各交各的。调色板之间互不相干时用（地被 N 物种、石阶 + 石子）。 */
+	PerPalette,
+};
+
+enum class EHandoverResult : uint8
+{
+	UpToDate,     // 判据说不用交。**稳态下每一趟都该是它** —— 交接是阻塞的
+	HandedOver,   // 真交了（至少一个）
+	NotReady,     // 该交，但源或组件没准备好
+};
+
+struct FHandoverOptions
+{
+	EHandoverMode Mode = EHandoverMode::AllOrNothing;
+	/**
+	 * 非空 => 每次真交接打一行，内容是"谁 + 第几个 + 容量"。
+	 * 这是阻塞的那一趟的唯一痕迹：稳态下一行都不该有，画路 / 拖尺寸时反复出现就说明上面
+	 * 某个"没变"的判据其实每次都在变，而那正是交互期掉帧的来源。
+	 */
+	const TCHAR* LogLabel = nullptr;
+};
+
+/**
+ * 只涨不缩地把新盒子并进上次那只，返回并好的。
+ *
+ * 起因见本文件上面那段"交互期的稳态化"：包围盒直接由尺寸算出而交接阈值只有 1 cm，
+ * 拖动中每一帧都会重走一次阻塞的 `SetInstanceSourceGPU`。
+ *
+ * `bFullRebuild` 时**不并**，让它重新收紧（否则一次误拉大就永久留着保守盒）。
+ * 盒子由配置算死、本来就不随交互漂的那几家（石阶 / 地被）不需要调这一条。
+ */
+FBox MergeHandoverBounds(FBox LocalBounds, const FHandoverCache& Cache, bool bFullRebuild = false);
+
+/** 从一个 `FPaletteBuffers` 填出交接面。`bWithCustomData` 的取舍见 `FHandoverSource::CustomData`。 */
+FHandoverSource MakeHandoverSource(
+	UCSGpuInstancedMeshComponent* Component, const FPaletteBuffers& Buffers, bool bWithCustomData);
+
+/**
+ * 判 + 交 + 回写。`Sources` 与 `Cache.Capacities` 按下标对齐（数不一致一律判成"要交"）。
+ *
+ * 交接本身是阻塞的（组件内部走 `SetStreamLayoutSync` + 立刻重建 render state），所以判据必须
+ * 只看**由配置算得出来的量**：一旦掺进实例数据，包围盒就会随落笔漂移，每一笔都成立，
+ * "交互期零阻塞"整条纪律当场退化掉。调用方算 `LocalBounds` 时守的就是这一条。
+ */
+EHandoverResult HandOverInstanceSources(
+	TConstArrayView<FHandoverSource> Sources,
+	const FBox& LocalBounds,
+	FHandoverCache& Cache,
+	const FHandoverOptions& Options = FHandoverOptions(),
+	const UObject* LogOwner = nullptr);
+
+/** 单调色板的直通壳子（门框砖 / 砖石柱 / 屋瓦 / 石阶 / 石子）。 */
+EHandoverResult HandOverInstanceSource(
+	const FHandoverSource& Source,
+	const FBox& LocalBounds,
+	FHandoverCache& Cache,
+	const FHandoverOptions& Options = FHandoverOptions(),
+	const UObject* LogOwner = nullptr);
+
 }

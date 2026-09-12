@@ -19,6 +19,7 @@
 // 第 4 行是原点 + 每实例随机数，第 5 行是剔除球。
 
 #include "/Engine/Public/Platform.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/CSGpuSharedLayout.ush"
 
 #ifndef THREADGROUPSIZE_X
 #define THREADGROUPSIZE_X 64
@@ -59,7 +60,7 @@ void PackHousePillarCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	const float3 LocalZ = mul(float4(R3.xyz, 0.0f), PillarWorldToComponent).xyz * PillarBlockSize.z;
 	const float3 Origin = mul(float4(R0.xyz, 1.0f), PillarWorldToComponent).xyz;
 
-	const uint Base = Index * 5u;
+	const uint Base = Index * CS_GPU_INSTANCED_ROW_FLOAT4S;
 	RWPillarInstances[Base + 0u] = float4(LocalX, 0.0f);   // .w 必须是 0：引擎拿它做选中/hitproxy
 	RWPillarInstances[Base + 1u] = float4(LocalY, 0.0f);
 	RWPillarInstances[Base + 2u] = float4(LocalZ, 0.0f);

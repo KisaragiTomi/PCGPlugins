@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Containers/ArrayView.h"
+#include "CSGpuSharedLayout.ush"   // CS_GROUND_SHAPER_FLOAT4S（与 .ush 同一份）
 
 /**
  * 地形塑形物高度场的 **CPU 孪生**，与 `Shaders/Private/CSGroundShaperField.ush` 逐行对照。
@@ -21,15 +22,15 @@
 namespace CSGroundShaperField
 {
 /**
- * 每座塑形物在 `GroundShaperParams` 里占几个 float4。ush 里的下标算式（`i * 3u + k`）与
- * `ACSGroundActor::BuildShaperGpuParams` / `UCSMeshOps::DisplaceGroundShapers` /
- * `CSGroundStairs::Scan` 里的 `Num() / 3` 全部依赖它。
+ * 每座塑形物在 `GroundShaperParams` 里占几个 float4。ush 里的下标算式（`i * CS_GROUND_SHAPER_FLOAT4S + k`，
+ * 与这里是 CSGpuSharedLayout.ush 里的同一份 #define）与 `ACSGroundActor::BuildShaperGpuParams` /
+ * `UCSMeshOps::DisplaceGroundShapers` / `CSGroundStairs::Scan` 里的 `Num() / Float4sPerShaper` 全部依赖它。
  *
  *   [3i + 0] Profile = (中心 X, 中心 Y, Radius, FalloffDistance)
  *   [3i + 1] Top     = (台高, 裙边噪声幅度(归一化), 噪声频率 = 1/波长, 二次抬升系数)
  *   [3i + 2] Noise   = (噪声种子, 0, 0, 0)
  */
-inline constexpr int32 Float4sPerShaper = 3;
+inline constexpr int32 Float4sPerShaper = CS_GROUND_SHAPER_FLOAT4S;
 
 /** fbm 倍频数。与 ush 的 CSGSF_NOISE_OCTAVES 同步。 */
 inline constexpr uint32 NoiseOctaves = 3;

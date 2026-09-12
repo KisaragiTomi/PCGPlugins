@@ -1,0 +1,86 @@
+// UCSGpuInstancedMeshComponent 的 Nanite 路（BaseMesh 开了 Nanite 时自动走）：把本组件的 packed 实例行改写成引擎的 instance scene
+// data，写进 UCSGpuInstancedNaniteComponent 那个图元在 GPU-Scene 里的实例区间，之后剔除 / LOD /
+// 光栅全归引擎的 Nanite 管线（非 Nanite 资产则是引擎的 ISM 代理）。
+//
+// 由 FScene::UpdatePrimitiveInstancesFromCompute 的委托派发，跑在 GPU-Scene 更新时序里、UploadGeneral
+// 之后 —— 此刻图元自己的 LocalToWorld 已经是这一帧的新值，InitializeInstanceSceneDataLS 正是拿它把
+// 组件局部的实例变换升到世界的。
+//
+// ⚠️ 必须与 CSGpuInstancedMesh.usf 分成两个文件：GPUSceneWriter.ush 把 SceneData.ush 切到 RW 读法
+//    （USE_GPU_SCENE_DATA_RW），同一个翻译单元里不能再有常规读法（见那个头文件开头的说明）。
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ComputeShaderUtils.ush"
+#include "/Engine/Private/GPUScene/GPUSceneWriter.ush"
+
+// custom data 步长与行 stride：与 C++ 共用同一份 #define。下面只写一个 float4 的 payload 元素，超过 4 就得改写入循环。
+#include "/Plugin/PCGPlugins/Shaders/Private/CSGpuSharedLayout.ush"
+#if CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS > 4
+#error CSGpuInstancedNaniteWriter writes a single float4 of custom data per instance
+#endif
+
+// ── source：与剔除 pass 同一份布局（FCSGpuInstanceSourceGPU）─────────────────────
+Buffer<float4> SrcInstances;       // 5 float4 / instance: [0..2] 3x3 rows, [3] origin + random, [4] cull sphere
+Buffer<uint>   SrcInstanceCount;   // [0] = live count
+Buffer<float>  SrcCustomData;      // CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS / instance（源序）
+uint           bSrcHasCustomData;  // 0 = 生产者没给，payload 写零（与剔除 pass 给可见槽写零同一口径）
+uint           SrcMaxInstances;    // capacity of SrcInstances, guards a stale GPU counter
+
+// ── target：GPU-Scene 里这个图元 ──────────────────────────────────────────────
+uint           WriteNumSlots;        // dispatch width —— 游戏线程以为这个图元有几个槽
+uint           WritePrimitiveId;     // FGPUSceneWriteDelegateParams::PersistentPrimitiveId
+uint           WritePayloadFlags;    // FGPUSceneWriteDelegateParams::PackedInstanceSceneDataFlags
+uint           WriteCustomDataCount; // FGPUSceneWriteDelegateParams::NumCustomDataFloats
+
+[numthreads(NUM_THREADS_PER_GROUP, 1, 1)]
+void WriteInstancesCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint Slot = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, NUM_THREADS_PER_GROUP);
+	if (Slot >= WriteNumSlots) return;
+
+	const FPrimitiveSceneData PrimitiveData = GetPrimitiveData(WritePrimitiveId);
+	// 以 GPU-Scene 上的区间为准，不信游戏线程的槽数：换容量时代理要到帧末才重建，这期间发出的写入
+	// 还对着旧代理，按新槽数写就越过它的区间、改到别的图元的实例上 —— 画面是别处的东西被挪走，
+	// 查不到这里来。
+	if (Slot >= uint(PrimitiveData.NumInstanceSceneDataEntries)) return;
+	const uint InstanceId = uint(PrimitiveData.InstanceSceneDataOffset) + Slot;
+
+	const uint LiveCount = min(SrcInstanceCount[0], SrcMaxInstances);
+	if (Slot >= LiveCount)
+	{
+		// 活着的个数之外一律藏起来。引擎新分配的槽本来就初始化成 HIDDEN，但计数器缩回来时
+		// 上一代写进去的实例还在，不重新藏就是一批幽灵。
+		WriteInstancePrimitiveIdAndFlags(InstanceId, WritePrimitiveId, INSTANCE_SCENE_DATA_FLAG_HIDDEN);
+		return;
+	}
+
+	const uint Base = Slot * CS_GPU_INSTANCED_ROW_FLOAT4S;
+	const float4 Row0 = SrcInstances[Base + 0u];
+	const float4 Row1 = SrcInstances[Base + 1u];
+	const float4 Row2 = SrcInstances[Base + 2u];
+	const float4 Origin = SrcInstances[Base + 3u];
+
+	// 行向量约定，与 LocalVertexFactory.ush 的 GetInstanceTransform() 是同一个矩阵：三行基 + 第四行原点。
+	// 写成列向量会把每个非对称的旋转写成它的转置 —— 砖都还在拱上但全歪了，看着像排布算错。
+	float4x4 LocalToPrimitive;
+	LocalToPrimitive[0] = float4(Row0.xyz, 0.0f);
+	LocalToPrimitive[1] = float4(Row1.xyz, 0.0f);
+	LocalToPrimitive[2] = float4(Row2.xyz, 0.0f);
+	LocalToPrimitive[3] = float4(Origin.xyz, 1.0f);
+
+	// Origin.w 就是经典路喂给 PerInstanceRandom 的那个数，原样进 RandomID —— 材质两条路读到的逐实例随机逐位相同。
+	InitializeInstanceSceneDataLS(InstanceId, WritePrimitiveId, Slot, WritePayloadFlags, WriteCustomDataCount, Origin.w, LocalToPrimitive);
+
+	if (WriteCustomDataCount > 0u)
+	{
+		float4 CustomData = float4(0.0f, 0.0f, 0.0f, 0.0f);
+		if (bSrcHasCustomData != 0u)
+		{
+			const uint SrcBase = Slot * CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS;
+			UNROLL
+			for (uint C = 0u; C < CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS; ++C) CustomData[C] = SrcCustomData[SrcBase + C];
+		}
+		const FInstancePayloadDataOffsets PayloadOffsets = GetInstancePayloadDataOffsets(WritePrimitiveId, WritePayloadFlags, Slot);
+		WriteInstanceCustomData(PayloadOffsets, 0u, CustomData);
+	}
+}

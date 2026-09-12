@@ -509,6 +509,7 @@ public:
 	 *
 	 * Dropping it restores the documented default (one batch over the whole mesh from arg set 0),
 	 * which is exactly what set 0 now holds. Re-run BuildMaterialSections to get the batches back.
+	 * Forwards to FCSMeshEditContext::InvalidateSections, which stages the drop on an async edit.
 	 */
 	static void InvalidateSections(FCSMeshEditContext& Context);
 

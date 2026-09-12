@@ -2199,7 +2199,7 @@ bool AComputeShaderMeshBoolean::RebuildGpuMeshFromCapture(const FCSMeshBooleanCa
 		// 输出大小是 GPU 定的，游戏线程不能声称自己知道。
 		Context.InvalidateKnownCounts();
 		// 查询盒是不问 GPU 就能拿到的唯一界；下面的精确归约算不出来时它就是兜底。
-		Context.Resident.WorldBounds = QueryBox;
+		Context.SetWorldBounds(QueryBox);
 		bEmitted = true;
 	});
 

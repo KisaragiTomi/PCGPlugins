@@ -25,6 +25,7 @@
 
 #include "/Engine/Public/Platform.ush"
 #include "/Plugin/PCGPlugins/Shaders/Private/CSGroundShaperField.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/CSGpuSharedLayout.ush"
 
 #ifndef THREADGROUPSIZE_X
 #define THREADGROUPSIZE_X 8
@@ -382,7 +383,7 @@ void ScanGroundStairsCS(uint3 Id : SV_DispatchThreadID)
 			const float3 ScaledY = LocalY * BlockScale.y;
 			const float3 ScaledZ = LocalZ * BlockScale.z;
 
-			const uint Row = Slot * 5u;
+			const uint Row = Slot * CS_GPU_INSTANCED_ROW_FLOAT4S;
 			RWStairInstances[Row + 0u] = float4(ScaledX, 0.0f);   // .w 必须是 0：引擎拿它做选中/hitproxy
 			RWStairInstances[Row + 1u] = float4(ScaledY, 0.0f);
 			RWStairInstances[Row + 2u] = float4(ScaledZ, 0.0f);
@@ -435,7 +436,7 @@ void ScanGroundStairsCS(uint3 Id : SV_DispatchThreadID)
 					// 正是想要的读法，整颗浮在地表上会读成"掉了个道具"。
 					const float3 POrigin = mul(float4(PebbleXY, PebbleZ, 1.0f), StairWorldToComponent).xyz;
 
-					const uint PRow = PSlot * 5u;
+					const uint PRow = PSlot * CS_GPU_INSTANCED_ROW_FLOAT4S;
 					RWStairPebbles[PRow + 0u] = float4(PLocalX, 0.0f);   // .w 必须是 0：引擎拿它做选中/hitproxy
 					RWStairPebbles[PRow + 1u] = float4(PLocalY, 0.0f);
 					RWStairPebbles[PRow + 2u] = float4(PLocalZ, 0.0f);

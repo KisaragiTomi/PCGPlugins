@@ -3018,7 +3018,7 @@ static bool BuildVineGeometryIntoMeshAsync(UCSMesh* Target, FVineBuildInput Inpu
 		// How many points the space colonization solve grows, and therefore how much geometry is
 		// emitted, is decided on the GPU — the game thread must not claim to know it.
 		Context.InvalidateKnownCounts();
-		Context.Resident.WorldBounds = Input.LocalBounds;
+		Context.SetWorldBounds(Input.LocalBounds);
 		bBuilt = true;
 	},
 		[Built, WeakTarget = TWeakObjectPtr<UCSMesh>(Target), VertexCapacity, IndexCapacity, OnBuilt = MoveTemp(OnBuilt)](bool bMeshAlive) mutable

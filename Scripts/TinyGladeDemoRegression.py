@@ -47,7 +47,7 @@ def settle_tris(mesh, tries=8):
 
     UCSMesh::EditMeshAsync 的收尾是一个 GameThread AsyncTask，而
     -ExecutePythonScript 跟本没有 tick 去泵它 —— 刚拖完就读会读到
-    “上一次真正上传完的那一版”，最后一帧还在 PendingBodySnapshot 里。
+    “上一次真正上传完的那一版”，最后一帧还在 BodySlot.Pending 里。
     GetTriangleCountSync 自己会 flush，顺带把队列泵一次，所以连读到
     两次相同即已收敛。
 
@@ -1103,7 +1103,9 @@ def demo_rock_shell():
     # 跑完之后它可能已经落在路外，于是被当成"路外却动了 80 cm"。
     # 改成按**路的几何**判：路是 x = c.x 的一条直线，离它远于笔刷半径 + 位移上限才算路外。
     brush_r = ground.get_editor_property("BrushRadius")
-    off_road_x = brush_r + ground.get_editor_property("RockShellRoadSink") + 100.0
+    # 路足迹糊开之后会往外伸一个模糊半径（2026-09-11），"路外"的界跟着外移同样的量。
+    off_road_x = (brush_r + ground.get_editor_property("RockShellRoadBlurRadius")
+                  + ground.get_editor_property("RockShellRoadSink") + 100.0)
     for t in range(tri_count):
         alive_after = shell_alive(after, t)
         if alive_after:
@@ -1652,7 +1654,7 @@ def demo_house_window():
     # ---- 它真的会被画出来（渲染侧逐环 + 墙材质必须是 Masked）----
     # 调原因版，不调 is_window_drawable()：理由逐字见 demo_house_vine 里那段。
     why = str(house.get_window_undrawable_reason())
-    check("the window is actually drawable (body/Masked wall material/frame bricks/ISM-capable material)",
+    check("the window is actually drawable (body mesh + Masked wall material)",
           why == "", why)
 
     # ---- 可画性不许挂在**门**的砖上（2026-09-06 退框砖之后的一枪）----
@@ -1911,12 +1913,12 @@ def demo_house_window():
               "markers=%d windows=%d (was %d)"
               % (house.get_feature_marker_count(), house.get_window_count(), with_marker))
 
-    # ---- 砖层（P1）扛洞缘：窗退掉框砖之后，**真正盖住断口的是这一层** ----
+    # ---- 砖层（P1）按洞裁砖：拿三扇窗当洞，端到端跑一次 actor 那条路 ----
     #
     # ⚠️ `bBrickWallEnabled` 默认关着，在此之前**全仓没有任何一条断言把它打开过** ——
     # `CSHouseBrickWall.h` 的纯函数有单测，但 actor 那条路（`BuildBrickWallBricks`：
-    # 容量、逐层哈希、`CurrentOpenings` 喂进去裁砖）一次都没被端到端跑过。窗刚退掉框砖，
-    # 洞缘从此归砖层，这条路不能再是盲区。
+    # 容量、逐层哈希、`CurrentOpenings` 喂进去裁砖）一次都没被端到端跑过。
+    # 窗的洞缘不归砖层（它由标记自带的预制框盖住，窗周围不走砖头补全），这里只借窗当洞。
     house.set_editor_property("Windows", [])
     house.set_editor_property("bBrickWallEnabled", True)
     house.rebuild_house()

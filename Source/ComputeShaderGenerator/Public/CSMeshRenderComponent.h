@@ -19,6 +19,11 @@ class UMaterialInterface;
  * The migration onto this leaf is in progress: the box-scene display path and the road are done
  * (URoadMeshComponent now derives from this class), vine and instanced still own their buffers.
  *
+ * 显存各归各：网格的 Outer 是本组件时它**归本组件**，组件销毁时自己把它的显存还掉
+ * （OnComponentDestroyed，不阻塞）；生产方挂在自己身上、只借本组件显示的网格一个字节都不动。
+ * 这与 UCSGpuInstancedMeshComponent 对它自己那张常驻网格的做法同一条纪律 —— 拥有方不必
+ * 在销毁前替 gpumesh 收拾。
+ *
  * The data is world-space, so the component renders with an absolute transform: its own
  * placement in the level does not move the geometry.
  *
@@ -92,6 +97,10 @@ public:
 		bool bEnableNanite = false, UCSMesh* SourceMeshOverride = nullptr);
 #endif
 
+	/** One step of the surface-cache poll, exactly as the core ticker runs it; returns whether the
+	 *  poll wants another. For tests: a synchronous test never reaches the next frame. */
+	bool TickSurfaceCacheRefreshForTest() { return TickSurfaceCacheRefresh(0.0f); }
+
 	//~ UPrimitiveComponent interface
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
 	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;
@@ -106,12 +115,59 @@ protected:
 	virtual UMaterialInterface* GetRenderMaterial() const override { return MeshMaterial; }
 	virtual bool IsGpuMeshProxyActive() const override;
 
+	virtual void OnComponentDestroyed(bool bDestroyingHierarchy) override;
 	virtual void BeginDestroy() override;
 
 private:
 	void BindMeshDelegate();
 	void UnbindMeshDelegate();
 	void HandleMeshChanged(UCSMesh* ChangedMesh);
+
+	/**
+	 * 变化事件落在帧末组件更新（SendAllEndOfFrameUpdates）中途时，推迟到下一次 core tick 再对账。
+	 *
+	 * 渲染线程 flush 会顺手泵游戏线程任务 —— 异步编辑的尾巴（广播本组件的变化事件）就在里面；而引擎
+	 * 自己也会在帧末组件更新的中途 flush（例如新建的代理给材质补 usage 标志时走 FMaterialUpdateContext）。
+	 * 那一刻碰渲染状态是 check 崩（UWorld::MarkActorComponentForNeededEndOfFrameUpdate 的
+	 * !bPostTickComponentUpdate）。晚一帧对上画面，代价只是这一帧的包围盒 / 代理还是旧的。
+	 */
+	void DeferMeshChanged();
+	bool bMeshChangedDeferred = false;
+
+	/**
+	 * Lumen surface cache upkeep (the proxy side is FCSGpuMeshSceneProxy::DrawStaticElements).
+	 *
+	 * The proxy's card-capture batches carry the published draw counts, and the engine collects
+	 * static batches only when the primitive is added or its transform is updated — while a landed
+	 * readback has no game-thread event of its own. So after every edit, and after every proxy
+	 * creation (whose batches may have been collected before any count was known), this polls the
+	 * resident set's publish serial. When it moves: a transform update, which makes the engine
+	 * collect the batches again with the landed counts, and a surface-cache invalidation, which
+	 * recaptures the cards from them.
+	 *
+	 * Geometry that grew past the bounds the live proxy's cards were built from gets a new proxy
+	 * instead. Lumen builds a primitive's card set once and afterwards only moves it
+	 * (FLumenSceneData::UpdateMeshCards), so no transform update can widen it.
+	 *
+	 * A poll rather than a flag the render thread raises: this component's state is game-thread
+	 * state, and the only ways back from the render thread are the task hops DeferMeshChanged
+	 * already documents as unsafe. Armed only while a publication is expected; costs one lock per
+	 * frame while it is. Same ticker discipline as DeferMeshChanged: a weak lambda and a flag, no
+	 * handle — a collected component unbinds the delegate and the core ticker drops it.
+	 */
+	void ArmSurfaceCacheRefresh();
+	bool TickSurfaceCacheRefresh(float DeltaTime);
+	bool bSurfaceCacheTickerArmed = false;
+
+	/** Publish serial the live proxy's capture batches were last collected against. */
+	uint32 SurfaceCacheServedSerial = 0;
+
+	/** Bounds the live proxy built its cards from — its local bounds when it joined the scene. */
+	FBox SurfaceCacheCardBounds = FBox(ForceInit);
+
+	/** When the poll was last armed. A readback that publishes nothing leaves the counts unknown
+	 *  until the next edit (which re-arms), so the wait is bounded instead of permanent. */
+	double SurfaceCacheArmedAt = 0.0;
 
 	/**
 	 * The material of every draw batch, in batch order — batch i draws from indirect arg set i.

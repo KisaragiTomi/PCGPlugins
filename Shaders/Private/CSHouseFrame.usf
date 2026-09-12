@@ -14,7 +14,7 @@
 // 写不一样的症状是"单测说砖在这儿、画面上砖在那儿"，而两边各自都自洽（同 `CSHouse_ClipKeeps`
 // 与材质那对判据的纪律）。
 //
-// 逐路常量 = 6 个 float4（`CSHouseFrame_Flatten` 是 CPU 侧的同一份定义）：
+// 逐路常量 = CS_HOUSE_FRAME_PATH_FLOAT4S（8）个 float4（`CSHouseFrame_Flatten` 是 CPU 侧的同一份定义）：
 //   [0] Origin.xyz（墙空间原点的世界坐标）    | CenterS
 //   [1] AxisU.xyz（沿边，单位）               | Radius
 //   [2] AxisV.xyz（竖直，单位）               | TopZ
@@ -22,7 +22,8 @@
 //   [4] asuint 位标志 | asuint 砖序起点 | asuint 砖数 | Pitch（相邻砖中心距）
 //   [5] HalfLen（首块砖的弧长）| LayoutScale（长度轴铺装缩放）| asuint 随机数基 | CrossScale（横截面缩放，柱头/柱础）
 //   [6] CullBelowZ（世界 Z 低于它的砖写负值随机数 ⇒ 材质 discard；≤ 0 = 不剔）
-//       | ShearAtS0（首块砖顶边朝 −S 多伸出的 cm）| ShearAtS1（末块砖顶边朝 +S）| 保留
+//       | ShearAtS0（首块砖顶边朝 −S 多伸出的 cm）| ShearAtS1（末块砖顶边朝 +S）| Jitter
+//   [7] SplitJitter（分层抖动幅度 cm，≤ 0 = 等分）| 本条路的总弧长（kernel 拿它把 cm 归一化）| 保留 ×2
 //
 // packed 行布局照抄 CSGpuInstancedMesh.usf：前三行是被缩放过的基（**矩阵的行**），第 4 行是
 // 原点 + 每实例随机数，第 5 行是剔除球（必须包住变换后的基础网格，否则实例会在视锥边缘闪掉）。
@@ -39,18 +40,18 @@
 #define THREADGROUPSIZE_X 64
 #endif
 
-// ⚠️ 与 `CSHouseFrame.cpp` 的 `CSHouseFrame_PathStride` 是**同一个数的两份**，改一处必须改另一处。
-#define FRAME_PATH_STRIDE 8
+// 逐路 stride 与位标志：与 `CSHouseFrame.cpp` 共用 CSGpuSharedLayout.ush 里的同一份 #define，
+// 这里只起本文件用惯的短名。
+#include "/Plugin/PCGPlugins/Shaders/Private/CSGpuSharedLayout.ush"
+#define FRAME_PATH_STRIDE     CS_HOUSE_FRAME_PATH_FLOAT4S
+#define FRAME_FLAG_LEFT_JAMB  CS_HOUSE_FRAME_FLAG_LEFT_JAMB
+#define FRAME_FLAG_RIGHT_JAMB CS_HOUSE_FRAME_FLAG_RIGHT_JAMB
+#define FRAME_FLAG_MID_ARC    CS_HOUSE_FRAME_FLAG_MID_ARC
+#define FRAME_FLAG_MID_FLAT   CS_HOUSE_FRAME_FLAG_MID_FLAT
 
-#define FRAME_FLAG_LEFT_JAMB  1u
-#define FRAME_FLAG_RIGHT_JAMB 2u
-#define FRAME_FLAG_MID_ARC    4u
-#define FRAME_FLAG_MID_FLAT   8u
-#define FRAME_FLAG_SILL       16u
+StructuredBuffer<float4> FramePaths;   // FRAME_PATH_STRIDE 个 float4 / 砖路
 
-StructuredBuffer<float4> FramePaths;   // 6 个 float4 / 砖路
-
-RWBuffer<float4> RWFrameInstances;     // 5 个 float4 / 实例
+RWBuffer<float4> RWFrameInstances;     // CS_GPU_INSTANCED_ROW_FLOAT4S 个 float4 / 实例
 RWBuffer<uint>   RWFrameCounter;       // [0] = 活跃实例数
 
 float4x4 FrameWorldToComponent;
@@ -87,19 +88,17 @@ void FrameEvalPath(uint Flags, float BaseZ, float TopZ, float LeftS, float Right
 	float L1 = 0.0f;
 	if (Flags & FRAME_FLAG_MID_ARC)  L1 = max(Radius, 0.0f) * MidMeasure;
 	if (Flags & FRAME_FLAG_MID_FLAT) L1 = max(MidMeasure, 0.0f);
-	// 窗台底边（第四段）。两侧门樘缺一不可 —— 与 `FPath::SillLen()` 逐字对应。
-	const float L3 = (((Flags & FRAME_FLAG_SILL) != 0u) && bLeft && bRight) ? max(RightS - LeftS, 0.0f) : 0.0f;
 
-	const float Total = L0 + L1 + L2 + L3;
+	const float Total = L0 + L1 + L2;
 	const float A = clamp(Arc, 0.0f, max(Total, 0.0f));
 
-	if (L0 > 0.0f && (A <= L0 || (L1 <= 0.0f && L2 <= 0.0f && L3 <= 0.0f)))
+	if (L0 > 0.0f && (A <= L0 || (L1 <= 0.0f && L2 <= 0.0f)))
 	{
 		OutSZ = float2(LeftS, BaseZ + min(A, L0));
 		OutTangent = float2(0.0f, 1.0f);
 		return;
 	}
-	if (L1 > 0.0f && (A <= L0 + L1 || (L2 <= 0.0f && L3 <= 0.0f)))
+	if (L1 > 0.0f && (A <= L0 + L1 || L2 <= 0.0f))
 	{
 		const float T = min(A - L0, L1);
 		if (Flags & FRAME_FLAG_MID_ARC)
@@ -117,18 +116,10 @@ void FrameEvalPath(uint Flags, float BaseZ, float TopZ, float LeftS, float Right
 		}
 		return;
 	}
-	if (L2 > 0.0f && (A <= L0 + L1 + L2 || L3 <= 0.0f))
+	if (L2 > 0.0f)
 	{
 		OutSZ = float2(RightS, TopZ - min(A - L0 - L1, L2));
 		OutTangent = float2(0.0f, -1.0f);
-		return;
-	}
-	if (L3 > 0.0f)
-	{
-		// 窗台底边：从右樘底走回左樘底。切向朝 −S ⇒ 面内朝外法线朝下（背离洞），
-		// 与另外三段"法线一律指出洞外"的口径一致。走反了砖会整排翻身。
-		OutSZ = float2(RightS - min(A - L0 - L1 - L2, L3), BaseZ);
-		OutTangent = float2(-1.0f, 0.0f);
 		return;
 	}
 	OutSZ = float2(LeftS, BaseZ);
@@ -310,7 +301,7 @@ void ScatterHouseFrameCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		LocalOrigin += AlongS * (Shear * 0.5f);
 	}
 
-	const uint Row = Brick * 5u;
+	const uint Row = Brick * CS_GPU_INSTANCED_ROW_FLOAT4S;
 	RWFrameInstances[Row + 0u] = float4(ScaledX, 0.0f);   // .w 必须是 0：引擎拿它做选中/hitproxy
 	RWFrameInstances[Row + 1u] = float4(ScaledY, 0.0f);
 	RWFrameInstances[Row + 2u] = float4(ScaledZ, 0.0f);

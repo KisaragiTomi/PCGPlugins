@@ -1,5 +1,6 @@
 #include "CSGpuInstancedMeshComponent.h"
 #include "CSGpuInstancedMeshSceneProxy.h"
+#include "CSGpuInstancedNaniteComponent.h"
 // 诊断入口 DebugGetDrawnAssetMismatchSync 要问"材质为本顶点工厂编出着色器了没有"，
 // 所以这里必须自己带上工厂类型与材质着色器映射那几个头 —— unity 构建下它们恰好被邻居带进来，
 // 漏写只有 -SingleFile 才照得出来（坑表里那条）。
@@ -9,6 +10,7 @@
 #include "CSMeshOps.h"
 
 #include "Engine/StaticMesh.h"
+#include "Engine/World.h"     // FWorldDelegates：资产重建后的延迟重判
 #include "MaterialShared.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialInterface.h"
@@ -19,6 +21,7 @@
 #include "StaticMeshResources.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
+#include "RenderUtils.h"      // UseGPUScene：Nanite 路的平台前提
 #include "RHI.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogCSGpuInstancedMesh, Log, All);
@@ -111,6 +114,64 @@ UCSGpuInstancedMeshComponent::UCSGpuInstancedMeshComponent()
 }
 
 // -----------------------------------------------------------------------------
+// Render path
+// -----------------------------------------------------------------------------
+
+bool UCSGpuInstancedMeshComponent::IsNaniteRenderPath() const
+{
+	// 外部喂进来的 GPU 网格（SetBaseMeshFromGpuData）不是资产，没有 Nanite 设置可读。
+	if (!BaseMesh || bBaseMeshIsExternal) return false;
+
+	// 判据就是资产自己的 Nanite 开关（含 r.Nanite.ForceEnableMeshes）。不看"这台机器现在画不画得了
+	// Nanite"：画不了时替身由引擎 ISM 代理画回退网格，引擎自己的 StaticMeshComponent 也是这么退的；
+	// 那样换 r.Nanite 时本组件不必跟着来回拆建两套缓冲。
+	if (!BaseMesh->IsNaniteEnabled()) return false;
+
+	// 替身整条路都建在 GPU-Scene 实例上，平台没有 GPU-Scene 就一个实例都画不出来 —— 那才退回 GPU 剔除路。
+	return UseGPUScene(GMaxRHIShaderPlatform, GMaxRHIFeatureLevel);
+}
+
+FBox UCSGpuInstancedMeshComponent::GetBaseLocalBounds() const
+{
+	if (BaseMeshSnapshot.IsValid()) return BaseMeshSnapshot.LocalBounds;
+	// Nanite 路画的是资产本身，不需要读顶点 —— 资产没开 CPU 访问时快照根本建不起来，
+	// 但实例的剔除球与整族包围盒照样要有。
+	if (IsNaniteRenderPath()) return BaseMesh->GetBoundingBox();
+	return FBox(ForceInit);
+}
+
+void UCSGpuInstancedMeshComponent::UpdateNaniteComponent()
+{
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	FCSGpuNaniteInstanceFeed Feed;
+	if (GpuInstanceSource.IsValid()) Feed.Packed = GpuInstanceSource;
+	else if (GpuPointSource.IsValid()) Feed.Points = GpuPointSource;
+	else if (PackedInstances.Num() > 0) Feed.CpuRows = MakeShared<const TArray<FVector4f>, ESPMode::ThreadSafe>(PackedInstances);
+
+	if (!NaniteComponent)
+	{
+		// TextExportTransient：拷贝粘贴 actor 时也不带它，理由同 DuplicateTransient。
+		NaniteComponent = NewObject<UCSGpuInstancedNaniteComponent>(this, NAME_None, RF_Transient | RF_DuplicateTransient | RF_TextExportTransient);
+		NaniteComponent->SetupAttachment(this);
+	}
+
+	// 先抄网格再给源：代理构造时要同时读到网格与槽数，SetFeed 可能触发重建。
+	NaniteComponent->SyncFromOwner(*this);
+	NaniteComponent->SetFeed(MoveTemp(Feed), LocalBounds);
+
+	// 注册即建代理，CreateRenderState_Concurrent 在同一个调用里把实例写进去。
+	if (!NaniteComponent->IsRegistered() && World->Scene) NaniteComponent->RegisterComponentWithWorld(World);
+}
+
+void UCSGpuInstancedMeshComponent::ReleaseNaniteComponent()
+{
+	if (IsValid(NaniteComponent)) NaniteComponent->DestroyComponent();
+	NaniteComponent = nullptr;
+}
+
+// -----------------------------------------------------------------------------
 // Base mesh
 // -----------------------------------------------------------------------------
 
@@ -127,6 +188,10 @@ void UCSGpuInstancedMeshComponent::SetBaseMeshFromGpuData(const FCSGpuMeshCPUDat
 {
 	BaseMeshSnapshot.Reset();
 	bBaseMeshIsExternal = true;
+#if WITH_EDITOR
+	// 不再是资产了，资产的重建与这一族无关。
+	UnbindBaseMeshRebuildEvent();
+#endif
 
 	if (!InMeshData.IsValid())
 	{
@@ -205,6 +270,11 @@ void UCSGpuInstancedMeshComponent::RebuildBaseMeshSnapshot()
 {
 	if (bBaseMeshIsExternal) return;
 
+#if WITH_EDITOR
+	// 每条改 BaseMesh 的路（SetBaseMesh / PostLoad / 细节面板）都经过这里，换网格就跟着换盯的对象。
+	BindBaseMeshRebuildEvent();
+#endif
+
 	BaseMeshSnapshot.Reset();
 
 	const FStaticMeshRenderData* RenderData = BaseMesh ? BaseMesh->GetRenderData() : nullptr;
@@ -266,13 +336,14 @@ void UCSGpuInstancedMeshComponent::RebuildBaseMeshSnapshot()
 		BaseMeshSnapshot.LODs.Add(Range);
 	}
 
-	if (BaseMeshSnapshot.LODs.Num() == 0)
+	// Nanite 路画的是资产本身，读不到顶点只影响烘焙出口 —— 那条出口自己会说"没有快照"，这里不刷屏。
+	if (BaseMeshSnapshot.LODs.Num() == 0 && !IsNaniteRenderPath())
 	{
 		UE_LOG(LogCSGpuInstancedMesh, Warning,
 			TEXT("%s: could not read vertex data from '%s'. Enable 'Allow CPU Access' on the mesh (required outside the editor)."),
 			*GetPathName(), *GetNameSafe(BaseMesh));
 	}
-	else
+	else if (BaseMeshSnapshot.LODs.Num() > 0)
 	{
 		BaseMeshSnapshot.LocalBounds = BaseMesh->GetBoundingBox();
 	}
@@ -420,6 +491,14 @@ int32 UCSGpuInstancedMeshComponent::DebugReadDrawnInstanceCountSync() const
 	else if (GpuPointSource.IsValid()) Counter = GpuPointSource.Counter;
 	if (!Counter.IsValid())
 	{
+		// Nanite 路的 CPU 数组：写入 pass 读的计数就是替身手上那份行数（CSGpuInstancedNanite_AddWritePasses
+		// 那条 AddClearUAVPass(..., LiveCount)）。替身没注册 = 没有图元，那才是真的 0。
+		if (IsNaniteRenderPath())
+		{
+			const bool bDrawing = NaniteComponent && NaniteComponent->IsRegistered() && NaniteComponent->GetGpuSceneSlotCount() > 0;
+			return bDrawing ? PackedInstances.Num() / CS_GPU_INSTANCED_ROW_FLOAT4S : 0;
+		}
+
 		// 没有 GPU 源时剔除 pass 用的是常量 `NumSourceInstances`（CSGpuInstancedMeshSceneProxy
 		// 那条 `AddClearUAVPass(..., Layout.NumSourceInstances)`），如实返回它。没有分配 =
 		// 组件根本不会建代理，一个实例都画不出来，那才是真的 0。
@@ -439,11 +518,23 @@ int32 UCSGpuInstancedMeshComponent::DebugReadDrawnInstanceCountSync() const
 	}
 	const uint32 Capacity = GpuInstanceSource.IsValid() ? GpuInstanceSource.Capacity : GpuPointSource.Capacity;
 	// GPU 的 counter 会数到越界丢弃的那些（InterlockedAdd 先加后判），按容量钳 —— 同石阶回读。
+	// 超容量要出声（审查 B4b）：钳过的数对所有断言都像"刚好装满"，而丢了哪些实例由原子序决定。
+	if (Values[0] > Capacity)
+	{
+		UE_LOG(LogCSGpuInstancedMesh, Warning, TEXT("%s: 实例源超容量：counter=%u capacity=%u，超出的实例被静默丢弃。"),
+			*GetPathName(), Values[0], Capacity);
+	}
 	return int32(FMath::Min(Values[0], FMath::Max(Capacity, 1u)));
 }
 
 FString UCSGpuInstancedMeshComponent::DebugGetDrawnAssetMismatchSync() const
 {
+	if (IsNaniteRenderPath())
+	{
+		if (!NaniteComponent) return TEXT("BaseMesh 开了 Nanite 但渲染替身没建起来（组件没注册过？一个实例都画不出来）");
+		return NaniteComponent->DebugDescribeMismatchSync(*this);
+	}
+
 	const FCSMeshResidentRef Resident = InstancedGpuMesh ? InstancedGpuMesh->GetResident() : FCSMeshResidentRef();
 	if (!Resident.IsValid() || !Resident->IsAllocated())
 	{
@@ -608,7 +699,7 @@ bool UCSGpuInstancedMeshComponent::ReadLiveInstanceRowsSync(TArray<FVector4f>& O
 	if (LiveCount < 0) return false;                       // 读不到 ≠ 0 个实例
 	if (LiveCount == 0) return true;                       // 真的没有实例，空集是正确答案
 
-	const uint32 Rows = uint32(LiveCount) * 5u;
+	const uint32 Rows = uint32(LiveCount) * CS_GPU_INSTANCED_ROW_FLOAT4S;
 	TArray<uint32> Raw;
 	// AuxVertex：packed 行平时停在 SRVMask（生产者的 SetBufferAccessFinal(PackedRef, SRVMask)），
 	// 读完必须放回去，否则下一帧的剔除 pass 在错误的访问状态上撞见它。
@@ -631,9 +722,9 @@ bool UCSGpuInstancedMeshComponent::DebugReadInstanceRandomsSync(TArray<float>& O
 	TArray<FVector4f> Row;
 	if (!ReadLiveInstanceRowsSync(Row)) return false;
 
-	OutRandoms.Reserve(Row.Num() / 5);
+	OutRandoms.Reserve(Row.Num() / CS_GPU_INSTANCED_ROW_FLOAT4S);
 	// 第 4 行的 .w 就是 PerInstanceRandom（LocalVertexFactory.ush 的 OriginBuffer 契约）。
-	for (int32 Base = 0; Base + 4 < Row.Num(); Base += 5) OutRandoms.Add(Row[Base + 3].W);
+	for (int32 Base = 0; Base + 4 < Row.Num(); Base += CS_GPU_INSTANCED_ROW_FLOAT4S) OutRandoms.Add(Row[Base + 3].W);
 	return true;
 }
 
@@ -651,7 +742,7 @@ UStaticMesh* UCSGpuInstancedMeshComponent::SaveToStaticMesh(const FTransform& Ba
 	TArray<FVector4f> Row;
 	if (!ReadLiveInstanceRowsSync(Row)) return nullptr;
 
-	const int32 NumInstances = Row.Num() / 5;
+	const int32 NumInstances = Row.Num() / CS_GPU_INSTANCED_ROW_FLOAT4S;
 	if (NumInstances <= 0)
 	{
 		UE_LOG(LogCSGpuInstancedMesh, Warning, TEXT("%s: 这一族一个实例都没有，不产资产。"), *GetPathName());
@@ -710,7 +801,7 @@ UStaticMesh* UCSGpuInstancedMeshComponent::SaveToStaticMesh(const FTransform& Ba
 
 	for (int32 Instance = 0; Instance < NumInstances; ++Instance)
 	{
-		const int32 Base = Instance * 5;
+		const int32 Base = Instance * CS_GPU_INSTANCED_ROW_FLOAT4S;
 		const FVector4f R0 = Row[Base + 0];
 		const FVector4f R1 = Row[Base + 1];
 		const FVector4f R2 = Row[Base + 2];
@@ -820,22 +911,25 @@ void UCSGpuInstancedMeshComponent::RebuildInstancePacking()
 		return;
 	}
 
+	// 快照有就是快照的（经典路的口径一字不变），Nanite 路没读顶点时退到资产包围盒。
+	const FBox BaseBounds = GetBaseLocalBounds();
+
 	if (GpuPointSource.IsValid())
 	{
 		// Point positions are world-space, so the bounds arrive world-space too; the base mesh's
 		// own extent has to be added because an instance stands out of its point.
 		const FBox WorldBounds = GpuPointSource.WorldBounds;
 		LocalBounds = WorldBounds.IsValid ? WorldBounds.InverseTransformBy(GetComponentTransform()) : FBox(ForceInit);
-		if (LocalBounds.IsValid && BaseMeshSnapshot.LocalBounds.IsValid)
+		if (LocalBounds.IsValid && BaseBounds.IsValid)
 		{
-			const double Reach = BaseMeshSnapshot.LocalBounds.GetExtent().Size() * FMath::Max(GpuPointSource.InstanceScale, UE_KINDA_SMALL_NUMBER);
+			const double Reach = BaseBounds.GetExtent().Size() * FMath::Max(GpuPointSource.InstanceScale, UE_KINDA_SMALL_NUMBER);
 			LocalBounds = LocalBounds.ExpandBy(Reach);
 		}
 		return;
 	}
 
 	const int32 NumInstances = PerInstanceTransforms.Num();
-	if (NumInstances == 0 || !BaseMeshSnapshot.IsValid())
+	if (NumInstances == 0 || !BaseBounds.IsValid)
 	{
 		LocalBounds = FBox(ForceInit);
 		return;
@@ -843,8 +937,8 @@ void UCSGpuInstancedMeshComponent::RebuildInstancePacking()
 
 	// Per-instance culling sphere: the base mesh's LOD0 sphere pushed through the instance
 	// transform. Non-uniform scale is handled conservatively by the largest axis.
-	const FVector BaseCentre = BaseMeshSnapshot.LocalBounds.GetCenter();
-	const float BaseRadius = float(BaseMeshSnapshot.LocalBounds.GetExtent().Size());
+	const FVector BaseCentre = BaseBounds.GetCenter();
+	const float BaseRadius = float(BaseBounds.GetExtent().Size());
 
 	TArray<FVector3f> Centres;
 	TArray<float> Radii;
@@ -884,7 +978,7 @@ void UCSGpuInstancedMeshComponent::RebuildInstancePacking()
 	const int32 ClusterSize = FMath::Clamp(InstancesPerCluster, 1, 4096);
 	const int32 NumClusters = FMath::DivideAndRoundUp(NumInstances, ClusterSize);
 
-	PackedInstances.SetNumUninitialized(NumInstances * 5);
+	PackedInstances.SetNumUninitialized(NumInstances * CS_GPU_INSTANCED_ROW_FLOAT4S);
 	ClusterBounds.SetNumUninitialized(NumClusters);
 
 	for (int32 Cluster = 0; Cluster < NumClusters; ++Cluster)
@@ -901,7 +995,7 @@ void UCSGpuInstancedMeshComponent::RebuildInstancePacking()
 
 			// Rows of the instance-to-component 3x3 + the origin, exactly the layout
 			// LocalVertexFactory.ush's GetInstanceTransform() reconstructs.
-			const int32 Dst = (First + Slot) * 5;
+			const int32 Dst = (First + Slot) * CS_GPU_INSTANCED_ROW_FLOAT4S;
 			PackedInstances[Dst + 0] = FVector4f(M.M[0][0], M.M[0][1], M.M[0][2], 0.0f);
 			PackedInstances[Dst + 1] = FVector4f(M.M[1][0], M.M[1][1], M.M[1][2], 0.0f);
 			PackedInstances[Dst + 2] = FVector4f(M.M[2][0], M.M[2][1], M.M[2][2], 0.0f);
@@ -969,6 +1063,18 @@ void UCSGpuInstancedMeshComponent::RebuildGpuMesh()
 		return;
 	}
 
+	if (IsNaniteRenderPath())
+	{
+		// Nanite 路不画自己的常驻网格：基础网格是资产自己的 Nanite 数据，实例进 GPU-Scene。上一种模式
+		// 留下的常驻缓冲按"没东西画"的口径还回去（没分配时 ReleaseGpuMesh 是空操作，不会每次都刷新）。
+		ReleaseGpuMesh();
+		UpdateNaniteComponent();
+		bGpuMeshDirty = false;
+		return;
+	}
+	// 从 Nanite 切回来，或 BaseMesh 换成了外部快照：替身不该再画。
+	ReleaseNaniteComponent();
+
 	const bool bPackedGpuSource = GpuInstanceSource.IsValid();
 	const bool bPointGpuSource = GpuPointSource.IsValid();
 	const bool bHasInstances = bPackedGpuSource || bPointGpuSource || PackedInstances.Num() > 0;
@@ -991,7 +1097,7 @@ void UCSGpuInstancedMeshComponent::RebuildGpuMesh()
 	}
 	else
 	{
-		NewLayout.NumSourceInstances = uint32(PackedInstances.Num() / 5);
+		NewLayout.NumSourceInstances = uint32(PackedInstances.Num() / CS_GPU_INSTANCED_ROW_FLOAT4S);
 		NewLayout.ClusterSize = uint32(FMath::Clamp(InstancesPerCluster, 1, 4096));
 		NewLayout.InstanceCapacity = ResolveInstanceCapacity(NewLayout.NumSourceInstances);
 		NewLayout.NumClusters = uint32(FMath::DivideAndRoundUp(NewLayout.NumSourceInstances, NewLayout.ClusterSize));
@@ -1142,7 +1248,7 @@ void UCSGpuInstancedMeshComponent::RebuildGpuMesh()
 		// The streams hold one component-local copy of the base mesh; this box is where the drawn
 		// instances are. They deliberately disagree — the instanced result has no vertices anywhere
 		// — and this is the answer anything asking "where is this mesh" wants.
-		Context.Resident.WorldBounds = DrawnWorldBounds;
+		Context.SetWorldBounds(DrawnWorldBounds);
 		bUploaded = true;
 	});
 
@@ -1186,6 +1292,36 @@ void UCSGpuInstancedMeshComponent::OnRegister()
 	if (bGpuMeshDirty || !GpuLayout.IsValid()) RebuildGpuMesh();
 }
 
+void UCSGpuInstancedMeshComponent::OnUnregister()
+{
+	// 只下线不销毁：重注册（编辑器改一个属性就会整体卸载 / 重注册一遍）时 UpdateNaniteComponent
+	// 原样挂回去，源和设置都还在替身身上。
+	if (NaniteComponent && NaniteComponent->IsRegistered()) NaniteComponent->UnregisterComponent();
+	Super::OnUnregister();
+}
+
+void UCSGpuInstancedMeshComponent::OnComponentDestroyed(bool bDestroyingHierarchy)
+{
+#if WITH_EDITOR
+	UnbindBaseMeshRebuildEvent();
+#endif
+	ReleaseNaniteComponent();
+
+	// 显存当场还回去，不等 GC（2026-09-07 审查 B7）：本组件手上的实例源引用与 InstancedGpuMesh 的常驻流
+	// （可见槽区 = 容量 × LOD 数 × 80 B）以前都拖到 UObject 被回收才放。**这是本组件那一份的唯一出口**：
+	// 删 actor、DestroyComponent、GC 三条路都会走到这里，生产者不必（也不该）在销毁前替它撤源 ——
+	// 生产者只放它自己分配的那批 buffer（ACSTinyGlade::ReleaseInstancedBuffers）。
+	GpuInstanceSource.Reset();
+	GpuPointSource.Reset();
+	// ReleaseGpuMesh 是一次计数 flush。构造脚本建出来的组件在每次重跑构造脚本时都会被引擎销毁重建，
+	// 那条路落在"改一个属性"上，一次 flush 都不许有 —— 那种组件只撂下引用，让 GC 走
+	// UCSMesh::BeginDestroy 的无阻塞释放；其余（原生 / 实例组件）当场释放。
+	if (CreationMethod == EComponentCreationMethod::UserConstructionScript) InstancedGpuMesh = nullptr;
+	else ReleaseGpuMesh();
+	GpuLayout = FCSGpuInstancedGpuLayout();
+	Super::OnComponentDestroyed(bDestroyingHierarchy);
+}
+
 void UCSGpuInstancedMeshComponent::PostLoad()
 {
 	Super::PostLoad();
@@ -1212,11 +1348,57 @@ void UCSGpuInstancedMeshComponent::PostEditChangeProperty(FPropertyChangedEvent&
 
 	Super::PostEditChangeProperty(PropertyChangedEvent);
 }
+
+void UCSGpuInstancedMeshComponent::BindBaseMeshRebuildEvent()
+{
+	if (RebuildEventMesh.Get() == BaseMesh && RebuildEventHandle.IsValid()) return;
+
+	UnbindBaseMeshRebuildEvent();
+	if (!BaseMesh || bBaseMeshIsExternal) return;
+
+	RebuildEventHandle = BaseMesh->OnPostMeshBuild().AddUObject(this, &UCSGpuInstancedMeshComponent::HandleBaseMeshRebuilt);
+	RebuildEventMesh = BaseMesh;
+}
+
+void UCSGpuInstancedMeshComponent::UnbindBaseMeshRebuildEvent()
+{
+	if (UStaticMesh* Mesh = RebuildEventMesh.Get()) Mesh->OnPostMeshBuild().Remove(RebuildEventHandle);
+	RebuildEventHandle.Reset();
+	RebuildEventMesh.Reset();
+
+	FWorldDelegates::OnWorldPreSendAllEndOfFrameUpdates.Remove(DeferredRefreshHandle);
+	DeferredRefreshHandle.Reset();
+}
+
+void UCSGpuInstancedMeshComponent::HandleBaseMeshRebuilt(UStaticMesh* RebuiltMesh)
+{
+	if (RebuiltMesh != BaseMesh || bBaseMeshIsExternal) return;
+	// 连着重建几次只挂一个：重判是幂等的，做一次就够。
+	if (DeferredRefreshHandle.IsValid()) return;
+
+	DeferredRefreshHandle = FWorldDelegates::OnWorldPreSendAllEndOfFrameUpdates.AddUObject(this, &UCSGpuInstancedMeshComponent::HandleDeferredBaseMeshRefresh);
+}
+
+void UCSGpuInstancedMeshComponent::HandleDeferredBaseMeshRefresh(UWorld* InWorld)
+{
+	if (InWorld != GetWorld()) return;
+
+	FWorldDelegates::OnWorldPreSendAllEndOfFrameUpdates.Remove(DeferredRefreshHandle);
+	DeferredRefreshHandle.Reset();
+
+	// 同一个入口重新读资产：Nanite 开关变了就换路（RebuildGpuMesh 里拆一边建一边），没变也把 GPU 剔除路的
+	// 快照换成重建后的顶点。未注册时它只记脏，OnRegister 会补上。
+	UE_LOG(LogCSGpuInstancedMesh, Log, TEXT("%s: base mesh '%s' was rebuilt; re-reading it (Nanite path: %s)."),
+		*GetPathName(), *GetNameSafe(BaseMesh), IsNaniteRenderPath() ? TEXT("yes") : TEXT("no"));
+	RebuildBaseMeshSnapshot();
+}
 #endif
 
 FPrimitiveSceneProxy* UCSGpuInstancedMeshComponent::CreateSceneProxy()
 {
 	if (GMaxRHIFeatureLevel < ERHIFeatureLevel::SM5) return nullptr;
+	// Nanite 路画的是替身（UCSGpuInstancedNaniteComponent），本组件自己不进场景。
+	if (IsNaniteRenderPath()) return nullptr;
 
 	// The one gate now, and it stands for all the old ones: RebuildGpuMesh releases the buffers
 	// unless there is a valid base mesh, a non-empty instance set and a layout the mesh accepted, so

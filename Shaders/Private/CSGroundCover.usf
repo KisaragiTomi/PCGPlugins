@@ -29,6 +29,7 @@
 
 #include "/Engine/Public/Platform.ush"
 #include "/Plugin/PCGPlugins/Shaders/Private/CSGroundShaperField.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/CSGpuSharedLayout.ush"
 
 #ifndef THREADGROUPSIZE_X
 #define THREADGROUPSIZE_X 8
@@ -382,7 +383,7 @@ void ScatterGroundCoverCS(uint3 Id : SV_DispatchThreadID)
 	const float3 LocalZ = mul(float4(AxisZ, 0.0f), CoverWorldToComponent).xyz * HeightScale;
 	const float3 Origin = mul(float4(P, Z, 1.0f), CoverWorldToComponent).xyz;
 
-	const uint Row = Slot * 5u;
+	const uint Row = Slot * CS_GPU_INSTANCED_ROW_FLOAT4S;
 	RWCoverInstances[Row + 0u] = float4(LocalX, 0.0f);   // .w 必须是 0：引擎拿它做选中/hitproxy
 	RWCoverInstances[Row + 1u] = float4(LocalY, 0.0f);
 	RWCoverInstances[Row + 2u] = float4(LocalZ, 0.0f);

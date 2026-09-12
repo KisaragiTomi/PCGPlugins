@@ -1,0 +1,39 @@
+// C++ 与 .usf **共用的唯一一份**布局常量。
+//
+// 这里只许有预处理器常量（#define）与注释，不许有任何只有 HLSL 或只有 C++ 才认得的语法：同一个文件
+// 既被着色器编译器读（`#include "/Plugin/PCGPlugins/Shaders/Private/CSGpuSharedLayout.ush"`），
+// 也被 C++ 读（ComputeShaderGenerator.Build.cs 把本目录加进了 include 路径，`#include "CSGpuSharedLayout.ush"`）。
+// 字面量一律不带类型后缀：C++ 与 HLSL 的后缀规则不同，无后缀的整数在两边都按上下文取型。
+//
+// 为什么非得一份（2026-09-07 审查 B3）：改一个数不会报错，只会错位 —— 行 stride 两边不一致是
+// "砖全在别处"，custom data 步长不一致是"叶子的相位有点怪"，LOD 上限不一致是 arg set 越界。
+// 收敛之前这几个数在 C++ 与 .usf 里各写一份、行 stride 散在约 24 处字面量，门框砖的路 stride
+// 改动时两侧仍是手工同步的。
+
+#pragma once
+
+// ── packed 实例行（FCSGpuInstanceSourceGPU：剔除 pass、GPU-Scene 写入 pass 与九条打包路共用）──
+// 每实例 5 个 float4：[0..2] 实例→组件 3x3 的**行**（.w 必须为 0，引擎拿它做 hitproxy / 选中），
+// [3] 组件空间原点 + .w 逐实例随机 0..1，[4] 剔除球心 + .w 半径。
+#define CS_GPU_INSTANCED_ROW_FLOAT4S 5
+
+// 逐实例 custom data 的 float 数 —— 也是材质侧 `Per Instance Custom Data` 的读取步长
+// （引擎按 `Buffer[InstanceId * NumCustomDataFloats + i]` 取），改它要连所有读它的材质一起改。
+// 当前语义（藤蔓 D13）：[0] = SpawnTime 秒、[1] = 该实例在藤上的弧长 cm。
+// Nanite / GPU-Scene 写入 pass 只写一个 float4 的 payload，所以上限是 4。
+#define CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS 2
+
+// GPU LOD 选择能在几级之间挑（剔除 shader 用一个 float4 存阈值）。源网格多出的 LOD 忽略。
+#define CS_GPU_INSTANCED_MAX_LODS 4
+
+// ── 门框砖的逐路常量（CSHouseFrame.usf ↔ CSHouseFrame.cpp）──────────────────────────────
+// 每条砖路占几个 float4（布局见 CSHouseFrame.usf 文件头），以及 R4.x 的位标志。
+#define CS_HOUSE_FRAME_PATH_FLOAT4S 8
+#define CS_HOUSE_FRAME_FLAG_LEFT_JAMB  1
+#define CS_HOUSE_FRAME_FLAG_RIGHT_JAMB 2
+#define CS_HOUSE_FRAME_FLAG_MID_ARC    4
+#define CS_HOUSE_FRAME_FLAG_MID_FLAT   8
+
+// ── 塑形物高度场（CSGroundShaperField.ush ↔ CSGroundShaperField.h）──────────────────────
+// 每座塑形物在 GroundShaperParams 里占几个 float4：Profile / Top / Noise。
+#define CS_GROUND_SHAPER_FLOAT4S 3

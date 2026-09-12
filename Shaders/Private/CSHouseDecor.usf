@@ -26,6 +26,7 @@
 // 方向就够了；真正需要精确正面的是窗台花箱那一批，它们的候选点表还等着 C1 拍板。
 
 #include "/Engine/Public/Platform.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/CSGpuSharedLayout.ush"
 
 #ifndef THREADGROUPSIZE_X
 #define THREADGROUPSIZE_X 64
@@ -88,7 +89,7 @@ void PackHouseDecorCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	const float3 ScaledY = LocalY * BlockScale.y;
 	const float3 ScaledZ = LocalZ * BlockScale.z;
 
-	const uint Base = Index * 5u;
+	const uint Base = Index * CS_GPU_INSTANCED_ROW_FLOAT4S;
 	RWDecorInstances[Base + 0u] = float4(ScaledX, 0.0f);   // .w 必须是 0：引擎拿它做选中/hitproxy
 	RWDecorInstances[Base + 1u] = float4(ScaledY, 0.0f);
 	RWDecorInstances[Base + 2u] = float4(ScaledZ, 0.0f);

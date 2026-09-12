@@ -82,7 +82,8 @@
 | `ECSGpuMeshSemantic` | 回读时填 `FCSGpuMeshCPUData` 的哪个成员：`Position` / `TangentBasis` / `TexCoord` / `Index` / `Color` / `MaterialId` / `None` |
 
 - `AddStandardTriangleStreams()` 注册标准三角集（渲染基座用的 7 条 + 一条逐三角材质 id）；`FCSMeshStreamLayout` 在其上追加额外流，并声明 UV 组数（`NumTexCoordSets`，房子墙那种「UV0 贴图 + UV1 传解析场」是加宽同一条交错流而非新增一条）与 indirect arg 组数。
-- 一条流由 `(Role, SlotIndex)` 寻址，重复的 pair 会被拒绝而不是静默遮蔽。`ResizeStreamsSync` 只改已声明的 `Fixed` 流，且**尺寸精确、内容清零**——尺寸随活计数变的流是按那个计数寻址的，幸存的字节会停在不再表示原意的偏移上。
+- 一条流由 `(Role, SlotIndex)` 寻址，重复的 pair 会被拒绝而不是静默遮蔽。`ResizeStreamsSync` 只改已声明的 `Fixed` 流，且**尺寸精确、内容清零**——尺寸随活计数变的流是按那个计数寻址的，幸存的字节会停在不再表示原意的偏移上。`SetStreamLayoutSync` 重分配时只拷贝逐单元步长没变的流：新增的流与被加宽的流（`EnsureTexCoordSets`）一律清零，由调用方重传。
+- **布局常量只有一份**：packed 实例行的 stride、custom data 步长、LOD 上限、门框砖路 stride 与塑形物场步长都在 [`Shaders/Private/CSGpuSharedLayout.ush`](Shaders/Private/CSGpuSharedLayout.ush) 里，C++ 与 .usf 都 include 它（只含 `#define`）。改数不会报错、只会错位，所以两边不许各写一份。
 - **容量是显式的**，这一点和 CPU 网格根本不同：buffer 定长，真实计数由 GPU 写在 `MeshCounters` 流里，CPU 侧只知道上限。
 
 #### 三条写入通道，没有第四条
@@ -93,7 +94,7 @@
 | `UCSMesh::EditMeshAsync` | `OwnedGraphAsync` | 自建自执行 | **否**（`OnComplete` 才是栅栏） | 交互式生成（藤蔓 `GenerateVineGPU`，耗时见藤蔓测试场景的「生成耗时基线」；Tiny Glade 网格槽的 `SubmitMeshSlotAsync`） |
 | `FCSMeshRenderThreadEdit` | `BorrowedGraph` | 借调用方的图 | —（本就在渲染线程） | 渲染线程逐帧 pass（实例剔除等） |
 
-三条共用同一套「注册常驻流 → 跑算子 → 恢复每条流的最终访问状态」。**恢复访问状态正是这一层存在的理由**：流被 RDG 留在默认 epilogue 状态（`SRVMask`）上做索引 / 间接绘制是非法的，症状是「某个算子跑完组件就不画了」，几乎无法回溯到原因。借图那条要立刻取变换（`UseExternalAccessMode`），因为读这些流的 pass 就在同一张图的后面——epilogue 的变换会晚于它们，等于永不发生。
+三条共用同一套「注册常驻流 → 跑算子 → 恢复每条流的最终访问状态」。游戏线程读的三样对象状态（分段表、包围盒、已知计数）只经 `FCSMeshEditContext` 的发布接口写：同步通道在 flush 之后落地，异步通道暂存到完成回调才在游戏线程落地，借图通道一律拒绝——渲染线程不许直写它们。**恢复访问状态正是这一层存在的理由**：流被 RDG 留在默认 epilogue 状态（`SRVMask`）上做索引 / 间接绘制是非法的，症状是「某个算子跑完组件就不画了」，几乎无法回溯到原因。借图那条要立刻取变换（`UseExternalAccessMode`），因为读这些流的 pass 就在同一张图的后面——epilogue 的变换会晚于它们，等于永不发生。
 
 异步通道的代价写在契约里：`EditFunc` 是**被移入拥有**的（`TFunction`），它读到的一切也必须归它所有——同步版靠 flush 兜住的「指向调用方栈的裸指针」在这里就是 use-after-free；计数要等完成回调才对游戏线程可见。同一时刻只允许一个异步编辑在飞（`IsEditInFlight()`），第二次直接被拒。
 
@@ -146,9 +147,9 @@
 - **光追 BLAS**（2026-09-09）：`FCSGpuMeshSceneProxy` 给每个 `UCSMeshRenderComponent`（含 `URoadMeshComponent`）建底层加速结构，每个 section 一段，让硬件 Lumen、光追阴影与光追反射看得见 GPU 常驻网格。本工程的 Lumen 走硬件光追、追的是 TLAS，给 GPU mesh 写距离场对它没用——代理也一直关着距离场表示。开关是 `r.CSGpuMesh.RayTracing`（默认 1），`CSGpuMesh.DumpRayTracing` 打印现状。
 - BLAS 的三角数只能来自 CPU（RHI 没有 indirect BLAS build），所以它跟着 `FCSMeshResident` 的 draw-args 回读镜像走：每次拥有图的编辑结束都请求一次 args 回读，落地时 `GetDrawArgsPublishSerial()` +1，proxy 在 `OnEndFrameRT` 泵里比对 serial 决定是否重建。回读在途时旧 BLAS 保留；连续逐帧编辑时新请求会顶掉在途的那份，所以编辑停下才重建，天然限流。重建是全量 fast build，不走 refit，也不进帧预算。
 - ⚠️ Index 流的最终访问状态必须含 `SRVMask`（现为 `VertexOrIndexBuffer | SRVMask`）：BLAS 构建按 SRV 读输入，RHI 不会替你转换。
-- 实例化叶子（默认的 GPU 剔除模式）不建 BLAS（`WantsRayTracingGeometry() = false`）：它的流里只有一份源网格，实例变换在 GPU buffer 里，单实例 BLAS 会在原点冒出一个幻影。所以门框砖、瓦、草这类实例化产物目前都不在 TLAS 里。
+- 实例化叶子（`BaseMesh` 没开 Nanite 时的 GPU 剔除路）不建 BLAS（`WantsRayTracingGeometry() = false`）：它的流里只有一份源网格，实例变换在 GPU buffer 里，单实例 BLAS 会在原点冒出一个幻影。所以门框砖、瓦、草这类实例化产物目前都不在 TLAS 里。
 - 没有 surface cache（proxy 只有 dynamic relevance，做不了 card capture），GPU mesh 在 Lumen 里「能遮挡、命中点发黑」；反射可开 `r.Lumen.Reflections.HardwareRayTracing.HitLighting=1` 补色。
-- **VSM 阴影**（2026-09-08 修）：非 Nanite 的 VSM 光栅会把每个 batch 送进 GPU-Scene 实例剔除，那条路按 `NumPrimitives` 重建 indirect args，而带 `IndirectArgsBuffer` 的 batch `NumPrimitives` 必须为 0——结果画 0 个索引，表现为 CSM 有影、VSM 没影。现在阴影深度视图改发**直接绘制**，计数取自 draw-args 的 CPU 镜像 `FCSGpuDrawArgs`（镜像还没落地时退回间接形式），其它视图仍是精确的间接绘制。实例化叶子（默认模式）的 VSM 阴影仍未修，会被 VSM 的准入检查拒掉。
+- **VSM 阴影**（2026-09-08 修）：非 Nanite 的 VSM 光栅会把每个 batch 送进 GPU-Scene 实例剔除，那条路按 `NumPrimitives` 重建 indirect args，而带 `IndirectArgsBuffer` 的 batch `NumPrimitives` 必须为 0——结果画 0 个索引，表现为 CSM 有影、VSM 没影。现在阴影深度视图改发**直接绘制**，计数取自 draw-args 的 CPU 镜像 `FCSGpuDrawArgs`（镜像还没落地时退回间接形式），其它视图仍是精确的间接绘制。实例化叶子的 GPU 剔除路 VSM 阴影仍未修，会被 VSM 的准入检查拒掉（`BaseMesh` 开了 Nanite 的走 Nanite 路，有 VSM 阴影）。
 - 📖 [`Docs/GpuMeshRayTracing.md`](Docs/GpuMeshRayTracing.md)；测试 `GpuMeshObject.RayTracingGeometry`（要真 RHI）与 `GpuMeshObject.DrawArgsMirror`。
 
 #### 出：回读与落盘
@@ -166,8 +167,8 @@
 - 最多 4 级 LOD（`CS_GPU_INSTANCED_MAX_LODS`）共用一条顶点 / 索引 buffer，每级一个 indirect arg 组，由 `FCSGpuInstancedLODRange` 寻址。`bGpuFrustumCulling` / `bGpuLODSelection` / `InstancesPerCluster`（默认 64）/ `LODScreenSizeScale` / `InstanceEndCullDistance` 控制簇剔除与 LOD 切换。
 - `FCSGpuInstancedGpuLayout` 在游戏线程派生一次后整份拷进 proxy，而不是两边各推一遍：`MaxInstancesPerLod` 是可见实例 buffer 里一个 LOD 区段的**步长**，两边算出不同的数会把幸存实例压到区段之外——那是设备错误或静默垃圾，不是任何人能追溯的报错。
 - `DebugReadDrawnInstanceCountSync()` / `DebugGetDrawnAssetMismatchSync()` 是 Development-only 的验收口子，读的是 GPU 上真正被 indirect draw 消费的那份计数。
-- **Nanite 模式**（`RenderMode = Nanite` / `SetRenderMode`）：同样三种实例源，但不画自己的常驻网格——挂一个渲染替身 `UCSGpuInstancedNaniteComponent`（`UStaticMeshComponent`，网格就是 `BaseMesh`），引擎在 GPU-Scene 里给它分一段只在 GPU 上的实例区间，由写入 pass 把 packed 行直接写进去（引擎接口 `FScene::UpdatePrimitiveInstancesFromCompute`，与 PCG 的 GPU 生成同一套）。剔除 / LOD / VSM 阴影 / 光追全归引擎；`BaseMesh` 没开 Nanite 时由引擎 ISM 代理画回退 LOD。不进 Lumen card 与距离场（引擎要求 CPU 端实例数据，开着是 `check()` 崩溃）。GPU 源每帧重写一遍（生产者原地改 buffer 从不通知），代价是 VSM 每帧作废这批实例的影子缓存，可用 `ShadowCacheInvalidationBehavior = Static` 换缓存。⚠️ 顶点色 alpha 是资产自己的，`PerInstanceRandom + VertexColor.A` 那条通道字典在这条路上不成立。
-- Shader：[`Shaders/Private/CSGpuInstancedMesh.usf`](Shaders/Private/CSGpuInstancedMesh.usf)（剔除 / LOD / 点云打包）、[`Shaders/Private/CSGpuInstancedNaniteWriter.usf`](Shaders/Private/CSGpuInstancedNaniteWriter.usf)（Nanite 模式的 GPU-Scene 写入）。
+- **Nanite 路（自动，没有开关）**：`BaseMesh` 是一张开了 Nanite 的资产（`UStaticMesh::IsNaniteEnabled()`）就自动走这条路，没开就走上面的 GPU 剔除路；`IsNaniteRenderPath()` 只报告结果。编辑器里在资产上勾 / 取消 Nanite，资产重建完（`OnPostMeshBuild`）组件会在下一次帧末更新前自己换路。同样三种实例源，但不画自己的常驻网格——挂一个渲染替身 `UCSGpuInstancedNaniteComponent`（`UStaticMeshComponent`，网格就是 `BaseMesh`），引擎在 GPU-Scene 里给它分一段只在 GPU 上的实例区间，由写入 pass 把 packed 行直接写进去（引擎接口 `FScene::UpdatePrimitiveInstancesFromCompute`，与 PCG 的 GPU 生成同一套）。剔除 / LOD / VSM 阴影 / 光追全归引擎；这台机器画不了 Nanite（`r.Nanite 0`、平台或材质不支持）时由引擎 ISM 代理画资产的回退网格，平台连 GPU-Scene 都没有才退回 GPU 剔除路；`SetBaseMeshFromGpuData` 喂的网格不是资产，永远走 GPU 剔除路。不进 Lumen card 与距离场（引擎要求 CPU 端实例数据，开着是 `check()` 崩溃）。GPU 源每帧重写一遍（生产者原地改 buffer 从不通知），代价是 VSM 每帧作废这批实例的影子缓存，可用 `ShadowCacheInvalidationBehavior = Static` 换缓存。⚠️ 顶点色 alpha 是资产自己的，`PerInstanceRandom + VertexColor.A` 那条通道字典在这条路上不成立。
+- Shader：[`Shaders/Private/CSGpuInstancedMesh.usf`](Shaders/Private/CSGpuInstancedMesh.usf)（剔除 / LOD / 点云打包）、[`Shaders/Private/CSGpuInstancedNaniteWriter.usf`](Shaders/Private/CSGpuInstancedNaniteWriter.usf)（Nanite 路的 GPU-Scene 写入）。
 
 #### 谁在用
 
@@ -185,7 +186,7 @@
 GPU 实例化叶子的用户（每个组件各持一份 `InstancedGpuMesh`）：地面的石阶 / 石阶卵石 / 裙边摆件 / 地被，房屋的门框砖（接缝、角石、包边、砖墙共用这一个组件）/ 承重柱砖 / 藤蔓枝叶花 / 屋瓦 / 摆件，以及 PointBrush 的实例显示。房屋的尖顶、门扇与窗的预制网格是普通 `UStaticMeshComponent`，不在这一层。
 
 - 📖 设计与落地计划：[`Docs/GpuTriangleUnified_Plan.md`](Docs/GpuTriangleUnified_Plan.md)；架构图 [`Docs/GpuTriangleUnified_Architecture.svg`](Docs/GpuTriangleUnified_Architecture.svg)、数据流 [`Docs/GpuTriangleBuffer_Unification_Flow.svg`](Docs/GpuTriangleBuffer_Unification_Flow.svg)
-- 🧪 自动化测试（`Source/ComputeShaderGenerator/Private/Tests/`）：`CSGpuMeshObjectTests`（对象 / 编辑 / 桥接口径）、`CSGpuInstancedMeshTests`、`CSGpuInstancedNaniteTests`（Nanite 模式，真渲染一帧从深度图数实例）、`CSGpuMemoryBudgetTests`、`CSDirectMeshSaveTests`、`CSMeshBooleanParityTests`；全部测试组与跑法见 [自动化测试](#自动化测试)
+- 🧪 自动化测试（`Source/ComputeShaderGenerator/Private/Tests/`）：`CSGpuMeshObjectTests`（对象 / 编辑 / 桥接口径）、`CSGpuInstancedMeshTests`、`CSGpuInstancedNaniteTests`（Nanite 路：按资产自动选路、真渲染一帧从深度图数实例）、`CSGpuMemoryBudgetTests`、`CSDirectMeshSaveTests`、`CSMeshBooleanParityTests`；全部测试组与跑法见 [自动化测试](#自动化测试)
 
 ### 2. GPU 浅水模拟 · Shallow Water
 
@@ -269,7 +270,7 @@ AVineContainer::GenerateVineGPU()          # 录完图即返回（"已递交"）
 
 | 类 | 角色 | 头文件 |
 |---|---|---|
-| `ACSTinyGlade` | 抽象基类：「CPU 权威数据 → 快照 → `UCSMesh`」的网格槽（异步上传、在途只留最新）、声明式重求值入口 `ReevaluateSite()`、实例族清单（诊断 / 烘焙 / 显存回收） | [`CSTinyGlade.h`](Source/ComputeShaderGenerator/Public/CSTinyGlade.h) |
+| `ACSTinyGlade` | 抽象基类：「CPU 权威数据 → 快照 → `UCSMesh`」的网格槽（异步上传、在途只留最新）、声明式重求值入口 `ReevaluateSite()`、实例族清单（诊断 / 烘焙）；显存各归各，gpumesh 组件销毁时自己放 | [`CSTinyGlade.h`](Source/ComputeShaderGenerator/Public/CSTinyGlade.h) |
 | `ACSGroundActor` | 地面：高度 + 顶点色的 CPU 权威镜像（R = 道路权重）与顶点色笔刷；由它派生地面网格、高度场、石阶、岩壳、裙边摆件、地被（草 + 花）六条链 | [`CSGroundActor.h`](Source/ComputeShaderGenerator/Public/CSGroundActor.h) |
 | `ACSGroundShaperActor` | 塑形物：放在地面上的不可见高度影响体，地面从「基底 + 相交塑形物」声明式重导出高度 | [`CSGroundShaperActor.h`](Source/ComputeShaderGenerator/Public/CSGroundShaperActor.h) |
 | `ACSHouseActor` | 房屋：落座、道路驱动的门拱与门扇、墙体与门框砖、四坡瓦顶、承重柱、接缝、角石、包边石、窗洞、藤蔓、摆件 | [`CSHouseActor.h`](Source/ComputeShaderGenerator/Public/CSHouseActor.h) |
@@ -457,7 +458,7 @@ BVH 那一行标「下界」：基准里用的是节点 32 字节、叶子 4 三
 | 关卡 | 演示内容 | 主要蓝图 / 资产 |
 |---|---|---|
 | `L_HouseGroundDemo` | 画路开门拱、承重柱、窗、接缝、藤蔓、摆件、拉尺寸、地被 | `BP_TinyGladeGround`、`BP_TinyGladeHouse`、`BP_Window_Cottage_1x1` / `BP_Window_Gothic_1x1` |
-| `L_TerrainOpsDemo` | 塑形物堆台、石阶、披挂岩壳、裙边摆件、房子随台升降、地被 | `BP_GroundShaper`、`SM_StoneStep_{S,M,L}` |
+| `L_TerrainOpsDemo` | 塑形物堆台、石阶、披挂岩壳、裙边摆件、房子随台升降、地被 | `BP_GroundShaper`、`BP_TinyGladeGround` |
 | `L_SplineBlockDemo` | 块沿样条排列、缩放后恰好占满 | `BP_SplineBlockRow` |
 
 - **画路**：选中地面 → 细节面板点 `StartVertexColorPaint` 进入顶点色笔刷，左键拖拽落笔、松开提交、`Esc` 退出；R 通道就是道路权重，路画过墙脚，房子当场开拱。`ResetPaint` 清空笔迹。
@@ -487,7 +488,7 @@ C++ 用例 120 余条，全部是 `IMPLEMENT_SIMPLE_AUTOMATION_TEST`，位于 `S
 | 过滤串（`PCGPlugins.` 之后） | 测试文件 | 覆盖 |
 |---|---|---|
 | `ComputeShaderGenerator.GpuMeshObject` | `CSGpuMeshObjectTests` | 流契约、StaticMesh 往返、算子、焊接、池、section 排序、draw-args 镜像、光追 BLAS、渲染线程编辑等 19 条 |
-| `ComputeShaderGenerator.GpuInstancedMesh` | `CSGpuInstancedMeshTests`、`CSGpuInstancedNaniteTests` | 打包、簇、流、扩容、门框砖烘焙存活、Nanite 模式 |
+| `ComputeShaderGenerator.GpuInstancedMesh` | `CSGpuInstancedMeshTests`、`CSGpuInstancedNaniteTests` | 打包、簇、流、扩容、门框砖烘焙存活、Nanite 路（按资产自动选路） |
 | `ComputeShaderGenerator.{MemoryBudget, DirectGPUMesh, MeshBoolean, GpuDebugDraw, PointBrush}` | `CSGpuMemoryBudgetTests` / `CSDirectMeshSaveTests` / `CSMeshBooleanParityTests` / `CSGpuDebugDrawTests` / `CSPointBrushTests` | 显存预算、直出网格存盘、布尔 GPU 对拍、体素调试、点 buffer 生命周期 |
 | `ComputeShaderGenerator.House` | `CSHouseLogicTests` / `CSHouseTileTests` / `CSHouseDecorTests` / `CSHouseVineTests` | 屋面、门段、剖面与裁剪场、门框砖与墩、窗、接缝、角石、包边、抓手、瓦、摆件、藤蔓 |
 | `ComputeShaderGenerator.{GroundDecor, RockShell, GroundShaper, GroundStairs}` | `CSGroundDecorTests` / `CSGroundRockShellTests` / `CSGroundShaperFieldTests` / `CSGroundStairsTests` | 裙边摆件、岩壳、塑形场 CPU / GPU 对拍、石阶 |
@@ -509,10 +510,10 @@ C++ 用例 120 余条，全部是 `IMPLEMENT_SIMPLE_AUTOMATION_TEST`，位于 `S
 | 文档 | 内容 | 状态 |
 |---|---|---|
 | [`Docs/TinyGlade/index.md`](Docs/TinyGlade/index.md) | Tiny Glade 复刻的文档入口：设计裁决、模块对照与进度、窗户 / 树冠专卷、逆向报告 | 持续更新 |
-| [`TinyGlade_结构审查.md`](TinyGlade_结构审查.md) | Tiny Glade 编排层的整体结构审查，子代理报告在 `Docs/TinyGlade/` 附录 A/B/C | 2026-09-06～07 审查 |
-| [`Docs/GpuTriangleUnified_Plan.md`](Docs/GpuTriangleUnified_Plan.md) | GPU 三角形统一：可拓展储存 + 单一 readback，CSMesh 对象层的前身 | 设计与落地计划 |
+| [`TinyGlade_结构审查.md`](TinyGlade_结构审查.md) | Tiny Glade 编排层的整体结构审查，子代理报告在 `Docs/TinyGlade/` 附录 A/B/C | 2026-09-06～07 审查，09-11 复核 |
+| [`Docs/GpuTriangleUnified_Plan.md`](Docs/GpuTriangleUnified_Plan.md) | GPU 三角形统一：可拓展储存 + 单一 readback，CSMesh 对象层的前身 | ⚠️ 历史文档：L0 回读层与 sink B 未按此落地，对象层取代了它（2026-09-10 标注） |
 | [`Docs/GpuMeshRayTracing.md`](Docs/GpuMeshRayTracing.md) | GPU 常驻网格的光追 BLAS 接入（Lumen 硬件光追 / 光追阴影 / 反射） | 2026-09-09 落地 |
-| [`Docs/VineGpuResidency.md`](Docs/VineGpuResidency.md) | 藤蔓生成链路的 GPU 常驻化现状与剩余计划 | 2026-08-14；现状表的「表面体素」「三角形缓存」两行已过时（体素已录进同一张图，三角缓存已删） |
+| [`Docs/VineGpuResidency.md`](Docs/VineGpuResidency.md) | 藤蔓生成链路的 GPU 常驻化现状与剩余计划 | 2026-08-14；现状表于 2026-09-10 订正过两行 |
 | [`Docs/FrameQuotaScheduler_Plan.md`](Docs/FrameQuotaScheduler_Plan.md) | GPU 生成作业的统一帧配额（分帧）调度 | 设计基线，暂不实施 |
 | [`Docs/GpuClothSim_Plan.md`](Docs/GpuClothSim_Plan.md) | XPBD 布料模拟：常驻算子逐帧驱动 `UCSMesh` 形变 | 计划，未实施 |
 | [`Docs/GpuRigidSettle_Plan.md`](Docs/GpuRigidSettle_Plan.md) | 批量刚体沉降（粒子簇形状匹配），布料计划的姊妹篇 | 计划，未实施 |

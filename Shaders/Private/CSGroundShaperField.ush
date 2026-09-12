@@ -16,7 +16,9 @@
 
 #pragma once
 
-// 每塑形物 3 个 float4（步长写死在 CSGroundShaperField.h 的 Float4sPerShaper，两边必须同步）：
+#include "/Plugin/PCGPlugins/Shaders/Private/CSGpuSharedLayout.ush"
+
+// 每塑形物 CS_GROUND_SHAPER_FLOAT4S（3）个 float4（与 CSGroundShaperField.h 的 Float4sPerShaper 是同一份 #define）：
 //   [3i + 0] = (中心 X, 中心 Y, Radius, FalloffDistance)
 //   [3i + 1] = (台高, 裙边噪声幅度(归一化), 噪声频率 = 1/波长, 二次抬升系数)
 //   [3i + 2] = (噪声种子, _, _, _)
@@ -153,9 +155,9 @@ float GroundShaperHeightAtXY(float2 P)
 	{
 		H = max(H, GroundShaperEvalOne(
 			P,
-			GroundShaperParams[i * 3u + 0u],
-			GroundShaperParams[i * 3u + 1u],
-			GroundShaperParams[i * 3u + 2u]));
+			GroundShaperParams[i * CS_GROUND_SHAPER_FLOAT4S + 0u],
+			GroundShaperParams[i * CS_GROUND_SHAPER_FLOAT4S + 1u],
+			GroundShaperParams[i * CS_GROUND_SHAPER_FLOAT4S + 2u]));
 	}
 	return H;
 }
@@ -201,12 +203,12 @@ float GroundShaperPeakAtXY(float2 P)
 	float Peak = 0.0f;
 	for (uint i = 0; i < GroundShaperCount; ++i)
 	{
-		const float4 B = GroundShaperParams[i * 3u + 1u];
+		const float4 B = GroundShaperParams[i * CS_GROUND_SHAPER_FLOAT4S + 1u];
 		const float h = GroundShaperEvalOne(
 			P,
-			GroundShaperParams[i * 3u + 0u],
+			GroundShaperParams[i * CS_GROUND_SHAPER_FLOAT4S + 0u],
 			B,
-			GroundShaperParams[i * 3u + 2u]);
+			GroundShaperParams[i * CS_GROUND_SHAPER_FLOAT4S + 2u]);
 		if (h > BestH)
 		{
 			BestH = h;
@@ -221,13 +223,13 @@ float GroundShaperHeightAtXYTallOnly(float2 P, float MinPeak)
 	float H = 0.0f;
 	for (uint i = 0; i < GroundShaperCount; ++i)
 	{
-		const float4 B = GroundShaperParams[i * 3u + 1u];
+		const float4 B = GroundShaperParams[i * CS_GROUND_SHAPER_FLOAT4S + 1u];
 		if (max(B.x, 0.0f) * (1.0f + max(B.w, 0.0f)) < MinPeak) continue;
 		H = max(H, GroundShaperEvalOne(
 			P,
-			GroundShaperParams[i * 3u + 0u],
+			GroundShaperParams[i * CS_GROUND_SHAPER_FLOAT4S + 0u],
 			B,
-			GroundShaperParams[i * 3u + 2u]));
+			GroundShaperParams[i * CS_GROUND_SHAPER_FLOAT4S + 2u]));
 	}
 	return H;
 }
@@ -239,12 +241,12 @@ float GroundShaperHeightAtXYExpanded(float2 P, float RadiusBonus)
 	float H = 0.0f;
 	for (uint i = 0; i < GroundShaperCount; ++i)
 	{
-		float4 A = GroundShaperParams[i * 3u + 0u];
+		float4 A = GroundShaperParams[i * CS_GROUND_SHAPER_FLOAT4S + 0u];
 		A.z += RadiusBonus;
 		H = max(H, GroundShaperEvalOne(
 			P, A,
-			GroundShaperParams[i * 3u + 1u],
-			GroundShaperParams[i * 3u + 2u]));
+			GroundShaperParams[i * CS_GROUND_SHAPER_FLOAT4S + 1u],
+			GroundShaperParams[i * CS_GROUND_SHAPER_FLOAT4S + 2u]));
 	}
 	return H;
 }

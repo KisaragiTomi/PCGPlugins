@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "CoreMinimal.h"
 #include "CSGroundShaperSteps.h"
@@ -701,9 +701,10 @@ public:
 	// ⚠️ **本节不含任何"自动填窗"的规则，也不许加。** TG 的窗全是玩家手放的，本项目的放置 UI
 	// 还没做、「门洞触发规则」又是唯一没拍板的一条 —— 窗的来源就停在 `Windows` 这份列表上。
 	//
-	// 窗与门共用**同一条**通路：同一张 openings 表、同一个 clip 场、同一条谓词、同一套门框砖。
-	// 窗多出来的只有两件事：① 洞底离地（`Z0 > 0`）⇒ 房体在洞面板下面另砌一块无 clip 的实心
-	// 窗台盒；② 洞的**下边界**也是一条 clip 边 ⇒ 砖路多出第四段（`CSHouseFrame::FPath::bSill`）。
+	// 窗与门共用**同一条**通路：同一张 openings 表、同一个 clip 场、同一条谓词。
+	// 与门不同的只有两件事：① 洞底离地（`Z0 > 0`）⇒ 房体在洞面板下面另砌一块无 clip 的实心
+	// 窗台盒；② **不出门框砖** —— 洞缘由附属物自带的预制框盖住，窗周围没有任何砖头补全
+	// （`CSHouseFrame::BuildEdgeElements`）。
 	// -------------------------------------------------------------------------
 
 	/** 关掉即整份列表不出洞（出图脚本靠它拍"同机位只切开关"的对照图）。 */
@@ -1337,22 +1338,67 @@ public:
 	/** 声明式重求值：落座 → 门拱 → 柱，两份 desc 各自哈希守卫。幂等，可被高频调用。 */
 	virtual void ReevaluateSite() override;
 
+	/**
+	 * **合批唤醒：只标脏，由本栋房子自己的 `Tick` 兑现。** 一帧里会被同一栋房子收到很多次的
+	 * 那些通知（标记登记 / 注销、地面广播）走这条，不要直接调 `ReevaluateSite()`。
+	 *
+	 * 起因（2026-09-10）：gizmo 多选拖 N 个窗标记时，每个标记**每 tick** 都会
+	 * `RegisterFeatureMarker` 一次，而那里原本直接同步重求值 ⇒ 一帧 N 次完整重建：算门
+	 * （约 340 次镜像双线性）、接缝、砖、藤、瓦、尖顶、门扇、摆件全跑 N 遍，收尾的
+	 * `NotifyMarkersRebuilt` 还要对**每个**标记吸附一次 ⇒ N² 次。而前 N−1 次的结果全部被
+	 * 后一次覆盖 —— 第 k 次跑的时候，第 k+1..N 个标记这一帧的新诉求还没写进来。纯粹是白烧。
+	 *
+	 * 现在一帧里来多少个通知，都只在 `Tick` 里兑现**一次**，与 N 无关。落在本帧还是下一帧，看通知
+	 * 在世界 tick 之前还是之后到：gizmo 拖动走 `PostEditMove`，在世界 tick 之前 ⇒ 本帧；EdMode
+	 * 的画笔在世界 tick 之后 ⇒ 下一帧。**至多延迟一帧**（用户裁决：视觉上无差别，且不经
+	 * `UCSHouseSubsystem` —— 房子自己决定什么时候更新）。
+	 *
+	 * "改完立刻读得到"不靠时机，靠的是每个派生物 getter 读前的 `FlushPendingReevaluate`：
+	 * 无头脚本与单测整段跑在同一帧里，`Tick` 根本插不进来。
+	 *
+	 * tick 平时关着：这里打开，`Tick` 兑现后自己关掉，闲置的房子零开销。
+	 */
+	void RequestReevaluate();
+
+	/**
+	 * 有待兑现的合批唤醒就地补上。幂等；没有待兑现的就只是一次布尔判断。
+	 *
+	 * **所有读派生状态的入口都先走它**：各族计数、洞表、`Is*Drawable` / `Get*UndrawableReason`、
+	 * GPU 回读、烘焙。`RequestReevaluate` 只标脏、等房子自己的 `Tick` 兑现，而"改完立刻读"
+	 * 那条路不等 tick —— 无头回归、单测、Python 脚本都是改完紧接着读，而且整份脚本跑在同一帧里，
+	 * 根本没有"下一帧"可等。不补票的症状是**读到上一次的账**，且没有任何报错。
+	 *
+	 * ⚠️ 2026-09-10 实测：起初只挂了洞相关的四个，理由是"别的计数只在同步入口之后读"——
+	 * 那句是错的。`TinyGladeDemoRegression.py` 画完路紧接着读 `get_open_door_count()` /
+	 * `get_frame_brick_count()`，读到的是画路**之前**的门数与砖数（188 = 72 角石 + 116 包边，
+	 * 一块拱砖都没有），两条断言当场转红。
+	 *
+	 * **不挂它的只有三类，且都有理由**：`QueryFeatureReject`（标记每 tick 都会调的预判，挂了会让
+	 * N 个标记重新变回 N 次重建；终裁由 `NotifyMarkersRebuilt` 下）、读的不是派生物的
+	 * （`GetFeatureMarkerCount` 是登记表、`GetBrickWallBrickBudget` 是纯配置）、以及
+	 * `GetReevaluateCount`（合批的观测量，挂了就测不到合批）。
+	 *
+	 * 重建途中被调到（`ReevaluateSite` 内部有几处读计数写日志）是安全的：欠账在 `ReevaluateSite`
+	 * 一开头就清了，补票只是一次布尔判断；即便重建途中又来了新通知，`bInReevaluate` 也会让它
+	 * 立刻返回，留给下一次 `Tick`。
+	 */
+	void FlushPendingReevaluate() const;
+
+	/**
+	 * `ReevaluateSite` 真正跑完的次数。
+	 *
+	 * 合批是否生效的**唯一可观测判据**（单测 `House.MarkerDragBatchesRebuilds` 读它）：
+	 * 一帧里拖 N 个窗，这个数的增量必须与 N 无关。没有它，"合批"只是一句没人守着的话。
+	 */
+	UFUNCTION(BlueprintPure, Category = "CS House")
+	int64 GetReevaluateCount() const { return ReevaluateCount; }
+
 #if WITH_EDITOR
 	/**
-	 * 把本房子**全部**实例路产物烘成 StaticMesh 资产 —— 裁决六 ① 在房子这一侧的用户入口。
-	 *
-	 * 一族一张：门框砖（含接缝砖，两者共用一个组件）/ 藤枝 / 藤叶 / 藤花 / 每个摆件 palette。
-	 * 资产落在 `BakeFolder/SM_<actor>_<family>`；返回真的烘出来的张数（这一族没有实例就跳过，
-	 * 跳过不算失败 —— 一栋不长花的房子是合法的）。
-	 *
-	 * ⚠️ **阻塞**（每族两次回读 + 一次 StaticMesh 构建），而这是**有意**的：它是用户主动发起的
-	 * 离线操作，不在任何交互路径上。它照旧被 `UCSMesh::GetBlockingFlushCount()` 数到，
-	 * 十一条 `flushes=0` 断言会在它被误接进重建链路的那一刻报红。
-	 *
-	 * 房体 / 柱那两条走的是网格路（`UCSMeshRenderComponent::SaveToStaticMesh`），不在这里。
+	 * 基类烘焙入口（一族一张，族表见 `GetInstancedFamilies`），这里只先补合批欠账 ——
+	 * 烘的必须是这一刻的状态。房体 / 柱走网格路（`UCSMeshRenderComponent::SaveToStaticMesh`）。
 	 */
-	UFUNCTION(BlueprintCallable, Category = "CS House")
-	int32 SaveInstancedToStaticMeshes(const FString& BakeFolder, bool bSaveAssets = false);
+	virtual int32 SaveInstancedToStaticMeshes(const FString& BakeFolder, bool bSaveAssets) override;
 #endif
 
 	/**
@@ -1474,9 +1520,9 @@ public:
 	UFUNCTION(BlueprintPure, Category = "CS House")
 	int32 GetOpenDoorCount() const;
 
-	/** 当前洞的总数（门 + 窗 + 注入）。 */
+	/** 当前洞的总数（门 + 窗 + 注入）。读之前补票，理由见 `FlushPendingReevaluate`。 */
 	UFUNCTION(BlueprintPure, Category = "CS House")
-	int32 GetOpeningCount() const { return CurrentOpenings.Num(); }
+	int32 GetOpeningCount() const { FlushPendingReevaluate(); return CurrentOpenings.Num(); }
 
 	/**
 	 * 稳定身份。subsystem 的注册表以它为 key，D7 的接缝 key 也用它（两房 GUID 的无序对）——
@@ -1581,13 +1627,13 @@ public:
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "CS House|Window", meta = (DevelopmentOnly))
 	void StartWindowBrush();
 
-	/** 这一轮真正砌出来的窗洞数（`Windows` 里过了谓词的那些）。 */
+	/** 这一轮真正砌出来的窗洞数（`Windows` 里过了谓词的那些）。读之前补票。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Window")
-	int32 GetWindowCount() const { return CurrentWindowCount; }
+	int32 GetWindowCount() const { FlushPendingReevaluate(); return CurrentWindowCount; }
 
 	/** 这一轮被谓词拒掉的窗诉求数。**必须与上一条一起看** —— 只看前者分不清"没填"与"被拒"。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Window")
-	int32 GetWindowRejectCount() const { return CurrentWindowRejectCount; }
+	int32 GetWindowRejectCount() const { FlushPendingReevaluate(); return CurrentWindowRejectCount; }
 
 	/**
 	 * **诊断 / 验收专用**：窗这一帧到底会不会出现在画面上，不会的话原因是什么。
@@ -1606,35 +1652,35 @@ public:
 
 	/** 这一轮与几个邻居交汇（= 交点数，一个交点一根接缝砖柱）。0 = 没和谁碰上。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Seam")
-	int32 GetSeamCornerCount() const { return CurrentSeamCornerCount; }
+	int32 GetSeamCornerCount() const { FlushPendingReevaluate(); return CurrentSeamCornerCount; }
 
 	/** 接缝砖数（含在 `GetFrameBrickCount()` 里 —— 两者共用一个组件与一份容量）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Seam")
-	int32 GetSeamBrickCount() const { return CurrentSeamBrickCount; }
+	int32 GetSeamBrickCount() const { FlushPendingReevaluate(); return CurrentSeamBrickCount; }
 
 	/** 这一轮被接缝抹掉的墙段数（clip，不是几何洞）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Seam")
-	int32 GetSeamCutCount() const { return CurrentSeamCuts.Num(); }
+	int32 GetSeamCutCount() const { FlushPendingReevaluate(); return CurrentSeamCuts.Num(); }
 
 	/** 角石砖数（同样含在 `GetFrameBrickCount()` 里 —— 三者共用一个组件与一份容量）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Quoin")
-	int32 GetQuoinBrickCount() const { return CurrentQuoinBrickCount; }
+	int32 GetQuoinBrickCount() const { FlushPendingReevaluate(); return CurrentQuoinBrickCount; }
 
 	/** 本轮实际出砖的角石柱数（正常恒 4；退化 footprint 或容量耗尽时会少）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Quoin")
-	int32 GetQuoinColumnCount() const { return CurrentQuoinColumnCount; }
+	int32 GetQuoinColumnCount() const { FlushPendingReevaluate(); return CurrentQuoinColumnCount; }
 
 	/** 包边砖数（同样含在 `GetFrameBrickCount()` 里 —— 四者共用一个组件与一份容量）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Trim")
-	int32 GetTrimBrickCount() const { return CurrentTrimBrickCount; }
+	int32 GetTrimBrickCount() const { FlushPendingReevaluate(); return CurrentTrimBrickCount; }
 
 	/** 砖层这一轮实际发出的砖数（**已被容量截断之后**的数）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Brick Wall")
-	int32 GetBrickWallBrickCount() const { return CurrentBrickWallBrickCount; }
+	int32 GetBrickWallBrickCount() const { FlushPendingReevaluate(); return CurrentBrickWallBrickCount; }
 
 	/** 砖层的层数（`PlanCourses` 的结果）。0 = 整层没开或墙高为零。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Brick Wall")
-	int32 GetBrickWallCourseCount() const { return CurrentBrickWallCourseCount; }
+	int32 GetBrickWallCourseCount() const { FlushPendingReevaluate(); return CurrentBrickWallCourseCount; }
 
 	/**
 	 * 砖层**不减洞**的砖数上界（`CSHouseBrickWall::EstimateBricks`）。
@@ -1645,11 +1691,11 @@ public:
 
 	/** 墙顶包边被洞切成了几段（无洞的矩形房恒 4）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Trim")
-	int32 GetTrimTopRunCount() const { return CurrentTrimTopRunCount; }
+	int32 GetTrimTopRunCount() const { FlushPendingReevaluate(); return CurrentTrimTopRunCount; }
 
 	/** 墙脚包边被洞切成了几段。**开一扇门就会多一段**——这正是"包边避开了洞"的可断言证据。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Trim")
-	int32 GetTrimBaseRunCount() const { return CurrentTrimBaseRunCount; }
+	int32 GetTrimBaseRunCount() const { FlushPendingReevaluate(); return CurrentTrimBaseRunCount; }
 
 	/**
 	 * 接缝画得出来吗（**执行面**判据，不是数值判据）。
@@ -1667,11 +1713,11 @@ public:
 	FString GetSeamUndrawableReason() const;
 
 	UFUNCTION(BlueprintPure, Category = "CS House")
-	int32 GetPillarCount() const { return CurrentPillarCount; }
+	int32 GetPillarCount() const { FlushPendingReevaluate(); return CurrentPillarCount; }
 
 	/** 当前砌出的门框砖总数。CPU 侧本来就排好了记录，这个数不需要回读 GPU。 */
 	UFUNCTION(BlueprintPure, Category = "CS House")
-	int32 GetFrameBrickCount() const { return CurrentFrameBrickCount; }
+	int32 GetFrameBrickCount() const { FlushPendingReevaluate(); return CurrentFrameBrickCount; }
 
 	/**
 	 * `RebuildFrame` **真的重排过几次砖**（单调递增，不序列化）。
@@ -1684,7 +1730,7 @@ public:
 	 * 哈希短路吸收无效唤醒是**设计**，同一帧被唤醒两次只该重排一次。
 	 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Diagnostics")
-	int32 GetFrameScatterCount() const { return FrameScatterCount; }
+	int32 GetFrameScatterCount() const { FlushPendingReevaluate(); return FrameScatterCount; }
 
 	// -------------------------------------------------------------------------
 	// GPU 侧真值（**诊断 / 验收专用，阻塞**）
@@ -1718,16 +1764,8 @@ public:
 	UFUNCTION(BlueprintPure, Category = "CS House|Diagnostics", meta = (DevelopmentOnly))
 	int32 DebugReadDecorInstanceCountGpuSync() const;
 
-	/**
-	 * 本房子每一条 GPU 实例路上，**GPU 真的在画的基础网格 / 材质**是不是我们以为的那两样。
-	 * 空串 = 是。原因串带家族前缀（门框 / 藤枝 / 藤叶 / 摆件[i]）。
-	 *
-	 * 与 `IsVineDrawable` 那一族的分工：那边查"能不能画"（组件在不在、注册没注册、非空没非空），
-	 * 这边查"画的是不是那个" —— 网格那一半是把上传到 GPU 的那份**回读出来**跟资产对，
-	 * 不是信任 CPU 快照。
-	 */
-	UFUNCTION(BlueprintPure, Category = "CS House|Diagnostics", meta = (DevelopmentOnly))
-	FString DebugGetGpuAssetMismatchSync() const;
+	/** 基类诊断（逐族回读对资产，族表见 `GetInstancedFamilies`），这里只先补合批欠账。 */
+	virtual FString DebugGetGpuAssetMismatchSync() const override;
 
 #if WITH_EDITOR
 	/**
@@ -1779,16 +1817,16 @@ public:
 	 * 少一个函数体是**链接错误**而不是编译错误 —— 上一轮在这里栽过一次，只有全量构建照得出来。
 	 */
 	UFUNCTION(BlueprintPure, Category = "CS House")
-	int32 GetPierSpanCount() const { return CurrentPierSpanCount; }
+	int32 GetPierSpanCount() const { FlushPendingReevaluate(); return CurrentPierSpanCount; }
 
 	UFUNCTION(BlueprintPure, Category = "CS House|Vine")
-	int32 GetVineSegmentCount() const { return CurrentVineSegmentCount; }
+	int32 GetVineSegmentCount() const { FlushPendingReevaluate(); return CurrentVineSegmentCount; }
 
 	UFUNCTION(BlueprintPure, Category = "CS House|Vine")
-	int32 GetVineLeafCount() const { return CurrentVineLeafCount; }
+	int32 GetVineLeafCount() const { FlushPendingReevaluate(); return CurrentVineLeafCount; }
 
 	UFUNCTION(BlueprintPure, Category = "CS House|Vine")
-	int32 GetVineFlowerCount() const { return CurrentVineFlowerCount; }
+	int32 GetVineFlowerCount() const { FlushPendingReevaluate(); return CurrentVineFlowerCount; }
 
 	/**
 	 * **诊断 / 验收专用**：藤蔓这一帧到底会不会被画出来，不会的话原因是什么。
@@ -1824,7 +1862,7 @@ public:
 
 	/** 这一轮铺出来的瓦片数。CPU 侧本来就排好了记录，不需要回读 GPU。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Roof Tile")
-	int32 GetRoofTileCount() const { return CurrentRoofTileCount; }
+	int32 GetRoofTileCount() const { FlushPendingReevaluate(); return CurrentRoofTileCount; }
 
 	/** 画不出来的原因（空串 = 画得出来）。理由逐字见 `GetVineUndrawableReason`。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Roof Tile", meta = (DevelopmentOnly))
@@ -1832,7 +1870,7 @@ public:
 
 	/** 这一轮立起来的尖顶数（矩形 2 根、正方形退化成 1 根、没网格 0 根）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Roof Finial")
-	int32 GetRoofFinialCount() const { return CurrentRoofFinialCount; }
+	int32 GetRoofFinialCount() const { FlushPendingReevaluate(); return CurrentRoofFinialCount; }
 
 	/**
 	 * 当前生效的洞表（门 + 窗 + 第三方注入）。
@@ -1841,11 +1879,11 @@ public:
 	 * 会报 "protected and cannot be read"）。门宽验收要逐洞量宽度与洞心，所以开这个只读口。
 	 */
 	UFUNCTION(BlueprintPure, Category = "CS House")
-	TArray<FCSWallOpening> GetCurrentOpenings() const { return CurrentOpenings; }
+	TArray<FCSWallOpening> GetCurrentOpenings() const { FlushPendingReevaluate(); return CurrentOpenings; }
 
 	/** 当前立着的门扇数（= 有门扇的洞数）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Door Leaf")
-	int32 GetDoorLeafCount() const { return CurrentDoorLeafCount; }
+	int32 GetDoorLeafCount() const { FlushPendingReevaluate(); return CurrentDoorLeafCount; }
 
 	/** 空串 = 画得出来。⚠️ 一律调它，不要调 is_*_drawable（见出图脚本坑 ⑩）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Door Leaf", meta = (DevelopmentOnly))
@@ -1857,11 +1895,11 @@ public:
 
 	/** 当前摆出来的装饰件总数（所有 palette 合计）。CPU 侧本来就排好了记录，不需要回读 GPU。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Decor")
-	int32 GetDecorInstanceCount() const { return CurrentDecorInstanceCount; }
+	int32 GetDecorInstanceCount() const { FlushPendingReevaluate(); return CurrentDecorInstanceCount; }
 
 	/** 这一轮生产出来的锚点个数。**摆件密度就是这个数**（过完填充概率与间距球之后才是上一条）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Decor")
-	int32 GetDecorAnchorCount() const { return CurrentDecorAnchorCount; }
+	int32 GetDecorAnchorCount() const { FlushPendingReevaluate(); return CurrentDecorAnchorCount; }
 
 	/**
 	 * 其中门/拱那一家的锚点个数（TG 的 `add_autoclutter_around_gates`）。
@@ -1871,7 +1909,7 @@ public:
 	 * 20 → 20）。拿总数做断言会在那一刻变成空判据。
 	 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Decor")
-	int32 GetDecorGateAnchorCount() const { return CurrentDecorGateAnchorCount; }
+	int32 GetDecorGateAnchorCount() const { FlushPendingReevaluate(); return CurrentDecorGateAnchorCount; }
 
 	/**
 	 * **诊断 / 验收专用**：装饰摆件这一帧到底会不会被画出来，不会的话原因是什么。
@@ -1911,18 +1949,31 @@ public:
 	 */
 	static float ComputeDoorWidthScale(float GapMax, float GapFull, float GapZero);
 
-	//~ AActor interface
-	virtual void OnConstruction(const FTransform& Transform) override;
+	//~ AActor interface（OnConstruction → ReevaluateSite 在基类）
 	virtual void PostRegisterAllComponents() override;
 	/** 编辑器 world 里删房子只走这一条（那个 world 没有 begun play）—— 拉尺寸抓手在这里收。 */
 	virtual void Destroyed() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void BeginDestroy() override;
+	/** 只做一件事：兑现 `RequestReevaluate` 攒下的那一次重求值，然后把自己的 tick 关掉。 */
+	virtual void Tick(float DeltaSeconds) override;
+	/**
+	 * 编辑器 world 按 `LEVELTICK_ViewportsOnly` tick，不 override 这个的 actor 在编辑器里一帧都不跑
+	 * ——而本项目的创作全在编辑器里。它与构造里的 `bCanEverTick` 缺一不可，缺哪个都是静默失效：
+	 * 读派生结果的路会补票，所以单测照绿，只有编辑器画面停在旧洞上。
+	 */
+	virtual bool ShouldTickIfViewportsOnly() const override { return true; }
 #if WITH_EDITOR
 	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
 	virtual void PostEditMove(bool bFinished) override;
 	virtual void PostEditUndo() override;
 #endif
+
+protected:
+	//~ ACSTinyGlade interface
+	/** 门框砖（含接缝 / 角石 / 包边 / 砖层）/ 藤枝 / 藤叶 / 藤花 / 每个摆件 palette / 屋瓦 / 柱砖。 */
+	virtual void GetInstancedFamilies(TArray<FCSInstancedFamily>& OutFamilies) const override;
+	virtual void ReleaseInstancedBuffers() override;
 
 private:
 	/**
@@ -2030,8 +2081,12 @@ private:
 	void RebuildBodyMesh();
 	void RebuildPillarMesh(const TArray<FVector>& Centers, const TArray<float>& Lengths);
 
-	/** 保证门框的实例组件存在并绑好网格/材质（多退少补，同藤蔓/摆件的做法）。 */
-	void EnsureFrameComponent();
+	/**
+	 * 保证门框的实例组件存在并绑好网格/材质，备容量、交接实例源（多退少补，同藤蔓/摆件的做法）。
+	 * 返回这一趟的交接结果：`HandedOver` = 组件刚拿到一批 buffer（扩容后是全新、清零的一批），
+	 * `RebuildFrame` 的早退门看到它就不许早退 —— 否则扩容那一轮画的是空 buffer（2026-09-07 审查 B1）。
+	 */
+	CSShaperSteps::EHandoverResult EnsureFrameComponent();
 
 	/**
 	 * 组装门框的**解析砖路**（2026-08-30「裁决一」选乙，**唯一**的一条）。返回门框 desc 哈希。
@@ -2096,8 +2151,9 @@ private:
 
 	void RebuildFrame();
 
-	/** 藤蔓：组件/容量/交接一次付清（同 EnsureFrameComponent），交互期只剩录 pass。 */
-	void EnsureVineComponents();
+	/** 藤蔓：组件/容量/交接一次付清（同 EnsureFrameComponent），交互期只剩录 pass。
+	 *  返回交接结果，`HandedOver` 时 `RebuildVine` 不许早退（理由见 EnsureFrameComponent）。 */
+	CSShaperSteps::EHandoverResult EnsureVineComponents();
 
 	/** 墙矩形（世界空间）—— 与房体面板同一份 `CSHouse_GetEdge`，不另起一套口径。 */
 	void BuildVineStrips(TArray<CSHouseVine::FWallStrip>& OutStrips) const;
@@ -2105,8 +2161,9 @@ private:
 	/** 规划 + 录一趟打包 pass；返回这次的形态哈希（喂幂等短路）。 */
 	void RebuildVine();
 
-	/** 屋面瓦：组件/容量/交接一次付清（同 EnsureVineComponents），交互期只剩录 pass。 */
-	void EnsureRoofTileComponent();
+	/** 屋面瓦：组件/容量/交接一次付清（同 EnsureVineComponents），交互期只剩录 pass。
+	 *  返回交接结果，`HandedOver` 时 `RebuildRoofTiles` 不许早退（理由见 EnsureFrameComponent）。 */
+	CSShaperSteps::EHandoverResult EnsureRoofTileComponent();
 
 	/** 参数打包，顺带从网格包围盒判定三条轴。**只有这一处**组装，别在调用点各写一份。 */
 	CSHouseTile::FParams MakeRoofTileParams() const;
@@ -2119,8 +2176,9 @@ private:
 	void RebuildRoofFinials();
 	void RebuildDoorLeaves();
 
-	/** 摆件：组件/容量/交接一次付清（同 EnsureVineComponents），交互期只剩录 pass。 */
-	void EnsureDecorComponents();
+	/** 摆件：组件/容量/交接一次付清（同 EnsureVineComponents），交互期只剩录 pass。
+	 *  返回交接结果，`HandedOver` 时 `RebuildDecor` 不许早退（理由见 EnsureFrameComponent）。 */
+	CSShaperSteps::EHandoverResult EnsureDecorComponents();
 
 	/** 锚点生产者要读的世界（墙矩形 + 洞 + 屋面 + 地面采样器）。 */
 	void BuildDecorSite(CSHouseDecor::FSite& OutSite) const;
@@ -2135,15 +2193,12 @@ private:
 	void ResolvePierSpans();
 
 	/**
-	 * 整栋房子**一次** EditMeshAsync：上传基体 → 排序分段组进同一个 EditFunc、同一张 RDG 图。
+	 * 整栋房子**一次** EditMeshAsync：上传基体 → 排序分段组进同一个 EditFunc、同一张 RDG 图
+	 * （基类 `SubmitMeshSlotAsync`；这里只给材质表与流布局）。
 	 *
 	 * 为什么不能"每个算子各发一次异步编辑"：EditMeshAsync 在途时会拒绝第二次（返回 false 且
 	 * OnComplete 永不触发），两个算子各发一次必然互相拒绝。也不能"只把上传异步化" ——
-	 * 那是 2 次 flush 变 1 次，不是变 0 次。
-	 *
-	 * 在途被拒时把目标存进 pending 槽，OnComplete 里补发最新的那一份（**最新态合并**）。
-	 * 拖拽 30 Hz 下被拒是常态而非边界情形；这条链给出的速率自动等于 GPU 实际完成速率，
-	 * 不需要调参，也不会像固定节流那样在最后一个 tick 落进窗口时吞掉末帧。
+	 * 那是 2 次 flush 变 1 次，不是变 0 次。在途被拒时的最新态合并见基类那条注释。
 	 */
 	void SubmitBodyMesh(TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> Snapshot);
 	void SubmitPillarMesh(TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> Snapshot);
@@ -2163,19 +2218,14 @@ private:
 	/** 管子构建完成：有挂起的折线就补发一次。 */
 	void OnVineTubeEditComplete();
 
-	/** 异步编辑的游戏线程尾巴：发布分段表 + 补发 pending。 */
-	void OnBodyEditComplete(bool bSorted);
+	/** 异步编辑的游戏线程尾巴（分段表已由基类发布）：有 pending 就补发，否则补上被推迟的摆位增量。 */
+	void OnBodyEditComplete();
 	void OnPillarEditComplete();
 
 	/**
-	 * 形状未变、只是搬了地方：一个位置+切线 pass 把已有几何搬过去，不重建、不重传。
-	 *
-	 * **同样走异步**：拖动房子是交互热路径，纪律是"一次设备同步都不许有"。增量始终相对
-	 * BuiltAtTransform（= GPU 实际所在）算，所以在途被拒时**什么都不用记** —— 下一次重试
-	 * 自然算出更大的那个增量，天然自愈、绝不会累加两次。
-	 *
-	 * 返回是否已把几何搬到位；false = 这一次没送出去（在途 / 被拒），调用方不许推进摆位哈希，
-	 * 否则这次移动就永远丢了。补送由 OnBodyEditComplete 兜底。
+	 * 形状未变、只是搬了地方：基类 `ApplyMeshSlotPlacement` 一个变换 pass 把已有几何搬到
+	 * `GetBuildTransform()`。返回 false = 这一次没送出去（在途 / 被拒），调用方不许推进摆位哈希；
+	 * 补送由 OnBodyEditComplete / OnPillarEditComplete 兜底。
 	 */
 	bool ApplyBodyPlacement();
 	bool ApplyPillarPlacement();
@@ -2194,8 +2244,8 @@ private:
 	TObjectPtr<UCSGpuInstancedMeshComponent> PillarBrickComponent;
 
 	TArray<CSShaperSteps::FPaletteBuffers> PillarGpuBuffers;
-	TArray<uint32> PillarHandedCapacities;
-	FBox PillarHandedLocalBounds = FBox(ForceInit);
+	/** 上次交给组件的容量/包围盒：只有它们真变了才需要再走一次阻塞的 SetInstanceSourceGPU。 */
+	CSShaperSteps::FHandoverCache PillarHandover;
 
 	/** 砖石柱：备容量 / 交接实例源（与 `EnsureFrameComponent` 同型，阻塞的活都在这里一次付清）。 */
 	void EnsurePillarBrickComponent();
@@ -2252,15 +2302,12 @@ private:
 	/** 这一轮立起来的转角墩数（0..4）。 */
 	int32 CurrentCornerPierCount = 0;
 
-	// 两级哈希（形状 / 摆位）各自守卫房体与柱：形状变 → 全量重建；只有摆位变 → TransformMesh 一刀。
-	uint32 BodyShapeHash = 0;
-	uint32 BodyPlacementHash = 0;
-	uint32 PillarShapeHash = 0;
-	uint32 PillarPlacementHash = 0;
-
-	/** 上次把几何烘进常驻流时的世界变换；增量变换相对它算（同 ACSGroundActor::MeshBuiltAtLocation）。 */
-	FTransform BodyBuiltAtTransform = FTransform::Identity;
-	FTransform PillarBuiltAtTransform = FTransform::Identity;
+	/**
+	 * 房体（基类主网格）与柱的网格槽簿记：两级哈希（形状变 → 全量重建；只有摆位变 → 一个变换
+	 * pass）、几何烘在哪个世界变换下（同 ACSGroundActor::MeshBuiltAtLocation）、在途待发的最新快照。
+	 */
+	FCSMeshSlotState BodySlot;
+	FCSMeshSlotState PillarSlot;
 
 	int32 CurrentPillarCount = 0;
 	int32 CurrentFrameBrickCount = 0;
@@ -2283,8 +2330,7 @@ private:
 	TArray<CSShaperSteps::FPaletteBuffers> FrameGpuBuffers;
 
 	/** 上次交给组件的容量/包围盒：只有它们真变了才需要再走一次阻塞的 SetInstanceSourceGPU。 */
-	TArray<uint32> FrameHandedCapacities;
-	FBox FrameHandedLocalBounds = FBox(ForceInit);
+	CSShaperSteps::FHandoverCache FrameHandover;
 
 	uint32 FrameDescHash = 0;
 
@@ -2335,8 +2381,8 @@ private:
 	 *  规划结果再多也只截断不扩容 —— 交互期一次设备同步都不许有。 */
 	TArray<CSShaperSteps::FPaletteBuffers> VineGpuBuffers;
 
-	TArray<uint32> VineHandedCapacities;
-	FBox VineHandedLocalBounds = FBox(ForceInit);
+	/** 上次交给组件的容量/包围盒：只有它们真变了才需要再走一次阻塞的 SetInstanceSourceGPU。 */
+	CSShaperSteps::FHandoverCache VineHandover;
 
 	uint32 VineDescHash = 0;
 	int32 CurrentVineSegmentCount = 0;
@@ -2379,8 +2425,8 @@ private:
 	/** 从包围盒判出来的三条轴与网格自身尺寸。`EnsureRoofTileComponent` 建快照时一并算好。 */
 	CSHouseTile::FMeshAxes RoofTileAxes;
 
-	uint32 RoofTileHandedCapacity = 0;
-	FBox RoofTileHandedLocalBounds = FBox(ForceInit);
+	/** 上次交给组件的容量/包围盒：只有它们真变了才需要再走一次阻塞的 SetInstanceSourceGPU。 */
+	CSShaperSteps::FHandoverCache RoofTileHandover;
 	uint32 RoofTileDescHash = 0;
 	int32 CurrentRoofTileCount = 0;
 
@@ -2421,8 +2467,8 @@ private:
 	 *  窗户那一家恒 `{0, 0}`（不长），见 `CSHouseDecor.h` 的文件头。 */
 	TArray<CSHouseDecor::FPaletteRange> DecorPaletteRanges;
 
-	TArray<uint32> DecorHandedCapacities;
-	FBox DecorHandedLocalBounds = FBox(ForceInit);
+	/** 上次交给组件的容量/包围盒：只有它们真变了才需要再走一次阻塞的 SetInstanceSourceGPU。 */
+	CSShaperSteps::FHandoverCache DecorHandover;
 
 	uint32 DecorDescHash = 0;
 	int32 CurrentDecorInstanceCount = 0;
@@ -2440,10 +2486,7 @@ private:
 	/** 下一次重求值强制全量重建：手动强刷，以及拖动松手时清掉增量变换攒下的浮点误差。 */
 	bool bForceFullRebuild = false;
 
-	/** 异步编辑在途时到达的最新目标快照（被拒即入槽，OnComplete 里补发）。 */
-	TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> PendingBodySnapshot;
-	TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> PendingPillarSnapshot;
-	/** 藤蔓管子在途时挂起的最新折线。与上面两个同一条纪律：被拒即入槽，完成回调里补发。 */
+	/** 藤蔓管子在途时挂起的最新折线。与 `BodySlot.Pending` 同一条纪律：被拒即入槽，完成回调里补发。 */
 	TSharedPtr<CSHouseVine::FTubePath, ESPMode::ThreadSafe> PendingVineTubePath;
 
 	/**
@@ -2483,4 +2526,13 @@ private:
 
 	FDelegateHandle GroundChangedHandle;
 	bool bInReevaluate = false; // SetActorZ 落座引发的重入保护
+
+	/** `GetReevaluateCount` 读。 */
+	int64 ReevaluateCount = 0;
+
+	/**
+	 * 欠着一次重求值。`RequestReevaluate` 置位，`ReevaluateSite` **一开头**就清 ——
+	 * 放在结尾清的话，重建途中新到的通知会被这一行一起抹掉（它读的输入已经过了那一步）。
+	 */
+	bool bReevaluatePending = false;
 };

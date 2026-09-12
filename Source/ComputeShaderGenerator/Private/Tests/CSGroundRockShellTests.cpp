@@ -16,7 +16,8 @@
  *
  *   ① `RockShell.Contract`      —— 纯 CPU：默认值之间那几条**不成文但承重**的不等式。
  *   ② `RockShell.DrapesOnSlopes`—— 陡坡上出现 / 平地上不出现 / 高度跟住解析场 / **它真的画得出来**。
- *   ③ `RockShell.RoadSinksNotHides` —— 画路之后壳**连续下沉**而不是消失：量下沉量，不量三角数。
+ *   ③ `RockShell.RoadSinksNotHides` —— 画路之后壳**连续下沉**而不是消失：量下沉量，不量三角数；
+ *                                      且路缘是缓坡不是折痕（与模糊半径 0 的对照组比梯度）。
  *
  * ⚠️ ③ 的形状是刻意的。今天刚踩过：GPU 石阶的 `StairMesh` / `StairMaterial` 在两张演示关卡里
  * 一直是 NULL，石阶在画面里是一撮黑块，而单测 53/53、回归 55 条全绿 —— 因为验收全部走
@@ -154,11 +155,13 @@ bool FCSRockShellContractTest::RunTest(const FString&)
 
 	// **壳与石阶严格互补**（计划：石阶要 road > 阈、碎石要 road < 阈），但裁决五禁止在壳的
 	// 显隐判据里出现 road —— 互补因此是靠"连续下沉在石阶阈值之前就走完"实现的：
-	// 壳在 road = 1/RoadFade 处已经沉到底，那个点必须早于石阶开始出现的 StairRoadThreshold。
-	const float ShellFullySunkAt = 1.0f / FMath::Max(CDO->RockShellRoadFade, 1.0f);
+	// road = 1/RoadFade 是壳眼里的足迹边缘，石阶开始出现的 StairRoadThreshold 必须落在足迹之内。
+	// （2026-09-11 起足迹先糊开再压壳，边缘处只沉一半；石阶离边缘还隔着笔刷衰减带，那一截
+	// 由 ③ 的实测兜着，这里只守不等式本身。）
+	const float ShellFootprintAt = 1.0f / FMath::Max(CDO->RockShellRoadFade, 1.0f);
 	TestTrue(
-		FString::Printf(TEXT("壳沉到底(%.3f) 早于石阶出现(%.3f)"), ShellFullySunkAt, CDO->StairRoadThreshold),
-		ShellFullySunkAt < CDO->StairRoadThreshold);
+		FString::Printf(TEXT("壳的路足迹(%.3f) 早于石阶出现(%.3f)"), ShellFootprintAt, CDO->StairRoadThreshold),
+		ShellFootprintAt < CDO->StairRoadThreshold);
 
 	// 下沉量必须盖得住壳自身的起伏，否则路面上还会露出石头尖。
 	// 三项：沿法线的厚度 + 表面起伏（`NoiseAmount` 是**坡度 = 1 时**的满幅，这里按 1 估）
@@ -525,7 +528,8 @@ bool FCSRockShellRoadSinkTest::RunTest(const FString&)
 	double SumSink = 0.0, DeepestSink = 0.0;
 	int32 OffRoadSamples = 0;
 	double WorstOffRoadDrift = 0.0;
-	const double OffRoadX = double(Ground->BrushRadius + Ground->RockShellRoadSink) + 100.0;
+	// 路足迹糊开之后会往外伸一个模糊半径（2026-09-11），"路外"的界跟着外移同样的量。
+	const double OffRoadX = double(Ground->BrushRadius + Ground->RockShellRoadBlurRadius + Ground->RockShellRoadSink) + 100.0;
 	for (int32 Tri = 0; Tri < Triangles; ++Tri)
 	{
 		const bool bAliveAfter = CSRockShellTest_TriangleAlive(After, Tri);
@@ -588,6 +592,66 @@ bool FCSRockShellRoadSinkTest::RunTest(const FString&)
 	// ⓒ 路外的壳**一动不动**：下沉是局部的，不是整张壳一起往下走。
 	TestTrue(FString::Printf(TEXT("路外的壳纹丝不动（最大漂移 %.2f cm）"), WorstOffRoadDrift),
 		OffRoadSamples == 0 || WorstOffRoadDrift < 0.01);
+
+	// ⓔ **路缘是缓坡，不是折痕**（用户裁决 2026-09-11：路对壳的下压太激烈 ⇒ 壳采模糊后的路足迹）。
+	//
+	// 量的是**平均下沉剖面**的最陡处：活顶点按到路中线（x = Centre）的距离分 25 cm 一箱，
+	// 逐箱求平均 ΔZ，取相邻两箱之差 / 箱宽的最大值。
+	// ⚠️ **不能逐三角取梯度最大值**（第一版就这么写的，实测两组都在 20 上下，比的是噪声不是路缘）：
+	// 角点不加表面起伏（`bIsCorner`，钉缝宽用），贴着它一两厘米的邻点却加满 ⇒ 画路把起伏撤掉时，
+	// 短边两端的 ΔZ 就差出几十厘米 —— 这种逐点跳变与路缘多陡毫无关系。分箱平均把它平掉，
+	// 剩下的只有路的沉降剖面。
+	// 判据是**相对**的：同一条路、同一张壳，只把半径切到 0 再披挂一趟当对照 —— 绝对阈值会随
+	// RoadSink / PatternScale 漂，相对比较不会。
+	{
+		auto SteepestSinkProfile = [&Before, Triangles](const TArray<FVector>& Sunk) -> double
+		{
+			constexpr double BinCm = 25.0;
+			constexpr int32 NumBins = 36;       // 0 .. 900 cm，盖得住默认笔刷半径 + 模糊半径
+			constexpr int32 MinPerBin = 20;     // 箱里点太少时平均值本身就是噪声
+			TArray<double> SumDz;
+			TArray<int32> Count;
+			SumDz.Init(0.0, NumBins);
+			Count.Init(0, NumBins);
+			for (int32 Tri = 0; Tri < Triangles; ++Tri)
+			{
+				if (!CSRockShellTest_TriangleAlive(Sunk, Tri) || !CSRockShellTest_TriangleAlive(Before, Tri)) continue;
+				for (int32 K = 0; K < 3; ++K)
+				{
+					const int32 Index = Tri * 3 + K;
+					const int32 Bin = int32(FMath::Abs(double(Before[Index].X) - CSRockShellTest_Centre) / BinCm);
+					if (Bin >= NumBins) continue;
+					SumDz[Bin] += double(Sunk[Index].Z) - double(Before[Index].Z);
+					++Count[Bin];
+				}
+			}
+			double Steepest = 0.0;
+			for (int32 Bin = 0; Bin + 1 < NumBins; ++Bin)
+			{
+				if (Count[Bin] < MinPerBin || Count[Bin + 1] < MinPerBin) continue;
+				const double Step = SumDz[Bin + 1] / double(Count[Bin + 1]) - SumDz[Bin] / double(Count[Bin]);
+				Steepest = FMath::Max(Steepest, FMath::Abs(Step) / BinCm);
+			}
+			return Steepest;
+		};
+
+		const double SteepBlurred = SteepestSinkProfile(After);
+		const float BlurRadius = Ground->RockShellRoadBlurRadius;
+		Ground->RockShellRoadBlurRadius = 0.0f;
+		Ground->RebuildRockShell();
+		TArray<FVector> AfterSharp;
+		Ground->DebugReadRockShellSync(AfterSharp);
+		const double SteepSharp = SteepestSinkProfile(AfterSharp);
+		Ground->RockShellRoadBlurRadius = BlurRadius;
+		Ground->RebuildRockShell();
+
+		AddInfo(FString::Printf(TEXT("路缘平均下沉剖面的最陡处：模糊半径 %.0f cm 时 %.2f，半径 0 时 %.2f（cm/cm）"),
+			BlurRadius, SteepBlurred, SteepSharp));
+		// 夹具自证：不糊的时候确实有那道折痕，否则下面的比较可能只是两个小数在比。
+		TestTrue(FString::Printf(TEXT("对照组（半径 0）确实有折痕（最陡 %.2f）"), SteepSharp), SteepSharp > 1.0);
+		TestTrue(FString::Printf(TEXT("模糊之后路缘至少缓一半（%.2f vs %.2f）"), SteepBlurred, SteepSharp),
+			BlurRadius > 0.0f && SteepBlurred < 0.5 * SteepSharp);
+	}
 
 	// ⓓ 擦掉路 ⇒ 壳原样浮回来（绝对式而非增量式）。
 	Ground->ResetPaint();

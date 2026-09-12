@@ -20,7 +20,9 @@ public class ComputeShaderGenerator : ModuleRules
 
 		PublicIncludePaths.AddRange(
 			new string[] {
-				// ... add public include paths required here ...
+				// Shaders/Private 里的 CSGpuSharedLayout.ush 是 C++ 与 .usf 共用的布局常量（只含 #define）。
+				// C++ 侧按普通头文件 include 它，所以着色器目录也得在 include 路径里。
+				Path.Combine(PluginDirectory, "Shaders", "Private"),
 			}
 			);
 				
@@ -73,6 +75,14 @@ public class ComputeShaderGenerator : ModuleRules
 		{
 			PrivateDependencyModuleNames.Add("D3D12RHI");
 			AddEngineThirdPartyPrivateStaticDependencies(Target, "DX12");
+		}
+
+		// MeshCardBuild.h (the Lumen card set the GPU-mesh proxy hands the surface cache) includes
+		// MeshUtilities.h under WITH_EDITORONLY_DATA. Include path only — nothing is linked, the
+		// Engine module adds it the same way for the skeletal-mesh proxy.
+		if (Target.bBuildWithEditorOnlyData)
+		{
+			PrivateIncludePathModuleNames.Add("MeshUtilities");
 		}
 
 		if (Target.Type == TargetType.Editor)

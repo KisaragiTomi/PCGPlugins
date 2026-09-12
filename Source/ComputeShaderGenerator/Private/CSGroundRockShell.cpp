@@ -23,6 +23,14 @@ namespace
 
 constexpr int32 CSRockShell_GroupSizeX = 64;
 
+/** 第零趟（路足迹模糊）的 2D 线程组边长，经 `ROCKSHELL_BLUR_GROUP` 喂给 kernel，两边只有这一处定义。 */
+constexpr int32 CSRockShell_BlurGroupSize = 8;
+/**
+ * 路足迹模糊的单侧抽头上限（格）。50 cm 格距下 = 16 m 伸展，远超任何有意义的缓坡；
+ * 它只挡"半径填错一个数量级"：1025² 的地面 × 两趟 × (2·32+1) 抽头 ≈ 1.4 亿次读，仍是一次性的几毫秒。
+ */
+constexpr int32 CSRockShell_BlurMaxTaps = 32;
+
 /** 契约字段所在的 UV 通道，见 Docs/TinyGlade/CSRockShellPattern.md「契约字段 → 通道映射」。 */
 constexpr int32 CSRockShell_UVDir = 0;      // (dir_to_centroid.x, .z)，只作核对
 constexpr int32 CSRockShell_UVCell = 1;     // (cell_id, is_corner)
@@ -414,7 +422,7 @@ class FCSGroundRockShellCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, RockShellRestDir)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, RockShellCellFlags)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float2>, RockShellCentroids)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, RockShellGroundColors)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float>, RockShellRoadField)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, RW_RockShellPositions)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_RockShellTangents)
 
@@ -432,7 +440,6 @@ class FCSGroundRockShellCS : public FGlobalShader
 		SHADER_PARAMETER(float, RockShellGroundBaseZ)
 		SHADER_PARAMETER(float, RockShellSlopeLo)
 		SHADER_PARAMETER(float, RockShellSlopeHi)
-		SHADER_PARAMETER(float, RockShellRoadFade)
 		SHADER_PARAMETER(float, RockShellRoadSink)
 		SHADER_PARAMETER(float, RockShellCellJitter)
 		SHADER_PARAMETER(float, RockShellCellRelief)
@@ -542,6 +549,131 @@ class FCSRockShellBevelPayloadCS : public FGlobalShader
 };
 
 IMPLEMENT_GLOBAL_SHADER(FCSRockShellBevelPayloadCS, "/Plugin/PCGPlugins/Shaders/Private/CSGroundRockShell.usf", "RockShellBevelPayloadCS", SF_Compute);
+
+/**
+ * 第零趟 X：色流 R × RoadFade 截成足迹，再沿 X 做高斯。一线程一地面格点。
+ * 为什么先截再糊、以及核的口径，见 `CSGroundRockShell.usf` 的「第零趟」小节。
+ *
+ * ⚠️ 与第二、三趟同一条规矩：参数结构里每一条都被 kernel 真读。
+ */
+class FCSRockShellRoadBlurXCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FCSRockShellRoadBlurXCS);
+	SHADER_USE_PARAMETER_STRUCT(FCSRockShellRoadBlurXCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, RockShellGroundColors)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, RW_RockShellRoadBlur)
+		SHADER_PARAMETER(FUintVector2, RockShellGroundVerts)
+		SHADER_PARAMETER(float, RockShellRoadFade)
+		SHADER_PARAMETER(uint32, RockShellBlurTaps)
+		SHADER_PARAMETER(float, RockShellBlurInvTwoSigmaSq)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("ROCKSHELL_BLUR_GROUP"), CSRockShell_BlurGroupSize);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FCSRockShellRoadBlurXCS, "/Plugin/PCGPlugins/Shaders/Private/CSGroundRockShell.usf", "BlurRockShellRoadXCS", SF_Compute);
+
+/** 第零趟 Y：读 X 趟的结果沿 Y 做高斯，写出披挂要采的 `RockShellRoadField`。 */
+class FCSRockShellRoadBlurYCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FCSRockShellRoadBlurYCS);
+	SHADER_USE_PARAMETER_STRUCT(FCSRockShellRoadBlurYCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float>, RockShellRoadBlurRO)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, RW_RockShellRoadBlur)
+		SHADER_PARAMETER(FUintVector2, RockShellGroundVerts)
+		SHADER_PARAMETER(uint32, RockShellBlurTaps)
+		SHADER_PARAMETER(float, RockShellBlurInvTwoSigmaSq)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("ROCKSHELL_BLUR_GROUP"), CSRockShell_BlurGroupSize);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FCSRockShellRoadBlurYCS, "/Plugin/PCGPlugins/Shaders/Private/CSGroundRockShell.usf", "BlurRockShellRoadYCS", SF_Compute);
+
+/**
+ * 录第零趟：色流 → 模糊足迹。返回披挂要采的那块 buffer（本图内的临时 buffer，图执行完就还池）。
+ *
+ * 格点数退化（< 2×2）或色流装不下整张格时不糊，直接给一块清零的场 —— 披挂读到 0 就是
+ * "没有路"，与旧写法在同一情形下 `CSRockShell_SampleRoad` 早退返回 0 是同一个结果。
+ * ⚠️ **不能不写**：没被写过的 RDG buffer 被读，内容是池子上一位租客的字节。
+ */
+FRDGBufferRef CSRockShell_AddRoadBlurPasses(
+	FRDGBuilder& GraphBuilder, FRDGBufferRef GroundColors, const CSRockShell::FDisplaceParams& Params)
+{
+	const FIntPoint Verts(FMath::Max(Params.GroundVerts.X, 0), FMath::Max(Params.GroundVerts.Y, 0));
+	const uint64 NumVerts = uint64(Verts.X) * uint64(Verts.Y);
+
+	FRDGBufferRef Field = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(float), uint32(FMath::Max<uint64>(NumVerts, 1))),
+		TEXT("CSRockShell.RoadField"));
+
+	const bool bGridUsable = Verts.X >= 2 && Verts.Y >= 2 && NumVerts <= uint64(MAX_uint32)
+		&& GroundColors && uint64(GroundColors->Desc.NumElements) >= NumVerts;
+	if (!bGridUsable)
+	{
+		AddClearUAVFloatPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Field, PF_R32_FLOAT)), 0.0f);
+		return Field;
+	}
+
+	// 半径 → 抽头与 σ（都以**格**为单位）：伸展 = ceil(半径 / 格距)，σ = 半径 / 3（核截在 3σ）。
+	// 半径为 0 时一个抽头都没有，这时 1/(2σ²) 是 1/0 —— 给 0，kernel 里 K = 0 那一项的
+	// exp(−0 × inv) 才不会变成 exp(NaN)。
+	const float RadiusCells = FMath::Clamp(
+		Params.RoadBlurRadius / FMath::Max(Params.GroundCellSize, 1e-3f), 0.0f, float(CSRockShell_BlurMaxTaps));
+	const uint32 Taps = uint32(FMath::CeilToInt(RadiusCells));
+	const float Sigma = RadiusCells / 3.0f;
+	const float InvTwoSigmaSq = Taps > 0u ? 1.0f / FMath::Max(2.0f * Sigma * Sigma, 1e-6f) : 0.0f;
+
+	const FUintVector2 GridVerts(uint32(Verts.X), uint32(Verts.Y));
+	const FIntVector GroupCount = FComputeShaderUtils::GetGroupCount(Verts, CSRockShell_BlurGroupSize);
+
+	FRDGBufferRef Temp = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(float), uint32(NumVerts)), TEXT("CSRockShell.RoadBlurX"));
+
+	FCSRockShellRoadBlurXCS::FParameters* XParams = GraphBuilder.AllocParameters<FCSRockShellRoadBlurXCS::FParameters>();
+	XParams->RockShellGroundColors = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(GroundColors, PF_R32_UINT));
+	XParams->RW_RockShellRoadBlur = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Temp, PF_R32_FLOAT));
+	XParams->RockShellGroundVerts = GridVerts;
+	// RoadFade 在**模糊之前**乘（顺序为什么承重见 usf 的「第零趟」）。
+	XParams->RockShellRoadFade = FMath::Max(Params.RoadFade, 0.0f);
+	XParams->RockShellBlurTaps = Taps;
+	XParams->RockShellBlurInvTwoSigmaSq = InvTwoSigmaSq;
+	TShaderMapRef<FCSRockShellRoadBlurXCS> XShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CSRockShell.RoadBlurX"), XShader, XParams, GroupCount);
+
+	FCSRockShellRoadBlurYCS::FParameters* YParams = GraphBuilder.AllocParameters<FCSRockShellRoadBlurYCS::FParameters>();
+	YParams->RockShellRoadBlurRO = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Temp, PF_R32_FLOAT));
+	YParams->RW_RockShellRoadBlur = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Field, PF_R32_FLOAT));
+	YParams->RockShellGroundVerts = GridVerts;
+	YParams->RockShellBlurTaps = Taps;
+	YParams->RockShellBlurInvTwoSigmaSq = InvTwoSigmaSq;
+	TShaderMapRef<FCSRockShellRoadBlurYCS> YShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CSRockShell.RoadBlurY"), YShader, YParams, GroupCount);
+
+	return Field;
+}
 }
 
 namespace CSRockShell
@@ -705,7 +837,7 @@ bool BuildMesh(
 		// **写死包围盒**：kernel 用 NaN 关掉看不见的三角，NaN 会污染任何"从顶点算出来"的
 		// 包围盒（计划已定这是对的做法）。CopyFromMeshSnapshot 刚按静止姿态算过一份，
 		// 那份是平的、也不含下沉量，必须在这里覆盖掉。
-		Context.Resident.WorldBounds = HardWorldBounds;
+		Context.SetWorldBounds(HardWorldBounds);
 	});
 	if (!bUploaded)
 	{
@@ -767,13 +899,17 @@ bool Displace(
 
 				if (Positions && Tangents && RestDir && CellFlags && Centroids && GroundColors)
 				{
+					// 第零趟：色流 → 模糊足迹。**必须在披挂之前** —— 披挂采的就是它；定序由 RDG 靠
+					// 这块临时 buffer 的 UAV→SRV 转换自己排，与第二、三趟同一套，不插手工 barrier。
+					const FRDGBufferRef RoadField = CSRockShell_AddRoadBlurPasses(GraphBuilder, GroundColors, Params);
+
 					FCSGroundRockShellCS::FParameters* PassParams = GraphBuilder.AllocParameters<FCSGroundRockShellCS::FParameters>();
 					PassParams->GroundShaperParams = ShaperRefs.SRV;
 					PassParams->GroundShaperCount = uint32(FMath::Max(ShaperCount, 0));
 					PassParams->RockShellRestDir = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(RestDir, PF_A32B32G32R32F));
 					PassParams->RockShellCellFlags = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(CellFlags, PF_R32_UINT));
 					PassParams->RockShellCentroids = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Centroids, PF_G32R32F));
-					PassParams->RockShellGroundColors = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(GroundColors, PF_R32_UINT));
+					PassParams->RockShellRoadField = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(RoadField, PF_R32_FLOAT));
 					PassParams->RW_RockShellPositions = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Positions, PF_R32_FLOAT));
 					PassParams->RW_RockShellTangents = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Tangents, PF_R32_UINT));
 					PassParams->RockShellTriangleCount = TriangleCount;
@@ -793,7 +929,6 @@ bool Displace(
 					// Hi 必须严格大于 Lo：smoothstep 在两者相等时是 0/0，整片 mask 变 NaN，
 					// 而 NaN 会顺着 Relief 写进位置 —— 症状是"壳整个消失"，与坡度判据无关。
 					PassParams->RockShellSlopeHi = FMath::Max(Params.SlopeHi, Params.SlopeLo + 1e-3f);
-					PassParams->RockShellRoadFade = FMath::Max(Params.RoadFade, 0.0f);
 					PassParams->RockShellRoadSink = Params.RoadSink;
 					PassParams->RockShellCellJitter = FMath::Max(Params.CellJitter, 0.0f);
 					PassParams->RockShellCellRelief = FMath::Max(Params.CellRelief, 0.0f);

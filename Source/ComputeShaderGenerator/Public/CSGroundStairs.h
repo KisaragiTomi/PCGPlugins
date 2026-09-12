@@ -132,7 +132,8 @@ COMPUTESHADERGENERATOR_API bool Scan(
 	const FScanParams& Params,
 	const TArray<FVector4f>& ShaperParams);
 
-/** 把最后一份引用交回渲染线程释放，避免在游戏线程上把在途帧正在读的显存抽走。 */
+/** 在渲染命令里放掉这批引用并清空。只是让释放排在已入队的命令之后，不是安全要求：pooled buffer 是原子
+ *  引用计数、池子恒持一份，哪个线程放引用都抽不走在途帧的显存（同 CSShaperSteps::ReleaseOnRenderThread）。 */
 COMPUTESHADERGENERATOR_API void ReleaseOnRenderThread(FStairBuffers& Buffers);
 
 /**

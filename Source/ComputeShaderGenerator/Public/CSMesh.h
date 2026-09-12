@@ -64,9 +64,15 @@ struct COMPUTESHADERGENERATOR_API FCSMeshSection
 };
 
 /**
- * Render-thread-side retained buffer set. Ownership lives here; a scene proxy only
- * borrows it. Buffers must be released on the render thread, which is why UCSMesh holds
- * this behind a TSharedPtr it hands to ENQUEUE_RENDER_COMMAND on destruction.
+ * Render-thread-side retained buffer set. Ownership lives here; a scene proxy only borrows it.
+ *
+ * Releasing does NOT have to happen on the render thread: FRDGPooledBuffer is atomically
+ * ref-counted and the RDG pool keeps a buffer alive for the frames still reading it whichever
+ * thread drops the last reference (2026-09-07 review B7). UCSMesh still hands the set to a render
+ * command on destruction, but only to sequence the drop behind the commands already queued and to
+ * keep the draw-args readback object — which is render-thread-only — on its own thread. The real
+ * hazards are the other two: a pooled buffer REUSED without being cleared, and a reference nobody
+ * drops until garbage collection.
  */
 struct COMPUTESHADERGENERATOR_API FCSMeshResident
 {
@@ -89,10 +95,12 @@ struct COMPUTESHADERGENERATOR_API FCSMeshResident
 	 *  batch over the whole mesh, which is the default and what every mesh that never meets the
 	 *  section builder keeps doing.
 	 *
-	 *  Written on the render thread inside an edit (like WorldBounds), read on the game thread
-	 *  after that edit's flush. Dropped by MarkBuffersChanged(): a table left pointing at
-	 *  regenerated — and therefore zeroed — arg sets draws garbage or nothing, and neither
-	 *  symptom leads anyone back to the stale table. */
+	 *  Game-thread state, written only through FCSMeshEditContext::InvalidateSections (which a
+	 *  synchronous edit applies on the render thread behind the flush that fences the game thread,
+	 *  and an asynchronous edit stages for its game-thread completion hop), UCSMesh::SetSections and
+	 *  MarkBuffersChanged(). Dropped by the latter: a table left pointing at regenerated — and
+	 *  therefore zeroed — arg sets draws garbage or nothing, and neither symptom leads anyone back
+	 *  to the stale table. */
 	TArray<FCSMeshSection> Sections;
 
 	/** Allocated capacity. The *actual* counts are GPU-decided and live in the MeshCounters
@@ -100,8 +108,10 @@ struct COMPUTESHADERGENERATOR_API FCSMeshResident
 	uint32 VertexCapacity = 0;
 	uint32 IndexCapacity = 0;
 
-	/** Conservative world-space bounds readable from the game thread. Operators that move
-	 *  or add geometry are responsible for widening it. */
+	/** Conservative world-space bounds readable from the game thread. Operators that move or add
+	 *  geometry are responsible for widening it, and do so through FCSMeshEditContext::SetWorldBounds
+	 *  only — an asynchronous edit stages the value for its game-thread completion hop instead of
+	 *  writing it next to a game thread nothing fenced (2026-09-07 review B2). */
 	FBox WorldBounds = FBox(ForceInit);
 
 	/** Incremented on every completed edit. Consumers (render proxies, spatial handles)
@@ -114,8 +124,8 @@ struct COMPUTESHADERGENERATOR_API FCSMeshResident
 	uint32 AllocationGeneration = 0;
 
 	/** Counts an operator could state exactly (uploads); INDEX_NONE when only the GPU knows
-	 *  (scene extraction, boolean). Written on the render thread inside an edit, read on the
-	 *  game thread after that edit's flush. */
+	 *  (scene extraction, boolean). Published through FCSMeshEditContext::SetKnownCounts: behind the
+	 *  flush of a synchronous edit, from the game-thread completion hop of an asynchronous one. */
 	int32 KnownVertexCount = INDEX_NONE;
 	int32 KnownIndexCount = INDEX_NONE;
 
@@ -348,16 +358,50 @@ struct COMPUTESHADERGENERATOR_API FCSMeshEditContext
 	FRDGBufferRef Counters() const { return Find(ECSGpuStreamRole::MeshCounters); }
 	FRDGBufferRef MaterialIds() const { return FindBySemantic(ECSGpuMeshSemantic::MaterialId); }
 
-	/** Record counts the operator knows exactly. Leave alone when only the GPU knows.
-	 *
-	 *  Ignored, with a warning, on a BorrowedGraph edit: these are read from the game thread and
-	 *  EditMeshSync's flush is the only thing that fences that read. A per-frame render pass
-	 *  publishing them would hand the game thread the result of a graph nobody has executed yet. */
+	// -------------------------------------------------------------------------
+	// Game-thread-read state an operator publishes: the section table, the conservative world
+	// bounds and the known counts. The resident set's copies are read from the game thread with
+	// no lock, so an operator never writes them directly — it goes through the calls below, and
+	// what they do depends on who owns the graph (2026-09-07 review B2):
+	//   OwnedGraph       — EditMeshSync's flush fences the game thread; the write goes through.
+	//   OwnedGraphAsync  — nothing blocks the game thread; the write is STAGED here and applied
+	//                      by the completion hop, which already runs on the game thread, before
+	//                      Generation moves and OnMeshChanged fires.
+	//   BorrowedGraph    — refused with a warning: a per-frame render pass has neither a flush nor
+	//                      a completion hop behind which to publish anything.
+	// -------------------------------------------------------------------------
+
+	/** The bounds this edit will leave behind: the staged value when one is pending, else the
+	 *  resident set's. Read-modify-write operators (transforms, displacement) start from this. */
+	FBox GetWorldBounds() const;
+
+	/** Publishes conservative world bounds. Operators that move or add geometry must widen them. */
+	void SetWorldBounds(const FBox& Bounds);
+
+	/** Drops the section table: the arg sets it described are being rewritten (every
+	 *  counter-writing pass). The draw falls back to one whole-mesh batch from arg set 0. */
+	void InvalidateSections();
+
+	/** Record counts the operator knows exactly. Leave alone when only the GPU knows. */
 	void SetKnownCounts(int32 VertexCount, int32 IndexCount);
 
-	/** Marks the counts unknown; the next GetTriangleCountSync() will read the GPU. Ignored on a
-	 *  BorrowedGraph edit for the same reason as SetKnownCounts. */
+	/** Marks the counts unknown; the next GetTriangleCountSync() will read the GPU. */
 	void InvalidateKnownCounts();
+
+	/** What an OwnedGraphAsync edit has staged so far. UCSMesh::EditMeshAsync copies it out of the
+	 *  context once the graph has executed and applies it from the game-thread completion hop. */
+	struct FStagedPublish
+	{
+		TOptional<FBox> WorldBounds;
+		bool bInvalidateSections = false;
+		bool bSetKnownCounts = false;
+		int32 KnownVertexCount = INDEX_NONE;
+		int32 KnownIndexCount = INDEX_NONE;
+
+		/** Writes the staged state into the resident set. Game thread. */
+		void ApplyTo(FCSMeshResident& InResident) const;
+	};
+	const FStagedPublish& GetStagedPublish() const { return Staged; }
 
 	/** Holds a non-RDG view alive until the graph has executed. SHADER_PARAMETER_SRV does not
 	 *  take a reference, and the graph runs after the operator lambda has returned — so an
@@ -367,6 +411,7 @@ struct COMPUTESHADERGENERATOR_API FCSMeshEditContext
 private:
 	TArray<FShaderResourceViewRHIRef> KeepAliveViews;
 	EKind Kind = EKind::OwnedGraph;
+	FStagedPublish Staged;
 };
 
 /**
@@ -388,9 +433,9 @@ private:
  *     ... add passes ...
  *                                  // ~FCSMeshRenderThreadEdit restores every stream's access state
  *
- * What it must not touch is the resident set's game-thread-read state. KnownVertexCount /
- * KnownIndexCount are refused by the context; Sections, WorldBounds, Generation and the
- * OnMeshChanged broadcast are simply not its business — nothing fences a render-thread write of
+ * What it must not touch is the resident set's game-thread-read state. The known counts, the
+ * section table and the world bounds are refused by the context's publish calls; Generation and
+ * the OnMeshChanged broadcast are simply not its business — nothing fences a render-thread write of
  * them against the game thread reading them, and no consumer expects any of them to move per frame.
  * A render-thread edit changes what is IN the buffers, never what the object says about them.
  */
@@ -536,6 +581,20 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "CS GpuMesh")
 	void ReleaseSync();
 
+	/**
+	 * 不阻塞地把显存还回去：整套常驻集合交给渲染线程，排在已入队的命令之后释放（与 BeginDestroy
+	 * 同一跳）。对象照样可用 —— 下一个要容量的算子会建一套新的；流布局是逐套的，调用方下次上传前
+	 * 照常声明（EnsureTexCoordSets 等）即可。
+	 *
+	 * 先广播 OnMeshChanged 再交出去：绑着的组件据此重建代理，代理的销毁因此排在释放**之前**
+	 * （代理借用的正是这几条流）。
+	 *
+	 * 有异步编辑在途时拒绝（返回 false）：那次编辑的游戏线程尾巴还攥着这套集合，交出去的话最后一份
+	 * 引用可能落在游戏线程上，而 ~FCSMeshResident 要删的回读只能在渲染线程碰。被拒的调用方什么都
+	 * 不用做 —— 对象被回收时 BeginDestroy 照样会放。
+	 */
+	bool ReleaseDeferred();
+
 	/** Game-thread approximation: true when nothing is allocated, or when the last operator
 	 *  stated a zero count. Never touches the GPU, so it can be wrong right after an operator
 	 *  whose output size only the GPU knows — use GetTriangleCountSync() when it matters. */
@@ -592,7 +651,12 @@ public:
 	 * callable, and everything it reads must be owned by it too. A raw pointer into the caller's
 	 * frame — the pattern EditMeshSync's flush makes safe — is a use-after-free here. Results come
 	 * back through OnComplete, which runs on the game thread after the graph has executed; its bool
-	 * is false when the mesh was destroyed before that point.
+	 * is false when the mesh was destroyed before that point. Whatever the operator published
+	 * through the context (bounds, section table, known counts) is staged and applied on the game
+	 * thread right before Generation moves and OnMeshChanged fires, so a consumer woken by either
+	 * already sees it. A synchronous edit issued while one is in flight publishes its own state at
+	 * its flush and the staged state lands after it; callers that must not interleave — every mesh
+	 * slot in ACSTinyGlade — park behind IsEditInFlight().
 	 *
 	 * Refused, and OnComplete never runs, when an async edit is already in flight: a second edit
 	 * would write the same resident streams while the first is still queued. Render commands are
@@ -687,9 +751,10 @@ public:
 	 *
 	 * Works before the first allocation (the declaration is simply remembered, and the next
 	 * allocation builds from it) and on an allocated mesh, which reallocates at the current
-	 * capacities and copies every stream that survives the change — streams the layout adds
-	 * start with whatever the buffer pool last left in them, the same as on a fresh allocation.
-	 * Either way the buffers change identity, so AllocationGeneration moves and the section
+	 * capacities and copies every stream whose per-unit stride survived the change. A stream the
+	 * layout adds, and a stream whose stride changed (a UV stream widened by EnsureTexCoordSets),
+	 * come back zeroed rather than holding the buffer pool's previous tenant; the caller re-uploads
+	 * those. Either way the buffers change identity, so AllocationGeneration moves and the section
 	 * table is dropped.
 	 *
 	 * Not a UFUNCTION: FCSGpuStreamDesc is not reflected. Game thread only; blocks. Returns

@@ -57,6 +57,27 @@ void CSGpuInstancedBuildAuxStreamDescs(
 	bool bExternalPackedSource);
 
 /**
+ * 点云源 -> packed 实例行（CSGpuInstancedMesh.usf 的 PackPointInstancesCS）。
+ *
+ * 两条路共用这一个入口：经典路每帧在剔除前打进 SourceInstances 槽，Nanite 路在 GPU-Scene 写入前
+ * 打进一块临时行。抽出来是为了让"点怎么变成实例"只有一份 —— 两边各写一份的话，法线朝向或随机数
+ * 哪天改了一边，另一边的画面就静默地对不上。
+ *
+ * WorldToComponent：点位是世界空间，行是组件局部空间。BaseSphere* 只决定第 5 行（剔除球），
+ * 不读那一行的调用方传零即可。
+ */
+void CSGpuInstancedAddPackPointsPass(
+	FRDGBuilder& GraphBuilder,
+	class FGlobalShaderMap* ShaderMap,
+	const FCSGpuInstancePointSourceGPU& Points,
+	FRDGBufferRef InstanceCount,
+	FRDGBufferRef OutPackedInstances,
+	const FMatrix44f& WorldToComponent,
+	const FVector3f& BaseSphereCentre,
+	float BaseSphereRadius,
+	uint32 MaxSourceInstances);
+
+/**
  * Scene proxy for UCSGpuInstancedMeshComponent.
  *
  * It owns no buffers. The component's UCSMesh holds the base mesh (all LODs concatenated into one

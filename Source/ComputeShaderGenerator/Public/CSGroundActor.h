@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "CoreMinimal.h"
 #include "CSGroundCover.h"        // 地被（草 + 花）：FCoverBuffers / FScatterParams
@@ -826,12 +826,16 @@ public:
 	float RockShellSlopeHi = 1.25f;
 
 	/**
-	 * 道路权重的沉降增益（TG 实测 10×）。壳在 `road ≥ 1/本值` 处就已经沉到底。
+	 * 道路权重的足迹增益（TG 实测 10×）：`saturate(road × 本值)` 就是壳眼里的"这里有路"，
+	 * `road ≥ 1/本值` 即足迹之内。足迹再经 `RockShellRoadBlurRadius` 糊开才去压壳。
 	 *
 	 * ⚠️ **这是壳与石阶"严格互补"的实现方式**，而互补不是靠阈值判断做到的（裁决五禁止
 	 * 在显隐判据里出现 road）：`1/RoadFade` 必须**小于** `StairRoadThreshold` —— 默认
-	 * 1/10 = 0.1 < 0.35，即路刚画到石阶还没长出来时，壳就已经完全埋进土里了。
+	 * 1/10 = 0.1 < 0.35，即石阶长出来的地方一定落在足迹之内。
 	 * 单测 `RockShell.Contract` 守着这条不等式（`CSGroundRockShellTests.cpp`）。
+	 * 模糊之后"足迹内 = 沉到底"只在离足迹边缘 ≳ 半径处严格成立，边缘本身只沉一半 ——
+	 * 石阶离足迹边缘还隔着笔刷衰减带那一截；默认值下沉一半的壳顶也已在地面以下约 40 cm
+	 * （`RoadSink` 是米级，壳自身厚度与起伏合计才几十厘米）。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell", meta = (ClampMin = "1.0"))
 	float RockShellRoadFade = 10.0f;
@@ -845,6 +849,26 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell", meta = (ClampMin = "0.0"))
 	float RockShellRoadSink = 160.0f;
+
+	/**
+	 * 路足迹压到壳上之前的**高斯模糊半径** cm（= 核的单侧伸展；σ = 本值 / 3，核截在 3σ）。
+	 * 0 = 不模糊（与 2026-09-11 之前的行为只差在跨足迹边缘的那一格里 saturate 与双线性的先后）。
+	 *
+	 * 用户裁决 2026-09-11（看图：「岩壳受到道路的下压太过激烈，应该采样道路经过模糊后的 buffer」）。
+	 * 病根：默认笔刷边缘的道路权重从 0 爬到 1/RoadFade = 0.1 只要 ~30 cm，`RoadSink` + 基准偏移
+	 * 那两米多的落差全挤进不到一个三角里，出图是一道道 V 形折痕。糊开之后足迹边缘处沉一半，
+	 * 内外各按高斯累积分布走完：**缓坡宽度 ≈ 本值**（10%→90% 约 0.85 × 本值，2%→98% 约 1.4 × 本值）。
+	 * 默认 300 ⇒ σ = 1 m。看得见的只是缓坡最外那一截（沉降超过壳自身几十厘米的高度就没进地面了），
+	 * 所以 `RoadSink` 越深，露出来的那段越陡 —— 两者要一起调。
+	 *
+	 * ⚠️ **先截足迹再糊**，不是先糊原始权重再乘 `RoadFade` —— 反过来的话 ×10 只取模糊场最底下
+	 * 那 10% 的尾巴，缓坡又被压回一刀。机制与 TG 的差异写在 `CSGroundRockShell.usf` 的「第零趟」。
+	 *
+	 * ⚠️ 调大有两个代价：壳在离路更远处就开始沉（路两侧的无石带变宽），以及比 ~3 × σ 还窄的路
+	 * 中线上不再沉到底。上限 32 格（kernel 侧的抽头钳位），50 cm 格距下即 16 m。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell", meta = (ClampMin = "0.0", UIMax = "1000.0"))
+	float RockShellRoadBlurRadius = 300.0f;
 
 	/**
 	 * 逐胞腔沿径向的随机胀缩幅度 cm（**图案空间**；TG 实测 −52..+19.5 cm）。
@@ -1144,17 +1168,6 @@ public:
 	UFUNCTION(BlueprintPure, Category = "CS Ground|Diagnostics", meta = (DevelopmentOnly))
 	int32 DebugReadRockShellDrawIndexCountGpuSync() const;
 
-	/**
-	 * 石阶 / 小石子这两条 GPU 实例路上，**GPU 真的在画的基础网格 / 材质**是不是我们以为的
-	 * 那两样。空串 = 是。原因串带家族前缀（石阶 / 石子）。
-	 *
-	 * ⚠️ 存在的理由就是坑表里那两条：`StairMesh` / `StairMaterial` 一直是 NULL 时画面上是
-	 * 一撮黑块而 readback 全绿；母材质没勾 `bUsedWithInstancedStaticMeshes` 时引擎**静默换成
-	 * 默认材质**，症状与"没绑材质"逐像素相同。`IsRockShellDrawable` 那一族只查"非空"。
-	 */
-	UFUNCTION(BlueprintPure, Category = "CS Ground|Diagnostics", meta = (DevelopmentOnly))
-	FString DebugGetGpuAssetMismatchSync() const;
-
 	// -------------------------------------------------------------------------
 	// Rock Shell（链 B）
 	// -------------------------------------------------------------------------
@@ -1174,21 +1187,6 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "CS Ground|Rock Shell")
 	void RebuildRockShell();
-
-#if WITH_EDITOR
-	/**
-	 * 把地面这一侧**全部**实例路产物（石阶 + 15% 小石子）烘成 StaticMesh 资产 ——
-	 * 裁决六 ① 在地面这一侧的用户入口，与 `ACSHouseActor::SaveInstancedToStaticMeshes` 同形。
-	 *
-	 * 资产落在 `BakeFolder/SM_<actor>_<family>`；返回真的烘出来的张数。
-	 * ⚠️ **阻塞**（每族两次回读 + 一次 StaticMesh 构建），是用户主动发起的离线操作，
-	 * 不在任何交互路径上；它照旧被 `UCSMesh::GetBlockingFlushCount()` 数到。
-	 *
-	 * 地面本体与岩壳走的是网格路（`UCSMeshRenderComponent::SaveToStaticMesh`），不在这里。
-	 */
-	UFUNCTION(BlueprintCallable, Category = "CS Ground")
-	int32 SaveInstancedToStaticMeshes(const FString& BakeFolder, bool bSaveAssets = false);
-#endif
 
 	/**
 	 * **诊断 / 验收专用**：岩壳这一帧到底会不会被画出来，不会的话原因是什么。
@@ -1481,15 +1479,26 @@ public:
 	/** 地面的世界 XY 矩形（笔刷范围提示用）。 */
 	FBox2D GetWorldRect2D() const;
 
-	//~ AActor interface
+	//~ AActor interface（EndPlay / Destroyed 在基类：只调下面的 ReleaseInstancedBuffers 放生产者那一份，
+	//  组件那一份由组件销毁时自己放）
 	virtual void PostRegisterAllComponents() override;
-	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
-	virtual void Destroyed() override;
 #if WITH_EDITOR
 	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
 	virtual void PostEditMove(bool bFinished) override;
 	virtual void PostEditUndo() override;
 #endif
+
+protected:
+	//~ ACSTinyGlade interface
+	/**
+	 * 石阶 / 石子 / 每个裙边摆件 palette / 每个地被物种。
+	 *
+	 * ⚠️ 石阶那两族进诊断的理由就是坑表里那两条：`StairMesh` / `StairMaterial` 一直是 NULL 时
+	 * 画面上是一撮黑块而 readback 全绿；母材质没勾 `bUsedWithInstancedStaticMeshes` 时引擎
+	 * **静默换成默认材质**，症状与"没绑材质"逐像素相同。`IsRockShellDrawable` 那一族只查"非空"。
+	 */
+	virtual void GetInstancedFamilies(TArray<FCSInstancedFamily>& OutFamilies) const override;
+	virtual void ReleaseInstancedBuffers() override;
 
 private:
 	/** 扫场景收集全部塑形物（加载顺序无保证，塑形物自己也会登记，两条路都幂等）。 */
@@ -1549,8 +1558,10 @@ private:
 	 *
 	 * 稳态下**零阻塞**：容量按配置上限一次付清（只涨不缩），包围盒量化只涨不缩，
 	 * 两者都没变时直接返回，一次 enqueue 都不发 —— 同 `EnsureRockShellMesh` / `EnsureStairComponent`。
+	 * bOutHandedOver = 这一趟真把实例源交给了组件（扩容后是清零的新 buffer），
+	 * `RebuildSkirtDecor` 的哈希早退门看到它就不许早退（2026-09-07 审查 B1）。
 	 */
-	bool EnsureSkirtDecorComponents();
+	bool EnsureSkirtDecorComponents(bool& bOutHandedOver);
 
 	/** 把登记在案的塑形物读成裙边生产者要的环表（**高度场参数与 GPU 位移 pass 同一份来源**）。 */
 	void BuildSkirtDecorSite(CSGroundDecor::FSite& OutSite) const;
@@ -1644,10 +1655,8 @@ private:
 
 	/** 上次交给组件的容量/包围盒：只有它们真变了才需要再走一次阻塞的 SetInstanceSourceGPU。
 	 *  容量是固定的、包围盒按地面矩形 × MaxAbsHeight 写死，所以稳态下这里永远不触发。 */
-	uint32 HandedStairCapacity = 0;
-	FBox HandedStairBounds = FBox(ForceInit);
-	uint32 HandedPebbleCapacity = 0;
-	FBox HandedPebbleBounds = FBox(ForceInit);
+	CSShaperSteps::FHandoverCache StairHandover;
+	CSShaperSteps::FHandoverCache PebbleHandover;
 
 	/**
 	 * 权威数据，随关卡序列化。别在 details 里展开它 —— 就是两条百万级数组。
@@ -1685,8 +1694,7 @@ private:
 	TArray<CSHouseDecor::FPaletteRange> SkirtDecorPaletteRanges;
 
 	/** 上次交给组件的容量/包围盒：只有它们真变了才需要再走一次阻塞的 SetInstanceSourceGPU。 */
-	TArray<uint32> SkirtDecorHandedCapacities;
-	FBox SkirtDecorHandedLocalBounds = FBox(ForceInit);
+	CSShaperSteps::FHandoverCache SkirtDecorHandover;
 
 	/** 上次那一轮的输入哈希（0 = 还没摆过）。`RebuildSkirtDecor()` 的第一句就用它短路。 */
 	uint32 SkirtDecorHash = 0;
@@ -1718,9 +1726,8 @@ private:
 	TArray<FVector3f> CoverBaseSphereCentres;
 	TArray<float> CoverBaseSphereRadii;
 
-	/** 上次交给组件的容量/包围盒：只有它们真变了才需要再走一次阻塞的 `SetInstanceSourceGPU`。 */
-	TArray<uint32> CoverHandedCapacities;
-	FBox CoverHandedLocalBounds = FBox(ForceInit);
+	/** 上次交给组件的容量/包围盒：只有它们真变了才需要再走一次阻塞的 SetInstanceSourceGPU。 */
+	CSShaperSteps::FHandoverCache CoverHandover;
 
 	/** 上次那一趟的输入哈希（0 = 还没散过）。`RebuildGroundCover()` 的第一句就用它短路。 */
 	uint32 CoverBuiltHash = 0;

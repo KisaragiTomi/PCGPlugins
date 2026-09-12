@@ -25,6 +25,7 @@
 // 第 5 行是剔除球（必须包住变换后的基础网格，否则实例会在视锥边缘闪掉）。
 
 #include "/Engine/Public/Platform.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/CSGpuSharedLayout.ush"
 
 #ifndef THREADGROUPSIZE_X
 #define THREADGROUPSIZE_X 64
@@ -75,7 +76,7 @@ void PackHouseTileCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	const float3 LocalZ = mul(float4(normalize(R3.xyz), 0.0f), TileWorldToComponent).xyz * ScaleXYZ.z;
 	const float3 Origin = mul(float4(WorldPos, 1.0f), TileWorldToComponent).xyz;
 
-	const uint Base = Index * 5u;
+	const uint Base = Index * CS_GPU_INSTANCED_ROW_FLOAT4S;
 	RWTileInstances[Base + 0u] = float4(LocalX, 0.0f);   // .w 必须是 0：引擎拿它做选中/hitproxy
 	RWTileInstances[Base + 1u] = float4(LocalY, 0.0f);
 	RWTileInstances[Base + 2u] = float4(LocalZ, 0.0f);

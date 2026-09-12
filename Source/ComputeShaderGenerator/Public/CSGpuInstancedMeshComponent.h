@@ -3,25 +3,24 @@
 #include "CoreMinimal.h"
 #include "CSGpuMeshComponent.h"
 #include "CSGpuMeshTypes.h"
+// 与 .usf 共用的布局常量（行 stride / custom data 步长 / LOD 上限），只含 #define。
+#include "CSGpuSharedLayout.ush"
 #include "CSGpuInstancedMeshComponent.generated.h"
 
 class UCSMesh;
+class UCSGpuInstancedNaniteComponent;
 class UStaticMesh;
 class UMaterialInterface;
 
-/** Number of LOD levels the GPU LOD-selection pass can pick between (the cull shader keeps the
- *  thresholds in a float4). Extra LODs on the source mesh are ignored. */
-#define CS_GPU_INSTANCED_MAX_LODS 4
-
 /**
- * 逐实例 custom data 的 float 数。材质侧就是 `Per Instance Custom Data` 节点。
+ * 布局常量 `CS_GPU_INSTANCED_ROW_FLOAT4S` / `CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS` /
+ * `CS_GPU_INSTANCED_MAX_LODS` 与 .usf 共用同一份 #define（CSGpuSharedLayout.ush），这里不再各写一份 ——
+ * 两边各写一份的症状是错位而不是报错（2026-09-07 审查 B3）。
  *
- * ⚠️ **它是材质侧的读取步长**（引擎按 `Buffer[InstanceId * NumCustomDataFloats + i]` 取），
- * 改这个数就要同时改所有消费它的材质，否则读到的是错位的邻居值 —— 数值看着"有点怪"，
- * 不报错、不断言。所以它是个编译期常量而不是逐组件的属性。
- * 当前语义（藤蔓 D13）：[0] = SpawnTime 秒、[1] = 该实例在藤上的弧长 cm。
+ * ⚠️ custom data 的步长**是材质侧的读取步长**（引擎按 `Buffer[InstanceId * NumCustomDataFloats + i]` 取），
+ * 改它要同时改所有消费它的材质，否则读到的是错位的邻居值 —— 数值看着"有点怪"，不报错、不断言。
+ * 所以它是个编译期常量而不是逐组件的属性。当前语义（藤蔓 D13）：[0] = SpawnTime 秒、[1] = 弧长 cm。
  */
-#define CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS 2
 
 /** One LOD of the base mesh inside the shared GPU vertex/index buffers. */
 struct FCSGpuInstancedLODRange
@@ -87,7 +86,8 @@ struct FCSGpuInstanceSourceGPU
 	 * Buffer<float>, CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS per instance。**可空** ——
 	 * 只有需要逐实例 custom data 的生产者（藤蔓的叶 / 花）才填，别的留空即可，
 	 * 剔除 pass 会给可见槽写零。刻意做成**并列缓冲**而不是把 packed 行加宽：
-	 * 那个 `* 5u` 的步长散在两个 .usf 与四处 CPU 路径里，动它的代价与风险都不对等。
+	 * 行 stride（CS_GPU_INSTANCED_ROW_FLOAT4S）是九条打包路 + 剔除 pass + GPU-Scene 写入 pass 共用的契约，
+	 * 加宽它等于让每一家都改，代价与风险都不对等。
 	 */
 	TRefCountPtr<FRDGPooledBuffer> CustomData;
 	uint32 Capacity = 0;                            // instances the buffer can hold
@@ -204,6 +204,32 @@ struct FCSGpuInstancedGpuLayout
  * ⚠️ 代价说清楚：**实例路的基础网格顶点色 alpha 从此不可用**（现有消费者只有
  *    `M_TinyGladeDecor`，它只读 RGB）。要用 alpha 做别的（叶片遮罩之类）得先改这份字典。
  *
+ * -----------------------------------------------------------------------------
+ * Nanite 路（BaseMesh 开了 Nanite 时自动走，没有开关）
+ * -----------------------------------------------------------------------------
+ * 判据只有一条：资产自己的 Nanite 设置（UStaticMesh::IsNaniteEnabled，含 r.Nanite.ForceEnableMeshes）。
+ * 开了就走这条路，没开就走上面的 GPU 剔除路 —— 用户在资产上勾 Nanite 就是在说"这张网格该由 Nanite 画"，
+ * 组件上再放一个开关只会让两处设置打架。编辑器里改资产的 Nanite 开关，资产重建完（OnPostMeshBuild）
+ * 组件会自己重判一次（见 HandleBaseMeshRebuilt）。
+ *
+ * 同一套实例源，换一条渲染路：本组件不再上传基础网格、不再跑自己的剔除，而是挂一个渲染替身
+ * UCSGpuInstancedNaniteComponent（一个 UStaticMeshComponent，网格就是 BaseMesh），引擎在 GPU-Scene
+ * 里给它分一段**只在 GPU 上**的实例区间，由 CSGpuInstancedNaniteWriter.usf 把 packed 行直接写进去。
+ * 之后剔除 / LOD / 光栅 / 阴影全归引擎的 Nanite 管线 —— 所以 VSM 有影子、主视锥外的实例照样投影，
+ * 这两条经典路都做不到（见构造函数里那段实测）。
+ *
+ *   · 仍然有效：BaseMesh、InstanceMaterial（设了就盖住资产的每个材质槽，没设用资产自己的材质）、
+ *     InstanceEndCullDistance、投影 / 可见性等渲染开关（替身每帧从本体抄）、全部实例源 API、烘焙出口与两条诊断。
+ *   · 不再生效：InstancesPerCluster / bGpuFrustumCulling / bGpuLODSelection / LODScreenSizeScale。
+ *   · 资产开了 Nanite 但这台机器画不了 Nanite（r.Nanite 0、平台不支持、材质不被 Nanite 支持）时，
+ *     替身由引擎 ISM 代理画资产的回退网格，仍然吃 GPU-Scene 实例；连 GPU-Scene 都没有的平台才退回 GPU 剔除路。
+ *   · SetBaseMeshFromGpuData 喂进来的网格不是资产、没有 Nanite 设置，永远走 GPU 剔除路。
+ *   · GPU 源每帧重写一遍（生产者原地重写 buffer、从不通知）⇒ VSM 每帧作废这批实例的影子缓存；
+ *     嫌贵就把本组件的 ShadowCacheInvalidationBehavior 设成 Static（替身跟着抄）。
+ *   ⚠️ 上面那份通道字典在这条路上**不成立**：顶点色是资产自己的数据，alpha 没法清零，材质里的
+ *     `PerInstanceRandom + VertexColor.A` 会整体多出资产的 alpha（通常是 1，整族亮一档，不报错）。
+ *     用这条等式的材质配开了 Nanite 的资产时，资产的顶点色 alpha 必须是 0。
+ *
  * The one thing that does NOT go through UCSMesh::EditMeshSync is the per-frame cull, which has to
  * run inside the renderer's own graph and can neither build a graph of its own nor block on a
  * flush. It uses the mesh's other sanctioned entry point instead — FCSMeshRenderThreadEdit, scoped
@@ -224,14 +250,22 @@ public:
 	// -------------------------------------------------------------------------
 
 	/** Mesh instanced by this component. Its LODs (up to CS_GPU_INSTANCED_MAX_LODS) become the
-	 *  GPU LOD levels, using the asset's own screen sizes. */
+	 *  GPU LOD levels, using the asset's own screen sizes. If the asset has Nanite enabled, the
+	 *  engine draws the asset itself instead (its Nanite data) and the CPU-side LODs are only read
+	 *  for the bake — see "Nanite 路" in the class comment. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "CS GPU Instanced Mesh")
 	TObjectPtr<UStaticMesh> BaseMesh;
 
-	/** Material drawn for every instance. Null uses the engine default surface material.
+	/** Material drawn for every instance. Null uses the engine default surface material — except
+	 *  for a Nanite-enabled BaseMesh, where null means the asset's own materials.
 	 *  Must have bUsedWithInstancedStaticMeshes set or it will fall back to the default. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS GPU Instanced Mesh")
 	TObjectPtr<UMaterialInterface> InstanceMaterial;
+
+	/** 这一族是不是交给引擎的 Nanite 管线画：BaseMesh 是一张开了 Nanite 的资产，且平台有 GPU-Scene。
+	 *  不是开关，是判据 —— 想换路就去资产上勾 / 取消 Nanite。 */
+	UFUNCTION(BlueprintPure, Category = "CS GPU Instanced Mesh")
+	bool IsNaniteRenderPath() const;
 
 	UFUNCTION(BlueprintCallable, Category = "CS GPU Instanced Mesh")
 	void SetBaseMesh(UStaticMesh* InMesh);
@@ -335,6 +369,9 @@ public:
 	 *
 	 * ⚠️ 材质那一半只做得到"引擎会不会换"，做不到"这一帧画出来的像素用的是哪份着色器" ——
 	 * 后者要有真的一帧渲染才存在。判不了的情形会在原因串里说明白，不会假装成通过。
+	 *
+	 * Nanite 路问的是另一组问题（替身在不在、代理是不是真 Nanite、GPU-Scene 写入发没发给当前代理），
+	 * 见 UCSGpuInstancedNaniteComponent::DebugDescribeMismatchSync。
 	 */
 	UFUNCTION(BlueprintPure, Category = "CS GPU Instanced Mesh|Diagnostics", meta = (DevelopmentOnly))
 	FString DebugGetDrawnAssetMismatchSync() const;
@@ -423,6 +460,9 @@ public:
 	 *  re-derive them — see FCSGpuInstancedGpuLayout. */
 	const FCSGpuInstancedGpuLayout& GetGpuLayout() const { return GpuLayout; }
 
+	/** Nanite 路的渲染替身（诊断 / 测试用）。BaseMesh 没开 Nanite 时为空。 */
+	UCSGpuInstancedNaniteComponent* GetNaniteComponent() const { return NaniteComponent; }
+
 	//~ UPrimitiveComponent interface
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
 	/** Builds the GPU mesh that the mutators skipped while the component was unregistered. This runs
@@ -430,6 +470,9 @@ public:
 	 *  created off the game thread during the end-of-frame update, where the build's render flush
 	 *  would not be legal, so proxy creation is only ever allowed to read what already exists. */
 	virtual void OnRegister() override;
+	/** Nanite 路的替身跟本组件一起下线：本体都不在世界里了，替身还画着就是一族没人管的实例。 */
+	virtual void OnUnregister() override;
+	virtual void OnComponentDestroyed(bool bDestroyingHierarchy) override;
 
 	//~ UObject interface
 	virtual void PostLoad() override;
@@ -440,6 +483,8 @@ public:
 protected:
 	//~ UCSGpuMeshComponent interface
 	virtual UMaterialInterface* GetRenderMaterial() const override { return InstanceMaterial; }
+	/** Nanite 路上本组件没有代理（画的是替身），ReadbackMeshSync 那次 static_cast 必须拦在前面。 */
+	virtual bool IsGpuMeshProxyActive() const override { return !IsNaniteRenderPath(); }
 
 private:
 	/**
@@ -477,6 +522,37 @@ private:
 	/** Hands the GPU buffers back and forgets the layout. The live proxy keeps its own references
 	 *  to the pooled buffers, so it goes on drawing correctly until its render state is recreated. */
 	void ReleaseGpuMesh();
+
+	/** Nanite 路：建（第一次）/ 同步 / 注册渲染替身，把当前实例源交给它。不阻塞。只在已注册时调。 */
+	void UpdateNaniteComponent();
+
+	/** 离开 Nanite 路（或本组件被销毁）：替身整个毁掉，不留一个没人管的图元。 */
+	void ReleaseNaniteComponent();
+
+	/** 一个实例的本地包围盒：快照有就用快照的，Nanite 路没读顶点时退到资产自己的包围盒。 */
+	FBox GetBaseLocalBounds() const;
+
+#if WITH_EDITOR
+	/**
+	 * 盯住 BaseMesh 的重建（OnPostMeshBuild）：在资产上勾 / 取消 Nanite、重导入、改 LOD 之后，重新判一次
+	 * 该走哪条路，顺带把 GPU 剔除路的快照刷新 —— 以前换了资产内容组件不会知道，画面上一直是旧网格。
+	 * 换网格时先解绑旧的，所以任何时刻只盯着当前这一张。
+	 */
+	void BindBaseMeshRebuildEvent();
+	void UnbindBaseMeshRebuildEvent();
+
+	/**
+	 * 不在 OnPostMeshBuild 里当场重建：那一刻编译管理器还攥着"引用这张网格的组件"清单，紧接着要逐个
+	 * 调 PostStaticMeshCompilation（StaticMeshCompiler.cpp），而重判可能正好把替身（也是其中之一）毁掉或新建。
+	 * 所以只挂一个一次性的 OnWorldPreSendAllEndOfFrameUpdates，下一次帧末更新开头再做 —— 仍赶在这一帧渲染之前。
+	 */
+	void HandleBaseMeshRebuilt(UStaticMesh* RebuiltMesh);
+	void HandleDeferredBaseMeshRefresh(UWorld* InWorld);
+
+	TWeakObjectPtr<UStaticMesh> RebuildEventMesh;
+	FDelegateHandle RebuildEventHandle;
+	FDelegateHandle DeferredRefreshHandle;
+#endif
 
 	/** Instance-buffer capacity for a live count, with hysteresis. Grows to 1.5x when the count
 	 *  passes what is held and shrinks only once three quarters of it are unused.
@@ -518,6 +594,11 @@ private:
 	/** What InstancedGpuMesh's streams are currently sized for. Reset when the mesh is released, so
 	 *  the ratchet does not survive the buffers it describes. */
 	FCSGpuInstancedGpuLayout GpuLayout;
+
+	/** Nanite 路的渲染替身。Outer 是本组件，Transient + DuplicateTransient：不存盘、PIE / 复制 actor
+	 *  时不跟着拷，副本在自己的 OnRegister 里另建一个。BaseMesh 没开 Nanite 时恒为空。 */
+	UPROPERTY(Transient, DuplicateTransient)
+	TObjectPtr<UCSGpuInstancedNaniteComponent> NaniteComponent;
 
 	/**
 	 * 有变更在未注册期间被跳过，重注册时必须重建一次。

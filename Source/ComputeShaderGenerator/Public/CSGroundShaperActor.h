@@ -154,8 +154,7 @@ public:
 	/** 影响范围的世界 XY 矩形（= 盘 + 裙边），也是区域重导出发布的脏区。 */
 	FBox2D GetFootprintRect2D() const;
 
-	//~ AActor interface
-	virtual void OnConstruction(const FTransform& Transform) override;
+	//~ AActor interface（OnConstruction → ReevaluateSite 在基类）
 	virtual void PostRegisterAllComponents() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void Destroyed() override;

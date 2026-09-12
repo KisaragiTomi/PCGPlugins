@@ -154,12 +154,6 @@ void ACSGroundShaperActor::UpdateEditorShape()
 // AActor
 // -----------------------------------------------------------------------------
 
-void ACSGroundShaperActor::OnConstruction(const FTransform& Transform)
-{
-	Super::OnConstruction(Transform);
-	RebuildTerrain();
-}
-
 void ACSGroundShaperActor::PostRegisterAllComponents()
 {
 	Super::PostRegisterAllComponents();

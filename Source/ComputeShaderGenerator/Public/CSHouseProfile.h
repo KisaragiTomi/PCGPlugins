@@ -44,16 +44,6 @@ enum class ECSOpeningShape : uint8
 };
 
 /**
- * 洞底高于这个值才另砌窗台。
- *
- * **一处砌盒、一处砌砖，两处必须共用同一个数**：`CSHouse_BuildBodySoup` 在 Z0 以下砌一块
- * 无 clip 的实心盒（窗台），`CSHouseFrame::MakeOpeningPath` 沿 Z0 那条下边界铺一圈砖
- * （窗台砖）。分开写死的症状是"有盒没砖"（下边界那条 clip 边裸露）或"有砖没盒"
- * （砖悬在半空）—— 两种都不报错。
- */
-constexpr float CSHouse_SillMinZ = 0.5f;
-
-/**
  * 一个洞 = 原型剖面 + 沿边的摆位。不存任何切出的几何。
  *
  * **为什么现在就要 Z0/Z1/AxisUS/Skew**（用户指令 2026-08-29：楼梯暂不做，但洞逻辑必须容纳它）：

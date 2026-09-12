@@ -25,6 +25,7 @@
 //   +X = 两者的面内垂线
 
 #include "/Engine/Public/Platform.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/CSGpuSharedLayout.ush"
 
 #ifndef THREADGROUPSIZE_X
 #define THREADGROUPSIZE_X 64
@@ -62,8 +63,10 @@ void PackHouseVineCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	// 逐实例 custom data。**在下面那两条退化 return 之前写**：counter 是按记录数直接
 	// 写死的（见文件头），被 return 跳过的槽位若不写就留着上一次的值 —— 症状是零星
 	// 几片叶子的生长相位莫名其妙，且只在记录集变化时出现。
-	RWVineCustomData[Index * 2u + 0u] = R3.x;
-	RWVineCustomData[Index * 2u + 1u] = R3.y;
+	// 步长是 CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS（与 C++ 同一份）；本 kernel 只有两个量要写，
+	// 步长抬高时多出来的槽位这里不填、由 GrowTo 的清零兜成 0。
+	RWVineCustomData[Index * CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS + 0u] = R3.x;
+	RWVineCustomData[Index * CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS + 1u] = R3.y;
 
 	const float3 WorldPos = R0.xyz;
 	const float LengthScale = max(R0.w, 1e-4f);
@@ -96,7 +99,7 @@ void PackHouseVineCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	const float3 ScaledY = LocalY * BlockScale.y;
 	const float3 ScaledZ = LocalZ * BlockScale.z;
 
-	const uint Base = Index * 5u;
+	const uint Base = Index * CS_GPU_INSTANCED_ROW_FLOAT4S;
 	RWVineInstances[Base + 0u] = float4(ScaledX, 0.0f);   // .w 必须是 0：引擎拿它做选中/hitproxy
 	RWVineInstances[Base + 1u] = float4(ScaledY, 0.0f);
 	RWVineInstances[Base + 2u] = float4(ScaledZ, 0.0f);

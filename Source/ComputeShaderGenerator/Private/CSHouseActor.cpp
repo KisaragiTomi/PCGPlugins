@@ -226,6 +226,11 @@ bool CSHouse_OpeningLess(const FCSWallOpening& A, const FCSWallOpening& B)
 
 ACSHouseActor::ACSHouseActor()
 {
+	// 合批唤醒的兑现点（见 `RequestReevaluate`）。基类默认 `bCanEverTick = false`，这里自己打开；
+	// 平时关着、有欠账才开。编辑器里要真的 tick，还得配 `ShouldTickIfViewportsOnly`（同特征标记）。
+	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.bStartWithTickEnabled = false;
+
 	PillarMeshComponent = CreateDefaultSubobject<UCSMeshRenderComponent>(TEXT("PillarMesh"));
 	PillarMeshComponent->SetupAttachment(RootComponent);
 
@@ -261,7 +266,9 @@ void ACSHouseActor::UnsubscribeGround()
 void ACSHouseActor::HandleGroundChanged(ACSGroundActor* /*ChangedGround*/, const FBox& /*ChangedBounds*/)
 {
 	// v1 直推：不过滤变更盒，无条件重求值——无效唤醒由哈希短路吸收（计划 D3）。
-	ReevaluateSite();
+	// 走合批：一次落笔会让地面把这条广播给每一栋受影响的房子，而画笔是按住不放的
+	// —— 同一栋房子一帧里收到多次是常态。
+	RequestReevaluate();
 }
 
 // -----------------------------------------------------------------------------
@@ -455,14 +462,17 @@ void ACSHouseActor::RegisterFeatureMarker(const FGuid& MarkerId, const FCSHouseW
 		if (Marker) Entry.Anchor = Marker->GetAnchor();
 		MarkerWindows.Insert(MoveTemp(Entry), Index);
 	}
-	ReevaluateSite();
+	// **合批**：gizmo 多选拖 N 个窗时，这里一帧会被叫 N 次（每个标记的 Tick 各一次），
+	// 而前 N−1 次的结果都会被后一次盖掉。见 `RequestReevaluate` 的注释。
+	RequestReevaluate();
 }
 
 void ACSHouseActor::UnregisterFeatureMarker(const FGuid& MarkerId)
 {
 	const int32 Removed = MarkerWindows.RemoveAll(
 		[&MarkerId](const FCSMarkerWindow& Entry) { return Entry.MarkerId == MarkerId; });
-	if (Removed > 0) ReevaluateSite();
+	// 合批：一次删多个窗（框选 + Delete）会一帧内连来 N 次，同 RegisterFeatureMarker。
+	if (Removed > 0) RequestReevaluate();
 }
 
 FCSOpeningSite ACSHouseActor::MakeOpeningSite() const
@@ -848,6 +858,7 @@ void ACSHouseActor::ResolvePierSpans()
 
 int32 ACSHouseActor::GetOpenDoorCount() const
 {
+	FlushPendingReevaluate();
 	int32 Count = 0;
 	for (const FCSWallOpening& O : CurrentOpenings) if (O.Type == ECSOpeningType::Door) ++Count;
 	return Count;
@@ -963,10 +974,37 @@ uint32 ACSHouseActor::ComputePillars(TArray<FVector>& OutPillarCenters, TArray<f
 	return CSHouse_Hash(H);
 }
 
+void ACSHouseActor::RequestReevaluate()
+{
+	// 只标脏。一帧里来多少次都只是同一个布尔，兑现只在 Tick 里发生一次（N vs N² 的账见头文件）。
+	bReevaluatePending = true;
+	if (!IsTemplate()) SetActorTickEnabled(true);
+}
+
+void ACSHouseActor::FlushPendingReevaluate() const
+{
+	if (!bReevaluatePending) return;
+	// `const_cast`：本函数做的是"把已经欠下的那一次重求值当场补上"，补完之后对外可见的状态
+	// 与"合批没生效、当场就跑了"逐位相同 —— 那正是 const 想保证的东西。而 getter 必须是
+	// const（`BlueprintPure` 要求），补票只能在这里做。
+	const_cast<ACSHouseActor*>(this)->ReevaluateSite();
+}
+
+void ACSHouseActor::Tick(float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+	// **先关再跑**：重建途中若又来了通知，`RequestReevaluate` 会把 tick 重新打开、留给下一帧。
+	// 顺序反过来，那次打开就被这一行关掉，新诉求要等到下一次别的唤醒才兑现。
+	SetActorTickEnabled(false);
+	FlushPendingReevaluate();
+}
+
 void ACSHouseActor::ReevaluateSite()
 {
 	if (bInReevaluate || IsTemplate() || !GetWorld()) return;
 	TGuardValue<bool> Guard(bInReevaluate, true);
+	// 欠账**在开头**清：重建途中新到的通知会重新置位，由下一次 Tick 兑现（见 bReevaluatePending）。
+	bReevaluatePending = false;
 
 	ResolveGroundAndSubscribe();
 
@@ -996,32 +1034,16 @@ void ACSHouseActor::ReevaluateSite()
 
 	const uint32 SeamCutHash = ComputeSeamCuts();
 	const uint32 BodyHash = CSHouse_Hash({ int32(ComputeDoors()), int32(SeamCutHash) });
-	if (bForceFullRebuild || BodyHash != BodyShapeHash || !GetTinyGladeMesh())
-	{
-		RebuildBodyMesh();
-		BodyShapeHash = BodyHash;
-		BodyPlacementHash = PlacementHash;
-	}
-	else if (PlacementHash != BodyPlacementHash)
-	{
-		// 只有真送出去了才推进哈希 —— 在途被拒时推进等于把这次移动丢掉。
-		if (ApplyBodyPlacement()) BodyPlacementHash = PlacementHash;
-	}
+	// "网格在不在"不够：删除后撤销，复活的网格对象还在、显存却已被渲染组件还掉了（IsSlotMeshLive）。
+	ReconcileMeshSlot(BodySlot, BodyHash, PlacementHash, bForceFullRebuild || !IsSlotMeshLive(TinyGladeMesh),
+		[this]() { RebuildBodyMesh(); }, [this]() { return ApplyBodyPlacement(); });
 
 	// ③ 柱（独立组件——纯地形变化只走到这，不碰房体）。
 	TArray<FVector> Centers;
 	TArray<float> Lengths;
 	const uint32 PillarHash = ComputePillars(Centers, Lengths);
-	if (bForceFullRebuild || PillarHash != PillarShapeHash || (Centers.Num() > 0 && !PillarMesh))
-	{
-		RebuildPillarMesh(Centers, Lengths);
-		PillarShapeHash = PillarHash;
-		PillarPlacementHash = PlacementHash;
-	}
-	else if (PlacementHash != PillarPlacementHash)
-	{
-		if (ApplyPillarPlacement()) PillarPlacementHash = PlacementHash;
-	}
+	ReconcileMeshSlot(PillarSlot, PillarHash, PlacementHash, bForceFullRebuild || (Centers.Num() > 0 && !IsSlotMeshLive(PillarMesh)),
+		[&]() { RebuildPillarMesh(Centers, Lengths); }, [this]() { return ApplyPillarPlacement(); });
 	CurrentPillarCount = Centers.Num();
 
 	// ④ 门框砖：clip 的配套件，洞集合一变就要重排（哈希短路吸收无效唤醒）。
@@ -1058,6 +1080,7 @@ void ACSHouseActor::ReevaluateSite()
 	NotifyMarkersRebuilt();
 
 	bForceFullRebuild = false;
+	++ReevaluateCount;   // 合批的观测量（`GetReevaluateCount`），只数真正跑完的
 }
 
 FCSHouseWindowBrushRequest ACSHouseActor::OnWindowBrushRequest;
@@ -1469,7 +1492,7 @@ void ACSHouseActor::RebuildBodyMesh()
 	CSHouse_BuildBodySoup(Desc, S);
 
 	const int32 TriangleCount = S.Indices.Num() / 3;
-	BodyBuiltAtTransform = Desc.World;
+	BodySlot.BuiltAt = Desc.World;
 	SubmitBodyMesh(MakeShared<FCSGpuMeshCPUData, ESPMode::ThreadSafe>(MoveTemp(S)));
 	UE_LOG(LogTinyGladeHouse, Log, TEXT("[TinyGladeHouse] %s body rebuilt: tris=%d openings=%d (doors=%d)"),
 		*GetName(), TriangleCount, CurrentOpenings.Num(), GetOpenDoorCount());
@@ -1477,136 +1500,55 @@ void ACSHouseActor::RebuildBodyMesh()
 
 void ACSHouseActor::SubmitBodyMesh(TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> Snapshot)
 {
-	if (!Snapshot.IsValid() || !TinyGladeMeshComponent) return;
-
-	if (!TinyGladeMesh) TinyGladeMesh = NewObject<UCSMesh>(this);
-	UCSMesh* Body = TinyGladeMesh;
-
-	// 材质表要在录图之前就绑好：分段数取自 Materials.Num()，排序 pass 要在同一张图里录进去。
+	FCSMeshSlotUpload Upload;
 	// ⚠️ 槽 1（屋顶）现在**一个三角都没有**（四坡改瓦片实例）—— 空分段只是画不出东西，无害；
 	// 槽位留着是为了不动这张 P2 冻结的槽表，`RoofMaterial` 本身归瓦片那条路用。
-	BindTinyGladeMaterials({ WallMaterial, RoofMaterial });
-
-	// 房体要两组 UV（UV1 传裁剪场）。逐 mesh 的流布局变体，别人不为它付显存；
-	// 同组数时这一步一点工作都不做。必须在容量与上传之前 —— 它会重建流集合。
-	UCSMeshOps::EnsureTexCoordSets(Body, 2);
-
-	// 在途 → 只留最新态。拖拽期间这条常态命中，被吸收掉的中间帧本来也没人看得见。
-	if (Body->IsEditInFlight())
-	{
-		PendingBodySnapshot = Snapshot;
-		return;
-	}
-
-	UCSMeshOps::FCSMeshUploadPayload Payload;
-	if (!UCSMeshOps::BuildUploadPayload(*Snapshot, Payload, UCSMeshOps::GetTexCoordSets(Body)))
-	{
-		UE_LOG(LogTinyGladeHouse, Warning, TEXT("[TinyGladeHouse] %s body upload failed (tris=%d)"),
-			*GetName(), Snapshot->Indices.Num() / 3);
-		return;
-	}
-
-	// 两条同步扩容都带早退，稳态下一次 enqueue 都没有；且必须在异步编辑**之前** ——
-	// 在途时发起的同步路径虽然 FIFO 有序、结果正确，但会一直阻塞到两者都跑完，
-	// 等于把省下的 flush 又还回去。
-	// 按 CSShaperSteps::ReserveCount 预留而不是按精确数要：拖尺寸时顶点数是 FootprintSize 的连续函数，
-	// 精确要就等于每一帧重新分配 + 拷贝一整份房体（EnsureCapacitySync 只涨不缩，但"涨"本身
-	// 就是一次阻塞刷新）。多要的容量不画任何东西 —— 画多少由计数器决定，这正是这套 GPU 网格
-	// 的设计前提。
-	const int32 NumSlots = FMath::Max(Body->Materials.Num(), 1);
-	Body->EnsureCapacitySync(CSShaperSteps::ReserveCount(Payload.VertexCount), CSShaperSteps::ReserveCount(Payload.IndexCount));
-	Body->EnsureIndirectDrawCapacitySync(NumSlots);
-	TinyGladeMeshComponent->SetGpuMesh(Body);
-
-	// 排序是否真的录进去了，只有渲染线程录图那一刻知道；游戏线程尾巴靠这个共享标志读。
-	// 直接读一个 lambda 体内置位的裸 bool 会永远读到 false ⇒ 房子只画一个材质且不报错。
-	TSharedPtr<bool, ESPMode::ThreadSafe> Sorted = MakeShared<bool, ESPMode::ThreadSafe>(false);
-	TSharedPtr<UCSMeshOps::FCSMeshUploadPayload, ESPMode::ThreadSafe> Owned =
-		MakeShared<UCSMeshOps::FCSMeshUploadPayload, ESPMode::ThreadSafe>(MoveTemp(Payload));
-	TWeakObjectPtr<ACSHouseActor> WeakThis(this);
-
-	// EditFunc 是 owned（TFunction 移入），它读到的一切也必须由它拥有 —— payload 因此走
-	// 共享指针按值捕获，而不是 EditMeshSync 那种"捕获栈上快照的裸指针"（在这里是 use-after-free）。
-	const bool bAccepted = Body->EditMeshAsync(
-		[Owned, NumSlots, Sorted](FCSMeshEditContext& Context)
-		{
-			UCSMeshOps::AddCopyFromSnapshotPasses(Context, *Owned);
-			*Sorted = UCSMeshOps::AddMaterialSectionPasses(Context, NumSlots);
-		},
-		[WeakThis, Sorted](bool /*bMeshAlive*/)
-		{
-			if (ACSHouseActor* House = WeakThis.Get()) House->OnBodyEditComplete(*Sorted);
-		});
-
-	if (!bAccepted)
-	{
-		// 走到这里说明被拒的原因不是"在途"（那条上面已经拦了），而是某种意外状态。
-		// 存进 pending 会永远没人来补发（OnComplete 不会触发），所以退回同步一次 ——
-		// 宁可付一次 flush，也不能让房子静默地没有几何。
-		UE_LOG(LogTinyGladeHouse, Warning, TEXT("[TinyGladeHouse] %s async body edit refused; falling back to a sync upload."), *GetName());
-		UCSMeshOps::CopyFromMeshSnapshot(Body, *Snapshot);
-		UCSMeshOps::BuildMaterialSections(Body);
-	}
+	Upload.Materials = { WallMaterial, RoofMaterial };
+	Upload.NumTexCoordSets = 2;   // UV1 传裁剪场
+	Upload.bSortSections = true;
+	SubmitMeshSlotAsync(TinyGladeMeshComponent, TinyGladeMesh, BodySlot, Snapshot, Upload, [this]() { OnBodyEditComplete(); });
 }
 
-void ACSHouseActor::OnBodyEditComplete(bool bSorted)
+void ACSHouseActor::OnBodyEditComplete()
 {
-	// SetSections 必须落在这条游戏线程尾巴上（异步化时最容易静默失效的一处，详见
-	// UCSMeshOps::PublishMaterialSections 的注释）。
-	if (bSorted && TinyGladeMesh) UCSMeshOps::PublishMaterialSections(TinyGladeMesh);
-
 	// 最新态合并：在途期间攒下的最后一份目标现在补发。
-	if (PendingBodySnapshot.IsValid())
+	if (const TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> Next = TakePending(BodySlot.Pending))
 	{
-		TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> Next = MoveTemp(PendingBodySnapshot);
-		PendingBodySnapshot.Reset();
 		SubmitBodyMesh(Next);
 		return;
 	}
 
 	// 在途期间被推迟的摆位增量在这里补上。没有这一步，"拖动中恰好撞上一次形状重建"的那一帧
-	// 位移就永远丢了 —— 而快扫看到的变换没再变，不会来第二次唤醒。增量相对 BuiltAtTransform
+	// 位移就永远丢了 —— 而快扫看到的变换没再变，不会来第二次唤醒。增量相对 BodySlot.BuiltAt
 	// 算，所以补送的是累计量，不是重放。
-	if (ApplyBodyPlacement()) BodyPlacementHash = ComputePlacementHash();
+	if (ApplyBodyPlacement()) BodySlot.PlacementHash = ComputePlacementHash();
 }
 
 bool ACSHouseActor::ApplyBodyPlacement()
 {
-	UCSMesh* Body = GetTinyGladeMesh();
-	if (!Body) return false;
+	return ApplyMeshSlotPlacement(GetTinyGladeMesh(), BodySlot, GetBuildTransform(), [this]() { OnBodyEditComplete(); });
+}
 
-	// 常驻流是世界空间、渲染组件用绝对变换 ⇒ SetActorLocation 不会带动已生成的几何，
-	// 得自己把它搬过去。变换 pass 同时改 Positions 与 Tangents（逆转置法线）并变换
-	// WorldBounds，平移与 yaw 都支持。
-	//
-	// UE 的合成口径是 "C = A * B 先 A 后 B"，所以增量 = 先撤旧变换、再上新变换；写反了
-	// 房子会在远离原点处飞走（旋转分量作用在未撤销的世界坐标上）。
-	const FTransform NewWorld = GetBuildTransform();
-	const FTransform Delta = BodyBuiltAtTransform.Inverse() * NewWorld;
-	if (Delta.Equals(FTransform::Identity, 1.0e-4)) return true;   // 已经在位
-	if (Body->IsEditInFlight()) return false;                      // 在途：留给 OnBodyEditComplete 重试
-
-	TWeakObjectPtr<ACSHouseActor> WeakThis(this);
-	const bool bAccepted = Body->EditMeshAsync(
-		[Delta](FCSMeshEditContext& Context) { UCSMeshOps::AddTransformPasses(Context, Delta); },
-		// 变换只改顶点、不动索引与材质分段，所以尾巴不发布分段表（bSorted = false）。
-		[WeakThis](bool /*bMeshAlive*/) { if (ACSHouseActor* House = WeakThis.Get()) House->OnBodyEditComplete(false); });
-	if (!bAccepted) return false;
-
-	BodyBuiltAtTransform = NewWorld;
-	return true;
+namespace
+{
+/**
+ * 交接包围盒从**构建空间**（`GetBuildTransform()`，只取 yaw）映射到**组件空间**（实例原点所在的空间）。
+ * 房子没有 pitch / roll / 缩放时是恒等变换，逐位不改现状；有的话不映射，剔除盒就偏、视锥边缘闪
+ * （2026-09-07 审查 B5：五家里以前只有门框砖做了这一步）。只有 yaw 时也因此不会多出一次交接。
+ */
+FBox CSHouse_BuildBoundsToComponent(const FTransform& BuildTransform, const USceneComponent* Component, const FBox& Bounds)
+{
+	if (!Component || !Bounds.IsValid) return Bounds;
+	const FTransform BuildToComponent = BuildTransform * Component->GetComponentTransform().Inverse();
+	return BuildToComponent.Equals(FTransform::Identity, 1.0e-4) ? Bounds : Bounds.TransformBy(BuildToComponent);
+}
 }
 
 void ACSHouseActor::EnsurePillarBrickComponent()
 {
-	// 蓝图 actor 重跑构造脚本会把实例组件销毁，指针会失效 —— 先判再补（同 EnsureFrameComponent）。
-	if (!IsValid(PillarBrickComponent))
-	{
-		PillarBrickComponent = NewObject<UCSGpuInstancedMeshComponent>(this, NAME_None, RF_Transient);
-		PillarBrickComponent->SetupAttachment(RootComponent);
-		PillarBrickComponent->RegisterComponent();   // 未注册时任何变更都会释放 GPU 网格
-		PillarHandedCapacities.Reset();
-	}
+	// 新组件身上没有实例源，交接缓存必须一起作废 —— 缓存说"交接过了"而组件是空的，
+	// 下一趟就会被判成稳态而跳过，画面永远空白且不报错。
+	if (CSShaperSteps::EnsureInstancedComponent(this, PillarBrickComponent)) PillarHandover.Capacities.Reset();
 	PillarBrickComponent->InstanceMaterial = PillarMaterial;
 	PillarBrickComponent->SetBaseMesh(PillarBrickMesh);   // 同一张网格时内部直接早退
 
@@ -1614,7 +1556,7 @@ void ACSHouseActor::EnsurePillarBrickComponent()
 	{
 		CSShaperSteps::ReleaseOnRenderThread(PillarGpuBuffers);
 		PillarGpuBuffers.SetNum(1);
-		PillarHandedCapacities.Reset();
+		PillarHandover.Capacities.Reset();
 	}
 
 	// 剔除球与三轴块尺寸都从基础网格的包围盒推。⚠️ `brick` 是 1×1×1 的**居中**字典 mesh，
@@ -1647,29 +1589,13 @@ void ACSHouseActor::EnsurePillarBrickComponent()
 	const double Reach = CSShaperSteps::QuantizeUp(FMath::Max(FootprintSize.X, FootprintSize.Y) * 0.6 + PillarSize);
 	const double Depth = CSShaperSteps::QuantizeUp(500.0 + PillarEmbed);
 	FBox LocalBounds(FVector(-Reach, -Reach, -Depth), FVector(Reach, Reach, PillarSize));
-	if (!bForceFullRebuild && PillarHandedLocalBounds.IsValid) LocalBounds += PillarHandedLocalBounds;
-
-	const bool bNeedHandover = PillarHandedCapacities.Num() != 1
-		|| PillarHandedCapacities[0] != PillarGpuBuffers[0].Capacity
-		|| !PillarHandedLocalBounds.IsValid
-		|| !PillarHandedLocalBounds.Min.Equals(LocalBounds.Min, 1.0)
-		|| !PillarHandedLocalBounds.Max.Equals(LocalBounds.Max, 1.0)
-		// 蓝图重跑构造脚本会销毁并重建实例组件：新组件身上没有实例源，缓存说"已交接"就会
-		// 永远画不出东西 —— 拿组件自己的状态兜底（同 EnsureFrameComponent）。
-		|| !PillarBrickComponent->HasInstanceSourceGPU();
-	if (!bNeedHandover || !PillarGpuBuffers[0].IsValid()) return;
-
-	FCSGpuInstanceSourceGPU Source;
-	Source.PackedInstances = PillarGpuBuffers[0].PackedInstances;   // 保留自己的引用，重打包还要用
-	Source.Counter = PillarGpuBuffers[0].Counter;
-	Source.CustomData = PillarGpuBuffers[0].CustomData;
-	Source.Capacity = PillarGpuBuffers[0].Capacity;
-	Source.LocalBounds = LocalBounds;
-	PillarBrickComponent->SetInstanceSourceGPU(Source);
-
-	PillarHandedCapacities.SetNumUninitialized(1);
-	PillarHandedCapacities[0] = PillarGpuBuffers[0].Capacity;
-	PillarHandedLocalBounds = LocalBounds;
+	LocalBounds = CSHouse_BuildBoundsToComponent(GetBuildTransform(), PillarBrickComponent, LocalBounds);
+	LocalBounds = CSShaperSteps::MergeHandoverBounds(LocalBounds, PillarHandover, bForceFullRebuild);
+	// 柱砖的 kernel（CSHousePillar.usf）不写 custom data，柱材质也不读：不交，省掉剔除 pass 里逐可见槽
+	// 抄一遍全零的那一趟（2026-09-07 审查 B1 的柱子那条：以前交的是一块从未被 kernel 写过的 buffer）。
+	CSShaperSteps::HandOverInstanceSource(
+		CSShaperSteps::MakeHandoverSource(PillarBrickComponent, PillarGpuBuffers[0], /*bWithCustomData*/ false),
+		LocalBounds, PillarHandover);
 }
 
 void ACSHouseActor::RebuildPillarMesh(const TArray<FVector>& Centers, const TArray<float>& Lengths)
@@ -1678,8 +1604,8 @@ void ACSHouseActor::RebuildPillarMesh(const TArray<FVector>& Centers, const TArr
 	if (bPillarUseBricks && PillarBrickMesh)
 	{
 		// ⚠️ 另一条必须显式清掉，否则方盒与砖同时画 —— 藤蔓换管子时正是漏了这一条。
-		if (PillarMeshComponent) PillarMeshComponent->SetGpuMesh(nullptr);
-		PillarMesh = nullptr;
+		// 连在途待发的那份方盒一起作废（ClearMeshSlot），否则完成回调会把它补发回来。
+		ClearMeshSlot(PillarMeshComponent, PillarMesh, PillarSlot.Pending);
 
 		EnsurePillarBrickComponent();
 		if (!PillarGpuBuffers.Num() || !PillarGpuBuffers[0].IsValid()) return;
@@ -1713,8 +1639,8 @@ void ACSHouseActor::RebuildPillarMesh(const TArray<FVector>& Centers, const TArr
 	if (!PillarMeshComponent) return;
 	if (Centers.IsEmpty())
 	{
-		PillarMeshComponent->SetGpuMesh(nullptr);
-		PillarMesh = nullptr;   // 下次有柱时重建，别让摆位快路径去搬一份空网格
+		// 下次有柱时重建，别让摆位快路径去搬一份空网格；在途待发的旧柱一并作废。
+		ClearMeshSlot(PillarMeshComponent, PillarMesh, PillarSlot.Pending);
 		UE_LOG(LogTinyGladeHouse, Log, TEXT("[TinyGladeHouse] %s pillars cleared"), *GetName());
 		return;
 	}
@@ -1737,61 +1663,28 @@ void ACSHouseActor::RebuildPillarMesh(const TArray<FVector>& Centers, const TArr
 	S.AttrLayout = FCSGpuMeshCPUData::EAttrLayout::PerVertex;
 
 	const int32 TriangleCount = S.Indices.Num() / 3;
-	PillarBuiltAtTransform = BuildTransform;
+	PillarSlot.BuiltAt = BuildTransform;
 	SubmitPillarMesh(MakeShared<FCSGpuMeshCPUData, ESPMode::ThreadSafe>(MoveTemp(S)));
 	UE_LOG(LogTinyGladeHouse, Log, TEXT("[TinyGladeHouse] %s pillars rebuilt: count=%d tris=%d"), *GetName(), Centers.Num(), TriangleCount);
 }
 
 void ACSHouseActor::SubmitPillarMesh(TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> Snapshot)
 {
-	if (!Snapshot.IsValid() || !PillarMeshComponent) return;
-
-	// 柱子走独立网格（基类上传管道只服务主网格——参数化改造是计划 D9 的后续项，这里内联同一套步骤）。
-	if (!PillarMesh) PillarMesh = NewObject<UCSMesh>(this);
-	PillarMeshComponent->MeshMaterial = PillarMaterial;
-	PillarMesh->SetMaterial(0, PillarMaterial);
-
-	if (PillarMesh->IsEditInFlight())
-	{
-		PendingPillarSnapshot = Snapshot;
-		return;
-	}
-
-	UCSMeshOps::FCSMeshUploadPayload Payload;
-	if (!UCSMeshOps::BuildUploadPayload(*Snapshot, Payload)) return;
-	// 同房体：柱数会随周界（=FootprintSize）跳变，按精确数要就是每次跳变一次阻塞重分配。
-	PillarMesh->EnsureCapacitySync(CSShaperSteps::ReserveCount(Payload.VertexCount), CSShaperSteps::ReserveCount(Payload.IndexCount));
-	PillarMeshComponent->SetGpuMesh(PillarMesh);
-
-	// 柱子只有一个材质槽，不需要排序分段 —— 一次上传就是全部工作。
-	TSharedPtr<UCSMeshOps::FCSMeshUploadPayload, ESPMode::ThreadSafe> Owned =
-		MakeShared<UCSMeshOps::FCSMeshUploadPayload, ESPMode::ThreadSafe>(MoveTemp(Payload));
-	TWeakObjectPtr<ACSHouseActor> WeakThis(this);
-
-	const bool bAccepted = PillarMesh->EditMeshAsync(
-		[Owned](FCSMeshEditContext& Context) { UCSMeshOps::AddCopyFromSnapshotPasses(Context, *Owned); },
-		[WeakThis](bool /*bMeshAlive*/)
-		{
-			if (ACSHouseActor* House = WeakThis.Get()) House->OnPillarEditComplete();
-		});
-
-	if (!bAccepted)
-	{
-		UE_LOG(LogTinyGladeHouse, Warning, TEXT("[TinyGladeHouse] %s async pillar edit refused; falling back to a sync upload."), *GetName());
-		UCSMeshOps::CopyFromMeshSnapshot(PillarMesh, *Snapshot);
-	}
+	// 柱子只有一个材质槽，不需要排序分段 —— 一次上传就是全部工作。容量同房体按台阶预留：
+	// 柱数会随周界（=FootprintSize）跳变，按精确数要就是每次跳变一次阻塞重分配。
+	FCSMeshSlotUpload Upload;
+	Upload.Materials = { PillarMaterial };
+	SubmitMeshSlotAsync(PillarMeshComponent, PillarMesh, PillarSlot, Snapshot, Upload, [this]() { OnPillarEditComplete(); });
 }
 
 void ACSHouseActor::OnPillarEditComplete()
 {
-	if (PendingPillarSnapshot.IsValid())
+	if (const TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> Next = TakePending(PillarSlot.Pending))
 	{
-		TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> Next = MoveTemp(PendingPillarSnapshot);
-		PendingPillarSnapshot.Reset();
 		SubmitPillarMesh(Next);
 		return;
 	}
-	if (ApplyPillarPlacement()) PillarPlacementHash = ComputePlacementHash();
+	if (ApplyPillarPlacement()) PillarSlot.PlacementHash = ComputePlacementHash();
 }
 
 void ACSHouseActor::ResolveVineSpawnTimes(const CSHouseVine::FPlan& Plan, TArray<float>& OutSpawnTimes)
@@ -1875,20 +1768,15 @@ void ACSHouseActor::SubmitVineTube(TSharedPtr<CSHouseVine::FTubePath, ESPMode::T
 {
 	if (!Path.IsValid() || !VineTubeComponent) return;
 
-	if (!VineTubeMesh) VineTubeMesh = NewObject<UCSMesh>(this);
+	EnsureSlotMesh(VineTubeComponent, VineTubeMesh);   // 归藤管组件所有：组件销毁时它自己还显存
 	// 走 MID 而不是材质资产本身：`VineGrowSpeed` 要下推（见 VineBranchGrowMID 的注释）。
 	UMaterialInterface* TubeMaterial = VineBranchGrowMID
 		? static_cast<UMaterialInterface*>(VineBranchGrowMID) : ToRawPtr(VineBranchMaterial);
-	VineTubeComponent->MeshMaterial = TubeMaterial;
-	VineTubeMesh->SetMaterial(0, TubeMaterial);
+	BindMeshSlotMaterials(VineTubeComponent, VineTubeMesh, { TubeMaterial });
 
 	// 在途被拒 ⇒ 只留**最新**那一份（不是排队）。拖尺寸时每 tick 都会来一次，排队的话
-	// 松手后要把整段拖动重放一遍；只留最新则最多落后一帧。同 SubmitPillarMesh。
-	if (VineTubeMesh->IsEditInFlight())
-	{
-		PendingVineTubePath = Path;
-		return;
-	}
+	// 松手后要把整段拖动重放一遍；只留最新则最多落后一帧。同基类的网格槽。
+	if (ParkIfInFlight(VineTubeMesh, PendingVineTubePath, Path)) return;
 
 	VineTubeComponent->SetGpuMesh(VineTubeMesh);
 
@@ -1918,46 +1806,21 @@ void ACSHouseActor::SubmitVineTube(TSharedPtr<CSHouseVine::FTubePath, ESPMode::T
 
 void ACSHouseActor::OnVineTubeEditComplete()
 {
-	if (PendingVineTubePath.IsValid())
-	{
-		TSharedPtr<CSHouseVine::FTubePath, ESPMode::ThreadSafe> Next = MoveTemp(PendingVineTubePath);
-		PendingVineTubePath.Reset();
-		SubmitVineTube(Next);
-	}
+	if (const TSharedPtr<CSHouseVine::FTubePath, ESPMode::ThreadSafe> Next = TakePending(PendingVineTubePath)) SubmitVineTube(Next);
 }
 
 bool ACSHouseActor::ApplyPillarPlacement()
 {
-	if (!PillarMesh) return false;
-
-	const FTransform NewWorld = GetBuildTransform();
-	const FTransform Delta = PillarBuiltAtTransform.Inverse() * NewWorld;
-	if (Delta.Equals(FTransform::Identity, 1.0e-4)) return true;
-	if (PillarMesh->IsEditInFlight()) return false;
-
-	TWeakObjectPtr<ACSHouseActor> WeakThis(this);
-	const bool bAccepted = PillarMesh->EditMeshAsync(
-		[Delta](FCSMeshEditContext& Context) { UCSMeshOps::AddTransformPasses(Context, Delta); },
-		[WeakThis](bool /*bMeshAlive*/) { if (ACSHouseActor* House = WeakThis.Get()) House->OnPillarEditComplete(); });
-	if (!bAccepted) return false;
-
-	PillarBuiltAtTransform = NewWorld;
-	return true;
+	return ApplyMeshSlotPlacement(PillarMesh, PillarSlot, GetBuildTransform(), [this]() { OnPillarEditComplete(); });
 }
 
 // -----------------------------------------------------------------------------
 // Frame（门框砖）
 // -----------------------------------------------------------------------------
 
-void ACSHouseActor::EnsureFrameComponent()
+CSShaperSteps::EHandoverResult ACSHouseActor::EnsureFrameComponent()
 {
-	// 蓝图 actor 重跑构造脚本会把实例组件销毁，指针会失效 —— 先判再补。
-	if (!IsValid(FrameComponent))
-	{
-		FrameComponent = NewObject<UCSGpuInstancedMeshComponent>(this, NAME_None, RF_Transient);
-		FrameComponent->SetupAttachment(RootComponent);
-		FrameComponent->RegisterComponent();   // 未注册时任何变更都会释放 GPU 网格，必须先注册再喂
-	}
+	CSShaperSteps::EnsureInstancedComponent(this, FrameComponent);
 	FrameComponent->InstanceMaterial = FrameMaterial;
 	FrameComponent->SetBaseMesh(FrameBrickMesh);   // 同一张网格时内部直接早退
 
@@ -1965,7 +1828,7 @@ void ACSHouseActor::EnsureFrameComponent()
 	{
 		CSShaperSteps::ReleaseOnRenderThread(FrameGpuBuffers);
 		FrameGpuBuffers.SetNum(1);
-		FrameHandedCapacities.Reset();
+		FrameHandover.Capacities.Reset();
 	}
 
 	// 剔除球与三轴块尺寸都从基础网格的包围盒推：TG 的 brick 是 100³ 居中盒，所以
@@ -1987,7 +1850,7 @@ void ACSHouseActor::EnsureFrameComponent()
 		float(FrameBrickLength * Bloat / FMath::Max(MeshSize.Y, 1.0)),
 		float(Thickness / FMath::Max(MeshSize.Z, 1.0)));
 
-	if (!FrameBrickMesh || !FrameComponent) return;
+	if (!FrameBrickMesh || !FrameComponent) return CSShaperSteps::EHandoverResult::UpToDate;
 
 	// **容量与实例源交接都在这里一次付清** —— 两者都是阻塞的（前者要在渲染线程分配，
 	// 后者内部走 SetStreamLayoutSync + 立刻重建 render state）。留给 RebuildFrame 去做的话，
@@ -2008,33 +1871,14 @@ void ACSHouseActor::EnsureFrameComponent()
 	// ⚠️ 这个盒是按 footprint 在**构建空间**（`GetBuildTransform()`，只取 yaw）里量的，而实例
 	// 原点存在**组件空间**里 —— 两者只有在房子没有 pitch/roll/缩放时才重合。状态文件
 	// 「已知潜伏问题」那条说的就是这个不对称（裁决一要求"按同一个变换口径写死"）：
-	// 盒子跟着做一次 构建空间 → 组件空间 的映射，剩下的两处口径就自洽了。
-	// 只有 yaw 时这一步是恒等变换，逐位不改现状；也因此拖动/旋转期不会多出一次交接。
-	const FTransform BuildToComponent = GetBuildTransform() * FrameComponent->GetComponentTransform().Inverse();
-	if (!BuildToComponent.Equals(FTransform::Identity, 1.0e-4)) LocalBounds = LocalBounds.TransformBy(BuildToComponent);
+	// 盒子跟着做一次 构建空间 → 组件空间 的映射，剩下的两处口径就自洽了（五家同一个 helper）。
+	LocalBounds = CSHouse_BuildBoundsToComponent(GetBuildTransform(), FrameComponent, LocalBounds);
 
-	if (!bForceFullRebuild && FrameHandedLocalBounds.IsValid) LocalBounds += FrameHandedLocalBounds;
-
-	const bool bNeedHandover = FrameHandedCapacities.Num() != 1
-		|| FrameHandedCapacities[0] != FrameGpuBuffers[0].Capacity
-		|| !FrameHandedLocalBounds.IsValid
-		|| !FrameHandedLocalBounds.Min.Equals(LocalBounds.Min, 1.0)
-		|| !FrameHandedLocalBounds.Max.Equals(LocalBounds.Max, 1.0)
-		// 蓝图重跑构造脚本会销毁并重建实例组件：新组件身上没有实例源，缓存说"已交接"就会
-		// 永远画不出东西 —— 拿组件自己的状态兜底。
-		|| !FrameComponent->HasInstanceSourceGPU();
-	if (!bNeedHandover || !FrameGpuBuffers[0].IsValid()) return;
-
-	FCSGpuInstanceSourceGPU Source;
-	Source.PackedInstances = FrameGpuBuffers[0].PackedInstances;   // 保留自己的引用，重散布还要用
-	Source.Counter = FrameGpuBuffers[0].Counter;
-	Source.Capacity = FrameGpuBuffers[0].Capacity;
-	Source.LocalBounds = LocalBounds;
-	FrameComponent->SetInstanceSourceGPU(Source);
-
-	FrameHandedCapacities.SetNumUninitialized(1);
-	FrameHandedCapacities[0] = FrameGpuBuffers[0].Capacity;
-	FrameHandedLocalBounds = LocalBounds;
+	LocalBounds = CSShaperSteps::MergeHandoverBounds(LocalBounds, FrameHandover, bForceFullRebuild);
+	// 门框砖没有生长动画，不吃逐实例 custom data —— 交了只会让剔除 pass 多抄一遍全零。
+	return CSShaperSteps::HandOverInstanceSource(
+		CSShaperSteps::MakeHandoverSource(FrameComponent, FrameGpuBuffers[0], /*bWithCustomData*/ false),
+		LocalBounds, FrameHandover);
 }
 
 uint32 ACSHouseActor::BuildFrameArches(TArray<CSHouseFrame::FElement>& OutElements, int32& OutBrickCount) const
@@ -2098,9 +1942,7 @@ uint32 ACSHouseActor::BuildFrameArches(TArray<CSHouseFrame::FElement>& OutElemen
 			CSHouse_Q(E.Path.CenterS, 1), CSHouse_Q(E.Path.Radius, 1),
 			CSHouse_Q(E.Path.BaseZ, 1), CSHouse_Q(E.Path.TopZ, 1),
 			CSHouse_Q(E.Path.LeftS, 1), CSHouse_Q(E.Path.RightS, 1),
-			int32(E.Path.MidKind) | (E.Path.bLeftJamb ? 0x10 : 0) | (E.Path.bRightJamb ? 0x20 : 0)
-			// 窗台底边那一段也决定砖摆在哪（它改变 TotalLen ⇒ 改变砖数与铺装缩放），必须入哈希。
-			| (E.Path.bSill ? 0x40 : 0) });
+			int32(E.Path.MidKind) | (E.Path.bLeftJamb ? 0x10 : 0) | (E.Path.bRightJamb ? 0x20 : 0) });
 	}
 	// 胀大系数与三轴尺寸只改 `BlockSize`、一条路都不改，而 `RebuildFrame` 的早退门看的就是
 	// 这个哈希 —— 不把它们算进来，改了系数就只会静默无效（与 D14 开篇 FrameMaterial 同型）。
@@ -2116,7 +1958,7 @@ uint32 ACSHouseActor::BuildFrameArches(TArray<CSHouseFrame::FElement>& OutElemen
 
 void ACSHouseActor::RebuildFrame()
 {
-	EnsureFrameComponent();
+	const CSShaperSteps::EHandoverResult FrameHandoverResult = EnsureFrameComponent();
 
 	TArray<CSHouseFrame::FElement> Elements;
 	int32 BrickCount = 0;
@@ -2159,7 +2001,7 @@ void ACSHouseActor::RebuildFrame()
 
 	// ⚠️ **三个都是 0（这栋房一块砖都没有）时合出来的必须还是 0**，不能直接 `CSHouse_Hash({0,0,0})`
 	// —— 那是一个非零常数，于是"没有砖"的房子每次重求值都判成"变了"：走一趟
-	// `ClearInstanceSourceGPU()`（它把 `FrameHandedCapacities` 清空），下一次 `EnsureFrameComponent`
+	// `ClearInstanceSourceGPU()`（它把 `FrameHandover` 清空），下一次 `EnsureFrameComponent`
 	// 就得重走阻塞的 `SetInstanceSourceGPU`。**实测代价是每轮 2 次阻塞刷新**，四条零阻塞断言
 	// （画一笔 / 拖带柱的房子 / 带藤拖 / 带摆件拖 —— 全是没有门因而没有砖的那栋）当场从 0 变成 2。
 	// 有砖的房子看不见这条，因为它的哈希本来就非零。
@@ -2168,9 +2010,14 @@ void ACSHouseActor::RebuildFrame()
 	const uint32 NewHash = (ArchHash == 0 && SeamHash == 0 && CornerPierHash == 0 && QuoinHash == 0 && TrimHash == 0 && BrickWallHash == 0)
 		? 0u : CSHouse_Hash({ int32(ArchHash), int32(SeamHash), int32(CornerPierHash), int32(QuoinHash), int32(TrimHash), int32(BrickWallHash), int32(FrameHash) });
 
-	bool bBuffersReady = FrameGpuBuffers.Num() == 1 && FrameHandedCapacities.Num() == 1;
+	bool bBuffersReady = FrameGpuBuffers.Num() == 1 && FrameHandover.Capacities.Num() == 1;
 	for (const CSShaperSteps::FPaletteBuffers& Buffers : FrameGpuBuffers) bBuffersReady &= Buffers.IsValid();
-	if (NewHash == FrameDescHash && CurrentFrameBrickCount == BrickCount && (BrickCount == 0 || bBuffersReady)) return;
+	// 刚交接过（扩容换了清零的新 buffer，或包围盒变了）就必须重排一次：哈希没变也不能拿它当"砖还在"
+	// （2026-09-07 审查 B1：以前这道门只看哈希与数量，扩容那一轮画的是池子残值）。有砖才强制 ——
+	// 没砖时 counter 本来就该是 0，强制反而会走进下面的撤源分支，把交接缓存清空，下一轮再交、再撤，
+	// 每轮白付两次阻塞（正是上面那段注释里那种失败形状）。
+	const bool bMustRescatter = FrameHandoverResult == CSShaperSteps::EHandoverResult::HandedOver && BrickCount > 0;
+	if (!bMustRescatter && NewHash == FrameDescHash && CurrentFrameBrickCount == BrickCount && (BrickCount == 0 || bBuffersReady)) return;
 
 	FrameDescHash = NewHash;
 	CurrentFrameBrickCount = BrickCount;
@@ -2181,7 +2028,7 @@ void ACSHouseActor::RebuildFrame()
 	{
 		// ⚠️ **撤实例源之前必须先把 counter 清零。**
 		//
-		// 撤掉之后 `FrameHandedCapacities` 被清空，于是**下一轮 `EnsureFrameComponent` 会把同一批
+		// 撤掉之后 `FrameHandover` 被清空，于是**下一轮 `EnsureFrameComponent` 会把同一批
 		// buffer 重新交接回去** —— 而那批 buffer 的 counter 还留着上一次的砖数，组件照着它又画了
 		// 一遍上一代的实例。症状是"砖数已经是 0 了、画面上砖还立着"，而
 		// `GetFrameBrickCount()` / 三角形数 / 零阻塞**四条断言全部照绿**。
@@ -2197,8 +2044,7 @@ void ACSHouseActor::RebuildFrame()
 			CSHouseFrame::Scatter(Elements, FrameGpuBuffers, WorldToComponent);
 		}
 		if (FrameComponent) FrameComponent->ClearInstanceSourceGPU();
-		FrameHandedCapacities.Reset();
-		FrameHandedLocalBounds = FBox(ForceInit);
+		FrameHandover.Reset();
 		return;
 	}
 
@@ -2575,6 +2421,7 @@ uint32 ACSHouseActor::BuildTrimBricks(TArray<CSHouseFrame::FElement>& InOutEleme
 
 bool ACSHouseActor::IsSeamDrawable(FString& OutReason) const
 {
+	FlushPendingReevaluate();
 	OutReason = GetSeamUndrawableReason();
 	if (!OutReason.IsEmpty())
 	{
@@ -2588,6 +2435,7 @@ bool ACSHouseActor::IsSeamDrawable(FString& OutReason) const
 
 FString ACSHouseActor::GetSeamUndrawableReason() const
 {
+	FlushPendingReevaluate();
 	// 逐环检查渲染那一侧 —— 交点数 / 砖数 / 裁剪段数三条数值断言对这些一个字都说不了。
 	if (!bSeamEnabled) return TEXT("bSeamEnabled 关着");
 	if (CurrentSeamCornerCount <= 0) return TEXT("这栋房没有和任何邻居真的相交（触发条件是 footprint 真重叠，不是靠得近）");
@@ -2638,6 +2486,7 @@ FString ACSHouseActor::GetSeamUndrawableReason() const
 
 bool ACSHouseActor::IsWindowDrawable(FString& OutReason) const
 {
+	FlushPendingReevaluate();
 	OutReason = GetWindowUndrawableReason();
 	if (!OutReason.IsEmpty())
 	{
@@ -2651,6 +2500,7 @@ bool ACSHouseActor::IsWindowDrawable(FString& OutReason) const
 
 FString ACSHouseActor::GetWindowUndrawableReason() const
 {
+	FlushPendingReevaluate();
 	// 逐环检查渲染那一侧 —— readback 断言对这些一个字都说不了（同 IsVineDrawable / IsDecorDrawable）。
 	if (!bWindowsEnabled) return TEXT("bWindowsEnabled 关着");
 	if (Windows.IsEmpty()) return TEXT("Windows 列表是空的（窗只从这份显式列表来）");
@@ -2675,46 +2525,16 @@ FString ACSHouseActor::GetWindowUndrawableReason() const
 			*WallMaterial->GetName());
 	}
 
-	// ---- 洞缘那一半 ----
+	// ---- 洞缘那一半：不归房子，所以一道砖判据都不设 ----
 	//
-	// ⚠️ **2026-09-06 起窗不出框砖**（裁决「附属物持有 mesh」的直接后果，见 `BuildEdgeElements`）。
-	// 所以这里**不能再要求"排出过框砖"**：那道判据现在量的是**门**。留着它有两个方向的坏处，
-	// 而且都不会报错 ——
-	//   ① 一栋只有窗、没有门的房子会被误判成"不可画"（框砖计数为零，可窗好端端地在那儿）；
-	//   ② 演示关卡里门恰好在场 ⇒ 它**因为错误的理由通过**，比不查还坏（下面回归里那条
-	//      "关掉门/角石/包边、只剩窗"就是专门来钉这一枪的）。
+	// ⚠️ **窗周围没有任何砖**：2026-09-06 起窗不出框砖（洞缘归标记自带的 `OpeningMesh`，见
+	// `ACSWindowMarker`），2026-09-10 起也不再把砖层算作窗的洞缘补全。别把门框砖 / 砖层的健康
+	// 挂回这里 —— 演示关卡里门恰好在排砖，窗会**因为错误的理由通过**；关掉门 / 角石 / 包边之后，
+	// 一栋只有窗的房子又会被误判成"不可画"（回归里"只剩窗"那一枪钉的就是它）。砖组件本身的
+	// 健康也不归窗管：接缝判据查它的全链（有接缝时），`DebugGetGpuAssetMismatchSync` 查画的是不是那块砖。
 	//
-	// 洞缘现在归谁：标记自带的 `OpeningMesh`（`ACSWindowMarker`），砖层开着时则归砖层。
 	// ⚠️ 属性面板 `Windows` 那一份没有标记、没有网格 ⇒ 洞缘是**裸的** —— 这是已知并接受的代价
 	// （那条路在计划里一直写着是"授权 / 测试用的便利入口"），所以它**不构成**"不可画"。
-	if (bBrickWallEnabled && CurrentBrickWallBrickCount <= 0)
-	{
-		return TEXT("砖层开着却一块砖都没排出来（洞缘会露出裁剪断口）");
-	}
-
-	// 砖那个组件只要还有人在用（门框 / 接缝 / 角石 / 包边 / 砖层任意一家），它的健康就仍要查：
-	// 下面这些坑会把砖**静默**画成一片灰或干脆不画，而砖数、三角数、零阻塞每一条断言照绿。
-	// 砖层开着时洞缘正是靠它盖的，所以这段对窗仍然有意义 —— 只是不再以"框砖存在"为前提。
-	if (bFrameEnabled && FrameBrickMesh && CurrentFrameBrickCount > 0)
-	{
-		if (!IsValid(FrameComponent)) return TEXT("砖：没有渲染组件");
-		if (!FrameComponent->IsRegistered()) return TEXT("砖：渲染组件没注册");
-		if (!FrameComponent->IsVisible()) return TEXT("砖：渲染组件不可见");
-		if (!FrameComponent->HasInstanceSourceGPU()) return TEXT("砖：实例源没交接");
-		if (FrameComponent->GetBaseMeshSnapshot().Positions.Num() < 3) return TEXT("砖：基础网格快照是空的");
-		if (!FrameComponent->GetGpuMesh()) return TEXT("砖：GPU 网格没分配");
-		const UMaterialInterface* BrickMaterial = FrameComponent->InstanceMaterial;
-		if (!BrickMaterial) return TEXT("砖：没有绑材质（会用引擎默认表面材质画成一片灰）");
-		// ⚠️ 没勾 `bUsedWithInstancedStaticMeshes` 的材质在实例路径上会被引擎**静默替换**成默认材质，
-		// 症状与"没绑材质"逐像素相同。所以"材质支持实例化"必须是显式判据，不能只查材质非空。
-		const UMaterial* BrickBase = BrickMaterial->GetMaterial();
-		if (!BrickBase || !BrickBase->bUsedWithInstancedStaticMeshes)
-		{
-			return FString::Printf(
-				TEXT("砖：材质 '%s' 的母材质没有勾 bUsedWithInstancedStaticMeshes（引擎会静默换成默认材质）"),
-				*BrickMaterial->GetName());
-		}
-	}
 	return FString();
 }
 
@@ -2763,18 +2583,12 @@ void ACSHouseActor::BuildVineStrips(TArray<CSHouseVine::FWallStrip>& OutStrips) 
 	}
 }
 
-void ACSHouseActor::EnsureVineComponents()
+CSShaperSteps::EHandoverResult ACSHouseActor::EnsureVineComponents()
 {
-	// 蓝图 actor 重跑构造脚本会把实例组件销毁，指针会失效 —— 先判再补（同 EnsureFrameComponent）。
+	// 新组件身上没有基础网格快照。三条按下标对齐，任一条是新的就整批重建。
 	auto EnsureOne = [this](TObjectPtr<UCSGpuInstancedMeshComponent>& Component)
 	{
-		if (!IsValid(Component))
-		{
-			Component = NewObject<UCSGpuInstancedMeshComponent>(this, NAME_None, RF_Transient);
-			Component->SetupAttachment(RootComponent);
-			Component->RegisterComponent();   // 未注册时任何变更都会释放 GPU 网格，必须先注册再喂
-			bVineBaseMeshReady = false;       // 新组件身上没有基础网格快照
-		}
+		if (CSShaperSteps::EnsureInstancedComponent(this, Component)) bVineBaseMeshReady = false;
 	};
 	EnsureOne(VineBranchComponent);
 	EnsureOne(VineLeafComponent);
@@ -2842,7 +2656,7 @@ void ACSHouseActor::EnsureVineComponents()
 	{
 		CSShaperSteps::ReleaseOnRenderThread(VineGpuBuffers);
 		VineGpuBuffers.SetNum(CSHouseVine::Palette_Num);
-		VineHandedCapacities.Reset();
+		VineHandover.Capacities.Reset();
 		bVineBaseMeshReady = false;
 	}
 
@@ -2900,7 +2714,7 @@ void ACSHouseActor::EnsureVineComponents()
 		if (bFlowerOk) SetBlock(VineGpuBuffers[CSHouseVine::Palette_Flower], FlowerData, FMath::Max(VineFlowerSize, 2.0f));
 	}
 
-	if (!bVineBaseMeshReady) return;
+	if (!bVineBaseMeshReady) return CSShaperSteps::EHandoverResult::UpToDate;
 
 	// 容量按**配置上限**一次付清，之后永不扩容（零阻塞纪律）。上限是纯配置量：
 	// 四面墙的总周长 / 间距 × 每根最多几段。规划真的排超了就在 kernel 里截断 ——
@@ -2929,47 +2743,21 @@ void ACSHouseActor::EnsureVineComponents()
 	const double Top = CSShaperSteps::QuantizeUp(CSHouseRoof_RidgeZ(GetRoofDesc())
 		+ FMath::Max(VineLeafSize, VineFlowerSize));
 	FBox LocalBounds(FVector(-Reach, -Reach, -VineLeafSize), FVector(Reach, Reach, Top));
-	if (!bForceFullRebuild && VineHandedLocalBounds.IsValid) LocalBounds += VineHandedLocalBounds;
+	// 三个调色板的组件是同一棵挂接树上的兄弟、变换相同，取叶那一个即可（藤没有叶就不会走到这里）。
+	LocalBounds = CSHouse_BuildBoundsToComponent(GetBuildTransform(), VineLeafComponent.Get(), LocalBounds);
+	LocalBounds = CSShaperSteps::MergeHandoverBounds(LocalBounds, VineHandover, bForceFullRebuild);
 
 	UCSGpuInstancedMeshComponent* Components[CSHouseVine::Palette_Num] =
 		{ VineBranchComponent, VineLeafComponent, VineFlowerComponent };
-
-	bool bNeedHandover = VineHandedCapacities.Num() != CSHouseVine::Palette_Num
-		|| !VineHandedLocalBounds.IsValid
-		|| !VineHandedLocalBounds.Min.Equals(LocalBounds.Min, 1.0)
-		|| !VineHandedLocalBounds.Max.Equals(LocalBounds.Max, 1.0);
-	for (int32 Index = 0; !bNeedHandover && Index < CSHouseVine::Palette_Num; ++Index)
-	{
-		// 蓝图重跑构造脚本会销毁并重建实例组件：新组件身上没有实例源，缓存说"已交接"就会
-		// 永远画不出东西 —— 拿组件自己的状态兜底（同 EnsureFrameComponent）。
-		bNeedHandover = VineHandedCapacities[Index] != VineGpuBuffers[Index].Capacity
-			|| !Components[Index]->HasInstanceSourceGPU();
-	}
-	if (!bNeedHandover) return;
+	TArray<CSShaperSteps::FHandoverSource, TInlineAllocator<CSHouseVine::Palette_Num>> Sources;
 	for (int32 Index = 0; Index < CSHouseVine::Palette_Num; ++Index)
 	{
-		if (!VineGpuBuffers[Index].IsValid()) return;
+		// 叶/花的生长动画靠 custom data（枝走管子，不吃这条，但三条一起交省一个分支）。
+		// 漏传的症状是材质里的 `Per Instance Custom Data` 恒读 0 ⇒ 叶子一出现就是长成的，
+		// 而不报任何错。
+		Sources.Add(CSShaperSteps::MakeHandoverSource(Components[Index], VineGpuBuffers[Index], /*bWithCustomData*/ true));
 	}
-
-	for (int32 Index = 0; Index < CSHouseVine::Palette_Num; ++Index)
-	{
-		FCSGpuInstanceSourceGPU Source;
-		Source.PackedInstances = VineGpuBuffers[Index].PackedInstances;   // 保留自己的引用，重打包还要用
-		Source.Counter = VineGpuBuffers[Index].Counter;
-		// 叶/花的生长动画靠它（枝走管子，不吃这条）。漏传的症状是材质里的
-		// `Per Instance Custom Data` 恒读 0 ⇒ 叶子一出现就是长成的，而不报任何错。
-		Source.CustomData = VineGpuBuffers[Index].CustomData;
-		Source.Capacity = VineGpuBuffers[Index].Capacity;
-		Source.LocalBounds = LocalBounds;
-		Components[Index]->SetInstanceSourceGPU(Source);
-	}
-
-	VineHandedCapacities.SetNumUninitialized(CSHouseVine::Palette_Num);
-	for (int32 Index = 0; Index < CSHouseVine::Palette_Num; ++Index)
-	{
-		VineHandedCapacities[Index] = VineGpuBuffers[Index].Capacity;
-	}
-	VineHandedLocalBounds = LocalBounds;
+	return CSShaperSteps::HandOverInstanceSources(Sources, LocalBounds, VineHandover);
 }
 
 void ACSHouseActor::RebuildVine()
@@ -2981,19 +2769,16 @@ void ACSHouseActor::RebuildVine()
 		if (CurrentVineSegmentCount != 0 || CurrentVineLeafCount != 0 || CurrentVineFlowerCount != 0)
 		{
 			// ⚠️ **撤实例源之前必须先把 counter 清零**（与 `RebuildFrame` 那条同源，
-			// 门框砖已经因此在画面上留过 12 层砖）：撤掉之后 `VineHandedCapacities` 被清空，
+			// 门框砖已经因此在画面上留过 12 层砖）：撤掉之后 `VineHandover` 被清空，
 			// 下一次 `EnsureVineComponents` 会把同一批 buffer 交回组件。这条路上的窗口是
 			// **重新打开藤之后 `bVineBaseMeshReady` 为假**那一次 —— 那时交接已经发生，
 			// 而 `CSHouseVine::Pack`（它自己的空表分支会清零）根本走不到。
 			CSShaperSteps::ZeroCounters(VineGpuBuffers);
-			if (VineTubeComponent) VineTubeComponent->SetGpuMesh(nullptr);
-			VineTubeMesh = nullptr;   // 下次有藤时重建，别让空网格留在组件上
-			PendingVineTubePath.Reset();
+			ClearMeshSlot(VineTubeComponent, VineTubeMesh, PendingVineTubePath);   // 下次有藤时重建，别让空网格留在组件上
 			if (VineBranchComponent) VineBranchComponent->ClearInstanceSourceGPU();
 			if (VineLeafComponent) VineLeafComponent->ClearInstanceSourceGPU();
 			if (VineFlowerComponent) VineFlowerComponent->ClearInstanceSourceGPU();
-			VineHandedCapacities.Reset();
-			VineHandedLocalBounds = FBox(ForceInit);
+			VineHandover.Reset();
 			CurrentVineSegmentCount = 0;
 			CurrentVineLeafCount = 0;
 			CurrentVineFlowerCount = 0;
@@ -3002,7 +2787,7 @@ void ACSHouseActor::RebuildVine()
 		return;
 	}
 
-	EnsureVineComponents();
+	const CSShaperSteps::EHandoverResult VineHandoverResult = EnsureVineComponents();
 	if (!bVineBaseMeshReady) return;
 
 	TArray<CSHouseVine::FWallStrip> Strips;
@@ -3070,7 +2855,9 @@ void ACSHouseActor::RebuildVine()
 	{
 		bBuffersReady = VineGpuBuffers[Index].IsValid();
 	}
-	if (NewHash == VineDescHash && VineHandedCapacities.Num() == CSHouseVine::Palette_Num && bBuffersReady) return;
+	// 刚交接过（扩容换了清零的新 buffer / 包围盒变了）就必须重打包，哈希没变也不能早退（审查 B1）。
+	const bool bMustRepack = VineHandoverResult == CSShaperSteps::EHandoverResult::HandedOver;
+	if (!bMustRepack && NewHash == VineDescHash && VineHandover.Capacities.Num() == CSHouseVine::Palette_Num && bBuffersReady) return;
 
 	VineDescHash = NewHash;
 	CurrentVineSegmentCount = Plan.Branch.Num();
@@ -3137,6 +2924,7 @@ void ACSHouseActor::RebuildVine()
 
 bool ACSHouseActor::IsVineDrawable(FString& OutReason) const
 {
+	FlushPendingReevaluate();
 	OutReason = GetVineUndrawableReason();
 	if (!OutReason.IsEmpty())
 	{
@@ -3168,6 +2956,7 @@ bool ACSHouseActor::IsVineSuppressedByGroundGap() const
 
 FString ACSHouseActor::GetVineUndrawableReason() const
 {
+	FlushPendingReevaluate();
 	FString OutReason;
 	// 逐环检查渲染那一侧 —— readback 断言对这些一个字都说不了（见头文件里那段教训）。
 	if (!bVineEnabled) { OutReason = TEXT("bVineEnabled 关着"); return OutReason; }
@@ -3313,23 +3102,17 @@ CSHouseTile::FParams ACSHouseActor::MakeRoofTileParams() const
 	return Params;
 }
 
-void ACSHouseActor::EnsureRoofTileComponent()
+CSShaperSteps::EHandoverResult ACSHouseActor::EnsureRoofTileComponent()
 {
-	// 蓝图 actor 重跑构造脚本会把实例组件销毁，指针会失效 —— 先判再补（同 EnsureVineComponents）。
-	if (!IsValid(RoofTileComponent))
-	{
-		RoofTileComponent = NewObject<UCSGpuInstancedMeshComponent>(this, NAME_None, RF_Transient);
-		RoofTileComponent->SetupAttachment(RootComponent);
-		RoofTileComponent->RegisterComponent();   // 未注册时任何变更都会释放 GPU 网格，必须先注册再喂
-		bRoofTileBaseMeshReady = false;           // 新组件身上没有基础网格快照
-	}
+	// 新组件身上没有基础网格快照，得重建。
+	if (CSShaperSteps::EnsureInstancedComponent(this, RoofTileComponent)) bRoofTileBaseMeshReady = false;
 	RoofTileComponent->InstanceMaterial = RoofMaterial;
 
 	if (RoofTileGpuBuffers.Num() != 1)
 	{
 		CSShaperSteps::ReleaseOnRenderThread(RoofTileGpuBuffers);
 		RoofTileGpuBuffers.SetNum(1);
-		RoofTileHandedCapacity = 0;
+		RoofTileHandover.Capacities.Reset();
 		bRoofTileBaseMeshReady = false;
 	}
 
@@ -3381,7 +3164,7 @@ void ACSHouseActor::EnsureRoofTileComponent()
 		RoofTileMeshBuiltFrom = bOk ? RoofTileMesh : nullptr;
 		bRoofTileBaseMeshReady = bOk;
 	}
-	if (!bRoofTileBaseMeshReady) return;
+	if (!bRoofTileBaseMeshReady) return CSShaperSteps::EHandoverResult::UpToDate;
 
 	// 面内那两轴**每次都重算**，不能留在上面那个只跑一次的快照块里：`bRoofTileSwapAxes` 是
 	// 交互旋钮，判定留在快照里的话勾了它什么都不会发生（"换了资产但什么都没发生"的同族失效）。
@@ -3418,26 +3201,11 @@ void ACSHouseActor::EnsureRoofTileComponent()
 	const double Top = CSShaperSteps::QuantizeUp(
 		double(CSHouseRoof_RidgeZ(Roof)) + double(RoofTileStandOff) + double(RoofTileLiftJitter) + TileReach);
 	FBox LocalBounds(FVector(-Reach, -Reach, -TileReach), FVector(Reach, Reach, Top));
-	if (!bForceFullRebuild && RoofTileHandedLocalBounds.IsValid) LocalBounds += RoofTileHandedLocalBounds;
-
-	// 蓝图重跑构造脚本会销毁并重建实例组件：新组件身上没有实例源，缓存说"已交接"就会
-	// 永远画不出东西 —— 拿组件自己的状态兜底（同 EnsureVineComponents）。
-	const bool bNeedHandover = RoofTileHandedCapacity != RoofTileGpuBuffers[0].Capacity
-		|| !RoofTileComponent->HasInstanceSourceGPU()
-		|| !RoofTileHandedLocalBounds.IsValid
-		|| !RoofTileHandedLocalBounds.Min.Equals(LocalBounds.Min, 1.0)
-		|| !RoofTileHandedLocalBounds.Max.Equals(LocalBounds.Max, 1.0);
-	if (!bNeedHandover || !RoofTileGpuBuffers[0].IsValid()) return;
-
-	FCSGpuInstanceSourceGPU Source;
-	Source.PackedInstances = RoofTileGpuBuffers[0].PackedInstances;   // 保留自己的引用，重打包还要用
-	Source.Counter = RoofTileGpuBuffers[0].Counter;
-	Source.Capacity = RoofTileGpuBuffers[0].Capacity;
-	Source.LocalBounds = LocalBounds;
-	RoofTileComponent->SetInstanceSourceGPU(Source);
-
-	RoofTileHandedCapacity = RoofTileGpuBuffers[0].Capacity;
-	RoofTileHandedLocalBounds = LocalBounds;
+	LocalBounds = CSHouse_BuildBoundsToComponent(GetBuildTransform(), RoofTileComponent, LocalBounds);
+	LocalBounds = CSShaperSteps::MergeHandoverBounds(LocalBounds, RoofTileHandover, bForceFullRebuild);
+	return CSShaperSteps::HandOverInstanceSource(
+		CSShaperSteps::MakeHandoverSource(RoofTileComponent, RoofTileGpuBuffers[0], /*bWithCustomData*/ false),
+		LocalBounds, RoofTileHandover);
 }
 
 void ACSHouseActor::RebuildRoofTiles()
@@ -3450,15 +3218,14 @@ void ACSHouseActor::RebuildRoofTiles()
 			// 否则下一次 `EnsureRoofTileComponent` 把同一批带陈旧计数器的 buffer 交回组件。
 			CSShaperSteps::ZeroCounters(RoofTileGpuBuffers);
 			if (IsValid(RoofTileComponent)) RoofTileComponent->ClearInstanceSourceGPU();
-			RoofTileHandedCapacity = 0;
-			RoofTileHandedLocalBounds = FBox(ForceInit);
+			RoofTileHandover.Reset();
 			CurrentRoofTileCount = 0;
 			RoofTileDescHash = 0;
 		}
 		return;
 	}
 
-	EnsureRoofTileComponent();
+	const CSShaperSteps::EHandoverResult RoofTileHandoverResult = EnsureRoofTileComponent();
 	if (!bRoofTileBaseMeshReady || RoofTileGpuBuffers.Num() != 1) return;
 
 	const FCSRoofDesc Roof = GetRoofDesc();
@@ -3483,7 +3250,11 @@ void ACSHouseActor::RebuildRoofTiles()
 		CSHouse_Q(RoofTileAxes.NativeCentre.X, 0.1), CSHouse_Q(RoofTileAxes.NativeCentre.Y, 0.1),
 		CSHouse_Q(RoofTileAxes.NativeCentre.Z, 0.1) };
 	const uint32 NewHash = CSHouse_Hash(HashInput);
-	if (NewHash == RoofTileDescHash && RoofTileHandedCapacity == RoofTileGpuBuffers[0].Capacity
+	// 交接结果也进早退门（审查 B1）：容量比对挡的是"扩容后没重排"，交接结果还多挡一种 ——
+	// 包围盒变了、同一批 buffer 重新交出去的那一趟，重排一次是便宜的保险。
+	if (RoofTileHandoverResult != CSShaperSteps::EHandoverResult::HandedOver
+		&& NewHash == RoofTileDescHash && RoofTileHandover.Capacities.Num() == 1
+		&& RoofTileHandover.Capacities[0] == RoofTileGpuBuffers[0].Capacity
 		&& RoofTileGpuBuffers[0].IsValid())
 	{
 		return;
@@ -3506,6 +3277,7 @@ void ACSHouseActor::RebuildRoofTiles()
 
 FString ACSHouseActor::GetRoofTileUndrawableReason() const
 {
+	FlushPendingReevaluate();
 	// 逐环检查渲染那一侧 —— readback 断言对这些一个字都说不了（见头文件里那段教训）。
 	if (!bRoofTilesEnabled) return TEXT("bRoofTilesEnabled 关着");
 	if (!RoofTileMesh) return TEXT("没有 RoofTileMesh");
@@ -3862,6 +3634,7 @@ void ACSHouseActor::RebuildDoorLeaves()
 
 FString ACSHouseActor::GetDoorLeafUndrawableReason() const
 {
+	FlushPendingReevaluate();
 	// 逐环检查渲染那一侧（同 `GetRoofFinialUndrawableReason`）——"洞开了"证明不了"门扇画出来了"。
 	if (!bDoorLeafEnabled) return TEXT("bDoorLeafEnabled 关着");
 	if (DoorLeafMeshes.IsEmpty()) return TEXT("DoorLeafMeshes 是空的（留空 = 有意不长门扇）");
@@ -3890,6 +3663,7 @@ FString ACSHouseActor::GetDoorLeafUndrawableReason() const
 
 FString ACSHouseActor::GetRoofFinialUndrawableReason() const
 {
+	FlushPendingReevaluate();
 	// 逐环检查渲染那一侧 —— readback 断言对这些一个字都说不了（同 `GetRoofTileUndrawableReason`）。
 	if (!RoofFinialMesh) return TEXT("没有 RoofFinialMesh");
 	if (CurrentRoofFinialCount <= 0) return TEXT("一根尖顶都没立起来");
@@ -3911,7 +3685,7 @@ FString ACSHouseActor::GetRoofFinialUndrawableReason() const
 	return FString();
 }
 
-void ACSHouseActor::EnsureDecorComponents()
+CSShaperSteps::EHandoverResult ACSHouseActor::EnsureDecorComponents()
 {
 	// palette 的排布恒为「门 → 墙脚 → 屋顶」，三家各占一段；檐口与屋脊**共用**屋顶那一段
 	// （TG 的 `add_birdnests` 本来就是一家两处）。窗户那家留空 ⇒ `Count == 0` ⇒ 一件都不长。
@@ -3933,42 +3707,18 @@ void ACSHouseActor::EnsureDecorComponents()
 	AppendFamily(DecorRoofMeshes, DecorPaletteRanges[int32(CSHouseDecor::EFamily::Eave)]);
 	DecorPaletteRanges[int32(CSHouseDecor::EFamily::Ridge)] = DecorPaletteRanges[int32(CSHouseDecor::EFamily::Eave)];
 
-	// 蓝图 actor 重跑构造脚本会把实例组件销毁，指针会失效 —— 先判再补（同 EnsureVineComponents）。
 	// ⚠️ 组件数一变就必须重建基础网格快照：palette 与组件是**按下标**对齐的，少一个就全体错位。
-	bool bComponentsChanged = false;
-	while (DecorComponents.Num() > Wanted.Num())
-	{
-		TObjectPtr<UCSGpuInstancedMeshComponent> Extra = DecorComponents.Pop();
-		if (IsValid(Extra)) Extra->DestroyComponent();
-		bComponentsChanged = true;
-	}
-	while (DecorComponents.Num() < Wanted.Num())
-	{
-		DecorComponents.Add(nullptr);
-		bComponentsChanged = true;
-	}
-	for (int32 Index = 0; Index < Wanted.Num(); ++Index)
-	{
-		if (!IsValid(DecorComponents[Index]))
-		{
-			UCSGpuInstancedMeshComponent* Component = NewObject<UCSGpuInstancedMeshComponent>(this, NAME_None, RF_Transient);
-			Component->SetupAttachment(RootComponent);
-			Component->RegisterComponent();   // 未注册时任何变更都会释放 GPU 网格，必须先注册再喂
-			DecorComponents[Index] = Component;
-			bComponentsChanged = true;
-		}
-		DecorComponents[Index]->InstanceMaterial = DecorMaterial;
-	}
-	if (bComponentsChanged) bDecorBaseMeshReady = false;
+	if (CSShaperSteps::EnsureInstancedComponents(this, DecorComponents, Wanted.Num())) bDecorBaseMeshReady = false;
+	for (const TObjectPtr<UCSGpuInstancedMeshComponent>& Component : DecorComponents) Component->InstanceMaterial = DecorMaterial;
 
 	if (DecorGpuBuffers.Num() != Wanted.Num())
 	{
 		CSShaperSteps::ReleaseOnRenderThread(DecorGpuBuffers);
 		DecorGpuBuffers.SetNum(Wanted.Num());
-		DecorHandedCapacities.Reset();
+		DecorHandover.Capacities.Reset();
 		bDecorBaseMeshReady = false;
 	}
-	if (Wanted.Num() == 0) return;
+	if (Wanted.Num() == 0) return CSShaperSteps::EHandoverResult::UpToDate;
 
 	// 换过网格资产就必须重建快照（同 `VineBranchMeshBuiltFrom` 的字段注释）。
 	bool bMeshesChanged = DecorMeshesBuiltFrom.Num() != Wanted.Num();
@@ -4009,7 +3759,7 @@ void ACSHouseActor::EnsureDecorComponents()
 		}
 		bDecorBaseMeshReady = bAllOk;
 	}
-	if (!bDecorBaseMeshReady) return;
+	if (!bDecorBaseMeshReady) return CSShaperSteps::EHandoverResult::UpToDate;
 
 	// 容量按**配置上限**一次付清，之后永不扩容（零阻塞纪律）。
 	// ⚠️ **必须再走一次 `CSShaperSteps::ReserveCount` 的台阶**，不能把上限直接喂给 ReserveCapacity：
@@ -4034,43 +3784,19 @@ void ACSHouseActor::EnsureDecorComponents()
 	// 下界也取 -Reach：摆件落在**地面**上，而房子坐在 footprint 内的最高点，
 	// 所以墙脚那一圈可以比房底低不少（低多少由地形说了算，不是常数）。
 	FBox LocalBounds(FVector(-Reach, -Reach, -Reach), FVector(Reach, Reach, Top));
-	if (!bForceFullRebuild && DecorHandedLocalBounds.IsValid) LocalBounds += DecorHandedLocalBounds;
+	// 各 palette 的组件是兄弟、变换相同，取第 0 个即可。
+	LocalBounds = CSHouse_BuildBoundsToComponent(GetBuildTransform(),
+		DecorComponents.IsValidIndex(0) ? DecorComponents[0].Get() : nullptr, LocalBounds);
+	LocalBounds = CSShaperSteps::MergeHandoverBounds(LocalBounds, DecorHandover, bForceFullRebuild);
 
-	bool bNeedHandover = DecorHandedCapacities.Num() != DecorGpuBuffers.Num()
-		|| !DecorHandedLocalBounds.IsValid
-		|| !DecorHandedLocalBounds.Min.Equals(LocalBounds.Min, 1.0)
-		|| !DecorHandedLocalBounds.Max.Equals(LocalBounds.Max, 1.0);
-	for (int32 Index = 0; !bNeedHandover && Index < DecorGpuBuffers.Num(); ++Index)
-	{
-		// 蓝图重跑构造脚本会销毁并重建实例组件：新组件身上没有实例源，缓存说"已交接"就会
-		// 永远画不出东西 —— 拿组件自己的状态兜底（同 EnsureVineComponents）。
-		bNeedHandover = DecorHandedCapacities[Index] != DecorGpuBuffers[Index].Capacity
-			|| !IsValid(DecorComponents[Index])
-			|| !DecorComponents[Index]->HasInstanceSourceGPU();
-	}
-	if (!bNeedHandover) return;
-
+	TArray<CSShaperSteps::FHandoverSource, TInlineAllocator<8>> Sources;
 	for (int32 Index = 0; Index < DecorGpuBuffers.Num(); ++Index)
 	{
-		if (!DecorGpuBuffers[Index].IsValid() || !IsValid(DecorComponents[Index])) return;
+		Sources.Add(CSShaperSteps::MakeHandoverSource(
+			DecorComponents.IsValidIndex(Index) ? ToRawPtr(DecorComponents[Index]) : nullptr,
+			DecorGpuBuffers[Index], /*bWithCustomData*/ false));
 	}
-
-	for (int32 Index = 0; Index < DecorGpuBuffers.Num(); ++Index)
-	{
-		FCSGpuInstanceSourceGPU Source;
-		Source.PackedInstances = DecorGpuBuffers[Index].PackedInstances;   // 保留自己的引用，重打包还要用
-		Source.Counter = DecorGpuBuffers[Index].Counter;
-		Source.Capacity = DecorGpuBuffers[Index].Capacity;
-		Source.LocalBounds = LocalBounds;
-		DecorComponents[Index]->SetInstanceSourceGPU(Source);
-	}
-
-	DecorHandedCapacities.SetNumUninitialized(DecorGpuBuffers.Num());
-	for (int32 Index = 0; Index < DecorGpuBuffers.Num(); ++Index)
-	{
-		DecorHandedCapacities[Index] = DecorGpuBuffers[Index].Capacity;
-	}
-	DecorHandedLocalBounds = LocalBounds;
+	return CSShaperSteps::HandOverInstanceSources(Sources, LocalBounds, DecorHandover);
 }
 
 void ACSHouseActor::RebuildDecor()
@@ -4096,8 +3822,7 @@ void ACSHouseActor::RebuildDecor()
 			{
 				if (IsValid(Component)) Component->ClearInstanceSourceGPU();
 			}
-			DecorHandedCapacities.Reset();
-			DecorHandedLocalBounds = FBox(ForceInit);
+			DecorHandover.Reset();
 			CurrentDecorInstanceCount = 0;
 			CurrentDecorAnchorCount = 0;
 			CurrentDecorGateAnchorCount = 0;
@@ -4106,7 +3831,7 @@ void ACSHouseActor::RebuildDecor()
 		return;
 	}
 
-	EnsureDecorComponents();
+	const CSShaperSteps::EHandoverResult DecorHandoverResult = EnsureDecorComponents();
 	if (!bDecorBaseMeshReady || DecorGpuBuffers.Num() == 0) return;
 
 	CSHouseDecor::FSite Site;
@@ -4140,7 +3865,9 @@ void ACSHouseActor::RebuildDecor()
 
 	bool bBuffersReady = DecorGpuBuffers.Num() == DecorComponents.Num();
 	for (const CSShaperSteps::FPaletteBuffers& Buffers : DecorGpuBuffers) bBuffersReady &= Buffers.IsValid();
-	if (NewHash == DecorDescHash && DecorHandedCapacities.Num() == DecorGpuBuffers.Num() && bBuffersReady) return;
+	// 刚交接过（扩容换了清零的新 buffer / 包围盒变了）就必须重打包，哈希没变也不能早退（审查 B1）。
+	const bool bMustRepack = DecorHandoverResult == CSShaperSteps::EHandoverResult::HandedOver;
+	if (!bMustRepack && NewHash == DecorDescHash && DecorHandover.Capacities.Num() == DecorGpuBuffers.Num() && bBuffersReady) return;
 
 	DecorDescHash = NewHash;
 	CurrentDecorAnchorCount = Anchors.Num();
@@ -4165,6 +3892,7 @@ void ACSHouseActor::RebuildDecor()
 
 bool ACSHouseActor::IsDecorDrawable(FString& OutReason) const
 {
+	FlushPendingReevaluate();
 	OutReason = GetDecorUndrawableReason();
 	if (!OutReason.IsEmpty())
 	{
@@ -4181,6 +3909,7 @@ bool ACSHouseActor::IsDecorDrawable(FString& OutReason) const
 
 FString ACSHouseActor::GetDecorUndrawableReason() const
 {
+	FlushPendingReevaluate();
 	FString OutReason;
 	// 逐环检查渲染那一侧 —— readback 断言对这些一个字都说不了（见头文件里那段教训）。
 	if (!bDecorEnabled) { OutReason = TEXT("bDecorEnabled 关着"); return OutReason; }
@@ -4244,26 +3973,31 @@ int32 CSHouse_ReadGpuInstanceCount(const UCSGpuInstancedMeshComponent* Component
 
 int32 ACSHouseActor::DebugReadFrameBrickCountGpuSync() const
 {
+	FlushPendingReevaluate();
 	return CSHouse_ReadGpuInstanceCount(FrameComponent);
 }
 
 int32 ACSHouseActor::DebugReadVineBranchCountGpuSync() const
 {
+	FlushPendingReevaluate();
 	return CSHouse_ReadGpuInstanceCount(VineBranchComponent);
 }
 
 int32 ACSHouseActor::DebugReadVineLeafCountGpuSync() const
 {
+	FlushPendingReevaluate();
 	return CSHouse_ReadGpuInstanceCount(VineLeafComponent);
 }
 
 int32 ACSHouseActor::DebugReadVineFlowerCountGpuSync() const
 {
+	FlushPendingReevaluate();
 	return CSHouse_ReadGpuInstanceCount(VineFlowerComponent);
 }
 
 int32 ACSHouseActor::DebugReadDecorInstanceCountGpuSync() const
 {
+	FlushPendingReevaluate();
 	int32 Total = 0;
 	for (const TObjectPtr<UCSGpuInstancedMeshComponent>& Component : DecorComponents)
 	{
@@ -4278,41 +4012,43 @@ int32 ACSHouseActor::DebugReadDecorInstanceCountGpuSync() const
 
 FString ACSHouseActor::DebugGetGpuAssetMismatchSync() const
 {
-	auto Check = [](const UCSGpuInstancedMeshComponent* Component, const FString& Label) -> FString
-	{
-		// 没有组件不算"画错了"——那是 `IsXxxDrawable` 那一族的职责范围，这里只答"画的是不是那个"。
-		if (!IsValid(Component)) return FString();
-		const FString Reason = Component->DebugGetDrawnAssetMismatchSync();
-		return Reason.IsEmpty() ? FString() : FString::Printf(TEXT("%s：%s"), *Label, *Reason);
-	};
+	FlushPendingReevaluate();
+	return Super::DebugGetGpuAssetMismatchSync();
+}
 
-	if (CurrentFrameBrickCount > 0)
-	{
-		const FString Reason = Check(FrameComponent, TEXT("门框砖"));
-		if (!Reason.IsEmpty()) return Reason;
-	}
-	if (CurrentVineSegmentCount > 0)
-	{
-		FString Reason = Check(VineBranchComponent, TEXT("藤枝"));
-		if (!Reason.IsEmpty()) return Reason;
-		Reason = Check(VineLeafComponent, TEXT("藤叶"));
-		if (!Reason.IsEmpty()) return Reason;
-	}
+void ACSHouseActor::GetInstancedFamilies(TArray<FCSInstancedFamily>& OutFamilies) const
+{
+	// ⚠️ 不许在这里补票（FlushPendingReevaluate）：族表必须无副作用，补票放在诊断入口里（见上）。
+	// 门框砖 + 接缝砖 + 角石 + 包边 + 砖层共用这一个组件。
+	OutFamilies.Add({ FrameComponent, TEXT("门框砖"), TEXT("FrameBricks"), CurrentFrameBrickCount > 0 });
+	OutFamilies.Add({ VineBranchComponent, TEXT("藤枝"), TEXT("VineBranch"), CurrentVineSegmentCount > 0 });
+	OutFamilies.Add({ VineLeafComponent, TEXT("藤叶"), TEXT("VineLeaf"), CurrentVineSegmentCount > 0 });
 	// 花单独判：一栋不长花的房子（`VineFlowerMesh` 留空）是**合法**的，拿枝数当门会把它误判。
-	if (CurrentVineFlowerCount > 0)
-	{
-		const FString Reason = Check(VineFlowerComponent, TEXT("藤花"));
-		if (!Reason.IsEmpty()) return Reason;
-	}
-	if (CurrentDecorInstanceCount > 0)
-	{
-		for (int32 Index = 0; Index < DecorComponents.Num(); ++Index)
-		{
-			const FString Reason = Check(DecorComponents[Index], FString::Printf(TEXT("摆件[%d]"), Index));
-			if (!Reason.IsEmpty()) return Reason;
-		}
-	}
-	return FString();
+	OutFamilies.Add({ VineFlowerComponent, TEXT("藤花"), TEXT("VineFlower"), CurrentVineFlowerCount > 0 });
+	for (int32 Index = 0; Index < DecorComponents.Num(); ++Index) OutFamilies.Add({ DecorComponents[Index], FString::Printf(TEXT("摆件[%d]"), Index), FString::Printf(TEXT("Decor%d"), Index), CurrentDecorInstanceCount > 0 });
+	OutFamilies.Add({ RoofTileComponent, TEXT("屋瓦"), TEXT("RoofTiles"), CurrentRoofTileCount > 0 });
+	OutFamilies.Add({ PillarBrickComponent, TEXT("柱砖"), TEXT("PillarBricks"), bPillarUseBricks && PillarBrickMesh && CurrentPillarCount > 0 });
+}
+
+void ACSHouseActor::ReleaseInstancedBuffers()
+{
+	// 只放本 actor 分配的生产者那一份（排在已入队的命令之后，见 CSShaperSteps::ReleaseOnRenderThread）。
+	// 组件手上的实例源、组件自己的常驻网格、槽网格的显存，各由组件在 OnComponentDestroyed 里放。
+	CSShaperSteps::ReleaseOnRenderThread(FrameGpuBuffers);
+	CSShaperSteps::ReleaseOnRenderThread(PillarGpuBuffers);
+	CSShaperSteps::ReleaseOnRenderThread(VineGpuBuffers);
+	CSShaperSteps::ReleaseOnRenderThread(RoofTileGpuBuffers);
+	CSShaperSteps::ReleaseOnRenderThread(DecorGpuBuffers);
+	// 缓冲都没了 ⇒ 交接缓存跟着作废，下次 Ensure* 按新分配的那批重交。
+	FrameHandover.Reset();
+	PillarHandover.Reset();
+	VineHandover.Reset();
+	RoofTileHandover.Reset();
+	DecorHandover.Reset();
+	// ⚠️ 编辑器里删除可以撤销 —— 复活的是**同一批对象**：缓冲刚交回去，槽网格与实例组件的显存也已被
+	// 各自的组件还掉，而各家的早退门只看输入哈希。复活后的第一次重求值因此必须全量重建（它会把各族的
+	// desc 哈希清零）。
+	bForceFullRebuild = true;
 }
 
 #if WITH_EDITOR
@@ -4321,6 +4057,7 @@ bool ACSHouseActor::DebugBakeFrameBricksSync(const FString& AssetPath, int32& Ou
 	int32& OutVertexInstances, int32& OutUVChannels, int32& OutDistinctBakedRandoms,
 	int32& OutGpuInstanceCount, bool& bOutRandomsMatchGpu)
 {
+	FlushPendingReevaluate();
 	OutTriangles = 0;
 	OutVertexInstances = 0;
 	OutUVChannels = 0;
@@ -4382,38 +4119,13 @@ bool ACSHouseActor::DebugBakeFrameBricksSync(const FString& AssetPath, int32& Ou
 
 int32 ACSHouseActor::SaveInstancedToStaticMeshes(const FString& BakeFolder, bool bSaveAssets)
 {
-	const FString Folder = BakeFolder.TrimStartAndEnd().IsEmpty()
-		? FString::Printf(TEXT("/Game/TinyGladeBake/%s"), *GetName())
-		: BakeFolder.TrimStartAndEnd();
-
-	int32 Saved = 0;
-	auto BakeOne = [this, &Folder, bSaveAssets, &Saved](UCSGpuInstancedMeshComponent* Component, const TCHAR* Family)
-	{
-		if (!IsValid(Component)) return;
-		const FString Path = FString::Printf(TEXT("%s/SM_%s_%s"), *Folder, *GetName(), Family);
-		// 烘回本 actor 的局部空间：资产摆在同一个变换上就复现画面（同岩壳 / 道路那两条出口）。
-		if (Component->SaveToStaticMesh(GetActorTransform(), Path, /*bReplaceExistingAsset*/ true, bSaveAssets))
-		{
-			++Saved;
-		}
-	};
-
-	BakeOne(FrameComponent, TEXT("FrameBricks"));   // 门框砖 + 接缝砖共用这一个组件
-	BakeOne(VineBranchComponent, TEXT("VineBranch"));
-	BakeOne(VineLeafComponent, TEXT("VineLeaf"));
-	BakeOne(VineFlowerComponent, TEXT("VineFlower"));
-	for (int32 Index = 0; Index < DecorComponents.Num(); ++Index)
-	{
-		BakeOne(DecorComponents[Index], *FString::Printf(TEXT("Decor%d"), Index));
-	}
-
-	UE_LOG(LogTinyGladeHouse, Log, TEXT("[TinyGladeHouse] %s 实例路烘焙：%d 张资产 -> %s"),
-		*GetName(), Saved, *Folder);
-	return Saved;
+	FlushPendingReevaluate();
+	return Super::SaveInstancedToStaticMeshes(BakeFolder, bSaveAssets);
 }
 
 UStaticMesh* ACSHouseActor::DebugBakeVineBranchesSync(const FString& AssetPath)
 {
+	FlushPendingReevaluate();
 	if (!IsValid(VineBranchComponent)) return nullptr;
 	return VineBranchComponent->SaveToStaticMesh(
 		GetActorTransform(), AssetPath, /*bReplaceExistingAsset*/ true, /*bSaveAsset*/ false);
@@ -4439,13 +4151,7 @@ void ACSHouseActor::BindHouseMaterials()
 	// 屋面全在瓦上）。⚠️ 实例路径要求母材质勾了 `bUsedWithInstancedStaticMeshes`，
 	// 没勾会被引擎**静默换成默认材质** —— `GetRoofTileUndrawableReason` 专门查这一条。
 	if (IsValid(RoofTileComponent)) RoofTileComponent->InstanceMaterial = RoofMaterial;
-	if (PillarMesh)
-	{
-		if (PillarMeshComponent) PillarMeshComponent->MeshMaterial = PillarMaterial;
-		PillarMesh->Materials.SetNum(FMath::Max(PillarMesh->Materials.Num(), 1));
-		PillarMesh->Materials[0] = PillarMaterial;
-		PillarMesh->NotifyMaterialsChanged();
-	}
+	if (PillarMesh) BindMeshSlotMaterials(PillarMeshComponent, PillarMesh, { PillarMaterial });
 
 	// 门框砖走另一条组件（实例化），漏了它的症状与 D14 开篇描述的一模一样：在细节面板里改
 	// FrameMaterial 静默无效，必须手点 RebuildHouse()。这里补上，重绑不重建的纪律才算完整。
@@ -4456,12 +4162,6 @@ void ACSHouseActor::BindHouseMaterials()
 		FrameComponent->InstanceMaterial = FrameMaterial;
 		FrameComponent->MarkRenderStateDirty();
 	}
-}
-
-void ACSHouseActor::OnConstruction(const FTransform& Transform)
-{
-	Super::OnConstruction(Transform);
-	ReevaluateSite();
 }
 
 void ACSHouseActor::PostRegisterAllComponents()
@@ -4538,9 +4238,10 @@ void ACSHouseActor::PostEditUndo()
 {
 	Super::PostEditUndo();
 
-	// AActor::PostEditUndo（ActorEditor.cpp）只做 InternalPostEditUndo + 一条
-	// UpdateAllPrimitiveSceneInfos —— 不调 PostEditMove、不保证跑构造脚本，所以重建必须放这。
-	// BodyDescHash 含量化世界变换，撤销一次移动后不重求值就会画在旧位置。
+	// 编辑器 world 里撤销本来就会经 UObject::PostEditUndo → PostEditChange →
+	// AActor::PostEditChangeProperty 重跑构造脚本（→ 基类 OnConstruction → ReevaluateSite）；
+	// 这里兜的是不重跑的那些情形（PIE world：ReregisterComponentsWhenModified 为假）。
+	// 重求值幂等，编辑器里多来一次无害 —— 而不来的话，撤销一次移动之后房子会画在旧位置。
 	ReevaluateSite();
 }
 #endif

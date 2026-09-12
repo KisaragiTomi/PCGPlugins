@@ -188,7 +188,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	"PCGPlugins.ComputeShaderGenerator.GpuInstancedMesh.Streams",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
-// This leaf's seven aux streams live in a UCSMesh alongside the standard set, addressed by
+// This leaf's aux streams (one per ECSGpuInstancedAuxSlot) live in a UCSMesh alongside the standard set, addressed by
 // (Role, TexCoordIndex). The standard set owns AuxVertex slot 0 for its per-triangle material ids
 // and offers no way to turn that off, so a leaf slot numbered from 0 collides — and a collision is
 // not loud: SetStreamLayoutSync refuses the layout and returns false, after which the vertex factory
@@ -225,32 +225,8 @@ bool FCSGpuInstancedMeshStreamsAutomationTest::RunTest(const FString& Parameters
 	Layout.ClusterSize = 8;
 	Layout.NumClusters = 13;
 
-	TArray<FCSGpuStreamDesc> AuxStreams;
-	CSGpuInstancedBuildAuxStreamDescs(AuxStreams, Layout, /*bExternalPackedSource*/ false);
-	if (!TestEqual(TEXT("Aux stream count"), AuxStreams.Num(), 7)) return false;
-
-	UCSMesh* Mesh = NewObject<UCSMesh>(GetTransientPackage());
-	if (!TestNotNull(TEXT("Mesh"), Mesh)) return false;
-
-	const FCSMeshResident* Resident = Mesh->GetResidentPtr();
-	if (!TestNotNull(TEXT("Resident set"), Resident)) return false;
-	// Counted rather than hard-coded: the point is that all seven survive on top of whatever the
-	// standard set happens to be, not that the standard set has a particular size today.
-	const int32 NumStandardStreams = Resident->Streams.Num();
-
-	FCSMeshStreamLayout StreamLayout;
-	StreamLayout.NumIndirectDraws = Layout.NumLODs;
-	CSGpuInstancedBuildAuxStreamDescs(StreamLayout.ExtraStreams, Layout, /*bExternalPackedSource*/ false);
-	if (!TestTrue(TEXT("The mesh accepts this leaf's stream layout"), Mesh->SetStreamLayoutSync(StreamLayout))) return false;
-
-	TestEqual(TEXT("Every aux stream was appended to the standard set"), Resident->Streams.Num(), NumStandardStreams + 7);
-	TestEqual(TEXT("One indirect arg set per LOD"), Mesh->GetIndirectDrawCount(), int32(Layout.NumLODs));
-
-	// The material-id stream is what the leaf slots must not land on, so its survival is half the
-	// assertion — a layout that displaced it would leave the operator layer without it.
-	TestNotNull(TEXT("The standard material-id stream still owns AuxVertex slot 0"),
-		Resident->FindStream(ECSGpuStreamRole::AuxVertex, 0));
-
+	// 本叶子声明的全部 aux 槽位，与 ECSGpuInstancedAuxSlot 一一对应。数量断言从这张表取、不另写魔数；
+	// 加新流时在这里补一行，下面的"能解析到 / 避开 0 号槽"就自动覆盖它。
 	const ECSGpuInstancedAuxSlot Slots[] = {
 		ECSGpuInstancedAuxSlot::SourceInstances,
 		ECSGpuInstancedAuxSlot::ClusterBounds,
@@ -259,7 +235,39 @@ bool FCSGpuInstancedMeshStreamsAutomationTest::RunTest(const FString& Parameters
 		ECSGpuInstancedAuxSlot::VisibleOrigins,
 		ECSGpuInstancedAuxSlot::VisibleLightmap,
 		ECSGpuInstancedAuxSlot::LodCounters,
+		ECSGpuInstancedAuxSlot::VisibleCustomData,
 	};
+	const int32 NumLeafSlots = int32(UE_ARRAY_COUNT(Slots));
+
+	TArray<FCSGpuStreamDesc> AuxStreams;
+	CSGpuInstancedBuildAuxStreamDescs(AuxStreams, Layout, /*bExternalPackedSource*/ false);
+	// 数不对**不许 return**：下面的检查全按槽位查（FindStream），多一条少一条都照样跑得动。
+	// 09-09 加 VisibleCustomData 时这里还是 `if (!TestEqual(..., 7)) return false;`，于是这一条红了之后
+	// 碰撞 / 尺寸 / 零字节检查被整段跳过了两天 —— 一个过期的数字把整条守卫静默关掉。
+	TestEqual(TEXT("Aux stream count matches the slot table (a new stream must be added to Slots above)"), AuxStreams.Num(), NumLeafSlots);
+
+	UCSMesh* Mesh = NewObject<UCSMesh>(GetTransientPackage());
+	if (!TestNotNull(TEXT("Mesh"), Mesh)) return false;
+
+	const FCSMeshResident* Resident = Mesh->GetResidentPtr();
+	if (!TestNotNull(TEXT("Resident set"), Resident)) return false;
+	// Counted rather than hard-coded: the point is that every leaf slot survives on top of whatever
+	// the standard set happens to be, not that the standard set has a particular size today.
+	const int32 NumStandardStreams = Resident->Streams.Num();
+
+	FCSMeshStreamLayout StreamLayout;
+	StreamLayout.NumIndirectDraws = Layout.NumLODs;
+	CSGpuInstancedBuildAuxStreamDescs(StreamLayout.ExtraStreams, Layout, /*bExternalPackedSource*/ false);
+	if (!TestTrue(TEXT("The mesh accepts this leaf's stream layout"), Mesh->SetStreamLayoutSync(StreamLayout))) return false;
+
+	TestEqual(TEXT("Every aux stream was appended to the standard set"), Resident->Streams.Num(), NumStandardStreams + NumLeafSlots);
+	TestEqual(TEXT("One indirect arg set per LOD"), Mesh->GetIndirectDrawCount(), int32(Layout.NumLODs));
+
+	// The material-id stream is what the leaf slots must not land on, so its survival is half the
+	// assertion — a layout that displaced it would leave the operator layer without it.
+	TestNotNull(TEXT("The standard material-id stream still owns AuxVertex slot 0"),
+		Resident->FindStream(ECSGpuStreamRole::AuxVertex, 0));
+
 	for (ECSGpuInstancedAuxSlot Slot : Slots)
 	{
 		TestTrue(FString::Printf(TEXT("Aux slot %u is clear of the standard set"), uint32(Slot)), uint8(Slot) != 0);
@@ -279,9 +287,20 @@ bool FCSGpuInstancedMeshStreamsAutomationTest::RunTest(const FString& Parameters
 	TestEqual(TEXT("Visible origins cover every LOD region"), AuxElementCount(ECSGpuInstancedAuxSlot::VisibleOrigins), VisibleSlots);
 	TestEqual(TEXT("Visible lightmap covers every LOD region"), AuxElementCount(ECSGpuInstancedAuxSlot::VisibleLightmap), VisibleSlots);
 	TestEqual(TEXT("Visible transforms are three float4 per slot"), AuxElementCount(ECSGpuInstancedAuxSlot::VisibleTransforms), VisibleSlots * 3);
-	// The source rows are five float4 per instance, over the capacity rather than the live count —
-	// the buffer ratchets, so the cull's MaxSourceInstances is the capacity.
-	TestEqual(TEXT("Source rows cover the instance capacity"), AuxElementCount(ECSGpuInstancedAuxSlot::SourceInstances), int32(Layout.InstanceCapacity) * 5);
+	// 逐实例 custom data 与另外三条可见缓冲同一套分区（每 LOD 一段），每槽 CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS 个 float。
+	// 格式必须是 PF_R32_FLOAT：引擎按 Buffer<float> 取（InstanceCustomDataBuffer），照抄邻居那几条的 float4
+	// 视图读出来是错位数据 —— 画面上只是"藤叶的数值不对"，不报错。
+	TestEqual(TEXT("Visible custom data covers every LOD region"),
+		AuxElementCount(ECSGpuInstancedAuxSlot::VisibleCustomData), VisibleSlots * int32(CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS));
+	if (const FCSMeshResident::FStream* CustomData = Resident->FindStream(ECSGpuStreamRole::AuxVertex, uint8(ECSGpuInstancedAuxSlot::VisibleCustomData)))
+	{
+		TestEqual(TEXT("Visible custom data is viewed as Buffer<float> (PF_R32_FLOAT)"), int32(CustomData->Desc.SrvFormat), int32(PF_R32_FLOAT));
+		TestEqual(TEXT("Visible custom data is one float per element"), int32(CustomData->Desc.BytesPerElement), int32(sizeof(float)));
+	}
+	// The source rows are CS_GPU_INSTANCED_ROW_FLOAT4S float4 per instance, over the capacity rather
+	// than the live count — the buffer ratchets, so the cull's MaxSourceInstances is the capacity.
+	TestEqual(TEXT("Source rows cover the instance capacity"), AuxElementCount(ECSGpuInstancedAuxSlot::SourceInstances),
+		int32(Layout.InstanceCapacity) * int32(CS_GPU_INSTANCED_ROW_FLOAT4S));
 	// Cluster spheres are sized from the capacity too, but only NumClusters of them are ever filled.
 	TestTrue(TEXT("Cluster spheres cover the live cluster count"),
 		AuxElementCount(ECSGpuInstancedAuxSlot::ClusterBounds) >= int32(Layout.NumClusters));
@@ -311,7 +330,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	"PCGPlugins.ComputeShaderGenerator.GpuInstancedMesh.StreamResize",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
-// Another instance changes six of this leaf's aux streams and nothing else. Saying so used to mean
+// Another instance changes every one of this leaf's aux streams except LodCounters, and nothing else. Saying so used to mean
 // re-declaring the whole layout, which reallocates and copies every resident stream — the base mesh
 // included — so an AddInstance copied the entire mesh to make one buffer bigger.
 // UCSMesh::ResizeStreamsSync is what the component uses instead, and this pins the bookkeeping half
@@ -388,7 +407,8 @@ bool FCSGpuInstancedMeshStreamResizeAutomationTest::RunTest(const FString& Param
 	};
 	TestEqual(TEXT("Visible origins grew with the capacity"), AuxElementCount(ECSGpuInstancedAuxSlot::VisibleOrigins), GrownVisibleSlots);
 	TestEqual(TEXT("Visible transforms grew with the capacity"), AuxElementCount(ECSGpuInstancedAuxSlot::VisibleTransforms), GrownVisibleSlots * 3);
-	TestEqual(TEXT("Source rows grew with the capacity"), AuxElementCount(ECSGpuInstancedAuxSlot::SourceInstances), int32(Grown.InstanceCapacity) * 5);
+	TestEqual(TEXT("Source rows grew with the capacity"), AuxElementCount(ECSGpuInstancedAuxSlot::SourceInstances),
+		int32(Grown.InstanceCapacity) * int32(CS_GPU_INSTANCED_ROW_FLOAT4S));
 	// Fixed at CS_GPU_INSTANCED_MAX_LODS on purpose, so it never appears in a resize at all.
 	TestEqual(TEXT("The LOD counters do not follow the instance capacity"),
 		AuxElementCount(ECSGpuInstancedAuxSlot::LodCounters), CS_GPU_INSTANCED_MAX_LODS);

@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-建 TinyGlade 墙体的三个材质 + 墙面的可调 MI。
+建 TinyGlade 墙体的两个材质 + 墙面的可调 MI。
 
 M_TinyGladeWall（Masked）  —— 洞由 OpacityMask 判据逐像素 discard 切出；
     **墙面 = 灰泥，砖 = 贴图 + 遮罩**（2026-09-03 加，见下面「灰泥剥落」一节）。
 MI_TinyGladeWall           —— 上面那张的实例，所有贴图/手感参数都在这里调。房子挂的是它。
-M_TinyGladeReveal（Opaque）—— **原本是洞口内壁**。用户 2026-08-29 裁决"不要内壁，中间用砖块
-    填满"（门框砖，见 TinyGladeSetupFrame.py）之后，`ACSHouseActor::RevealMaterial` 这个属性
-    随内壁一起作废、已从 C++ 删掉。这个材质资产**没有跟着删**：它现在是承重柱的材质
-    （PillarMaterial），关卡里还引用着，改名/删掉会留下一堆空引用。
 M_TinyGladeRoof（Opaque） —— 屋面。
+
+（M_TinyGladeReveal 已于 2026-09-11 删除：它原是洞口内壁，内壁作废后借作承重柱材质；柱子后来
+    由 TinyGladeSetupPillar.py 改挂 M_TinyGladeBrick，它就没人引用了。本脚本因此不再建它、也不再
+    写 PillarMaterial —— 柱材质归 TinyGladeSetupPillar.py 管，这里再写会把它改回去。）
 
 ⚠️ OpacityMask 里那段 HLSL 是 CSHouseProfile.h 里 CSHouse_ClipKeeps() 的逐字翻译。
    两处不一致就会出现"CPU 谓词说能放、画面上切穿帮"，而且不会报任何错。改一处必须改两处。
@@ -594,8 +594,6 @@ if fixed:
 
 wall = build_wall()
 wall_mi = build_wall_instance(wall)
-# 名字是内壁时代留下的（见文件头）；今天它只当承重柱材质用，比墙略暗。
-reveal = build_plain("M_TinyGladeReveal", 0.34, 0.30, 0.26)
 roof = build_plain("M_TinyGladeRoof", 0.30, 0.16, 0.13)
 
 st = MEL.get_statistics(wall)
@@ -610,7 +608,7 @@ unreal.log("M_TinyGladeWall stats: vs=%s ps=%s samplers=%s" % (
 bp = unreal.EditorAssetLibrary.load_asset("%s/BP_TinyGladeHouse" % PKG)
 if bp:
     cdo = unreal.get_default_object(bp.generated_class())
-    for prop, mat in (("WallMaterial", wall_mi), ("RoofMaterial", roof), ("PillarMaterial", reveal)):
+    for prop, mat in (("WallMaterial", wall_mi), ("RoofMaterial", roof)):
         cdo.set_editor_property(prop, mat)
     unreal.EditorAssetLibrary.save_loaded_asset(bp)
     unreal.log("assigned to BP_TinyGladeHouse CDO")
@@ -619,7 +617,7 @@ count = 0
 for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors():
     if "House" not in a.get_class().get_name():
         continue
-    for prop, mat in (("WallMaterial", wall_mi), ("RoofMaterial", roof), ("PillarMaterial", reveal)):
+    for prop, mat in (("WallMaterial", wall_mi), ("RoofMaterial", roof)):
         a.set_editor_property(prop, mat)
     a.call_method("RebuildHouse")
     count += 1

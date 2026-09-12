@@ -1,9 +1,12 @@
-#include "CSGroundShaperSteps.h"
+﻿#include "CSGroundShaperSteps.h"
 
 #include "CSMesh.h"                    // UCSMesh::CountedBlockingFlush —— 阻塞刷新的唯一计数入口
 #include "RenderGraphBuilder.h"         // ZeroCounters 自建图（同上，unity 会掩盖）
 #include "RenderGraphUtils.h"           // AllocatePooledBuffer / AddClearUAVPass（unity 构建会掩盖掉这一条，-SingleFile 才抓得到）
+#include "GameFramework/Actor.h"     // EnsureInstancedComponent 要 GetRootComponent（unity 会掩盖）
 #include "RenderingThread.h"
+
+DEFINE_LOG_CATEGORY_STATIC(LogCSShaperSteps, Log, All);
 
 namespace CSShaperSteps
 {
@@ -14,20 +17,36 @@ static bool CSShaperSteps_GrowTo(TArray<FPaletteBuffers>& Palettes, const TArray
 
 	TArray<FPaletteBuffers> Work = Palettes;
 	ENQUEUE_RENDER_COMMAND(CSGroundStepEnsureCapacity)(
-		[&Work, Grow, Capacities](FRHICommandListImmediate&)
+		[&Work, Grow, Capacities](FRHICommandListImmediate& RHICmdList)
 		{
+			// 分配完立刻清零：池子把同尺寸、无人引用的 buffer 直接复用（RenderGraphResourcePool.cpp 的
+			// TryFindPooledBuffer），新 buffer 里就是上一位租客 —— 常常正是本家上一代 —— 的字节。不清的话，
+			// 扩容后交接出去的是一份带着陈旧 counter 与残行的实例源，剔除 pass 照着它画，而砖数 / 三角数 /
+			// 零阻塞断言全绿（2026-09-07 审查 B1）。三条都清：counter 是画不画的开关，行与 custom data
+			// 是画出来是什么。清零走 PF_R32_UINT 视图 —— typed 视图的步长取自格式，整块 buffer 都盖得到
+			// （同 CSMesh.cpp 的 ResizeStreams）。
+			FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("CSShaperSteps.GrowTo"));
+			auto AllocateZeroed = [&GraphBuilder](uint32 BytesPerElement, uint32 NumElements, const TCHAR* Name)
+			{
+				TRefCountPtr<FRDGPooledBuffer> Pooled = AllocatePooledBuffer(
+					FRDGBufferDesc::CreateBufferDesc(BytesPerElement, NumElements), Name);
+				FRDGBufferRef Ref = GraphBuilder.RegisterExternalBuffer(Pooled, Name);
+				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Ref, PF_R32_UINT)), 0u);
+				// 打包 pass 与剔除 pass 都按 SRVMask 读它们，这里就停在那个状态上（同 ZeroCounters）。
+				GraphBuilder.SetBufferAccessFinal(Ref, ERHIAccess::SRVMask);
+				return Pooled;
+			};
 			for (const int32 Index : Grow)
 			{
 				// typed buffer（不是 structured）：剔除 pass 用 Buffer<float4> / Buffer<uint> 视图。
-				Work[Index].PackedInstances = AllocatePooledBuffer(
-					FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), Capacities[Index] * 5u), TEXT("CSShaperSteps.PackedInstances"));
-				Work[Index].Counter = AllocatePooledBuffer(
-					FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1), TEXT("CSShaperSteps.Counter"));
-				Work[Index].CustomData = AllocatePooledBuffer(
-					FRDGBufferDesc::CreateBufferDesc(sizeof(float),
-						Capacities[Index] * uint32(CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS)), TEXT("CSShaperSteps.CustomData"));
+				Work[Index].PackedInstances = AllocateZeroed(
+					sizeof(FVector4f), Capacities[Index] * CS_GPU_INSTANCED_ROW_FLOAT4S, TEXT("CSShaperSteps.PackedInstances"));
+				Work[Index].Counter = AllocateZeroed(sizeof(uint32), 1u, TEXT("CSShaperSteps.Counter"));
+				Work[Index].CustomData = AllocateZeroed(
+					sizeof(float), Capacities[Index] * uint32(CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS), TEXT("CSShaperSteps.CustomData"));
 				Work[Index].Capacity = Capacities[Index];
 			}
+			GraphBuilder.Execute();
 		});
 	// 阻塞到 pooled 引用可用为止（同 CSPointBrushActor 的上传路径）。
 	// **必须走计数通道**：这里以前是一个裸 FlushRenderingCommands，而计数器在 CSMesh.cpp 里，
@@ -100,5 +119,172 @@ void ReleaseOnRenderThread(TArray<FPaletteBuffers>& Palettes)
 			Released.Reset();
 		});
 	Palettes.Reset();
+}
+
+// --- 实例组件的建/补 ---------------------------------------------------------------------
+
+bool EnsureInstancedComponent(AActor* Owner, TObjectPtr<UCSGpuInstancedMeshComponent>& Component)
+{
+	if (!Owner || ::IsValid(Component)) return false;
+
+	UCSGpuInstancedMeshComponent* Made = NewObject<UCSGpuInstancedMeshComponent>(Owner, NAME_None, RF_Transient);
+	Made->SetupAttachment(Owner->GetRootComponent());
+	Made->RegisterComponent();   // 未注册时任何变更都会释放 GPU 网格，必须先注册再喂
+	Component = Made;
+	return true;
+}
+
+bool EnsureInstancedComponents(
+	AActor* Owner, TArray<TObjectPtr<UCSGpuInstancedMeshComponent>>& Components, int32 Num)
+{
+	bool bChanged = false;
+	while (Components.Num() > Num)
+	{
+		TObjectPtr<UCSGpuInstancedMeshComponent> Extra = Components.Pop();
+		// 不必先撤实例源：组件在 OnComponentDestroyed 里当场放掉它那几份 pooled 引用与自己的显存。
+		if (::IsValid(Extra)) Extra->DestroyComponent();
+		bChanged = true;
+	}
+	while (Components.Num() < Num)
+	{
+		Components.Add(nullptr);
+		bChanged = true;
+	}
+	for (TObjectPtr<UCSGpuInstancedMeshComponent>& One : Components) bChanged |= EnsureInstancedComponent(Owner, One);
+	return bChanged;
+}
+
+// --- 实例源交接 ---------------------------------------------------------------------------
+
+namespace
+{
+/**
+ * 包围盒的等值阈值，cm。
+ *
+ * 它**不是**稳态判据本身：真正把"随尺寸连续变化的量"吸成阶梯的是 `QuantizeUp` 的 200 cm 台阶，
+ * 这里只是最后一道等值判定。原来九处各自写死 `1.0`，改这个数得改九遍。
+ */
+constexpr double HandoverBoundsEpsilon = 1.0;
+
+bool HandoverBoundsDiffer(const FBox& Cached, const FBox& Wanted)
+{
+	return !Cached.IsValid
+		|| !Cached.Min.Equals(Wanted.Min, HandoverBoundsEpsilon)
+		|| !Cached.Max.Equals(Wanted.Max, HandoverBoundsEpsilon);
+}
+
+void HandOverOne(const CSShaperSteps::FHandoverSource& Source, const FBox& LocalBounds)
+{
+	FCSGpuInstanceSourceGPU Out;
+	// 保留自己那份引用：这批 buffer 下一轮重散布 / 重打包还要写。
+	Out.PackedInstances = Source.PackedInstances;
+	Out.Counter = Source.Counter;
+	Out.CustomData = Source.CustomData;
+	Out.Capacity = Source.Capacity;
+	Out.LocalBounds = LocalBounds;
+	Source.Component->SetInstanceSourceGPU(Out);
+}
+}
+
+FBox MergeHandoverBounds(FBox LocalBounds, const FHandoverCache& Cache, bool bFullRebuild)
+{
+	if (!bFullRebuild && Cache.LocalBounds.IsValid) LocalBounds += Cache.LocalBounds;
+	return LocalBounds;
+}
+
+FHandoverSource MakeHandoverSource(
+	UCSGpuInstancedMeshComponent* Component, const FPaletteBuffers& Buffers, bool bWithCustomData)
+{
+	FHandoverSource Source;
+	Source.Component = Component;
+	Source.PackedInstances = Buffers.PackedInstances;
+	Source.Counter = Buffers.Counter;
+	if (bWithCustomData) Source.CustomData = Buffers.CustomData;
+	Source.Capacity = Buffers.Capacity;
+	return Source;
+}
+
+EHandoverResult HandOverInstanceSources(
+	TConstArrayView<FHandoverSource> Sources,
+	const FBox& LocalBounds,
+	FHandoverCache& Cache,
+	const FHandoverOptions& Options,
+	const UObject* LogOwner)
+{
+	if (Sources.IsEmpty()) return EHandoverResult::UpToDate;
+
+	const bool bBoundsChanged = HandoverBoundsDiffer(Cache.LocalBounds, LocalBounds);
+	// 数不一致 = 调色板重排过（换了资产 / 加减了物种），按下标对齐的前提没了，缓存整条作废。
+	const bool bCountChanged = Cache.Capacities.Num() != Sources.Num();
+	if (bCountChanged) Cache.Capacities.SetNumZeroed(Sources.Num());
+
+	auto WantsHandover = [&](int32 Index)
+	{
+		const FHandoverSource& One = Sources[Index];
+		if (!::IsValid(One.Component)) return true;   // 组件没了 => 缓存必然是陈的
+		return bBoundsChanged
+			|| Cache.Capacities[Index] != One.Capacity
+			// 蓝图重跑构造脚本会销毁并重建实例组件：新组件身上没有实例源，只看缓存就会
+			// 永远画不出东西 —— 拿组件自己的状态兜底。
+			|| !One.Component->HasInstanceSourceGPU();
+	};
+
+	auto LogHandover = [&](int32 Index, uint32 Capacity)
+	{
+		if (!Options.LogLabel) return;
+		UE_LOG(LogCSShaperSteps, Log, TEXT("[CSShaperSteps] %s %s[%d] 实例源交接（capacity=%u）"),
+			LogOwner ? *LogOwner->GetName() : TEXT("?"), Options.LogLabel, Index, Capacity);
+	};
+
+	if (Options.Mode == EHandoverMode::PerPalette)
+	{
+		EHandoverResult Result = EHandoverResult::UpToDate;
+		for (int32 Index = 0; Index < Sources.Num(); ++Index)
+		{
+			if (!WantsHandover(Index)) continue;
+			if (!Sources[Index].IsReady())
+			{
+				Result = EHandoverResult::NotReady;
+				continue;
+			}
+			HandOverOne(Sources[Index], LocalBounds);
+			Cache.Capacities[Index] = Sources[Index].Capacity;
+			LogHandover(Index, Sources[Index].Capacity);
+			if (Result == EHandoverResult::UpToDate) Result = EHandoverResult::HandedOver;
+		}
+		// 逐调色板模式下盒子是全体共用的，所以无条件回写：某一个没准备好不该让别的下一趟
+		// 又被判成"盒子变了"而白交一次。它自己那格容量还留着旧值，轮到它就绪时照样会交。
+		Cache.LocalBounds = LocalBounds;
+		return Result;
+	}
+
+	bool bNeedHandover = bCountChanged;
+	for (int32 Index = 0; !bNeedHandover && Index < Sources.Num(); ++Index) bNeedHandover = WantsHandover(Index);
+	if (!bNeedHandover) return EHandoverResult::UpToDate;
+
+	// 全或无：调色板与组件按下标对齐，交一半等于错位，所以先整批验一遍再动手。
+	for (const FHandoverSource& One : Sources)
+	{
+		if (!One.IsReady()) return EHandoverResult::NotReady;
+	}
+
+	for (int32 Index = 0; Index < Sources.Num(); ++Index)
+	{
+		HandOverOne(Sources[Index], LocalBounds);
+		Cache.Capacities[Index] = Sources[Index].Capacity;
+		LogHandover(Index, Sources[Index].Capacity);
+	}
+	Cache.LocalBounds = LocalBounds;
+	return EHandoverResult::HandedOver;
+}
+
+EHandoverResult HandOverInstanceSource(
+	const FHandoverSource& Source,
+	const FBox& LocalBounds,
+	FHandoverCache& Cache,
+	const FHandoverOptions& Options,
+	const UObject* LogOwner)
+{
+	return HandOverInstanceSources(MakeArrayView(&Source, 1), LocalBounds, Cache, Options, LogOwner);
 }
 }

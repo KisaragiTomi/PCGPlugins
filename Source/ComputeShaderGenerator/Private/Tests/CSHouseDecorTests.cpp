@@ -54,7 +54,7 @@ CSHouseDecor::FSite CSDecorTest_MakeSite(const FVector2D& Footprint, const FVect
 		Site.Strips.Add(Strip);
 	}
 
-	Site.Roof.Footprint = Footprint;
+	Site.Roof.Footprint = FCSHouseFootprint::MakeRect(Footprint);
 	Site.Roof.EaveZ = CSDecorTest_WallHeight;
 	Site.Roof.Pitch = 35.0f;
 	Site.Roof.Overhang = 25.0f;
@@ -404,7 +404,7 @@ bool FCSHouseDecorFitsReservedCapacityTest::RunTest(const FString& Parameters)
 	TArray<CSHouseDecor::FAnchor> Anchors;
 	CSHouseDecor::BuildAnchors(Site, Params, Anchors);
 
-	const int32 Bound = CSHouseDecor::MaxRecordsBound(Footprint, Site.Roof.Overhang, PierWidth, Params);
+	const int32 Bound = CSHouseDecor::MaxRecordsBound(FCSHouseFootprint::MakeRect(Footprint), Site.Roof.Overhang, PierWidth, Params);
 	TestTrue(FString::Printf(TEXT("锚点装得下解析上限（%d ≤ %d）"), Anchors.Num(), Bound),
 		Anchors.Num() <= Bound);
 
@@ -418,6 +418,58 @@ bool FCSHouseDecorFitsReservedCapacityTest::RunTest(const FString& Parameters)
 	CSHouseDecor::BuildPlan(Anchors, Params, CSDecorTest_MakeRanges(), 3, Plan);
 	TestTrue(FString::Printf(TEXT("记录数不超过锚点数（%d ≤ %d）"), Plan.TotalRecords(), Anchors.Num()),
 		Plan.TotalRecords() <= Anchors.Num());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseDecorPolylineRoofAnchorsTest,
+	"PCGPlugins.ComputeShaderGenerator.House.DecorPolylineRoofAnchors",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseDecorPolylineRoofAnchorsTest::RunTest(const FString& Parameters)
+{
+	// footprint 3e：檐口锚点沿每条边的檐口外沿（内距 = −Overhang）排，屋脊锚点落在最高那段脊上。
+	CSHouseDecor::FSite Site;
+	Site.Roof.Footprint.Verts.Reset();
+	for (int32 i = 0; i < 6; ++i)
+	{
+		const double A = UE_DOUBLE_TWO_PI * double(i) / 6.0;
+		Site.Roof.Footprint.Verts.Add(FVector2D(300.0 * FMath::Cos(A), 300.0 * FMath::Sin(A)));
+	}
+	Site.Roof.EaveZ = 300.0f;
+	Site.Roof.Pitch = 35.0f;
+	Site.Roof.Overhang = 25.0f;
+
+	CSHouseDecor::FParams Params;
+	TArray<CSHouseDecor::FAnchor> Anchors;
+	CSHouseDecor::BuildAnchors(Site, Params, Anchors);
+
+	TSet<int32> EaveSides;
+	int32 EaveOffOutline = 0, EaveCount = 0, RidgeCount = 0, RidgeOffTop = 0;
+	for (const CSHouseDecor::FAnchor& A : Anchors)
+	{
+		const FVector2D XY(A.Location.X, A.Location.Y);
+		if (A.Family == CSHouseDecor::EFamily::Eave)
+		{
+			++EaveCount;
+			EaveSides.Add(A.AnchorId / 65536);
+			if (!FMath::IsNearlyEqual(Site.Roof.InsetDistance(XY), -25.0, 1.0e-3)) ++EaveOffOutline;
+		}
+		else if (A.Family == CSHouseDecor::EFamily::Ridge)
+		{
+			++RidgeCount;
+			if (!XY.Equals(FVector2D::ZeroVector, 1.0e-3)) ++RidgeOffTop;
+		}
+	}
+	TestEqual(TEXT("every hexagon edge carries eave anchors"), EaveSides.Num(), 6);
+	TestTrue(FString::Printf(TEXT("eave anchors exist (%d)"), EaveCount), EaveCount >= 6);
+	TestEqual(TEXT("every eave anchor sits on the eave outline"), EaveOffOutline, 0);
+	TestEqual(TEXT("a pointed roof gets exactly one ridge anchor"), RidgeCount, 1);
+	TestEqual(TEXT("and it sits on the apex"), RidgeOffTop, 0);
+
+	const int32 Bound = CSHouseDecor::MaxRecordsBound(Site.Roof.Footprint, Site.Roof.Overhang, 40.0f, Params);
+	TestTrue(FString::Printf(TEXT("the capacity bound covers the polyline anchors (%d <= %d)"), Anchors.Num(), Bound),
+		Anchors.Num() <= Bound);
 	return true;
 }
 

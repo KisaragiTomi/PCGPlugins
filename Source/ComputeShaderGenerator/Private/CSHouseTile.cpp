@@ -1,6 +1,6 @@
 #include "CSHouseTile.h"
 
-#include "CSHouseResize.h"          // CSHouseResize_EdgeOuterLocal：边号 → 局部外法线，唯一真源
+#include "CSHouseProfile.h"         // CSHouse_GetEdge：边号 → 边框架（外法线 = −In），唯一真源
 #include "CSHouseVine.h"            // IdentityHash / Hash01：逐实例随机的身份哈希，别再造一份
 #include "ComputeShaderGenerateHelper.h"
 #include "DataDrivenShaderPlatformInfo.h"
@@ -101,19 +101,14 @@ float CSHouseTile_ColumnPitch(const CSHouseTile::FParams& Params)
 	return FMath::Max(Native / FMath::Max(Params.ColumnOverlap, 0.05f), 1.0f);
 }
 
-/** 这个坡面的坡长（檐口外沿 → 脊 / 尖），四个面同一个值（四面同坡度、同外挑）。 */
-float CSHouseTile_SlopeLength(const FCSRoofDesc& Roof)
+/**
+ * 坡长（檐口外沿 → 屋面最高处，沿坡面量），所有坡面共用同一个值（同坡度、同外挑）。
+ * 到不了最高处的坡面（矩形的短边面、多边形上先收尖的面）在后面几排自然区间为空。
+ */
+float CSHouseTile_SlopeLength(const FCSRoofDesc& Roof, double MaxInset)
 {
 	const float CosP = FMath::Max(Roof.CosPitch(), UE_KINDA_SMALL_NUMBER);
-	return (Roof.HalfSpan() + FMath::Max(Roof.Overhang, 0.0f)) / CosP;
-}
-
-/** 第 Side 面的半长（沿边方向）与它到中心的距离。外法线/沿边方向都是轴对齐单位向量 ⇒ 取分量即可。 */
-void CSHouseTile_EdgeSpan(const FVector2D& Half, const FVector2D& Outward, const FVector2D& Along,
-	double& OutCentreDist, double& OutHalfLength)
-{
-	OutCentreDist = FMath::Abs(Outward.X) * Half.X + FMath::Abs(Outward.Y) * Half.Y;
-	OutHalfLength = FMath::Abs(Along.X) * Half.X + FMath::Abs(Along.Y) * Half.Y;
+	return (float(MaxInset) + FMath::Max(Roof.Overhang, 0.0f)) / CosP;
 }
 }
 
@@ -123,8 +118,14 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 {
 	OutTiles.Reset();
 
-	const FVector2D Half = Roof.HalfSize();
-	if (Half.X <= 1.0 || Half.Y <= 1.0) return;
+	const FCSHouseFootprint& Footprint = Roof.Footprint;
+	const int32 NumFaces = Footprint.NumEdges();
+	if (!Footprint.IsValidFootprint()) return;
+
+	FCSRoofSkeleton Skeleton;
+	CSHouseRoof_BuildSkeleton(Footprint, double(FMath::Max(Roof.Overhang, 0.0f)), Skeleton);
+	// 最大内切圆半径不到 1 cm 的"屋顶"不铺（矩形时代的「任一半边 ≤ 1 cm」）。
+	if (Skeleton.MaxInset <= 1.0) return;
 
 	FParams Params = InParams;
 	Params.Axes = CSHouseTile_SanitizeAxes(Params.Axes);
@@ -133,11 +134,11 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 	const float SinP = Roof.SinPitch();
 	const float TanP = Roof.TanPitch();
 	const float Overhang = FMath::Max(Roof.Overhang, 0.0f);
-	const float SlopeLen = CSHouseTile_SlopeLength(Roof);
+	const float SlopeLen = CSHouseTile_SlopeLength(Roof, Skeleton.MaxInset);
 	if (SlopeLen <= 1.0f) return;
 
-	// 排：沿坡面**等分**（目标间距只决定份数）。四个面共用同一份排数与排距 ⇒ 每一排的高度
-	// 在四个面上逐位相同，角斜脊上两侧的瓦因此是对齐的，不会错半排。
+	// 排：沿坡面**等分**（目标间距只决定份数）。所有坡面共用同一份排数与排距 ⇒ 每一排的高度
+	// 在每个面上逐位相同，角斜脊上两侧的瓦因此是对齐的，不会错半排。
 	const int32 Rows = FMath::Clamp(FMath::RoundToInt(SlopeLen / CSHouseTile_RowPitch(Params)), 1, CSHouseTile_MaxRows);
 	const double RowStep = double(SlopeLen) / double(Rows);
 	const float ColumnPitch = CSHouseTile_ColumnPitch(Params);
@@ -163,14 +164,14 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 
 	OutTiles.Reserve(MaxTilesBound(Roof, Params));
 
-	for (int32 Side = 0; Side < 4; ++Side)
+	for (int32 Side = 0; Side < NumFaces; ++Side)
 	{
 		// 外法线与沿边方向。⚠️ 沿边取 `(n.y, -n.x)` 而不是 `(-n.y, n.x)`：只有这一支能让
-		// (上坡, 沿排, 法线) 成右手基，另一支差一个镜像。
-		const FVector2D Outward = CSHouseResize_EdgeOuterLocal(Side);
+		// (上坡, 沿排, 法线) 成右手基，另一支差一个镜像。逆时针折线上它恰好是 −U。
+		const FCSHouseEdgeFrame Edge = CSHouse_GetEdge(Side, Footprint, 0.0f);
+		if (Edge.Len <= 0.0f) continue;
+		const FVector2D Outward(-Edge.In.X, -Edge.In.Y);
 		const FVector2D Along(Outward.Y, -Outward.X);
-		double CentreDist = 0.0, HalfLength = 0.0;
-		CSHouseTile_EdgeSpan(Half, Outward, Along, CentreDist, HalfLength);
 
 		// 局部（actor 空间）的三条轴。法线朝上外、上坡向指向屋脊、沿排水平。
 		const FVector NormalLocal(Outward.X * SinP, Outward.Y * SinP, CosP);
@@ -179,17 +180,20 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 
 		for (int32 Row = 0; Row < Rows; ++Row)
 		{
-			// 沿坡面的弧长（自檐口外沿起）→ 内距。d = −Overhang 是檐口外沿，d = HalfSpan 是脊。
+			// 沿坡面的弧长（自檐口外沿起）→ 内距。d = −Overhang 是檐口外沿，d = MaxInset 是屋面最高处。
 			const double SlopeS = (double(Row) + 0.5) * RowStep;
 			const double Inset = -double(Overhang) + SlopeS * double(CosP);
 
-			// 这一排的半宽：四坡的每个坡面在平面上都是"底边 + 两条 45° 斜边"的梯形，
-			// 半宽随内距 1:1 收窄（见头文件）。收到 0 就是角上的尖，那一排没有瓦。
-			const double HalfWidth = HalfLength - Inset;
-			if (HalfWidth <= 0.5) continue;
+			// 这一排在本坡面上的沿边区间（见 `CSHouseRoof_FaceSpanAtInset`）。矩形上是 [d, Len − d]，
+			// 即"半宽随内距 1:1 收窄"；收到不足 1 cm 就是角上的尖，那一排没有瓦。
+			double T0 = 0.0, T1 = 0.0;
+			if (!CSHouseRoof_FaceSpanAtInset(Footprint, Side, Inset, T0, T1)) continue;
+			const double Width = T1 - T0;
+			if (Width <= 1.0) continue;
+			const FVector2D RowBase = Edge.Start + Edge.In * Inset;
 
-			const int32 Columns = FMath::Clamp(FMath::RoundToInt(2.0 * HalfWidth / ColumnPitch), 1, CSHouseTile_MaxColumns);
-			const double ColumnStep = 2.0 * HalfWidth / double(Columns);
+			const int32 Columns = FMath::Clamp(FMath::RoundToInt(Width / ColumnPitch), 1, CSHouseTile_MaxColumns);
+			const double ColumnStep = Width / double(Columns);
 
 			for (int32 Column = 0; Column < Columns; ++Column)
 			{
@@ -204,8 +208,8 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 				const float LiftJ = Params.LiftJitter * (CSHouseVine::Hash01(
 					CSHouseVine::IdentityHash(Side, Row, Column, 74u, Params.Seed)) - 0.5f) * 2.0f;
 
-				const double U = -HalfWidth + (double(Column) + 0.5) * ColumnStep;
-				const FVector2D XY = Outward * (CentreDist - Inset) + Along * U;
+				// 列从 T1 端起排（沿 Along = −U 走），与矩形时代「U 从 −半宽起」同序 ⇒ 身份 (面, 排, 列) 不变。
+				const FVector2D XY = RowBase + Edge.U * (T1 - (double(Column) + 0.5) * ColumnStep);
 				const double Z = double(Roof.EaveZ) + double(TanP) * Inset;
 				const FVector Local = FVector(XY.X, XY.Y, Z) + NormalLocal * (double(Params.StandOff) + double(LiftJ));
 
@@ -254,40 +258,26 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 	// -------------------------------------------------------------------------
 	// 角斜脊 / 屋脊的盖瓦（用户 2026-08-31：「瓦片交汇处有 mesh 进行遮蔽」）
 	//
-	// 同一瓦片沿四条角斜脊与屋脊收口。TG 的原始资产含 roof_tile / lod1 / backface，
-	// 不是三个可随机互换的瓦型；这里只复用经 VS 尺寸适配的可见瓦片。
+	// 同一瓦片沿骨架的每条弧收口（矩形上 = 四条角斜脊 + 一条屋脊）。TG 的原始资产含
+	// roof_tile / lod1 / backface，不是三个可随机互换的瓦型；这里只复用经 VS 尺寸适配的可见瓦片。
 	// 未从“没有 roof_ridge 文件名”推断原版的收口生成算法。下面是按参考图的 UE 适配。
 	if (Params.RidgeCapScale > 0.0f)
 	{
-		const double ApexZ = double(Roof.EaveZ) + double(Roof.HalfSpan()) * double(TanP);
-		const double EaveOuterZ = double(Roof.EaveZ) - double(Overhang) * double(TanP);
-		const double RidgeHalf = double(Roof.RidgeHalfLength());
-		const FVector RidgeDir = Roof.bRidgeAlongX() ? FVector(1.0, 0.0, 0.0) : FVector(0.0, 1.0, 0.0);
-
 		// 一条脊线 = 起点 → 终点 + 该处两坡法线的角平分。
 		struct FRidgeLine { FVector A; FVector B; FVector Normal; };
-		TArray<FRidgeLine, TInlineAllocator<5>> Lines;
+		TArray<FRidgeLine, TInlineAllocator<16>> Lines;
 
-		// ① 四条角斜脊：檐口外角 → 同侧的屋脊端点。
-		//    角平分线是闭式的：相邻两坡的外法线是 (sx·sinP, 0, cosP) 与 (0, sy·sinP, cosP)，
-		//    和归一化即得 —— 不必去查这个角挨着哪两个 Side，也就不会写出一个与 Side 编号耦合的表。
-		for (int32 Corner = 0; Corner < 4; ++Corner)
+		// 角平分线是闭式的：两侧坡面的外法线是 (外法线_a · sinP, cosP) 与 (外法线_b · sinP, cosP)，
+		// 和归一化即得。脊上两面对冲 ⇒ 恒为竖直向上。
+		for (const FCSRoofSkeletonArc& Arc : Skeleton.Arcs)
 		{
-			const double Sx = (Corner == 0 || Corner == 1) ? 1.0 : -1.0;
-			const double Sy = (Corner == 1 || Corner == 2) ? 1.0 : -1.0;
-			const FVector Foot(Sx * (Half.X + double(Overhang)), Sy * (Half.Y + double(Overhang)), EaveOuterZ);
-			const double AlongRidge = Roof.bRidgeAlongX() ? Sx : Sy;
-			const FVector Top = RidgeDir * (AlongRidge * RidgeHalf) + FVector(0.0, 0.0, ApexZ);
-			const FVector N(Sx * double(SinP), Sy * double(SinP), 2.0 * double(CosP));
-			Lines.Add({ Foot, Top, N.GetSafeNormal() });
-		}
-
-		// ② 屋脊本身：两个端点之间。两坡法线在这里对称 ⇒ 角平分恒为竖直向上。
-		if (RidgeHalf > 0.5)
-		{
-			Lines.Add({ RidgeDir * -RidgeHalf + FVector(0.0, 0.0, ApexZ),
-						RidgeDir * RidgeHalf + FVector(0.0, 0.0, ApexZ),
-						FVector(0.0, 0.0, 1.0) });
+			const FCSHouseEdgeFrame FA = CSHouse_GetEdge(Arc.FaceA, Footprint, 0.0f);
+			const FCSHouseEdgeFrame FB = CSHouse_GetEdge(Arc.FaceB, Footprint, 0.0f);
+			const FVector N(-(FA.In.X + FB.In.X) * double(SinP), -(FA.In.Y + FB.In.Y) * double(SinP), 2.0 * double(CosP));
+			Lines.Add({
+				FVector(Arc.A.X, Arc.A.Y, double(Roof.EaveZ) + Arc.InsetA * double(TanP)),
+				FVector(Arc.B.X, Arc.B.Y, double(Roof.EaveZ) + Arc.InsetB * double(TanP)),
+				N.GetSafeNormal() });
 		}
 
 		const float CapPitch = CSHouseTile_ColumnPitch(Params);
@@ -306,11 +296,11 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 
 			for (int32 Index = 0; Index < Count; ++Index)
 			{
-				// 身份用 Side = 4 + 线号，与四个坡面的 (Side, Row, Column) 不会撞。
-				const uint32 Id = CSHouseVine::IdentityHash(4 + Line, Index, 0, 71u, Params.Seed);
+				// 身份用 Side = 面数 + 线号，与坡面的 (Side, Row, Column) 不会撞（矩形上就是原来的 4 + 线号）。
+				const uint32 Id = CSHouseVine::IdentityHash(NumFaces + Line, Index, 0, 71u, Params.Seed);
 				const float Random01 = CSHouseVine::Hash01(Id);
 				const float ScaleJ = 1.0f + Params.ScaleJitter * (CSHouseVine::Hash01(
-					CSHouseVine::IdentityHash(4 + Line, Index, 0, 72u, Params.Seed)) - 0.5f) * 2.0f;
+					CSHouseVine::IdentityHash(NumFaces + Line, Index, 0, 72u, Params.Seed)) - 0.5f) * 2.0f;
 
 				const FVector LocalPos = L.A + Dir * ((double(Index) + 0.5) * Step)
 					+ L.Normal * double(Params.StandOff + Thickness);
@@ -361,42 +351,44 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 
 int32 MaxTilesBound(const FCSRoofDesc& Roof, const FParams& InParams)
 {
-	const FVector2D Half = Roof.HalfSize();
-	if (Half.X <= 1.0 || Half.Y <= 1.0) return 0;
+	const FCSHouseFootprint& Footprint = Roof.Footprint;
+	if (!Footprint.IsValidFootprint()) return 0;
+
+	const float Overhang = FMath::Max(Roof.Overhang, 0.0f);
+	FCSRoofSkeleton Skeleton;
+	CSHouseRoof_BuildSkeleton(Footprint, double(Overhang), Skeleton);
+	if (Skeleton.MaxInset <= 1.0) return 0;
 
 	FParams Params = InParams;
 	Params.Axes = CSHouseTile_SanitizeAxes(Params.Axes);
 
-	const float SlopeLen = CSHouseTile_SlopeLength(Roof);
-	const float Overhang = FMath::Max(Roof.Overhang, 0.0f);
+	const float SlopeLen = CSHouseTile_SlopeLength(Roof, Skeleton.MaxInset);
 	// +1 是等分那一步的取整余量（`RoundToInt` 最多多给半格）。
 	const int32 Rows = FMath::Clamp(FMath::CeilToInt(SlopeLen / CSHouseTile_RowPitch(Params)) + 1, 1, CSHouseTile_MaxRows);
 	const float ColumnPitch = CSHouseTile_ColumnPitch(Params);
 
 	int32 Total = 0;
-	for (int32 Side = 0; Side < 4; ++Side)
+	for (int32 Side = 0; Side < Footprint.NumEdges(); ++Side)
 	{
-		const FVector2D Outward = CSHouseResize_EdgeOuterLocal(Side);
-		const FVector2D Along(Outward.Y, -Outward.X);
-		double CentreDist = 0.0, HalfLength = 0.0;
-		CSHouseTile_EdgeSpan(Half, Outward, Along, CentreDist, HalfLength);
-		// 最宽的一排就是檐口外沿那一排（半宽 = 半长 + 外挑）。
+		// 最宽的一排就是檐口外沿那一排：凸折线上每个坡面的排宽随内距单调收窄。
+		double T0 = 0.0, T1 = 0.0;
+		if (!CSHouseRoof_FaceSpanAtInset(Footprint, Side, -double(Overhang), T0, T1)) continue;
 		const int32 Columns = FMath::Clamp(
-			FMath::CeilToInt(2.0 * (HalfLength + double(Overhang)) / double(ColumnPitch)) + 1, 1, CSHouseTile_MaxColumns);
+			FMath::CeilToInt((T1 - T0) / double(ColumnPitch)) + 1, 1, CSHouseTile_MaxColumns);
 		Total += Rows * Columns;
 	}
 
-	// 脊瓦：4 条角斜脊 + 1 条屋脊。容量是**一次预留、超了截断**（零阻塞纪律），漏算这一段的
-	// 症状是"屋脊末端少几块盖瓦"，而瓦数、零阻塞、三角数全都正常 —— 只有出图看得见。
+	// 脊瓦：骨架的每条弧（矩形上 4 条角斜脊 + 1 条屋脊）。容量是**一次预留、超了截断**（零阻塞纪律），
+	// 漏算这一段的症状是"屋脊末端少几块盖瓦"，而瓦数、零阻塞、三角数全都正常 —— 只有出图看得见。
 	if (InParams.RidgeCapScale > 0.0f)
 	{
-		const double ApexZ = double(Roof.HalfSpan()) * double(Roof.TanPitch());
-		const double Diag = FMath::Sqrt(FMath::Square(Half.X + double(Overhang))
-			+ FMath::Square(Half.Y + double(Overhang)) + FMath::Square(ApexZ + double(Overhang) * double(Roof.TanPitch())));
-		const int32 PerHip = FMath::Clamp(FMath::CeilToInt(Diag / double(ColumnPitch)) + 1, 1, CSHouseTile_MaxColumns);
-		const int32 OnRidge = FMath::Clamp(
-			FMath::CeilToInt(double(Roof.RidgeLength()) / double(ColumnPitch)) + 1, 1, CSHouseTile_MaxColumns);
-		Total += 4 * PerHip + OnRidge;
+		const double TanP = double(Roof.TanPitch());
+		for (const FCSRoofSkeletonArc& Arc : Skeleton.Arcs)
+		{
+			const double Length = FMath::Sqrt(FVector2D::DistSquared(Arc.A, Arc.B)
+				+ FMath::Square((Arc.InsetB - Arc.InsetA) * TanP));
+			Total += FMath::Clamp(FMath::CeilToInt(Length / double(ColumnPitch)) + 1, 1, CSHouseTile_MaxColumns);
+		}
 	}
 	return Total;
 }

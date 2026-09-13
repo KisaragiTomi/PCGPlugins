@@ -20,7 +20,7 @@ namespace
 FCSRoofDesc CSHouseTileTest_MakeRoof(double SizeX, double SizeY)
 {
 	FCSRoofDesc Desc;
-	Desc.Footprint = FVector2D(SizeX, SizeY);
+	Desc.Footprint = FCSHouseFootprint::MakeRect(FVector2D(SizeX, SizeY));
 	Desc.EaveZ = 300.0f;
 	Desc.Pitch = 35.0f;
 	Desc.Overhang = 25.0f;
@@ -144,7 +144,7 @@ bool FCSHouseTileCoversAllSlopesTest::RunTest(const FString& Parameters)
 	for (const CSHouseTile::FRecord& R : Tiles)
 	{
 		const FVector2D XY(R.WorldPos.X, R.WorldPos.Y);
-		const FVector2D Half = Roof.HalfSize();
+		const FVector2D Half = Roof.Footprint.GetBounds().Max;   // 居中矩形的半尺寸
 		// 哪条边最近就属于哪个面（与高度场的 min 同一条判据）。
 		const double D[4] = { Half.Y + XY.Y, Half.X - XY.X, Half.Y - XY.Y, Half.X + XY.X };
 		int32 Best = 0;
@@ -194,7 +194,7 @@ bool FCSHouseTileCoursesLineUpTest::RunTest(const FString& Parameters)
 	// 错开半排的症状是角斜脊上两侧的瓦犬牙交错，只有贴脸看才看得出来。
 	TSet<int32> Courses;
 	for (const CSHouseTile::FRecord& R : Tiles) Courses.Add(FMath::RoundToInt(R.WorldPos.Z));
-	const float SlopeLen = (Roof.HalfSpan() + Roof.Overhang) / Roof.CosPitch();
+	const float SlopeLen = (float(Roof.MaxInset()) + Roof.Overhang) / Roof.CosPitch();
 	const int32 Rows = FMath::Max(1, FMath::RoundToInt(SlopeLen / 26.0f));
 	TestEqual(FString::Printf(TEXT("all four slopes share the same %d courses"), Rows), Courses.Num(), Rows);
 
@@ -235,7 +235,7 @@ bool FCSHouseTilePyramidTest::RunTest(const FString& Parameters)
 		int32 PerFace[4] = { 0, 0, 0, 0 };
 		for (const CSHouseTile::FRecord& R : Tiles)
 		{
-			const FVector2D Half = Square.HalfSize();
+			const FVector2D Half = Square.Footprint.GetBounds().Max;
 			const double D[4] = { Half.Y + R.WorldPos.Y, Half.X - R.WorldPos.X,
 				Half.Y - R.WorldPos.Y, Half.X + R.WorldPos.X };
 			int32 Best = 0;
@@ -527,6 +527,95 @@ bool FCSHouseTileRidgeCapsTest::RunTest(const FString& Parameters)
 		TestTrue(TEXT("cap clears the body tile thickness"), R.WorldPos.Z - RoofZ >= 5.99f);
 	}
 	TestTrue(TEXT("horizontal ridge clearance was exercised"), HorizontalCaps > 0);
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// ⑨ 折线屋面（footprint 3e）：六边形 / 不规则五边形上，瓦照样贴面、铺满每个坡面、装得进上界
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseTilePolylineRoofTest,
+	"PCGPlugins.ComputeShaderGenerator.House.TilePolylineRoof",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseTilePolylineRoofTest::RunTest(const FString& Parameters)
+{
+	TArray<FVector2D> Hexagon;
+	for (int32 i = 0; i < 6; ++i)
+	{
+		const double A = UE_DOUBLE_TWO_PI * double(i) / 6.0;
+		Hexagon.Add(FVector2D(320.0 * FMath::Cos(A), 320.0 * FMath::Sin(A)));
+	}
+	struct FCase { const TCHAR* What; TArray<FVector2D> Verts; };
+	const FCase Cases[] = {
+		{ TEXT("hexagon"), Hexagon },
+		{ TEXT("irregular pentagon"), { FVector2D(-320, -180), FVector2D(260, -220), FVector2D(380, 60),
+			FVector2D(40, 290), FVector2D(-290, 150) } },
+	};
+
+	for (const FCase& C : Cases)
+	{
+		FCSRoofDesc Roof = CSHouseTileTest_MakeRoof(1.0, 1.0);
+		Roof.Footprint.Verts = C.Verts;
+		const int32 NumFaces = Roof.Footprint.NumEdges();
+
+		const CSHouseTile::FParams Params = CSHouseTileTest_MakeParams();
+		TArray<CSHouseTile::FRecord> Tiles;
+		CSHouseTile::BuildPlan(Roof, FTransform::Identity, Params, Tiles);
+		TestTrue(FString::Printf(TEXT("[%s] the roof gets tiled (%d)"), C.What, Tiles.Num()), Tiles.Num() > 100);
+
+		TArray<int32> PerFace;
+		PerFace.SetNumZeroed(NumFaces);
+		int32 OffSurface = 0, OutsideRoof = 0, BadNormal = 0, LeftHanded = 0;
+		for (const CSHouseTile::FRecord& R : Tiles)
+		{
+			const FVector2D XY(R.WorldPos.X, R.WorldPos.Y);
+			if (!FMath::IsNearlyEqual(float(R.WorldPos.Z), CSHouseRoof_EvalZ(Roof, XY), 0.01f)) ++OffSurface;
+			if (!CSHouseRoof_IsUnderRoof(Roof, XY)) ++OutsideRoof;
+			if (FVector::DotProduct(FVector(R.AxisZ), CSHouseRoof_EvalNormal(Roof, XY)) < 0.70) ++BadNormal;
+			if (FVector3f::DotProduct(FVector3f::CrossProduct(R.AxisX, R.AxisY), R.AxisZ) < 0.9f) ++LeftHanded;
+
+			int32 Best = 0;
+			double BestD = TNumericLimits<double>::Max();
+			for (int32 Face = 0; Face < NumFaces; ++Face)
+			{
+				const FCSHouseEdgeFrame F = CSHouse_GetEdge(Face, Roof.Footprint, 0.0f);
+				const double D = FVector2D::DotProduct(XY - F.Start, F.In);
+				if (D < BestD) { BestD = D; Best = Face; }
+			}
+			++PerFace[Best];
+		}
+		TestEqual(FString::Printf(TEXT("[%s] every tile sits on the roof surface"), C.What), OffSurface, 0);
+		TestEqual(FString::Printf(TEXT("[%s] no tile lands outside the eave outline"), C.What), OutsideRoof, 0);
+		TestEqual(FString::Printf(TEXT("[%s] every tile faces its slope"), C.What), BadNormal, 0);
+		TestEqual(FString::Printf(TEXT("[%s] every tile basis is right-handed"), C.What), LeftHanded, 0);
+		for (int32 Face = 0; Face < NumFaces; ++Face)
+		{
+			TestTrue(FString::Printf(TEXT("[%s] slope %d is tiled (%d)"), C.What, Face, PerFace[Face]), PerFace[Face] > 5);
+		}
+
+		// 脊瓦沿骨架的每条弧：右手基、比坡面更竖直、容量上界盖得住。
+		CSHouseTile::FParams WithCaps = Params;
+		WithCaps.RidgeCapScale = 1.15f;
+		TArray<CSHouseTile::FRecord> Capped;
+		CSHouseTile::BuildPlan(Roof, FTransform::Identity, WithCaps, Capped);
+		const int32 Caps = Capped.Num() - Tiles.Num();
+		TestTrue(FString::Printf(TEXT("[%s] ridge caps exist (%d)"), C.What, Caps), Caps > NumFaces);
+		int32 CapMirrored = 0, CapTooFlat = 0;
+		for (int32 Index = Tiles.Num(); Index < Capped.Num(); ++Index)
+		{
+			const CSHouseTile::FRecord& R = Capped[Index];
+			if (FVector3f::DotProduct(FVector3f::CrossProduct(R.AxisX, R.AxisY), R.AxisZ) <= 0.0f) ++CapMirrored;
+			if (R.AxisZ.Z < Roof.CosPitch() - 1.0e-3f) ++CapTooFlat;
+		}
+		TestEqual(FString::Printf(TEXT("[%s] every ridge cap basis is right-handed"), C.What), CapMirrored, 0);
+		TestEqual(FString::Printf(TEXT("[%s] every ridge cap rides a ridge (steeper normal than a slope)"), C.What), CapTooFlat, 0);
+		const int32 Bound = CSHouseTile::MaxTilesBound(Roof, WithCaps);
+		TestTrue(FString::Printf(TEXT("[%s] tiles + caps fit the bound (%d <= %d)"), C.What, Capped.Num(), Bound), Capped.Num() <= Bound);
+		TestTrue(FString::Printf(TEXT("[%s] the bound is not absurdly high (%d <= 4 x %d)"), C.What, Bound, Capped.Num()),
+			Bound <= Capped.Num() * 4);
+	}
 	return true;
 }
 

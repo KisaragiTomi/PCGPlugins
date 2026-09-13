@@ -958,8 +958,7 @@ float ACSHouseActor::ComputeDoorWidthScale(float GapMax, float GapFull, float Ga
 FCSRoofDesc ACSHouseActor::GetRoofDesc() const
 {
 	FCSRoofDesc Desc;
-	// 屋面还认矩形：直骨架的内距公式是 `min(HX − |x|, HY − |y|)`，折线化排在 3e。
-	Desc.Footprint = FootprintSize;
+	Desc.Footprint = GetFootprint();
 	Desc.EaveZ = WallHeight + RoofHeightOffset;
 	Desc.Pitch = RoofPitch;
 	Desc.Overhang = RoofOverhang;
@@ -3442,10 +3441,11 @@ void ACSHouseActor::RebuildRoofFinials()
 	}
 
 	const FCSRoofDesc Roof = GetRoofDesc();
-	const float RidgeHalf = Roof.RidgeHalfLength();
-	// 脊长收到 0（正方形）时两端重合 ⇒ 只立一根，金字塔尖不需要特例。
-	// 阈值取 1 cm：比这更短的"脊"两根尖顶会互相穿模，而肉眼分不出一根两根。
-	const int32 WantCount = (RidgeHalf > 0.5f) ? 2 : 1;
+	// 尖顶立在最高那段脊的两端（骨架的 TopA / TopB）。脊长收到 0（正方形、正多边形）时两端重合
+	// ⇒ 只立一根，金字塔尖不需要特例。阈值取 1 cm：比这更短的"脊"两根尖顶会互相穿模，而肉眼分不出一根两根。
+	FCSRoofSkeleton Skeleton;
+	CSHouseRoof_BuildSkeleton(Roof.Footprint, double(Roof.Overhang), Skeleton);
+	const int32 WantCount = FVector2D::Distance(Skeleton.TopA, Skeleton.TopB) > 1.0 ? 2 : 1;
 
 	// 竖直轴从包围盒判：尖顶是**一根细长的东西** ⇒ 最长的一轴就是它朝上那根。
 	// （TG 的 `roof_spire` 是 y-up 导出的，不判轴直接进 UE 会躺倒。）
@@ -3514,8 +3514,9 @@ void ACSHouseActor::RebuildRoofFinials()
 		// 留空 = 用网格自带的材质槽（`SetMaterial(nullptr)` 会清成空槽画成灰，不能这么写）。
 		if (RoofFinialMaterial) Component->SetMaterial(0, RoofFinialMaterial);
 
-		const double Along = (WantCount == 2) ? ((Index == 0) ? -double(RidgeHalf) : double(RidgeHalf)) : 0.0;
-		const FVector LocalPos = Roof.RidgeToLocal(Along, 0.0, double(RidgeZ) - double(RoofFinialSink));
+		const FVector2D XY = (WantCount == 2) ? ((Index == 0) ? Skeleton.TopA : Skeleton.TopB)
+			: (Skeleton.TopA + Skeleton.TopB) * 0.5;
+		const FVector LocalPos(XY.X, XY.Y, double(RidgeZ) - double(RoofFinialSink));
 		Component->SetWorldTransform(FTransform(
 			Build.GetRotation() * Stand,
 			Build.TransformPosition(LocalPos),
@@ -3880,7 +3881,7 @@ CSShaperSteps::EHandoverResult ACSHouseActor::EnsureDecorComponents()
 	// 上限是 FootprintSize 的**连续函数**（周长 / 间距），而 ReserveCapacity 只对齐到 64 ——
 	// 拖尺寸时每涨过一个间距就重新分配一次。藤蔓那轮正是漏了这一步，实测一段拖动 21 次阻塞刷新。
 	const CSHouseDecor::FParams Params = MakeDecorParams();
-	const int32 Bound = CSHouseDecor::MaxRecordsBound(FootprintSize, RoofOverhang, PierWidth, Params);
+	const int32 Bound = CSHouseDecor::MaxRecordsBound(GetFootprint(), RoofOverhang, PierWidth, Params);
 	const uint32 MaxRecords = uint32(FMath::Clamp(CSShaperSteps::ReserveCount(Bound), 64, 1 << 16));
 	CSShaperSteps::ReserveCapacity(DecorGpuBuffers, MaxRecords);
 

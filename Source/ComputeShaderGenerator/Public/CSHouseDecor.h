@@ -287,7 +287,7 @@ COMPUTESHADERGENERATOR_API void BuildPlan(const TArray<FAnchor>& Anchors, const 
  * `CSShaperSteps::ReserveCount`（×1.5 对齐 4096）—— 藤蔓那轮就是漏了这一步：`ReserveCapacity`
  * 只对齐到 64，拖尺寸时每涨过一根藤的间距就重新分配一次，实测一段拖动累计 21 次阻塞刷新。
  */
-COMPUTESHADERGENERATOR_API int32 MaxRecordsBound(const FVector2D& Footprint, float Overhang, float PierWidth,
+COMPUTESHADERGENERATOR_API int32 MaxRecordsBound(const FCSHouseFootprint& Footprint, float Overhang, float PierWidth,
 	const FParams& Params);
 
 /**

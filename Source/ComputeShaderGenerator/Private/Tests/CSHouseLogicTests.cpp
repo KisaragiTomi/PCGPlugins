@@ -43,7 +43,7 @@ namespace
 FCSRoofDesc CSHouseTest_MakeRoof(double SizeX, double SizeY)
 {
 	FCSRoofDesc Desc;
-	Desc.Footprint = FVector2D(SizeX, SizeY);
+	Desc.Footprint = FCSHouseFootprint::MakeRect(FVector2D(SizeX, SizeY));
 	Desc.EaveZ = 300.0f;
 	Desc.Pitch = 35.0f;
 	Desc.Overhang = 25.0f;
@@ -66,10 +66,14 @@ bool FCSHouseRoofEvalTest::RunTest(const FString& Parameters)
 	const FCSRoofDesc Roof = CSHouseTest_MakeRoof(600.0, 400.0);
 	const float TanP = Roof.TanPitch();
 
-	TestTrue(TEXT("The ridge follows the long axis"), Roof.bRidgeAlongX());
-	TestTrue(TEXT("Span is the 400 side"), FMath::IsNearlyEqual(Roof.SpanLength(), 400.0f));
+	FCSRoofSkeleton Skeleton;
+	CSHouseRoof_BuildSkeleton(Roof.Footprint, Roof.Overhang, Skeleton);
+	TestTrue(TEXT("The ridge follows the long axis"),
+		FMath::IsNearlyZero(Skeleton.TopA.Y, 1.0e-6) && FMath::IsNearlyZero(Skeleton.TopB.Y, 1.0e-6) && Skeleton.TopB.X > Skeleton.TopA.X);
+	TestTrue(TEXT("The highest inset is half the 400 side"), FMath::IsNearlyEqual(Roof.MaxInset(), 200.0, 1.0e-6));
 	// 等坡度四坡的推论：两端的坡面各吃掉半跨，脊线只剩 |X − Y|。**不是**长边的长度。
-	TestTrue(TEXT("The ridge segment is the aspect difference"), FMath::IsNearlyEqual(Roof.RidgeLength(), 200.0f));
+	TestTrue(TEXT("The ridge segment is the aspect difference"),
+		FMath::IsNearlyEqual(FVector2D::Distance(Skeleton.TopA, Skeleton.TopB), 200.0, 1.0e-4));
 
 	// 屋脊高只由**短边**决定：脊线上的内距恰好是半跨。
 	TestTrue(TEXT("Ridge height"), FMath::IsNearlyEqual(CSHouseRoof_RidgeZ(Roof), 300.0f + TanP * 200.0f, 1.0e-3f));
@@ -100,13 +104,19 @@ bool FCSHouseRoofEvalTest::RunTest(const FString& Parameters)
 
 	// 正方形连续退化成金字塔：脊长 0，尖点在中心。
 	const FCSRoofDesc Square = CSHouseTest_MakeRoof(400.0, 400.0);
-	TestTrue(TEXT("A square roof degenerates to a pyramid"), FMath::IsNearlyEqual(Square.RidgeLength(), 0.0f));
+	FCSRoofSkeleton SquareSkeleton;
+	CSHouseRoof_BuildSkeleton(Square.Footprint, Square.Overhang, SquareSkeleton);
+	TestTrue(TEXT("A square roof degenerates to a pyramid"),
+		FVector2D::Distance(SquareSkeleton.TopA, SquareSkeleton.TopB) < 1.0e-4 && SquareSkeleton.TopA.Equals(FVector2D::ZeroVector, 1.0e-4));
 	TestTrue(TEXT("The pyramid apex is at the centre"),
 		FMath::IsNearlyEqual(CSHouseRoof_EvalZ(Square, FVector2D(0.0, 0.0)), 300.0f + Square.TanPitch() * 200.0f, 1.0e-3f));
 
 	// 转 90°：脊向跟着长轴走，短边没变 ⇒ 脊高不变，且高度场整体就是转置。
 	const FCSRoofDesc RoofY = CSHouseTest_MakeRoof(400.0, 600.0);
-	TestFalse(TEXT("The ridge follows the long axis after the swap"), RoofY.bRidgeAlongX());
+	FCSRoofSkeleton SkeletonY;
+	CSHouseRoof_BuildSkeleton(RoofY.Footprint, RoofY.Overhang, SkeletonY);
+	TestTrue(TEXT("The ridge follows the long axis after the swap"),
+		FMath::IsNearlyZero(SkeletonY.TopA.X, 1.0e-6) && FMath::IsNearlyZero(SkeletonY.TopB.X, 1.0e-6) && SkeletonY.TopB.Y > SkeletonY.TopA.Y);
 	TestTrue(TEXT("Ridge height is unchanged by the swap"),
 		FMath::IsNearlyEqual(CSHouseRoof_RidgeZ(RoofY), CSHouseRoof_RidgeZ(Roof), 1.0e-3f));
 	TestTrue(TEXT("The height field is the transpose"),
@@ -168,6 +178,141 @@ bool FCSHouseRoofNormalTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Under the end overhang"), CSHouseRoof_IsUnderRoof(Roof, FVector2D(320.0, 0.0)));
 	TestFalse(TEXT("Past the end overhang"), CSHouseRoof_IsUnderRoof(Roof, FVector2D(340.0, 0.0)));
 
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// 屋面折线化（footprint 3e）：凸折线的直骨架 = 等坡度四坡屋面
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseRoofPolylineSkeletonTest,
+	"PCGPlugins.ComputeShaderGenerator.House.RoofPolylineSkeleton",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseRoofPolylineSkeletonTest::RunTest(const FString& Parameters)
+{
+	auto MakeRoof = [](const TArray<FVector2D>& Verts)
+	{
+		FCSRoofDesc Desc;
+		Desc.Footprint.Verts = Verts;
+		Desc.EaveZ = 300.0f;
+		Desc.Pitch = 35.0f;
+		Desc.Overhang = 25.0f;
+		return Desc;
+	};
+
+	// ---- ① 矩形：骨架恰好是「四条角斜脊（按角号）+ 一条脊」，端点与老公式一致 ----
+	{
+		const FCSRoofDesc Roof = CSHouseTest_MakeRoof(600.0, 400.0);
+		FCSRoofSkeleton S;
+		CSHouseRoof_BuildSkeleton(Roof.Footprint, Roof.Overhang, S);
+		TestEqual(TEXT("rect: four hips"), S.NumHips, 4);
+		TestEqual(TEXT("rect: four hips plus one ridge"), S.Arcs.Num(), 5);
+		if (S.Arcs.Num() == 5)
+		{
+			for (int32 Corner = 0; Corner < 4; ++Corner)
+			{
+				const FVector2D Sign = CSHouseQuoin::CornerSign(Corner);
+				const FCSRoofSkeletonArc& Hip = S.Arcs[Corner];
+				TestTrue(FString::Printf(TEXT("rect: hip %d starts on the eave outer corner"), Corner),
+					Hip.A.Equals(FVector2D(Sign.X * 325.0, Sign.Y * 225.0), 1.0e-6) && FMath::IsNearlyEqual(Hip.InsetA, -25.0, 1.0e-9));
+				TestTrue(FString::Printf(TEXT("rect: hip %d ends on its ridge end"), Corner),
+					Hip.B.Equals(FVector2D(Sign.X * 100.0, 0.0), 1.0e-6) && FMath::IsNearlyEqual(Hip.InsetB, 200.0, 1.0e-9));
+			}
+			const FCSRoofSkeletonArc& Ridge = S.Arcs[4];
+			TestTrue(TEXT("rect: the ridge runs -100 -> +100 along X at the top"),
+				Ridge.A.Equals(FVector2D(-100.0, 0.0), 1.0e-6) && Ridge.B.Equals(FVector2D(100.0, 0.0), 1.0e-6)
+				&& FMath::IsNearlyEqual(Ridge.InsetA, 200.0, 1.0e-9));
+		}
+		TestTrue(TEXT("rect: max inset is exactly half the short side"), S.MaxInset == 200.0);
+	}
+
+	// ---- ② 正六边形：收成一个尖，六条角斜脊都汇到中心 ----
+	{
+		TArray<FVector2D> Hex;
+		for (int32 i = 0; i < 6; ++i)
+		{
+			const double A = UE_DOUBLE_TWO_PI * double(i) / 6.0;
+			Hex.Add(FVector2D(300.0 * FMath::Cos(A), 300.0 * FMath::Sin(A)));
+		}
+		const FCSRoofDesc Roof = MakeRoof(Hex);
+		FCSRoofSkeleton S;
+		CSHouseRoof_BuildSkeleton(Roof.Footprint, Roof.Overhang, S);
+		const double Inradius = 300.0 * FMath::Cos(UE_DOUBLE_PI / 6.0);
+		TestTrue(FString::Printf(TEXT("hexagon: max inset is the inradius (%.4f)"), S.MaxInset), FMath::IsNearlyEqual(S.MaxInset, Inradius, 1.0e-6));
+		TestTrue(TEXT("hexagon: the top is a point at the centre"),
+			S.TopA.Equals(FVector2D::ZeroVector, 1.0e-6) && S.TopB.Equals(FVector2D::ZeroVector, 1.0e-6));
+		TestEqual(TEXT("hexagon: six hips"), S.NumHips, 6);
+		for (int32 Corner = 0; Corner < S.NumHips && Corner < S.Arcs.Num(); ++Corner)
+		{
+			const FCSRoofSkeletonArc& Hip = S.Arcs[Corner];
+			const FVector2D Vertex = Hex[(Corner + 1) % 6];
+			TestTrue(FString::Printf(TEXT("hexagon: hip %d ends at the apex"), Corner), Hip.B.Equals(FVector2D::ZeroVector, 1.0e-6));
+			TestTrue(FString::Printf(TEXT("hexagon: hip %d starts on the eave corner past its vertex"), Corner),
+				Hip.A.Equals(Vertex.GetSafeNormal() * (300.0 + 25.0 / FMath::Cos(UE_DOUBLE_PI / 6.0)), 1.0e-6));
+		}
+		TestTrue(TEXT("hexagon: ridge height uses the inradius"),
+			FMath::IsNearlyEqual(CSHouseRoof_RidgeZ(Roof), 300.0f + Roof.TanPitch() * float(Inradius), 1.0e-3f));
+		TestTrue(TEXT("hexagon: vertices sit on the wall top"),
+			FMath::IsNearlyEqual(CSHouseRoof_EvalZ(Roof, Hex[2]), 300.0f, 1.0e-3f));
+		TestTrue(TEXT("hexagon: just inside the eave outline is under the roof"),
+			CSHouseRoof_IsUnderRoof(Roof, FVector2D(Inradius + 24.0, 0.0).GetRotated(30.0)));
+		TestFalse(TEXT("hexagon: just outside the eave outline is not"),
+			CSHouseRoof_IsUnderRoof(Roof, FVector2D(Inradius + 26.0, 0.0).GetRotated(30.0)));
+	}
+
+	// ---- ③ 不规则凸五边形：骨架的每条弧上，两侧坡面都取到最小内距，且内距沿弧线性变化 ----
+	{
+		const FCSRoofDesc Roof = MakeRoof({ FVector2D(-320, -180), FVector2D(260, -220), FVector2D(380, 60),
+			FVector2D(40, 290), FVector2D(-290, 150) });
+		TestTrue(TEXT("pentagon fixture is strictly convex CCW"), Roof.Footprint.IsStrictlyConvexCCW());
+		FCSRoofSkeleton S;
+		CSHouseRoof_BuildSkeleton(Roof.Footprint, Roof.Overhang, S);
+		TestEqual(TEXT("pentagon: five hips"), S.NumHips, 5);
+		TestTrue(FString::Printf(TEXT("pentagon: a convex skeleton has 2N-3 = 7 arcs or fewer after dropping zero-length ones (%d)"), S.Arcs.Num()),
+			S.Arcs.Num() >= 5 && S.Arcs.Num() <= 8);
+
+		int32 OffArc = 0, WrongFaces = 0;
+		for (const FCSRoofSkeletonArc& Arc : S.Arcs)
+		{
+			for (int32 K = 0; K <= 8; ++K)
+			{
+				const double Alpha = double(K) / 8.0;
+				const FVector2D P = FMath::Lerp(Arc.A, Arc.B, Alpha);
+				const double Want = FMath::Lerp(Arc.InsetA, Arc.InsetB, Alpha);
+				if (!FMath::IsNearlyEqual(Roof.InsetDistance(P), Want, 1.0e-6)) ++OffArc;
+				const FCSHouseEdgeFrame FA = CSHouse_GetEdge(Arc.FaceA, Roof.Footprint, 0.0f);
+				const FCSHouseEdgeFrame FB = CSHouse_GetEdge(Arc.FaceB, Roof.Footprint, 0.0f);
+				if (!FMath::IsNearlyEqual(FVector2D::DotProduct(P - FA.Start, FA.In), Want, 1.0e-6)
+					|| !FMath::IsNearlyEqual(FVector2D::DotProduct(P - FB.Start, FB.In), Want, 1.0e-6)) ++WrongFaces;
+			}
+		}
+		TestEqual(TEXT("pentagon: every arc point has the arc's inset"), OffArc, 0);
+		TestEqual(TEXT("pentagon: both faces of every arc attain that inset"), WrongFaces, 0);
+
+		// 最高处：网格上找不到比 MaxInset 更高的点，而且离它不远。
+		double GridMax = -1.0e9;
+		for (int32 X = -400; X <= 400; X += 4)
+		for (int32 Y = -300; Y <= 300; Y += 4)
+		{
+			GridMax = FMath::Max(GridMax, Roof.InsetDistance(FVector2D(X, Y)));
+		}
+		TestTrue(FString::Printf(TEXT("pentagon: max inset bounds the height field (grid %.3f vs %.3f)"), GridMax, S.MaxInset),
+			GridMax <= S.MaxInset + 1.0e-6 && GridMax >= S.MaxInset - 4.0);
+		TestTrue(TEXT("pentagon: the top sits at the max inset"),
+			FMath::IsNearlyEqual(Roof.InsetDistance(S.TopA), S.MaxInset, 1.0e-6)
+			&& FMath::IsNearlyEqual(Roof.InsetDistance(S.TopB), S.MaxInset, 1.0e-6));
+	}
+
+	// ---- ④ 退化 ----
+	{
+		FCSRoofSkeleton S;
+		FCSHouseFootprint Two;
+		Two.Verts = { FVector2D(0, 0), FVector2D(100, 0) };
+		CSHouseRoof_BuildSkeleton(Two, 25.0, S);
+		TestTrue(TEXT("an invalid footprint yields an empty skeleton"), S.Arcs.IsEmpty() && S.MaxInset == 0.0);
+	}
 	return true;
 }
 

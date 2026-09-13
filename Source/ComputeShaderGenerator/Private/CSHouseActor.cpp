@@ -2242,7 +2242,7 @@ uint32 ACSHouseActor::ComputeSeamCuts()
 	for (const CSHouseSeam::FHouse& Other : Neighbours)
 	{
 		if (!CSHouseSeam::Intersects(Self, Other)) continue;
-		for (int32 Edge = 0; Edge < 4; ++Edge)
+		for (int32 Edge = 0; Edge < Self.Footprint.NumEdges(); ++Edge)
 		{
 			FCSWallCut Cut;
 			if (CSHouseSeam::CutOnEdge(Self, Other, Edge, Cut)) CurrentSeamCuts.Add(Cut);

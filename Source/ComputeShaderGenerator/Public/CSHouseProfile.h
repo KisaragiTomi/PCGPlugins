@@ -1017,7 +1017,7 @@ inline FCSHouseCornerFrame CSHouse_GetCorner(int32 CornerIndex, const FCSHouseFo
 struct FCSWallHit
 {
 	bool  bHit = false;
-	/** 0..3，与 `CSHouse_GetEdge` 同号。 */
+	/** 边号，与 `CSHouse_GetEdge` 同号（矩形 0..3）。 */
 	int32 EdgeIndex = -1;
 	/** 沿边弧长，与 `CSHouse_GetEdge` 的 S 同口径。 */
 	float S = 0.0f;
@@ -1132,7 +1132,7 @@ struct COMPUTESHADERGENERATOR_API FCSWallAnchor
 {
 	GENERATED_BODY()
 
-	/** 挂在哪条边，0..3，与 `CSHouse_GetEdge` 同号。`-1` = 尚未锚定。 */
+	/** 挂在哪条边，与 `CSHouse_GetEdge` 同号（矩形 0..3）。`-1` = 尚未锚定。 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Wall Anchor")
 	int32 EdgeIndex = -1;
 
@@ -1255,7 +1255,7 @@ enum class ECSFeatureReject : uint8
 	None,
 	/** 尺寸退化（宽 ≤ 0 或 Z1 ≤ Z0），根本不是一个洞。 */
 	Degenerate,
-	/** 边号不在 0..3。 */
+	/** 边号越界（不在 0..NumEdges−1）。 */
 	NotOnWall,
 	/** 会吃掉墙两端的护角。 */
 	NearCorner,
@@ -1359,7 +1359,7 @@ inline const TCHAR* CSHouse_FeatureRejectText(ECSFeatureReject Reason)
 	{
 	case ECSFeatureReject::None:            return TEXT("");
 	case ECSFeatureReject::Degenerate:      return TEXT("尺寸退化（宽或高 ≤ 0）");
-	case ECSFeatureReject::NotOnWall:       return TEXT("边号不在 0..3");
+	case ECSFeatureReject::NotOnWall:       return TEXT("边号越界");
 	case ECSFeatureReject::NearCorner:      return TEXT("吃掉了墙端的护角");
 	case ECSFeatureReject::SillTooLow:      return TEXT("窗台太低（低于 WindowMinSillZ 或在地面以下）");
 	case ECSFeatureReject::AboveEave:       return TEXT("洞顶吃掉了墙顶的连续砖带");

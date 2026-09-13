@@ -5085,6 +5085,50 @@ bool FCSHouseResizeHandlePolylineTest::RunTest(const FString& Parameters)
 }
 
 // -----------------------------------------------------------------------------
+// 异形房子的接缝（footprint 折线化 3d 的 actor 接线）：4 号及以后的边也要被裁
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseSeamPolylineActorTest,
+	"PCGPlugins.ComputeShaderGenerator.House.SeamPolylineActor",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseSeamPolylineActorTest::RunTest(const FString& Parameters)
+{
+	// 3d 只改了纯函数、actor 那一侧的逐边循环当时还写着 `Edge < 4`：纯函数单测全绿，
+	// 六边形房子的 4、5 号边却永远不被接缝裁剪。这条从 actor 读回裁剪段数，专钉那一层接线。
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	// 六边形（半径 300，0 号顶点在 +X）：4 号边是底边 y = −259.8、x ∈ [−150, 150]。
+	ACSHouseActor* Hex = World->SpawnActor<ACSHouseActor>(FVector::ZeroVector, FRotator::ZeroRotator);
+	// 矩形邻居只咬住底边中段：x ∈ [−120, 120]、y ∈ [−430, −230]，碰不到 3、5 号斜边。
+	ACSHouseActor* Box = World->SpawnActor<ACSHouseActor>(FVector(0.0, -330.0, 0.0), FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("Hexagon house"), Hex) || !TestNotNull(TEXT("Box house"), Box)) return false;
+	for (ACSHouseActor* House : { Hex, Box })
+	{
+		House->Windows.Reset();
+		House->bSeamEnabled = true;
+	}
+	Hex->FootprintShape = CSHouseTest_RegularPolygon(6, 1.0);
+	Hex->FootprintSize = FVector2D(600.0, 519.6152422706632);
+	Box->FootprintSize = FVector2D(240.0, 200.0);
+	Hex->ReevaluateSite();
+	Box->ReevaluateSite();
+	Hex->ReevaluateSite();
+
+	if (!TestTrue(TEXT("both houses have an identity"), Hex->GetHouseId().IsValid() && Box->GetHouseId().IsValid())) return false;
+	TestEqual(TEXT("the hexagon is cut on exactly one wall (its edge 4)"), Hex->GetSeamCutCount(), 1);
+	TestTrue(FString::Printf(TEXT("the box is cut where it enters the hexagon (%d)"), Box->GetSeamCutCount()),
+		Box->GetSeamCutCount() >= 1);
+	TestTrue(TEXT("and the two contours cross"), Hex->GetSeamCornerCount() >= 2);
+
+	World->DestroyActor(Box);
+	World->DestroyActor(Hex);
+	return true;
+}
+
+// -----------------------------------------------------------------------------
 // 高度抓手（D5 的第二个自由度）：上下拖那个"窗框"改墙高
 //
 // 与 `House.ResizeHandle` 分开：那条钉的是**水平**推拉那套父子回路的数学，这条钉的是

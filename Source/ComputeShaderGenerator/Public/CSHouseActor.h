@@ -133,8 +133,8 @@ struct COMPUTESHADERGENERATOR_API FCSHouseWindow
 {
 	GENERATED_BODY()
 
-	/** 边缘线段索引：0 南(+X 向) 1 东(+Y 向) 2 北(-X 向) 3 西(-Y 向)，与 CSHouse_GetEdge 同号。 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Window", meta = (ClampMin = "0", ClampMax = "3"))
+	/** footprint 的边号，与 CSHouse_GetEdge 同号（矩形上 0 南 1 东 2 北 3 西）。越界的边号在谓词里判 NotOnWall。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Window", meta = (ClampMin = "0"))
 	int32 EdgeIndex = 0;
 
 	/** 沿边弧长上的窗心（从边起点算）。 */

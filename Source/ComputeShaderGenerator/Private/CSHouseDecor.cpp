@@ -144,7 +144,8 @@ void BuildAnchors(const FSite& Site, const FParams& Params, TArray<FAnchor>& Out
 
 		// 身份由**几何**导出：边号 + 量化到 10 cm 的沿边位置。用洞表下标的话，在 0 号边多开
 		// 一个门会把后面所有洞推一位 ⇒ 全屋摆件重掷一遍（而且不会有任何断言报红）。
-		const int32 GateBase = (O.EdgeIndex & 3) * 1000003 + FMath::Clamp(FMath::RoundToInt(O.CenterS / 10.0f), 0, 65535) * 4;
+		// 边号不取模：折线有几条边就有几个号，`& 3` 会让 4 号边与 0 号边撞身份。
+		const int32 GateBase = O.EdgeIndex * 1000003 + FMath::Clamp(FMath::RoundToInt(O.CenterS / 10.0f), 0, 65535) * 4;
 
 		for (int32 Side = 0; Side < 2; ++Side)
 		{
@@ -202,7 +203,7 @@ void BuildAnchors(const FSite& Site, const FParams& Params, TArray<FAnchor>& Out
 				const FVector P = Strip.Origin + Strip.U * S + Strip.N * Params.WallFootStandOff;
 				FAnchor Anchor;
 				Anchor.Family = EFamily::WallFoot;
-				Anchor.AnchorId = (Strip.EdgeIndex & 3) * 65536 + Index;
+				Anchor.AnchorId = Strip.EdgeIndex * 65536 + Index;
 				Anchor.Facing = Strip.N;
 				Anchor.Up = FVector::UpVector;
 				if (SeatAndAccept(FVector2D(P.X, P.Y), Anchor.Location)) OutAnchors.Add(Anchor);

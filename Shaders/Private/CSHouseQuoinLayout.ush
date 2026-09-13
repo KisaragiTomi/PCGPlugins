@@ -10,9 +10,13 @@ namespace CSHouseQuoinLayout
 {
 using float3 = FVector3f;
 #define CS_QUOIN_INLINE inline
+inline float QuoinSqrt(float V) { return FMath::Sqrt(V); }
 #else
 #define CS_QUOIN_INLINE
+float QuoinSqrt(float V) { return sqrt(V); }
 #endif
+// Vector members differ between the two languages (FVector3f.X vs float3.x), so this
+// file only ever builds vectors from scalars and never reads a component back.
 
 struct FQuoinPlacement
 {
@@ -23,26 +27,43 @@ struct FQuoinPlacement
 	float ShortSize;
 };
 
+// HalfTurnCos = cos(turn / 2) of the footprint corner; <= 0 means a right angle (the
+// constant this function used before footprints became polylines). The two outer wall
+// normals are the bisector rotated by +/- turn/2: FaceA belongs to the wall leaving the
+// corner, FaceB to the wall arriving at it.
 CS_QUOIN_INLINE FQuoinPlacement PlaceQuoin(float3 Corner, float OutwardX, float OutwardY,
-	float Scale, float WidthOffset, bool OddCourse)
+	float HalfTurnCos, float Scale, float WidthOffset, bool OddCourse)
 {
-	const float D = 0.7071067811865475f;
-	const float3 FaceA = float3((OutwardX - OutwardY) * D, (OutwardY + OutwardX) * D, 0.0f);
-	const float3 FaceB = float3((OutwardX + OutwardY) * D, (OutwardY - OutwardX) * D, 0.0f);
+	const float C = HalfTurnCos > 0.0f ? (HalfTurnCos < 1.0f ? HalfTurnCos : 1.0f) : 0.7071067811865475f;
+	const float SinSq = 1.0f - C * C;
+	const float S = QuoinSqrt(SinSq > 0.0f ? SinSq : 0.0f);
+	const float AX = OutwardX * C - OutwardY * S;
+	const float AY = OutwardX * S + OutwardY * C;
+	const float BX = OutwardX * C + OutwardY * S;
+	const float BY = OutwardY * C - OutwardX * S;
+	const float3 FaceA = float3(AX, AY, 0.0f);
+	const float3 FaceB = float3(BX, BY, 0.0f);
 	const float Limit = 16.0f * Scale;
 	const float Offset = WidthOffset < -Limit ? -Limit : (WidthOffset > Limit ? Limit : WidthOffset);
 	FQuoinPlacement Q;
 	Q.LongSize = 92.0f * Scale + Offset;
 	Q.ShortSize = 63.7f * Scale;
-	Q.AxisX = OddCourse ? FaceB : FaceA;
+	// Each course is a box squared to one wall: even courses to FaceB's wall, odd courses
+	// to FaceA's. The long axis runs along that wall and points past the corner; the short
+	// axis is that wall's normal. On a right angle these are exactly FaceA / FaceB again.
+	const float3 AlongB = float3(-BY, BX, 0.0f);
+	const float3 AlongA = float3(AY, -AX, 0.0f);
+	const float3 AnchorNormal = OddCourse ? FaceA : FaceB;
+	Q.AxisX = OddCourse ? AlongA : AlongB;
 	// AxisY = world -Z. Preserve a right-handed basis on both course orientations.
 	Q.AxisZ = OddCourse ? FaceA : -FaceB;
-	const float SizeA = OddCourse ? Q.ShortSize : Q.LongSize;
-	const float SizeB = OddCourse ? Q.LongSize : Q.ShortSize;
 	const float Protrude = 3.85f * Scale;
-	// Anchor the two outer faces; varying the width moves the embedded center,
-	// never the corner edge. A centered diagonal brick cannot form this bond.
-	Q.Center = Corner + FaceA * (Protrude - 0.5f * SizeA) + FaceB * (Protrude - 0.5f * SizeB);
+	// Anchor the vertical outer edge on the corner of the outline pushed out by Protrude
+	// (the mitre point, Protrude / cos(turn/2) along the bisector): both walls then sit
+	// Protrude below the brick on any turn up to 90 degrees. Varying the width moves the
+	// embedded center, never the corner edge. A centered diagonal brick cannot form this bond.
+	const float3 Edge = Corner + float3(OutwardX, OutwardY, 0.0f) * (Protrude / C);
+	Q.Center = Edge - Q.AxisX * (0.5f * Q.LongSize) - AnchorNormal * (0.5f * Q.ShortSize);
 	return Q;
 }
 

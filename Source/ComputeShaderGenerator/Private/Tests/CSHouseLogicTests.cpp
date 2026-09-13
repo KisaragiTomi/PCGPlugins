@@ -2910,7 +2910,7 @@ bool FCSHouseQuoinCoversOuterEdgeTest::RunTest(const FString& Parameters)
 			for (float Offset : { -16.0f * Scale, 0.0f, 16.0f * Scale })
 			{
 				const auto P = CSHouseQuoinLayout::PlaceQuoin(
-					FVector3f(Q.Point.X, Q.Point.Y, 0.0f), Q.Outward.X, Q.Outward.Y, Scale, Offset, Odd);
+					FVector3f(Q.Point.X, Q.Point.Y, 0.0f), Q.Outward.X, Q.Outward.Y, Q.HalfTurnCos, Scale, Offset, Odd);
 				TestTrue(TEXT("Quoin basis remains right-handed on both course orientations"),
 					FVector3f::DotProduct(FVector3f::CrossProduct(P.AxisX, FVector3f(0, 0, -1)), P.AxisZ) > 0.999f);
 				TestTrue(TEXT("The long edge stays longer than the short edge at either random extreme"), P.LongSize > P.ShortSize);
@@ -2930,8 +2930,8 @@ bool FCSHouseQuoinCoversOuterEdgeTest::RunTest(const FString& Parameters)
 						C.What, Index, Which, Outmost), FMath::IsNearlyEqual(Outmost, Expected, 0.002f) && Outmost > 0.5f);
 				}
 			}
-			const auto Even = CSHouseQuoinLayout::PlaceQuoin(FVector3f::ZeroVector, Q.Outward.X, Q.Outward.Y, Scale, 0, false);
-			const auto Odd = CSHouseQuoinLayout::PlaceQuoin(FVector3f::ZeroVector, Q.Outward.X, Q.Outward.Y, Scale, 0, true);
+			const auto Even = CSHouseQuoinLayout::PlaceQuoin(FVector3f::ZeroVector, Q.Outward.X, Q.Outward.Y, Q.HalfTurnCos, Scale, 0, false);
+			const auto Odd = CSHouseQuoinLayout::PlaceQuoin(FVector3f::ZeroVector, Q.Outward.X, Q.Outward.Y, Q.HalfTurnCos, Scale, 0, true);
 			TestTrue(TEXT("Successive courses exchange the long edge between adjacent walls"),
 				FMath::Abs(FVector3f::DotProduct(Even.AxisX, Odd.AxisX)) < 0.001f);
 		}
@@ -2944,6 +2944,204 @@ bool FCSHouseQuoinCoversOuterEdgeTest::RunTest(const FString& Parameters)
 			CSHouseQuoin::BuildQuoins(FTransform::Identity, FVector2D(600.0, 40.0), 24.0f, 0.0f, 300.0f, 0.0f, None), 0);
 		TestEqual(TEXT("a zero-height wall yields no quoin"),
 			CSHouseQuoin::BuildQuoins(FTransform::Identity, FVector2D(600.0, 400.0), 24.0f, 0.0f, 0.0f, 0.0f, None), 0);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseQuoinPolylineCornersTest,
+	"PCGPlugins.ComputeShaderGenerator.House.QuoinPolylineCorners",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseQuoinPolylineCornersTest::RunTest(const FString& Parameters)
+{
+	// footprint 折线化 3c：角石从「矩形四角 + shader 写死的 45°」换成「折线的每个合格凸角 + 逐角的半转角」。
+	// 判据与 QuoinCoversOuterEdge 同一条 —— 外角那条竖直棱被砖盖住、两面相邻墙都只伸出 3.85 × Scale ——
+	// 换到非直角上再钉一遍；外加：凹角 / 锐角不出、CornerIndex 跟着角号走、墩心在两面墙的中线交点上。
+	const float T = 24.0f;
+	const float Scale = 26.0f / 69.0f;
+	const float Protrude = 3.85f * Scale;
+
+	auto RegularPolygon = [](int32 N, double Radius)
+	{
+		FCSHouseFootprint FP;
+		for (int32 i = 0; i < N; ++i)
+		{
+			const double A = UE_DOUBLE_TWO_PI * double(i) / double(N);
+			FP.Verts.Add(FVector2D(Radius * FMath::Cos(A), Radius * FMath::Sin(A)));
+		}
+		return FP;
+	};
+
+	// 每个角：两条相邻墙的外法线（远边 = k 号边、近边 = k+1 号边）。
+	auto WallNormals = [&](const FCSHouseFootprint& FP, int32 Corner, FVector3f& OutFar, FVector3f& OutNear)
+	{
+		const FCSHouseEdgeFrame Far = CSHouse_GetEdge(Corner, FP, T);
+		const FCSHouseEdgeFrame Near = CSHouse_GetEdge((Corner + 1) % FP.NumEdges(), FP, T);
+		OutFar = FVector3f(float(-Far.In.X), float(-Far.In.Y), 0.0f);
+		OutNear = FVector3f(float(-Near.In.X), float(-Near.In.Y), 0.0f);
+	};
+
+	// 砖盒底面四个角沿法线 N 最远伸到哪（相对角点）。
+	auto Outmost = [](const CSHouseQuoinLayout::FQuoinPlacement& P, const FVector3f& Corner, const FVector3f& N)
+	{
+		float Best = -FLT_MAX;
+		for (float SX : { -0.5f, 0.5f })
+		for (float SZ : { -0.5f, 0.5f })
+		{
+			const FVector3f V = P.Center + P.AxisX * (SX * P.LongSize) + P.AxisZ * (SZ * P.ShortSize);
+			Best = FMath::Max(Best, FVector3f::DotProduct(V - Corner, N));
+		}
+		return Best;
+	};
+
+	// ---- ① 正五 / 六 / 八边形：每个角都出，半转角 = π/N，砖盖住外棱且两面只伸出 Protrude ----
+	for (int32 N : { 5, 6, 8 })
+	{
+		const FCSHouseFootprint FP = RegularPolygon(N, 300.0);
+		TestTrue(FString::Printf(TEXT("[%d-gon] fixture is strictly convex CCW"), N), FP.IsStrictlyConvexCCW());
+		TArray<CSHouseQuoin::FQuoin> Quoins;
+		const int32 Made = CSHouseQuoin::BuildQuoins(FTransform::Identity, FP, T, 0.0f, 300.0f, 0.0f, Quoins);
+		TestEqual(FString::Printf(TEXT("[%d-gon] every corner gets a quoin"), N), Made, N);
+		if (Made != N) continue;
+
+		const float ExpectCos = float(FMath::Cos(UE_DOUBLE_PI / N));
+		for (int32 i = 0; i < N; ++i)
+		{
+			const CSHouseQuoin::FQuoin& Q = Quoins[i];
+			const FVector2D V = FP.Verts[(i + 1) % N];
+			TestEqual(FString::Printf(TEXT("[%d-gon] quoin %d carries its corner index"), N, i), Q.CornerIndex, i);
+			TestTrue(FString::Printf(TEXT("[%d-gon] quoin %d sits on its vertex"), N, i), Q.Point.Equals(V, 1.0e-3));
+			TestTrue(FString::Printf(TEXT("[%d-gon] quoin %d points radially out"), N, i),
+				FVector2D::DotProduct(Q.Outward, V.GetSafeNormal()) > 0.99999);
+			TestTrue(FString::Printf(TEXT("[%d-gon] quoin %d half-turn cosine is cos(pi/N) (%.6f)"), N, i, Q.HalfTurnCos),
+				FMath::IsNearlyEqual(Q.HalfTurnCos, ExpectCos, 1.0e-5f));
+
+			FVector3f NFar, NNear;
+			WallNormals(FP, i, NFar, NNear);
+			const FVector3f Corner(float(Q.Point.X), float(Q.Point.Y), 0.0f);
+			for (bool Odd : { false, true })
+			for (float Offset : { -16.0f * Scale, 0.0f, 16.0f * Scale })
+			{
+				const auto P = CSHouseQuoinLayout::PlaceQuoin(Corner, Q.Outward.X, Q.Outward.Y, Q.HalfTurnCos, Scale, Offset, Odd);
+				TestTrue(TEXT("Polyline quoin basis stays right-handed"),
+					FVector3f::DotProduct(FVector3f::CrossProduct(P.AxisX, FVector3f(0, 0, -1)), P.AxisZ) > 0.999f);
+				TestTrue(TEXT("Polyline quoin basis stays orthogonal (a box, not a sheared prism)"),
+					FMath::Abs(FVector3f::DotProduct(P.AxisX, P.AxisZ)) < 1.0e-4f);
+				// 偶数层方正地贴远边、奇数层贴近边。
+				const FVector3f& Aligned = Odd ? NNear : NFar;
+				TestTrue(FString::Printf(TEXT("[%d-gon] corner %d course %d is squared to one wall"), N, i, int32(Odd)),
+					FMath::Abs(FVector3f::DotProduct(P.AxisZ, Aligned)) > 0.9999f);
+				// 两面墙都被砖盖过、且都只伸出 Protrude（转角 ≤ 90° 时最远点恰在外棱锚点上）。
+				for (const FVector3f& Wall : { NFar, NNear })
+				{
+					const float Out = Outmost(P, Corner, Wall);
+					TestTrue(FString::Printf(TEXT("[%d-gon] corner %d course %d stays shallow on both walls (%.4f cm)"), N, i, int32(Odd), Out),
+						FMath::IsNearlyEqual(Out, Protrude, 0.002f));
+				}
+				// 外棱（角点那条竖线）落在砖的横截面里。
+				const FVector3f D = Corner - P.Center;
+				TestTrue(FString::Printf(TEXT("[%d-gon] corner %d course %d covers the outer edge"), N, i, int32(Odd)),
+					FMath::Abs(FVector3f::DotProduct(D, P.AxisX)) <= 0.5f * P.LongSize + 1.0e-3f
+					&& FMath::Abs(FVector3f::DotProduct(D, P.AxisZ)) <= 0.5f * P.ShortSize + 1.0e-3f);
+			}
+		}
+
+		// 半转角一路送进 GPU 元素。
+		CSHouseFrame::FBrickParams Params;
+		Params.Length = 26.0f;
+		Params.MaxBricks = 4096;
+		TArray<CSHouseFrame::FElement> Elements;
+		CSHouseQuoin::BuildQuoinElements(Quoins, 7u, Params, Elements, FVector2f(0.01f, 0.01f));
+		TestEqual(FString::Printf(TEXT("[%d-gon] one column path per quoin"), N), Elements.Num(), N);
+		for (int32 i = 0; i < Elements.Num() && i < N; ++i)
+		{
+			TestEqual(FString::Printf(TEXT("[%d-gon] element %d carries the half-turn cosine"), N, i),
+				Elements[i].QuoinHalfTurnCos, Quoins[i].HalfTurnCos);
+		}
+	}
+
+	// ---- ② 直角：半转角 1/√2，且 shader 的「≤ 0 按直角」退路与显式传 1/√2 等价 ----
+	{
+		TArray<CSHouseQuoin::FQuoin> Quoins;
+		CSHouseQuoin::BuildQuoins(FTransform::Identity, FCSHouseFootprint::MakeRect(FVector2D(600.0, 400.0)), T, 0.0f, 300.0f, 0.0f, Quoins);
+		TestEqual(TEXT("rect polyline yields four quoins"), Quoins.Num(), 4);
+		for (int32 i = 0; i < Quoins.Num(); ++i)
+		{
+			const CSHouseQuoin::FQuoin& Q = Quoins[i];
+			TestEqual(FString::Printf(TEXT("rect quoin %d carries its corner index"), i), Q.CornerIndex, i);
+			TestTrue(FString::Printf(TEXT("rect quoin %d half-turn cosine is 1/sqrt(2)"), i),
+				FMath::IsNearlyEqual(Q.HalfTurnCos, UE_INV_SQRT_2, 1.0e-6f));
+			for (bool Odd : { false, true })
+			{
+				const auto Explicit = CSHouseQuoinLayout::PlaceQuoin(FVector3f::ZeroVector, Q.Outward.X, Q.Outward.Y, UE_INV_SQRT_2, Scale, 0.0f, Odd);
+				const auto Legacy = CSHouseQuoinLayout::PlaceQuoin(FVector3f::ZeroVector, Q.Outward.X, Q.Outward.Y, 0.0f, Scale, 0.0f, Odd);
+				TestTrue(TEXT("HalfTurnCos <= 0 falls back to a right angle"),
+					Explicit.Center.Equals(Legacy.Center, 1.0e-4f) && Explicit.AxisX.Equals(Legacy.AxisX, 1.0e-5f)
+					&& Explicit.AxisZ.Equals(Legacy.AxisZ, 1.0e-5f));
+			}
+		}
+	}
+
+	// ---- ③ L 形：凹角不出角石，角号跳过它；墩心在两面墙的中线交点上（凸角凹角同一个式子） ----
+	{
+		FCSHouseFootprint L;
+		for (const FVector2D& V : { FVector2D(0, 0), FVector2D(600, 0), FVector2D(600, 300),
+			FVector2D(300, 300), FVector2D(300, 600), FVector2D(0, 600) })
+		{
+			L.Verts.Add(V);
+		}
+		TestTrue(TEXT("L fixture is counter-clockwise"), L.GetSignedArea() > 0.0);
+		TArray<CSHouseQuoin::FQuoin> Quoins;
+		const int32 Made = CSHouseQuoin::BuildQuoins(FTransform::Identity, L, T, 0.0f, 300.0f, 0.0f, Quoins);
+		TestEqual(TEXT("L: five convex corners, the reflex one is skipped"), Made, 5);
+		TArray<int32> Indices;
+		for (const CSHouseQuoin::FQuoin& Q : Quoins) Indices.Add(Q.CornerIndex);
+		TestTrue(TEXT("L: corner indices skip the reflex corner"), Indices == TArray<int32>({ 0, 1, 3, 4, 5 }));
+
+		const FCSHouseCornerFrame Reflex = CSHouse_GetCorner(2, L);
+		TestTrue(TEXT("L: corner 2 is reflex"), Reflex.SinTurn < 0.0 && !Reflex.IsConvex());
+		for (int32 Corner = 0; Corner < L.NumEdges(); ++Corner)
+		{
+			const FVector2D Mid = CSHouse_GetCorner(Corner, L).PointAtDepth(T * 0.5);
+			const FCSHouseEdgeFrame Far = CSHouse_GetEdge(Corner, L, T);
+			const FCSHouseEdgeFrame Near = CSHouse_GetEdge((Corner + 1) % L.NumEdges(), L, T);
+			const double DFar = FVector2D::DotProduct(Mid - Far.Start, Far.In);
+			const double DNear = FVector2D::DotProduct(Mid - Near.Start, Near.In);
+			TestTrue(FString::Printf(TEXT("L: corner %d mid point is half a wall inside both walls (%.4f, %.4f)"), Corner, DFar, DNear),
+				FMath::IsNearlyEqual(DFar, 12.0, 1.0e-6) && FMath::IsNearlyEqual(DNear, 12.0, 1.0e-6));
+		}
+		// 直角上的中线交点就是老写法「沿平分线内缩 T/√2」。
+		const FCSHouseCornerFrame Right = CSHouse_GetCorner(0, L);
+		TestTrue(TEXT("L: right-angle mid point equals the legacy T/sqrt(2) inset"),
+			Right.PointAtDepth(T * 0.5).Equals(Right.Point - Right.Outward * (T * 0.70710678118654752440), 1.0e-6));
+	}
+
+	// ---- ④ 锐角不出：直角三角形只在直角上出一根 ----
+	{
+		FCSHouseFootprint Tri;
+		Tri.Verts = { FVector2D(0, 0), FVector2D(400, 0), FVector2D(0, 400) };
+		TArray<CSHouseQuoin::FQuoin> Quoins;
+		const int32 Made = CSHouseQuoin::BuildQuoins(FTransform::Identity, Tri, T, 0.0f, 300.0f, 0.0f, Quoins);
+		TestEqual(TEXT("right triangle: only the right angle gets a quoin"), Made, 1);
+		if (Made == 1)
+		{
+			TestEqual(TEXT("right triangle: the quoin sits on corner 2 (the origin)"), Quoins[0].CornerIndex, 2);
+			TestTrue(TEXT("right triangle: at the origin"), Quoins[0].Point.Equals(FVector2D::ZeroVector, 1.0e-6));
+		}
+	}
+
+	// ---- ⑤ 退化：边长放不下两头的斜接让出量时一根都不出 ----
+	{
+		TArray<CSHouseQuoin::FQuoin> None;
+		// 正六边形边长 = 半径；两头各让出 T·tan(30°) ≈ 13.86，边长 20 < 27.7。
+		TestEqual(TEXT("a hexagon whose sides cannot hold both mitres yields no quoin"),
+			CSHouseQuoin::BuildQuoins(FTransform::Identity, RegularPolygon(6, 20.0), T, 0.0f, 300.0f, 0.0f, None), 0);
+		FCSHouseFootprint Two;
+		Two.Verts = { FVector2D(0, 0), FVector2D(100, 0) };
+		TestEqual(TEXT("an invalid footprint yields no quoin"),
+			CSHouseQuoin::BuildQuoins(FTransform::Identity, Two, T, 0.0f, 300.0f, 0.0f, None), 0);
+		TestEqual(TEXT("an out-of-range corner is not convex"), CSHouse_GetCorner(7, Two).IsConvex(), false);
 	}
 	return true;
 }

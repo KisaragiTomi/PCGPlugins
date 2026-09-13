@@ -1659,7 +1659,7 @@ public:
 	UFUNCTION(BlueprintPure, Category = "CS House|Quoin")
 	int32 GetQuoinBrickCount() const { FlushPendingReevaluate(); return CurrentQuoinBrickCount; }
 
-	/** 本轮实际出砖的角石柱数（正常恒 4；退化 footprint 或容量耗尽时会少）。 */
+	/** 本轮实际出砖的角石柱数（= footprint 上转角不超过 90° 的凸角数，矩形恒 4；退化 footprint 或容量耗尽时会少）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Quoin")
 	int32 GetQuoinColumnCount() const { FlushPendingReevaluate(); return CurrentQuoinColumnCount; }
 
@@ -2135,7 +2135,8 @@ private:
 
 	/**
 	 * 转角墩：转角配成墩的角上那根柱础 / 柱身 / 柱头（2026-09-06 用户裁决"转角就是一个墩"）。
-	 * 立在角点沿角平分线内缩 T/√2 处 —— 两面墙墙厚中线的交点，门樘砖与拱廊的墩都在那条中线上。
+	 * 立在两面墙墙厚中线的交点（`FCSHouseCornerFrame::PointAtDepth(T/2)`，直角上是沿角平分线内缩 T/√2），
+	 * 门樘砖与拱廊的墩都在那条中线上。
 	 * 高度读 `ResolvePierSpans` 写的 `CornerPierTopZ`，角石在同一高度以下让路。追加进同一份元素表。
 	 */
 	uint32 BuildCornerPierBricks(TArray<CSHouseFrame::FElement>& InOutElements, int32& InOutBrickCount);
@@ -2294,7 +2295,7 @@ private:
 	 * 每个角各自的转角墩顶（墙空间高度；0 = 这个角没配成墩），长度 = footprint 顶点数；
 	 * 角 k 夹在 k 号边远端与 k+1 号边近端之间。`ResolvePierSpans` 每轮整份重写（跑之前为空，读方一律按 Num 截断），
 	 * `BuildCornerPierBricks` 按它立柱、`BuildQuoinBricks` 按它让角石在墩顶以下让路 ——
-	 * 两个消费者读同一份数，才不会出现"墩砌到 A、角石剔到 B"。序号与 `CSHouseQuoin::CornerSign` 同序。
+	 * 两个消费者读同一份数，才不会出现"墩砌到 A、角石剔到 B"。序号与 `CSHouse_GetCorner` 同号。
 	 */
 	TArray<float> CornerPierTopZ;
 	/** 这一轮立起来的转角墩数（0..角数）。 */

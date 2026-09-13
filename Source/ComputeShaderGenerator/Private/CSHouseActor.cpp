@@ -894,7 +894,7 @@ void ACSHouseActor::ResolvePierSpans()
 	// `CornerPierTopZ` 出，角石（`BuildQuoinBricks`）读同一份数值在起拱线以下让路。
 	for (int32 Corner = 0; Corner < NumCorners; ++Corner)
 	{
-		// 角 k 夹在「k 号边的远端」与「k+1 号边的近端」之间，与 `CSHouseQuoin::CornerSign` 同序。
+		// 角 k 夹在「k 号边的远端」与「k+1 号边的近端」之间，与 `CSHouse_GetCorner` 同号。
 		const int32 FarEdge = Corner;
 		const int32 NearEdge = (Corner + 1) % NumCorners;
 		const float FarLen = CSHouse_GetEdge(FarEdge, Footprint, WallThickness).Len;
@@ -2297,29 +2297,34 @@ uint32 ACSHouseActor::BuildCornerPierBricks(TArray<CSHouseFrame::FElement>& InOu
 	Params.CapitalHeight = PierCapitalHeight;
 	Params.MaxBricks = EffectiveFrameCapacity();
 
-	// 墩心放在两面墙**墙厚中线的交点**：门樘砖走墙厚正中（`BuildFrameArches` 的 Mid），拱廊的墩
-	// 也在那条线上，角点沿角平分线内缩 T/√2 正好到那儿。角石（Inset 0）留在外角当面层。
-	// 角点与角平分线仍由 `CSHouseQuoin::BuildQuoins` 算 —— 四角的几何只能有一个真源。
+	// 墩心放在两面墙**墙厚中线的交点**（`PointAtDepth(T/2)`，直角上是沿平分线内缩 T/√2）：
+	// 门樘砖走墙厚正中（`BuildFrameArches` 的 Mid），拱廊的墩也在那条线上。角石（Inset 0）留在外角当面层。
+	// 角点与角平分线与角石同一个真源 `CSHouse_GetCorner`。墩不看 `IsQuoinCorner`：凹角 / 锐角上
+	// 不包角石，但两道拱照样可以在那里配成墩。
 	const float BaseZ = float(GetActorLocation().Z);
-	TArray<CSHouseQuoin::FQuoin> Corners;
-	CSHouseQuoin::BuildQuoins(GetBuildTransform(), FootprintSize, WallThickness, BaseZ, WallHeight,
-		WallThickness * 0.70710678f, Corners);
+	const FTransform World = GetBuildTransform();
+	const FCSHouseFootprint Footprint = GetFootprint();
 
 	const uint32 Seed = HouseId.IsValid() ? GetTypeHash(HouseId) : uint32(GetUniqueID());
 	int32 Cursor = CSHouseFrame::NextBrickSlot(InOutElements);
 	TArray<int32> H;
-	for (int32 Corner = 0; Corner < Corners.Num() && Corner < CornerPierTopZ.Num(); ++Corner)
+	for (int32 Corner = 0; Corner < CornerPierTopZ.Num() && Corner < Footprint.NumEdges(); ++Corner)
 	{
 		const float TopZ = CornerPierTopZ[Corner];
 		if (TopZ <= UE_KINDA_SMALL_NUMBER) continue;
-		const CSHouseQuoin::FQuoin& C = Corners[Corner];
-		const int32 Added = CSHouseFrame::AppendCornerPier(C.Point, C.Outward, BaseZ, BaseZ + TopZ,
+		const FCSHouseCornerFrame CF = CSHouse_GetCorner(Corner, Footprint);
+		const FVector2D Local = CF.PointAtDepth(WallThickness * 0.5);
+		const FVector WorldPoint = World.TransformPosition(FVector(Local.X, Local.Y, 0.0));
+		const FVector WorldOut = World.TransformVectorNoScale(FVector(CF.Outward.X, CF.Outward.Y, 0.0));
+		const FVector2D Point(WorldPoint.X, WorldPoint.Y);
+		const FVector2D Outward = FVector2D(WorldOut.X, WorldOut.Y).GetSafeNormal();
+		const int32 Added = CSHouseFrame::AppendCornerPier(Point, Outward, BaseZ, BaseZ + TopZ,
 			Seed, Corner, Params, InOutElements, Cursor);
 		if (Added <= 0) continue;
 		++CurrentCornerPierCount;
 		InOutBrickCount += Added;
 		// 哈希只记标量：角序号、砖数、柱心、墩顶。逐砖位置是它们的纯函数。
-		H.Append({ Corner, Added, CSHouse_Q(C.Point.X, 1), CSHouse_Q(C.Point.Y, 1), CSHouse_Q(TopZ, 1) });
+		H.Append({ Corner, Added, CSHouse_Q(Point.X, 1), CSHouse_Q(Point.Y, 1), CSHouse_Q(TopZ, 1) });
 	}
 	return H.IsEmpty() ? 0u : CSHouse_Hash(H);
 }
@@ -2349,7 +2354,7 @@ uint32 ACSHouseActor::BuildQuoinBricks(TArray<CSHouseFrame::FElement>& InOutElem
 	// 与它们错开 —— 那正是「已知潜伏问题」里 `GetBuildTransform()` vs `ToInverseMatrixWithScale()`
 	// 那条不对称的同族。
 	TArray<CSHouseQuoin::FQuoin> Quoins;
-	CurrentQuoinColumnCount = CSHouseQuoin::BuildQuoins(GetBuildTransform(), FootprintSize, WallThickness,
+	CurrentQuoinColumnCount = CSHouseQuoin::BuildQuoins(GetBuildTransform(), GetFootprint(), WallThickness,
 		float(GetActorLocation().Z), WallHeight, QuoinInset, Quoins);
 	if (Quoins.IsEmpty()) return 0;
 
@@ -2359,9 +2364,13 @@ uint32 ACSHouseActor::BuildQuoinBricks(TArray<CSHouseFrame::FElement>& InOutElem
 	// `FQuoin::BottomZ` 已经是世界 Z，剔除线跟它同一个口径。
 	{
 		const float BaseZ = float(GetActorLocation().Z);
-		for (int32 Corner = 0; Corner < Quoins.Num() && Corner < CornerPierTopZ.Num(); ++Corner)
+		// 按角号对，不按数组下标：不出角石的角（凹角 / 锐角）被跳过，下标与角号会错开。
+		for (CSHouseQuoin::FQuoin& Q : Quoins)
 		{
-			if (CornerPierTopZ[Corner] > UE_KINDA_SMALL_NUMBER) Quoins[Corner].CullBelowZ = BaseZ + CornerPierTopZ[Corner];
+			if (CornerPierTopZ.IsValidIndex(Q.CornerIndex) && CornerPierTopZ[Q.CornerIndex] > UE_KINDA_SMALL_NUMBER)
+			{
+				Q.CullBelowZ = BaseZ + CornerPierTopZ[Q.CornerIndex];
+			}
 		}
 	}
 
@@ -2383,7 +2392,7 @@ uint32 ACSHouseActor::BuildQuoinBricks(TArray<CSHouseFrame::FElement>& InOutElem
 	for (const CSHouseQuoin::FQuoin& Q : Quoins)
 	{
 		H.Append({ CSHouse_Q(Q.Point.X, 1), CSHouse_Q(Q.Point.Y, 1),
-			CSHouse_Q(Q.Outward.X, 0.01), CSHouse_Q(Q.Outward.Y, 0.01),
+			CSHouse_Q(Q.Outward.X, 0.01), CSHouse_Q(Q.Outward.Y, 0.01), CSHouse_Q(Q.HalfTurnCos, 0.001),
 			CSHouse_Q(Q.BottomZ, 1), CSHouse_Q(Q.TopZ, 1),
 			// 剔除高度也得进：它决定哪些砖被写成负值随机数 ⇒ 决定画面。漏掉它 =
 			// 转角门开了/关了而角柱照旧，且**没有任何报错**（同 `StyleFlags` 那条）。

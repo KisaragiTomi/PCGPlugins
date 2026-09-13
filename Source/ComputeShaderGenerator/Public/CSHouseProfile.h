@@ -910,6 +910,66 @@ inline FCSHouseEdgeFrame CSHouse_GetEdge(int32 EdgeIndex, const FVector2D& Footp
 }
 
 /**
+ * 周界上的一个角。角 k 夹在「k 号边的远端」与「k+1 号边的近端」之间，位置 = `Verts[k+1]`。
+ *
+ * 角石（`CSHouseQuoin::BuildQuoins`）、转角墩（`ACSHouseActor::BuildCornerPierBricks`）、
+ * 跨角配墩（`ResolvePierSpans`）问的都是它 —— 角点与角平分线只能有一个真源。各算各的症状是
+ * 「角石包的角与墩立的角在非直角上错开」，而矩形上几种写法逐位相同，单测一条都不会红。
+ */
+struct FCSHouseCornerFrame
+{
+	/** 外皮角点（局部空间）。 */
+	FVector2D Point = FVector2D::ZeroVector;
+	/** 角平分线，指向房外（单位）= 两面墙外法线之和的方向。凹角同样成立（指向凹口）。 */
+	FVector2D Outward = FVector2D(1.0, 0.0);
+	/** 转角（远边 U 转到近边 U 的有向角）的正弦：> 0 凸角（逆时针左转），< 0 凹角，≈ 0 共线。 */
+	double SinTurn = 0.0;
+	/** `cos(转角 / 2)` = 平分线与任一面墙外法线的夹角余弦。直角 = 1/√2，共线 = 1，折返 → 0。 */
+	double HalfTurnCos = 1.0;
+
+	bool IsConvex(double MinSin = 1.0e-4) const { return SinTurn > MinSin; }
+
+	/**
+	 * 两面墙各向内偏 `Depth` 之后的交点 = 沿平分线内缩 `Depth / cos(转角/2)`，凸角凹角同一个式子。
+	 * `Depth = T/2` 就是墙厚中线的角点（门樘砖、拱廊墩、转角墩都立在那条线上）；直角上是 `T/√2`。
+	 */
+	FVector2D PointAtDepth(double Depth) const
+	{
+		return Point - Outward * (Depth / FMath::Max(HalfTurnCos, 1.0e-3));
+	}
+};
+
+/** 角 `CornerIndex` 的框架。越界或退化折线返回默认值（`HalfTurnCos = 1`、`SinTurn = 0`，不算凸角）。 */
+inline FCSHouseCornerFrame CSHouse_GetCorner(int32 CornerIndex, const FCSHouseFootprint& Footprint)
+{
+	FCSHouseCornerFrame C;
+	const int32 N = Footprint.NumEdges();
+	if (N < 3 || CornerIndex < 0 || CornerIndex >= N) return C;
+	const FVector2D& A = Footprint.Verts[CornerIndex];
+	const FVector2D& P = Footprint.Verts[(CornerIndex + 1) % N];
+	const FVector2D& B = Footprint.Verts[(CornerIndex + 2) % N];
+	const FVector2D UFar = (P - A).GetSafeNormal();
+	const FVector2D UNear = (B - P).GetSafeNormal();
+	// 外法线 = −In = (U.y, −U.x)（逆时针折线的内部在行进方向左手侧）。
+	const FVector2D NFar(UFar.Y, -UFar.X);
+	const FVector2D NNear(UNear.Y, -UNear.X);
+	C.Point = P;
+	C.SinTurn = UFar.X * UNear.Y - UFar.Y * UNear.X;
+	const FVector2D Sum = NFar + NNear;
+	const double SumLen = Sum.Size();
+	if (SumLen <= 1.0e-6)
+	{
+		// 折返（尖刺）：两面外法线相消，没有平分线。那种折线本该在编辑入口被拒绝，这里只防除零。
+		C.Outward = NFar;
+		C.HalfTurnCos = 0.0;
+		return C;
+	}
+	C.Outward = Sum / SumLen;
+	C.HalfTurnCos = SumLen * 0.5;   // |NFar + NNear| = 2·cos(转角/2)
+	return C;
+}
+
+/**
  * 射线（或一个点）落在哪面外墙上。**房子局部空间** —— 世界变换由调用方先解掉。
  *
  * D8 特征标记的宿主解析用它：`S` / `Z` 恰好就是 `FCSHouseWindow` 要的 `CenterS` / 窗台高，

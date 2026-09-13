@@ -370,6 +370,11 @@ struct FElement
 	float QuoinScale = 0.0f;
 	/** 角石基础网格 X/Z 尺寸的倒数；R6.yz 在角石分支中取代端头剪切。 */
 	FVector2f QuoinMeshInvSize = FVector2f::ZeroVector;
+	/**
+	 * 角石所在角的 `cos(转角 / 2)`，走 R7.w（原先保留为 0 的那一格）。只在 `QuoinScale > 0` 时上传；
+	 * `<= 0` 按直角（1/√2）处理，所以没填它的旧路径画面不变。见 `CSHouseQuoinLayout::PlaceQuoin`。
+	 */
+	float QuoinHalfTurnCos = 0.0f;
 };
 
 /**

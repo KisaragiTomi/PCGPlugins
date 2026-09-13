@@ -23,7 +23,8 @@
 //   [5] HalfLen（首块砖的弧长）| LayoutScale（长度轴铺装缩放）| asuint 随机数基 | CrossScale（横截面缩放，柱头/柱础）
 //   [6] CullBelowZ（世界 Z 低于它的砖写负值随机数 ⇒ 材质 discard；≤ 0 = 不剔）
 //       | ShearAtS0 | ShearAtS1 | Jitter；角石分支下 yz = 1 / 基础网格的 X、Z 尺寸
-//   [7] SplitJitter（分层抖动幅度 cm，≤ 0 = 等分）| 本条路的总弧长（kernel 拿它把 cm 归一化）| QuoinScale（> 0 = 按相邻墙面包角）| 保留
+//   [7] SplitJitter（分层抖动幅度 cm，≤ 0 = 等分）| 本条路的总弧长（kernel 拿它把 cm 归一化）| QuoinScale（> 0 = 按相邻墙面包角）
+//       | 角石所在角的 cos(转角/2)（≤ 0 = 直角）
 //
 // packed 行布局照抄 CSGpuInstancedMesh.usf：前三行是被缩放过的基（**矩阵的行**），第 4 行是
 // 原点 + 每实例随机数，第 5 行是剔除球（必须包住变换后的基础网格，否则实例会在视锥边缘闪掉）。
@@ -243,7 +244,7 @@ void ScatterHouseFrameCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	FQuoinPlacement Quoin = (FQuoinPlacement)0;
 	if (bQuoin)
 	{
-		Quoin = PlaceQuoin(WorldPos, AxisX.x, AxisX.y, QuoinScale,
+		Quoin = PlaceQuoin(WorldPos, AxisX.x, AxisX.y, R7.w, QuoinScale,
 			R6.w * (2.0f * FrameInstanceRandom(RandomIndex) - 1.0f), ((Brick - Begin) & 1u) != 0u);
 		WorldPos = Quoin.Center;
 		AxisX = Quoin.AxisX;

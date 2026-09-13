@@ -94,8 +94,9 @@ void CSHouseFrame_Flatten(const TArray<CSHouseFrame::FElement>& In, TArray<FVect
 		Out.Add(FVector4f(E.CullBelowZ,
 			E.QuoinScale > 0.0f ? E.QuoinMeshInvSize.X : E.ShearAtS0,
 			E.QuoinScale > 0.0f ? E.QuoinMeshInvSize.Y : E.ShearAtS1, E.Jitter));
-		// [7] 分层抖动幅度（cm，≤ 0 = 等分）| 本条路的总弧长（kernel 拿它把 cm 归一化）| 角石比例 | 保留。
-		Out.Add(FVector4f(E.SplitJitter, E.Path.TotalLen(), E.QuoinScale, 0.0f));
+		// [7] 分层抖动幅度（cm，≤ 0 = 等分）| 本条路的总弧长（kernel 拿它把 cm 归一化）| 角石比例 | 角石的 cos(转角/2)。
+		Out.Add(FVector4f(E.SplitJitter, E.Path.TotalLen(), E.QuoinScale,
+			E.QuoinScale > 0.0f ? E.QuoinHalfTurnCos : 0.0f));
 	}
 }
 }

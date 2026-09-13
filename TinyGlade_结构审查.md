@@ -14,7 +14,7 @@
 - **09-11 复核**：30 条里 2 条已修（21、22），6 条部分修（1、15、23、24、25、29），3 条换了形态（9、11、19），19 条原样成立。GPU 基座的契约层四条已修三条半；编排层与生命周期的结论几乎原样成立。另订正原结论 24 处，多为计数与引文；其中推翻缺陷判断的有三处：标记其实有 `PostEditChangeProperty`，砖层容量并非固定 512，C13 的首次松手降级在常规拖动里不会发生。新增 8 条（31–38）。审查之后有 5 条用户裁决，改写了第 2、9、29、34 条的建议与建议顺序，见复核总览。
 - 底层架构站得住：CPU 权威镜像 → 声明式重求值 → 哈希守卫 → GPU 常驻，这条链的方向正确。纯函数层（`CSHouseProfile.h` / `CSHouseSeam.h` / `CSHouseQuoin.h` / `CSHouseTrim.h` / `CSHouseRoof.h` / `CSHouseResize.h` / `CSHouseDoorRuns.h`）质量高、有单测。
 - 结构性问题集中在**编排层**：两个 actor 把十几条产物管线的状态机全部手写在自己身上，产物之间靠成员变量与注释约定的顺序传递数据，哈希输入靠手工枚举。本审查发现的绝大多数缺陷都由这一层产出，而且同一类缺陷会反复出现。
-- 与 Tiny Glade 模型差异最大、也最贵的一条是矩形 footprint；其次是墙体两套表示并存而终局未定。这两条是方向问题，需要拍板而不是重构。
+- 与 Tiny Glade 模型差异最大、也最贵的一条是矩形 footprint；其次是墙体两套表示并存而终局未定。这两条是方向问题，需要拍板而不是重构。（09-13：前者已拍板并落地为闭合凸折线，见大问题 3；后者仍待拍板。）
 - 模块之间的交互（深挖 D）与编排层同病：四类客户端用三种策略同步叫醒房子（09-10 起地面 / 标记改为只标脏，但执行面变成了四种，见 34）、地面一次登记触发九次派生重建、标记的回执被自己的探针盖掉（09-11 已换形态，见 11）、身份 GUID 随复制撞键——都是「协议只写在注释里」的产物。冗余（深挖 E）几乎没有字面复制，全是同构不同文：抓手两族、九份哈希收尾、健康检查链、约 60 个只读探针。
 - 生命周期（深挖 G）与前两者同源：状态该归权威 / 派生 / 持久记忆 / 拖动期临时哪一类，头注释写得很清楚；「谁负责让它回到一致」却没有落到代码——权威量的写入者不 `Modify()`、参照系与登记表不进事务、三道闸门判「来历」不判「状态」、解绑与释放在三个销毁钩子里各做一部分（显存 09-11 已改为各放各的，解绑仍分散）。六条生命周期路径只有两条有测试，09-11 仍是如此。
 
@@ -23,7 +23,7 @@
 | 纯函数层（剖面 / 接缝 / 角石 / 包边 / 屋面 / 拉尺寸 / 门段） | header-inline 纯函数，36 条逻辑单测（其中 5 条建世界 spawn actor） | 好，保持；但拱曲线在三个消费者里有三种定义、`Circle` 竖向两套口径（大问题 4 深挖 C 补充 1、2） |
 | GPU 基座（`UCSMesh` / `UCSGpuInstancedMeshComponent` / `CSShaperSteps`） | 描述符驱动、异步编辑、计数阻塞刷新；09-10 起有共享布局头与 Nanite 路（资产开了 Nanite 就自动走 GPU-Scene） | 机制层好。契约层四条已修三条半：21 清零并看交接结果、22 暂存发布、23 共享布局头，24 只在诊断回读出声；剩原子槽位泄漏到烘焙产物、经典路交接必阻塞（24）。buffer 设施五份同构体（大问题 1）；新缺口见 33、35 |
 | 编排层（`ACSHouseActor` / `ACSGroundActor`） | 约 10.9K 行、257 个可编辑属性、8 条实例化产物家族（含柱砖）+ 5 条 `UCSMesh` 产物（房体 / 盒柱 / 藤管 / 地面 / 岩壳）；网格槽簿记、实例族清单、显存回收已上提到基类 `ACSTinyGlade` | **主要问题所在**（大问题 1、2，中等问题 6；新增 31、32、34） |
-| 数据模型（footprint / 洞 / 墙） | 矩形四边硬编码；墙 = 面板 + clip，砖层半成品（09-11 代码零变化） | **方向待拍板**（大问题 3、4） |
+| 数据模型（footprint / 洞 / 墙） | footprint 是闭合凸折线（09-13；存「形状 + 包围盒尺寸」）；墙 = 面板 + clip，砖层半成品 | 大问题 3 已修（凸）；大问题 4 **方向待拍板** |
 | 通知与注册（`UCSHouseSubsystem` / `OnGroundChanged` / 标记登记） | 地面 / 标记只标脏，由房子自己的 Tick 合批（09-10）；另有同步入口 7 处、子系统 `DirtyHouses`（抓手）、0.25 s 快扫、读时补票 48 处 | 可用。地面 N 倍放大已收成每帧每栋一次；但四种执行面并存，快扫基线只由子系统回写，邻居落座改出的新 Z 只靠 0.25 s 快扫传过来（34）。登记链重复重建、GUID 复制撞键仍在（10、13）；标记回执换了形态（11） |
 | 生命周期（事务 / 存读 / 复制 / PIE / 卸载） | 状态四类在头注释里分得清；`RF_WasLoaded` / `bHasBeenPlaced` / `FDelegateHandle` 三处以来历或句柄代状态 | 拉尺寸不进事务、撤销顺序确定但 `MarkerRef*` 不回滚、一次 Ctrl+Z 三次同步重求值（26–28）；显存改为组件自放 + actor 在 `EndPlay` / `Destroyed` 放生产者缓冲（29 部分修）；样条块在 PIE / 打包里没有网格（37）；六条路径只测两条（30） |
 | 模块边界（include 方向 / 公共头归属 / 遗留耦合） | 地面反向依赖房子四处；三个公共头挂在一侧名下，其中 `CSGroundShaperSteps.h` 又接下了交接状态机；藤管入口焊在 4.9K 行旧文件里 | 拆模块前先搬头（8、19）；非编辑器构建今天链接不过（38） |
@@ -37,7 +37,7 @@
 | --- | --- | --- |
 | 1 实例化产物管线 | 部分修 | 交接判据与动作已收成一份（`CSShaperSteps::HandOverInstanceSources` / `EHandoverResult`），其余五类样板仍逐家手写；实为 9 家（原文漏数柱砖）；门框砖仍漏 `ReserveCount` |
 | 2 隐式数据流与哈希覆盖 | 成立 | 顺序与约束原样；已核实的哈希缺口 15 → 12 条（F4 / D1 / D2 已修），新增 31；A2 已修，A1 仍在 |
-| 3 矩形 footprint | 部分修（09-12 起在做） | 2026-09-12 裁决升闭合折线，排建议顺序第 3 步。3a-1（折线成为边框架唯一算法，逐位等价）与 3b（墙那一路按 `NumEdges()` 走，含房体三角汤）已落地；屋面 / 接缝 / 角 / 拉尺寸四组原样。剩凸 / 凹一条分叉待定 |
+| 3 矩形 footprint | 已修（凸，09-13） | 2026-09-12 裁决升闭合折线；09-13 分期落完：斜接转角、剩余机械项、角石 / 转角墩、接缝、屋面直骨架 + 瓦 + 檐口锚点、形状存盘 + 折线拖边，另一个收尾提交补了三处漏网的四边假设。凸 / 凹按建议默认值走「先凸、接口留凹」；凹要换的三处见正文 |
 | 4 墙体两套表示 | 成立 | 窗台砖第四段与 `CSHouse_SillMinZ` 已删，窗台盒只剩字面量 `0.5f`；「容量 512」原结论有误 |
 | 5 变换契约 | 成立 | 编辑钩子仍不钉 pitch / roll / scale；交接盒已统一映射，算缓解 |
 | 6 一次改动两次重求值 | 成立 | 改属性 2 次、gizmo 松手 2 次、抓手 2 次、撤销 3 次，全部同步 |
@@ -74,7 +74,8 @@
 - 2026-09-11：删除时显存各放各的。实例组件与渲染组件在 `OnComponentDestroyed` 里放自己那份；actor 只在 `EndPlay` / `Destroyed` 放自己分配的生产者缓冲（`ReleaseInstancedBuffers`）。这取代了第 29 条「一个 `Teardown()` 统一放 GPU」那一半。
 - 2026-09-11：本帧标脏、下一帧重建，不存在先后关系。被动唤醒一律只标脏；重建一律推到下一帧，不在标脏的同一帧兑现。不做中央待办表，也不排先后。挂点由此定为下一帧。同日早些时候的版本要求「标脏那一刻把别人要读的便宜 CPU 输入写定」，并把塑形物 → 地面的高度镜像重算、房子落座 Z 列为违例；这条要求随本裁决撤销，两处不再算违例。落地要做的事见 9、34。
 
-- 2026-09-12：**footprint 升闭合折线**。矩形不再是终局，大问题 3 从「方向待拍板」转为待排期的重构。落地顺序与内部分期见「建议顺序」新的第 3 步；逐函数清单与规模在附录 A。本裁决同时决定了大问题 3 的「若升，排在哪个模块之前」那半：排在族结构（第 2 步）之后、`FCSHouseSiteState` 固化（原第 3 步）之前 —— 数据表示先定，控制流再收敛，否则切片类型与哈希口径要按矩形定一次、按折线再改一次。**尚未回答的分叉见「待拍板」首条：凸多边形还是含凹。**
+- 2026-09-12：**footprint 升闭合折线**。矩形不再是终局，大问题 3 从「方向待拍板」转为待排期的重构。落地顺序与内部分期见「建议顺序」新的第 3 步；逐函数清单与规模在附录 A。本裁决同时决定了大问题 3 的「若升，排在哪个模块之前」那半：排在族结构（第 2 步）之后、`FCSHouseSiteState` 固化（原第 3 步）之前 —— 数据表示先定，控制流再收敛，否则切片类型与哈希口径要按矩形定一次、按折线再改一次。
+- 2026-09-13：用户要求「解决剩下的问题」，两处开放项按本文建议的默认值落地，不是另起的裁决：① 凸 / 凹 —— **先凸**，表示与接口按含凹留好（斜接对凹角天然成立、角框架带转角正负、裁剪段本来就是列表），非严格凸的形状一律退回矩形；② 奇数边的 `S` 原点随斜接移动 `T` —— 旧锚点带口径标记就地换算（`FCSWallAnchor::SConvention`），属性表里的窗在 `PostLoad` 迁移一次（`WallSConvention`）。
 
 ### 09-11 二轮上提候选（只读审计，未做）
 
@@ -330,14 +331,14 @@ struct FCSInstancedFamily {
 
 ### 3. 矩形 footprint 硬编码已渗透到 14 个文件
 
-**现状（09-12）：已拍板要改，3a-1 与 3b 已落地。** 2026-09-12 用户裁决 footprint 升闭合折线，本条从「方向待拍板」变成在做的重构，排在建议顺序第 3 步（族结构之后、`FCSHouseSiteState` 之前）。下面的计数与清单因此从「问题描述」变成「工作量清单」：机械 22 处、天然可推广 0 行、必须重写 5 组，逐函数表在附录 A。
+**现状（09-13）：已修（凸折线）。** 分期逐条见建议顺序第 3 步。整模块自动化 138 条，136 过 + 2 条既存红（`Vine.StrandMatchesRecords` / `Vine.TubePath`，折线化之前就红），折线专项测试 9 条（`FootprintMitreCorners` / `QuoinPolylineCorners` / `SeamPolylineFootprints` / `SeamPolylineActor` / `RoofPolylineSkeleton` / `TilePolylineRoof` / `DecorPolylineRoofAnchors` / `EdgePushPolyline` / `ResizeHandlePolyline`）。下面 09-11 / 09-07 的计数与清单保留为历史记录，已不再是工作量清单。
 
-已经不成立的部分（两个提交，整模块 118 条测试全绿）：
+- **表示**：存盘的是 `FootprintShape`（任意坐标系的凸折线，空 = 矩形）+ `FootprintSize`（包围盒尺寸），`GetFootprint()` = `FCSHouseFootprint::FromShape` 把形状拉伸到包围盒并居中。选它而不是「厘米折线 + `FootprintSize` 退役」：写 `FootprintSize` 的旧路径（详情面板、蓝图、`footprint_size` 脚本、拖边、测试）在异形房子上照样成立，旧存档不需要迁移。代价是改尺寸会非等比拉伸形状，那正是「包围盒尺寸」的本义。
+- **几何核**：墙在转角**斜接**（`FCSHouseEdgeFrame::InsetStart / InsetEnd`，让出量 `T·tan(转角/2)`，凹角为负），矩形的实心体不变、转角处两条边各拿一半；角点与平分线只有 `CSHouse_GetCorner` 一个真源。
+- **消费者**：房体 / 门段 / 配墩 / 支撑柱 / 各家哈希与容量（3b-2）、角石与转角墩（3c）、接缝（3d）、屋面 + 瓦 + 尖顶 + 檐口与屋脊锚点（3e）、拉尺寸与抓手（3f）全部只认折线。grep `Edge < 4|\[4\]|& 3|% 4` 在非测试的 `CSHouse*` 里只剩：矩形便捷重载 `CSHouse_GetEdge(…, FVector2D, T)`、测试用的 `CSHouseQuoin::CornerSign`、矩形推拉 `CSHouse_ApplyEdgePush`（矩形房子仍走它，算术被 `House.EdgePush` 钉着）、高度框的四根条子（它画的就是包围盒）、柱砖逐层的四分之一转（与边无关）。
+- **凹 footprint 要换的只有三处**：`CSHouseRoof_BuildSkeleton` 加分裂事件、`CSHouseSeam::CutOnEdge` 一面墙输出多段、`FromShape` 放开凸性闸门。表示、边框架、角框架、角石（凹角本来就不出）、裁剪段列表都不用动。
 
-- `CSHouse_GetEdge` 的 `switch (EdgeIndex & 3)` 与四条边各自硬编码的 `In` 都没了（`b91ff61`）。折线是唯一算法，矩形是特例，逐位等价由 `House.FootprintPolylineMatchesRect` 钉住。
-- 墙那一路（射线 / 就近 / 三个锚点函数 / 谓词 site / 房体 desc / 包边 / 砖层）不再假定四条边，`CSHouse_BuildBodySoup` 按 `NumEdges()` 砌墙（`6e06034`）。**附录 A 判定「天然可推广」的那一整类至此确实一行未改** —— 这条预测得到了验证。
-
-仍成立的部分：屋面 / 瓦 / 檐口锚点、接缝三函数、角石与转角墩、拉尺寸与两族抓手全部原样，下表的行数与分类对它们照旧有效。剩下未定的是凸 / 凹（见「待拍板」首条），它只改④⑤两组的做法，不改分期。
+**行为变化**（均有测试钉住或已在提交信息里写明）：转角面板划分变了（斜接）；奇数边旧锚点就地换算、属性表窗迁移一次；角石的 GPU 摆放读逐角的 `cos(转角/2)`（R7.w，≤ 0 按直角）；长轴沿 Y 的矩形房，屋脊摆件的朝向硬币与原来相反（分布不变）。
 
 **现状（09-11）：成立，代码零变化。** 两种口径在基线（`2229775`）与工作区逐文件相同。
 
@@ -489,7 +490,7 @@ struct FCSInstancedFamily {
 - 「地面 → 房子」因此有四条依赖，「房子 → 地面」一条（`CSGroundActor.h`：采样与订阅）。两个 actor 互相依赖，中等问题 7 的模块拆分之前必须先把上表四个头搬到中性名字下（`CSInstancedPalette.h` / `CSHash.h` / `CSWallStrip.h` / `CSDecorPlan.h` 之类）。
 - `CSGroundShaperSteps.h` 第 7 行 `#include "CSGpuInstancedMeshComponent.h"`（533 行）只为 `CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS`，而这个宏在头里只出现在注释里，真正用它的是 `CSGroundShaperSteps.cpp:28`。这一行让全部 TG 头都传递包含了实例组件头。（09-11：前提失效，见上方现状；实例组件头也从 533 行涨到 614 行。）
 - `CSHouseFeatureMarker.h` 第 5 行 include `CSHouseActor.h` 只为 `FCSHouseWindow`（定义在 `CSHouseActor.h:132`），`ACSHouseActor` 在标记头里只以指针 / 引用出现。后果：460 行的标记头带上 2456 行的房子头及其 13 个 TG 头；`CSHouseActor.h` 共被 14 个文件包含，其中 5 个在编辑器模块 `PCGEditorProcess`（窗笔刷 EdMode、失选监听、模块入口、两个测试）——改任何一个房子侧的头，编辑器模块跟着重编。`FCSHouseWindow` 挪进 `CSHouseProfile.h`（`FCSWallAnchor` / `FCSWallHit` 已在那里）即可断开。
-- 裸字段：`FootprintSize` / `WallThickness` / `WallHeight` 是公开属性，被标记、子系统、两族抓手直接读 13 次（如 `CSHouse_MakeWallAnchor(Hit, House->FootprintSize, House->WallThickness, …)`）。大问题 3 若升折线，这 13 处全在编排层之外。
+- 裸字段：`FootprintSize` / `WallThickness` / `WallHeight` 是公开属性，被标记、子系统、两族抓手直接读 13 次（如 `CSHouse_MakeWallAnchor(Hit, House->FootprintSize, House->WallThickness, …)`）。大问题 3 若升折线，这 13 处全在编排层之外。（09-13：footprint 的几何读取都已改走 `GetFootprint()`，只剩高度框读 `FootprintSize` 当包围盒；`WallThickness` / `WallHeight` 仍是裸读。）
 - `CSVineTube.h` 声明的 `BuildTubeIntoMesh` 实现在 `GeometryEditorActor.cpp:4779`（4863 行的旧藤蔓文件），注释明说是因为要用那个文件里两个 file-static；反过来 `CSVineScatter.cpp`（旧藤蔓的散布输入）include `CSGroundActor.h` 并 `TActorIterator<ACSGroundActor>`。TG 与旧藤蔓在翻译单元层面互相咬住（见 19）。
 - `CSHouseSubsystem.cpp` 把 `CSHouseActor.h` 与 `Engine/World.h` 各 include 了两次（第 3 / 8、6 / 10 行）。
 - 做对的一侧：编辑器模块只靠三个静态多播委托接线（`ACSHouseActor::OnWindowBrushRequest` / `OnResizeModeChanged`、`ACSGroundActor::OnGroundPaintEditorRequest`），运行时模块零编辑器 include；`CSWindowBrushEdModeTests.cpp` 钉住了「按钮 → 委托 → 模块 → 激活」整条链。
@@ -1011,18 +1012,20 @@ class ACSHouseCanonicalHandleActor : public ACSHouseHandleActor
    - 24 的零阻塞交接（基础网格 generation）也属于这一步，但它与实例化叶子的渲染路线绑在一起，要先拍板。
    - 09-11 二轮的上提候选也放在这一步：② 主网格槽状态（房子的 `BodySlot`）归基类，地面拖动改走 `ApplyMeshSlotPlacement`（36）；④ `FlushPending` 空虚钩子与烘焙自检 helper（15 剩下的第一段）。
    - 29 的幂等 `Teardown()` 只管解绑 / 注销，不再承担 GPU 释放。
-3. **footprint 升闭合折线（2026-09-12 裁决）。** 排在这里而不是更后：第 2 步的族结构与墙的形状正交，可以先做；而原第 3 步的 `FCSHouseSiteState` 要把几何参数拍成只读切片、切片即哈希输入，表示还要变的话那套类型与哈希口径得定两次。逐函数清单与规模见附录 A，内部分六期，每期自带判据：
+3. **footprint 升闭合折线（2026-09-12 裁决；09-13 已完成，凸）。** 排在这里而不是更后：第 2 步的族结构与墙的形状正交，可以先做；而原第 3 步的 `FCSHouseSiteState` 要把几何参数拍成只读切片、切片即哈希输入，表示还要变的话那套类型与哈希口径得定两次。逐函数清单与规模见附录 A，内部分六期，每期自带判据。⚠️ 实际做的时候第 1 步的安全网并没有先补，靠的是每期的专项测试 + 全模块回归；第 1 步仍然欠着：
 
    - **3a-1 折线成为边框架的唯一算法（已完成，`b91ff61`）**：新增 `FCSHouseFootprint`（逆时针闭合折线）与唯一的几何核 `CSHouse_MakeEdgeFrame`；`In` 从四条边各自硬编码的常量变成逆时针性质的推论 `Perp(U)`；`CSHouse_GetEdge` 两个重载都走这个核，矩形只是「四顶点折线」这个特例。转角约定抽成具名的 `CSHouse_EdgeInsetsBothEnds`。67 个调用点一个没动。判据是**逐位**复现（`House.FootprintPolylineMatchesRect`：冻结一份改动前的 switch，扫 6 尺寸 × 4 墙厚 × 4 边，`==` 而不是 `IsNearlyEqual`，因为墙长进哈希）。
    - **3b 墙那一路不再假定四条边（已完成，`6e06034`）**：`ACSHouseActor::GetFootprint()`；`RayHitWall` / `NearestWall` / 三个锚点函数 / `FCSOpeningSite` / `FCSHouseBodyDesc` / `CSHouseTrim` / `CSHouseBrickWall` 改吃折线；`CSHouse_BuildBodySoup` 的墙板循环改成 `NumEdges()`；`MakeWallAnchor` 的 `EdgeIndex & 3` 去掉；`MarkerRefFootprint` 跟着变折线（比较走 `EqualsApprox`，顶点数不同即不同）。**房体三角汤至此与边数无关** —— 喂一个五边形折线就砌五面墙。整模块 118 条测试全绿。
-   - **3a-2 转角换斜接 + 折线成为序列化权威（未做，约 80 行）**：把 `CSHouse_EdgeInsetsBothEnds` 换成逐端的让出量（斜接：转角方块沿角平分线一分为二，直角处各让 `T/2`，而不是今天的 0 或 `T`），同步改 `CSHouse_BuildBodySoup` 的面板端面（盒子变棱台）；`FootprintSize` 退役、折线本身可编辑可存盘，并处理锚点迁移（边 1/3 的 `S` 原点会移动 `T`）。⚠️ 这一期**会**改几何：矩形的外壳与内壳不变（同一个实心环），变的是转角处的面板划分与三角汤，所以判据不再是逐位复现，而是「同一实心体 + 转角处两条边各拿一半」。3a-1 那条测试届时连同冻结副本一起删。
-   - **3b-2 剩下的机械改动（未做）**：`FootprintCorners` / `Reach`、`BuildCorners` 改 N×M、`ComputePillars`、`CornerPierTopZ[4]` 变 `TArray`、顶点表进哈希、`Reach = max(X, Y) · 0.6` 五处、`EdgeIndex` 的 `ClampMax = "3"`、`CSHouseDecor::MaxRecordsBound` 的周长。`ComputeDoors` 已是闭合周界求解，是最接近折线的一段。
-   - **3c 角的重定义（约 120 行）**：角石的 `Diag = 1/√2` 与内缩量换成随内角变的角平分线（`T / (2·sin(θ/2))`）、凹角不出角石；`ResolvePierSpans` 的「跨度 = 墙厚」是直角 butt joint 的推论，要重推。
-   - **3d 接缝（约 120 行）**：`Intersects` 的两轴 SAT 换成全边法线（凸）或分解（凹）；`CutOnEdge` 的 Liang–Barsky 换 Cyrus–Beck，`FCSWallCut` 改多区间表 —— `CSHouse_BuildBodySoup` 已经会并重叠段，接得上。
-   - **3e 屋面 + 瓦 + 檐口锚点（约 300 行，最大单项）**：凸多边形下 `InsetDistance` 可机械改成「到各边支撑线距离的 min」，脊 / 角脊 / 脊高 / 法线要从高度场重推；含凹则要真直骨架。瓦的逐坡铺设与角斜脊、`CSHouseDecor` 的檐口锚点跟着走。
-   - **3f 交互层（约 150 行）**：折线没有「对侧不动、中心随动」，`CSHouseResize` 的推拉语义要重定义（推一条边 = 沿法线平移该段并与两邻段重新求交）；四锥一框换成每边一个抓手或顶点抓手。
+   - **3a-2 转角换斜接（已完成，`6037a0a`）**：`CSHouse_EdgeInsetsBothEnds` 删掉，`FCSHouseEdgeFrame` 带逐端让出量 `InsetStart / InsetEnd`（半角公式 `T·sin/(1+cos)`，直角恰好 `T`、凹角为负）与 `SpanAtDepth`；墙板成了端面斜切的棱柱（`AddWallPrism`），包边 / 砖层走墙厚中线的斜接区间，谓词的护角取 `max(CornerMargin, 让出量)`。锚点迁移：`FCSWallAnchor::SConvention`（旧锚点在 `CSHouse_AnchorS` 里就地换算）+ `ACSHouseActor::WallSConvention`（`PostLoad` 把属性表里奇数边的窗心平移一个墙厚、清掉两张迟回记忆）。3a-1 那条逐位测试连同冻结副本删掉，换成 `House.FootprintMitreCorners`（矩形 / 五边形 / L 形的斜接闭合、三角汤体积 = 环面积 × 墙高、旧锚点换算）。原计划放在这一期的「折线成为序列化权威」挪到了 3f。
+   - **3b-2 剩下的机械改动（已完成，`d6f9583`）**：落座采样按折线包围盒网格 + 补采顶点；门段环的数组按边数；跨角配墩与 `CornerPierTopZ` 按角数；六家哈希改成量化顶点表（`CSHouse_AppendFootprintHash`，第七家藤蔓在 3f）；支撑柱角点走墙厚中线的斜接点；各家容量与交接包围盒走 `GetPerimeter` / `GetCenteredSpan`（矩形上逐位等于原来的 `2(X+Y)` / `max(X, Y)`）。藤蔓哈希因为与另一会话未提交的改动相邻，挪到 3f 一起做。
+   - **3c 角的重定义（已完成，`d31bc12`）**：`FCSHouseCornerFrame` / `CSHouse_GetCorner`（角点、平分线、转角正弦、`cos(转角/2)`、`PointAtDepth`）成为角的唯一真源；角石只出在转角 ∈ (0°, 90°] 的凸角上（凹角没有外棱；锐角上方正砖会从另一面墙戳出 `−cos(转角)·短边`），`FQuoin` 带 `CornerIndex` 与 `HalfTurnCos`；GPU 的 `PlaceQuoin` 读 R7.w 里的 `cos(转角/2)`，每层砖方正地贴一面墙、外棱锚在外扩后轮廓的斜接点上，直角时与原公式一致；转角墩改立在 `PointAtDepth(T/2)`。`ResolvePierSpans` 跨角那条「跨度 = 墙厚」没有重推 —— 非直角转角两道拱之间的实际跨度待有非直角的拱廊需求时再定。测试 `House.QuoinPolylineCorners`。
+   - **3d 接缝（已完成，`72624d7` + 收尾 `2afbe4e`）**：分离轴取两条折线全部边法线（凹时保守误报、下游精确求交所以无害）；`BuildCorners` N×M；`CutOnEdge` 推广为 Cyrus–Beck（矩形上四个半平面与原来逐项相同）。`FCSWallCut` 没有改成多区间：一面墙对一个凸邻居只可能被盖一段，而 `CurrentSeamCuts` 本来就是列表 —— 凹邻居落地时改的是 `CutOnEdge` 的输出个数，不是裁剪段的类型。actor 那一侧的逐边循环当时漏改，收尾提交补上并加了 `House.SeamPolylineActor`。测试另有 `House.SeamPolylineFootprints`。
+   - **3e 屋面 + 瓦 + 檐口锚点（已完成，`c2ec83b`）**：高度场改成「到每条边所在直线的最小内距」（凸多边形上它就是等坡度直骨架屋面，矩形上逐项就是原公式）；脊向 API 全删，换成 `MaxInset` 与 `CSHouseRoof_BuildSkeleton`（边塌缩事件，输出按角号排的角斜脊 + 节点间的脊 + 最高那段脊）；`CSHouseRoof_FaceSpanAtInset` 给出坡面每一排的区间，瓦、瓦的容量上界、檐口锚点、`MaxRecordsBound` 都走它；脊瓦沿骨架每条弧，尖顶立在最高那段脊的两端。测试 `House.RoofPolylineSkeleton` / `House.TilePolylineRoof` / `House.DecorPolylineRoofAnchors`。
+   - **3f 交互层 + 形状存盘（已完成，`5712216`）**：`FootprintShape` + `FromShape`（见大问题 3 现状）；`CSHouse_ApplyEdgePushPolyline`：被推的边沿外法线平移、两端沿相邻边滑、包围盒回到房心并补 actor 中心 ⇒ 除被推的边外每条边的世界直线不动（矩形的「对侧不动、中心随动」是特例），下限是宽度 ≥ `MinFootprint`、相邻边与被推的边都保留 ≥ 1 cm；矩形房子仍走原矩形算术。抓手按边数生成，高度框仍画包围盒。测试 `House.EdgePushPolyline` / `House.ResizeHandlePolyline`。
 
-   前置：第 1 步的安全网必须先有，3a 的「矩形折线逐顶点复现今天的输出」是唯一能挡住回归的判据。附录 A 的「天然可推广」那一类（clip 场、谓词、门段、包边、砖层、藤条、摆件锚点、门扇）在 3a 做完后一行不用改，这也是先做 3a 的理由。
+   前置（原写）：第 1 步的安全网必须先有，3a 的「矩形折线逐顶点复现今天的输出」是唯一能挡住回归的判据。附录 A 的「天然可推广」那一类（clip 场、谓词、门段、包边、砖层、藤条、摆件锚点、门扇）在 3a 做完后一行不用改，这也是先做 3a 的理由 —— 这条预测在 3b / 3b-2 得到验证。
+
+   未做 / 遗留：异形房子没有顶点级编辑手柄（只能在详情面板里改 `FootprintShape` 或拖边）；拖边写 `FootprintShape` 与写 `FootprintSize` 一样不进事务（26；详情面板里改属性照常可撤销）；凹 footprint 的三处换算点见大问题 3；各提交都只在「含其他会话未提交改动的完整工作区」里编译测试过，没有在干净检出上单独验证。
 
 4. 先把唤醒收成「本帧标脏、下一帧重建」，再固化 `FCSHouseSiteState`：
    - 按 09-11 裁决，房子 Tick 收紧成一律下一帧，落座改了 Z 的房子标脏邻居（9、34）。不再需要把跨 actor 输入挪到标脏那一刻写定。
@@ -1039,7 +1042,7 @@ class ACSHouseCanonicalHandleActor : public ACSHouseHandleActor
 
 审查之后已拍板的 5 条见「复核总览」，已从本表移除。其中「唤醒策略是否统一为子系统单点执行」已被 09-10 裁决否决，本表改列它的后续问题；「只标脏、稍后统一算」的挂点已由 09-11 裁决定为下一帧。
 
-- **折线只支持凸多边形，还是含凹？**（2026-09-12 裁决升折线之后剩下的唯一分叉，卡着第 3 步的 3d / 3e 两期）。凸：屋面 `InsetDistance` 可机械改成「到各边支撑线距离的 min」，接缝裁剪用 Cyrus–Beck，单区间够用 —— ④⑤两组的规模能压掉大半。含凹：屋面要真直骨架、接缝要多边形分解与多区间裁剪、角石要判内外角，`CSHouseRoof.h` 与 `CSHouseTile.cpp` 基本重写。TG 的墙是任意闭合曲线（含凹），所以「只做凸」是有意收窄。建议分两阶段：先凸，但 3a 的段框架与 `FCSWallCut` 的多区间结构按含凹的接口留好，届时只换 3d / 3e 的算法，不动表示。
+- **凹 footprint 做不做、何时做？**（09-13 已按「先凸」落地，见建议顺序第 3 步。）TG 的墙是任意闭合曲线（含凹），所以「只做凸」是有意收窄。要做时只换三处：屋面直骨架加分裂事件、`CSHouseSeam::CutOnEdge` 一面墙输出多段、`FCSHouseFootprint::FromShape` 放开凸性闸门；表示与其余消费者不动。另一个相关的：异形房子要不要顶点级编辑手柄。
 - 两层墙的终局：先做灰泥层再动砖层，还是把面板路定为当前终局；`CLIP_HLSL` 是否改成从 C++ 生成。
 - 房子是否要支持 pitch / roll / scale；不支持则是否在编辑钩子里钉死。
 - `Windows` 属性表是否退役，只留标记一种来源。

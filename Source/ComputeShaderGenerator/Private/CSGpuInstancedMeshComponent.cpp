@@ -84,30 +84,31 @@ namespace
 
 UCSGpuInstancedMeshComponent::UCSGpuInstancedMeshComponent()
 {
-	// 2026-08-30 实测（出图对照，不是推断）：
-	//   · r.Shadow.Virtual.Enable 0（CSM）—— **这条路会投影**，门框砖的影子清清楚楚。
-	//   · r.Shadow.Virtual.Enable 1（VSM，本工程 Config/DefaultEngine.ini 的项目级设置）
-	//     —— 一点影子都没有，且与 r.Shadow.Virtual.Cache / NonNanite.Batch / NonNanite.UseHZB
-	//     三个开关**逐字节无关**（三张对照图 md5 完全相同，都不是它们的锅）。
-	// 所以旧注释里那句"GPU-Scene 覆盖 indirect args"在这条路上根本不成立
-	// （MeshPassProcessor.cpp:1304 的 bDoOverrideArgs 要求 PrimitiveIdStreamIndex >= 0，
-	//  而本工厂注册时就没有 SupportsPrimitiveIdStream），拦住它的是另一件事：
-	// **本 batch 连 VSM 的准入都过不去**。ShadowDepthRendering.cpp:2145 对 VSM 的
-	// MeshSelectionMask 只收 `MeshBatch.VertexFactory->SupportsGPUScene()` 为真的 batch，
-	// 而那个函数正是 `SupportsPrimitiveIdStream() && PrimitiveIdStreamIndex != INDEX_NONE`
-	// （VertexFactory.h:754）—— 本工厂两个条件都不满足，于是 Process() 根本不被调用，
-	// 一条 draw command 都不会生成。（2026-09-07 读源码修正：此前写成"进不了实例剔除表"，
-	// 方向对但关卡找错了一道。）
+	// **本条路的阴影只走常规 CSM，永远进不了 VSM。**（2026-09-12 定论，前两版归因都不完整。）
 	//
-	// ⚠️ 这一条**没有**被 2026-09-07 那次修复覆盖。非实例化路（UCSMeshRenderComponent）是靠
-	// 给阴影 batch 一个 CPU 侧计数、改发直接绘制绕过 args 被顶掉的问题；本条路的病因不同，
-	// 那个办法在这里无效 —— 要进 VSM 就得有 primitive-id 流，而那与本工厂手取实例变换的前提
-	// 互斥（见 InitRHI 里那条 checkf）。【机制系源码阅读；"VSM 不画 / CSM 画"是实测】
+	// 关卡在 ShadowDepthRendering.cpp:2145：VSM 的 MeshSelectionMask 只收
+	// `MeshBatch.VertexFactory->SupportsGPUScene()` 为真的 batch，而那个函数正是
+	// `SupportsPrimitiveIdStream() && PrimitiveIdStreamIndex != INDEX_NONE`（VertexFactory.h:754）
+	// —— 本工厂两个条件都不满足（故意的，见 InitRHI 里那条 checkf），于是 Process() 根本不被
+	// 调用，一条 draw command 都不会生成。
+	// 顺带否掉两条旧归因：① "GPU-Scene 覆盖 indirect args" 在这条路上不成立
+	// （MeshPassProcessor.cpp:1304 的 bDoOverrideArgs 要求 PrimitiveIdStreamIndex >= 0）；
+	// ② 与 r.Shadow.Virtual.Cache / NonNanite.Batch / NonNanite.UseHZB 三个开关逐字节无关
+	// （2026-08-30 三张对照图 md5 完全相同）。
 	//
-	// 留 true 而不是退回 false：它在 CSM 下确凿正确，在 VSM 下**一个影子像素都画不出来**
-	// （改前/改后同机位逐像素比过，差异只有纹理采样噪声，没有任何影子形状），
-	// 而退回 false 只会把上面这条错误归因再钉一遍。
-	// ⚠️ 另一条已知代价（CSM 下才看得见）：可见实例集是 RunCulling 按**主视锥**压出来的
+	// 那为什么今天 VSM 开着还有影子 —— 因为**引擎自带这条回退**，2026-08-30「VSM 下一个影子
+	// 像素都画不出来」的实测漏看了它：方向光开 VSM 时引擎照样建 CSM 级联，只把级联的
+	// MeshSelectionMask 钉成 EShadowMeshSelection::SM（ShadowSetup.cpp:5606），于是级联里
+	// **只画进不了 VSM 的那些网格** —— 正好就是本条路。默认被
+	// `r.Shadow.Virtual.ForceOnlyVirtualShadowMaps`（默认 1）整个砍掉，本工程在
+	// Config/DefaultEngine.ini 里置 0 把它打开了，完整机制与出处写在那边。
+	// ⇒ 不存在双重阴影：非实例路（UCSMeshRenderComponent）的工厂 SupportsGPUScene() 为真，
+	//   只进 VSM；本条路为假，只进级联。两边的 selection mask 互斥。
+	//
+	// ⚠️ 要让本条路**原生**进 VSM，只有"把实例灌进 GPU-Scene"一条路（UCSGpuInstancedNaniteComponent
+	//    那条替身就是这么干的，所以它今天有 VSM 阴影）。给本工厂加 primitive-id 流是行不通的：
+	//    那与手取实例变换的前提互斥。
+	// ⚠️ 另一条已知代价（CSM 时期就有）：可见实例集是 RunCulling 按**主视锥**压出来的
 	//    （一族只跑一次），主视锥外的实例不进阴影图。要视锥外也投影得另备一份不做视锥剔除的 args。
 	CastShadow = true;
 	bUseAsOccluder = false;

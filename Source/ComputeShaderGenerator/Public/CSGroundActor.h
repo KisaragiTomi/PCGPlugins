@@ -235,17 +235,31 @@ struct COMPUTESHADERGENERATOR_API FCSGroundCoverSpecies
 	float HeightOffset = 0.0f;
 
 	/**
-	 * 这个物种投不投阴影。**默认关**（2026-09-06 用户裁决：草和花不要投影）。
+	 * 这个物种投不投阴影。**默认开**（2026-09-12 用户裁决：花要有投影），但
+	 * **`ACSGroundActor::ACSGroundActor` 把 `Grass` 这一份钉回 `false`** —— 所以实际语义是
+	 * 「花默认投影、草默认不投影」。两者分开的理由是密度差着两个数量级：
 	 *
-	 * 地被是一株一个 instance、满密度 50 株/m²，投影是这条路上最贵的一项：每一株都要进
-	 * 阴影深度 pass 再画一遍，而叶片本身只有几个三角 —— 付的是 draw 侧的固定开销，不是像素。
-	 * 观感上也不缺：TG 的草同样不投影，草地的明暗来自地面自己的阴影与 AO。
+	 * · 草满密度 50 株/m²，投影是这条路上最贵的一项：每一株都要进阴影深度 pass 再画一遍，
+	 *   而叶片本身只有几个三角 —— 付的是 draw 侧的固定开销，不是像素。观感上也不缺：
+	 *   TG 的草同样不投影，草地的明暗来自地面自己的阴影与 AO。（2026-09-06 裁决，仍然有效。）
+	 * · 花是稀疏点缀，一朵的影子是看得见的形状，不是一片糊在地上的噪声。
 	 *
 	 * ⚠️ 写在**组件**上（`EnsureCoverComponents` 里 `SetCastShadow`），不是材质开关 ——
 	 * 材质那一层关不掉阴影 pass 的 draw。
+	 *
+	 * ⚠️ 光这一条**不足以**让影子出现：地被走实例路（`UCSGpuInstancedMeshComponent`），它的
+	 * 顶点工厂故意不声明 primitive-id 流 ⇒ `SupportsGPUScene()` 为假 ⇒ 进不了 VSM，只能进
+	 * 常规 CSM 级联。而方向光开 VSM 时那份回退级联默认是**不创建**的 ——
+	 * 必须同时有 `r.Shadow.Virtual.ForceOnlyVirtualShadowMaps=0`（本工程
+	 * `Config/DefaultEngine.ini` 已设，那里写了完整的机制与出处）。少了它的症状是
+	 * 「开关打开、组件 CastShadow 为真、一个影子像素都没有」，没有任何报错。
+	 *
+	 * ⚠️ 改默认值只影响**新建**的物种行（以及 CDO）。`Flowers` 是 TArray，已存盘的关卡里
+	 * 整个数组都是序列化过的 ⇒ 老关卡里的花仍然带着当年存下的 `false`，要在 details 面板里
+	 * 手动勾一次。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Shape")
-	bool bCastShadow = false;
+	bool bCastShadow = true;
 
 	/**
 	 * 物种盐。⚠️ **两个物种撞盐会让它们逐格完全相关** —— 每一朵花的位置上必定也有一株草，
@@ -273,6 +287,15 @@ class COMPUTESHADERGENERATOR_API ACSGroundActor : public ACSTinyGlade
 	GENERATED_BODY()
 
 public:
+	/**
+	 * 只做一件事：把 `Grass.bCastShadow` 钉回 `false`。
+	 *
+	 * `FCSGroundCoverSpecies::bCastShadow` 的声明默认值是 `true`（花要投影），而草和花共用
+	 * 同一个结构体 ⇒ 草那一份必须在这里显式压回去。没有"逐成员默认值"这种东西，构造函数
+	 * 就是唯一的落点。理由与两者的密度差写在那个字段的注释里。
+	 */
+	ACSGroundActor();
+
 	/** Raised by StartVertexColorPaint(); the editor module answers it by activating the paint EdMode. */
 	static FCSGroundPaintEditorRequest OnGroundPaintEditorRequest;
 

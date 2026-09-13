@@ -96,10 +96,9 @@ UCSMeshRenderComponent::UCSMeshRenderComponent()
 	SetUsingAbsoluteRotation(true);
 	SetUsingAbsoluteScale(true);
 
-	// 2026-08-30 实测（出图对照）：房体 / 地面 / 柱子这条路与实例化那条**结论完全一样** ——
-	// CSM（r.Shadow.Virtual.Enable 0）下投影正常、自阴影与屋檐投墙都对；VSM（项目级设置 =1）
-	// 下一点影子都没有。两条路都进不了 VSM，但**卡在两道不同的关卡上**（2026-09-07 读源码定位，
-	// 此前把两条都归因于"进不了实例剔除表"，那对本条路是错的）：
+	// **本条路（房体 / 地面 / 柱子）的阴影走 VSM**，与实例化那条正好相反 —— 两条路卡在
+	// 两道不同的关卡上（2026-09-07 读源码定位，此前把两条都归因于"进不了实例剔除表"，
+	// 那对本条路是错的），各自的解法也不同：
 	//   · 这条路用引擎自己的 FLocalVertexFactory，它声明了 SupportsPrimitiveIdStream ⇒ 顺利
 	//     通过 VSM 的准入（ShadowDepthRendering.cpp:2145），实例也确实进了 GPU-Scene ——
 	//     阴影视图有自己的 DynamicPrimitiveCollector（ShadowSetup.cpp:2806），
@@ -107,9 +106,15 @@ UCSMeshRenderComponent::UCSMeshRenderComponent()
 	//     真正拦住它的是 MeshPassProcessor.cpp:1304 的 bDoOverrideArgs：VSM 下 args 被换成
 	//     实例剔除按 NumPrimitives*3 现造的那份（InstanceCullingContext.cpp:256），而带
 	//     IndirectArgsBuffer 的 batch 必须把 NumPrimitives 填 0 ⇒ 索引数 0 ⇒ 画 0 个三角形。
-	//     **已修**：阴影视图改发直接绘制，计数走 FCSMeshResident::GetDrawArgs 的 CPU 副本。
-	//   · 实例化那条（UCSGpuInstancedMeshComponent）不声明该 flag，args 不被覆盖，
-	//     但因此连 VSM 的准入都过不去 —— 详见那边的注释。那条**未修**。
+	//     **已修（2026-09-07）**：阴影视图改发直接绘制，计数走 FCSMeshResident::GetDrawArgs
+	//     的 CPU 副本。
+	//   · 实例化那条（UCSGpuInstancedMeshComponent）不声明该 flag，args 不被覆盖，但因此连
+	//     VSM 的准入都过不去。那条**不修**，改走引擎自带的 CSM 回退级联
+	//     （`r.Shadow.Virtual.ForceOnlyVirtualShadowMaps=0`，见 Config/DefaultEngine.ini）——
+	//     级联的 MeshSelectionMask 被钉成 SM，正好只收它。详见那边的注释。
+	//
+	// ⚠️ 两条路的 selection mask 互斥（本条 SupportsGPUScene()=真 ⇒ 只进 VSM；那条为假 ⇒
+	//    只进级联），所以开着回退级联也不会有双重阴影。
 	//
 	// 留 true 而不是退回 false：CSM 下确凿正确，VSM 下在上述修复前一个影子像素都画不出来
 	// （改前/改后同机位逐像素比过）。

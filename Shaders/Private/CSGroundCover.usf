@@ -387,8 +387,18 @@ void ScatterGroundCoverCS(uint3 Id : SV_DispatchThreadID)
 	RWCoverInstances[Row + 0u] = float4(LocalX, 0.0f);   // .w 必须是 0：引擎拿它做选中/hitproxy
 	RWCoverInstances[Row + 1u] = float4(LocalY, 0.0f);
 	RWCoverInstances[Row + 2u] = float4(LocalZ, 0.0f);
-	// .w 是顶点工厂读的 PerInstanceRandom，材质拿它做逐株色变（TG 的草色也是逐叶的）。
+	// .w 是顶点工厂读的 PerInstanceRandom（LocalVertexFactory.ush 的 OriginBuffer 契约）。
 	// **种子同样必须是格身份**：用槽位的话每一笔落笔全场变色，而这一条不会有任何断言报红。
+	//
+	// ⚠️ 2026-09-12 核实：这个值**写了但没人读**。地被三个 MI（MI_TG_Grass / MI_TG_Flower /
+	//    MI_TG_Lavender）同一个主材质 `M_TG_Grass`，而它的表达式里只有
+	//    MaterialExpressionVertexColor 与 MaterialExpressionPerInstanceCustomData，
+	//    **没有 MaterialExpressionPerInstanceRandom**。而实例路的顶点色 RGB 是基础网格自带的
+	//    那一份、逐实例逐位相同（A 被 ClearPackedColorAlpha 清零）⇒ **每一株的颜色完全一样**。
+	//    此前这里写的"材质拿它做逐株色变"是想当然，不是实测。
+	//    要逐株色变就在 `M_TG_Grass` 里接上 `PerInstanceRandom + VertexColor.A`
+	//    （那条等式的两条路契约见 `CSGpuInstancedMeshComponent.h` 的通道字典），
+	//    烘焙路才不会跟着变。
 	RWCoverInstances[Row + 3u] = float4(Origin, CSCover_Hash01(CSCover_CellSeed(Cell, 41u)));
 
 	const float3 SphereCentre = Origin

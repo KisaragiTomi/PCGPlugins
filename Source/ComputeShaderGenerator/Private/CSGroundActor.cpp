@@ -77,6 +77,16 @@ FLinearColor CSGround_UnquantizeColor(const FColor& Stored)
 }
 }
 
+ACSGroundActor::ACSGroundActor()
+{
+	// 草与花共用 `FCSGroundCoverSpecies`，而那个结构体的 `bCastShadow` 声明默认值是 true
+	// （2026-09-12 裁决：花要有投影）。草满密度 50 株/m²，投影是这条路上最贵的一项，所以
+	// 草这一份在这里压回 false —— 逐成员默认值没有别的落点。完整理由见
+	// `FCSGroundCoverSpecies::bCastShadow` 的注释。
+	// ⚠️ 别把这一行换成"给 Flowers 塞一个默认元素"：空数组正是"没有花"的表达方式。
+	Grass.bCastShadow = false;
+}
+
 void ACSGroundActor::StartVertexColorPaint()
 {
 	OnGroundPaintEditorRequest.Broadcast(this);

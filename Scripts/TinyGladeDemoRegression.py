@@ -318,6 +318,12 @@ def demo_house_ground():
     # ⚠️ 同瓦：**`get_roof_finial_undrawable_reason()` 那条才是重点。** 尖顶走的是普通
     # `UStaticMeshComponent`，材质槽空掉时组件照画（退回引擎默认表面材质）⇒ 画面上一根灰柱子，
     # 而"根数 == 2"照绿。资产没接上时同样一个断言都不会红（"留空 = 不长"）。
+    # Finials are optional for the 2026-09-12 terracotta reference style.
+    # Explicitly install the fixture, then restore the user's original reference.
+    original_finial_mesh = road_house.get_editor_property("RoofFinialMesh")
+    road_house.set_editor_property("RoofFinialMesh", unreal.load_asset(
+        "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/roof_spire"))
+    road_house.rebuild_house()
     finials = road_house.get_roof_finial_count()
     finial_why = str(road_house.get_roof_finial_undrawable_reason())
     check("the roof finials are actually drawable (mesh/registration/material slot)",
@@ -352,6 +358,9 @@ def demo_house_ground():
     road_house.rebuild_house()
     check("putting the mesh back stands them up again", road_house.get_roof_finial_count() == 2,
           "finials=%d" % road_house.get_roof_finial_count())
+
+    road_house.set_editor_property("RoofFinialMesh", original_finial_mesh)
+    road_house.rebuild_house()
 
     # ---- 「一块砖都没有」那条分支：角石上线后演示里不再自然可达，必须显式走一遍 ----
     #

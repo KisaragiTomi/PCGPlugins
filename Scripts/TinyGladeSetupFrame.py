@@ -6,6 +6,8 @@ TG 整个游戏只有一块砖网格（/PCGPlugins/HouseTest/TinyGladeAsset/Mesh
 尺寸全靠逐实例非均匀缩放（逆向报告 §1.4「Affine3Packed transform，非均匀缩放 = 砖尺寸」）。
 所以这里给的是"想要多大"，不是"选哪块"。
 """
+import runpy
+from pathlib import Path
 import unreal
 
 PKG = "/PCGPlugins/HouseTest"
@@ -22,19 +24,8 @@ unreal.log("FRAME brick mesh %s size=(%.1f, %.1f, %.1f)" % (brick.get_name(), si
 
 # ---- 砖材质。GPU 实例化那条 VF 必须勾 "Used with Instanced Static Meshes"，
 #      否则材质在实例路径上不编译，砖会整批画成默认棋盘格。----
-path = "%s/M_TinyGladeBrick" % PKG
-if unreal.EditorAssetLibrary.does_asset_exist(path):
-    unreal.EditorAssetLibrary.delete_asset(path)
-mat = TOOLS.create_asset("M_TinyGladeBrick", PKG, unreal.Material, unreal.MaterialFactoryNew())
-mat.set_editor_property("used_with_instanced_static_meshes", True)
-base = MEL.create_material_expression(mat, unreal.MaterialExpressionConstant3Vector, -350, 0)
-base.set_editor_property("constant", unreal.LinearColor(0.46, 0.42, 0.37, 1.0))
-MEL.connect_material_property(base, "", unreal.MaterialProperty.MP_BASE_COLOR)
-rough = MEL.create_material_expression(mat, unreal.MaterialExpressionConstant, -350, 120)
-rough.set_editor_property("r", 0.92)
-MEL.connect_material_property(rough, "", unreal.MaterialProperty.MP_ROUGHNESS)
-MEL.recompile_material(mat)
-unreal.EditorAssetLibrary.save_loaded_asset(mat)
+builder = Path(unreal.Paths.project_dir()) / 'Plugins/PCGPlugins/Scripts/TinyGladeMakeBrickMaterial.py'
+mat = runpy.run_path(str(builder))['build']()
 
 FRAME_PROPS = (
     ("FrameBrickMesh", brick),

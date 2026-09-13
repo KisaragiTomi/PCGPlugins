@@ -64,11 +64,10 @@ PILLAR_PROPS = (
     ("bPillarUseBricks", True),
     ("PillarBrickMesh", brick),
     ("PillarMaterial", mat),
-    # 砖的截面。比方盒时代的 30 稍粗一点 —— 交错砌法里奇数层要收窄到 72%，
-    # 太细的话收窄那一层看着像断了。
+    # 连续方形承压截面，逐层旋转同一块倒角石；不再交替缩窄到 72%。
     ("PillarSize", 34.0),
     ("PillarCourseHeight", 20.0),
-    ("PillarYawJitter", 0.14),
+    ("PillarYawJitter", 0.035),
     ("PillarBracketCourses", 3),
     ("PillarBracketOverhang", 0.55),
 )

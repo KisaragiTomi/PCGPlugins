@@ -1105,8 +1105,7 @@ D7 的两半至此都合上：**形状相交**那半（接缝砖）2026-08-31 �
   跟着动。那是另一件事，别和角石混在一轮里。
 - **墙裙（A8）** 与**垛口**：`AppendColumn` 已经是它们现成的发射器（各自加一个家族盐即可），
   但两者的驱动曲线不是竖直线段（墙裙沿墙脚、垛口沿墙顶），要先决定"沿边铺"那条路怎么走。
-- **角石的砖没有交替进退**（TG 的 quoin 是一进一出的）。当前是一根等截面柱。
-  要做的话是 kernel 里按砖序号奇偶给 `BlockScale.x` 加一个偏移，不动排布。
+- **角石的交错包角**：2026-09-12 已按 A7 的参考图与二进制复核修正。奇偶控制相邻墙的方向，随机数改变长边；旧版等截面斜柱和仅改 `BlockScale.x` 的建议不再适用。
 
 #### 验收门（本轮）
 
@@ -1256,6 +1255,41 @@ if (!bChanged) return;   // 加载后重导出结果与序列化值一致时不�
 
 ### 四坡屋顶 + 屋面瓦（2026-08-31，另一会话的重构 + 本轮资产收尾）
 
+#### 房顶参考图与当前引用（2026-09-12）
+
+![用户提供的 TG 橙陶瓦屋顶：错缝搭接、瓦边厚度与连续盖脊](img/tiny-glade-ref-roof-tiles.png)
+
+本图为用户原图，未裁剪、未调色。当前示例采用图中的陶瓦屋顶：瓦片逐排压叠，屋脊连续收口，没有自动立起的金属尖顶。
+
+反编译依据见[屋顶 shader 摘录及 SHA-256](evidence/roof-shader-20260912.txt)与[原始 roof_tile 顶点](evidence/roof_tile-source.json)：
+
+- `roof_tile` 只有位置属性；`roof_tile_lod1`、`roof_tile_backface` 分别属于简化/背面通道，不能作为三种随机瓦型。旧的 `MI_roof_tile_normal` 引用没有实现屋顶着色。
+- VS 先按 `scale_t` 和顶点符号调整尺寸，再抬起 `Vertex_Position.y > 0.1` 的瓦端。原始 X 是瓦宽，Y 是瓦长，Z 是瓦面法线。旧的包围盒长短猜测把宽轴当成了顺坡轴。
+- VS 用原始 `Position.xy * (0.85, 0.92) + 0.5` 生成正面坐标，再乘 `0.2`、加种子选出的格子偏移；这是 **5×5 图集**，不是导入器补出的 UV 展开。PS 只给 `C9 > 0.999` 的顶面施加 `roof_tile_normal`。
+- PS 分开采样 `roof_colors`、`roof_tile_normal`、`roof_tile_damage`。颜色使用世界米制坐标 `*0.1` 和逐实例偏移，两个方向按亮度与面法线混合；法线图不参与 Base Color。
+
+当前 `RoofTileMesh` 引用 **`/PCGPlugins/HouseTest/SM_TinyGladeRoofTile`**，由原版 20 顶点/36 三角形生成，保留源拓扑、倒角与宽窄变化；原始提取资产不改写。新资产烘焙原版符号缩放和瓦端抬升，再显式整理为 X 沿排、Y 顺坡、Z 朝外，并烘焙图集坐标与顶面标记。采用 3 cm 实体厚度、3 cm 瓦端抬升，包围盒厚度仍为 6 cm，适配当前 16.9 cm 排距；这些厘米数是本项目的适配值，非原版统一尺寸。
+
+`RoofMaterial` 统一为 **`M_TinyGladeRoof`**：`roof_colors_layer00` 提供陶瓦底色，另采样法线/破损图集；保留受光、粗糙表面和稳定逐瓦色差。亮度、风化量和随机哈希属于 UE 适配，未完整复刻 TG 的主题、积雪、噪声和专用光照。
+
+盖瓦的顺坡轴沿脊搭接，宽度跨脊，中心抬一个瓦片包围盒厚度，避免坡面瓦穿出形成小三角。此收口排布是依据参考图的 UE 实现；“没有 roof_ridge 文件，所以原版一定用同样方式盖脊”的旧推断不成立。示例 BP 与两个实例的 `RoofFinialMesh` 清空，尖顶功能及原资产仍可单独使用。
+
+重建入口：[TinyGladeSetupRoofTiles.py](../../Scripts/TinyGladeSetupRoofTiles.py)，内部调用[瓦片生成](../../Scripts/TinyGladeMakeRoofMesh.py)与[屋顶材质](../../Scripts/TinyGladeMakeRoofMaterial.py)。墙材质重建也复用屋顶材质入口，不再覆写纯色。入口不切换关卡；截图验收后保存当前地图。
+
+
+
+同机位实测（沿用原关卡光照、相机和 Lumen）：
+
+![修改前：灰褐纯色、坡面瓦穿出盖瓦、自动尖顶](img/roof-reference-20260912-before.png)
+
+![修改后：陶瓦颜色与逐瓦变化、正确压叠、盖瓦遮住坡面交汇](img/roof-reference-20260912-after.png)
+
+![第二栋房屋：同一材质与瓦片在另一尺寸屋顶上的结果](img/roof-reference-20260912-small-house.png)
+
+验证：Development Editor 模块编译通过；8 项 `House.Tile*` 测试通过，其中 `TileRidgeCaps` 增加了盖瓦长轴沿脊和净空检查。编辑器冷启动加载新模块后完成截图验收；两栋分别 1454 / 827 片，执行面检查为空错误，尖顶均为 0，关卡仍为原来的 24 个 Actor。网格正面剔除与三张材质输入已经通过实际渲染检查。
+
+以下保留 2026-08-31 的实现记录；引用与当前样式以上方 2026-09-12 的修正为准。
+
 **这一节记的不是我做的那部分**：`FCSRoofDesc` 的重构与 `CSHouseTile` 模块由另一个会话完成，
 我接手的是它差的最后一步（资产接线）与回归覆盖。
 
@@ -1285,7 +1319,7 @@ if (!bChanged) return;   // 加载后重导出结果与序列化值一致时不�
 
 新增 [`Scripts/TinyGladeSetupRoofTiles.py`](../../Scripts/TinyGladeSetupRoofTiles.py)：
 
-- 接 `/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/roof_tile` + `MI_roof_tile_normal`；
+- 历史接线为 `roof_tile` + `MI_roof_tile_normal`；2026-09-12 已替换为上方的烘焙瓦片和专用屋顶材质。
 - **CDO 与关卡实例都写**（CDO 不传播到已存在实例）；
 - 自带执行面判据：母材质必须勾 `bUsedWithInstancedStaticMeshes`（没勾会**静默换默认材质**，
   症状与"没绑材质"逐像素相同）且不许是 `MSM_Unlit`（裁决六）。实测 `M_TG_Texture` 两条都满足。
@@ -1337,7 +1371,7 @@ if (!bChanged) return;   // 加载后重导出结果与序列化值一致时不�
 四个坡面的瓦在角斜脊 / 屋脊上是**对切**的，缝一眼看得见。盖瓦骑在缝上，法线取**两坡法线的
 角平分**，沿五条脊线（4 条角斜脊 + 1 条屋脊）再铺一遍同一块 `roof_tile`。
 
-**TG 侧没有专门的脊瓦网格**（`assets/meshes` 138 个里查无 `roof_ridge`），所以这里不引入新资产。
+**历史推断已于 2026-09-12 修正**：查无 `roof_ridge` 文件名不足以证明原版脊瓦的生成方式。现行资产与收口适配见上方参考图段落。
 角平分是闭式的：相邻两坡的外法线是 `(sx·sinP, 0, cosP)` 与 `(0, sy·sinP, cosP)`，和归一化即得 ——
 不必去查"这个角挨着哪两个 Side"，也就写不出一张与 Side 编号耦合的表。正方形时 `RidgeHalf == 0`，
 屋脊那条自然跳过，仍与 `RidgeLength()` 的 `max(…, 0)` 同源。
@@ -3227,6 +3261,43 @@ TG 的 `flags&4` 分支给砖沿墙 / 穿墙 ×1.045、竖直 ×0.95（§1.3）�
 <a id="a7"></a>
 #### A7 —— 转角护角砖（D7 的"墙自身转角"部分，**不依赖任何接缝设施**）
 
+##### 2026-09-12：按参考图修正包角
+
+![TG 参考：浅凸于灰泥墙面的交错包角石](img/tiny-glade-ref-corner-quoin.png)
+
+图片由用户提供，原样保存。可见的角石沿两面墙展开，外棱连续、表面浅凸于灰泥；相邻层交换长短边，砖长和层高有少量变化。旧模型把砖心放在外角、整块砖朝向角平分线，只缩小位移仍会留下斜着突出的砖柱。
+
+**重新反汇编后的订正。** 本次直接读取 `tiny-glade.exe` 的 `add_wall_corners`（`0x141215540–0x1412172A6`），得到以下证据：
+
+| 指令位置 | 计算或数据流 | 对应含义 |
+| --- | --- | --- |
+| `0x141215E72–0x141215E8E` | `0.92 + 0.16 × (2r − 1)`，随后送入矩形构造的宽度参数 | 随机改变长边，不能解释成整块砖的对角线位移 |
+| `0x141215DD6`、`0x141215EBB`、`0x141215F0E` | 从 `[rbp+0x190]` 读取层号，递增保存，再 `test sil,1` | 这里确实检查层号奇偶；旧代码“所有 test 都是 Rust bool”的注释有误 |
+| `0x141216973–0x1412169A0` | 同一个层号的奇偶分支，选择之前算出的两条相邻边方向 | 长边逐层切换墙面方向 |
+| `0x141215F26–0x141215F38`、`0x141216BB3` | 半宽减 `0.28 + 0.0385`，另一水平轴厚度 `0.637` | 宽度变化同时补偿中心；`0.637/2 = 0.28+0.0385`，两面外棱保持锚定 |
+| `0x141215C41`、`0x141215C93–0x141215CBD` | 标称高度 `0.69`；`random_splits` 输入 `0.21 / 高度` | 随机分层，端点保持固定 |
+
+[保留的反汇编片段及原始二进制 SHA-256](evidence/quoin-native-20260912.asm)可用于复核。上表是本次二进制复核结论。矩形外角锚定到本项目 footprint，以及按现有层高缩放，是 UE 侧的适配。TG 函数还存在屋顶/墙型条件下的 `0.76`、`0.56` 宽度分支；本次没有把尚未对齐的墙型枚举擅自映射到本项目。
+
+**当前实现。** 共用 `brick` 网格、`AppendColumn`、`SolveRun` 和 GPU 实例组件。`CSHouseQuoinLayout.ush` 让 C++ 回归与实际 shader 共用包角变换；层号采用砖路内序号，前方增加门框槽位不会翻转交错方向。宽度随机只移动埋入墙内的中心，外侧两面的位置保持不变。
+
+源尺寸按 `FrameBrickLength / 69` 缩放到本项目。当前 `FrameBrickLength=26 cm` 时，短边约 `24.0 cm`，长边 `34.67 ± 6.03 cm`，两面各浅凸约 `1.45 cm`。`QuoinJitter=16`、`QuoinSplitJitter=21` 保留为 TG 基准厘米，实际分别换算为 `6.03 cm`、`7.91 cm`；`QuoinInset` 则仍是 UE 世界厘米。`Inset=0` 表示正常包角，正值进一步压入墙面。实例层高沿用现有砖路和长度膨胀系数。
+
+角石分支使用砖路记录原有的空格存比例；无剪切的竖直角石在 `R6.yz` 存基础网格 X/Z 尺寸倒数，普通门框仍在这里存端头剪切。总 stride 保持 8 个 float4，逐实例容量与洞口剔除高度保持原契约。宽度随机、分层随机和种子均纳入重新散布的哈希。
+
+**同机位渲染核对（1600 × 1000）。** 下面两图分别是原来的斜向砖柱与修正后的贴墙包角。两栋房子的转角、门框和底部支撑已分别检查。
+
+| 修改前 | 修改后 |
+| --- | --- |
+| ![斜向砖柱](img/quoin-reference-20260912-before.png) | ![沿两面墙交错的包角石](img/quoin-reference-20260912-after.png) |
+
+![修正后的房屋整体](img/quoin-reference-20260912-house.png)
+
+验收：按 Rider 工作区配置推断使用 `UETest574Editor / Win64 / Development`，常规模块编译通过；重新启动编辑器后，关卡 24 个 actor 全部恢复、两栋房子的角石数分别为 72 / 68。角石覆盖、比例、稳定随机数、容量截断、门框重叠、拱间墩与支撑接触共 9 项回归全部通过。以上修正后截图来自常规编译后的重新启动，并已核对文档中的图文显示。
+
+下面保留 2026-08-31 的落地记录；几何朝向和随机含义以本次订正为准。
+
+
 > ✅ **已落地（2026-08-31）** —— `CSHouseQuoin.h`，见卷零「转角角石已落地」。落地时抓到并修掉了
 > 一个真缺陷（`Seed ^ (Index*K)` 在 `Index==0` 时是恒等映射）。
 >
@@ -4816,7 +4887,7 @@ per-instance 布局声明，两份必须放在同一个头文件里，否则「�
 | `M_TinyGladeReveal` | `BLEND_Opaque` | `MSM_DefaultLit` | — | 常数 `(0.34,0.30,0.26)` + Roughness `0.9` |
 | `M_TinyGladeRoof` | `BLEND_Opaque` | `MSM_DefaultLit` | — | 常数 `(0.30,0.16,0.13)` + Roughness `0.9` |
 | `M_TinyGladeBrick` | `BLEND_Opaque` | `MSM_DefaultLit` | **`bUsedWithInstancedStaticMeshes = true`**（全仓唯一） | 常数 `(0.46,0.42,0.37)` + Roughness `0.92` |
-| `M_TinyGladeGround` | `BLEND_Opaque` | `MSM_DefaultLit` | — | UV0（世界平铺，`UVWorldPeriod` 默认 500 cm）采 `grass_patch_summer` / `dirtpath_1`，按 **VertexColor.R = 道路权重** `Lerp`；Roughness `0.95` |
+| `M_TinyGladeGround` | `BLEND_Opaque` | `MSM_DefaultLit` | — | 2026-09-12：`dirtpath_grass` / `dirtpath_2` / `dirtpath_1` 三图按道路 R 和 `dirtpath_heightmap` 高度竞争混合；Roughness `0.95`。采样倍率、反编译与参考图见 [CSGroundMaterial.md](CSGroundMaterial.md) |
 
 **五个材质全部 `HasPerInstanceCustomData = False`**（AssetRegistry tag 实测）。
 另有一个材质实例 `MI_TinyGladeWall`（父级即 `M_TinyGladeWall`），墙面全部贴图与手感参数的调节面在它上面。

@@ -1,0 +1,210 @@
+_nani_instanced_roof.raster.hlsl_b903e43ffb3da915.vs_main.glsl
+SHA256 6f27137d495d22ad4c16c8445c4efcca5318d0cec272380516c133c4771925c4
+
+146:     vec2 _315 = unpackHalf2x16((instanced_data._m0[instance_indirection_buffer._m0[uint(gl_InstanceIndex)]].scale_t.y >> 16u) & 65535u);
+147:     float _316 = _315.x;
+148:     bool _317 = instanced_data._m0[instance_indirection_buffer._m0[uint(gl_InstanceIndex)]].is_main_roof_body != 0;
+149:     vec3 _322 = (vec3(unpackHalf2x16(instanced_data._m0[instance_indirection_buffer._m0[uint(gl_InstanceIndex)]].scale_t.x & 65535u).x, unpackHalf2x16((instanced_data._m0[instance_indirection_buffer._m0[uint(gl_InstanceIndex)]].scale_t.x >> 16u) & 65535u).x, unpackHalf2x16(instanced_data._m0[instance_indirection_buffer._m0[uint(gl_InstanceIndex)]].scale_t.y & 65535u).x) * smoothstep(_316 * 0.800000011920928955078125, _316, pow(instanced_data._m0[instance_indirection_buffer._m0[uint(gl_InstanceIndex)]].animation_t, 0.800000011920928955078125))) * vec3(0.505970001220703125, 0.5, 0.5);
+150:     float _324 = _322.x * 0.949999988079071044921875;
+151:     vec3 _325 = _322;
+152:     _325.x = _324;
+153:     vec3 _326 = _325 * vec3(3.58920383453369140625, 3.70370388031005859375, 3.70370388031005859375);
+154:     float _337 = spvNMax(spvNMin(spvNMax(_324, spvNMax(_322.y, _322.z)), spvNMin(_326.x, spvNMin(_326.y, _326.z))), 9.9999997473787516355514526367188e-06);
+155:     vec3 _338 = in_var_Vertex_Position * vec3(1.976401805877685546875, 2.0, 2.0);
+156:     vec3 _339 = _338 * _337;
+157:     vec2 _349 = unpackHalf2x16((instanced_data._m0[instance_indirection_buffer._m0[uint(gl_InstanceIndex)]].velocity_rotation >> 16u) & 65535u);
+158:     float _350 = _349.x;
+159:     vec3 _351 = normalize(vec3(1.0, 0.0, 0.0));
+160:     float _352 = sin(_350);
+161:     float _353 = cos(_350);
+162:     float _354 = 1.0 - _353;
+163:     float _356 = _354 * _351.x;
+164:     float _360 = _356 * _351.y;
+165:     float _362 = _351.z * _352;
+166:     float _364 = _354 * _351.z;
+167:     float _365 = _364 * _351.x;
+168:     float _366 = _351.y * _352;
+169:     float _369 = _354 * _351.y;
+170:     float _372 = _369 * _351.z;
+171:     float _373 = _351.x * _352;
+172:     vec3 _384 = (_339 - ((vec3(_337) - _325) * vec3(mix(ivec3(-1), ivec3(1), greaterThanEqual(_339, vec3(0.0)))))) * transpose(mat3(vec3((_356 * _351.x) + _353, _360 - _362, _365 + _366), vec3(_360 + _362, (_369 * _351.y) + _353, _372 - _373), vec3(_365 - _366, _372 + _373, (_364 * _351.z) + _353)));
+173:     vec3 _422;
+174:     if (_317)
+175:     {
+176:         uint _389 = (uint(instanced_data._m0[instance_indirection_buffer._m0[uint(gl_InstanceIndex)]].seed) * 1664525u) + instanced_data._m0[instance_indirection_buffer._m0[uint(gl_InstanceIndex)]].roof_id;
+177:         uint _391 = _389 + (_389 << 10u);
+178:         uint _393 = _391 ^ (_391 >> 6u);
+179:         uint _395 = _393 + (_393 << 3u);
+180:         uint _397 = _395 ^ (_395 >> 11u);
+181:         float _405 = ((uintBitsToFloat(((_397 + (_397 << 15u)) & 8388607u) | 1065353216u) - 1.0) > 0.89999997615814208984375) ? 0.0199999995529651641845703125 : 0.0599999986588954925537109375;
+182:         vec3 _421;
+183:         if (in_var_Vertex_Position.y > 0.100000001490116119384765625)
+184:         {
+185:             vec3 _420;
+186:             if (instanced_data._m0[instance_indirection_buffer._m0[uint(gl_InstanceIndex)]].is_circle != 0)
+187:             {
+188:                 vec3 _419 = _384;
+189:                 _419.z = _384.z - _405;
+190:                 _420 = _419;
+191:             }
+192:             else
+193:             {
+194:                 vec3 _416 = _384;
+195:                 _416.z = _384.z + _405;
+196:                 _420 = _416;
+197:             }
+198:             _421 = _420;
+199:         }
+200:         else
+201:         {
+202:             _421 = _384;
+203:         }
+204:         _422 = _421;
+205:     }
+206:     else
+207:     {
+208:         _422 = _384;
+209:     }
+
+647:     vec3 _1498 = ((_1495 * 34.0) + vec3(1.0)) * _1495;
+648:     vec3 _1505 = ((_1498 - vec3(289.0) * trunc(_1498 / vec3(289.0))) + vec3(_1490.x)) + vec3(0.0, _1484.x, 1.0);
+649:     vec3 _1508 = ((_1505 * 34.0) + vec3(1.0)) * _1505;
+650:     vec2 _1511 = _1488.xy;
+651:     vec2 _1513 = _1486.zw;
+652:     vec3 _1517 = spvNMax(vec3(0.5) - vec3(dot(_1479, _1479), dot(_1511, _1511), dot(_1513, _1513)), vec3(0.0));
+653:     vec3 _1518 = _1517 * _1517;
+654:     vec3 _1522 = fract((_1508 - vec3(289.0) * trunc(_1508 / vec3(289.0))) * vec3(0.024390242993831634521484375)) * 2.0;
+655:     vec3 _1523 = _1522 - vec3(1.0);
+656:     vec3 _1525 = abs(_1523) - vec3(0.5);
+657:     vec3 _1528 = _1523 - floor(_1522 + vec3(-0.5));
+658:     vec3 _1540;
+659:     _1540.x = (_1528.x * _1480) + (_1525.x * _1481);
+660:     vec2 _1547 = (_1528.yz * _1489.xz) + (_1525.yz * _1489.yw);
+661:     _295.w = _294 + dot(_437 - _1259, _295.xyz);
+662:     uint _1557 = uint(instanced_data._m0[instance_indirection_buffer._m0[uint(gl_InstanceIndex)]].seed) * 1664525u;
+663:     uint _1559 = _1557 + (_1557 << 10u);
+664:     uint _1561 = _1559 ^ (_1559 >> 6u);
+665:     uint _1563 = _1561 + (_1561 << 3u);
+666:     uint _1565 = _1563 ^ (_1563 >> 11u);
+667:     bool _1568 = _1430 ? _1430 : true;
+668:     uint _1569 = _1430 ? _1431 : 8388607u;
+669:     uint _1570 = _1430 ? _1432 : 1065353216u;
+670:     uint _1578 = _1557 + 34568u;
+671:     uint _1580 = _1578 + (_1578 << 10u);
+672:     uint _1582 = _1580 ^ (_1580 >> 6u);
+673:     uint _1584 = _1582 + (_1582 << 3u);
+674:     uint _1586 = _1584 ^ (_1584 >> 11u);
+675:     vec2 _1602 = vec2(roundEven((uintBitsToFloat(((_1565 + (_1565 << 15u)) & _1569) | _1570) - 1.0) * 5.0) * 0.20000000298023223876953125, roundEven((uintBitsToFloat(((_1586 + (_1586 << 15u)) & (_1568 ? _1569 : 8388607u)) | (_1568 ? _1570 : 1065353216u)) - 1.0) * 5.0) * 0.20000000298023223876953125);
+676:     float _1616;
+677:     if (!_317)
+678:     {
+679:         _1616 = clamp(_438 * 0.0500000007450580596923828125, 0.0, 1.0) * 0.699999988079071044921875;
+680:     }
+681:     else
+682:     {
+683:         _1616 = _316;
+684:     }
+685:     gl_Position = vec4(_1259, 1.0) * frame_constants_storage_buffer._m0[0u].view_constants[_Globals.current_view_index].world_to_sample;
+686:     out_var_C2 = _1259;
+687:     out_var_C3 = pow(fract((((1.0 - _1444) * (((uintBitsToFloat(((_1314 ^ (_1314 >> 18u)) & _1318) | _1319) - 1.0) * _1442) + ((uintBitsToFloat(((_1352 ^ (_1352 >> 18u)) & _1356) | _1357) - 1.0) * _1441))) + (((uintBitsToFloat(((_1390 ^ (_1390 >> 18u)) & _1394) | _1395) - 1.0) * _1442) * _1444)) + (((uintBitsToFloat(((_1427 ^ (_1427 >> 18u)) & _1431) | _1432) - 1.0) * _1441) * _1444)), 1.5);
+688:     out_var_C4 = dot((_1518 * _1518) * (vec3(1.792842864990234375) - (((_1528 * _1528) + (_1525 * _1525)) * 0.8537347316741943359375)), vec3(_1540.x, _1547.x, _1547.y)) * 32.5;
+689:     out_var_C5 = _1616;
+690:     out_var_C6 = (((in_var_Vertex_Position.xy * vec2(0.85000002384185791015625, 0.920000016689300537109375)) + vec2(0.5)) * 0.20000000298023223876953125) + _1602;
+691:     out_var_C7 = _295;
+692:     out_var_C8 = instance_indirection_buffer._m0[uint(gl_InstanceIndex)];
+693:     out_var_C9 = _338.z;
+694:     out_var_C10 = (((in_var_Vertex_Position.yz * vec2(0.800000011920928955078125, 0.89999997615814208984375)) + vec2(0.5)) * 0.20000000298023223876953125) + _1602;
+695: }
+696: 
+
+_nani_instanced_roof.raster.hlsl_b903e43ffb3da915.ps_main.glsl
+SHA256 42ba88d05a190565d2ede722bb4049f6e70ee07ac56aa0262a0cfa89c867d49f
+
+120: 
+121: layout(set = 0, binding = 1) uniform sampler sampler_llr;
+122: layout(set = 0, binding = 16) uniform texture2DArray roof_colors;
+123: layout(set = 0, binding = 19) uniform texture2D roof_tile_normal;
+124: layout(set = 0, binding = 20) uniform texture2D roof_tile_damage;
+125: 
+
+385:     bool _429;
+386:     if (in_var_C9 > (-0.949999988079071044921875))
+387:     {
+388:         _429 = in_var_C9 < 0.89999997615814208984375;
+389:     }
+390:     else
+391:     {
+392:         _429 = false;
+393:     }
+394:     vec4 _436 = texture(sampler2D(roof_tile_damage, sampler_llr), mix(in_var_C6, in_var_C10, bvec2(_429)), frame_constants_storage_buffer._m0[0u].global_mip_bias);
+395:     float _438 = 1.0 - _436.x;
+396:     float _439 = _438 * in_var_C3;
+397:     vec3 _444 = in_var_C2 * 0.100000001490116119384765625;
+398:     bool _445 = _439 > 0.00999999977648258209228515625;
+399:     vec3 _466;
+400:     if (_445)
+401:     {
+402:         uint _449 = uint(instanced_data._m0[in_var_C8].seed ^ 2834);
+403:         uint _451 = _449 + (_449 << 10u);
+404:         uint _453 = _451 ^ (_451 >> 6u);
+405:         uint _455 = _453 + (_453 << 3u);
+406:         uint _457 = _455 ^ (_455 >> 11u);
+407:         _466 = _444 + vec3(uintBitsToFloat(((_457 + (_457 << 15u)) & 8388607u) | 1065353216u) - 1.0);
+408:     }
+409:     else
+410:     {
+411:         _466 = _444;
+412:     }
+413:     bool _469 = _445 ? true : false;
+414:     uint _471 = uint(instanced_data._m0[in_var_C8].seed ^ 34534);
+415:     uint _473 = _471 + (_471 << 10u);
+416:     uint _475 = _473 ^ (_473 >> 6u);
+417:     uint _477 = _475 + (_475 << 3u);
+418:     uint _479 = _477 ^ (_477 >> 11u);
+419:     bool _482 = _469 ? _469 : true;
+420:     uint _483 = _469 ? (_445 ? 8388607u : _177) : 8388607u;
+421:     uint _484 = _469 ? (_445 ? 1065353216u : _177) : 1065353216u;
+422:     vec3 _513;
+423:     if ((uintBitsToFloat(((_479 + (_479 << 15u)) & _483) | _484) - 1.0) < 0.5)
+424:     {
+425:         uint _493 = uint(instanced_data._m0[in_var_C8].seed ^ 234);
+426:         uint _495 = _493 + (_493 << 10u);
+427:         uint _497 = _495 ^ (_495 >> 6u);
+428:         uint _499 = _497 + (_497 << 3u);
+429:         uint _501 = _499 ^ (_499 >> 11u);
+430:         _513 = _466 + vec3((uintBitsToFloat(((_501 + (_501 << 15u)) & (_482 ? _483 : 8388607u)) | (_482 ? _484 : 1065353216u)) - 1.0) * 0.4000000059604644775390625);
+431:     }
+432:     else
+433:     {
+434:         _513 = _466;
+435:     }
+436:     float _514 = float(roof_color_ids._m0[instanced_data._m0[in_var_C8].roof_id]);
+437:     vec3 _520 = texture(sampler2DArray(roof_colors, sampler_llr), vec3(_513.zy, _514)).xyz;
+438:     vec3 _525 = texture(sampler2DArray(roof_colors, sampler_llr), vec3(_513.xy, _514)).xyz;
+439:     vec3 _527 = pow(abs(_224), vec3(1.0));
+440:     float _532 = dot(_520, vec3(0.2125999927520751953125, 0.715200006961822509765625, 0.072200000286102294921875)) + _527.x;
+441:     float _533 = dot(_525, vec3(0.2125999927520751953125, 0.715200006961822509765625, 0.072200000286102294921875)) + _527.z;
+442:     float _535 = spvNMax(_532, _533) - 0.20000000298023223876953125;
+443:     float _537 = spvNMax(_532 - _535, 0.0);
+444:     float _539 = spvNMax(_533 - _535, 0.0);
+445:     vec3 _546 = (((_520 * _537) + (_525 * _539)) / vec3(_537 + _539)) * 0.60000002384185791015625;
+446:     vec3 _556 = mix(mix(_546 * 0.89999997615814208984375, _546 * 1.2999999523162841796875, vec3(clamp(1.0 - (in_var_C3 * 3.0), 0.0, 1.0))), _377, vec3(clamp((clamp(_439 * 5.0, 0.0, 1.0) * _424) + in_var_C4, 0.0, 1.0)));
+
+467:     vec3 _611;
+468:     if (in_var_C9 > 0.999000012874603271484375)
+469:     {
+470:         vec2 _579 = dFdx(in_var_C6);
+471:         vec2 _581 = -dFdy(in_var_C6);
+472:         vec3 _582 = cross(_224, -dFdy(in_var_C2));
+473:         vec3 _583 = cross(dFdx(in_var_C2), _224);
+474:         float _584 = _579.x;
+475:         float _585 = _581.y;
+476:         float _587 = _579.y;
+477:         float _588 = _581.x;
+478:         float _591 = 1.0 / ((_584 * _585) - (_587 * _588));
+479:         _611 = normalize(((texture(sampler2D(roof_tile_normal, sampler_llr), in_var_C6, frame_constants_storage_buffer._m0[0u].global_mip_bias).xyz * 2.0) - vec3(1.0)) * transpose(mat3(((_582 * _584) + (_583 * _588)) * _591, ((_582 * _587) + (_583 * _585)) * _591, _224)));
+480:     }
+481:     else
+482:     {
+483:         _611 = _224;
+484:     }

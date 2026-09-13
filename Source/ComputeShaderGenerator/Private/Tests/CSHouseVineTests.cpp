@@ -433,12 +433,34 @@ bool FCSHouseVineRootEscapesHolesTest::RunTest(const FString& Parameters)
 
 	// 三个拱吃掉 450 / 600 cm 的墙脚（含外扩后自由墙脚只剩 78 / 600 cm ≈ 13%），
 	// 藤仍应保住**大部分**段数。阈值 0.45 的依据是两头都够远：
-	//   · 实测 0.663（本条自己 AddInfo 出来的数，重跑即可核对）；
+	//   · 实测 0.598（本条自己 AddInfo 出来的数，重跑即可核对）。
+	//     ⚠️ 2026-09-12 之前这个数是 **0.663**，掉下来是**有意的**：那一轮拿掉了洞缘上的
+	//     倾角镜像（一次折 131.8° 的"折断"式急拐），藤不再靠在 20 cm 窄道里来回弹跳攒段数。
+	//     下面那条"平均爬到多高"是配套的判据 —— 段数掉了 6.5 个百分点，而**高度不掉**
+	//     （288 vs 无洞对照 288），所以掉的是"皱"不是"覆盖"。改动与标定表见
+	//     `Docs/TinyGlade/VineObstacleTurning_20260912.md` 与 `FParams::MaxTurn`。
 	//   · 第一档的同一场景在解析上**不可能**超过 13% —— 它的规则是"藤脚在洞里就整根不长"，
 	//     而自由墙脚只有 13%。所以 0.45 既在实测之下有余量，又远在第一档之上，不会两头都松。
 	const float Kept = float(Holed.Branch.Num()) / FMath::Max(float(Clear.Branch.Num()), 1.0f);
 	AddInfo(FString::Printf(TEXT("三拱全开保留率 %.3f（%d / %d 段）"),
 		Kept, Holed.Branch.Num(), Clear.Branch.Num()));
+
+	// 段数不是覆盖面：**同时报藤数与爬到的高度**，否则"段数掉了"分不清是"藤少了"还是
+	// "藤不再皱了"。2026-09-12 那一轮正是后者 —— 拿掉洞缘上的镜像折角之后，原来靠在
+	// 20 cm 窄道里来回弹跳攒出来的段没了，藤改成近乎直着爬上去，段数掉而高度不掉。
+	auto TopZ = [](const CSHouseVine::FPlan& P)
+	{
+		float Sum = 0.0f;
+		for (const CSHouseVine::FStrand& S : P.Strands)
+		{
+			float Top = 0.0f;
+			for (const CSHouseVine::FStrandPoint& Pt : S.Points) Top = FMath::Max(Top, Pt.WallSZ.Y);
+			Sum += Top;
+		}
+		return P.Strands.Num() > 0 ? Sum / float(P.Strands.Num()) : 0.0f;
+	};
+	AddInfo(FString::Printf(TEXT("藤数 %d / %d，平均爬到 %.0f / %.0f cm（墙高 %.0f）"),
+		Holed.Strands.Num(), Clear.Strands.Num(), TopZ(Holed), TopZ(Clear), CSVineTest_Height));
 	TestTrue(FString::Printf(TEXT("三个落地拱之下藤不会成片秃掉（保留 %.1f%%）"), Kept * 100.0f), Kept > 0.45f);
 	return true;
 }
@@ -915,6 +937,175 @@ bool FCSHouseVineNoVineWhenAirborneTest::RunTest(const FString& Parameters)
 		TestTrue(TEXT("阈下照常长"), CountAt(Params.MaxGroundGap - 1.0f) > 0);
 		TestEqual(TEXT("阈上不长"), CountAt(Params.MaxGroundGap + 1.0f), 0);
 	}
+	return true;
+}
+
+
+// -----------------------------------------------------------------------------
+// (16) 相邻段夹角有上界 —— 2026-09-12 那个画面缺陷的可判定形式
+//
+// 缺陷：旧算法在障碍处**直接改写**倾角（墙角 `Angle = -Angle`、洞里再 `Angle = 0`），
+// 而倾角是相对竖直方向的**绝对**偏角 ⇒ 取反一次相邻段就折过 `2·|Angle|`，
+// `MaxLean` 默认 1.15 rad 时上界是 **131.8°**：藤在门洞边缘和墙角上"折断"式急拐。
+//
+// ⚠️ **这一条只能在折线上断言**，不能在 `FParams` 上断言：`MaxTurn` 存在不等于它被执行了，
+// 而"执行了"的唯一诚实证据就是逐段量出来的转折角。反过来，画面上这个缺陷极其显眼，
+// 却不会让任何既有断言报红 —— 洞照样避开了、随机照样稳、藤照样贴在墙上。
+//
+// 反编译对照：TG 的 `ivy_grower` 里一次镜像/归零都没有，方向来自
+// `IvyDirectionProposer::get_direction`（位置的连续函数，两层 FastNoise / 2.8 m 波长 /
+// 0.21 m 步长）。详见 `Docs/TinyGlade/VineObstacleTurning_20260912.md`。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseVineTurnRateTest,
+	"PCGPlugins.TinyGladeHouse.Vine.TurnRate",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseVineTurnRateTest::RunTest(const FString& Parameters)
+{
+	// 一面 12 m 长的墙 + 两个落地拱 + 一个矩形窗。**墙刻意取长**（默认单测那面只有 6 m）：
+	// 本条要量的是"相邻段"，而相邻段对数 ≈ 藤数 × 段数，短墙 + 密洞给不出统计量 ——
+	// 演示用的 6 m 墙上开三个 150 宽的拱，含外扩之后自由墙脚只剩 13%，藤大半在根上就没了，
+	// 只能量到三四十对，两条门槛都会变成噪声。洞之间留出宽走廊，藤才既长得起来又真撞得到洞。
+	TArray<CSHouseVine::FWallStrip> Strips;
+	{
+		CSHouseVine::FWallStrip Wide = CSVineTest_MakeStrip();
+		Wide.Length = 1200.0f;
+		Strips.Add(Wide);
+	}
+
+	TArray<FCSWallOpening> Openings;
+	Openings.Add(CSVineTest_MakeDoor(200.0f, 180.0f));
+	Openings.Add(CSVineTest_MakeDoor(600.0f, 180.0f));
+	{
+		// 矩形窗：洞缘是**竖直**的两条线，正是"带着大倾角撞上去、一段之内换不了横移方向"
+		// 那一档的最纯形态（拱的缘往上收，反而好绕）。
+		FCSWallOpening Window;
+		Window.Type = ECSOpeningType::Window;
+		Window.Shape = ECSOpeningShape::Rect;
+		Window.EdgeIndex = 0;
+		Window.CenterS = 900.0f;
+		Window.Width = 120.0f;
+		Window.Z0 = 90.0f;
+		Window.Z1 = 210.0f;
+		Openings.Add(Window);
+	}
+
+	// 逐段量转折角。**在 (S, Z) 里量**而不是在世界里：跨墙那一段横跨两个墙平面，
+	// 世界方向会额外转一个二面角（矩形房就是 90°），而 S 已经跳进隔壁墙的参数化里 ⇒
+	// 涉及跨墙段的那一对本来就没有可比的角。本条的墙只有一面，所以过滤器不会真的丢掉
+	// 任何一对，它是给将来四面墙的用例留的。
+	struct FTurnStats
+	{
+		int32 Pairs = 0;
+		int32 Over = 0;        // 折过 MaxTurn 的对数
+		int32 InsideHole = 0;  // 落在洞形里的点数
+		float Worst = 0.0f;    // 最大转折（弧度）
+	};
+	auto Measure = [&Strips, &Openings](const CSHouseVine::FParams& P, CSHouseVine::FPlan& OutPlan)
+	{
+		CSHouseVine::BuildPlan(Strips, Openings, P, OutPlan);
+		FTurnStats Stats;
+		for (const CSHouseVine::FStrand& Strand : OutPlan.Strands)
+		{
+			for (const CSHouseVine::FStrandPoint& Point : Strand.Points)
+			{
+				for (const FCSWallOpening& O : Openings)
+				{
+					if (CSVineTest_InArchProfile(O, FVector2D(Point.WallSZ.X, Point.WallSZ.Y)))
+					{
+						++Stats.InsideHole;
+						break;
+					}
+				}
+			}
+			for (int32 I = 0; I + 2 < Strand.Points.Num(); ++I)
+			{
+				const CSHouseVine::FStrandPoint& P0 = Strand.Points[I];
+				const CSHouseVine::FStrandPoint& P1 = Strand.Points[I + 1];
+				const CSHouseVine::FStrandPoint& P2 = Strand.Points[I + 2];
+				if (P0.EdgeIndex != P1.EdgeIndex || P1.EdgeIndex != P2.EdgeIndex) continue;
+
+				const FVector2f D0 = P1.WallSZ - P0.WallSZ;
+				const FVector2f D1 = P2.WallSZ - P1.WallSZ;
+				if (D0.IsNearlyZero() || D1.IsNearlyZero()) continue;
+
+				// 倾角 = 相对 +Z 的偏角，与 `BuildPlan` 里那个 `Angle` 同一口径。
+				const float Turn = FMath::Abs(FMath::UnwindRadians(
+					FMath::Atan2(D1.X, D1.Y) - FMath::Atan2(D0.X, D0.Y)));
+				++Stats.Pairs;
+				Stats.Worst = FMath::Max(Stats.Worst, Turn);
+				if (Turn > P.MaxTurn + 0.001f) ++Stats.Over;
+			}
+		}
+		return Stats;
+	};
+
+	const CSHouseVine::FParams Params = CSVineTest_MakeParams();
+	CSHouseVine::FPlan Plan;
+	const FTurnStats Base = Measure(Params, Plan);
+	AddInfo(FString::Printf(TEXT("%d 根藤、%d 对相邻段，最大转折 %.1f°（上界 %.1f°）"),
+		Plan.Strands.Num(), Base.Pairs, FMath::RadiansToDegrees(Base.Worst),
+		FMath::RadiansToDegrees(Params.MaxTurn)));
+
+	// 样本量：没有足够的相邻段对的话下面那条是空话。
+	TestTrue(FString::Printf(TEXT("量到了足够多的相邻段对（%d）"), Base.Pairs), Base.Pairs > 100);
+	TestEqual(FString::Printf(TEXT("没有一对相邻段折过 %.1f°（最大 %.1f°）"),
+		FMath::RadiansToDegrees(Params.MaxTurn), FMath::RadiansToDegrees(Base.Worst)), Base.Over, 0);
+
+	// 上界不许是靠"藤直接穿过障碍"换来的。
+	TestEqual(TEXT("折线上没有一个点落在洞形里"), Base.InsideHole, 0);
+
+	// ⓐ **反向门**：把预算放到 2 × MaxLean 以上（= 旧代码那句镜像的全部权限），同一场景
+	//    量出来的折角必须**超过**默认上界。破了它就说明这个场景本来就没有大转向的需求，
+	//    上面那条"没有一对折过 40.1°"是恒真的空话。
+	//    （旧代码在同型场景里量出 100.4°，见 `Docs/TinyGlade/VineObstacleTurning_20260912.md`。）
+	{
+		CSHouseVine::FParams Loose = CSVineTest_MakeParams();
+		Loose.MaxTurn = Loose.MaxLean * 2.0f + 0.1f;
+		CSHouseVine::FPlan LoosePlan;
+		const FTurnStats Wide = Measure(Loose, LoosePlan);
+		AddInfo(FString::Printf(TEXT("预算放开到 %.2f rad 时最大转折 %.1f°"),
+			Loose.MaxTurn, FMath::RadiansToDegrees(Wide.Worst)));
+		TestTrue(FString::Printf(TEXT("场景真的有大转向的需求（放开预算量到 %.1f° > %.1f°）"),
+			FMath::RadiansToDegrees(Wide.Worst), FMath::RadiansToDegrees(Params.MaxTurn)),
+			Wide.Worst > Params.MaxTurn);
+	}
+
+	// ⓑ `MaxTurn` 真的是那条闸：调小它，量出来的上界必须跟着下来。
+	//    这一条挡的是"上界其实来自别的地方（比如 Wander），MaxTurn 根本没接上"。
+	{
+		CSHouseVine::FParams Tight = CSVineTest_MakeParams();
+		Tight.MaxTurn = 0.15f;
+		CSHouseVine::FPlan TightPlan;
+		const FTurnStats Narrow = Measure(Tight, TightPlan);
+		AddInfo(FString::Printf(TEXT("MaxTurn = 0.15 时最大转折 %.1f°"),
+			FMath::RadiansToDegrees(Narrow.Worst)));
+		TestEqual(FString::Printf(TEXT("调小 MaxTurn 上界跟着下来（%.1f° ≤ 8.6°）"),
+			FMath::RadiansToDegrees(Narrow.Worst)), Narrow.Over, 0);
+	}
+
+	// ⓒ 同一份输入两次规划**逐位相同**。扫描本身不掷随机，跨墙掷也提到了扫描之外，
+	//    所以这一条是可判定的 —— 破了它就说明有什么东西开始依赖"扫到第几档"（自指）。
+	CSHouseVine::FPlan Again;
+	CSHouseVine::BuildPlan(Strips, Openings, Params, Again);
+	TestEqual(TEXT("两次规划的藤数相同"), Again.Strands.Num(), Plan.Strands.Num());
+	int32 PointDiff = 0;
+	for (int32 I = 0; I < FMath::Min(Again.Strands.Num(), Plan.Strands.Num()); ++I)
+	{
+		const CSHouseVine::FStrand& X = Again.Strands[I];
+		const CSHouseVine::FStrand& Y = Plan.Strands[I];
+		if (X.Points.Num() != Y.Points.Num() || X.RootKey != Y.RootKey) { ++PointDiff; continue; }
+		for (int32 J = 0; J < X.Points.Num(); ++J)
+		{
+			// 逐位 —— 刻意不给容差：规划是纯函数，同一份输入的浮点结果必须一个 bit 都不差。
+			if (X.Points[J].WallSZ.X != Y.Points[J].WallSZ.X
+				|| X.Points[J].WallSZ.Y != Y.Points[J].WallSZ.Y
+				|| X.Points[J].EdgeIndex != Y.Points[J].EdgeIndex) ++PointDiff;
+		}
+	}
+	TestEqual(TEXT("两次规划的折线逐位相同"), PointDiff, 0);
 	return true;
 }
 

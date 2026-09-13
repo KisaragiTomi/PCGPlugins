@@ -19,6 +19,47 @@ namespace
 
 constexpr int32 CSHouseVine_GroupSize = 64;
 
+/**
+ * 障碍处往两侧各扫几档倾角（候选数 = 2 × 这个数 + 1）。
+ *
+ * 4 的依据是两头都够：一段只有 26 cm，四分之一预算（≈ 8°）已经是 3.6 cm 级的横移差，
+ * 再密纯属白扫；而再疏（比如 2 档）会跳过"窄墩之间只有近竖直那一条缝能过去"的情形 ——
+ * 症状是两个洞之间那一条墙上的藤成片长不上去，而洞旁边的藤看着都正常。
+ */
+constexpr int32 CSHouseVine_TurnProbes = 4;
+
+/**
+ * 落点**往回收**的档位：先按整步扫一圈倾角，一档都不通就把这一步收短、再扫一圈。
+ *
+ * 为什么需要它：预算只有 `MaxTurn`（默认 0.55），而 `MaxLean` 是 1.15 ⇒ 一段之内**换不了
+ * 横移的方向**。藤贴着洞缘、还带着 1.0 rad 朝洞里的倾角时，九个候选全都仍然朝洞里走 ⇒
+ * 整根收尾。实测代价：三拱全开的保留率从 0.663 掉到 0.485（`VineRootEscapesHoles` 自己
+ * AddInfo 的数）。收短一步等于给倾角**多争一两段的时间**转过来，而**倾角一个字不改**
+ * ⇒ 转向上限逐位不受影响。
+ *
+ * 这一档是 TG 同构的：`intersect_ivy_growth_w_wall_segment` 撞上别的墙时并**不**改方向，
+ * 它把落点挪到被撞那面墙的外皮上（`hit ± normal · 0.315 m`）—— 也就是**步长随障碍变短**。
+ * TG 另有一条 `|新点 − 上一点| < 0.42 m = 2 × 步长` 的理智闸，说明它本来就容忍变长的步。
+ *
+ * ⚠️ 最短一档别低于 1/4：6.5 cm 的段在 `Bloat` 1.15 下几乎整段互穿，再短就只是白付实例。
+ */
+constexpr float CSHouseVine_StepFracs[] = { 1.0f, 0.5f, 0.25f };
+
+/**
+ * 第 `Probe` 个候选倾角。以 `Wish`（游走给出的目标）为圆心按 |偏移| 递增往两侧扫，
+ * 全部夹在 `[Lo, Hi]` 内 —— **那对上下界就是"相邻段夹角 ≤ MaxTurn"的构造性保证**，
+ * 调用方不必再检查一次。
+ *
+ * ⚠️ `Probe == 0` 必须**恒等于** `Wish`：无障碍时第 0 个候选就被接受，于是整条无障碍路径
+ * 与"只有游走"的旧代码逐位相同。这一条是本轮改动能不碰既有几何断言的全部理由，别顺手改序。
+ */
+float CSHouseVine_ProbeAngle(int32 Probe, float Wish, float Lo, float Hi, float Step)
+{
+	const int32 Ring = (Probe + 1) / 2;                          // 0, 1, 1, 2, 2, 3, 3, ...
+	const float Side = (Probe & 1) ? 1.0f : -1.0f;               // 先往 +，再往 −
+	return FMath::Clamp(Wish + Side * float(Ring) * Step, Lo, Hi);
+}
+
 class FCSHouseVinePackCS : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FCSHouseVinePackCS);
@@ -216,73 +257,116 @@ void BuildPlan(const TArray<FWallStrip>& Strips, const TArray<FCSWallOpening>& O
 				// 同一根藤在拐弯前后会拿到两套随机，而且拐不拐弯本身又由随机决定 ⇒ 自指。
 				// 身份 = (起点墙, 藤号, 段号, 佐料, 种子)，跨墙对它是透明的。
 				const uint32 Id = IdentityHash(Root.EdgeIndex, StrandIdx, Segment, 11u, Params.Seed);
-				Angle += (Hash01(Id) - 0.5f) * 2.0f * Params.Wander;
-				Angle = FMath::Clamp(Angle, -Params.MaxLean, Params.MaxLean);
 
-				const FWallStrip* NextWall = Wall;
-				float NextS = S + FMath::Sin(Angle) * SegLen;
-				const float NextZ = Z + FMath::Cos(Angle) * SegLen;
+				// ── 这一段的倾角 ─────────────────────────────────────────────────────
+				// 目标倾角 = 游走。`Wish` 与旧代码那句"加完扰动再夹一次"的结果**逐位相同**
+				// （前提是 `MaxTurn >= Wander`，见 `FParams::MaxTurn`）⇒ 无障碍段的形状没变。
+				const float PrevAngle = Angle;
+				const float Budget = FMath::Max(Params.MaxTurn, 0.0f);
+				const float Wish = FMath::Clamp(
+					FMath::Clamp(PrevAngle + (Hash01(Id) - 0.5f) * 2.0f * Params.Wander,
+						-Params.MaxLean, Params.MaxLean),
+					PrevAngle - Budget, PrevAngle + Budget);
 
 				// 长到墙顶就收。四坡屋顶下四面墙顶一律平在墙高（山墙那条随坡升高的剖面已随
 				// 双坡结构一起删除），这条线以上是屋面，不是墙。
-				if (NextZ > Wall->Height) break;
+				// ⚠️ 判据用**目标**倾角而不是最终被接受的那一个：后者要等扫描跑完才知道，
+				// 而 `cos` 在 [−MaxLean, MaxLean] 上恒正 ⇒ 用目标倾角判与旧行为逐位一致。
+				if (Z + FMath::Cos(Wish) * SegLen > Wall->Height) break;
 
-				// 撞墙角。两条出路：
-				//  · 跨到隔壁那面墙继续长（TG 的 `check_for_wall_jump`）—— 藤绕着房子转角爬，
-				//    这是 TG 里最显眼的一条藤蔓行为，第一档没做；
-				//  · 没掷中（或隔壁那面墙不在输入里，比如单墙单测）就把倾角**镜像**回来。
-				//    镜像而不是夹死：夹死会让藤沿着墙角笔直往上爬一长条，一眼看出是程序生成的。
-				if (NextS < Margin || NextS > Wall->Length - Margin)
+				// ── 障碍：在转向预算内**扫**一个能过去的倾角 ─────────────────────────
+				// ⚠️ 旧代码在这里**改写**倾角（墙角 `Angle = -Angle`、洞里再 `Angle = 0`），
+				// 那正是 2026-09-12 修掉的画面缺陷：倾角是相对竖直的**绝对**偏角，取反一次
+				// 相邻段就折过 `2·|Angle|`（MaxLean 1.15 ⇒ 131.8°），藤在洞缘和墙角上"折断"
+				// 式急拐；归零同样是一次离散跳变。
+				// 反编译实证（`Docs/TinyGlade/VineObstacleTurning_20260912.md`）：TG 的
+				// `ivy_grower` 里**一次镜像/归零都没有** —— 方向来自
+				// `IvyDirectionProposer::get_direction`，是位置的连续函数（两层 FastNoise 在
+				// `pos / 2.8 m` 上取样、步长 0.21 m ⇒ 一步只走过 7.5% 个波长）。
+				// 这里用"候选倾角**全部**夹在 [PrevAngle ± MaxTurn] 内"把同一条性质补回来：
+				// 于是"相邻段夹角 ≤ MaxTurn"是**构造性**的，不靠调参（由 Vine.TurnRate 守着）。
+				// 而"取能过去的**最小**转向"在几何上就是**沿障碍边缘滑行** —— 藤贴着洞缘绕上去，
+				// 不是被弹开。
+				//
+				// 扫描是**两层**的：外层收步长（`CSHouseVine_StepFracs`）、内层扫倾角。
+				// 顺序是"先整步试完所有倾角，再收短一步重试" —— 宁可少走一步，也不硬折。
+				// 只有内层的话，带着 1.0 rad 朝洞里的倾角撞上洞缘时九个候选全都还朝洞里走，
+				// 整根当场收尾：实测保留率 0.663 → 0.485。收步长不动倾角，所以上界不受影响。
+				const float Lo = FMath::Max(PrevAngle - Budget, -Params.MaxLean);
+				const float Hi = FMath::Min(PrevAngle + Budget, Params.MaxLean);
+				const float ProbeStep = Budget / float(CSHouseVine_TurnProbes);
+
+				// 跨墙那一掷**提到扫描之外**。`Hash01` 是纯函数、没有流式状态，所以提前掷一个字都
+				// 不改；留在循环里反而会让"掷不掷"取决于扫到第几档 —— 那就成了自指
+				// （与"身份不许含拐不拐弯"是同一条）。
+				const bool bJumpDraw = Hash01(IdentityHash(Root.EdgeIndex, StrandIdx, Segment, 53u, Params.Seed))
+					< Params.JumpChance;
+
+				const FWallStrip* NextWall = nullptr;
+				float NextS = 0.0f;
+				float NextZ = 0.0f;
+				for (int32 Frac = 0; Frac < int32(UE_ARRAY_COUNT(CSHouseVine_StepFracs)) && !NextWall; ++Frac)
 				{
-					const bool bForward = NextS > Wall->Length - Margin;
-					const FWallStrip* Neighbour = EdgeModulus > 1
-						? FindStrip((Wall->EdgeIndex + (bForward ? 1 : EdgeModulus - 1)) % EdgeModulus)
-						: nullptr;
-					const bool bJump = Neighbour && Neighbour != Wall
-						&& Neighbour->Length > MarginOf(*Neighbour) * 2.0f
-						&& Hash01(IdentityHash(Root.EdgeIndex, StrandIdx, Segment, 53u, Params.Seed)) < Params.JumpChance;
-					if (bJump)
+					const float CandLen = SegLen * CSHouseVine_StepFracs[Frac];
+					for (int32 Probe = 0; Probe <= CSHouseVine_TurnProbes * 2 && !NextWall; ++Probe)
 					{
-						const float NeighbourMargin = MarginOf(*Neighbour);
-						// 越角以后沿墙方向不翻身：原来"往前"到了新墙上仍然是"往前"（从墙头进），
-						// 倾角保持不变，藤读起来是**连着**绕过转角的，而不是在转角处折了一下。
-						const float Entry = bForward ? NeighbourMargin : Neighbour->Length - NeighbourMargin;
-						const float Overshoot = bForward ? (NextS - (Wall->Length - Margin)) : (Margin - NextS);
-						NextS = FMath::Clamp(bForward ? Entry + Overshoot : Entry - Overshoot,
-							NeighbourMargin, Neighbour->Length - NeighbourMargin);
-						NextWall = Neighbour;
-					}
-					else
-					{
-						Angle = -Angle;
-						NextS = FMath::Clamp(S + FMath::Sin(Angle) * SegLen, Margin, Wall->Length - Margin);
+						const float Cand = CSHouseVine_ProbeAngle(Probe, Wish, Lo, Hi, ProbeStep);
+						const FWallStrip* CandWall = Wall;
+						float CandS = S + FMath::Sin(Cand) * CandLen;
+						const float CandZ = Z + FMath::Cos(Cand) * CandLen;
+
+						// 墙顶也要逐候选查一次：|Cand| < |Wish| 时 `cos` 更大、落点比目标那一步更高。
+						// ⚠️ 第 0 个候选恒等于 `Wish`，所以这一条对无障碍路径是恒真的（逐位不变）。
+						if (CandZ > Wall->Height) continue;
+
+						// 撞墙角。掷中跨墙（TG 的 `check_for_wall_jump`）⇒ 拐上相邻那面墙继续长，
+						// 这是 TG 里最显眼的一条藤蔓行为；没掷中（或隔壁那面墙不在输入里，比如
+						// 单墙单测）⇒ 这个候选算不通过、继续往回扫，一档都扫不出来才收尾。
+						// ⚠️ **收尾是有意的，而且与 TG 同构**：TG 的 `ivy_grower` 在
+						// `next.along < 0 || > wall.length` 时直接 return，而它的方向是位置的函数
+						// ⇒ 下一帧提出来的还是同一个方向，等于永久停在墙端。原来那句镜像才是外加的。
+						if (CandS < Margin || CandS > Wall->Length - Margin)
+						{
+							if (!bJumpDraw) continue;
+							const bool bForward = CandS > Wall->Length - Margin;
+							const FWallStrip* Neighbour = EdgeModulus > 1
+								? FindStrip((Wall->EdgeIndex + (bForward ? 1 : EdgeModulus - 1)) % EdgeModulus)
+								: nullptr;
+							if (!Neighbour || Neighbour == Wall
+								|| Neighbour->Length <= MarginOf(*Neighbour) * 2.0f) continue;
+
+							const float NeighbourMargin = MarginOf(*Neighbour);
+							// 越角以后沿墙方向不翻身：原来"往前"到了新墙上仍然是"往前"（从墙头进），
+							// 倾角保持不变，藤读起来是**连着**绕过转角的，而不是在转角处折了一下。
+							const float Entry = bForward ? NeighbourMargin : Neighbour->Length - NeighbourMargin;
+							const float Overshoot = bForward ? (CandS - (Wall->Length - Margin)) : (Margin - CandS);
+							CandS = FMath::Clamp(bForward ? Entry + Overshoot : Entry - Overshoot,
+								NeighbourMargin, Neighbour->Length - NeighbourMargin);
+							CandWall = Neighbour;
+						}
+
+						// 墙洞。判据仍是与材质同源的那条 clip 场（见 `IsInsideOpening`）——
+						// 换的只是"撞上以后怎么办"，判据本身一个字没动。
+						if (IsInsideOpening(Openings, CandWall->EdgeIndex, CandS, CandZ, Params.HoleClearance)) continue;
+
+						NextWall = CandWall;
+						NextS = CandS;
+						NextZ = CandZ;
+						Angle = Cand;
 					}
 				}
 
-				// 墙洞：先**绕**，绕不过去再直着往上顶一次，还不行才停。
-				// ⚠️ "撞上就停"试过，作废：演示房子一开六个拱，两面长墙的藤当场从 319 段掉到 132，
-				// 拱之间的墙面成片秃掉 —— 因为每根藤是从墙脚长上去的，拱正好压在它的根上。
-				// 第二次尝试取**竖直**（Angle = 0）而不是再镜像一次：窄墩两侧都是洞，能穿过去的
-				// 只有竖直那一条路；再镜像一次只会在两个洞之间原地摆动。
-				// 这也更接近 TG 的 `intersect_ivy_growth_w_wall_segment`（逐段求交后改向，不是整根砍掉）。
-				if (IsInsideOpening(Openings, NextWall->EdgeIndex, NextS, NextZ, Params.HoleClearance))
-				{
-					const float Mirror = FMath::Clamp(S - FMath::Sin(Angle) * SegLen, Margin, Wall->Length - Margin);
-					if (NextWall == Wall && !IsInsideOpening(Openings, Wall->EdgeIndex, Mirror, NextZ, Params.HoleClearance))
-					{
-						Angle = -Angle;
-						NextS = Mirror;
-					}
-					else if (NextWall == Wall && !IsInsideOpening(Openings, Wall->EdgeIndex, S, NextZ, Params.HoleClearance))
-					{
-						Angle = 0.0f;
-						NextS = S;
-					}
-					else
-					{
-						break;   // 被夹在洞与墙角之间，继续绕就是原地打转
-					}
-				}
+				// 倾角 × 步长两层都扫遍了还是没有一条路 ⇒ 被夹在洞与墙角之间，继续绕就是原地打转。
+				// ⚠️ 这一条与 TG 的 `ivy.blocked = true` 同义，但门槛高得多。TG 一撞洞就停，它
+				// **有本钱停是因为播种是连续的、不是因为起点撒得高**（2026-09-12 反汇编
+				// `ivy_spawner` 核实，此前"起点撒在整面墙上"那条推论是错的：起点取墙曲线上的
+				// 点再走 `Vec2 → x0y` swizzle，**高度分量是字面的 0**，和本项目一样全在墙脚，
+				// 沿墙的疏密由一道 2D 噪声门决定）。真正的差别是它每帧播 2–4 根、每根 20–70 点、
+				// 吃满 40000 点的全局预算才停手，洞集合一变还会清 `blocked` 重试 ⇒ 停一根不要紧，
+				// 新的会在墙脚别处长出来。本项目是提交时**一次性确定性**生成整套藤，停一根就是
+				// 永久少一根 —— "撞上就停"实测把演示房子从 319 段打到 132、拱之间成片秃掉。
+				// 所以是"先在预算内扫，扫不出来才停"。
+				if (!NextWall) break;
 
 				const FVector A = Wall->Origin + Wall->U * S + Wall->Up * Z + Wall->N * Params.StandOff;
 				const FVector B = NextWall->Origin + NextWall->U * NextS + NextWall->Up * NextZ + NextWall->N * Params.StandOff;

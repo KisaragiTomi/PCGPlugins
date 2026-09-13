@@ -2930,6 +2930,7 @@ void ACSHouseActor::RebuildVine()
 	Params.MaxSegments = VineMaxSegments;
 	Params.Wander = VineWander;
 	Params.MaxLean = VineMaxLean;
+	Params.MaxTurn = VineMaxTurn;
 	Params.Bloat = VineBloat;
 	Params.Thickness = VineThickness;
 	Params.StandOff = VineStandOff;
@@ -2966,7 +2967,8 @@ void ACSHouseActor::RebuildVine()
 		int32(Plan.Branch.Num()), int32(Plan.Leaf.Num()), int32(Plan.Flower.Num()),
 		CSHouse_Q(FootprintSize.X, 1), CSHouse_Q(FootprintSize.Y, 1), CSHouse_Q(WallHeight, 1),
 		CSHouse_Q(VineStrandSpacing, 0.5), CSHouse_Q(VineSegmentLength, 0.5), VineMaxSegments,
-		CSHouse_Q(VineWander, 0.01), CSHouse_Q(VineMaxLean, 0.01), CSHouse_Q(VineBloat, 0.01),
+		CSHouse_Q(VineWander, 0.01), CSHouse_Q(VineMaxLean, 0.01), CSHouse_Q(VineMaxTurn, 0.01),
+		CSHouse_Q(VineBloat, 0.01),
 		CSHouse_Q(VineThickness, 0.1), CSHouse_Q(VineStandOff, 0.1), CSHouse_Q(VineLeafSize, 0.1),
 		CSHouse_Q(VineLeafChance, 0.01), CSHouse_Q(VineLeafSizeJitter, 0.01), VineSeed,
 		CSHouse_Q(VineFlowerChance, 0.01), CSHouse_Q(VineFlowerFromFrac, 0.01), CSHouse_Q(VineFlowerSize, 0.1),

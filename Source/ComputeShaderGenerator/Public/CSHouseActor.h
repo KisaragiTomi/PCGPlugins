@@ -1076,10 +1076,29 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine", meta = (ClampMin = "0.0", ClampMax = "1.5"))
 	float VineWander = 0.55f;
 
-	/** 相对"正上"的最大偏角（弧度）。撞到上界时倾角**镜像**而不是夹死 —— 夹死会让藤沿墙角
-	 *  笔直爬一长条，一眼看出是程序生成的。 */
+	/** 相对"正上"的最大偏角（弧度）。撞到上界就**夹住** —— 障碍处怎么改向是 `VineMaxTurn`
+	 *  那一条的事，与这里无关。取值明显大于 `VineMaxTurn` 时藤一段之内换不了横移的方向，
+	 *  窄道里会靠"收短一步"熬过去（见 `CSHouseVine.cpp` 的 `CSHouseVine_StepFracs`）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine", meta = (ClampMin = "0.1", ClampMax = "1.5"))
 	float VineMaxLean = 1.15f;
+
+	/**
+	 * **一段之内倾角最多转多少**（弧度）。这是"相邻段夹角有上界"的唯一来源。
+	 *
+	 * 2026-09-12 加的：旧算法在障碍处**直接改写**倾角（墙角把倾角取反、洞里再归零），
+	 * 而倾角是相对竖直的**绝对**偏角 ⇒ 取反一次相邻段就折过 `2·|倾角|`，
+	 * `VineMaxLean` 默认 1.15 时上界是 131.8°，症状是**藤在门洞边缘和墙角上"折断"式急拐**。
+	 * 反编译实证：TG 的 `ivy_grower` 里一次镜像/归零都没有，方向是位置的连续函数
+	 * （见 `Docs/TinyGlade/VineObstacleTurning_20260912.md`）。
+	 *
+	 * ⚠️ **不要调到比 `VineWander` 小**：游走本身就是每段 ±`VineWander` 的转向，
+	 * 预算更小会连**无障碍处**的形状一起改掉。取 0 = 藤笔直不转、撞上就收尾。
+	 *
+	 * 默认 0.70 是标定出来的拐点：它是"带洞的墙与无洞的墙爬得一样高"的第一个值，
+	 * 再小藤会在两个拱之间 20 cm 的窄道里拐不过弯就收尾。标定表见 `FParams::MaxTurn`。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine", meta = (ClampMin = "0.0", ClampMax = "1.5"))
+	float VineMaxTurn = 0.70f;
 
 	/** 长度轴胀大系数。**与 `FrameBrickBloat` 同一条 TG 实证**：正缝会在藤的每个折点露出
 	 *  一条亮缝，而折点恰恰最显眼；胀大之后相邻两段必然互穿，段数一变只是穿插量微调。 */

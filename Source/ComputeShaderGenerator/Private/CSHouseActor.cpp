@@ -1001,8 +1001,8 @@ uint32 ACSHouseActor::GetTrackingHash() const
 	for (const CSHouseSeam::FHouse& N : Neighbours)
 	{
 		H.Append({ CSHouse_Q(N.Center.X, 1), CSHouse_Q(N.Center.Y, 1), CSHouse_Q(N.BaseZ, 0.5),
-			CSHouse_Q(N.Yaw, 0.1), CSHouse_Q(N.Footprint.X, 1), CSHouse_Q(N.Footprint.Y, 1),
-			CSHouse_Q(N.WallHeight, 1) });
+			CSHouse_Q(N.Yaw, 0.1), CSHouse_Q(N.WallHeight, 1) });
+		CSHouse_AppendFootprintHash(H, N.Footprint);
 	}
 	return CSHouse_Hash(H);
 }
@@ -2172,7 +2172,7 @@ CSHouseSeam::FHouse ACSHouseActor::MakeSeamHouse() const
 	// 只取 yaw，与 `GetBuildTransform()` 同口径 —— 房体面板与门框砖都建在那个变换里，
 	// 接缝换一个口径就会在有 pitch/roll 的房子上与它们错开（「已知潜伏问题」那条的同族）。
 	H.Yaw = float(GetActorRotation().Yaw);
-	H.Footprint = FootprintSize;
+	H.Footprint = GetFootprint();
 	H.BaseZ = float(Loc.Z);
 	H.WallHeight = WallHeight;
 	H.WallThickness = WallThickness;

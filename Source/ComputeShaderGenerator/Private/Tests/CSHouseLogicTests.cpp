@@ -2599,7 +2599,7 @@ CSHouseSeam::FHouse CSHouseTest_MakeSeamHouse(uint32 Tag, double X, double Y, fl
 	H.Id = FGuid(Tag, 0x1111u, 0x2222u, 0x3333u);
 	H.Center = FVector2D(X, Y);
 	H.Yaw = Yaw;
-	H.Footprint = FVector2D(SizeX, SizeY);
+	H.Footprint = FCSHouseFootprint::MakeRect(FVector2D(SizeX, SizeY));
 	H.BaseZ = 0.0f;
 	H.WallHeight = 300.0f;
 	H.WallThickness = 24.0f;
@@ -2755,8 +2755,8 @@ bool FCSHouseSeamGeometryTest::RunTest(const FString& Parameters)
 	{
 		const FVector2D LA = CSHouseSeam::ToLocal(A, C.Point);
 		const FVector2D LB = CSHouseSeam::ToLocal(B, C.Point);
-		const double AX = FMath::Abs(LA.X) - A.Footprint.X * 0.5, AY = FMath::Abs(LA.Y) - A.Footprint.Y * 0.5;
-		const double BX = FMath::Abs(LB.X) - B.Footprint.X * 0.5, BY = FMath::Abs(LB.Y) - B.Footprint.Y * 0.5;
+		const double AX = FMath::Abs(LA.X) - A.Footprint.GetBounds().Max.X, AY = FMath::Abs(LA.Y) - A.Footprint.GetBounds().Max.Y;
+		const double BX = FMath::Abs(LB.X) - B.Footprint.GetBounds().Max.X, BY = FMath::Abs(LB.Y) - B.Footprint.GetBounds().Max.Y;
 		// 落在轮廓上 = 至少一个方向恰好贴边，且两个方向都不在框外。
 		if (AX > 0.01 || AY > 0.01 || BX > 0.01 || BY > 0.01) ++OffContour;
 		if (FMath::Abs(AX) > 0.01 && FMath::Abs(AY) > 0.01) ++OffContour;
@@ -2773,8 +2773,8 @@ bool FCSHouseSeamGeometryTest::RunTest(const FString& Parameters)
 		const FVector2D Probe = C.Point + C.Outward * 20.0;
 		const FVector2D PA = CSHouseSeam::ToLocal(A, Probe);
 		const FVector2D PB = CSHouseSeam::ToLocal(B, Probe);
-		const bool bOutA = FMath::Abs(PA.X) > A.Footprint.X * 0.5 || FMath::Abs(PA.Y) > A.Footprint.Y * 0.5;
-		const bool bOutB = FMath::Abs(PB.X) > B.Footprint.X * 0.5 || FMath::Abs(PB.Y) > B.Footprint.Y * 0.5;
+		const bool bOutA = FMath::Abs(PA.X) > A.Footprint.GetBounds().Max.X || FMath::Abs(PA.Y) > A.Footprint.GetBounds().Max.Y;
+		const bool bOutB = FMath::Abs(PB.X) > B.Footprint.GetBounds().Max.X || FMath::Abs(PB.Y) > B.Footprint.GetBounds().Max.Y;
 		if (!bOutA || !bOutB) ++PointingInwards;
 	}
 	TestEqual(TEXT("the brick depth axis faces the quadrant that is outside both houses"), PointingInwards, 0);
@@ -2790,7 +2790,7 @@ bool FCSHouseSeamGeometryTest::RunTest(const FString& Parameters)
 		auto InsideB = [&](float S)
 		{
 			const FVector2D L = CSHouseSeam::ToLocal(B, CSHouseSeam::ToWorld(A, F.Start + F.U * S));
-			return FMath::Abs(L.X) <= B.Footprint.X * 0.5 + 0.01 && FMath::Abs(L.Y) <= B.Footprint.Y * 0.5 + 0.01;
+			return FMath::Abs(L.X) <= B.Footprint.GetBounds().Max.X + 0.01 && FMath::Abs(L.Y) <= B.Footprint.GetBounds().Max.Y + 0.01;
 		};
 		for (int32 K = 1; K < 20; ++K)
 		{
@@ -2809,7 +2809,7 @@ bool FCSHouseSeamGeometryTest::RunTest(const FString& Parameters)
 	// 拿房体三角汤直接验：接缝那一段的三角形数**不许减少**（不生成面板就是一个真几何洞），
 	// 而裁剪判据必须在那一段上说"丢掉"。两条一起才说得清"洞在渲染层、不在几何里"。
 	FCSHouseBodyDesc Desc;
-	Desc.Footprint = FCSHouseFootprint::MakeRect(A.Footprint);
+	Desc.Footprint = A.Footprint;
 	Desc.WallThickness = A.WallThickness;
 	Desc.WallHeight = A.WallHeight;
 	Desc.PierWidth = 40.0f;
@@ -2846,6 +2846,125 @@ bool FCSHouseSeamGeometryTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("the wall inside the neighbour is clipped away"), KeptInsideCut, 0);
 	TestEqual(TEXT("the wall outside the neighbour survives"), DroppedOutsideCut, 0);
 
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseSeamPolylineTest,
+	"PCGPlugins.ComputeShaderGenerator.House.SeamPolylineFootprints",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseSeamPolylineTest::RunTest(const FString& Parameters)
+{
+	// footprint 折线化 3d：接缝的分离轴、交点、墙段裁剪从「矩形的 2 根轴 / 4×4 / 四条轴对齐边界」
+	// 换成「每条边的法线 / N×M / 每条边一个半平面」。判据与 SeamCornersAndCuts 同一套，换到六边形上。
+	auto WithPolyline = [](uint32 Tag, double X, double Y, float Yaw, const TArray<FVector2D>& Verts)
+	{
+		CSHouseSeam::FHouse H = CSHouseTest_MakeSeamHouse(Tag, X, Y, Yaw, 1.0, 1.0);
+		H.Footprint.Verts = Verts;
+		return H;
+	};
+	auto Hexagon = [](double R)
+	{
+		TArray<FVector2D> V;
+		for (int32 i = 0; i < 6; ++i)
+		{
+			const double A = UE_DOUBLE_TWO_PI * double(i) / 6.0;
+			V.Add(FVector2D(R * FMath::Cos(A), R * FMath::Sin(A)));
+		}
+		return V;
+	};
+	// 世界点是否在某栋房的 footprint 里（含边界容差）。
+	auto Inside = [](const CSHouseSeam::FHouse& H, const FVector2D& World, double Tol)
+	{
+		return H.Footprint.ContainsPoint(CSHouseSeam::ToLocal(H, World), Tol);
+	};
+
+	// ---- ① 包围盒相交、斜边之间隔着一条缝 ⇒ 不是接缝（只测两根轴的矩形 SAT 会误报）----
+	{
+		const CSHouseSeam::FHouse Lower = WithPolyline(21, 0.0, 0.0, 0.0f,
+			{ FVector2D(0, 0), FVector2D(300, 0), FVector2D(0, 300) });
+		const CSHouseSeam::FHouse Upper = WithPolyline(22, 0.0, 0.0, 0.0f,
+			{ FVector2D(310, 310), FVector2D(10, 310), FVector2D(310, 10) });
+		TestTrue(TEXT("triangle fixtures are counter-clockwise"),
+			Lower.Footprint.GetSignedArea() > 0.0 && Upper.Footprint.GetSignedArea() > 0.0);
+		TestFalse(TEXT("two triangles separated along their hypotenuses do not seam"), CSHouseSeam::Intersects(Lower, Upper));
+		TestFalse(TEXT("and the test is symmetric"), CSHouseSeam::Intersects(Upper, Lower));
+		TArray<CSHouseSeam::FCorner> None;
+		TestEqual(TEXT("separated triangles: no corners"), CSHouseSeam::BuildCorners(Lower, Upper, None), 0);
+	}
+
+	// ---- ② 六边形 × 带 yaw 的矩形：交点在两条轮廓上、成对、交换顺序逐位相同；裁剪段分类正确 ----
+	const CSHouseSeam::FHouse Hex = WithPolyline(23, 0.0, 0.0, 0.0f, Hexagon(300.0));
+	const CSHouseSeam::FHouse Box = CSHouseTest_MakeSeamHouse(24, 330.0, 90.0, 23.0f, 360.0, 260.0);
+	TestTrue(TEXT("hexagon and yawed box overlap"), CSHouseSeam::Intersects(Hex, Box));
+
+	TArray<CSHouseSeam::FCorner> AB, BA;
+	const int32 NAB = CSHouseSeam::BuildCorners(Hex, Box, AB);
+	const int32 NBA = CSHouseSeam::BuildCorners(Box, Hex, BA);
+	TestTrue(FString::Printf(TEXT("hexagon/box crossings come in pairs (got %d)"), NAB), NAB >= 2 && (NAB % 2) == 0);
+	TestEqual(TEXT("swapping the pair keeps the corner count"), NBA, NAB);
+	int32 NotBitEqual = 0;
+	for (int32 K = 0; K < FMath::Min(NAB, NBA); ++K)
+	{
+		if (AB[K].Point.X != BA[K].Point.X || AB[K].Point.Y != BA[K].Point.Y
+			|| AB[K].Outward.X != BA[K].Outward.X || AB[K].Outward.Y != BA[K].Outward.Y) ++NotBitEqual;
+	}
+	TestEqual(TEXT("both houses compute the same polyline seam bit for bit"), NotBitEqual, 0);
+
+	int32 OffContour = 0, PointingInwards = 0;
+	for (const CSHouseSeam::FCorner& C : AB)
+	{
+		// 在轮廓上 = 容差内算「在里面」，但往两侧各挪一点就分出里外 —— 用「容差内在、零容差邻域不全在」近似。
+		if (!Inside(Hex, C.Point, 0.01) || !Inside(Box, C.Point, 0.01)) ++OffContour;
+		const FVector2D Probe = C.Point + C.Outward * 20.0;
+		if (Inside(Hex, Probe, 0.0) || Inside(Box, Probe, 0.0)) ++PointingInwards;
+	}
+	TestEqual(TEXT("every polyline seam corner lies on both contours"), OffContour, 0);
+	TestEqual(TEXT("every polyline seam bisector faces outside both houses"), PointingInwards, 0);
+
+	int32 Cuts = 0, MisclassifiedIn = 0, MisclassifiedOut = 0;
+	for (int32 Edge = 0; Edge < Hex.Footprint.NumEdges(); ++Edge)
+	{
+		FCSWallCut Cut;
+		if (!CSHouseSeam::CutOnEdge(Hex, Box, Edge, Cut)) continue;
+		++Cuts;
+		TestEqual(TEXT("the cut names the edge it was asked about"), Cut.EdgeIndex, Edge);
+		const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Hex.Footprint, Hex.WallThickness);
+		auto WallPoint = [&](float S) { return CSHouseSeam::ToWorld(Hex, F.Start + F.U * S); };
+		for (int32 K = 1; K < 20; ++K)
+		{
+			if (!Inside(Box, WallPoint(FMath::Lerp(Cut.MinS, Cut.MaxS, float(K) / 20.0f)), 0.01)) ++MisclassifiedIn;
+		}
+		if (Cut.MinS > 2.0f && Inside(Box, WallPoint(Cut.MinS - 2.0f), 0.0)) ++MisclassifiedOut;
+		if (Cut.MaxS < F.Len - 2.0f && Inside(Box, WallPoint(Cut.MaxS + 2.0f), 0.0)) ++MisclassifiedOut;
+	}
+	TestTrue(FString::Printf(TEXT("the box cuts at least one hexagon wall (%d)"), Cuts), Cuts > 0);
+	TestEqual(TEXT("every point inside a hexagon cut really is inside the box"), MisclassifiedIn, 0);
+	TestEqual(TEXT("and each hexagon cut stops where the box stops"), MisclassifiedOut, 0);
+
+	// 反过来：矩形的墙被六边形盖住的段（Other 是六边形 ⇒ 走 6 个半平面）。
+	int32 BoxCuts = 0, BoxMisIn = 0, BoxMisOut = 0;
+	for (int32 Edge = 0; Edge < Box.Footprint.NumEdges(); ++Edge)
+	{
+		FCSWallCut Cut;
+		if (!CSHouseSeam::CutOnEdge(Box, Hex, Edge, Cut)) continue;
+		++BoxCuts;
+		const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Box.Footprint, Box.WallThickness);
+		auto WallPoint = [&](float S) { return CSHouseSeam::ToWorld(Box, F.Start + F.U * S); };
+		for (int32 K = 1; K < 20; ++K)
+		{
+			if (!Inside(Hex, WallPoint(FMath::Lerp(Cut.MinS, Cut.MaxS, float(K) / 20.0f)), 0.01)) ++BoxMisIn;
+		}
+		if (Cut.MinS > 2.0f && Inside(Hex, WallPoint(Cut.MinS - 2.0f), 0.0)) ++BoxMisOut;
+		if (Cut.MaxS < F.Len - 2.0f && Inside(Hex, WallPoint(Cut.MaxS + 2.0f), 0.0)) ++BoxMisOut;
+	}
+	TestTrue(FString::Printf(TEXT("the hexagon cuts at least one box wall (%d)"), BoxCuts), BoxCuts > 0);
+	TestEqual(TEXT("every point inside a box cut really is inside the hexagon"), BoxMisIn, 0);
+	TestEqual(TEXT("and each box cut stops where the hexagon stops"), BoxMisOut, 0);
+
+	// ---- ③ 外接圆粗筛取最远顶点 ----
+	TestTrue(TEXT("reach of a hexagon is its circumradius"), FMath::IsNearlyEqual(Hex.Reach(), 300.0f, 1.0e-3f));
 	return true;
 }
 

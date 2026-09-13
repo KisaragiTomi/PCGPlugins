@@ -70,15 +70,21 @@ struct FHouse
 	/** 房子在世界里的 XY 与 yaw（度）—— 与 `ACSHouseActor::GetBuildTransform()` 同口径（只取 yaw）。 */
 	FVector2D Center = FVector2D::ZeroVector;
 	float Yaw = 0.0f;
-	FVector2D Footprint = FVector2D(600.0, 400.0);
+	/** 局部空间的闭合折线（逆时针），与 `ACSHouseActor::GetFootprint()` 同一份。 */
+	FCSHouseFootprint Footprint = FCSHouseFootprint::MakeRect(FVector2D(600.0, 400.0));
 	/** 房底世界 Z（落座之后）。 */
 	float BaseZ = 0.0f;
 	float WallHeight = 300.0f;
 	float WallThickness = 24.0f;
 
 	float EaveZ() const { return BaseZ + WallHeight; }
-	/** 外接圆半径：邻近粗筛用（半对角线）。 */
-	float Reach() const { return 0.5f * float(FVector2D(Footprint.X, Footprint.Y).Size()); }
+	/** 外接圆半径：邻近粗筛用（离局部原点最远的顶点；矩形上就是半对角线）。 */
+	float Reach() const
+	{
+		double MaxSq = 0.0;
+		for (const FVector2D& V : Footprint.Verts) MaxSq = FMath::Max(MaxSq, V.SizeSquared());
+		return float(FMath::Sqrt(MaxSq));
+	}
 };
 
 /**
@@ -130,21 +136,20 @@ inline FVector2D ToWorld(const FHouse& H, const FVector2D& Local)
 	return H.Center + FVector2D(Local.X * C - Local.Y * S, Local.X * S + Local.Y * C);
 }
 
+/** 轮廓顶点表（世界 XY）。多数房子不超过 8 个顶点，放栈上。 */
+using FContour = TArray<FVector2D, TInlineAllocator<8>>;
+
 /**
- * footprint 轮廓的四个角（世界 XY），**顺序与 `CSHouse_GetEdge` 的边号一一对应**：
- * 第 k 条轮廓边 = Out[k] → Out[(k+1)&3]。
+ * footprint 轮廓的顶点（世界 XY），**顺序与 `CSHouse_GetEdge` 的边号一一对应**：
+ * 第 k 条轮廓边 = Out[k] → Out[(k+1) % N]。
  *
- * ⚠️ 用的是**整条**矩形边，不是 `CSHouse_GetEdge` 那条为了避免转角重叠而两端各内缩 T 的墙段
- * —— 轮廓是轮廓，墙段是墙段。拿内缩过的墙段求交点，会在两房恰好在角附近相交时漏掉交点
- * （漏掉的那一根接缝砖没有任何断言看得见）。
+ * 用的是外皮线段 —— 斜接口径下它与 `CSHouse_GetEdge` 的 `Start → Start + U·Len` 是同一条线。
+ * （直角对接时代这里特意不用墙段，因为那时奇数边两端各缩了 T，拿它求交会在角附近漏交点。）
  */
-inline void FootprintCorners(const FHouse& H, FVector2D Out[4])
+inline void FootprintCorners(const FHouse& H, FContour& Out)
 {
-	const double HX = H.Footprint.X * 0.5, HY = H.Footprint.Y * 0.5;
-	Out[0] = ToWorld(H, FVector2D(-HX, -HY));
-	Out[1] = ToWorld(H, FVector2D(HX, -HY));
-	Out[2] = ToWorld(H, FVector2D(HX, HY));
-	Out[3] = ToWorld(H, FVector2D(-HX, HY));
+	Out.Reset();
+	for (const FVector2D& V : H.Footprint.Verts) Out.Add(ToWorld(H, V));
 }
 
 /** 第 k 条轮廓边的**世界外法线**（局部 −In，见 `CSHouse_GetEdge`）。 */
@@ -166,38 +171,50 @@ inline bool OverlapZ(const FHouse& A, const FHouse& B, float& OutBottom, float& 
 }
 
 /**
- * 两房是否真的交汇：**footprint OBB 真重叠 + Z 区间相交**（用户裁决：不是"靠得近"）。
+ * 两房是否真的交汇：**footprint 真重叠 + Z 区间相交**（用户裁决：不是"靠得近"）。
  *
- * 分离轴只需要四根（两个矩形各自的两根轴）—— 2D 下矩形的边法线就是它的轴，没有第三类候选。
+ * 分离轴取两条折线**每一条边**的法线 —— 2D 下凸多边形的候选分离轴就是这些，没有第三类。
+ * 矩形时代只测两根（另两条边与它们平行），折线上少测一根就会把「包围盒相交、斜边之间隔着
+ * 一条缝」的两栋房判成相交。
+ *
+ * 凹折线上它是**保守**的：找到分离轴就一定分离，找不到时可能误报相交。误报无害 ——
+ * 下游的交点与裁剪段是逐边精确求的，误报的一对算出来什么都没有。
  */
 inline bool Intersects(const FHouse& A, const FHouse& B)
 {
 	float Bottom = 0.0f, Top = 0.0f;
 	if (!OverlapZ(A, B, Bottom, Top)) return false;
+	if (!A.Footprint.IsValidFootprint() || !B.Footprint.IsValidFootprint()) return false;
 
-	FVector2D CornersA[4], CornersB[4];
+	FContour CornersA, CornersB;
 	FootprintCorners(A, CornersA);
 	FootprintCorners(B, CornersB);
 
-	auto Separated = [](const FVector2D* P, const FVector2D* Q, const FVector2D& Axis)
+	auto Separated = [](const FContour& P, const FContour& Q, const FVector2D& Axis)
 	{
 		// 从第 0 个角起算而不是从 ±FLT_MAX 起算：少一个"极值常量选错类型"的坑，也少一个 include。
 		double PMin = FVector2D::DotProduct(P[0], Axis), PMax = PMin;
 		double QMin = FVector2D::DotProduct(Q[0], Axis), QMax = QMin;
-		for (int32 K = 1; K < 4; ++K)
+		for (int32 K = 1; K < P.Num(); ++K)
 		{
 			const double DP = FVector2D::DotProduct(P[K], Axis);
-			const double DQ = FVector2D::DotProduct(Q[K], Axis);
 			PMin = FMath::Min(PMin, DP); PMax = FMath::Max(PMax, DP);
+		}
+		for (int32 K = 1; K < Q.Num(); ++K)
+		{
+			const double DQ = FVector2D::DotProduct(Q[K], Axis);
 			QMin = FMath::Min(QMin, DQ); QMax = FMath::Max(QMax, DQ);
 		}
 		// 恰好相切不算相交：触发条件是"真正重叠"，相切的两栋房各自的墙面正好贴上，没有穿插要遮。
 		return PMax <= QMin + MinSpan || QMax <= PMin + MinSpan;
 	};
 
-	for (int32 K = 0; K < 2; ++K)
+	for (int32 K = 0; K < CornersA.Num(); ++K)
 	{
 		if (Separated(CornersA, CornersB, EdgeOutward(A, K))) return false;
+	}
+	for (int32 K = 0; K < CornersB.Num(); ++K)
+	{
 		if (Separated(CornersA, CornersB, EdgeOutward(B, K))) return false;
 	}
 	return true;
@@ -224,10 +241,10 @@ struct FCorner
 /**
  * 两房轮廓的交点表。**规范序内部化** ⇒ `BuildCorners(A,B)` 与 `BuildCorners(B,A)` 逐位相同。
  *
- * 16 次线段求交（4×4），顺序固定为"规范序第一栋的边号 × 第二栋的边号"，所以交点次序也是确定的
+ * N×M 次线段求交，顺序固定为"规范序第一栋的边号 × 第二栋的边号"，所以交点次序也是确定的
  * —— 不排序、也不能排序：按坐标排序又会把浮点比较请回来。
  *
- * 两矩形相交一般出 2 或 4 个交点（带 yaw 最多 8）。平行边共线的退化情形直接跳过：那种情形下
+ * 两个凸轮廓相交出偶数个交点（两矩形一般 2 或 4，带 yaw 最多 8）。平行边共线的退化情形直接跳过：那种情形下
  * 两面墙是贴合的，没有穿插要遮，硬造一根柱子反而多出一个孤零零的砖堆。
  */
 inline int32 BuildCorners(const FHouse& A, const FHouse& B, TArray<FCorner>& OutCorners)
@@ -242,17 +259,17 @@ inline int32 BuildCorners(const FHouse& A, const FHouse& B, TArray<FCorner>& Out
 	float Bottom = 0.0f, Top = 0.0f;
 	if (!OverlapZ(*First, *Second, Bottom, Top)) return 0;
 
-	FVector2D P[4], Q[4];
+	FContour P, Q;
 	FootprintCorners(*First, P);
 	FootprintCorners(*Second, Q);
 
-	for (int32 I = 0; I < 4; ++I)
+	for (int32 I = 0; I < P.Num(); ++I)
 	{
-		const FVector2D P0 = P[I], D1 = P[(I + 1) & 3] - P0;
+		const FVector2D P0 = P[I], D1 = P[(I + 1) % P.Num()] - P0;
 		const FVector2D NI = EdgeOutward(*First, I);
-		for (int32 J = 0; J < 4; ++J)
+		for (int32 J = 0; J < Q.Num(); ++J)
 		{
-			const FVector2D Q0 = Q[J], D2 = Q[(J + 1) & 3] - Q0;
+			const FVector2D Q0 = Q[J], D2 = Q[(J + 1) % Q.Num()] - Q0;
 			const double Denom = D1.X * D2.Y - D1.Y * D2.X;
 			if (FMath::Abs(Denom) <= UE_DOUBLE_KINDA_SMALL_NUMBER) continue;   // 平行/共线：见上
 			const FVector2D W = Q0 - P0;
@@ -280,9 +297,12 @@ inline int32 BuildCorners(const FHouse& A, const FHouse& B, TArray<FCorner>& Out
 /**
  * `Self` 的第 `EdgeIndex` 面墙上被 `Other` 的 footprint 盖住的那一段（墙空间 S 区间 + Z 区间）。
  *
- * 参数化按 `CSHouse_GetEdge`（**内缩过的墙段**，因为要裁的是那块面板的 S 坐标），再把两端点
- * 拿到 Other 的局部系里做 Liang–Barsky 区间裁剪 —— 矩形是轴对齐的，四个半平面各夹一次即可，
- * 没有迭代、没有分支依赖顺序。
+ * 参数化按 `CSHouse_GetEdge`（外皮线段、S 从外角点起算，与面板同一个 S），再把两端点拿到
+ * Other 的局部系里做 Cyrus–Beck 区间裁剪：Other 的每条边是一个半平面「(P − Start)·In ≥ 0」，
+ * 各夹一次即可 —— 没有迭代，夹的顺序不改结果。矩形上这四个半平面就是原来 Liang–Barsky 的四条轴对齐边界。
+ *
+ * ⚠️ **只对凸的 Other 成立**：凹折线的内部不是半平面的交，一面墙可能被盖住两段，而 `FCSWallCut`
+ * 一次只装一段。凹 footprint 落地时这里要换成「逐边求交 + 输出多段」。
  */
 inline bool CutOnEdge(const FHouse& Self, const FHouse& Other, int32 EdgeIndex, FCSWallCut& OutCut)
 {
@@ -293,10 +313,10 @@ inline bool CutOnEdge(const FHouse& Self, const FHouse& Other, int32 EdgeIndex, 
 	const FCSHouseEdgeFrame F = CSHouse_GetEdge(EdgeIndex, Self.Footprint, Self.WallThickness);
 	if (F.Len <= MinSpan) return false;
 
+	if (!Other.Footprint.IsValidFootprint()) return false;
 	const FVector2D A = ToLocal(Other, ToWorld(Self, F.Start));
 	const FVector2D Bv = ToLocal(Other, ToWorld(Self, F.Start + F.U * F.Len));
 	const FVector2D Dir = Bv - A;
-	const double HX = Other.Footprint.X * 0.5, HY = Other.Footprint.Y * 0.5;
 
 	double T0 = 0.0, T1 = 1.0;
 	auto Clip = [&T0, &T1](double P, double Q)
@@ -307,10 +327,14 @@ inline bool CutOnEdge(const FHouse& Self, const FHouse& Other, int32 EdgeIndex, 
 		else { if (R < T0) return false; if (R < T1) T1 = R; }
 		return true;
 	};
-	if (!Clip(-Dir.X, A.X + HX)) return false;
-	if (!Clip(Dir.X, HX - A.X)) return false;
-	if (!Clip(-Dir.Y, A.Y + HY)) return false;
-	if (!Clip(Dir.Y, HY - A.Y)) return false;
+	for (int32 J = 0; J < Other.Footprint.NumEdges(); ++J)
+	{
+		// 半平面「(A + t·Dir − Start)·In ≥ 0」⇔「−(Dir·In)·t ≤ (A − Start)·In」。
+		// 边框架的 In 在轴对齐边上是精确的 (±1, 0) / (0, ±1)，矩形上与原来的四次夹逐位相同。
+		const FCSHouseEdgeFrame G = CSHouse_GetEdge(J, Other.Footprint, Other.WallThickness);
+		if (G.Len <= 0.0f) continue;
+		if (!Clip(-FVector2D::DotProduct(Dir, G.In), FVector2D::DotProduct(A - G.Start, G.In))) return false;
+	}
 
 	OutCut.EdgeIndex = EdgeIndex;
 	OutCut.MinS = float(T0 * F.Len);

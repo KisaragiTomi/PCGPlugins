@@ -688,7 +688,8 @@ struct FCSHouseEdgeFrame
  * 摆件锚点、门扇）的原因：它们只认 `(Start, U, In, Len)`，不认边数。
  *
  * 本类型目前**还不是序列化的权威** —— `ACSHouseActor::FootprintSize` 仍是被编辑的那个量，
- * 折线由它派生（3a-1 的边界）。让折线本身可编辑、可存盘是 3a-2 的事。
+ * 折线由它派生（`GetFootprint`）。顺序是先把所有消费者改成只认折线（3b / 3c / 3d / 3e / 3f），
+ * 最后一期才让折线本身可编辑、可存盘 —— 反过来的话，中间会有一段「能画出非矩形、屋顶和接缝却还是矩形」的状态。
  */
 USTRUCT(BlueprintType)
 struct COMPUTESHADERGENERATOR_API FCSHouseFootprint
@@ -709,6 +710,93 @@ struct COMPUTESHADERGENERATOR_API FCSHouseFootprint
 		if (N < 3 || EdgeIndex < 0 || EdgeIndex >= N) return false;
 		OutA = Verts[EdgeIndex];
 		OutB = Verts[(EdgeIndex + 1) % N];
+		return true;
+	}
+
+	/** 轴对齐包围盒（局部空间）。空折线返回无效盒。 */
+	FBox2D GetBounds() const
+	{
+		FBox2D Box(ForceInit);
+		for (const FVector2D& V : Verts) Box += V;
+		return Box;
+	}
+
+	/**
+	 * 以**局部原点**为心、能盖住整条折线的轴对齐方盒的**边长**：`2 · max(|x|, |y|)`。
+	 *
+	 * 各家实例组件的交接包围盒原来写 `max(FootprintSize.X, FootprintSize.Y) · 0.6` —— 那是「居中
+	 * 矩形的边长乘 1.2 倍余量再取半」。对 `MakeRect` 造的居中矩形，这个函数**逐位**等于
+	 * `max(X, Y)`（`2 · (X · 0.5)` 是精确的），所以换过去之后矩形上的盒子一厘米都不变；对不居中
+	 * 或非矩形的折线它仍是保守的（取的是离原点最远的那一维，不是包围盒自己的边长）。
+	 */
+	double GetCenteredSpan() const
+	{
+		double Half = 0.0;
+		for (const FVector2D& V : Verts) Half = FMath::Max(Half, FMath::Max(FMath::Abs(V.X), FMath::Abs(V.Y)));
+		return Half * 2.0;
+	}
+
+	/** 外皮周长（逐边长度之和）。 */
+	double GetPerimeter() const
+	{
+		double Sum = 0.0;
+		const int32 N = Verts.Num();
+		for (int32 i = 0; i < N && N >= 2; ++i) Sum += FVector2D::Distance(Verts[i], Verts[(i + 1) % N]);
+		return Sum;
+	}
+
+	/**
+	 * 点在折线围成的区域内，或离任一条边不超过 `Tolerance`（边界算在内）。
+	 *
+	 * 奇偶规则判内部；边界单独按距离判 —— 纯奇偶规则在边上的点结果取决于舍入，而落座采样、
+	 * 支撑点这些调用方恰恰会把采样点放在边上（矩形的采样网格含四条边），边界必须稳定地算在内。
+	 */
+	bool ContainsPoint(const FVector2D& P, double Tolerance = 0.01) const
+	{
+		const int32 N = Verts.Num();
+		if (N < 3) return false;
+		bool bInside = false;
+		for (int32 i = 0, j = N - 1; i < N; j = i++)
+		{
+			const FVector2D& A = Verts[i];
+			const FVector2D& B = Verts[j];
+			const FVector2D AB = B - A;
+			const double LenSq = AB.SizeSquared();
+			const double T = LenSq > UE_DOUBLE_SMALL_NUMBER ? FMath::Clamp(FVector2D::DotProduct(P - A, AB) / LenSq, 0.0, 1.0) : 0.0;
+			if (FVector2D::DistSquared(P, A + AB * T) <= Tolerance * Tolerance) return true;
+			if (((A.Y > P.Y) != (B.Y > P.Y)) && (P.X < (B.X - A.X) * (P.Y - A.Y) / (B.Y - A.Y) + A.X)) bInside = !bInside;
+		}
+		return bInside;
+	}
+
+	/** 有向面积：逆时针为正。 */
+	double GetSignedArea() const
+	{
+		double Twice = 0.0;
+		const int32 N = Verts.Num();
+		for (int32 i = 0; i < N; ++i)
+		{
+			const FVector2D& A = Verts[i];
+			const FVector2D& B = Verts[(i + 1) % N];
+			Twice += A.X * B.Y - A.Y * B.X;
+		}
+		return Twice * 0.5;
+	}
+
+	/**
+	 * 严格凸且逆时针：每个角都是左转（叉积 > `MinTurnSin`）。共线角（叉积≈0）不算凸 ——
+	 * 那种顶点让一条墙被无谓地切成两段，屋面直骨架还会在那里出一条零长的脊。
+	 */
+	bool IsStrictlyConvexCCW(double MinTurnSin = 1.0e-4) const
+	{
+		const int32 N = Verts.Num();
+		if (N < 3) return false;
+		for (int32 i = 0; i < N; ++i)
+		{
+			const FVector2D UIn = (Verts[i] - Verts[(i + N - 1) % N]).GetSafeNormal();
+			const FVector2D UOut = (Verts[(i + 1) % N] - Verts[i]).GetSafeNormal();
+			if (UIn.X * UOut.Y - UIn.Y * UOut.X <= MinTurnSin) return false;
+		}
 		return true;
 	}
 

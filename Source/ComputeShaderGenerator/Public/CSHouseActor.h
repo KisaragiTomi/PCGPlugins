@@ -2291,12 +2291,13 @@ private:
 	TMap<uint32, bool> PierSpanIsPier;
 
 	/**
-	 * 四个角各自的转角墩顶（墙空间高度；0 = 这个角没配成墩）。`ResolvePierSpans` 每轮整份重写，
+	 * 每个角各自的转角墩顶（墙空间高度；0 = 这个角没配成墩），长度 = footprint 顶点数；
+	 * 角 k 夹在 k 号边远端与 k+1 号边近端之间。`ResolvePierSpans` 每轮整份重写（跑之前为空，读方一律按 Num 截断），
 	 * `BuildCornerPierBricks` 按它立柱、`BuildQuoinBricks` 按它让角石在墩顶以下让路 ——
 	 * 两个消费者读同一份数，才不会出现"墩砌到 A、角石剔到 B"。序号与 `CSHouseQuoin::CornerSign` 同序。
 	 */
-	float CornerPierTopZ[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-	/** 这一轮立起来的转角墩数（0..4）。 */
+	TArray<float> CornerPierTopZ;
+	/** 这一轮立起来的转角墩数（0..角数）。 */
 	int32 CurrentCornerPierCount = 0;
 
 	/**

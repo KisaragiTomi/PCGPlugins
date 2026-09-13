@@ -196,6 +196,18 @@ uint32 CSHouse_Hash(const TArray<int32>& Values)
 int32 CSHouse_Q(double Value, double Quantum) { return int32(FMath::RoundToInt(Value / Quantum)); }
 
 /**
+ * footprint 进哈希：顶点数 + 逐顶点量化到 1 cm。
+ *
+ * 原来各家哈希写的是 `CSHouse_Q(FootprintSize.X, 1), CSHouse_Q(FootprintSize.Y, 1)` —— 两个数只能
+ * 描述居中矩形。顶点数必须进去：加一个顶点而位置不动的折线，量化后的坐标序列可能与原来的前缀相同。
+ */
+void CSHouse_AppendFootprintHash(TArray<int32>& H, const FCSHouseFootprint& Footprint)
+{
+	H.Add(Footprint.NumEdges());
+	for (const FVector2D& V : Footprint.Verts) H.Append({ CSHouse_Q(V.X, 1), CSHouse_Q(V.Y, 1) });
+}
+
+/**
  * 藤蔓管子的环半径系数。**两个调用点必须用同一个值**：`PackTubePath` 按
  * `w = 想要的半径 / (10 * CircleScale)` 反解逐点缩放，Pass C 再按
  * `半径 = 10 * CircleScale * w` 还原。取值本身是任意的（两边约掉了），
@@ -322,22 +334,33 @@ double ACSHouseActor::ComputeSeatZ() const
 	const float Yaw = FMath::DegreesToRadians(GetActorRotation().Yaw);
 	const FVector2D AxX(FMath::Cos(Yaw), FMath::Sin(Yaw));
 	const FVector2D AxY(-FMath::Sin(Yaw), FMath::Cos(Yaw));
-	const double HX = FootprintSize.X * 0.5, HY = FootprintSize.Y * 0.5;
+	const FCSHouseFootprint Footprint = GetFootprint();
+	const FBox2D Box = Footprint.GetBounds();
+	if (!Box.bIsValid) return Loc.Z;
+	const FVector2D Size = Box.GetSize();
 	const double Step = 50.0;   // 与地面镜像默认格距同阶；max 采样对格距不敏感
 
 	double MaxGround = TNumericLimits<double>::Lowest();
-	const int32 NX = FMath::Max(1, int32(FMath::CeilToInt(FootprintSize.X / Step)));
-	const int32 NY = FMath::Max(1, int32(FMath::CeilToInt(FootprintSize.Y / Step)));
+	auto SampleAt = [&](const FVector2D& L)
+	{
+		const FVector2D P = FVector2D(Loc.X, Loc.Y) + AxX * L.X + AxY * L.Y;
+		MaxGround = FMath::Max(MaxGround, double(Ground->SampleHeight(P)));
+	};
+	const int32 NX = FMath::Max(1, int32(FMath::CeilToInt(Size.X / Step)));
+	const int32 NY = FMath::Max(1, int32(FMath::CeilToInt(Size.Y / Step)));
 	for (int32 ix = 0; ix <= NX; ++ix)
 	{
 		for (int32 iy = 0; iy <= NY; ++iy)
 		{
-			const double LX = -HX + FootprintSize.X * ix / NX;
-			const double LY = -HY + FootprintSize.Y * iy / NY;
-			const FVector2D P = FVector2D(Loc.X, Loc.Y) + AxX * LX + AxY * LY;
-			MaxGround = FMath::Max(MaxGround, double(Ground->SampleHeight(P)));
+			const FVector2D L(Box.Min.X + Size.X * ix / NX, Box.Min.Y + Size.Y * iy / NY);
+			// 包围盒网格只采落在折线内（含边界）的点：非矩形折线的包围盒角上是房外的空地，
+			// 采了会把房子顶到那块地的高度上去。矩形的网格点全在内部或边上，一个都不会被跳过。
+			if (Footprint.ContainsPoint(L, 0.5)) SampleAt(L);
 		}
 	}
+	// 顶点单独补采：锐角顶点可能夹在两个网格点之间，漏掉它就漏掉角上那块凸起。
+	// 矩形的四个角本来就是网格点，补采不改最大值。
+	for (const FVector2D& V : Footprint.Verts) SampleAt(V);
 	if (MaxGround <= TNumericLimits<double>::Lowest() * 0.5) return Loc.Z;
 	return MaxGround + HeightOffset;
 }
@@ -564,12 +587,16 @@ uint32 ACSHouseActor::ComputeDoors()
 		// 一条压过转角的路在那边得到的是**一条跨角的段**；四条边各自求解只会把它切成两个
 		// 互不相干、还各自被护角推开的洞。转角实拍见 `img/tiny-glade-ref-corner-arch-passage.png`：
 		// **两道拱共用一根角柱**，角柱不是障碍，它就是中墩。
-		FCSHouseEdgeFrame Frames[4];
-		float EdgeStart[4] = { 0, 0, 0, 0 };
+		const FCSHouseFootprint Footprint = GetFootprint();
+		const int32 NumEdges = Footprint.NumEdges();
+		TArray<FCSHouseEdgeFrame, TInlineAllocator<8>> Frames;
+		TArray<float, TInlineAllocator<8>> EdgeStart;
+		Frames.SetNum(NumEdges);
+		EdgeStart.SetNumZeroed(NumEdges);
 		float Perimeter = 0.0f;
-		for (int32 Edge = 0; Edge < 4; ++Edge)
+		for (int32 Edge = 0; Edge < NumEdges; ++Edge)
 		{
-			Frames[Edge] = CSHouse_GetEdge(Edge, FootprintSize, WallThickness);
+			Frames[Edge] = CSHouse_GetEdge(Edge, Footprint, WallThickness);
 			EdgeStart[Edge] = Perimeter;
 			Perimeter += Frames[Edge].Len;
 		}
@@ -585,8 +612,8 @@ uint32 ACSHouseActor::ComputeDoors()
 			{
 				float Wrapped = FMath::Fmod(Ring, Perimeter);
 				if (Wrapped < 0.0f) Wrapped += Perimeter;
-				OutEdge = 3;
-				for (int32 Edge = 0; Edge < 4; ++Edge)
+				OutEdge = NumEdges - 1;
+				for (int32 Edge = 0; Edge < NumEdges; ++Edge)
 				{
 					if (Wrapped < EdgeStart[Edge] + Frames[Edge].Len) { OutEdge = Edge; break; }
 				}
@@ -642,7 +669,7 @@ uint32 ACSHouseActor::ComputeDoors()
 
 				// 段可能跨越 0 点，所以按"环上 [S0, S1] 与每条边的 [start, start+len] 求交"来切，
 				// 边的区间同时试 −Perimeter / 0 / +Perimeter 三个副本，覆盖绕回的情况。
-				for (int32 Edge = 0; Edge < 4; ++Edge)
+				for (int32 Edge = 0; Edge < NumEdges; ++Edge)
 				{
 					for (int32 Rep = -1; Rep <= 1; ++Rep)
 					{
@@ -784,7 +811,8 @@ uint32 ACSHouseActor::ComputeDoors()
 	// 房体**形状**哈希：几何参数 + 门集合，**不含世界变换**（那份归 ComputePlacementHash）。
 	// 纪律：desc 哈希只接受"决定顶点位置或索引的量"——材质/颜色/高亮一律走 D14 的外观通道。
 	TArray<int32> H;
-	H.Append({ CSHouse_Q(FootprintSize.X, 1), CSHouse_Q(FootprintSize.Y, 1), CSHouse_Q(WallHeight, 1), CSHouse_Q(WallThickness, 0.5),
+	CSHouse_AppendFootprintHash(H, GetFootprint());
+	H.Append({ CSHouse_Q(WallHeight, 1), CSHouse_Q(WallThickness, 0.5),
 		CSHouse_Q(RoofPitch, 0.1), CSHouse_Q(RoofOverhang, 1) });
 	for (const FCSWallOpening& O : CurrentOpenings)
 	{
@@ -812,7 +840,10 @@ void ACSHouseActor::ResolvePierSpans()
 	// （2026-09-04 转角位被这么擦掉过一次，判据 ⑥ 抓到的）。
 	constexpr uint8 PierBits = CSHouse_StylePierBefore | CSHouse_StylePierAfter;
 	for (FCSWallOpening& Opening : CurrentOpenings) Opening.StyleFlags &= ~PierBits;
-	for (float& TopZ : CornerPierTopZ) TopZ = 0.0f;
+	// 转角数 = 边数：闭合折线上每个顶点恰好是一个角。
+	const FCSHouseFootprint Footprint = GetFootprint();
+	const int32 NumCorners = Footprint.NumEdges();
+	CornerPierTopZ.Init(0.0f, NumCorners);
 
 	FCSHousePierStyle Style;
 	Style.bEnabled = bPierStyleEnabled;
@@ -861,12 +892,12 @@ void ACSHouseActor::ResolvePierSpans()
 	// （`CSHouse_BuildBodySoup`）；只有"中间那根柱子"是转角特有的 —— 同边的墩由
 	// `BuildEdgeElements` 沿边出，转角的墩立在角点上，由 `BuildCornerPierBricks` 读
 	// `CornerPierTopZ` 出，角石（`BuildQuoinBricks`）读同一份数值在起拱线以下让路。
-	for (int32 Corner = 0; Corner < 4; ++Corner)
+	for (int32 Corner = 0; Corner < NumCorners; ++Corner)
 	{
 		// 角 k 夹在「k 号边的远端」与「k+1 号边的近端」之间，与 `CSHouseQuoin::CornerSign` 同序。
 		const int32 FarEdge = Corner;
-		const int32 NearEdge = (Corner + 1) & 3;
-		const float FarLen = CSHouse_GetEdge(FarEdge, FootprintSize, WallThickness).Len;
+		const int32 NearEdge = (Corner + 1) % NumCorners;
+		const float FarLen = CSHouse_GetEdge(FarEdge, Footprint, WallThickness).Len;
 		FCSWallOpening* Far = nullptr;
 		FCSWallOpening* Near = nullptr;
 		for (FCSWallOpening& O : CurrentOpenings)
@@ -879,7 +910,7 @@ void ACSHouseActor::ResolvePierSpans()
 		}
 		if (!Far || !Near) continue;
 
-		// key 的顶字节 0xC0 与边号（0..3）不共域：跨角跨度与同边跨度永远不互相继承样式。
+		// key 的顶字节 0xC0 与边号（< 0xC0）不共域：跨角跨度与同边跨度永远不互相继承样式。
 		const uint32 Key = (0xC0u << 24) | uint32(Corner);
 		const bool bWasPier = PierSpanIsPier.FindRef(Key);
 		const bool bIsPier = CSHouse_SpanIsPier(Style, WallThickness, bWasPier);
@@ -952,7 +983,8 @@ uint32 ACSHouseActor::GetTrackingHash() const
 	const FVector Loc = GetActorLocation();
 	TArray<int32> H = {
 		CSHouse_Q(Loc.X, 1), CSHouse_Q(Loc.Y, 1), CSHouse_Q(Loc.Z, 0.5), CSHouse_Q(GetActorRotation().Yaw, 0.1),
-		CSHouse_Q(FootprintSize.X, 1), CSHouse_Q(FootprintSize.Y, 1), CSHouse_Q(WallHeight, 1) };
+		CSHouse_Q(WallHeight, 1) };
+	CSHouse_AppendFootprintHash(H, GetFootprint());
 
 	// **邻居的摆位也算这栋房的输入**（D7 接缝）：接缝是两栋房的纯函数，邻居一动这栋房的几何
 	// 就变了 —— 而邻居移动**不发任何委托给这栋房**（`PostEditMove` 只叫醒它自己）。兜底快扫比的
@@ -986,14 +1018,22 @@ uint32 ACSHouseActor::ComputePillars(TArray<FVector>& OutPillarCenters, TArray<f
 	const FVector2D AxX(FMath::Cos(YawRad), FMath::Sin(YawRad));
 	const FVector2D AxY(-FMath::Sin(YawRad), FMath::Cos(YawRad));
 
-	// 支撑点：周界（内缩半墙厚，柱子落在墙体正下方），四角 + 每边按间距等分。
-	const double HX = FootprintSize.X * 0.5 - WallThickness * 0.5;
-	const double HY = FootprintSize.Y * 0.5 - WallThickness * 0.5;
-	const FVector2D Corners[4] = { { -HX, -HY }, { HX, -HY }, { HX, HY }, { -HX, HY } };
-	TArray<FVector2D> Points;
-	for (int32 E = 0; E < 4; ++E)
+	// 支撑点：墙厚中线那一圈（柱子落在墙体正下方），每个角 + 每边按间距等分。
+	//
+	// 中线的角点就是深度 T/2 处的斜接点：外角点沿本边 U 让出 `InsetStart / 2`、再沿 In 进 T/2。
+	// 矩形上它逐位等于原来的「四角各内缩半个墙厚」—— 直角让出量恰好是 T。
+	const FCSHouseFootprint Footprint = GetFootprint();
+	const int32 NumEdges = Footprint.NumEdges();
+	TArray<FVector2D, TInlineAllocator<8>> Corners;
+	for (int32 E = 0; E < NumEdges; ++E)
 	{
-		const FVector2D A = Corners[E], B = Corners[(E + 1) % 4];
+		const FCSHouseEdgeFrame F = CSHouse_GetEdge(E, Footprint, WallThickness);
+		Corners.Add(F.Start + F.U * (F.InsetStart * 0.5) + F.In * (WallThickness * 0.5));
+	}
+	TArray<FVector2D> Points;
+	for (int32 E = 0; E < NumEdges; ++E)
+	{
+		const FVector2D A = Corners[E], B = Corners[(E + 1) % NumEdges];
 		const float Len = float(FVector2D::Distance(A, B));
 		const int32 Count = FMath::Max(1, int32(Len / PillarSpacing));
 		for (int32 J = 0; J < Count; ++J) Points.Add(FMath::Lerp(A, B, float(J) / Count));   // 含起角，终角归下一条边
@@ -1632,8 +1672,9 @@ void ACSHouseActor::EnsurePillarBrickComponent()
 	// 上限 = 周界柱位数 × 每根最多几层。柱长由地面空隙定，没有上界，所以层数要自己钉一个：
 	// 500 cm 的悬空已经远超任何合理场景，再高就截断 —— 少砌几块砖远好过在拖动的某一帧
 	// 付一次设备同步。
-	const double Perimeter = 2.0 * (FootprintSize.X + FootprintSize.Y);
-	const int32 MaxPillars = FMath::CeilToInt(Perimeter / FMath::Max(PillarSpacing, 20.0f)) + 4;
+	const FCSHouseFootprint Footprint = GetFootprint();
+	const double Perimeter = Footprint.GetPerimeter();
+	const int32 MaxPillars = FMath::CeilToInt(Perimeter / FMath::Max(PillarSpacing, 20.0f)) + Footprint.NumEdges();
 	const int32 MaxCourses = FMath::CeilToInt(500.0f / FMath::Max(PillarCourseHeight, 4.0f));
 	const uint32 MaxBricks = uint32(FMath::Clamp(
 		CSShaperSteps::ReserveCount(MaxPillars * MaxCourses), 64, 1 << 16));
@@ -1641,7 +1682,7 @@ void ACSHouseActor::EnsurePillarBrickComponent()
 
 	// 交接包围盒：量化 + 只涨不缩（理由同门框砖那段 —— 拖尺寸时 1 cm 阈值会让每帧重走一次
 	// 阻塞的 SetInstanceSourceGPU）。柱子往**下**长，所以下界要给足。
-	const double Reach = CSShaperSteps::QuantizeUp(FMath::Max(FootprintSize.X, FootprintSize.Y) * 0.6 + PillarSize);
+	const double Reach = CSShaperSteps::QuantizeUp(Footprint.GetCenteredSpan() * 0.6 + PillarSize);
 	const double Depth = CSShaperSteps::QuantizeUp(500.0 + PillarEmbed);
 	FBox LocalBounds(FVector(-Reach, -Reach, -Depth), FVector(Reach, Reach, PillarSize));
 	LocalBounds = CSHouse_BuildBoundsToComponent(GetBuildTransform(), PillarBrickComponent, LocalBounds);
@@ -1919,7 +1960,7 @@ CSShaperSteps::EHandoverResult ACSHouseActor::EnsureFrameComponent()
 	// FootprintSize / WallHeight 的连续函数，而下面 bNeedHandover 的阈值是 1 cm ——
 	// 拖尺寸时每帧都判"包围盒变了"，于是每帧重走一次阻塞的 SetInstanceSourceGPU。
 	// 全量重建时不并旧盒，让它重新收紧（否则一次误拉大就永久留着保守盒）。
-	const double Reach = CSShaperSteps::QuantizeUp(FMath::Max(FootprintSize.X, FootprintSize.Y) * 0.6 + FrameBrickLength);
+	const double Reach = CSShaperSteps::QuantizeUp(GetFootprint().GetCenteredSpan() * 0.6 + FrameBrickLength);
 	const double Top = CSShaperSteps::QuantizeUp(WallHeight + FrameBrickLength);
 	FBox LocalBounds(FVector(-Reach, -Reach, -FrameBrickLength), FVector(Reach, Reach, Top));
 
@@ -1943,6 +1984,7 @@ uint32 ACSHouseActor::BuildFrameArches(TArray<CSHouseFrame::FElement>& OutElemen
 	if (!bFrameEnabled || !FrameBrickMesh || CurrentOpenings.IsEmpty()) return 0;
 
 	const FTransform World = GetBuildTransform();
+	const FCSHouseFootprint Footprint = GetFootprint();
 	const float T = WallThickness;
 
 	CSHouseFrame::FBrickParams Params;
@@ -1964,7 +2006,7 @@ uint32 ACSHouseActor::BuildFrameArches(TArray<CSHouseFrame::FElement>& OutElemen
 		while (End < CurrentOpenings.Num() && CurrentOpenings[End].EdgeIndex == CurrentOpenings[Begin].EdgeIndex) ++End;
 
 		// **与房体面板同一份 `CSHouse_GetEdge`**：墙在哪儿只能有一个真源（同 BuildVineStrips）。
-		const FCSHouseEdgeFrame F = CSHouse_GetEdge(CurrentOpenings[Begin].EdgeIndex, FootprintSize, T);
+		const FCSHouseEdgeFrame F = CSHouse_GetEdge(CurrentOpenings[Begin].EdgeIndex, Footprint, T);
 		// 砖路走**墙厚正中**：砖的 +Z 尺寸 = 墙厚时，正好把断口两侧都封住（同旧路）。
 		const FVector Mid(F.Start.X + F.In.X * (T * 0.5), F.Start.Y + F.In.Y * (T * 0.5), 0.0);
 
@@ -2266,7 +2308,7 @@ uint32 ACSHouseActor::BuildCornerPierBricks(TArray<CSHouseFrame::FElement>& InOu
 	const uint32 Seed = HouseId.IsValid() ? GetTypeHash(HouseId) : uint32(GetUniqueID());
 	int32 Cursor = CSHouseFrame::NextBrickSlot(InOutElements);
 	TArray<int32> H;
-	for (int32 Corner = 0; Corner < Corners.Num() && Corner < 4; ++Corner)
+	for (int32 Corner = 0; Corner < Corners.Num() && Corner < CornerPierTopZ.Num(); ++Corner)
 	{
 		const float TopZ = CornerPierTopZ[Corner];
 		if (TopZ <= UE_KINDA_SMALL_NUMBER) continue;
@@ -2317,7 +2359,7 @@ uint32 ACSHouseActor::BuildQuoinBricks(TArray<CSHouseFrame::FElement>& InOutElem
 	// `FQuoin::BottomZ` 已经是世界 Z，剔除线跟它同一个口径。
 	{
 		const float BaseZ = float(GetActorLocation().Z);
-		for (int32 Corner = 0; Corner < Quoins.Num() && Corner < 4; ++Corner)
+		for (int32 Corner = 0; Corner < Quoins.Num() && Corner < CornerPierTopZ.Num(); ++Corner)
 		{
 			if (CornerPierTopZ[Corner] > UE_KINDA_SMALL_NUMBER) Quoins[Corner].CullBelowZ = BaseZ + CornerPierTopZ[Corner];
 		}
@@ -2605,9 +2647,10 @@ void ACSHouseActor::BuildVineStrips(TArray<CSHouseVine::FWallStrip>& OutStrips) 
 	// **与房体面板同一份 `CSHouse_GetEdge`**：墙在哪儿只能有一个真源。各抄一份的症状是
 	// "藤悬在离墙半个墙厚的空中"，而且只在改过 WallThickness 之后才显形。
 	const FTransform World = GetBuildTransform();
-	for (int32 EdgeIndex = 0; EdgeIndex < 4; ++EdgeIndex)
+	const FCSHouseFootprint Footprint = GetFootprint();
+	for (int32 EdgeIndex = 0; EdgeIndex < Footprint.NumEdges(); ++EdgeIndex)
 	{
-		const FCSHouseEdgeFrame F = CSHouse_GetEdge(EdgeIndex, FootprintSize, WallThickness);
+		const FCSHouseEdgeFrame F = CSHouse_GetEdge(EdgeIndex, Footprint, WallThickness);
 		if (F.Len <= UE_KINDA_SMALL_NUMBER) continue;
 
 		CSHouseVine::FWallStrip Strip;
@@ -2776,8 +2819,9 @@ CSShaperSteps::EHandoverResult ACSHouseActor::EnsureVineComponents()
 	// 容量按**配置上限**一次付清，之后永不扩容（零阻塞纪律）。上限是纯配置量：
 	// 四面墙的总周长 / 间距 × 每根最多几段。规划真的排超了就在 kernel 里截断 ——
 	// 少画几段藤，远好过在拖动的某一帧上付一次设备同步。
-	const double Perimeter = 2.0 * (FootprintSize.X + FootprintSize.Y);
-	const int32 MaxStrands = FMath::CeilToInt(Perimeter / FMath::Max(VineStrandSpacing, 20.0f)) + 4;
+	const FCSHouseFootprint Footprint = GetFootprint();
+	const double Perimeter = Footprint.GetPerimeter();
+	const int32 MaxStrands = FMath::CeilToInt(Perimeter / FMath::Max(VineStrandSpacing, 20.0f)) + Footprint.NumEdges();
 	// ⚠️ **必须再走一次 `CSShaperSteps::ReserveCount` 的台阶**，不能把这个数直接喂给 ReserveCapacity。
 	// 上限本身是 FootprintSize 的**连续函数**（周长 / 间距），而 ReserveCapacity 只对齐到 64 ——
 	// 拖尺寸时每涨过一根藤的间距就重新分配一次，实测每次 **5 次阻塞刷新**，一段拖动累计 21 次。
@@ -2792,7 +2836,7 @@ CSShaperSteps::EHandoverResult ACSHouseActor::EnsureVineComponents()
 
 	// 交接包围盒：量化 + 只涨不缩，理由与门框砖那段逐字相同（拖尺寸时 1 cm 阈值会让
 	// 每帧都重走一次阻塞的 SetInstanceSourceGPU）。藤爬满整面墙，所以取整个 footprint。
-	const double Reach = CSShaperSteps::QuantizeUp(FMath::Max(FootprintSize.X, FootprintSize.Y) * 0.6
+	const double Reach = CSShaperSteps::QuantizeUp(Footprint.GetCenteredSpan() * 0.6
 		+ FMath::Max(VineLeafSize, VineFlowerSize) + VineStandOff);
 	// ⚠️ 上界取**屋脊高**而不是墙高：藤自己只爬到檐口，但瓦 / 尖顶那一层将来也吃这只盒子，
 	// 停在墙高的话斜看时会成片被剔掉（症状是"转个视角就闪没"，最难复现的那一类）。
@@ -3254,7 +3298,7 @@ CSShaperSteps::EHandoverResult ACSHouseActor::EnsureRoofTileComponent()
 		FMath::Max(RoofTileAxes.NativeAlongSlope(), RoofTileAxes.NativeAcrossRow())))
 		* double(FMath::Max(RoofTileRowOverlap, RoofTileColumnOverlap)) * (1.0 + double(RoofTileScaleJitter));
 	const double Reach = CSShaperSteps::QuantizeUp(
-		FMath::Max(FootprintSize.X, FootprintSize.Y) * 0.5 + double(RoofOverhang) + TileReach);
+		GetFootprint().GetCenteredSpan() * 0.5 + double(RoofOverhang) + TileReach);
 	const double Top = CSShaperSteps::QuantizeUp(
 		double(CSHouseRoof_RidgeZ(Roof)) + double(RoofTileStandOff) + double(RoofTileLiftJitter) + TileReach);
 	FBox LocalBounds(FVector(-Reach, -Reach, -TileReach), FVector(Reach, Reach, Top));
@@ -3290,9 +3334,9 @@ void ACSHouseActor::RebuildRoofTiles()
 
 	// 幂等短路：瓦是 (屋面 desc, 参数, 摆位) 的**纯函数** —— 不读门、不读地面、不读道路，
 	// 所以拿输入拼哈希是诚实的（摆件那条不行，它的锚点吃地面采样，只能拿产物拼）。
-	const TArray<int32> HashInput = {
+	TArray<int32> HashInput = {
 		int32(ComputePlacementHash() & 0x7FFFFFFF),
-		CSHouse_Q(FootprintSize.X, 1), CSHouse_Q(FootprintSize.Y, 1), CSHouse_Q(WallHeight, 1),
+		CSHouse_Q(WallHeight, 1),
 		CSHouse_Q(RoofPitch, 0.1), CSHouse_Q(RoofOverhang, 1), CSHouse_Q(RoofHeightOffset, 0.1),
 		CSHouse_Q(RoofTileRowPitch, 0.1), CSHouse_Q(RoofTileColumnPitch, 0.1),
 		CSHouse_Q(RoofTileRowOverlap, 0.01), CSHouse_Q(RoofTileColumnOverlap, 0.01),
@@ -3306,6 +3350,7 @@ void ACSHouseActor::RebuildRoofTiles()
 		CSHouse_Q(RoofTileAxes.NativeSize.Z, 0.1),
 		CSHouse_Q(RoofTileAxes.NativeCentre.X, 0.1), CSHouse_Q(RoofTileAxes.NativeCentre.Y, 0.1),
 		CSHouse_Q(RoofTileAxes.NativeCentre.Z, 0.1) };
+	CSHouse_AppendFootprintHash(HashInput, GetFootprint());
 	const uint32 NewHash = CSHouse_Hash(HashInput);
 	// 交接结果也进早退门（审查 B1）：容量比对挡的是"扩容后没重排"，交接结果还多挡一种 ——
 	// 包围盒变了、同一批 buffer 重新交出去的那一趟，重排一次是便宜的保险。
@@ -3405,15 +3450,16 @@ void ACSHouseActor::RebuildRoofFinials()
 	}
 
 	const FTransform Build = GetBuildTransform();
-	const TArray<int32> HashInput = {
+	TArray<int32> HashInput = {
 		int32(ComputePlacementHash() & 0x7FFFFFFF),
-		CSHouse_Q(FootprintSize.X, 1), CSHouse_Q(FootprintSize.Y, 1), CSHouse_Q(WallHeight, 1),
+		CSHouse_Q(WallHeight, 1),
 		CSHouse_Q(RoofPitch, 0.1), CSHouse_Q(RoofHeightOffset, 0.1),
 		CSHouse_Q(RoofFinialScale, 0.001), CSHouse_Q(RoofFinialSink, 0.1),
 		// 资产换了必须重建（同 `RoofTileMeshBuiltFrom` 的教训：只认一个 bool 会"换了资产什么都没发生"）。
 		int32(GetTypeHash(RoofFinialMesh) & 0x7FFFFFFF),
 		int32(GetTypeHash(RoofFinialMaterial) & 0x7FFFFFFF),
 		UpAxis, WantCount };
+	CSHouse_AppendFootprintHash(HashInput, GetFootprint());
 	const uint32 NewHash = CSHouse_Hash(HashInput);
 	// ⚠️ 组件数也要进短路条件：蓝图重跑构造脚本会把 transient 组件销毁，而形态哈希一个字没变 ——
 	// 只比哈希的话尖顶会**在重跑构造脚本后永久消失**（同 `EnsureRoofTileComponent` 开头那条）。
@@ -3561,13 +3607,15 @@ void ACSHouseActor::RebuildDoorLeaves()
 		return;
 	}
 
+	const FCSHouseFootprint Footprint = GetFootprint();
 	TArray<int32> HashInput = {
 		int32(ComputePlacementHash() & 0x7FFFFFFF),
-		CSHouse_Q(FootprintSize.X, 1), CSHouse_Q(FootprintSize.Y, 1), CSHouse_Q(WallThickness, 0.5),
+		CSHouse_Q(WallThickness, 0.5),
 		CSHouse_Q(DoorLeafWidthRatio, 0.001), CSHouse_Q(DoorLeafRise, 0.001),
 		CSHouse_Q(DoorLeafMaxStretch, 0.001), CSHouse_Q(DoorLeafInset, 0.1),
 		int32(GetTypeHash(DoorLeafMaterial) & 0x7FFFFFFF),
 		WantCount };
+	CSHouse_AppendFootprintHash(HashInput, Footprint);
 	// 档位表进哈希：换一张网格、加一档、或换了顺序都必须重建（同 `RoofTileMeshBuiltFrom` 的教训）。
 	for (const FLeafRank& Rank : Ranks) HashInput.Add(int32(GetTypeHash(Rank.Mesh) & 0x7FFFFFFF));
 	// 洞变了门扇就得跟着变。**逐洞进哈希**，只记洞数会漏掉"同样两个洞、其中一个变宽了"。
@@ -3618,7 +3666,7 @@ void ACSHouseActor::RebuildDoorLeaves()
 		if (!IsValid(Component)) continue;
 
 		const FCSWallOpening& Door = *Doors[Index];
-		const FCSHouseEdgeFrame F = CSHouse_GetEdge(Door.EdgeIndex, FootprintSize, WallThickness);
+		const FCSHouseEdgeFrame F = CSHouse_GetEdge(Door.EdgeIndex, Footprint, WallThickness);
 
 		// 门扇高：默认齐**起拱线**（拱顶那半圆留空，读作气窗）。矩形门扇顶到拱顶必然切角，
 		// 所以 `DoorLeafRise` 默认 0，要顶满得先有拱形门扇网格。
@@ -3835,7 +3883,7 @@ CSShaperSteps::EHandoverResult ACSHouseActor::EnsureDecorComponents()
 		MeshReach = FMath::Max(MeshReach, double(Buffers.BaseSphereRadius));
 	}
 	MeshReach *= FMath::Max(double(DecorScale) * (1.0 + double(DecorScaleJitter)), 0.05);
-	const double Reach = CSShaperSteps::QuantizeUp(FMath::Max(FootprintSize.X, FootprintSize.Y) * 0.6
+	const double Reach = CSShaperSteps::QuantizeUp(GetFootprint().GetCenteredSpan() * 0.6
 		+ Params.GateApproachDistance + Params.GateApproachSpread + MeshReach);
 	const double Top = CSShaperSteps::QuantizeUp(CSHouseRoof_RidgeZ(GetRoofDesc()) + Params.RoofStandOff + MeshReach);
 	// 下界也取 -Reach：摆件落在**地面**上，而房子坐在 footprint 内的最高点，
@@ -3908,11 +3956,12 @@ void ACSHouseActor::RebuildDecor()
 	TArray<int32> HashInput;
 	HashInput.Reserve(Anchors.Num() * 5 + 20);
 	HashInput.Append({ int32(ComputePlacementHash() & 0x7FFFFFFF), Anchors.Num(), Plan.TotalRecords(),
-		CSHouse_Q(FootprintSize.X, 1), CSHouse_Q(FootprintSize.Y, 1), CSHouse_Q(WallHeight, 1),
+		CSHouse_Q(WallHeight, 1),
 		CSHouse_Q(RoofPitch, 0.1), CSHouse_Q(RoofOverhang, 1),
 		CSHouse_Q(DecorWallFootSpacing, 0.5), CSHouse_Q(DecorEaveSpacing, 0.5),
 		CSHouse_Q(DecorMinSpacing, 0.5), CSHouse_Q(DecorRoadReject, 0.01),
 		CSHouse_Q(DecorScale, 0.01), CSHouse_Q(DecorScaleJitter, 0.01), DecorSeed });
+	CSHouse_AppendFootprintHash(HashInput, GetFootprint());
 	for (const CSHouseDecor::FAnchor& Anchor : Anchors)
 	{
 		HashInput.Append({ int32(Anchor.Family), Anchor.AnchorId,

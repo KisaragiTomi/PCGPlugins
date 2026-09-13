@@ -68,11 +68,8 @@ void ACSHouseHeightHandleActor::UpdateFrameGeometry()
 	const ACSHouseActor* H = Host.Get();
 	if (!H) return;
 
-	// 框是**包围盒的可视化**，口径就该是 footprint 本身。
-	//
-	// ⚠️ 这里**故意不问 `CSHouse_GetEdge`**（墙板/门框砖/藤蔓/摆件都问它）：那个函数给的是
-	// 墙外皮，且东西两面缩短了 2×WallThickness 以避开转角重叠 —— 拿它当框的边，四根条子会
-	// 缺角，框宽也不再是干净的 `footprint × FrameScale`。
+	// 框是**包围盒的可视化**：`FootprintSize` 就是 footprint 折线的包围盒（异形房子的形状被拉伸到它），
+	// 所以四根条子恒围成一个矩形、与房子有几条边无关。高度抓手只有一个自由度，框的形状不承载信息。
 	const FVector2D Frame = H->FootprintSize * double(FrameScale);
 	const FVector2D HalfFrame = Frame * 0.5;
 	constexpr double CubeSize = 100.0;   // 引擎 Cube 的边长

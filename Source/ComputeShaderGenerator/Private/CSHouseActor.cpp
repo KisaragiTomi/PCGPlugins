@@ -1215,8 +1215,28 @@ float ACSHouseActor::PushEdge(int32 EdgeIndex, float Offset, bool bFinished)
 {
 	FVector2D NewSize = FootprintSize;
 	FVector NewCentre = GetActorLocation();
-	const float Applied = CSHouse_ApplyEdgePush(NewSize, NewCentre, EdgeIndex,
-		float(GetActorRotation().Yaw), Offset, MinFootprint);
+	TArray<FVector2D> NewShape;
+	float Applied = 0.0f;
+
+	// 矩形（形状为空或退回矩形）走矩形版：那条的算术被 `House.EdgePush` 按位钉着，旧存档一位都不许变。
+	const FCSHouseFootprint Current = GetFootprint();
+	const bool bShaped = FootprintShape.Num() >= 3
+		&& !Current.EqualsApprox(FCSHouseFootprint::MakeRect(FootprintSize), 0.0);
+	if (!bShaped)
+	{
+		Applied = CSHouse_ApplyEdgePush(NewSize, NewCentre, EdgeIndex,
+			float(GetActorRotation().Yaw), Offset, MinFootprint);
+	}
+	else
+	{
+		// 异形：推完的折线已经按包围盒居中 ⇒ 它的包围盒就是新尺寸、它本身就是新形状
+		// （`FromShape` 会再拉伸一次，比例恰好是 1）。
+		FCSHouseFootprint Local = Current;
+		Applied = CSHouse_ApplyEdgePushPolyline(Local, NewCentre, EdgeIndex,
+			float(GetActorRotation().Yaw), Offset, MinFootprint);
+		NewSize = Local.GetBounds().GetSize();
+		NewShape = MoveTemp(Local.Verts);
+	}
 
 	// 尺寸没动就一步都不走：推到 MinFootprint 下限之后每帧都会走到这里，照常重求值的话
 	// 那一整段"墙拖不动"的时间里房子仍在无谓地重算门、砖、藤、摆件。
@@ -1225,6 +1245,7 @@ float ACSHouseActor::PushEdge(int32 EdgeIndex, float Offset, bool bFinished)
 	if (Applied != 0.0f)
 	{
 		FootprintSize = NewSize;
+		if (bShaped) FootprintShape = MoveTemp(NewShape);
 		// 中心与尺寸必须**同一帧**落地：只改其中一个，画面上就是"对侧墙也跟着走"，
 		// 与计划 D5 那个"拖 1 m 走 2 m"的父子回路缺陷逐像素相同，极易误诊到别处。
 		SetActorLocation(NewCentre);
@@ -1297,10 +1318,11 @@ void ACSHouseActor::EnterResizeMode()
 	// ⚠️ 顺序在两处生成里都一样：**先 attach 再 Initialize**。`InitializeHandle` 末尾的
 	// `SnapToCanonical` 写的是世界位置，attach 会把它换算成相对量；反过来的话抓手的相对位置
 	// 会被算成"世界原点到规范位置"，房子一移动抓手就飞了。
-	ResizeHandles.Reserve(5);
+	const int32 NumEdges = GetFootprint().NumEdges();
+	ResizeHandles.Reserve(NumEdges + 1);
 
-	// ① 四面墙各一个锥子：水平推拉，四个独立自由度 ⇒ 四个 actor。
-	for (int32 Edge = 0; Edge < 4; ++Edge)
+	// ① 每面墙一个锥子：水平推拉，每条边一个独立自由度 ⇒ 每条边一个 actor（矩形四个）。
+	for (int32 Edge = 0; Edge < NumEdges; ++Edge)
 	{
 		ACSHouseResizeHandleActor* Handle = World->SpawnActor<ACSHouseResizeHandleActor>(
 			GetActorLocation(), GetActorRotation(), SpawnParams);
@@ -1386,7 +1408,7 @@ TArray<ACSHouseHandleActor*> ACSHouseActor::GetResizeHandles() const
 TArray<ACSHouseResizeHandleActor*> ACSHouseActor::GetEdgeHandles() const
 {
 	TArray<ACSHouseResizeHandleActor*> Out;
-	Out.Reserve(4);
+	Out.Reserve(ResizeHandles.Num());
 	for (const TObjectPtr<ACSHouseHandleActor>& Handle : ResizeHandles)
 	{
 		if (ACSHouseResizeHandleActor* Edge = Cast<ACSHouseResizeHandleActor>(Handle)) Out.Add(Edge);
@@ -2957,7 +2979,10 @@ void ACSHouseActor::RebuildVine()
 		CSHouse_Q(GroundGapSummary, 1),
 		// 四坡以后四面墙顶一律平在 WallHeight（已在上面进哈希），屋面参数不再决定藤怎么排。
 		int32(ComputePlacementHash() & 0x7FFFFFFF) };
-	const uint32 NewHash = CSHouse_Hash(HashInput);
+	// 顶点表另拼：藤条沿每条边排，形状变了而包围盒尺寸没变时（异形房子改 `FootprintShape`）也必须重排。
+	TArray<int32> FootprintHash;
+	CSHouse_AppendFootprintHash(FootprintHash, GetFootprint());
+	const uint32 NewHash = HashCombine(CSHouse_Hash(HashInput), CSHouse_Hash(FootprintHash));
 
 	bool bBuffersReady = VineGpuBuffers.Num() == CSHouseVine::Palette_Num;
 	for (int32 Index = 0; bBuffersReady && Index < CSHouseVine::Palette_Num; ++Index)

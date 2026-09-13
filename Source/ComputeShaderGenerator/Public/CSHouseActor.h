@@ -242,22 +242,37 @@ public:
 	// Footprint / Body
 	// -------------------------------------------------------------------------
 
-	/** 底面尺寸 cm（X=长边候选，Y=短边候选）；位置/朝向用 actor transform（支持任意 yaw）。 */
+	/**
+	 * 底面**包围盒**尺寸 cm（局部 X / Y）；位置/朝向用 actor transform（支持任意 yaw）。
+	 * 矩形房子的包围盒就是它自己；异形房子由 `FootprintShape` 拉伸到这个尺寸。
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House", meta = (ClampMin = "100.0"))
 	FVector2D FootprintSize = FVector2D(600.0, 400.0);
 
 	/**
-	 * footprint 的**折线视图**（2026-09-12 裁决：矩形不是终局）。
+	 * footprint 的**形状**（2026-09-12 裁决：矩形不是终局）：一条闭合凸折线，坐标系任意 ——
+	 * 它的包围盒会被拉伸到 `FootprintSize`、居中到房心（`FCSHouseFootprint::FromShape`）。
+	 * **空 = 矩形**，旧存档与新放的房子都是空的。
 	 *
-	 * ⚠️ 3b 期间它是**派生量**：被编辑、被序列化、被 `PushEdge` 推的仍然是上面那个
-	 * `FootprintSize`，这里只是把它翻成四顶点闭合折线。让折线本身可编辑（于是能画出非矩形
-	 * 的房子）是 3a-2 的事，那时这两个量调个个儿：折线成为权威，`FootprintSize` 退役。
+	 * 为什么存"形状 + 尺寸"而不是一条厘米折线：写 `FootprintSize` 的旧路径（详情面板、蓝图、
+	 * `Scripts` 里的 `footprint_size`、拖边、测试）一条都不用改就在异形房子上成立，旧存档不需要
+	 * 迁移。代价是改尺寸会非等比地拉伸形状 —— 那正是"包围盒尺寸"这个量的本义。
 	 *
-	 * **按值返回**：四个顶点一次小分配。逐实例的热路径问的是 `CSHouse_GetEdge`（它在矩形
-	 * 重载里就地算顶点、不碰堆），不是这个 —— 调用方在循环外取一次即可。
+	 * 顶点按逆时针给（顺时针的会被翻过来）；第 k 条边从第 k 个顶点走到第 k+1 个，门窗锚点、
+	 * 拉尺寸抓手都按这个边号。**必须严格凸**：凹角、共线顶点、自交一律退回矩形（屋顶直骨架与
+	 * 接缝裁剪只对凸成立）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House")
+	TArray<FVector2D> FootprintShape;
+
+	/**
+	 * footprint 的**折线视图** = `FootprintShape` × `FootprintSize`。所有几何消费者只认它。
+	 *
+	 * **按值返回**：几个顶点一次小分配。逐实例的热路径问的是 `CSHouse_GetEdge`，
+	 * 不是这个 —— 调用方在循环外取一次即可。
 	 */
 	UFUNCTION(BlueprintPure, Category = "CS House")
-	FCSHouseFootprint GetFootprint() const { return FCSHouseFootprint::MakeRect(FootprintSize); }
+	FCSHouseFootprint GetFootprint() const { return FCSHouseFootprint::FromShape(FootprintShape, FootprintSize); }
 
 	/** 檐口高 cm。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House", meta = (ClampMin = "100.0"))

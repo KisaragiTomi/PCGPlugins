@@ -687,9 +687,10 @@ struct FCSHouseEdgeFrame
  * `In`，也是折线化之所以能不碰下游那一整类纯函数（clip 场、谓词、门段、包边、砖层、藤条、
  * 摆件锚点、门扇）的原因：它们只认 `(Start, U, In, Len)`，不认边数。
  *
- * 本类型目前**还不是序列化的权威** —— `ACSHouseActor::FootprintSize` 仍是被编辑的那个量，
- * 折线由它派生（`GetFootprint`）。顺序是先把所有消费者改成只认折线（3b / 3c / 3d / 3e / 3f），
- * 最后一期才让折线本身可编辑、可存盘 —— 反过来的话，中间会有一段「能画出非矩形、屋顶和接缝却还是矩形」的状态。
+ * 存盘的是**形状 + 尺寸**两个量（`ACSHouseActor::FootprintShape` / `FootprintSize`），本类型由
+ * `FromShape` 现组 —— 形状只管"长什么样"、尺寸只管包围盒多大，所以写 `FootprintSize` 的每一条
+ * 旧路径（详情面板、蓝图、脚本、拖边）在异形房子上照样成立，旧存档的空形状就是矩形、不需要迁移。
+ * 消费者一律只认本类型（3b–3e 改完），不认那两个存盘量。
  */
 USTRUCT(BlueprintType)
 struct COMPUTESHADERGENERATOR_API FCSHouseFootprint
@@ -827,6 +828,44 @@ struct COMPUTESHADERGENERATOR_API FCSHouseFootprint
 		FP.Verts.Add({ HX, -HY });
 		FP.Verts.Add({ HX, HY });
 		FP.Verts.Add({ -HX, HY });
+		return FP;
+	}
+
+	/**
+	 * **形状 × 尺寸 → footprint**（`ACSHouseActor::FootprintShape` × `FootprintSize`）。
+	 *
+	 * 形状是任意坐标系下的一条闭合折线：这里把它的**包围盒**拉伸到 `Size`、居中到原点；顺时针的
+	 * 翻成逆时针（首顶点不动）。于是形状只描述"长什么样"，大小永远由 `Size` 说了算 —— 拖尺寸、
+	 * 蓝图、脚本里写 `FootprintSize` 的每一条旧路径在异形房子上照样成立。
+	 *
+	 * 退回矩形的三种情形：形状少于 3 个点（空 = 矩形，旧存档就是这样）、包围盒退化、
+	 * 不是严格凸的（共线顶点、凹角、自交）—— 凹 footprint 还没有落地（屋顶直骨架与接缝裁剪都只对凸成立）。
+	 */
+	static FCSHouseFootprint FromShape(TConstArrayView<FVector2D> Shape, const FVector2D& Size)
+	{
+		const int32 N = Shape.Num();
+		if (N < 3) return MakeRect(Size);
+
+		FBox2D Box(ForceInit);
+		for (const FVector2D& V : Shape) Box += V;
+		const FVector2D Extent = Box.GetSize();
+		if (Extent.X <= UE_KINDA_SMALL_NUMBER || Extent.Y <= UE_KINDA_SMALL_NUMBER) return MakeRect(Size);
+		const FVector2D Centre = Box.GetCenter();
+
+		FCSHouseFootprint FP;
+		FP.Verts.Reserve(N);
+		for (const FVector2D& V : Shape)
+		{
+			FP.Verts.Add(FVector2D((V.X - Centre.X) / Extent.X * Size.X, (V.Y - Centre.Y) / Extent.Y * Size.Y));
+		}
+		if (FP.GetSignedArea() < 0.0)
+		{
+			FCSHouseFootprint Reversed;
+			Reversed.Verts.Reserve(N);
+			for (int32 Index = 0; Index < N; ++Index) Reversed.Verts.Add(FP.Verts[(N - Index) % N]);
+			FP = MoveTemp(Reversed);
+		}
+		if (!FP.IsStrictlyConvexCCW()) return MakeRect(Size);
 		return FP;
 	}
 };

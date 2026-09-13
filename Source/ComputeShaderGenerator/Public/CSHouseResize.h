@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "CSHouseProfile.h"   // FCSHouseFootprint / CSHouse_GetEdge —— 折线版推拉
 
 /**
  * 拉尺寸（计划 D5）的纯函数层：单边推拉。
@@ -68,5 +69,68 @@ inline float CSHouse_ApplyEdgePush(FVector2D& InOutSize, FVector& InOutCenter, i
 
 	if (bDrivesX) InOutSize.X = Desired; else InOutSize.Y = Desired;
 	InOutCenter += CSHouseResize_EdgeOuterWorld(EdgeIndex, YawDegrees) * (Applied * 0.5);
+	return float(Applied);
+}
+
+/**
+ * **折线版**单边推拉（footprint 折线化 3f）：第 `EdgeIndex` 条边沿自己的外法线平移，两端顶点沿
+ * 相邻两条边滑动（相邻边所在的直线不变）；之后把包围盒中心移回局部原点、actor 中心反向补上。
+ * 于是**除被推的那条边以外，每条边的世界位置都不变** —— 矩形版「对侧不动、中心随动」是它的特例。
+ *
+ * 下限三条，都只收住"往里推"或"推穿"：
+ *  ① 外法线方向上的宽度不低于 `MinFootprint`（矩形上就是被推的那一维，与矩形版逐字同一条）；
+ *  ② 两条相邻边不许被推到短于 1 cm（往里推时它们变短）；
+ *  ③ 被推的边本身不许短于 1 cm（锐角折线往外推时它变短）。
+ * 返回实际生效的位移，记账纪律与矩形版相同。
+ *
+ * 矩形房子（`FootprintShape` 为空）仍走上面的矩形版：那条的算术被 `House.EdgePush` 按位钉着；
+ * 两者在矩形上一致由 `House.EdgePushPolyline` 在容差内钉住。
+ */
+inline float CSHouse_ApplyEdgePushPolyline(FCSHouseFootprint& InOutLocal, FVector& InOutCenter, int32 EdgeIndex,
+	float YawDegrees, float Offset, float MinFootprint)
+{
+	const int32 N = InOutLocal.NumEdges();
+	if (N < 3 || EdgeIndex < 0 || EdgeIndex >= N) return 0.0f;
+	const FCSHouseEdgeFrame F = CSHouse_GetEdge(EdgeIndex, InOutLocal, 0.0f);
+	const FCSHouseEdgeFrame Prev = CSHouse_GetEdge((EdgeIndex + N - 1) % N, InOutLocal, 0.0f);
+	const FCSHouseEdgeFrame Next = CSHouse_GetEdge((EdgeIndex + 1) % N, InOutLocal, 0.0f);
+	if (F.Len <= 0.0f || Prev.Len <= 0.0f || Next.Len <= 0.0f) return 0.0f;
+	const FVector2D Normal(-F.In.X, -F.In.Y);
+
+	// ① 宽度：凸折线上被推的边就是外法线那一侧的支撑线，推 d 宽度恰好变 d。
+	double MinProj = TNumericLimits<double>::Max(), MaxProj = -TNumericLimits<double>::Max();
+	for (const FVector2D& V : InOutLocal.Verts)
+	{
+		const double P = FVector2D::DotProduct(V, Normal);
+		MinProj = FMath::Min(MinProj, P);
+		MaxProj = FMath::Max(MaxProj, P);
+	}
+	const double Current = MaxProj - MinProj;
+	double Applied = FMath::Max(Current + double(Offset), double(FMath::Max(MinFootprint, 1.0f))) - Current;
+
+	// 顶点沿相邻边滑动的速率：起点沿 Prev.U 走 d / CPrev，终点沿 Next.U 走 d / CNext。
+	// 凸角上 CPrev = sin(起点转角) > 0、CNext = −sin(终点转角) < 0；共线顶点速率发散，退化成沿法线平移。
+	const double CPrev = FVector2D::DotProduct(Prev.U, Normal);
+	const double CNext = FVector2D::DotProduct(Next.U, Normal);
+	constexpr double MinLen = 1.0;
+	if (CPrev > 1.0e-6) Applied = FMath::Max(Applied, (MinLen - double(Prev.Len)) * CPrev);      // ② 上一条边
+	if (CNext < -1.0e-6) Applied = FMath::Max(Applied, (MinLen - double(Next.Len)) * -CNext);    // ② 下一条边
+	// ③ 本边：两端沿本边方向各走 d·cot(转角)，合起来缩短 d·(cotA + cotB)。转角小于 90° 时往外推变短，
+	//    大于 90°（锐角折线）时往里推变短，两个方向各收一次。矩形上 cot 90° = 0，这条不起作用。
+	const double Shrink = (CPrev > 1.0e-6 ? FVector2D::DotProduct(Prev.U, F.U) / CPrev : 0.0)
+		- (CNext < -1.0e-6 ? FVector2D::DotProduct(Next.U, F.U) / CNext : 0.0);
+	if (Shrink > 1.0e-9) Applied = FMath::Min(Applied, FMath::Max((double(F.Len) - MinLen) / Shrink, 0.0));
+	else if (Shrink < -1.0e-9) Applied = FMath::Max(Applied, FMath::Min((double(F.Len) - MinLen) / Shrink, 0.0));
+	if (Applied == 0.0) return 0.0f;   // 幂等早退：Offset=0 连调 N 次不许改动任何量
+
+	const int32 Start = EdgeIndex;
+	const int32 End = (EdgeIndex + 1) % N;
+	InOutLocal.Verts[Start] += CPrev > 1.0e-6 ? Prev.U * (Applied / CPrev) : Normal * Applied;
+	InOutLocal.Verts[End] += CNext < -1.0e-6 ? Next.U * (Applied / CNext) : Normal * Applied;
+
+	// 包围盒中心回到局部原点，actor 中心补同一段（世界量：过 yaw）。
+	const FVector2D Centre = InOutLocal.GetBounds().GetCenter();
+	for (FVector2D& V : InOutLocal.Verts) V -= Centre;
+	InOutCenter += FRotator(0.0, double(YawDegrees), 0.0).RotateVector(FVector(Centre.X, Centre.Y, 0.0));
 	return float(Applied);
 }

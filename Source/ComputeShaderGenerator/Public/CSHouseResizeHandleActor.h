@@ -58,7 +58,7 @@ public:
 	 */
 	void InitializeHandle(ACSHouseActor* InHost, int32 InEdgeIndex);
 
-	/** 0 南 1 东 2 北 3 西，与 `CSHouse_GetEdge` / `CSHouseResize_EdgeOuterLocal` 同号。 */
+	/** footprint 的边号，与 `CSHouse_GetEdge` 同号（矩形上 0 南 1 东 2 北 3 西）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Resize")
 	int32 GetEdgeIndex() const { return EdgeIndex; }
 

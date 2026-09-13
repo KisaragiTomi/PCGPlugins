@@ -400,6 +400,176 @@ bool FCSHouseEdgePushTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+namespace
+{
+/** 正 N 边形（逆时针，首顶点在 +X 轴上）。 */
+TArray<FVector2D> CSHouseTest_RegularPolygon(int32 N, double Radius)
+{
+	TArray<FVector2D> Verts;
+	for (int32 i = 0; i < N; ++i)
+	{
+		const double A = UE_DOUBLE_TWO_PI * double(i) / double(N);
+		Verts.Add(FVector2D(Radius * FMath::Cos(A), Radius * FMath::Sin(A)));
+	}
+	return Verts;
+}
+
+/** 第 Edge 条边所在直线的世界表示：(世界外法线, 直线沿外法线离世界原点多远)。 */
+void CSHouseTest_WorldEdgeLine(const FCSHouseFootprint& Local, const FVector& Centre, float Yaw, int32 Edge,
+	FVector2D& OutNormal, double& OutOffset)
+{
+	const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Local, 0.0f);
+	const FRotator R(0.0, double(Yaw), 0.0);
+	const FVector N = R.RotateVector(FVector(-F.In.X, -F.In.Y, 0.0));
+	const FVector P = Centre + R.RotateVector(FVector(F.Start.X, F.Start.Y, 0.0));
+	OutNormal = FVector2D(N.X, N.Y);
+	OutOffset = FVector2D::DotProduct(FVector2D(P.X, P.Y), OutNormal);
+}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseEdgePushPolylineTest,
+	"PCGPlugins.ComputeShaderGenerator.House.EdgePushPolyline",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseEdgePushPolylineTest::RunTest(const FString& Parameters)
+{
+	// footprint 折线化 3f：推一条边 = 这条边沿外法线平移、两端沿相邻边滑、包围盒回到房心。
+	// 不变量从「对侧墙不动」推广成「**除被推的那条以外每条边的世界直线都不动**」。
+
+	// ---- ① 矩形上与矩形版一致（矩形房子仍走矩形版，这条钉住两者没有分叉）----
+	for (int32 Edge = 0; Edge < 4; ++Edge)
+	{
+		for (double Delta : { 123.0, -50.0, -1000.0 })
+		{
+			constexpr float Yaw = 37.0f;
+			FVector2D Size(600.0, 400.0);
+			FVector RectCentre(1000.0, 2000.0, 50.0);
+			const float RectApplied = CSHouse_ApplyEdgePush(Size, RectCentre, Edge, Yaw, float(Delta), 200.0f);
+
+			FCSHouseFootprint Poly = FCSHouseFootprint::MakeRect(FVector2D(600.0, 400.0));
+			FVector PolyCentre(1000.0, 2000.0, 50.0);
+			const float PolyApplied = CSHouse_ApplyEdgePushPolyline(Poly, PolyCentre, Edge, Yaw, float(Delta), 200.0f);
+
+			TestEqual(FString::Printf(TEXT("rect edge %d delta %.0f: same applied offset"), Edge, Delta),
+				double(PolyApplied), double(RectApplied), 1.0e-3);
+			TestTrue(FString::Printf(TEXT("rect edge %d delta %.0f: same size"), Edge, Delta),
+				Poly.GetBounds().GetSize().Equals(Size, 1.0e-3));
+			TestTrue(FString::Printf(TEXT("rect edge %d delta %.0f: same centre"), Edge, Delta),
+				PolyCentre.Equals(RectCentre, 1.0e-3));
+			TestTrue(FString::Printf(TEXT("rect edge %d delta %.0f: still the centred rectangle"), Edge, Delta),
+				Poly.EqualsApprox(FCSHouseFootprint::MakeRect(Size), 1.0e-3));
+		}
+	}
+
+	// ---- ② 六边形：被推的边走 Δ，其余五条边的世界直线一条都不动 ----
+	{
+		constexpr float Yaw = 23.0f;
+		constexpr double Delta = 60.0;
+		FCSHouseFootprint Hex;
+		Hex.Verts = CSHouseTest_RegularPolygon(6, 300.0);
+		FVector Centre(500.0, -200.0, 10.0);
+
+		TArray<FVector2D> NormalsBefore;
+		TArray<double> OffsetsBefore;
+		for (int32 Edge = 0; Edge < 6; ++Edge)
+		{
+			FVector2D N; double O = 0.0;
+			CSHouseTest_WorldEdgeLine(Hex, Centre, Yaw, Edge, N, O);
+			NormalsBefore.Add(N);
+			OffsetsBefore.Add(O);
+		}
+
+		const float Applied = CSHouse_ApplyEdgePushPolyline(Hex, Centre, 2, Yaw, float(Delta), 200.0f);
+		TestEqual(TEXT("hexagon: the push applies in full"), double(Applied), Delta, 1.0e-4);
+		for (int32 Edge = 0; Edge < 6; ++Edge)
+		{
+			FVector2D N; double O = 0.0;
+			CSHouseTest_WorldEdgeLine(Hex, Centre, Yaw, Edge, N, O);
+			TestTrue(FString::Printf(TEXT("hexagon: edge %d keeps its direction"), Edge), N.Equals(NormalsBefore[Edge], 1.0e-9));
+			const double Want = OffsetsBefore[Edge] + (Edge == 2 ? Delta : 0.0);
+			TestTrue(FString::Printf(TEXT("hexagon: edge %d line %s (%.6f vs %.6f)"), Edge,
+				Edge == 2 ? TEXT("moves by the push") : TEXT("stays put"), O, Want), FMath::IsNearlyEqual(O, Want, 1.0e-6));
+		}
+		TestTrue(TEXT("hexagon: still strictly convex"), Hex.IsStrictlyConvexCCW());
+		TestTrue(TEXT("hexagon: bounding box recentred on the local origin"),
+			Hex.GetBounds().GetCenter().Equals(FVector2D::ZeroVector, 1.0e-9));
+	}
+
+	// ---- ③ 下限：宽度（MinFootprint）、相邻边推穿、被推的边推没 ----
+	{
+		const double Sin60 = FMath::Sin(UE_DOUBLE_PI / 3.0);
+		const double Width = 2.0 * 300.0 * FMath::Cos(UE_DOUBLE_PI / 6.0);
+
+		// 宽度先卡住：MinFootprint 450 < 宽度 519.6，而相邻边要到 −258.9 才被推穿。
+		{
+			FCSHouseFootprint Hex;
+			Hex.Verts = CSHouseTest_RegularPolygon(6, 300.0);
+			FVector Centre = FVector::ZeroVector;
+			const float Applied = CSHouse_ApplyEdgePushPolyline(Hex, Centre, 0, 0.0f, -1000.0f, 450.0f);
+			TestEqual(TEXT("hexagon: the width floor holds"), double(Applied), 450.0 - Width, 1.0e-3);
+		}
+		// 相邻边先卡住：MinFootprint 200 太松，往里推到两条相邻边只剩 1 cm 为止。
+		{
+			FCSHouseFootprint Hex;
+			Hex.Verts = CSHouseTest_RegularPolygon(6, 300.0);
+			FVector Centre = FVector::ZeroVector;
+			const float Applied = CSHouse_ApplyEdgePushPolyline(Hex, Centre, 0, 0.0f, -1000.0f, 200.0f);
+			TestEqual(TEXT("hexagon: neighbours are not pushed through"), double(Applied), (1.0 - 300.0) * Sin60, 1.0e-3);
+			TestEqual(TEXT("hexagon: the previous edge keeps 1 cm"), double(CSHouse_GetEdge(5, Hex, 0.0f).Len), 1.0, 1.0e-3);
+			TestEqual(TEXT("hexagon: the next edge keeps 1 cm"), double(CSHouse_GetEdge(1, Hex, 0.0f).Len), 1.0, 1.0e-3);
+			TestTrue(TEXT("hexagon: pushed to the neighbour limit it is still convex"), Hex.IsStrictlyConvexCCW());
+		}
+		// 往外推：60° 转角上被推的边两头各缩 d·cot60°，推到只剩 1 cm 为止。
+		{
+			FCSHouseFootprint Hex;
+			Hex.Verts = CSHouseTest_RegularPolygon(6, 300.0);
+			FVector Centre = FVector::ZeroVector;
+			const float Applied = CSHouse_ApplyEdgePushPolyline(Hex, Centre, 0, 0.0f, 1000.0f, 200.0f);
+			const double Cot60 = 1.0 / FMath::Tan(UE_DOUBLE_PI / 3.0);
+			TestEqual(TEXT("hexagon: the pushed edge is not pushed out of existence"), double(Applied), 299.0 / (2.0 * Cot60), 1.0e-3);
+			TestEqual(TEXT("hexagon: the pushed edge keeps 1 cm"), double(CSHouse_GetEdge(0, Hex, 0.0f).Len), 1.0, 1.0e-3);
+		}
+		// 幂等：Offset = 0 一位都不许动。
+		{
+			FCSHouseFootprint Hex;
+			Hex.Verts = CSHouseTest_RegularPolygon(6, 300.0);
+			const FCSHouseFootprint Before = Hex;
+			FVector Centre(1.0, 2.0, 3.0);
+			TestEqual(TEXT("hexagon: a zero push applies zero"), CSHouse_ApplyEdgePushPolyline(Hex, Centre, 3, 11.0f, 0.0f, 200.0f), 0.0f);
+			TestTrue(TEXT("hexagon: a zero push leaves the polyline bit for bit"), Hex.EqualsApprox(Before, 0.0));
+			TestTrue(TEXT("hexagon: a zero push leaves the centre bit for bit"), Centre == FVector(1.0, 2.0, 3.0));
+		}
+	}
+
+	// ---- ④ 形状 × 尺寸：任意坐标系、顺时针也行；凹的、退化的退回矩形 ----
+	{
+		const FVector2D Size(600.0, 519.6152422706632);
+		TArray<FVector2D> Shape = CSHouseTest_RegularPolygon(6, 3.0);
+		for (FVector2D& V : Shape) V += FVector2D(7.0, -3.0);                       // 任意坐标系
+		TArray<FVector2D> Clockwise;
+		for (int32 i = 0; i < Shape.Num(); ++i) Clockwise.Add(Shape[(Shape.Num() - i) % Shape.Num()]);
+
+		const FCSHouseFootprint FromCCW = FCSHouseFootprint::FromShape(Shape, Size);
+		const FCSHouseFootprint FromCW = FCSHouseFootprint::FromShape(Clockwise, Size);
+		TestEqual(TEXT("FromShape keeps the vertex count"), FromCCW.NumEdges(), 6);
+		TestTrue(TEXT("FromShape stretches the bounding box to the size"), FromCCW.GetBounds().GetSize().Equals(Size, 1.0e-6));
+		TestTrue(TEXT("FromShape centres the bounding box on the origin"), FromCCW.GetBounds().GetCenter().Equals(FVector2D::ZeroVector, 1.0e-6));
+		FCSHouseFootprint Expected;
+		Expected.Verts = CSHouseTest_RegularPolygon(6, 300.0);
+		TestTrue(TEXT("FromShape reproduces the hexagon of that size"), FromCCW.EqualsApprox(Expected, 1.0e-6));
+		TestTrue(TEXT("a clockwise shape comes out counter-clockwise with its first vertex kept"),
+			FromCW.EqualsApprox(FromCCW, 1.0e-9));
+
+		TArray<FVector2D> LShape = { FVector2D(0, 0), FVector2D(2, 0), FVector2D(2, 1), FVector2D(1, 1), FVector2D(1, 2), FVector2D(0, 2) };
+		TestTrue(TEXT("a concave shape falls back to the rectangle"),
+			FCSHouseFootprint::FromShape(LShape, Size).EqualsApprox(FCSHouseFootprint::MakeRect(Size), 0.0));
+		TestTrue(TEXT("an empty shape is the rectangle bit for bit"),
+			FCSHouseFootprint::FromShape(TArray<FVector2D>(), Size).EqualsApprox(FCSHouseFootprint::MakeRect(Size), 0.0));
+	}
+	return true;
+}
+
 // -----------------------------------------------------------------------------
 // 边缘线段分割：等分、护角、最小宽度早退
 // -----------------------------------------------------------------------------
@@ -4820,6 +4990,97 @@ bool FCSHouseResizeHandleTest::RunTest(const FString& Parameters)
 		}
 	}
 
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// 异形房子的拉尺寸抓手（footprint 折线化 3f）：一条边一个锥子，推一条边其余墙不动
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseResizeHandlePolylineTest,
+	"PCGPlugins.ComputeShaderGenerator.House.ResizeHandlePolyline",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseResizeHandlePolylineTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	constexpr float Yaw = 37.0f;
+	ACSHouseActor* House = World->SpawnActor<ACSHouseActor>(FVector(1000.0, 2000.0, 0.0), FRotator(0.0f, Yaw, 0.0f));
+	if (!TestNotNull(TEXT("House"), House)) return false;
+	House->Windows.Reset();
+	House->FootprintShape = CSHouseTest_RegularPolygon(6, 1.0);
+	House->FootprintSize = FVector2D(600.0, 519.6152422706632);
+	House->MinFootprint = 200.0f;
+	House->ReevaluateSite();
+
+	const FCSHouseFootprint Before = House->GetFootprint();
+	if (!TestEqual(TEXT("the shaped house really is a hexagon"), Before.NumEdges(), 6)) return false;
+
+	House->EnterResizeMode();
+	TestEqual(TEXT("seven handles: six cones plus the height frame"), House->GetResizeHandles().Num(), 7);
+	TArray<ACSHouseResizeHandleActor*> Handles = House->GetEdgeHandles();
+	if (!TestEqual(TEXT("one cone per hexagon edge"), Handles.Num(), 6)) return false;
+
+	TSet<int32> Edges;
+	ACSHouseResizeHandleActor* Pushed = nullptr;
+	for (ACSHouseResizeHandleActor* Handle : Handles)
+	{
+		if (!TestNotNull(TEXT("Handle"), Handle)) return false;
+		Edges.Add(Handle->GetEdgeIndex());
+		if (Handle->GetEdgeIndex() == 4) Pushed = Handle;
+
+		// 锥子在自己那面墙外皮中点再往外 HandleOffset。
+		const FCSHouseEdgeFrame F = CSHouse_GetEdge(Handle->GetEdgeIndex(), Before, House->WallThickness);
+		const FVector2D MidLocal = F.Start + F.U * (F.Len * 0.5f);
+		const FVector WallMid = House->GetActorTransform().TransformPosition(FVector(MidLocal.X, MidLocal.Y, 0.0));
+		const FVector Outer = Handle->GetOuterNormalWorld();
+		TestTrue(FString::Printf(TEXT("cone %d points along its wall's outer normal"), Handle->GetEdgeIndex()),
+			Outer.Equals(FRotator(0.0, Yaw, 0.0).RotateVector(FVector(-F.In.X, -F.In.Y, 0.0)), 1.0e-6));
+		TestEqual(FString::Printf(TEXT("cone %d sits HandleOffset outside its wall"), Handle->GetEdgeIndex()),
+			FVector::DotProduct(Handle->GetActorLocation() - WallMid, Outer), double(Handle->HandleOffset), 1.0e-2);
+	}
+	TestEqual(TEXT("the six cones cover six distinct edges"), Edges.Num(), 6);
+	if (!TestNotNull(TEXT("cone on edge 4"), Pushed)) return false;
+
+	TArray<FVector2D> NormalsBefore;
+	TArray<double> OffsetsBefore;
+	for (int32 Edge = 0; Edge < 6; ++Edge)
+	{
+		FVector2D N; double O = 0.0;
+		CSHouseTest_WorldEdgeLine(Before, House->GetActorLocation(), Yaw, Edge, N, O);
+		NormalsBefore.Add(N);
+		OffsetsBefore.Add(O);
+	}
+
+	constexpr double Delta = 60.0;
+	Pushed->SetActorLocation(Pushed->GetActorLocation() + Pushed->GetOuterNormalWorld() * Delta);
+	const float Applied = Pushed->ConsumeDragToHost(false);
+	TestEqual(TEXT("a 60 cm drag applies 60 cm"), double(Applied), Delta, 1.0e-2);
+	TestEqual(TEXT("the pushed house keeps its six-vertex shape"), House->FootprintShape.Num(), 6);
+
+	const FCSHouseFootprint After = House->GetFootprint();
+	TestEqual(TEXT("the pushed footprint still has six edges"), After.NumEdges(), 6);
+	for (int32 Edge = 0; Edge < FMath::Min(6, After.NumEdges()); ++Edge)
+	{
+		FVector2D N; double O = 0.0;
+		CSHouseTest_WorldEdgeLine(After, House->GetActorLocation(), Yaw, Edge, N, O);
+		const double Want = OffsetsBefore[Edge] + (Edge == 4 ? Delta : 0.0);
+		TestTrue(FString::Printf(TEXT("world wall %d %s (%.4f vs %.4f)"), Edge,
+			Edge == 4 ? TEXT("moves by the drag") : TEXT("stays put"), O, Want),
+			N.Equals(NormalsBefore[Edge], 1.0e-6) && FMath::IsNearlyEqual(O, Want, 1.0e-2));
+	}
+	for (const ACSHouseResizeHandleActor* Handle : House->GetEdgeHandles())
+	{
+		TestTrue(FString::Printf(TEXT("cone %d is back on its canonical spot"), Handle->GetEdgeIndex()),
+			Handle->GetActorLocation().Equals(Handle->ComputeCanonicalWorldLocation(), 1.0e-2));
+	}
+
+	House->ExitResizeMode();
+	TestEqual(TEXT("leaving resize mode destroys every handle"), House->GetResizeHandles().Num(), 0);
+	World->DestroyActor(House);
 	return true;
 }
 

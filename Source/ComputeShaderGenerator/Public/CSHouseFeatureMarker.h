@@ -291,7 +291,7 @@ protected:
 	 *
 	 * ⚠️ 2026-09-06 起入参是锚点而不是命中：诉求必须从锚点派生，"房子变了 → 锚点不动 →
 	 * 诉求跟着新墙重算"才成立。拿命中去算的话，房子一改尺寸诉求就停在陈旧的弧长上。
-	 * `CenterS` 用 `CSHouse_AnchorS(InAnchor, Host.FootprintSize, Host.WallThickness)` 取。
+	 * `CenterS` 用 `CSHouse_AnchorS(InAnchor, Host.GetFootprint(), Host.WallThickness)` 取。
 	 */
 	virtual FCSHouseWindow MakeDemand(const FCSWallAnchor& InAnchor, const ACSHouseActor& InHost) const
 		PURE_VIRTUAL(ACSHouseFeatureMarker::MakeDemand, return FCSHouseWindow(););

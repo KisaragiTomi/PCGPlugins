@@ -1,8 +1,7 @@
 #include "CSHouseResizeHandleActor.h"
 
 #include "CSHouseActor.h"
-#include "CSHouseProfile.h"   // CSHouse_GetEdge —— 墙在哪儿只有这一个真源
-#include "CSHouseResize.h"    // CSHouseResize_EdgeOuterLocal / _EdgeOuterWorld
+#include "CSHouseProfile.h"   // CSHouse_GetEdge —— 墙在哪儿、朝哪儿只有这一个真源
 #include "Components/StaticMeshComponent.h"
 #include "Components/SceneComponent.h"
 #include "Engine/StaticMesh.h"
@@ -30,17 +29,11 @@ ACSHouseResizeHandleActor::ACSHouseResizeHandleActor()
 void ACSHouseResizeHandleActor::InitializeHandle(ACSHouseActor* InHost, int32 InEdgeIndex)
 {
 	SetHost(InHost);
-	EdgeIndex = InEdgeIndex & 3;
+	// 边号不取模：折线有几条边就有几个抓手（`EnterResizeMode`），越界的边号在下面的
+	// `CSHouse_GetEdge` 里给出零长框架，抓手原地不动、推拉不生效。
+	EdgeIndex = InEdgeIndex;
 
-	// 锥子指向房外：把它的 +Z 转到**局部**外法线上。用局部量而不是世界量，房子整体旋转时
-	// attach 会自动带着走 —— 存世界朝向的话每次转房子都得回来补一次。
-	if (ArrowComponent)
-	{
-		const FVector2D N = CSHouseResize_EdgeOuterLocal(EdgeIndex);
-		ArrowComponent->SetRelativeRotation(FRotationMatrix::MakeFromZ(FVector(N.X, N.Y, 0.0)).Rotator());
-
-		ApplyHighlightMaterial(ArrowComponent);
-	}
+	if (ArrowComponent) ApplyHighlightMaterial(ArrowComponent);
 
 	SnapToCanonical();
 }
@@ -49,7 +42,10 @@ FVector ACSHouseResizeHandleActor::GetOuterNormalWorld() const
 {
 	const ACSHouseActor* H = Host.Get();
 	if (!H) return FVector::ZeroVector;
-	return CSHouseResize_EdgeOuterWorld(EdgeIndex, float(H->GetActorRotation().Yaw));
+	// 局部外法线 = −In（`CSHouse_GetEdge`），矩形上逐位等于原来的 `CSHouseResize_EdgeOuterLocal`。
+	const FCSHouseEdgeFrame F = CSHouse_GetEdge(EdgeIndex, H->GetFootprint(), H->WallThickness);
+	if (F.Len <= 0.0f) return FVector::ZeroVector;
+	return FRotator(0.0, H->GetActorRotation().Yaw, 0.0).RotateVector(FVector(-F.In.X, -F.In.Y, 0.0));
 }
 
 FVector ACSHouseResizeHandleActor::ComputeCanonicalWorldLocation() const
@@ -62,9 +58,10 @@ FVector ACSHouseResizeHandleActor::ComputeCanonicalWorldLocation() const
 	// 墙外皮中心：`CSHouse_GetEdge` 的线段中点沿外法线推 HandleOffset。**不另起一套口径** ——
 	// 墙板、门框砖、藤蔓、摆件全都问这一个函数，抓手再抄一份的症状是改了 WallThickness
 	// 之后抓手悬在离墙半个墙厚的空中。
-	const FCSHouseEdgeFrame F = CSHouse_GetEdge(EdgeIndex, H->FootprintSize, H->WallThickness);
+	const FCSHouseEdgeFrame F = CSHouse_GetEdge(EdgeIndex, H->GetFootprint(), H->WallThickness);
+	if (F.Len <= 0.0f) return GetActorLocation();
 	const FVector2D MidLocal = F.Start + F.U * (F.Len * 0.5f);
-	const FVector2D OuterLocal = CSHouseResize_EdgeOuterLocal(EdgeIndex);
+	const FVector2D OuterLocal(-F.In.X, -F.In.Y);
 	const FVector2D OutLocal = MidLocal + OuterLocal * HandleOffset;
 
 	const FVector Local(OutLocal.X, OutLocal.Y, H->WallHeight * HandleHeightFraction);
@@ -81,6 +78,15 @@ void ACSHouseResizeHandleActor::SnapToCanonical()
 	if (const ACSHouseActor* H = Host.Get())
 	{
 		SetActorRotation(H->GetActorRotation());
+
+		// 锥子指向房外：把它的 +Z 转到**局部**外法线上。用局部量而不是世界量，房子整体旋转时
+		// attach 会自动带着走。每次归位都重算 —— 异形房子推一条边，相邻边不动但形状变了，
+		// 改的是 `FootprintShape` 而边号不变，外法线仍可能因为有人在详情面板里改了形状而变。
+		const FCSHouseEdgeFrame F = CSHouse_GetEdge(EdgeIndex, H->GetFootprint(), H->WallThickness);
+		if (ArrowComponent && F.Len > 0.0f)
+		{
+			ArrowComponent->SetRelativeRotation(FRotationMatrix::MakeFromZ(FVector(-F.In.X, -F.In.Y, 0.0)).Rotator());
+		}
 	}
 
 	// 记账量与摆位**必须一起更新**：只摆位不重置，下一次 PostEditMove 会把程序刚制造的

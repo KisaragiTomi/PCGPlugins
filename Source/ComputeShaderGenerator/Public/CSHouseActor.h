@@ -1943,6 +1943,10 @@ public:
 	static float ComputeDoorWidthScale(float GapMax, float GapFull, float GapZero);
 
 	//~ AActor interface（OnConstruction → ReevaluateSite 在基类）
+	/** 旧存档的弧长口径迁移（见 `WallSConvention`）。 */
+	virtual void PostLoad() override;
+	/** 新生成的房子直接写斜接口径 —— 没有旧数据可迁移。 */
+	virtual void PostActorCreated() override;
 	virtual void PostRegisterAllComponents() override;
 	/** 编辑器 world 里删房子只走这一条（那个 world 没有 begun play）—— 拉尺寸抓手在这里收。 */
 	virtual void Destroyed() override;
@@ -2516,6 +2520,21 @@ private:
 	/** 稳定身份，随关卡序列化；首次注册时生成。 */
 	UPROPERTY()
 	FGuid HouseId;
+
+	/**
+	 * 本房子存盘数据的**弧长口径**。0 = 直角对接（2026-09-13 之前），1 = 斜接。
+	 *
+	 * 口径换了，存下来的绝对弧长就要换算：`Windows` 表里奇数边的 `CenterS` 从缩进 `T` 的那一点
+	 * 量起，斜接之后要补一个 `T`；门段记忆 `DoorRunMemory` 存的是环参数，而环长随奇数边变长了
+	 * `4T`，旧值落在错的位置上（迟回门槛 32 cm 可能在 32–40 cm 宽的路上放出一道持久的幻门），
+	 * 连同 `PierSpanIsPier` 一起清掉，下一轮重判。标记的锚点不在这里迁，它自带口径字段
+	 * （`FCSWallAnchor::SConvention`），在 `CSHouse_AnchorS` 里就地换算。
+	 *
+	 * ⚠️ **默认必须是 0**：这个字段是后加的，旧存档里没有它，读进来拿到的是默认值。新生成的
+	 * actor 在 `PostActorCreated` 里写 1。
+	 */
+	UPROPERTY()
+	int32 WallSConvention = 0;
 
 	FDelegateHandle GroundChangedHandle;
 	bool bInReevaluate = false; // SetActorZ 落座引发的重入保护

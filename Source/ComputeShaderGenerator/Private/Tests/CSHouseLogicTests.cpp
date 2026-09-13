@@ -3120,8 +3120,9 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FCSHouseTrimTilesPerimeterTest::RunTest(const FString& Parameters)
 {
-	// 无洞时四条边各出一段，合起来正好铺满周界（四段之和 = 2X + 2Y，因为 1/3 号墙
-	// 两端各内缩一个墙厚、而 0/2 号墙跑满 —— 与房体面板同一套 `CSHouse_GetEdge` 分法）。
+	// 无洞时四条边各出一段，合起来正好铺满中线周界。砖路走墙厚正中，所以每段取**中线处的
+	// 斜接区间** `[T/2, L - T/2]`：两条边的砖在角平分线上相遇（2026-09-13 起；之前是 0/2 号墙
+	// 跑满、1/3 号墙两端各缩 T 的直角对接，两种分法的总长恰好相等，都是 2X + 2Y - 4T）。
 	const FVector2D Footprint(600.0, 400.0);
 	const float T = 24.0f;
 
@@ -3148,12 +3149,12 @@ bool FCSHouseTrimTilesPerimeterTest::RunTest(const FString& Parameters)
 	{
 		Total += R.Span();
 		Edges.Add(R.EdgeIndex);
-		TestTrue(FString::Printf(TEXT("run on edge %d starts at the edge start"), R.EdgeIndex),
-			FMath::IsNearlyZero(R.S0, 0.01f));
+		TestTrue(FString::Printf(TEXT("run on edge %d starts at the mid-thickness mitre point (%.3f)"), R.EdgeIndex, R.S0),
+			FMath::IsNearlyEqual(R.S0, T * 0.5f, 0.01f));
 	}
 	TestEqual(TEXT("all four edges are covered"), Edges.Num(), 4);
-	// 0/2 号墙跑满 X，1/3 号墙是 Y − 2T。
-	const double Expect = 2.0 * Footprint.X + 2.0 * (Footprint.Y - 2.0 * T);
+	// 每条边 L - T（两端各让半个墙厚）=> 2(X - T) + 2(Y - T)。
+	const double Expect = 2.0 * (Footprint.X - T) + 2.0 * (Footprint.Y - T);
 	TestTrue(FString::Printf(TEXT("the runs tile the perimeter (%.1f vs %.1f)"), Total, Expect),
 		FMath::IsNearlyEqual(Total, Expect, 0.01));
 
@@ -3429,9 +3430,15 @@ bool FCSHouseBrickWallTest::RunTest(const FString& Parameters)
 		const int32 Budget = CSHouseBrickWall::EstimateBricks(FCSHouseFootprint::MakeRect(Footprint), T, Courses, Params.Length);
 		TestTrue(FString::Printf(TEXT("the estimate is an upper bound (%d <= %d)"), NoHoleBricks, Budget),
 			NoHoleBricks <= Budget);
-		// 上界就是"周长 / 砖长 × 层数"，别留魔数：这里现算一遍对答案。
+		// 上界就是"中线周长 / 砖长 × 层数"，别留魔数：这里现算一遍对答案。周长取中线处的斜接
+		// 区间（与 `BuildBand` 真正铺砖的区间同一个口径），不是外皮全长 `Len`。
 		float Perimeter = 0.0f;
-		for (int32 Edge = 0; Edge < 4; ++Edge) Perimeter += CSHouse_GetEdge(Edge, Footprint, T).Len;
+		for (int32 Edge = 0; Edge < 4; ++Edge)
+		{
+			float S0 = 0.0f, S1 = 0.0f;
+			CSHouse_GetEdge(Edge, Footprint, T).SpanAtDepth(T * 0.5f, T, S0, S1);
+			Perimeter += S1 - S0;
+		}
 		TestEqual(TEXT("the budget is perimeter / brick length x courses"),
 			Budget, FMath::CeilToInt(Perimeter / Params.Length) * Courses.Count);
 
@@ -4618,19 +4625,17 @@ bool FCSHouseMarkerDragBatchTest::RunTest(const FString& Parameters)
 }
 
 // -----------------------------------------------------------------------------
-// footprint 折线化（3a-1）：折线是唯一算法，矩形是它的特例且逐位复现
+// footprint 折线化（3a-2）：转角斜接 —— 面板沿角平分线相接，凸凹两种角都成立
 // -----------------------------------------------------------------------------
 
 namespace
 {
 /**
- * 折线化之前 `CSHouse_GetEdge` 的**原样冻结副本**，只服务下面那条等价性断言。
- *
- * 冻结而不是调产线代码：要证的正是「换了实现之后这四条边一位都没动」，拿产线自己比自己
- * 等于什么都没证。3a-2 换成斜接、四条边**应当**改变时，这条测试会红 —— 那时连同本副本
- * 一起删掉，换成斜接自己的判据（转角方块沿角平分线均分）。
+ * 斜接之前 `CSHouse_GetEdge` 的**原样冻结副本**（直角对接：偶数边吃下转角方块、奇数边两端各缩
+ * `T`）。只服务一条关系断言：新旧两套框架描述的是**同一面外墙**，差别只在转角方块归谁 ——
+ * 这正是 `FCSWallAnchor::SConvention` 那条「奇数边距离 + T」换算的依据。
  */
-FCSHouseEdgeFrame CSHouseTest_LegacyGetEdge(int32 EdgeIndex, const FVector2D& Footprint, float T)
+FCSHouseEdgeFrame CSHouseTest_ButtJointGetEdge(int32 EdgeIndex, const FVector2D& Footprint, float T)
 {
 	const double HX = Footprint.X * 0.5, HY = Footprint.Y * 0.5;
 	FCSHouseEdgeFrame F;
@@ -4644,96 +4649,226 @@ FCSHouseEdgeFrame CSHouseTest_LegacyGetEdge(int32 EdgeIndex, const FVector2D& Fo
 	return F;
 }
 
-/** 逐位相等（不是 IsNearlyEqual）：墙长与起点都进哈希，1 ULP 的漂移就会让幂等短路失效。 */
+/** 逐位相等：墙长、起点、让出量都进哈希，1 ULP 的漂移就会让幂等短路失效。 */
 bool CSHouseTest_FramesIdentical(const FCSHouseEdgeFrame& A, const FCSHouseEdgeFrame& B)
 {
 	return A.Start.X == B.Start.X && A.Start.Y == B.Start.Y
 		&& A.U.X == B.U.X && A.U.Y == B.U.Y
 		&& A.In.X == B.In.X && A.In.Y == B.In.Y
-		&& A.Len == B.Len;
+		&& A.Len == B.Len && A.InsetStart == B.InsetStart && A.InsetEnd == B.InsetEnd;
+}
+
+/** 内皮上的端点（深度 T 处的斜接点）。 */
+FVector2D CSHouseTest_InnerStart(const FCSHouseEdgeFrame& F, float T)
+{
+	return F.Start + F.U * double(F.InsetStart) + F.In * double(T);
+}
+FVector2D CSHouseTest_InnerEnd(const FCSHouseEdgeFrame& F, float T)
+{
+	return F.Start + F.U * double(F.Len - F.InsetEnd) + F.In * double(T);
+}
+
+/** 简单多边形的有向面积（逆时针为正）。 */
+double CSHouseTest_PolygonArea(const TArray<FVector2D>& P)
+{
+	double Twice = 0.0;
+	for (int32 i = 0; i < P.Num(); ++i)
+	{
+		const FVector2D& A = P[i];
+		const FVector2D& B = P[(i + 1) % P.Num()];
+		Twice += A.X * B.Y - A.Y * B.X;
+	}
+	return Twice * 0.5;
+}
+
+/**
+ * 三角汤的体积（散度定理：Σ p0·(p1×p2) / 6）。每块面板都是闭合的六面体，所以对整锅汤求和
+ * 就是所有面板体积之和 —— 面板之间有任何重叠，这个数就会比实心环大；有缝就会小。
+ */
+double CSHouseTest_SoupVolume(const FCSGpuMeshCPUData& Soup)
+{
+	double Six = 0.0;
+	for (int32 i = 0; i + 2 < Soup.Indices.Num(); i += 3)
+	{
+		const FVector P0(Soup.Positions[Soup.Indices[i]]);
+		const FVector P1(Soup.Positions[Soup.Indices[i + 1]]);
+		const FVector P2(Soup.Positions[Soup.Indices[i + 2]]);
+		Six += FVector::DotProduct(P0, FVector::CrossProduct(P1, P2));
+	}
+	return FMath::Abs(Six) / 6.0;
 }
 }   // namespace
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FCSHouseFootprintPolylineMatchesRectTest,
-	"PCGPlugins.ComputeShaderGenerator.House.FootprintPolylineMatchesRect",
+	FCSHouseFootprintMitreCornersTest,
+	"PCGPlugins.ComputeShaderGenerator.House.FootprintMitreCorners",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
-bool FCSHouseFootprintPolylineMatchesRectTest::RunTest(const FString& Parameters)
+bool FCSHouseFootprintMitreCornersTest::RunTest(const FString& Parameters)
 {
-	// 尺寸扫一遍：正方形（脊长为 0）、长宽比悬殊、非整数、以及墙厚接近半短边的极端档。
-	const FVector2D Sizes[] = {
-		{ 600.0, 400.0 }, { 400.0, 600.0 }, { 500.0, 500.0 },
-		{ 1000.0, 210.0 }, { 233.7, 417.3 }, { 200.0, 200.0 },
-	};
+	// ---- ① 矩形：外角点起、外皮全长、两端各让一个墙厚；矩形重载与折线重载逐位相同 ----
+	const FVector2D Sizes[] = { { 600.0, 400.0 }, { 400.0, 600.0 }, { 500.0, 500.0 }, { 1000.0, 210.0 }, { 233.7, 417.3 } };
 	const float Thicknesses[] = { 24.0f, 1.0f, 60.0f, 12.5f };
-
 	for (const FVector2D& Size : Sizes)
 	{
 		for (const float T : Thicknesses)
 		{
 			const FCSHouseFootprint FP = FCSHouseFootprint::MakeRect(Size);
-			TestEqual(TEXT("MakeRect gives four edges"), FP.NumEdges(), 4);
-
 			for (int32 Edge = 0; Edge < 4; ++Edge)
 			{
-				const FCSHouseEdgeFrame Legacy = CSHouseTest_LegacyGetEdge(Edge, Size, T);
 				const FCSHouseEdgeFrame Rect = CSHouse_GetEdge(Edge, Size, T);
 				const FCSHouseEdgeFrame Poly = CSHouse_GetEdge(Edge, FP, T);
+				const FString Tag = FString::Printf(TEXT("size %s, T %.2f, edge %d"), *Size.ToString(), T, Edge);
 
-				// ① 新的矩形重载没有改变任何一位 —— 下游 67 个消费点因此不用跟着动。
-				TestTrue(*FString::Printf(TEXT("Rect overload is bit-identical to the frozen legacy switch (size %s, T %.2f, edge %d)"),
-					*Size.ToString(), T, Edge), CSHouseTest_FramesIdentical(Rect, Legacy));
-
-				// ② 折线走的是同一个核：矩形只是「四个顶点的闭合折线」，不是另一条实现。
-				TestTrue(*FString::Printf(TEXT("Polyline overload is bit-identical to the rect overload (size %s, T %.2f, edge %d)"),
-					*Size.ToString(), T, Edge), CSHouseTest_FramesIdentical(Poly, Rect));
-
-				// ③ In 是逆时针性质的推论，不再是四条边各自硬编码的常量。
-				TestTrue(*FString::Printf(TEXT("In is the left-hand perpendicular of U (edge %d)"), Edge),
+				TestTrue(*FString::Printf(TEXT("Rect and polyline overloads are bit-identical (%s)"), *Tag),
+					CSHouseTest_FramesIdentical(Rect, Poly));
+				// 直角的半角公式 sin/(1+cos) = 1/1 —— 让出量必须**恰好**是 T，不是约等于。
+				TestTrue(*FString::Printf(TEXT("A right-angle corner insets exactly one wall thickness (%s)"), *Tag),
+					Rect.InsetStart == T && Rect.InsetEnd == T);
+				TestTrue(*FString::Printf(TEXT("Start is the outer corner (%s)"), *Tag),
+					Rect.Start.Equals(FP.Verts[Edge], 0.0));
+				TestTrue(*FString::Printf(TEXT("In is the left-hand perpendicular of U (%s)"), *Tag),
 					Rect.In.X == -Rect.U.Y && Rect.In.Y == Rect.U.X);
+
+				// 新旧口径是同一面外墙：偶数边完全一致，奇数边旧框架 = 新框架两端各缩 T。
+				const FCSHouseEdgeFrame Butt = CSHouseTest_ButtJointGetEdge(Edge, Size, T);
+				const bool bOdd = (Edge & 1) != 0;
+				const FVector2D ExpectStart = bOdd ? (Rect.Start + Rect.U * double(T)) : Rect.Start;
+				const float ExpectLen = bOdd ? (Rect.Len - 2.0f * T) : Rect.Len;
+				TestTrue(*FString::Printf(TEXT("The butt-joint frame is the mitre frame minus the ceded corner (%s)"), *Tag),
+					Butt.Start.Equals(ExpectStart, 1.0e-6) && FMath::IsNearlyEqual(Butt.Len, ExpectLen, 1.0e-3f));
 			}
 		}
 	}
 
-	// 非矩形折线：本轮还没有生产者能造出它，但核必须已经能吃 —— 这是 3a-2 的接口保证。
-	// 取一个正五边形（外接半径 300），逐边验 U 是单位向量、In ⊥ U 且指向房心一侧、Len > 0。
+	// ---- ② 斜接闭合：每个角上，前一条边的内皮终点 == 后一条边的内皮起点 ----
+	//
+	// 这是「面板不重叠、不留缝」的几何本体。凸角与凹角走同一个公式，所以拿一个 L 形（含一个凹角）
+	// 和一个正五边形（非直角凸角）一起验。
+	auto CheckClosure = [this](const FCSHouseFootprint& FP, float T, const TCHAR* Name)
 	{
-		FCSHouseFootprint Penta;
-		for (int32 i = 0; i < 5; ++i)
+		const int32 N = FP.NumEdges();
+		for (int32 Edge = 0; Edge < N; ++Edge)
 		{
-			const double Angle = 2.0 * UE_DOUBLE_PI * double(i) / 5.0;
-			Penta.Verts.Add(FVector2D(300.0 * FMath::Cos(Angle), 300.0 * FMath::Sin(Angle)));
+			const FCSHouseEdgeFrame A = CSHouse_GetEdge(Edge, FP, T);
+			const FCSHouseEdgeFrame B = CSHouse_GetEdge((Edge + 1) % N, FP, T);
+			const FVector2D EndA = CSHouseTest_InnerEnd(A, T);
+			const FVector2D StartB = CSHouseTest_InnerStart(B, T);
+			TestTrue(*FString::Printf(TEXT("%s: the inner faces of edges %d and %d meet on the bisector (%s vs %s)"),
+					Name, Edge, (Edge + 1) % N, *EndA.ToString(), *StartB.ToString()),
+				EndA.Equals(StartB, 1.0e-4));
 		}
-		TestEqual(TEXT("Pentagon has five edges"), Penta.NumEdges(), 5);
+	};
 
-		for (int32 Edge = 0; Edge < 5; ++Edge)
-		{
-			const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Penta, 24.0f);
-			TestTrue(*FString::Printf(TEXT("Pentagon edge %d has positive length"), Edge), F.Len > 0.0f);
-			TestTrue(*FString::Printf(TEXT("Pentagon edge %d has a unit U"), Edge),
-				FMath::IsNearlyEqual(F.U.Size(), 1.0, 1.0e-9));
-			TestTrue(*FString::Printf(TEXT("Pentagon edge %d has In perpendicular to U"), Edge),
-				FMath::IsNearlyZero(FVector2D::DotProduct(F.U, F.In), 1.0e-9));
-			// 逆时针 ⇒ 内法线指向房心：边中点沿 In 走一步必须更靠近原点。
-			FVector2D A, B;
-			Penta.GetEdgeVerts(Edge, A, B);
-			const FVector2D Mid = (A + B) * 0.5;
-			TestTrue(*FString::Printf(TEXT("Pentagon edge %d has In pointing inward"), Edge),
-				(Mid + F.In).Size() < Mid.Size());
-		}
+	const float T = 24.0f;
+	CheckClosure(FCSHouseFootprint::MakeRect(FVector2D(600.0, 400.0)), T, TEXT("rectangle"));
+
+	FCSHouseFootprint Penta;
+	for (int32 i = 0; i < 5; ++i)
+	{
+		const double Angle = 2.0 * UE_DOUBLE_PI * double(i) / 5.0;
+		Penta.Verts.Add(FVector2D(300.0 * FMath::Cos(Angle), 300.0 * FMath::Sin(Angle)));
+	}
+	CheckClosure(Penta, T, TEXT("pentagon"));
+	// 正五边形每个角左转 72° ⇒ 让出量 T·tan(36°)。
+	{
+		const FCSHouseEdgeFrame F = CSHouse_GetEdge(0, Penta, T);
+		const float Want = T * FMath::Tan(FMath::DegreesToRadians(36.0f));
+		TestTrue(FString::Printf(TEXT("A regular pentagon cedes T*tan(36 deg) at each corner (%.4f vs %.4f)"), F.InsetStart, Want),
+			FMath::IsNearlyEqual(F.InsetStart, Want, 1.0e-3f) && FMath::IsNearlyEqual(F.InsetEnd, Want, 1.0e-3f));
 	}
 
-	// 退化输入不许炸：顶点不足三个时返回零长框架，调用方按 Len <= 0 跳过（同零长边）。
+	// L 形（逆时针）：(0,0) → (600,0) → (600,300) → (300,300) → (300,600) → (0,600)。
+	// 顶点 3 = (300,300) 处是**右转**（凹角），让出量必须为负，内皮向外伸出去补那块三角。
+	FCSHouseFootprint L;
+	L.Verts = { { 0.0, 0.0 }, { 600.0, 0.0 }, { 600.0, 300.0 }, { 300.0, 300.0 }, { 300.0, 600.0 }, { 0.0, 600.0 } };
+	CheckClosure(L, T, TEXT("L-shape"));
+	{
+		// 边 2 走进凹角（终点是顶点 3），边 3 走出凹角（起点是顶点 3）。
+		const FCSHouseEdgeFrame In = CSHouse_GetEdge(2, L, T);
+		const FCSHouseEdgeFrame Out = CSHouse_GetEdge(3, L, T);
+		TestTrue(FString::Printf(TEXT("A reflex corner cedes a negative amount on the incoming edge (%.3f)"), In.InsetEnd),
+			FMath::IsNearlyEqual(In.InsetEnd, -T, 1.0e-3f));
+		TestTrue(FString::Printf(TEXT("and on the outgoing edge (%.3f)"), Out.InsetStart),
+			FMath::IsNearlyEqual(Out.InsetStart, -T, 1.0e-3f));
+		// 深度 T 处的实体区间因此比外皮还长。
+		float S0 = 0.0f, S1 = 0.0f;
+		Out.SpanAtDepth(T, T, S0, S1);
+		TestTrue(TEXT("At the inner face the reflex-side span reaches past the outer corner"), S0 < 0.0f);
+	}
+
+	// ---- ③ 实心体守恒：无洞时三角汤的体积 = (外轮廓面积 − 内轮廓面积) × 墙高 ----
+	//
+	// 面板有任何重叠，体积就会偏大；有缝就会偏小。直角对接时代同样满足这条（偶数边吃下转角、
+	// 奇数边让开），所以它钉的不是「换了约定」，而是「换完之后仍然是那一个实心环」。
+	auto CheckVolume = [this](const FCSHouseFootprint& FP, float T, float H, const TCHAR* Name)
+	{
+		FCSHouseBodyDesc Desc;
+		Desc.Footprint = FP;
+		Desc.WallThickness = T;
+		Desc.WallHeight = H;
+		FCSGpuMeshCPUData Soup;
+		CSHouse_BuildBodySoup(Desc, Soup);
+
+		TArray<FVector2D> Inner;
+		for (int32 Edge = 0; Edge < FP.NumEdges(); ++Edge)
+		{
+			Inner.Add(CSHouseTest_InnerStart(CSHouse_GetEdge(Edge, FP, T), T));
+		}
+		const double Want = (CSHouseTest_PolygonArea(FP.Verts) - CSHouseTest_PolygonArea(Inner)) * double(H);
+		const double Got = CSHouseTest_SoupVolume(Soup);
+		TestTrue(FString::Printf(TEXT("%s: the wall panels fill exactly one solid ring (volume %.1f vs %.1f)"), Name, Got, Want),
+			FMath::IsNearlyEqual(Got, Want, Want * 1.0e-6 + 1.0));
+	};
+	CheckVolume(FCSHouseFootprint::MakeRect(FVector2D(600.0, 400.0)), T, 300.0f, TEXT("rectangle"));
+	CheckVolume(Penta, T, 300.0f, TEXT("pentagon"));
+	CheckVolume(L, T, 300.0f, TEXT("L-shape"));
+
+	// ---- ④ 旧锚点：口径 0 在奇数边上从缩进 T 的那一点量起 ⇒ 解析时补一个 T ----
+	{
+		const FCSHouseFootprint FP = FCSHouseFootprint::MakeRect(FVector2D(600.0, 400.0));
+		FCSWallAnchor Legacy;
+		Legacy.EdgeIndex = 1;
+		Legacy.DistFromCorner = 100.0f;
+		Legacy.SConvention = 0;
+		FCSWallAnchor Mitre = Legacy;
+		Mitre.SConvention = 1;
+		TestTrue(TEXT("A legacy odd-edge anchor resolves one wall thickness further from the corner"),
+			FMath::IsNearlyEqual(CSHouse_AnchorS(Legacy, FP, T), 100.0f + T, 1.0e-3f));
+		TestTrue(TEXT("A mitre anchor resolves verbatim"),
+			FMath::IsNearlyEqual(CSHouse_AnchorS(Mitre, FP, T), 100.0f, 1.0e-3f));
+
+		// 终点角那一侧同理：旧框架里 S = (L − 2T) − d，折到外角点量起就是 L − (d + T)。
+		Legacy.bFromEndCorner = true;
+		TestTrue(TEXT("The same holds when anchored to the end corner"),
+			FMath::IsNearlyEqual(CSHouse_AnchorS(Legacy, FP, T), 400.0f - (100.0f + T), 1.0e-3f));
+
+		// 偶数边在旧口径下本来就从外角点量起，不换算。
+		FCSWallAnchor EvenLegacy;
+		EvenLegacy.EdgeIndex = 0;
+		EvenLegacy.DistFromCorner = 100.0f;
+		TestTrue(TEXT("A legacy even-edge anchor is unchanged"),
+			FMath::IsNearlyEqual(CSHouse_AnchorS(EvenLegacy, FP, T), 100.0f, 1.0e-3f));
+
+		// 新造的锚点一律写斜接口径 —— 否则它会被上面那条换算再挪一次。
+		FCSWallHit Hit;
+		Hit.bHit = true;
+		Hit.EdgeIndex = 1;
+		Hit.S = 120.0f;
+		const FCSWallAnchor Made = CSHouse_MakeWallAnchor(Hit, FP, T, 90.0f);
+		TestEqual(TEXT("MakeWallAnchor writes the mitre convention"), int32(Made.SConvention), 1);
+		TestTrue(TEXT("and round-trips its own S"), FMath::IsNearlyEqual(CSHouse_AnchorS(Made, FP, T), 120.0f, 1.0e-3f));
+	}
+
+	// ---- ⑤ 退化输入不炸 ----
 	{
 		FCSHouseFootprint Degenerate;
 		Degenerate.Verts.Add(FVector2D::ZeroVector);
 		Degenerate.Verts.Add(FVector2D(100.0, 0.0));
 		TestFalse(TEXT("Two vertices is not a valid footprint"), Degenerate.IsValidFootprint());
-		TestTrue(TEXT("Degenerate footprint yields a zero-length frame"),
-			CSHouse_GetEdge(0, Degenerate, 24.0f).Len == 0.0f);
+		TestTrue(TEXT("Degenerate footprint yields a zero-length frame"), CSHouse_GetEdge(0, Degenerate, T).Len == 0.0f);
 		TestTrue(TEXT("Out-of-range edge yields a zero-length frame"),
-			CSHouse_GetEdge(9, FCSHouseFootprint::MakeRect(FVector2D(600.0, 400.0)), 24.0f).Len == 0.0f);
+			CSHouse_GetEdge(9, FCSHouseFootprint::MakeRect(FVector2D(600.0, 400.0)), T).Len == 0.0f);
 	}
 
 	return true;

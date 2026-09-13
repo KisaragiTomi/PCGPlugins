@@ -643,13 +643,36 @@ inline bool CSHouse_OpeningsOverlap(const FCSWallOpening& A, const FCSWallOpenin
 // 墙面框架与可放置性谓词（D8「谓词是唯一真源」的执行面）
 // -----------------------------------------------------------------------------
 
-/** 一面墙的局部框架：Start 起点（外皮线上）、U 沿墙、In 向内（厚度方向）、Len 墙长。U×In = +Z（已验）。 */
+/**
+ * 一面墙的局部框架。U×In = +Z（已验）。
+ *
+ * **2026-09-13 起是斜接口径**（footprint 折线化 3a-2）：`Start` 就是外角点、`Len` 是外皮线段
+ * 全长，两端的转角方块沿角平分线一分为二、两条边各拿一半 —— 让出来的那半由 `InsetStart` /
+ * `InsetEnd` 描述。在这之前是直角对接：偶数边吃下整个转角方块、奇数边两端各缩 `T`，它只在
+ * 偶数条边且全直角的多边形上成立（旧口径的存量锚点见 `FCSWallAnchor::SConvention`）。
+ */
 struct FCSHouseEdgeFrame
 {
-	FVector2D Start = FVector2D::ZeroVector;
-	FVector2D U = FVector2D::ZeroVector;
-	FVector2D In = FVector2D::ZeroVector;
-	float Len = 0;
+	FVector2D Start = FVector2D::ZeroVector;   // 外皮线段起点 = 外角点
+	FVector2D U = FVector2D::ZeroVector;       // 沿墙的单位向量
+	FVector2D In = FVector2D::ZeroVector;      // 指向房内的单位法线（逆时针 ⇒ Perp(U)）
+	float Len = 0;                              // 外皮线段全长
+	float InsetStart = 0;                       // 起点角：内皮沿 +U 让出的距离；直角 = T，凹角 < 0
+	float InsetEnd = 0;                         // 终点角：内皮沿 −U 让出的距离
+
+	/**
+	 * 墙体内深度 `Depth`（0 = 外皮，`T` = 内皮）处本边实体占的 S 区间。
+	 *
+	 * 斜接面是一条从外角点斜到内角点的直线，所以两端被切掉的量随深度**线性**增长：外皮上
+	 * 一点都不切（`[0, Len]`），内皮上各切一个 `Inset`。凹角的 `Inset` 为负 ⇒ 区间反而向外
+	 * 伸出去，补上凹角内侧那块本来没有墙的三角。
+	 */
+	void SpanAtDepth(float Depth, float T, float& OutS0, float& OutS1) const
+	{
+		const float K = T > UE_KINDA_SMALL_NUMBER ? FMath::Clamp(Depth / T, 0.0f, 1.0f) : 0.0f;
+		OutS0 = InsetStart * K;
+		OutS1 = Len - InsetEnd * K;
+	}
 };
 
 /**
@@ -721,28 +744,36 @@ struct COMPUTESHADERGENERATOR_API FCSHouseFootprint
 };
 
 /**
- * 转角对接归谁：**过渡期的直角约定**，`true` = 这条边两端各让出一个墙厚 `T`。
+ * 转角斜接的让出量：内皮沿 `UOut` 方向缩进（或伸出）多少，才能与上一条边的内皮在角平分线上
+ * 相交。`UIn` 是走进这个角的方向、`UOut` 是走出去的方向，两者都是单位向量。
  *
- * ⚠️ **这是 3a-2 要换掉的东西，不要在它上面盖新逻辑。** 今天的语义是「偶数边吃下两个转角
- * 方块，奇数边缩进去抵住它们」（矩形上就是南北墙通长、东西墙缩 2T）。它只在**偶数条边且
- * 全为直角**的多边形上成立 —— 奇数边会有一个转角两边都想让，非直角处让出的量也不该是 T。
- * 折线的终局是**斜接**：转角方块沿角平分线一分为二，两条边各拿一半，让出的量是
- * `T / (2·tan(θ/2))`，对直角恰好退化成 `T/2`（而不是今天的 0 或 T）。
+ * 推导：两条内皮线各自沿 `In` 平移 `T`，交点投到出边上的弧长就是 `T · tan(转角/2)`，转角是
+ * 从 `UIn` 转到 `UOut` 的有向角（逆时针多边形的凸角是左转、为正）。用半角公式
+ * `tan(φ/2) = sin φ / (1 + cos φ)` 直接拿叉积 / 点积算，不走三角函数：
  *
- * 斜接落地时这个函数删掉，`CSHouse_MakeEdgeFrame` 的 `bInsetBothEnds` 换成逐端的让出量。
+ *   直角（左转 90°）：sin = 1、cos = 0 ⇒ 让出 **恰好** T（这是矩形逐位可测的那个值）
+ *   直线（不转）：    sin = 0          ⇒ 0
+ *   凹角（右转）：    sin < 0          ⇒ 负数，内皮向外伸出
+ *
+ * 近 180° 的折返（尖刺）分母趋零、让出量发散 —— 那种折线本该在编辑入口被拒绝，这里只防除零。
  */
-inline bool CSHouse_EdgeInsetsBothEnds(int32 EdgeIndex)
+inline float CSHouse_CornerInset(const FVector2D& UIn, const FVector2D& UOut, float T)
 {
-	return (EdgeIndex & 1) != 0;
+	const double SinTurn = UIn.X * UOut.Y - UIn.Y * UOut.X;
+	const double CosTurn = FVector2D::DotProduct(UIn, UOut);
+	const double Denom = 1.0 + CosTurn;
+	if (Denom <= 1.0e-6) return float((SinTurn >= 0.0 ? 1.0e3 : -1.0e3) * double(T));
+	return float(double(T) * SinTurn / Denom);
 }
 
 /**
- * 一条边的框架：外皮线段 `A → B`，按转角约定让出两端，`In` 由逆时针性质导出。
+ * 一条边的斜接框架：外皮线段 `A → B`，`Prev` 是 `A` 之前的顶点、`Next` 是 `B` 之后的顶点。
  *
  * 所有 `CSHouse_GetEdge` 重载共用这一份 —— 矩形那条也走它，所以「矩形是折线的特例」不是
- * 说法而是代码事实。
+ * 说法而是代码事实。`In` 由逆时针性质导出（内部在行进方向的左手侧）。
  */
-inline FCSHouseEdgeFrame CSHouse_MakeEdgeFrame(const FVector2D& A, const FVector2D& B, bool bInsetBothEnds, float T)
+inline FCSHouseEdgeFrame CSHouse_MakeEdgeFrame(
+	const FVector2D& Prev, const FVector2D& A, const FVector2D& B, const FVector2D& Next, float T)
 {
 	FCSHouseEdgeFrame F;
 	const FVector2D D = B - A;
@@ -750,17 +781,16 @@ inline FCSHouseEdgeFrame CSHouse_MakeEdgeFrame(const FVector2D& A, const FVector
 	if (Len0 <= UE_DOUBLE_SMALL_NUMBER) return F;   // 退化边：零长框架，调用方按 Len <= 0 跳过
 
 	F.U = D / Len0;
-	// 逆时针 ⇒ 内部在左手侧。原来四条边各写一份 In 的地方就是这一行。
 	F.In = FVector2D(-F.U.Y, F.U.X);
-	// ⚠️ **先转 float 再减**，与老口径 `float(Footprint.Y) - 2 * T` 的舍入逐位一致；
-	// 在 double 里减完再转会差 1 ULP，而墙长进哈希。
-	F.Len = bInsetBothEnds ? (float(Len0) - 2 * T) : float(Len0);
-	F.Start = bInsetBothEnds ? (A + F.U * T) : A;
+	F.Start = A;
+	F.Len = float(Len0);
+	F.InsetStart = CSHouse_CornerInset((A - Prev).GetSafeNormal(), F.U, T);
+	F.InsetEnd = CSHouse_CornerInset(F.U, (Next - B).GetSafeNormal(), T);
 	return F;
 }
 
 /**
- * 周界某一面墙。折线版：边号即顶点号，`In` 由逆时针导出，两端按转角约定让出。
+ * 周界某一面墙（斜接口径）。边号即顶点号：边 i 从 `Verts[i]` 走到 `Verts[i+1]`。
  *
  * **住在头文件里而不是 CSHouseActor.cpp 的匿名命名空间里**：墙板、门框砖、藤蔓、摆件、
  * 以及下面那条谓词全都要问"这面墙在哪、有多长"，各抄一份的症状是"藤悬在离墙半个墙厚的
@@ -770,31 +800,25 @@ inline FCSHouseEdgeFrame CSHouse_GetEdge(int32 EdgeIndex, const FCSHouseFootprin
 {
 	FVector2D A, B;
 	if (!Footprint.GetEdgeVerts(EdgeIndex, A, B)) return FCSHouseEdgeFrame();
-	return CSHouse_MakeEdgeFrame(A, B, CSHouse_EdgeInsetsBothEnds(EdgeIndex), T);
+	const int32 N = Footprint.NumEdges();
+	const FVector2D& Prev = Footprint.Verts[(EdgeIndex + N - 1) % N];
+	const FVector2D& Next = Footprint.Verts[(EdgeIndex + 2) % N];
+	return CSHouse_MakeEdgeFrame(Prev, A, B, Next, T);
 }
 
 /**
- * 周界四墙的矩形口径：0 南(+X 向) 1 东(+Y 向) 2 北(-X 向) 3 西(-Y 向)，东西两面缩短 2T。
+ * 矩形口径的便捷重载：0 南(+X 向) 1 东(+Y 向) 2 北(-X 向) 3 西(-Y 向)。
  *
  * 与折线版**逐位等价**（`House.FootprintPolylineMatchesRect` 钉住）：这里不重排顶点、不走
  * `TArray`，只是把 `MakeRect` 的四个顶点就地算出来喂同一个核，免掉热路径上的堆分配
  * （门框砖 / 藤条 / 摆件都在逐实例的循环里问边框架）。
- *
- * 3a-1 期间调用方可以继续传 `FVector2D`；能产出非矩形 footprint 之后，这个重载随
- * `ACSHouseActor::FootprintSize` 一起退役。
  */
 inline FCSHouseEdgeFrame CSHouse_GetEdge(int32 EdgeIndex, const FVector2D& Footprint, float T)
 {
 	const double HX = Footprint.X * 0.5, HY = Footprint.Y * 0.5;
-	FVector2D A, B;
-	switch (EdgeIndex & 3)
-	{
-	case 0:  A = { -HX, -HY }; B = { HX, -HY };  break;
-	case 1:  A = { HX, -HY };  B = { HX, HY };   break;
-	case 2:  A = { HX, HY };   B = { -HX, HY };  break;
-	default: A = { -HX, HY };  B = { -HX, -HY }; break;
-	}
-	return CSHouse_MakeEdgeFrame(A, B, CSHouse_EdgeInsetsBothEnds(EdgeIndex), T);
+	const FVector2D C[4] = { { -HX, -HY }, { HX, -HY }, { HX, HY }, { -HX, HY } };
+	const int32 E = EdgeIndex & 3;
+	return CSHouse_MakeEdgeFrame(C[(E + 3) & 3], C[E], C[(E + 1) & 3], C[(E + 2) & 3], T);
 }
 
 /**
@@ -937,13 +961,27 @@ struct COMPUTESHADERGENERATOR_API FCSWallAnchor
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Wall Anchor")
 	float SillZ = 0.0f;
 
-	bool IsValidAnchor() const { return EdgeIndex >= 0 && EdgeIndex <= 3 && DistFromCorner >= 0.0f; }
+	/**
+	 * `DistFromCorner` 是按哪种转角口径量的。**0 = 旧口径，1 = 斜接**（2026-09-13 起）。
+	 *
+	 * 旧口径下奇数边（矩形的东西墙）两端各缩 `T`，距离从**缩进去的那一点**量起；斜接下所有边
+	 * 都从外角点量起。同一个物理点在两种口径下差恰好一个 `T`，换算只在 `CSHouse_AnchorS` 一处做。
+	 *
+	 * ⚠️ **默认值必须是 0，不能是 1**：这个字段是后加的，旧存档里没有它，读进来拿到的是这里的
+	 * 默认值 —— 默认成 1 就会把所有旧锚点当新口径解释，东西墙上的窗整体平移一个墙厚。
+	 * 新锚点由 `CSHouse_MakeWallAnchor` 显式写 1。
+	 */
+	UPROPERTY()
+	uint8 SConvention = 0;
+
+	/** 边号只查下界：折线化之后边数不再是 4，上界由调用方拿 footprint 自己判。 */
+	bool IsValidAnchor() const { return EdgeIndex >= 0 && DistFromCorner >= 0.0f; }
 
 	/** 逐字段相等。用来在重登记前挡掉"没动"的那些，口径同 `FCSHouseWindow::operator==`。 */
 	bool operator==(const FCSWallAnchor& O) const
 	{
 		return EdgeIndex == O.EdgeIndex && bFromEndCorner == O.bFromEndCorner
-			&& DistFromCorner == O.DistFromCorner && SillZ == O.SillZ;
+			&& DistFromCorner == O.DistFromCorner && SillZ == O.SillZ && SConvention == O.SConvention;
 	}
 	bool operator!=(const FCSWallAnchor& O) const { return !(*this == O); }
 };
@@ -964,6 +1002,7 @@ inline FCSWallAnchor CSHouse_MakeWallAnchor(const FCSWallHit& Hit, const FCSHous
 
 	// 边号原样收下（原来是 `& 3`）：命中本来就来自逐边遍历，折线化之后边数不再是 4。
 	A.EdgeIndex = Hit.EdgeIndex;
+	A.SConvention = 1;   // 斜接口径：从外角点量起（见 `FCSWallAnchor::SConvention`）
 	// 正中间（S == Len/2）归**起点角**：判据要给出确定的一侧，`>` 而不是 `>=` 就是这个用意。
 	A.bFromEndCorner = (S > F.Len * 0.5f);
 	A.DistFromCorner = A.bFromEndCorner ? (F.Len - S) : S;
@@ -981,7 +1020,11 @@ inline float CSHouse_AnchorS(const FCSWallAnchor& A, const FCSHouseFootprint& Fo
 {
 	const FCSHouseEdgeFrame F = CSHouse_GetEdge(A.EdgeIndex, Footprint, T);
 	const float Len = FMath::Max(F.Len, 0.0f);
-	const float S = A.bFromEndCorner ? (Len - A.DistFromCorner) : A.DistFromCorner;
+	// 旧口径的奇数边距离是从缩进 `T` 的那一点量的：起点角那一侧外角点再往里 T，终点角那一侧
+	// 同理 ⇒ 两侧都是「距离 + T」。旧口径只可能出现在矩形（折线化之前存的档），所以奇偶判据
+	// 在这里仍然成立，不需要知道边数。
+	const float Dist = (A.SConvention == 0 && (A.EdgeIndex & 1) != 0) ? A.DistFromCorner + T : A.DistFromCorner;
+	const float S = A.bFromEndCorner ? (Len - Dist) : Dist;
 	return FMath::Clamp(S, 0.0f, Len);
 }
 
@@ -1079,11 +1122,17 @@ struct FCSOpeningSite
 inline ECSFeatureReject CSHouse_QueryOpening(const FCSOpeningSite& Site, const FCSWallOpening& Candidate)
 {
 	if (!Candidate.IsValid()) return ECSFeatureReject::Degenerate;
-	if (Candidate.EdgeIndex < 0 || Candidate.EdgeIndex > 3) return ECSFeatureReject::NotOnWall;
+	if (Candidate.EdgeIndex < 0 || Candidate.EdgeIndex >= Site.Footprint.NumEdges()) return ECSFeatureReject::NotOnWall;
 
 	// 必须整个落在这面墙的可用段内（护角照留），且顶部不能吃掉墙顶的连续砖带。
+	//
+	// 护角从外角点量起，且**至少让过斜接面**：锐角处的斜接让出量会超过 `CornerMargin`
+	// （内角 30° 时是 3.7 个墙厚），洞要是伸进斜接面，那一截面板端面是斜的、裁剪场照样切，
+	// 画面上就是一块斜着缺了角的墙。直角下让出量 = T < 默认护角，取 max 之后与只看护角逐位相同。
 	const FCSHouseEdgeFrame F = CSHouse_GetEdge(Candidate.EdgeIndex, Site.Footprint, Site.WallThickness);
-	if (Candidate.S0() < Site.CornerMargin || Candidate.S1() > F.Len - Site.CornerMargin) return ECSFeatureReject::NearCorner;
+	const float MarginStart = FMath::Max(Site.CornerMargin, F.InsetStart);
+	const float MarginEnd = FMath::Max(Site.CornerMargin, F.InsetEnd);
+	if (Candidate.S0() < MarginStart || Candidate.S1() > F.Len - MarginEnd) return ECSFeatureReject::NearCorner;
 	if (Candidate.Z0 < 0.0f) return ECSFeatureReject::SillTooLow;
 	if (Candidate.Type != ECSOpeningType::Door && Candidate.Z0 < Site.MinSillZ) return ECSFeatureReject::SillTooLow;
 	if (Candidate.Z1 + FMath::Abs(Candidate.Skew) * Candidate.HalfWidth() > Site.WallHeight - Site.LintelBand) return ECSFeatureReject::AboveEave;

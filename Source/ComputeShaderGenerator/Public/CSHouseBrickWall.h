@@ -82,10 +82,15 @@ inline int32 EstimateBricks(const FCSHouseFootprint& Footprint, float WallThickn
 	if (Courses.Count <= 0) return 0;
 	const float Length = FMath::Max(BrickLength, 1.0f);
 
+	// 周长取**中线处的斜接区间**之和，与 `CSHouseTrim::BuildBand` 真正铺砖的区间同一个口径：
+	// 凸角处它比外皮短、凹角处比外皮长，拿外皮全长当上界在凹角房子上会偏小。
 	float Perimeter = 0.0f;
 	for (int32 Edge = 0; Edge < Footprint.NumEdges(); ++Edge)
 	{
-		Perimeter += FMath::Max(CSHouse_GetEdge(Edge, Footprint, WallThickness).Len, 0.0f);
+		const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Footprint, WallThickness);
+		float S0 = 0.0f, S1 = 0.0f;
+		F.SpanAtDepth(WallThickness * 0.5f, WallThickness, S0, S1);
+		Perimeter += FMath::Max(S1 - S0, 0.0f);
 	}
 	// 每条边各自向上取整会更准，但这里要的是**上界**，一次取整就够，且与边数无关地偏大。
 	return FMath::CeilToInt(Perimeter / Length) * Courses.Count;

@@ -97,13 +97,15 @@ inline bool BlocksBand(const FCSWallOpening& Opening, const FBand& Band)
  *
  * `Clearance` 是洞两侧额外让开的距离 cm（让门樘砖有地方站，别和包边挤在一起）。
  */
-inline int32 SplitEdge(int32 EdgeIndex, float EdgeLen, const FBand& Band, float Clearance,
+inline int32 SplitEdge(int32 EdgeIndex, float SpanS0, float SpanS1, const FBand& Band, float Clearance,
 	TArrayView<const FCSWallOpening> EdgeOpenings, float MinRun, TArray<FRun>& Out)
 {
 	const int32 Before = Out.Num();
-	if (EdgeLen <= MinRun) return 0;
+	if (SpanS1 - SpanS0 <= MinRun) return 0;
+	// 下面沿用原来的变量名：`EdgeLen` 现在是这条边**可铺区间的终点**，不再恒等于墙长。
+	const float EdgeLen = SpanS1;
 
-	float Cursor = 0.0f;
+	float Cursor = SpanS0;
 	// 上一个洞留给**下一段起点**的剪切量（那一段的 S0 挨着的正是它）。
 	float PendingShear = 0.0f;
 	for (const FCSWallOpening& Opening : EdgeOpenings)
@@ -111,7 +113,7 @@ inline int32 SplitEdge(int32 EdgeIndex, float EdgeLen, const FBand& Band, float 
 		// 剪影而不是包围盒：拱洞在高处只挡住窄窄一条，砖因此能跟着拱圈收进去。
 		float BlockedS0 = 0.0f, BlockedS1 = 0.0f;
 		if (!BlockedSpan(Opening, Band, BlockedS0, BlockedS1)) continue;
-		const float Lo = FMath::Max(BlockedS0 - Clearance, 0.0f);
+		const float Lo = FMath::Max(BlockedS0 - Clearance, SpanS0);
 		const float Hi = FMath::Min(BlockedS1 + Clearance, EdgeLen);
 		if (Hi <= Cursor) continue;                     // 已经被前一个洞吞掉（洞可能互相重叠）
 		// 端头的剪切量：本段的 S1 与下一段的 S0 都挨着**这个**洞，所以两处同一个数。
@@ -178,13 +180,21 @@ inline int32 BuildBand(const FTransform& World, const FCSHouseFootprint& Footpri
 		const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Footprint, WallThickness);
 		if (F.Len <= MinRun) continue;
 
+		// 砖路走墙厚正中（`BuildTrimElements` 的原点），所以可铺区间取**中线处的斜接区间**：
+		// 两条边的砖在角平分线上相遇，谁都不吃下整个转角方块。转角外侧那一小块缺口由角石盖住
+		// （TG 同构：墙角是 `add_wall_corners` 的角石柱，不是两排砖互相搭接）。
+		// ⚠️ 关掉角石时那块缺口会露出来 —— 那是斜接的代价，不是 bug。直角对接时代是偶数边吃下
+		// 整个转角、奇数边缩进去，它只在偶数条直角边上成立，折线化之后没有等价物。
+		float SpanS0 = 0.0f, SpanS1 = 0.0f;
+		F.SpanAtDepth(WallThickness * 0.5f, WallThickness, SpanS0, SpanS1);
+
 		// 同一条边的洞是洞表里的连续片段（调用方保证排序）。这里线性挑出来，不重排。
 		int32 Begin = 0;
 		while (Begin < AllOpenings.Num() && AllOpenings[Begin].EdgeIndex != Edge) ++Begin;
 		int32 End = Begin;
 		while (End < AllOpenings.Num() && AllOpenings[End].EdgeIndex == Edge) ++End;
 
-		SplitEdge(Edge, F.Len, Band, Clearance,
+		SplitEdge(Edge, SpanS0, SpanS1, Band, Clearance,
 			AllOpenings.Slice(Begin, End - Begin), MinRun, OutRuns);
 	}
 	return BuildTrimElements(World, Footprint, WallThickness, OutRuns, Band, Seed, FamilySalt, Params, InOutElements);

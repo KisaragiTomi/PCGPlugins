@@ -139,6 +139,43 @@ struct FCSHouseMeshWriter
 		AddQuad(O + X, Y, Z, Slot);          // right (+X)
 	}
 
+	/**
+	 * 任意**平面**四边形：角点按环序 P0 → P1 → P2 → P3，法线 = (P1−P0)×(P3−P0) 的方向。
+	 * 与 `AddQuad(A, U, V)` 同一套三角划分与 UV 约定（取 P0 处两条邻边的长度），
+	 * 平行四边形时两者产出相同的角点。
+	 */
+	void AddQuad4(const FVector& P0, const FVector& P1, const FVector& P2, const FVector& P3, int32 Slot)
+	{
+		const float LU = float((P1 - P0).Size()) / CSHouse_UVScale;
+		const float LV = float((P3 - P0).Size()) / CSHouse_UVScale;
+		AddTri(P0, P1, P2, Slot, { 0, 0 }, { LU, 0 }, { LU, LV });
+		AddTri(P0, P2, P3, Slot, { 0, 0 }, { LU, LV }, { 0, LV });
+	}
+
+	/**
+	 * 一段墙板：外皮 S 区间 `[SA, SB]`、内皮 S 区间 `[SAin, SBin]`、高度 `[ZLo, ZHi]`、厚 `T`。
+	 *
+	 * 这就是斜接之后的面板形状：外皮与内皮都是矩形，只有两个端面可能是斜的（沿角平分线切）。
+	 * 六个面的角点顺序与 `AddBox(Start + U·SA + Up·ZLo, U·(SB−SA), In·T, Up·(ZHi−ZLo))` 逐面对应，
+	 * 所以 `SAin == SA && SBin == SB` 时它就是原来那个盒子。
+	 */
+	void AddWallPrism(const FVector& Start, const FVector& U, const FVector& In, const FVector& Up,
+		float SA, float SB, float SAin, float SBin, float T, float ZLo, float ZHi, int32 Slot)
+	{
+		const FVector Lo = Up * ZLo, Hi = Up * ZHi, Deep = In * T;
+		const FVector O0 = Start + U * SA + Lo,           O1 = Start + U * SB + Lo;
+		const FVector I0 = Start + U * SAin + Deep + Lo,  I1 = Start + U * SBin + Deep + Lo;
+		const FVector O0t = Start + U * SA + Hi,          O1t = Start + U * SB + Hi;
+		const FVector I0t = Start + U * SAin + Deep + Hi, I1t = Start + U * SBin + Deep + Hi;
+
+		AddQuad4(O0, I0, I1, O1, Slot);        // bottom (-Z)
+		AddQuad4(O0t, O1t, I1t, I0t, Slot);    // top (+Z)
+		AddQuad4(O0, O1, O1t, O0t, Slot);      // 外皮（背离房内）
+		AddQuad4(I0, I0t, I1t, I1, Slot);      // 内皮（朝向房内）
+		AddQuad4(O0, O0t, I0t, I0, Slot);      // 起点端面（斜接时是斜的）
+		AddQuad4(O1, I1, I1t, O1t, Slot);      // 终点端面
+	}
+
 };
 
 // `FCSHouseEdgeFrame` / `CSHouse_GetEdge` 已上提到 `CSHouseProfile.h`：谓词（`CSHouse_QueryOpening`）
@@ -1375,17 +1412,30 @@ void CSHouse_BuildBodySoup(const FCSHouseBodyDesc& Desc, FCSGpuMeshCPUData& S)
 		//
 		// ⚠️ **任何情况下都不许靠"不生成面板"来开洞**（2026-08-30 裁决三，全项目架构不变量）：
 		// 想让某一片墙消失，砌出实心盒再用裁剪场把它 discard 掉 —— 墩就是这么做的，见下面。
+		// 斜接：面板贴着转角的那一端，内皮要沿角平分线让出 `Inset`（凹角为负，内皮反而伸出去）。
+		// 只有真正**顶到墙端**的面板才吃这个量；从墙中间起止的面板两端都是直的。被接缝切在斜接区
+		// 里面的那种少见情况取 max / min，保证内皮区间不越过斜接面、不与邻边的面板重叠。
+		auto InnerSpan = [&F](float SA, float SB, float& OutSAin, float& OutSBin)
+		{
+			OutSAin = (SA <= 0.5f) ? F.InsetStart : FMath::Max(SA, F.InsetStart);
+			OutSBin = (SB >= F.Len - 0.5f) ? (F.Len - F.InsetEnd) : FMath::Min(SB, F.Len - F.InsetEnd);
+			// 整块面板都落在斜接区里时内皮会反向：压成零长，棱台退化成三棱柱，面不翻。
+			OutSBin = FMath::Max(OutSBin, OutSAin);
+		};
+
 		auto AddPanel = [&](float SA, float SB, float Z0, const FCSOpeningClipField& Field, uint8 Tag)
 		{
 			// H − Z0 也要判：Z0 被参数推到墙顶以上时盒子会退化成反向挤出（面全朝里）。
 			if (SB - SA < 0.5f || H - Z0 < 0.5f) return;
+			float SAin = SA, SBin = SB;
+			InnerSpan(SA, SB, SAin, SBin);
 			Writer.SetPanel(Start, U, Field, ECSHousePart::Wall, Tag);
-			Writer.AddBox(Start + U * SA + Up * Z0, U * (SB - SA), In * T, Up * (H - Z0), SlotWall);
+			Writer.AddWallPrism(Start, U, In, Up, SA, SB, SAin, SBin, T, Z0, H, SlotWall);
 			if (Z0 > 0.5f)
 			{
 				// 窗台：真几何而不是 clip 的下界 —— 判据因此只需两个 float（见 CSHouseProfile.h）。
 				Writer.SetPanel(Start, U, FCSOpeningClipField(), ECSHousePart::Wall, 0);
-				Writer.AddBox(Start + U * SA, U * (SB - SA), In * T, Up * Z0, SlotWall);
+				Writer.AddWallPrism(Start, U, In, Up, SA, SB, SAin, SBin, T, 0.0f, Z0, SlotWall);
 			}
 		};
 
@@ -4169,6 +4219,35 @@ void ACSHouseActor::BindHouseMaterials()
 		FrameComponent->InstanceMaterial = FrameMaterial;
 		FrameComponent->MarkRenderStateDirty();
 	}
+}
+
+void ACSHouseActor::PostLoad()
+{
+	Super::PostLoad();
+	if (WallSConvention >= 1) return;
+
+	// 直角对接 → 斜接（2026-09-13）。只迁**存下来的绝对弧长**：锚点自带口径字段、在
+	// `CSHouse_AnchorS` 里就地换算，门的位置每轮从道路重算，都不需要在这里动。
+	//
+	// ⚠️ 不 `Modify()`：这里在加载序列里，不是用户编辑。迁完的值随下一次存盘落地；不存盘就
+	// 下次加载再迁一遍，读的仍是磁盘上那份旧值 —— 幂等。
+	const float T = WallThickness;
+	for (FCSHouseWindow& Window : Windows)
+	{
+		// 旧口径奇数边从外角点往里 T 处量起 ⇒ 同一个物理点在斜接口径下远一个 T。
+		// 旧存档只可能是矩形（边号 0..3），奇偶判据成立。
+		if ((Window.EdgeIndex & 1) != 0) Window.CenterS += T;
+	}
+	// 环参数随奇数边变长而整体错位，旧记忆没有意义；清掉由下一轮重判（至多一次迟回决策）。
+	DoorRunMemory.Empty();
+	PierSpanIsPier.Empty();
+	WallSConvention = 1;
+}
+
+void ACSHouseActor::PostActorCreated()
+{
+	Super::PostActorCreated();
+	WallSConvention = 1;
 }
 
 void ACSHouseActor::PostRegisterAllComponents()

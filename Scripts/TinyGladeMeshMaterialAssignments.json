@@ -1,0 +1,232 @@
+{
+  "assignments": [
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/stairs_step.stairs_step",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_VertexColor.MI_TG_VertexColor",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_MeshProjected_nani_solid_albedo_layer02",
+      "reason": "Stone mesh has no source UV; use object-space projection"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/stairs_pebble.stairs_pebble",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_dirtpath_1.MI_dirtpath_1",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_MeshProjected_nani_solid_albedo_layer02",
+      "reason": "Stone mesh has no source UV; use object-space projection"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/ivy_branch.ivy_branch",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_ivy_branch_color.MI_ivy_branch_color",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_MeshProjected_ivy_branch_color",
+      "reason": "Source mesh has no UV stream; generated lightmap UV is not a texture mapping"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/brick.brick",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_brick_colors_layer00.MI_brick_colors_layer00",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_MeshProjected_brick_colors_layer00",
+      "reason": "Source mesh has no UV stream; generated lightmap UV is not a texture mapping"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/roof_spire.roof_spire",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_roof_colors_layer00.MI_roof_colors_layer00",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_MeshProjected_roof_colors_layer00",
+      "reason": "Source mesh has no UV stream; generated lightmap UV is not a texture mapping"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/roof_tile.roof_tile",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_roof_colors_layer00.MI_roof_colors_layer00",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_MeshProjected_roof_colors_layer00",
+      "reason": "Source mesh has no UV stream; generated lightmap UV is not a texture mapping"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/rocky_terrain_shell/rocky_terrain_shell/StaticMeshes/rocky_terrain_shell.rocky_terrain_shell",
+      "slot": 0,
+      "slot_name": "-1",
+      "old": "/Engine/EngineMaterials/WorldGridMaterial.WorldGridMaterial",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_rocky_terrain",
+      "reason": "Extracted rock shell had the engine checker material"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/background_tree.background_tree",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_VertexColor.MI_TG_VertexColor",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/M_TG_MeshDistantFoliage",
+      "reason": "Background foliage has no vertex colour stream"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/forest_terrain.forest_terrain",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_terrain_summer.MI_terrain_summer",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_MeshProjected_terrain_summer",
+      "reason": "Source mesh has no UV stream; generated lightmap UV is not a texture mapping"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/ice_cracks.ice_cracks",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_ice_roughness.MI_ice_roughness",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/M_TG_MeshIce",
+      "reason": "Roughness data was being displayed as albedo without UV"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/lilypad_flower.lilypad_flower",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MIA_lilypad_flower.MIA_lilypad_flower",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/M_TG_VertexColor",
+      "reason": "Petals carry vertex colour, with no source UV"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/path_pebble.path_pebble",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_dirtpath_1.MI_dirtpath_1",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_MeshProjected_nani_solid_albedo_layer02",
+      "reason": "Stone mesh has no source UV; use object-space projection"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/roof_support_beam.roof_support_beam",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_wooden_plank.MI_wooden_plank",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_MeshProjected_wooden_plank",
+      "reason": "Source mesh has no UV stream; generated lightmap UV is not a texture mapping"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/roof_tile_backface.roof_tile_backface",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_roof_colors_layer00.MI_roof_colors_layer00",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_MeshProjected_roof_colors_layer00",
+      "reason": "Source mesh has no UV stream; generated lightmap UV is not a texture mapping"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/roof_tile_lod1.roof_tile_lod1",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_roof_colors_layer00.MI_roof_colors_layer00",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_MeshProjected_roof_colors_layer00",
+      "reason": "Source mesh has no UV stream; generated lightmap UV is not a texture mapping"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/tree_billboard.tree_billboard",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MIA_canopy_cards.MIA_canopy_cards",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/M_TG_MeshLeafBillboard",
+      "reason": "Packed canopy mask is not a leaf colour texture"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/water_plane.water_plane",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_VertexColor.MI_TG_VertexColor",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/M_TG_MeshWater",
+      "reason": "Water surface had an uncoloured vertex-colour material"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/water_stones.water_stones",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_VertexColor.MI_TG_VertexColor",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_MeshProjected_nani_solid_albedo_layer02",
+      "reason": "Stone mesh has no source UV; use object-space projection"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/window_cottage_1x1.window_cottage_1x1",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_window_colors_layer00.MI_window_colors_layer00",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_MeshProjected_window_colors_layer00",
+      "reason": "Source mesh has no UV stream; generated lightmap UV is not a texture mapping"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/wooden_gate_ladder.wooden_gate_ladder",
+      "slot": 0,
+      "slot_name": "default",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_wooden_plank.MI_wooden_plank",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_TG_MeshProjected_wooden_plank",
+      "reason": "Source mesh has no UV stream; generated lightmap UV is not a texture mapping"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/plant_thistle.plant_thistle",
+      "slot": 0,
+      "slot_name": "part0",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MIA_thistle_flower.MIA_thistle_flower",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/M_TG_MeshMeadowPlant",
+      "reason": "Source clearing_meadow_plant shader: part0 stem, part1 leaf, part2 tinted flower alpha; all source vertex colours are zero"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/plant_thistle.plant_thistle",
+      "slot": 1,
+      "slot_name": "part1",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/M_TG_VertexColor.M_TG_VertexColor",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/M_TG_MeshMeadowPlant",
+      "reason": "Source clearing_meadow_plant shader: part0 stem, part1 leaf, part2 tinted flower alpha; all source vertex colours are zero"
+    },
+    {
+      "mesh": "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/plant_thistle.plant_thistle",
+      "slot": 2,
+      "slot_name": "part2",
+      "old": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/M_TG_VertexColor.M_TG_VertexColor",
+      "new": "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/M_TG_MeshThistleFlower",
+      "reason": "Source clearing_meadow_plant shader: part0 stem, part1 leaf, part2 tinted flower alpha; all source vertex colours are zero"
+    }
+  ],
+  "projected_instances": {
+    "MI_TG_MeshProjected_nani_solid_albedo_layer02": {
+      "texture": "nani_solid_albedo_layer02",
+      "tile_cm": 180.0
+    },
+    "MI_TG_MeshProjected_ivy_branch_color": {
+      "texture": "ivy_branch_color",
+      "tile_cm": 140.0
+    },
+    "MI_TG_MeshProjected_brick_colors_layer00": {
+      "texture": "brick_colors_layer00",
+      "tile_cm": 140.0
+    },
+    "MI_TG_MeshProjected_roof_colors_layer00": {
+      "texture": "roof_colors_layer00",
+      "tile_cm": 140.0
+    },
+    "MI_TG_MeshProjected_terrain_summer": {
+      "texture": "terrain_summer",
+      "tile_cm": 3000.0
+    },
+    "MI_TG_MeshProjected_wooden_plank": {
+      "texture": "wooden_plank",
+      "tile_cm": 140.0
+    },
+    "MI_TG_MeshProjected_window_colors_layer00": {
+      "texture": "window_colors_layer00",
+      "tile_cm": 140.0
+    }
+  },
+  "shared_materials": [
+    "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/M_TG_TextureMasked",
+    "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/M_TG_Glass",
+    "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MIA_bush"
+  ],
+  "new_materials": [
+    "M_TG_MeshProjected",
+    "M_TG_MeshLeafBillboard",
+    "M_TG_MeshWater",
+    "M_TG_MeshIce",
+    "M_TG_MeshDistantFoliage",
+    "M_TG_MeshMeadowPlant",
+    "M_TG_MeshThistleFlower"
+  ]
+}

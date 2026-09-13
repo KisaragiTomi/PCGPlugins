@@ -240,8 +240,19 @@ return lerp(lerp(plaster, mortar, Band), brick, Mask);
 
 NORMAL_HLSL = """
 float3 n = normalize(lerp(NPlaster, NBrick, Mask));
-n += float3(Lip, 0.0f);       // 卷边：灰泥断面朝砖那侧倒
-return normalize(n);
+// Texture UVs use world projection, so mesh UV0 tangents are not their basis.
+// Reconstruct the projection frame on both signs of all three axes.
+float3 N0 = normalize(N);
+float3 a = abs(N0);
+float3 U = a.z > max(a.x,a.y) ? float3(1,0,0)
+         : (a.x > a.y ? float3(0,1,0) : float3(1,0,0));
+float3 V = a.z > max(a.x,a.y) ? float3(0,1,0) : float3(0,0,1);
+U = normalize(U - N0 * dot(U,N0));
+V = normalize(V - N0 * dot(V,N0));
+float3 worldN = U*n.x + V*n.y + N0*n.z;
+// Peel gradient was measured along the mesh tangent axes, independently of UVs.
+worldN += Lip.x * Parameters.TangentToWorld[0] + Lip.y * Parameters.TangentToWorld[1];
+return normalize(worldN);
 """
 
 
@@ -381,6 +392,7 @@ def build_wall():
     mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
     # 双面会露出墙板背面成黑洞。断口由门框砖填满（内壁那条路已作废），所以这里必须保持单面。
     mat.set_editor_property("two_sided", False)
+    mat.set_editor_property("tangent_space_normal", False)
 
     # ---- 世界位置 / 法线：洞缘噪声与世界投影 UV **共用**这两个源 ----
     # （建在洞之前是因为下面的 clip 要用；两处各建一份只是浪费节点。）
@@ -460,9 +472,9 @@ def build_wall():
         ("GradEps", scalar(mat, "GradEps", 2.0, "03 Peel", 6, -1400, 1040)),
         ("UseCoverage", scalar(mat, "UseVertexCoverage", 0.0, "03 Peel", 7, -1400, 1110)),
         ("CoverageWeight", scalar(mat, "CoverageWeight", 1.0, "03 Peel", 8, -1400, 1180)),
-        # 0.88（仿真档）在引擎里读成一地碎屑；0.93 之后是"偶尔几块石头从灰泥里顶出来"，
-        # 与用户 2026-09-03 那句"一部分砖恒高于灰泥面"对得上（2026-09-04 三档同机位对照选定）。
-        ("ProtrudeLevel", scalar(mat, "ProtrudeLevel", 0.93, "04 Protrude", 0, -1400, 1250)),
+        # 2026-09-12：恢复 stone_floor_2 的配对纹理后，0.93 会把高度图细碎峰值露出来。
+        # 同机位复核用 1.06 抑制碎斑，仍允许靠近剥落边的完整砖面突出。
+        ("ProtrudeLevel", scalar(mat, "ProtrudeLevel", 1.06, "04 Protrude", 0, -1400, 1250)),
         ("ProtrudeVar", scalar(mat, "ProtrudeVariation", 0.11, "04 Protrude", 1, -1400, 1320)),
         ("ProtrudeThin", scalar(mat, "ProtrudeEdgeBoost", 0.15, "04 Protrude", 2, -1400, 1390)),
         ("ProtrudeRange", scalar(mat, "ProtrudeEdgeRange", 25.0, "04 Protrude", 3, -1400, 1460)),
@@ -507,12 +519,13 @@ def build_wall():
     MEL.connect_material_expressions(p_groove, "", albedo, "GrooveDarken")
     MEL.connect_material_property(albedo, "", unreal.MaterialProperty.MP_BASE_COLOR)
 
-    nrm = custom(mat, "TGWallNormal", NORMAL_HLSL, ["NPlaster", "NBrick", "Mask", "Lip"],
+    nrm = custom(mat, "TGWallNormal", NORMAL_HLSL, ["NPlaster", "NBrick", "Mask", "Lip", "N"],
                  unreal.CustomMaterialOutputType.CMOT_FLOAT3, -400, 100)
     MEL.connect_material_expressions(t_plasn, "RGB", nrm, "NPlaster")
     MEL.connect_material_expressions(t_brickn, "RGB", nrm, "NBrick")
     MEL.connect_material_expressions(m_mask, "", nrm, "Mask")
     MEL.connect_material_expressions(m_lip, "", nrm, "Lip")
+    MEL.connect_material_expressions(vnrm, "", nrm, "N")
     MEL.connect_material_property(nrm, "", unreal.MaterialProperty.MP_NORMAL)
 
     p_prough = scalar(mat, "PlasterRoughness", 0.85, "02 Plaster", 7, -700, 260)
@@ -588,38 +601,49 @@ def build_plain(name, r, g, b):
     return mat
 
 
-fixed = fix_data_textures()
-if fixed:
-    unreal.log("sRGB fixed on data textures: %s" % ", ".join(fixed))
+def main():
+    fixed = fix_data_textures()
+    if fixed:
+        unreal.log("sRGB fixed on data textures: %s" % ", ".join(fixed))
 
-wall = build_wall()
-wall_mi = build_wall_instance(wall)
-roof = build_plain("M_TinyGladeRoof", 0.30, 0.16, 0.13)
+    wall = build_wall()
+    wall_mi = build_wall_instance(wall)
+    # 屋顶有自己的颜色/法线/破损图，重建墙材质不能覆写成纯色。
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location("tg_roof_material", Path(__file__).with_name("TinyGladeMakeRoofMaterial.py"))
+    roof_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(roof_module)
+    roof = roof_module.build()
 
-st = MEL.get_statistics(wall)
-unreal.log("M_TinyGladeWall stats: vs=%s ps=%s samplers=%s" % (
-    st.get_editor_property("num_vertex_shader_instructions"),
-    st.get_editor_property("num_pixel_shader_instructions"),
-    st.get_editor_property("num_samplers")))
+    st = MEL.get_statistics(wall)
+    unreal.log("M_TinyGladeWall stats: vs=%s ps=%s samplers=%s" % (
+        st.get_editor_property("num_vertex_shader_instructions"),
+        st.get_editor_property("num_pixel_shader_instructions"),
+        st.get_editor_property("num_samplers")))
 
-# ---- 挂到蓝图 CDO + 当前关卡里已有的房子 ----
-# ⚠️ **不 load_map**：编辑器里可能开着别的、还没存的关卡（实测 2026-09-03 开着
-# L_TerrainOpsDemo 且 dirty）。换关卡会弹存盘对话框把脚本卡死，或者把改动丢掉。
-bp = unreal.EditorAssetLibrary.load_asset("%s/BP_TinyGladeHouse" % PKG)
-if bp:
-    cdo = unreal.get_default_object(bp.generated_class())
-    for prop, mat in (("WallMaterial", wall_mi), ("RoofMaterial", roof)):
-        cdo.set_editor_property(prop, mat)
-    unreal.EditorAssetLibrary.save_loaded_asset(bp)
-    unreal.log("assigned to BP_TinyGladeHouse CDO")
+    # ---- 挂到蓝图 CDO + 当前关卡里已有的房子 ----
+    # ⚠️ **不 load_map**：编辑器里可能开着别的、还没存的关卡（实测 2026-09-03 开着
+    # L_TerrainOpsDemo 且 dirty）。换关卡会弹存盘对话框把脚本卡死，或者把改动丢掉。
+    bp = unreal.EditorAssetLibrary.load_asset("%s/BP_TinyGladeHouse" % PKG)
+    if bp:
+        cdo = unreal.get_default_object(bp.generated_class())
+        for prop, mat in (("WallMaterial", wall_mi), ("RoofMaterial", roof)):
+            cdo.set_editor_property(prop, mat)
+        unreal.EditorAssetLibrary.save_loaded_asset(bp)
+        unreal.log("assigned to BP_TinyGladeHouse CDO")
 
-count = 0
-for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors():
-    if "House" not in a.get_class().get_name():
-        continue
-    for prop, mat in (("WallMaterial", wall_mi), ("RoofMaterial", roof)):
-        a.set_editor_property(prop, mat)
-    a.call_method("RebuildHouse")
-    count += 1
-unreal.log("assigned to %d house actors in the CURRENT level (level not saved)" % count)
-unreal.log("MATERIALS DONE")
+    count = 0
+    for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors():
+        if "House" not in a.get_class().get_name():
+            continue
+        for prop, mat in (("WallMaterial", wall_mi), ("RoofMaterial", roof)):
+            a.set_editor_property(prop, mat)
+        a.call_method("RebuildHouse")
+        count += 1
+    unreal.log("assigned to %d house actors in the CURRENT level (level not saved)" % count)
+    unreal.log("MATERIALS DONE")
+
+
+if __name__ == '__main__':
+    main()

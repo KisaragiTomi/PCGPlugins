@@ -3,6 +3,8 @@
 `ACSGroundActor` 的四条派生链（地被 / 石阶 / 石阶材质 / 岩壳）在 2026-09-06 集中改过一轮。
 本文只记**改了什么、从什么改到什么、为什么**，以及改动之间的横向影响。
 
+2026-09-12 的地面三层材质修正另见 [CSGroundMaterial.md](CSGroundMaterial.md)，包含草土深色过渡、噪声土斑、反编译依据与用户参考图。
+
 ⚠️ **每个参数自己的语义不在这里** —— 权威是源码声明处的注释（`CSGroundActor.h` 的
 `FCSGroundCoverSpecies` 与 `CS Ground|Stairs` / `CS Ground|Rock Shell` 两组）。本文不复述，
 只在需要读懂表格时给一句话。

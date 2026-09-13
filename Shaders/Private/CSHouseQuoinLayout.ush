@@ -1,0 +1,53 @@
+#ifndef CS_HOUSE_QUOIN_LAYOUT
+#define CS_HOUSE_QUOIN_LAYOUT
+
+// Shared by the scatter shader and geometry regression tests. Native TG dimensions
+// in cm: width 92 +/- 16, depth 63.7, nominal course 69, projection 3.85.
+// add_wall_corners: 0x141215E72 (width), 0x141215F0E / 0x14121698A (course parity),
+// 0x141216BB3 (depth). Scale adapts these proportions to our FrameBrickLength.
+#ifdef __cplusplus
+namespace CSHouseQuoinLayout
+{
+using float3 = FVector3f;
+#define CS_QUOIN_INLINE inline
+#else
+#define CS_QUOIN_INLINE
+#endif
+
+struct FQuoinPlacement
+{
+	float3 Center;
+	float3 AxisX;
+	float3 AxisZ;
+	float LongSize;
+	float ShortSize;
+};
+
+CS_QUOIN_INLINE FQuoinPlacement PlaceQuoin(float3 Corner, float OutwardX, float OutwardY,
+	float Scale, float WidthOffset, bool OddCourse)
+{
+	const float D = 0.7071067811865475f;
+	const float3 FaceA = float3((OutwardX - OutwardY) * D, (OutwardY + OutwardX) * D, 0.0f);
+	const float3 FaceB = float3((OutwardX + OutwardY) * D, (OutwardY - OutwardX) * D, 0.0f);
+	const float Limit = 16.0f * Scale;
+	const float Offset = WidthOffset < -Limit ? -Limit : (WidthOffset > Limit ? Limit : WidthOffset);
+	FQuoinPlacement Q;
+	Q.LongSize = 92.0f * Scale + Offset;
+	Q.ShortSize = 63.7f * Scale;
+	Q.AxisX = OddCourse ? FaceB : FaceA;
+	// AxisY = world -Z. Preserve a right-handed basis on both course orientations.
+	Q.AxisZ = OddCourse ? FaceA : -FaceB;
+	const float SizeA = OddCourse ? Q.ShortSize : Q.LongSize;
+	const float SizeB = OddCourse ? Q.LongSize : Q.ShortSize;
+	const float Protrude = 3.85f * Scale;
+	// Anchor the two outer faces; varying the width moves the embedded center,
+	// never the corner edge. A centered diagonal brick cannot form this bond.
+	Q.Center = Corner + FaceA * (Protrude - 0.5f * SizeA) + FaceB * (Protrude - 0.5f * SizeB);
+	return Q;
+}
+
+#ifdef __cplusplus
+}
+#endif
+#undef CS_QUOIN_INLINE
+#endif

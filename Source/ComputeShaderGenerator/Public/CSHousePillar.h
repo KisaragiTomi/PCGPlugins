@@ -39,8 +39,8 @@ struct FParams
 {
 	float BrickWidth = 34.0f;      // 砖的截面边长（世界 cm）
 	float CourseHeight = 20.0f;    // 一层砖的高度
-	float YawJitter = 0.14f;       // 逐层绕竖轴的随机偏转（弧度）。TG 的石柱不是笔直码齐的
-	float SizeJitter = 0.10f;      // 逐层尺寸的对称抖动
+	float YawJitter = 0.035f;      // 每层在 90° 旋转档上微偏转，装配时上限 0.05 rad，保留连续承压面
+	float SizeJitter = 0.04f;      // 对称尺寸抖动，上限 5%；两条水平轴共同缩放
 	/**
 	 * 托架（TG 的 `construct_rectangle_brackets` / `_small_brackets`）：顶部这几层向外**逐层出挑**，
 	 * 把房底"托"住。0 = 不做托架，退回纯直柱。

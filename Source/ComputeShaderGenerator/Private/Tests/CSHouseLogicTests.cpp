@@ -8,6 +8,8 @@
 #include "CSHouseDoorRuns.h"
 #include "CSHouseProfile.h"
 #include "CSHouseQuoin.h"
+#include "CSHouseQuoinLayout.ush"
+#include "CSHousePillar.h"
 #include "CSHouseTrim.h"
 #include "CSHouseBrickWall.h"
 #include "CSHouseResize.h"
@@ -2866,12 +2868,11 @@ bool FCSHouseQuoinCoversOuterEdgeTest::RunTest(const FString& Parameters)
 		{ TEXT("axis-aligned"),     FVector2D(600.0, 400.0),    0.0f, FVector2D(0.0, 0.0),       0.0f },
 		{ TEXT("yawed 37 deg"),     FVector2D(600.0, 400.0),   37.0f, FVector2D(1200.0, -800.0), 0.0f },
 		{ TEXT("square + offset"),  FVector2D(500.0, 500.0), -113.0f, FVector2D(-300.0, 450.0),  0.0f },
-		{ TEXT("slightly inset"),   FVector2D(800.0, 300.0),   90.0f, FVector2D(0.0, 0.0),       4.0f },
+		{ TEXT("slightly inset"),   FVector2D(800.0, 300.0),   90.0f, FVector2D(0.0, 0.0),       1.0f },
 	};
 
 	const float T = 24.0f;          // WallThickness
-	const float Depth = 20.0f;      // FrameBrickDepth —— 砖的 +X（面内朝外）
-	const float Thick = T;          // FrameBrickThickness <= 0.5 时退化成墙厚（见 EnsureFrameComponent）
+	const float Scale = 26.0f / 69.0f; // Shared shader profile, adapted to the current course height.
 	const double Diag = 0.70710678118654752440;
 
 	for (const FCase& C : Cases)
@@ -2903,27 +2904,36 @@ bool FCSHouseQuoinCoversOuterEdgeTest::RunTest(const FString& Parameters)
 			TestTrue(FString::Printf(TEXT("[%s] quoin %d points along the corner bisector"), C.What, Index),
 				FVector2D::DotProduct(Q.Outward, FVector2D(Bisector.X, Bisector.Y)) > 0.999);
 
-			// ---- 核心判据：两个相邻墙面各自的外法线上都伸出墙外 ----
-			// 砖的横截面 = 沿 Outward 的 Depth × 沿其法向的 Thick，中心在 Q.Point。
-			const FVector2D U = Q.Outward;
-			const FVector2D V(-U.Y, U.X);
-			for (int32 Which = 0; Which < 2; ++Which)
+			// Exercise the actual placement helper compiled by both C++ and HLSL.
+			// Each course changes its long edge, but both outer wall planes stay fixed.
+			for (bool Odd : { false, true })
+			for (float Offset : { -16.0f * Scale, 0.0f, 16.0f * Scale })
 			{
-				const FVector LocalN = (Which == 0) ? FVector(Sign.X, 0.0, 0.0) : FVector(0.0, Sign.Y, 0.0);
-				const FVector WorldN3 = World.TransformVectorNoScale(LocalN);
-				const FVector2D N = FVector2D(WorldN3.X, WorldN3.Y).GetSafeNormal();
-
-				const FVector FacePoint = World.TransformPosition(
-					(Which == 0) ? FVector(Sign.X * HX, 0.0, 0.0) : FVector(0.0, Sign.Y * HY, 0.0));
-				const double FaceD = FVector2D::DotProduct(FVector2D(FacePoint.X, FacePoint.Y), N);
-
-				const double BoxD = FVector2D::DotProduct(Q.Point, N)
-					+ 0.5 * Depth * FMath::Abs(FVector2D::DotProduct(U, N))
-					+ 0.5 * Thick * FMath::Abs(FVector2D::DotProduct(V, N));
-
-				TestTrue(FString::Printf(TEXT("[%s] quoin %d stands proud of wall face %d (by %.2f cm)"),
-					C.What, Index, Which, BoxD - FaceD), BoxD - FaceD > 0.5);
+				const auto P = CSHouseQuoinLayout::PlaceQuoin(
+					FVector3f(Q.Point.X, Q.Point.Y, 0.0f), Q.Outward.X, Q.Outward.Y, Scale, Offset, Odd);
+				TestTrue(TEXT("Quoin basis remains right-handed on both course orientations"),
+					FVector3f::DotProduct(FVector3f::CrossProduct(P.AxisX, FVector3f(0, 0, -1)), P.AxisZ) > 0.999f);
+				TestTrue(TEXT("The long edge stays longer than the short edge at either random extreme"), P.LongSize > P.ShortSize);
+				for (int32 Which = 0; Which < 2; ++Which)
+				{
+					const FVector LocalN = Which == 0 ? FVector(Sign.X, 0, 0) : FVector(0, Sign.Y, 0);
+					const FVector3f N(World.TransformVectorNoScale(LocalN));
+					const FVector3f FacePoint(World.TransformPosition(FVector(Sign.X * HX, Sign.Y * HY, 0)));
+					const float XDot = FVector3f::DotProduct(P.AxisX, N);
+					const float ZDot = FVector3f::DotProduct(P.AxisZ, N);
+					TestTrue(TEXT("Brick faces align with a wall, never the diagonal bisector"),
+						FMath::Abs(XDot) > 0.999f || FMath::Abs(ZDot) > 0.999f);
+					const float Outmost = FVector3f::DotProduct(P.Center - FacePoint, N)
+						+ 0.5f * (P.LongSize * FMath::Abs(XDot) + P.ShortSize * FMath::Abs(ZDot));
+					const float Expected = 3.85f * Scale - C.Inset * float(Diag);
+					TestTrue(FString::Printf(TEXT("[%s] corner %d face %d stays shallow and anchored (%.3f cm)"),
+						C.What, Index, Which, Outmost), FMath::IsNearlyEqual(Outmost, Expected, 0.002f) && Outmost > 0.5f);
+				}
 			}
+			const auto Even = CSHouseQuoinLayout::PlaceQuoin(FVector3f::ZeroVector, Q.Outward.X, Q.Outward.Y, Scale, 0, false);
+			const auto Odd = CSHouseQuoinLayout::PlaceQuoin(FVector3f::ZeroVector, Q.Outward.X, Q.Outward.Y, Scale, 0, true);
+			TestTrue(TEXT("Successive courses exchange the long edge between adjacent walls"),
+				FMath::Abs(FVector3f::DotProduct(Even.AxisX, Odd.AxisX)) < 0.001f);
 		}
 	}
 
@@ -2969,7 +2979,7 @@ bool FCSHouseQuoinSharesColumnEmitterTest::RunTest(const FString& Parameters)
 
 	TArray<CSHouseFrame::FElement> FromSeam, FromQuoin;
 	const int32 SeamBricks = CSHouseSeam::BuildCornerElements(Corners, 0x1234u, Params, FromSeam);
-	const int32 QuoinBricks = CSHouseQuoin::BuildQuoinElements(Quoins, 0x1234u, Params, FromQuoin);
+	const int32 QuoinBricks = CSHouseQuoin::BuildQuoinElements(Quoins, 0x1234u, Params, FromQuoin, FVector2f(0.01f, 0.01f));
 
 	TestEqual(TEXT("both emit the same brick count"), QuoinBricks, SeamBricks);
 	TestTrue(TEXT("both emit exactly one path"), FromSeam.Num() == 1 && FromQuoin.Num() == 1);
@@ -3030,7 +3040,7 @@ bool FCSHouseQuoinRandomIgnoresSlotTest::RunTest(const FString& Parameters)
 			Filler.BrickCount = PrefixBricks;
 			Elements.Add(Filler);
 		}
-		CSHouseQuoin::BuildQuoinElements(Quoins, 0xABCDu, Params, Elements);
+		CSHouseQuoin::BuildQuoinElements(Quoins, 0xABCDu, Params, Elements, FVector2f(0.01f, 0.01f));
 		for (int32 i = Skip; i < Elements.Num(); ++i)
 		{
 			OutRandoms.Add(Elements[i].RandomBase);
@@ -3082,7 +3092,7 @@ bool FCSHouseQuoinTruncatesTest::RunTest(const FString& Parameters)
 		Params.MaxBricks = Cap;
 
 		TArray<CSHouseFrame::FElement> Elements;
-		const int32 Added = CSHouseQuoin::BuildQuoinElements(Quoins, 1u, Params, Elements);
+		const int32 Added = CSHouseQuoin::BuildQuoinElements(Quoins, 1u, Params, Elements, FVector2f(0.01f, 0.01f));
 
 		TestTrue(FString::Printf(TEXT("cap %d is never exceeded (added %d)"), Cap, Added), Added <= Cap);
 		TestTrue(FString::Printf(TEXT("cap %d never yields a negative count"), Cap), Added >= 0);
@@ -4726,6 +4736,63 @@ bool FCSHouseFootprintPolylineMatchesRectTest::RunTest(const FString& Parameters
 			CSHouse_GetEdge(9, FCSHouseFootprint::MakeRect(FVector2D(600.0, 400.0)), 24.0f).Len == 0.0f);
 	}
 
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCSHouseQuoinProfileTest,
+	"PCGPlugins.ComputeShaderGenerator.House.QuoinProfile",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseQuoinProfileTest::RunTest(const FString& Parameters)
+{
+	CSHouseFrame::FBrickParams Params;
+	Params.Jitter = 16.0f;
+	Params.SplitJitter = 21.0f;
+	TArray<CSHouseQuoin::FQuoin> Quoins;
+	CSHouseQuoin::BuildQuoins(FTransform::Identity, FVector2D(600, 400), 24, 0, 471, 0, Quoins);
+	Quoins[0].CullBelowZ = 180.0f;
+	TArray<CSHouseFrame::FElement> Elements;
+	CSHouseQuoin::BuildQuoinElements(Quoins, 123, Params, Elements, FVector2f(0.01f, 0.01f));
+	TestEqual(TEXT("Four corners use four ordinary column paths"), Elements.Num(), 4);
+	if (Elements.Num() != 4) return false;
+	const auto& E = Elements[0];
+	TestTrue(TEXT("Native dimensions scale with course height"), FMath::IsNearlyEqual(E.QuoinScale, 26.0f / 69.0f));
+	TestTrue(TEXT("Width jitter is scaled, not a world-space diagonal shift"), FMath::IsNearlyEqual(E.Jitter, 16.0f * 26.0f / 69.0f));
+	TestTrue(TEXT("Split jitter uses the same native scale"), FMath::IsNearlyEqual(E.SplitJitter, 21.0f * 26.0f / 69.0f));
+	TestEqual(TEXT("Corner openings retain their cull height"), E.CullBelowZ, 180.0f);
+	TestEqual(TEXT("Generic frame paths do not acquire a quoin profile"), CSHouseFrame::FElement().QuoinScale, 0.0f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCSHouseMasonryContactTest,
+	"PCGPlugins.ComputeShaderGenerator.House.MasonryContact",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseMasonryContactTest::RunTest(const FString& Parameters)
+{
+	// Exercise short supports, non-integral lengths, rotated placement and
+	// legacy serialized jitter. Every course must bear on a full shaft section;
+	// caps must grow towards the building and the top must touch its underside.
+	for (float Length : { 11.0f, 37.0f, 150.0f, 237.0f })
+	{
+		CSHousePillar::FParams Params;
+		Params.YawJitter = 0.14f;
+		Params.SizeJitter = 0.10f;
+		const FTransform World(FRotator(0, 37, 0), FVector(1200, -600, 300));
+		TArray<CSHousePillar::FBrick> Bricks;
+		CSHousePillar::BuildBricks({ FVector(100, 80, 0) }, { Length }, World, Params, Bricks);
+		TestTrue(TEXT("A usable gap produces a support"), !Bricks.IsEmpty());
+		float LastBottom = 300.0f;
+		for (const auto& B : Bricks)
+		{
+			const float X = B.AxisX.Size(), Y = B.AxisY.Size();
+			TestTrue(TEXT("Masonry retains a square bearing section"), FMath::IsNearlyEqual(X,Y,0.001f));
+			TestTrue(TEXT("No course narrows below 95 percent of the shaft"), X >= Params.BrickWidth * 0.95f - 0.001f);
+			TestTrue(TEXT("Adjacent horizontal bearing planes meet"), FMath::IsNearlyEqual(B.Origin.Z+B.AxisZ.Z*0.5f,LastBottom,0.001f));
+			LastBottom = B.Origin.Z-B.AxisZ.Z*0.5f;
+		}
+		TestTrue(TEXT("Support reaches the requested embedded bottom"), FMath::IsNearlyEqual(LastBottom,300.0f-Length,0.001f));
+	}
 	return true;
 }
 

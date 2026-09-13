@@ -326,8 +326,9 @@ public:
 	 * 角斜脊 / 屋脊上盖瓦的尺寸系数。≤ 0 = 不铺脊瓦。
 	 *
 	 * 交汇处两坡的瓦是**对切**的，接缝一眼看得见；盖瓦骑在缝上、法线取两坡法线的角平分把它遮住。
-	 * TG 侧没有专门的脊瓦网格（`assets/meshes` 查无 `roof_ridge`），盖的仍是同一块 `roof_tile`，
-	 * 所以这里不引入新资产。> 1 让盖瓦比普通瓦大一圈，才压得住两侧。
+	 * 使用已适配原版顶点变形的 SM_TinyGladeRoofTile；顺坡轴沿脊搭接、宽度轴跨脊。
+	 * 盖瓦中心抬一个瓦片包围盒厚度，避免坡面瓦穿出。该收口排布是参考图的 UE 适配。
+	 * roof_tile_lod1 / backface 是原版的简化/背面通道，不能当作随机瓦型或专用脊瓦。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile", meta = (ClampMin = "0.0", ClampMax = "3.0"))
 	float RoofRidgeCapScale = 1.15f;
@@ -778,7 +779,7 @@ public:
 	 *
 	 * 2026-09-04 用户："很多结构离墙太近了，应该是它们的中心在墙 mesh 上，而不是它们的最远端。"
 	 * 之前砖的穿墙厚度 = 墙厚、路走墙厚正中 ⇒ 砖的外表面与墙面**共面**，拱圈石 / 墩 / 勒脚
-	 * 全贴在灰泥里一点都不凸；而角石（`QuoinInset = 0`：一半在实体里一半探出去）反倒是对的。
+	 * 全贴在灰泥里一点都不凸；角石则独立按两面墙的外棱锚定，见 `CSHouseQuoinLayout.ush`。
 	 * TG 的砖本来就是墙本身、灰泥是盖在外面的一层，拱圈石天然凸出灰泥面并在门上投影
 	 * （实拍 `img/tiny-glade-ref-door-in-arch.png`）。
 	 * 中心仍在墙厚正中（"中心在墙 mesh 上"），厚度加 2×此值 ⇒ 两面各凸一截，
@@ -894,43 +895,22 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Quoin")
 	bool bQuoinEnabled = true;
 
-	/**
-	 * 柱心沿角平分线**向内**缩的距离 cm。
-	 *
-	 * 0 = 柱心正落在外角点上：砖一半埋在墙角实体里、一半探出去，正是角石该有的样子，
-	 * 也是"遮住那条竖直棱"最省的摆法。调大则整根往房里坐（棱会重新露出来），
-	 * 调负数则整根飘出墙外。**改它会改砖的位置 ⇒ 已进砖路哈希**。
-	 */
+	/** 包角外棱沿角平分线向内缩的距离 cm。0 = 按 TG 比例浅凸于两面墙。
+	 * 正值把整列角石压入墙面；超过凸出量时会隐入墙内。Point 是外棱锚点，不是砖心。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Quoin", meta = (ClampMin = "-50.0", ClampMax = "100.0"))
 	float QuoinInset = 0.0f;
 
-	/**
-	 * 角石**逐砖横向随机偏移**的幅度（cm），沿角平分线 ±。0 = 关（等截面柱，加这条之前的样子）。
-	 *
-	 * 默认 16 cm 来自 TG 的二进制：`system_wall_constructor::utils::wall_corners::add_wall_corners`
-	 * （VA 0x141215540）里每层角砖取一次 `fastrand::Rng::f32`，算 `K*(1−r)` 与 `K*r` 相减
-	 * ⇒ **`K × (2r − 1)`**，`K` 是 `.rdata` 常量 **0.16**（TG 单位 = m ⇒ 16 cm）。
-	 *
-	 * ⚠️ **TG 的角砖不是"一进一出"**：那个函数里没有任何对砖序号的奇偶判定（4 处 `testb $1`
-	 * 全是 Rust bool 参数）。进退是**对称随机**的 —— `TinyGlade_模块对照与进度.md` 里原先
-	 * 那条"TG 的 quoin 是一进一出的"是肉眼观感，已按二进制订正。
-	 *
-	 * ⚠️ 16 cm 是**照搬 TG 的绝对值**，没有按本项目的墙厚/砖长折算过。觉得过头就往下调。
-	 */
+	/** 角石长边的随机变化，TG 基准厘米（默认 16，上限 16）。
+	 * 按 FrameBrickLength / 69 折算：26 cm 层高时长边 34.67 ± 6.03 cm。
+	 * 0 = 固定长边；长短边仍按层号交错。两张外表面的位置不受随机数影响。
+	 * 原函数 0x141215E72–0x141215E8E 算 0.92 + 0.16*(2r-1)，
+	 * 0x141215F0E / 0x14121698A 用层号奇偶换向；旧版“所有 test 都是 bool”的注释有误。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Quoin", meta = (ClampMin = "0.0"))
 	float QuoinJitter = 16.0f;
 
-	/**
-	 * 角石**分层随机化**的抖动幅度（cm），沿柱高方向。0 = 等分（加这条之前的样子）。
-	 *
-	 * 对位 TG 的 `utils::random_splits`：它在 [0,1] 上均匀分点再叠对称抖动，**抖幅被夹到
-	 * `0.495 × 间距`** ⇒ 分点永远保序、不会出现零厚度的层。kernel 里是逐砖现算自己的两个
-	 * 分界（不落数组），数学与 TG 一致。
-	 *
-	 * 默认 21 cm 取自 TG 在 `add_wall_corners` 里传给 `random_splits` 的那个 `0.21`
-	 * （TG 单位 = m）。⚠️ 与 `QuoinJitter` 一样是**照搬绝对值**，没按本项目的砖长折算过。
-	 * 真正生效的幅度还会被上面那条 0.495 夹一道，所以调大到一定程度就不再有变化。
-	 */
+	/** 分层抖动，TG 基准厘米（默认 21）；按 FrameBrickLength / 69 折算。
+	 * 对位 random_splits 的 0.21 / 柱高，分点抖幅上限为 0.495 × 间距。
+	 * 两端固定，内部边界共享，0 = 等分；改变此值会触发重新散布。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Quoin", meta = (ClampMin = "0.0"))
 	float QuoinSplitJitter = 21.0f;
 
@@ -964,7 +944,7 @@ public:
 	/**
 	 * 压顶石课程中心相对**墙顶**的偏移 cm。
 	 *
-	 * 0 = 骑在墙顶（一半埋进墙、一半探出去）—— 与 `QuoinInset` 同一条口径，也是 TG 那种
+	 * 0 = 骑在墙顶（一半埋进墙、一半探出去）—— 这是水平压顶的口径，也是 TG 那种
 	 * "砖互相穿插、看不出接缝"的做法。正值整课往上抬（会在墙顶露出一条缝），负值往下沉。
 	 * 课程本身的高度是 `FrameBrickDepth`（三家共用一份 `BlockSize`，见 CSHouseTrim.h）。
 	 */
@@ -1318,7 +1298,7 @@ public:
 
 	/** 逐层绕竖轴的随机偏转（弧度）。TG 的石柱不是笔直码齐的。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Pillar", meta = (ClampMin = "0.0", ClampMax = "0.8"))
-	float PillarYawJitter = 0.14f;
+	float PillarYawJitter = 0.035f;
 
 	/** 顶部出挑的层数（TG 的 brackets / small_brackets）。0 = 不做托架。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Pillar", meta = (ClampMin = "0", ClampMax = "8"))

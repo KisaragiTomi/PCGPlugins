@@ -88,14 +88,16 @@ void BuildBricks(const TArray<FVector>& Centers, const TArray<float>& Lengths,
 			}
 
 			const uint32 Id = CSHouseVine::IdentityHash(P, C, 0, 17u, Params.Seed);
-			const float Yaw = (CSHouseVine::Hash01(Id) - 0.5f) * 2.0f * Params.YawJitter;
-			const float Jit = 1.0f + (CSHouseVine::Hash01(Id ^ 0x9E3779B9u) - 0.5f) * 2.0f * Params.SizeJitter;
-
-			// 交错砌法（TG 的 `util_cross_brick_pillar::construct_crossbrick_pillar`）：
-			// 奇偶层把 X/Y 换过来。一摞同向的砖读起来是一根方管，交错才有"砌"的感觉。
-			const bool bCross = (C & 1) != 0;
-			const float SizeX = Width * Widen * Jit * (bCross ? 0.72f : 1.0f);
-			const float SizeY = Width * Widen * Jit * (bCross ? 1.0f : 0.72f);
+			// Keep a continuous square bearing section. The old 0.72 alternating
+			// rectangles made each course retreat by 28%; that number has no TG
+			// decompilation evidence. Rotate the same beveled stone by quarter turns
+			// for variety, as the TG brick VS does, without narrowing the support.
+			const float Yaw = float(C & 3) * HALF_PI
+				+ (CSHouseVine::Hash01(Id) - 0.5f) * 2.0f * FMath::Clamp(Params.YawJitter, 0.0f, 0.05f);
+			const float Jit = 1.0f + (CSHouseVine::Hash01(Id ^ 0x9E3779B9u) - 0.5f)
+				* 2.0f * FMath::Clamp(Params.SizeJitter, 0.0f, 0.05f);
+			const float SizeX = Width * Widen * Jit;
+			const float SizeY = SizeX;
 
 			const float CosY = FMath::Cos(Yaw), SinY = FMath::Sin(Yaw);
 			const FVector LocalX(CosY, SinY, 0.0);

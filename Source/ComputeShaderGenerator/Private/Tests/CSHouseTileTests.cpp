@@ -510,6 +510,23 @@ bool FCSHouseTileRidgeCapsTest::RunTest(const FString& Parameters)
 	TestTrue(FString::Printf(TEXT("MaxTilesBound 覆盖脊瓦（bound %d ≥ 实产 %d）"),
 		CSHouseTile::MaxTilesBound(Roof, WithCaps), Capped.Num()),
 		CSHouseTile::MaxTilesBound(Roof, WithCaps) >= Capped.Num());
+
+	// A horizontal ridge exposes both regressions: the cap must run lengthwise
+	// and its underside must clear the top of the body tiles (old offset was 0).
+	CSHouseTile::FParams ThickCaps = WithCaps;
+	ThickCaps.Thickness = 6.0f;
+	CSHouseTile::BuildPlan(Roof, FTransform::Identity, ThickCaps, Capped);
+	int32 HorizontalCaps = 0;
+	for (int32 Index = Plain.Num(); Index < Capped.Num(); ++Index)
+	{
+		const CSHouseTile::FRecord& R = Capped[Index];
+		if (R.AxisZ.Z < 0.999f) continue;
+		++HorizontalCaps;
+		TestTrue(TEXT("cap length runs along the horizontal ridge"), FMath::Abs(R.AxisX.X) > 0.999f);
+		const float RoofZ = CSHouseRoof_EvalZ(Roof, FVector2D(R.WorldPos.X, R.WorldPos.Y));
+		TestTrue(TEXT("cap clears the body tile thickness"), R.WorldPos.Z - RoofZ >= 5.99f);
+	}
+	TestTrue(TEXT("horizontal ridge clearance was exercised"), HorizontalCaps > 0);
 	return true;
 }
 

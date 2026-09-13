@@ -97,8 +97,9 @@ struct FParams
 	/**
 	 * 角斜脊 / 屋脊上盖瓦的尺寸系数。≤ 0 = 不铺脊瓦。
 	 *
-	 * TG 侧**没有专门的脊瓦网格**（`assets/meshes` 里没有 `roof_ridge`）—— 交汇处盖的仍是同一块
-	 * `roof_tile`，只是骑在接缝上、法线取两坡法线的角平分。所以这里不引入新资产。
+	 * 使用已适配原版顶点变形的 SM_TinyGladeRoofTile；顺坡轴沿脊搭接、宽度轴跨脊。
+	 * 盖瓦中心抬一个瓦片包围盒厚度，避免坡面瓦穿出。该收口排布是参考图的 UE 适配。
+	 * roof_tile_lod1 / backface 是原版的简化/背面通道，不能当作随机瓦型或专用脊瓦。
 	 */
 	float RidgeCapScale = 1.15f;
 	/** 沿屋面法线抬起 cm。 */

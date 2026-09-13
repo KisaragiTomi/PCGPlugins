@@ -2248,9 +2248,8 @@ uint32 ACSHouseActor::BuildQuoinBricks(TArray<CSHouseFrame::FElement>& InOutElem
 	Params.Gap = FMath::Max(FrameBrickGap, 0.0f);
 	// **与门框砖 / 接缝砖共用同一份常驻容量**：角石只是同一个组件里排在最后的那些行。
 	Params.MaxBricks = EffectiveFrameCapacity();
-	// 逐砖横向随机偏移 —— **只有角石这一路开**。门框砖、接缝砖、包边石传的 params 里
-	// 这一格保持 0，所以它们逐位不变（`House.QuoinSharesTheColumnEmitter` 也因此照旧成立：
-	// 那条断言拿同一份 params 喂角石与接缝柱，同一份进去两边拿到的 Jitter 恒等）。
+	// 角石的 TG 基准厘米在 BuildQuoinElements 里按层高折算。
+	// 原函数随机改变长边，并按路内层号换向；不能把随机数加到角平分线位置上。
 	Params.Jitter = FMath::Max(QuoinJitter, 0.0f);
 	Params.SplitJitter = FMath::Max(QuoinSplitJitter, 0.0f);
 
@@ -2278,14 +2277,17 @@ uint32 ACSHouseActor::BuildQuoinBricks(TArray<CSHouseFrame::FElement>& InOutElem
 	// 于是将来谁给砖材质接上 `PerInstanceRandom` 色差，开一扇门就会让四个角整体换色，
 	// 而所有几何断言全绿。与接缝砖那条是同一个理由的另一半。
 	const uint32 Seed = HouseId.IsValid() ? GetTypeHash(HouseId) : uint32(GetUniqueID());
-	const int32 Added = CSHouseQuoin::BuildQuoinElements(Quoins, Seed, Params, InOutElements);
+	const FVector MeshSize = FrameBrickMesh->GetBoundingBox().GetSize();
+	const FVector2f MeshInvSize(1.0 / FMath::Max(MeshSize.X, 1.0), 1.0 / FMath::Max(MeshSize.Z, 1.0));
+	const int32 Added = CSHouseQuoin::BuildQuoinElements(Quoins, Seed, Params, InOutElements, MeshInvSize);
 	CurrentQuoinBrickCount = Added;
 	InOutBrickCount += Added;
 
-	// 哈希只记标量：柱心 + 朝外方向 + 柱底/柱顶 + 砖数。逐砖的位置是它们的纯函数。
-	// `QuoinInset` 不必单列 —— 它已经吃进 `Point` 了。
+	// 参数也进入哈希：只改随机幅度、层高或种子同样必须重新散布。
+	// QuoinInset 已经包含在 Point 中。
 	TArray<int32> H;
-	H.Append({ Added });
+	H.Append({ Added, int32(Seed), CSHouse_Q(Params.Length, 0.001), CSHouse_Q(Params.Gap, 0.001),
+		CSHouse_Q(Params.Jitter, 0.001), CSHouse_Q(Params.SplitJitter, 0.001) });
 	for (const CSHouseQuoin::FQuoin& Q : Quoins)
 	{
 		H.Append({ CSHouse_Q(Q.Point.X, 1), CSHouse_Q(Q.Point.Y, 1),

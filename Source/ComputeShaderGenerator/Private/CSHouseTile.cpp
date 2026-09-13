@@ -254,13 +254,9 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 	// -------------------------------------------------------------------------
 	// 角斜脊 / 屋脊的盖瓦（用户 2026-08-31：「瓦片交汇处有 mesh 进行遮蔽」）
 	//
-	// TG 侧**没有专门的脊瓦网格** —— `assets/meshes` 里查无 `roof_ridge`，交汇处盖的仍是同一块
-	// `roof_tile`，只是骑在接缝上、法线取两坡法线的**角平分**。所以这里不引入任何新资产，
-	// 只把同一份记录沿五条脊线再铺一遍：4 条角斜脊 + 1 条屋脊。
-	//
-	// 正方形（金字塔）时屋脊长为 0，那一条自然跳过 —— 与 `RidgeLength()` 的 `max(…, 0)` 同源，
-	// 不需要在这里特判形态。
-	// -------------------------------------------------------------------------
+	// 同一瓦片沿四条角斜脊与屋脊收口。TG 的原始资产含 roof_tile / lod1 / backface，
+	// 不是三个可随机互换的瓦型；这里只复用经 VS 尺寸适配的可见瓦片。
+	// 未从“没有 roof_ridge 文件名”推断原版的收口生成算法。下面是按参考图的 UE 适配。
 	if (Params.RidgeCapScale > 0.0f)
 	{
 		const double ApexZ = double(Roof.EaveZ) + double(Roof.HalfSpan()) * double(TanP);
@@ -317,15 +313,15 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 					CSHouseVine::IdentityHash(4 + Line, Index, 0, 72u, Params.Seed)) - 0.5f) * 2.0f;
 
 				const FVector LocalPos = L.A + Dir * ((double(Index) + 0.5) * Step)
-					+ L.Normal * double(Params.StandOff);
+					+ L.Normal * double(Params.StandOff + Thickness);
 
-				// 基：沿脊 = 线方向，法线 = 角平分，上坡 = 两者叉积（右手，且天然与脊垂直）。
+				// 瓦的顺坡轴沿脊搭接；宽度跨脊。中心抬一个包围盒厚度，避免坡面瓦穿出盖瓦。
 				FVector Dirs[3];
-				Dirs[Params.Axes.AlongRow] = World.TransformVectorNoScale(Dir).GetSafeNormal();
+				Dirs[Params.Axes.UpSlope] = World.TransformVectorNoScale(Dir).GetSafeNormal();
 				Dirs[Params.Axes.Normal] = World.TransformVectorNoScale(
 					L.Normal * double(Params.Axes.NormalSign)).GetSafeNormal();
-				Dirs[Params.Axes.UpSlope] = FVector::CrossProduct(
-					Dirs[Params.Axes.Normal], Dirs[Params.Axes.AlongRow]).GetSafeNormal();
+				Dirs[Params.Axes.AlongRow] = FVector::CrossProduct(
+					Dirs[Params.Axes.Normal], Dirs[Params.Axes.UpSlope]).GetSafeNormal();
 
 				// ⚠️ **基必须是右手的**，与四面循环那条 `AlongSign` 同一个理由：镜像基会让瓦
 				// 背面朝外、光照整个翻掉，而位置、瓦数、包围盒断言全绿（`House.TileOnRoof`
@@ -337,8 +333,8 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 				}
 
 				float Sizes[3];
-				Sizes[Params.Axes.AlongRow] = float(Step) * Params.ColumnOverlap * ScaleJ * SizeScale * Params.RidgeCapScale;
-				Sizes[Params.Axes.UpSlope] = float(Step) * ScaleJ * SizeScale * Params.RidgeCapScale;
+				Sizes[Params.Axes.UpSlope] = float(Step) * Params.ColumnOverlap * ScaleJ * SizeScale * Params.RidgeCapScale;
+				Sizes[Params.Axes.AlongRow] = ColumnPitch * 0.80f * ScaleJ * SizeScale * Params.RidgeCapScale;
 				Sizes[Params.Axes.Normal] = Thickness;
 
 				// 枢轴补偿：与铺瓦逐字同一段（实例变换是 `原点 + Σ v_i·方向_i·缩放_i`）。

@@ -89,12 +89,13 @@ void CSHouseFrame_Flatten(const TArray<CSHouseFrame::FElement>& In, TArray<FVect
 			E.Pitch));
 		Out.Add(FVector4f(E.HalfLen, E.LayoutScale,
 			*reinterpret_cast<const float*>(&E.RandomBase), E.CrossScale));
-		// [6] 剔除高度（世界 Z，≤ 0 = 不剔）| 首块砖剪切 | 末块砖剪切 | 保留。
-		// 单开一行而不是挤进上面某一格：六行里没有一格是空的，而这份 stride 只有本文件与
-		// `CSHouseFrame.usf` 两个消费者。
-		Out.Add(FVector4f(E.CullBelowZ, E.ShearAtS0, E.ShearAtS1, E.Jitter));
-		// [7] 分层抖动幅度（cm，≤ 0 = 等分）| 本条路的总弧长（kernel 拿它把 cm 归一化）| 保留 ×2。
-		Out.Add(FVector4f(E.SplitJitter, E.Path.TotalLen(), 0.0f, 0.0f));
+		// [6] 剔除高度 | 端头剪切或角石网格尺寸倒数 | 同前 | 逐砖变化幅度。
+		// QuoinScale 是判别字段：竖直包角无端头剪切，R6.yz 可承载基础网格尺寸。
+		Out.Add(FVector4f(E.CullBelowZ,
+			E.QuoinScale > 0.0f ? E.QuoinMeshInvSize.X : E.ShearAtS0,
+			E.QuoinScale > 0.0f ? E.QuoinMeshInvSize.Y : E.ShearAtS1, E.Jitter));
+		// [7] 分层抖动幅度（cm，≤ 0 = 等分）| 本条路的总弧长（kernel 拿它把 cm 归一化）| 角石比例 | 保留。
+		Out.Add(FVector4f(E.SplitJitter, E.Path.TotalLen(), E.QuoinScale, 0.0f));
 	}
 }
 }

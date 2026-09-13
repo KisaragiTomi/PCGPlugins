@@ -22,8 +22,8 @@
 //   [4] asuint 位标志 | asuint 砖序起点 | asuint 砖数 | Pitch（相邻砖中心距）
 //   [5] HalfLen（首块砖的弧长）| LayoutScale（长度轴铺装缩放）| asuint 随机数基 | CrossScale（横截面缩放，柱头/柱础）
 //   [6] CullBelowZ（世界 Z 低于它的砖写负值随机数 ⇒ 材质 discard；≤ 0 = 不剔）
-//       | ShearAtS0（首块砖顶边朝 −S 多伸出的 cm）| ShearAtS1（末块砖顶边朝 +S）| Jitter
-//   [7] SplitJitter（分层抖动幅度 cm，≤ 0 = 等分）| 本条路的总弧长（kernel 拿它把 cm 归一化）| 保留 ×2
+//       | ShearAtS0 | ShearAtS1 | Jitter；角石分支下 yz = 1 / 基础网格的 X、Z 尺寸
+//   [7] SplitJitter（分层抖动幅度 cm，≤ 0 = 等分）| 本条路的总弧长（kernel 拿它把 cm 归一化）| QuoinScale（> 0 = 按相邻墙面包角）| 保留
 //
 // packed 行布局照抄 CSGpuInstancedMesh.usf：前三行是被缩放过的基（**矩阵的行**），第 4 行是
 // 原点 + 每实例随机数，第 5 行是剔除球（必须包住变换后的基础网格，否则实例会在视锥边缘闪掉）。
@@ -43,6 +43,7 @@
 // 逐路 stride 与位标志：与 `CSHouseFrame.cpp` 共用 CSGpuSharedLayout.ush 里的同一份 #define，
 // 这里只起本文件用惯的短名。
 #include "/Plugin/PCGPlugins/Shaders/Private/CSGpuSharedLayout.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/CSHouseQuoinLayout.ush"
 #define FRAME_PATH_STRIDE     CS_HOUSE_FRAME_PATH_FLOAT4S
 #define FRAME_FLAG_LEFT_JAMB  CS_HOUSE_FRAME_FLAG_LEFT_JAMB
 #define FRAME_FLAG_RIGHT_JAMB CS_HOUSE_FRAME_FLAG_RIGHT_JAMB
@@ -232,33 +233,31 @@ void ScatterHouseFrameCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	// + 判号翻转"三步才得到同一个方向，那三步在拱心退化时会翻错号；这里没有可翻错的号。
 	const float2 OutwardSZ = float2(-TangentSZ.y, TangentSZ.x);
 
-	const float3 WorldPos = Origin + AxisU * SZ.x + AxisV * SZ.y;
-	const float3 AxisX = AxisU * OutwardSZ.x + AxisV * OutwardSZ.y;
+	float3 WorldPos = Origin + AxisU * SZ.x + AxisV * SZ.y;
+	float3 AxisX = AxisU * OutwardSZ.x + AxisV * OutwardSZ.y;
 	const float3 AxisY = -(AxisU * TangentSZ.x + AxisV * TangentSZ.y);
-	const float3 AxisZ = cross(AxisX, AxisY);   // 恒等于墙外法线；用叉积保证行列式为正
+	float3 AxisZ = cross(AxisX, AxisY);   // 恒等于墙外法线；用叉积保证行列式为正
+
+	const float QuoinScale = R7.z;
+	const bool bQuoin = QuoinScale > 0.0f;
+	FQuoinPlacement Quoin = (FQuoinPlacement)0;
+	if (bQuoin)
+	{
+		Quoin = PlaceQuoin(WorldPos, AxisX.x, AxisX.y, QuoinScale,
+			R6.w * (2.0f * FrameInstanceRandom(RandomIndex) - 1.0f), ((Brick - Begin) & 1u) != 0u);
+		WorldPos = Quoin.Center;
+		AxisX = Quoin.AxisX;
+		AxisZ = Quoin.AxisZ;
+	}
+	else if (R6.w > 0.0f)
+	{
+		WorldPos += AxisX * (R6.w * (2.0f * FrameInstanceRandom(RandomIndex) - 1.0f));
+	}
 
 	const float3 LocalX = mul(float4(AxisX, 0.0f), FrameWorldToComponent).xyz;
 	const float3 LocalY = mul(float4(AxisY, 0.0f), FrameWorldToComponent).xyz;
 	const float3 LocalZ = mul(float4(AxisZ, 0.0f), FrameWorldToComponent).xyz;
 	float3 LocalOrigin = mul(float4(WorldPos, 1.0f), FrameWorldToComponent).xyz;
-
-	// 逐砖**横向随机偏移**（`FElement::Jitter`，走 R6.w）。沿 `AxisX` —— 柱路上它就是那条
-	// 朝外的角平分线（`ColumnFrame` 取 `AxisU = −Outward`，而本 kernel 对竖直路算出
-	// `OutwardSZ = (−1, 0)` ⇒ `AxisX = +Outward`），所以偏移读起来正是角石的"进退"。
-	//
-	// 公式照 TG 的 `utils::wall_corners::add_wall_corners`（VA 0x141215540）：那里每层取一次
-	// `fastrand::Rng::f32`，算的是 `K*(1−r)` 与 `K*r` 相减 ⇒ **`K × (2r − 1)`**，
-	// `K` 是 `.rdata` 常量 **0.16**（TG 单位 = m ⇒ 16 cm）。
-	//
-	// ⚠️ **不是"一进一出"的确定性交替**：那个函数里没有任何对砖序号的奇偶判定
-	// （4 处 `testb $1` 全是 Rust bool 参数）。随机才是原样。
-	// ⚠️ 随机数取的是**这块砖自己的逐实例随机数**（序号来自路的 `RandomBase`，不是槽位）——
-	// 与砖的身份同源，所以重扫不会重掷。取槽位的症状是"改一处全场角石重排"且无断言可见。
-	const float FrameJitter = R6.w;
-	if (FrameJitter > 0.0f)
-	{
-		LocalOrigin += LocalX * (FrameJitter * (2.0f * FrameInstanceRandom(RandomIndex) - 1.0f));
-	}
 
 	// 长度轴额外吃铺装缩放（`SolveRun` 把整条路恰好铺满就靠它）。
 	float3 BlockScale = FrameBlockSize;
@@ -268,6 +267,14 @@ void ScatterHouseFrameCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	const float CrossScale = R5.w > 1e-4f ? R5.w : 1.0f;
 	BlockScale.x *= CrossScale;
 	BlockScale.z *= CrossScale;
+	if (bQuoin)
+	{
+		BlockScale.x = Quoin.LongSize * R6.y;
+		BlockScale.z = Quoin.ShortSize * R6.z;
+		// Accommodate an off-center base mesh without shifting the two anchored faces.
+		LocalOrigin -= LocalX * (BlockScale.x * FrameBaseSphereCentre.x)
+			+ LocalZ * (BlockScale.z * FrameBaseSphereCentre.z);
+	}
 
 	float3 ScaledX = LocalX * BlockScale.x;
 	const float3 ScaledY = LocalY * BlockScale.y;
@@ -282,8 +289,8 @@ void ScatterHouseFrameCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	//
 	// ⚠️ 剪切**不加任何逐实例数据**：基是三个任意向量，倾斜高度轴就是一次剪切。
 	// 平顶段的轴向是 +X 朝上、+Y 沿 −S（见文件头），所以"朝 +S"就是 −ScaledY 方向。
-	const float ShearAtS0 = R6.y;
-	const float ShearAtS1 = R6.z;
+	const float ShearAtS0 = bQuoin ? 0.0f : R6.y;
+	const float ShearAtS1 = bQuoin ? 0.0f : R6.z;
 	const bool bFirst = (Brick == Begin);
 	const bool bLast  = (Brick + 1u == Begin + Count);
 	// 只有一块砖而两端都挨着洞时取较大的那个：剪切是平行四边形，一个自由度救不了梯形。

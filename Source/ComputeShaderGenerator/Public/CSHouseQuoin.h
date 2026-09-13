@@ -76,8 +76,8 @@ inline FVector2D CornerSign(int32 Index)
 /**
  * footprint 四角 → 角石柱（**纯函数**，单测直接吃它）。追加写，返回本次追加的柱数。
  *
- * `Inset` 是柱心沿角平分线**向内**缩的距离 cm：0 = 柱心正落在外角点上（砖一半在实体里、
- * 一半探出去，正是角石该有的样子）；调大则整根往房里坐。
+ * `Inset` 是包角外棱沿角平分线向内缩的距离 cm。Point 是外角锚点，不是砖心。
+ * GPU 按两面墙的法线把砖心移入墙体，使两张外表面只突出 3.85 × QuoinScale cm。
  *
  * ⚠️ **退化 footprint 直接不出**：任一边短于两个墙厚时四个角互相吃掉，柱心会跑到房子外面去。
  */
@@ -120,7 +120,8 @@ inline int32 BuildQuoins(const FTransform& World, const FVector2D& Footprint, fl
  * 开一扇门就会让四个角的角石整体换色，而所有几何断言全绿。
  */
 inline int32 BuildQuoinElements(const TArray<FQuoin>& Quoins, uint32 Seed,
-	const CSHouseFrame::FBrickParams& Params, TArray<CSHouseFrame::FElement>& InOutElements)
+	const CSHouseFrame::FBrickParams& Params, TArray<CSHouseFrame::FElement>& InOutElements,
+	const FVector2f& MeshInvSize)
 {
 	int32 Cursor = CSHouseFrame::NextBrickSlot(InOutElements);
 	const int32 Before = Cursor;
@@ -132,7 +133,16 @@ inline int32 BuildQuoinElements(const TArray<FQuoin>& Quoins, uint32 Seed,
 		const int32 Added = CSHouseFrame::AppendColumn(Q.Point, Q.Outward, Q.BottomZ, Q.TopZ,
 			CSHouseFrame::PathRandomBase(Seed, CSHouseFrame::EPathFamily::Quoin, Index),
 			Params, InOutElements, Cursor);
-		if (Added > 0 && !InOutElements.IsEmpty()) InOutElements.Last().CullBelowZ = Q.CullBelowZ;
+		if (Added > 0 && !InOutElements.IsEmpty())
+		{
+			CSHouseFrame::FElement& E = InOutElements.Last();
+			E.CullBelowZ = Q.CullBelowZ;
+			E.QuoinMeshInvSize = MeshInvSize;
+			E.QuoinScale = FMath::Max(Params.Length, 1.0f) / 69.0f;
+			// TG 的基准厘米按本项目层高折算；Jitter 改长边，SplitJitter 改分层。
+			E.Jitter = FMath::Clamp(Params.Jitter, 0.0f, 16.0f) * E.QuoinScale;
+			E.SplitJitter = FMath::Max(Params.SplitJitter, 0.0f) * E.QuoinScale;
+		}
 	}
 	return Cursor - Before;
 }

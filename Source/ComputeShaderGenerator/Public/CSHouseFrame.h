@@ -272,12 +272,7 @@ struct FWallFrame
 /** 砖的排布参数（尺寸不在这里 —— 那是 `FPaletteBuffers::BlockSize` 的事）。 */
 struct FBrickParams
 {
-	/**
-	 * **逐砖横向随机偏移的幅度（cm）**，见 `FElement::Jitter`。默认 0 = 关。
-	 * 放在 params 里而不是做成 `AppendColumn` 的新形参，是为了让
-	 * `House.QuoinSharesTheColumnEmitter`（同一组输入喂角石与接缝柱、逐字段比 `FElement`）
-	 * 天然继续成立 —— 同一份 params 进去，两边拿到的 `Jitter` 恒等。
-	 */
+	/** 普通砖路的位置抖动 cm。角石发射器将它作为 TG 基准长边抖动，按层高折算。 */
 	float Jitter = 0.0f;
 	/** **分层随机化的抖动幅度（cm）**，见 `FElement::SplitJitter`。默认 0 = 等分。 */
 	float SplitJitter = 0.0f;
@@ -349,19 +344,8 @@ struct FElement
 	 */
 	float ShearAtS0 = 0.0f;
 	float ShearAtS1 = 0.0f;
-	/**
-	 * **逐砖横向随机偏移的幅度（cm）**，沿本条路的法线轴（`AxisZ`；柱路上就是那条朝外的
-	 * 角平分线）。kernel 里按 `Jitter × (2r − 1)` 施加，`r` 是这块砖自己的逐实例随机数。
-	 * `<= 0` = 不抖（默认，所有既有砖路逐位不变）。走 `R6.w`（那一格原本空着）。
-	 *
-	 * 出处是 TG 的 `system_wall_constructor::utils::wall_corners::add_wall_corners`
-	 * （VA 0x141215540）：那里对每一层角砖取一次 `fastrand::Rng::f32`，算的正是
-	 * `K*(1−r)` 与 `K*r` 相减 ⇒ **`K × (2r − 1)`**，`K` 是 `.rdata` 里的常量 **0.16**
-	 * （TG 单位 = m ⇒ 16 cm）。
-	 *
-	 * ⚠️ **TG 的角砖不是"一进一出"的确定性交替**（`TinyGlade_模块对照与进度.md` 里那条
-	 * 措辞已按二进制订正）：全函数没有任何对砖序号的奇偶判定，进退是**对称随机**的。
-	 */
+	/** 逐砖变化幅度 cm。普通砖路沿 AxisX 平移；QuoinScale > 0 时只改变角石长边。
+	 * TG 的 0.16 是长边变化，并非角平分线平移；见 A7 的 2026-09-12 二进制订正。 */
 	float Jitter = 0.0f;
 	/**
 	 * **分层随机化的抖动幅度（cm）**，沿路的弧长方向。`<= 0` = 等分（默认，既有砖路逐位不变）。
@@ -382,6 +366,10 @@ struct FElement
 	 * 这也比"标称层高 ×(1±抖动)"稳：那种写法会改总长度，这个只动分界、总长恒定。
 	 */
 	float SplitJitter = 0.0f;
+	/** 角石比例：FrameBrickLength / TG 标称层高 69 cm。0 = 普通砖路；走 R7.z。 */
+	float QuoinScale = 0.0f;
+	/** 角石基础网格 X/Z 尺寸的倒数；R6.yz 在角石分支中取代端头剪切。 */
+	FVector2f QuoinMeshInvSize = FVector2f::ZeroVector;
 };
 
 /**

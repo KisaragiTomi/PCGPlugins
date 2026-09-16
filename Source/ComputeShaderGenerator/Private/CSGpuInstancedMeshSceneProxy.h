@@ -84,7 +84,9 @@ void CSGpuInstancedAddPackPointsPass(
  * vertex + one index buffer), the per-LOD indirect args and the seven aux streams; this proxy
  * adopts that set through FCSGpuMeshSceneProxy::SetExternalStreams and, every frame, runs the
  * cluster/instance cull + LOD selection passes of CSGpuInstancedMesh.usf, which compact the visible
- * instances into per-LOD regions and fill one DrawIndexedIndirect arg set per LOD.
+ * instances into per-LOD regions and fill one DrawIndexedIndirect arg set per material section of
+ * each LOD (all sections of a LOD share that LOD's region; each draws its own index run with its
+ * own material).
  *
  * What it does NOT adopt is UCSMeshRenderComponent's proxy. That one hard-wires FLocalVertexFactory
  * through FCSMeshRenderSceneProxy, and this path exists precisely because the instance transform has
@@ -102,7 +104,10 @@ void CSGpuInstancedAddPackPointsPass(
 class FCSGpuInstancedMeshSceneProxy final : public FCSGpuMeshSceneProxy
 {
 public:
-	FCSGpuInstancedMeshSceneProxy(UCSGpuInstancedMeshComponent* Component, const FCSMeshResidentRef& InResident);
+	/** InDrawMaterials：每个材质段（= 每个 draw，与快照 Sections 同序）一张，调用方已解析好覆盖 / 资产材质
+	 *  并做完用途检查（CreateSceneProxy）；空项画引擎默认材质。 */
+	FCSGpuInstancedMeshSceneProxy(UCSGpuInstancedMeshComponent* Component, const FCSMeshResidentRef& InResident,
+		const TArray<UMaterialInterface*>& InDrawMaterials);
 	virtual ~FCSGpuInstancedMeshSceneProxy() override;
 
 	/** Creates the shared cull view extension if it does not exist yet. Game thread. */
@@ -133,6 +138,8 @@ protected:
 	 *  a GPU buffer (FCSGpuInstanceSourceGPU), which a single-instance BLAS cannot express. Ray
 	 *  tracing for this leaf needs GPU-side TLAS instance data and is a separate piece of work. */
 	virtual bool WantsRayTracingGeometry() const override { return false; }
+	/** 一个 draw 一张，与 Sections 同序（基座的 BLAS / card-capture 按下标配材质；本叶子两者都不开，补齐是为了口径一致）。 */
+	virtual void GetBatchMaterials(TArray<FMaterialRenderProxy*, TInlineAllocator<8>>& OutMaterials) const override;
 
 private:
 	/** The buffer set this proxy borrows, held as the shared reference so either teardown order is
@@ -153,6 +160,10 @@ private:
 	// whole FCSGpuInstancedBaseMesh or the packed instance array any more — those live in the mesh
 	// object, and copying them per proxy is exactly the cost retention removes.
 	TArray<FCSGpuInstancedLODRange> LODs;
+	/** 快照的材质段，一段一个 draw（arg set 下标 = 段号）。截到 Layout.NumDraws。 */
+	TArray<FCSGpuInstancedSection> Sections;
+	/** 每段的材质，恒非空（空的已换成引擎默认材质）。与 Sections 同长。 */
+	TArray<UMaterialInterface*> DrawMaterials;
 	FVector3f BaseSphereCentre = FVector3f::ZeroVector; // base bounds, for the point-source packer
 	float BaseSphereRadius = 0.0f;
 	FCSGpuInstanceSourceGPU GpuSource;

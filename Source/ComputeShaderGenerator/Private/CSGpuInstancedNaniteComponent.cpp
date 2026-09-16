@@ -259,6 +259,12 @@ void UCSGpuInstancedNaniteComponent::SyncFromOwner(const UCSGpuInstancedMeshComp
 
 	if (bDirty) MarkRenderStateDirty();
 
+	// CustomPrimitiveData：经典路的 proxy 把本体的这份送进 primitive uniform buffer，替身也得有同一份，
+	// 同一张材质在两条路上才读到同一个值。
+	// setter 自带 memcmp 短路、不重建 proxy，所以逐帧抄是免费的。
+	const TArray<float>& WantedPrimitiveData = Owner.GetCustomPrimitiveData().Data;
+	if (WantedPrimitiveData.Num() > 0) SetCustomPrimitiveDataFloatArray(0, TConstArrayView<float>(WantedPrimitiveData));
+
 	// 这两条有自己的 setter（会处理渲染状态），不走 bDirty。
 	if (GetVisibleFlag() != Owner.GetVisibleFlag()) SetVisibility(Owner.GetVisibleFlag());
 	if (bHiddenInGame != Owner.bHiddenInGame) SetHiddenInGame(Owner.bHiddenInGame);

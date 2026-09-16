@@ -60,6 +60,14 @@ void WriteInstancesCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupInde
 	const float4 Row2 = SrcInstances[Base + 2u];
 	const float4 Origin = SrcInstances[Base + 3u];
 
+	// 负的逐实例随机数 = 生产者要藏起来的实例（与经典路 InstanceCullCS 同一条组件级契约）。
+	// 不能指望材质去 discard 它：没设覆盖材质时画的是资产自己的材质，那张材质不认识这个哨兵。
+	if (Origin.w < 0.0f)
+	{
+		WriteInstancePrimitiveIdAndFlags(InstanceId, WritePrimitiveId, INSTANCE_SCENE_DATA_FLAG_HIDDEN);
+		return;
+	}
+
 	// 行向量约定，与 LocalVertexFactory.ush 的 GetInstanceTransform() 是同一个矩阵：三行基 + 第四行原点。
 	// 写成列向量会把每个非对称的旋转写成它的转置 —— 砖都还在拱上但全歪了，看着像排布算错。
 	float4x4 LocalToPrimitive;

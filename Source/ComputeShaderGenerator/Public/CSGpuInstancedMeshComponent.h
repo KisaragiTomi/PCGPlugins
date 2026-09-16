@@ -32,6 +32,22 @@ struct FCSGpuInstancedLODRange
 };
 
 /**
+ * 基础网格的一个材质段 = 一个 DrawIndexedIndirect。
+ *
+ * 同一级 LOD 的各段是那一级索引区间里连续、不重叠的几截，按 LOD 升序、段内按索引顺序排；它们共用那一级的
+ * 可见实例区段与计数器（剔除只按 LOD 分区，与材质无关），只是各画各的索引区间、各用各的材质。
+ * `MaterialIndex` 是材质槽号：资产路 = `UStaticMesh::GetStaticMaterials()` 的下标（`FStaticMeshSection::MaterialIndex`），
+ * 外部快照路 = `FCSGpuMeshCPUData::Materials` 的下标（`TriangleMaterialSlots` 的取值）。
+ */
+struct FCSGpuInstancedSection
+{
+	int32 LodIndex = 0;
+	uint32 FirstIndex = 0;  // into the shared index buffer (absolute, not relative to the LOD)
+	uint32 NumIndices = 0;
+	int32 MaterialIndex = 0;
+};
+
+/**
  * CPU snapshot of the base mesh. The proxy uploads it once into the GPU streams owned by
  * FCSGpuMeshSceneProxy; from then on the geometry is GPU-resident and only the per-instance
  * data changes. All LODs live in one vertex buffer and one index buffer, addressed by
@@ -41,10 +57,31 @@ struct FCSGpuInstancedBaseMesh
 {
 	TArray<FVector3f> Positions;
 	TArray<uint32> TangentBasis;  // 2 packed 8888 SNORM per vertex (TangentX, TangentZ)
-	TArray<FVector2f> TexCoords;  // 1 per vertex
+
+	/**
+	 * 每顶点 NumTexCoordSets 组 UV，**交错**排：第 V 个顶点的第 S 组在 `[V * NumTexCoordSets + S]`。
+	 * 交错而不是按组分段，因为它原样上传进 UCSMesh 的 TexCoord 流 —— 那条流加宽的形态、引擎 manual fetch 的
+	 * 取数 `VertexFetch_TexCoordBuffer[NumTexCoords * VertexId + CoordIndex]` 都是这个布局
+	 * （见 FCSMeshStreamLayout::NumTexCoordSets）。
+	 */
+	TArray<FVector2f> TexCoords;
 	TArray<uint32> Colors;        // 1 packed RGBA8 per vertex
 	TArray<uint32> Indices;
 	TArray<FCSGpuInstancedLODRange> LODs;
+
+	/**
+	 * 全部 LOD 的材质段，一段一个 draw（布局见 FCSGpuInstancedSection）。至多 CS_GPU_INSTANCED_MAX_DRAWS 段 ——
+	 * 装不下时快照丢弃后面整级 LOD，LODs 与它同步截断，所以"第 i 段属于哪一级"永远查得到。
+	 */
+	TArray<FCSGpuInstancedSection> Sections;
+
+	/**
+	 * UV 组数，1..FCSGpuMeshCPUData::MaxTexCoordChannels（= MAX_STATIC_TEXCOORDS = 8），取自基础网格实际带的组数。
+	 * 逐族决定 GPU 常驻 TexCoord 流有多宽：只有一组 UV 的网格（草、花、石阶）布局与改动前逐位相同，不为别人付显存。
+	 * 2026-09-14 以前这里写死一组，TG 叶卡的树冠材质要读 UV1.xy / UV2.x（卡片中心）⇒ 树没法走实例路。
+	 * 第 5..8 组只经 manual fetch 到达 shader（stream component 最多挂 4 个），见 CSGpuMeshSceneProxy.cpp 的 TexCoord 分支。
+	 */
+	int32 NumTexCoordSets = 1;
 
 	/** Local bounds of LOD0, used as the per-instance culling sphere. */
 	FBox LocalBounds = FBox(ForceInit);
@@ -52,8 +89,10 @@ struct FCSGpuInstancedBaseMesh
 	bool IsValid() const
 	{
 		return Positions.Num() >= 3 && Indices.Num() >= 3 && LODs.Num() > 0
+			&& Sections.Num() > 0 && Sections.Num() <= CS_GPU_INSTANCED_MAX_DRAWS
 			&& TangentBasis.Num() == Positions.Num() * 2
-			&& TexCoords.Num() == Positions.Num()
+			&& NumTexCoordSets >= 1 && NumTexCoordSets <= FCSGpuMeshCPUData::MaxTexCoordChannels
+			&& TexCoords.Num() == Positions.Num() * NumTexCoordSets
 			&& Colors.Num() == Positions.Num();
 	}
 
@@ -62,9 +101,11 @@ struct FCSGpuInstancedBaseMesh
 		Positions.Reset();
 		TangentBasis.Reset();
 		TexCoords.Reset();
+		NumTexCoordSets = 1;
 		Colors.Reset();
 		Indices.Reset();
 		LODs.Reset();
+		Sections.Reset();
 		LocalBounds = FBox(ForceInit);
 	}
 };
@@ -77,6 +118,10 @@ struct FCSGpuInstancedBaseMesh
  *   [3]    origin.xyz in component space, .w = per-instance random (0..1)
  *   [4]    culling sphere: centre.xyz in component space, .w = radius
  * Counter[0] holds the live instance count, so the count never round-trips to the CPU.
+ *
+ * ⚠️ **[3].w < 0 = 这个实例藏起来**（组件级契约，2026-09-15）：经典路的剔除 pass 跳过它，Nanite 路的
+ * GPU-Scene 写入把它写成 HIDDEN，`SaveToStaticMesh` 不烘它。以前这条哨兵只有 `M_TinyGladeBrick` 的
+ * OpacityMask 认（门框砖的转角墩剔除），组件改成默认画资产材质之后材质就不再可靠，契约因此下沉到组件。
  */
 struct FCSGpuInstanceSourceGPU
 {
@@ -131,8 +176,12 @@ struct FCSGpuInstancePointSourceGPU
  */
 struct FCSGpuInstancedGpuLayout
 {
-	/** LOD levels drawn, one DrawIndexedIndirect arg set each. */
+	/** LOD levels drawn. */
 	uint32 NumLODs = 1;
+
+	/** DrawIndexedIndirect arg sets = material sections over all drawn LODs (FCSGpuInstancedBaseMesh::Sections).
+	 *  Part of the declared stream layout: a base mesh with a different section count re-declares it. */
+	uint32 NumDraws = 1;
 
 	/** Instances the source and visible buffers are sized for — the region stride, not the live
 	 *  count. It ratchets with hysteresis (see UCSGpuInstancedMeshComponent::ResolveInstanceCapacity):
@@ -203,6 +252,20 @@ struct FCSGpuInstancedGpuLayout
  *    材质图里没有任何分支、也不需要两份材质实例。
  * ⚠️ 代价说清楚：**实例路的基础网格顶点色 alpha 从此不可用**（现有消费者只有
  *    `M_TinyGladeDecor`，它只读 RGB）。要用 alpha 做别的（叶片遮罩之类）得先改这份字典。
+ *    默认改画资产材质之后（见下一节）这条也核过（2026-09-15）：TG 资产库的母材质 `M_TG_Texture` /
+ *    `M_TG_VertexColor` / `M_TG_MeshProjected` / `M_TG_Glass` 都不读顶点色 alpha（`M_TG_Texture` 里读 A 的
+ *    那个 Append 节点是悬空的，读 R 的那一支被 `RockShellCapSkirt = 0` 乘掉），所以不冲突。
+ *
+ * -----------------------------------------------------------------------------
+ * 材质：逐 section，默认用资产自己的（2026-09-15）
+ * -----------------------------------------------------------------------------
+ * 基础网格有几个材质段就发几个 draw（FCSGpuInstancedSection，一段一个 DrawIndexedIndirect，同一级 LOD
+ * 的各段共用那一级的剔除结果）。每段的材质按 `GetSectionMaterial` 解析：
+ *   · `InstanceMaterial` 设了 ⇒ 它盖住**每一段**（整体覆盖，老用法逐像素不变）；
+ *   · 空 ⇒ 这一段在基础网格资产上挂的那个材质槽（`SetBaseMeshFromGpuData` 喂的数据取它自带的 `Materials` 表）；
+ *   · 还是空，或母材质没勾 `bUsedWithInstancedStaticMeshes` ⇒ 这一段画成引擎默认材质，并打一次警告。
+ * 以前空 `InstanceMaterial` 一律画默认材质，于是用户资产上配好的材质在实例路上从来没生效过。
+ * `GetMaterialUndrawableReason()` 是这条的非阻塞判据，`DebugGetDrawnAssetMismatchSync()` 再加一道着色器映射探针。
  *
  * -----------------------------------------------------------------------------
  * Nanite 路（BaseMesh 开了 Nanite 时自动走，没有开关）
@@ -256,11 +319,38 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "CS GPU Instanced Mesh")
 	TObjectPtr<UStaticMesh> BaseMesh;
 
-	/** Material drawn for every instance. Null uses the engine default surface material — except
-	 *  for a Nanite-enabled BaseMesh, where null means the asset's own materials.
-	 *  Must have bUsedWithInstancedStaticMeshes set or it will fall back to the default. */
+	/** 整体覆盖材质：设了就盖住基础网格的**每一个**材质段；**留空 = 每段用基础网格资产那个材质槽上挂的材质**
+	 *  （两条渲染路同一个意思，见类注释「材质」一节）。母材质必须勾 bUsedWithInstancedStaticMeshes
+	 *  （Nanite 路是 bUsedWithNanite），否则那一段被引擎换成默认材质。
+	 *  运行时换它请走 SetInstanceMaterial —— 经典路的代理在构造时就把材质抄走了，直接写属性看不出变化。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS GPU Instanced Mesh")
 	TObjectPtr<UMaterialInterface> InstanceMaterial;
+
+	/** 换整体覆盖材质。变了才写、变了才让渲染状态重建（经典路的代理构造时抄走材质）；传空 = 退回资产材质。 */
+	UFUNCTION(BlueprintCallable, Category = "CS GPU Instanced Mesh")
+	void SetInstanceMaterial(UMaterialInterface* InMaterial);
+
+	/** 快照里有几个材质段（= 经典路发几个 draw）。Nanite 路没读顶点时为 0 —— 那条路按资产的材质槽画。 */
+	UFUNCTION(BlueprintPure, Category = "CS GPU Instanced Mesh")
+	int32 GetNumSections() const { return BaseMeshSnapshot.Sections.Num(); }
+
+	/** 第 SectionIndex 段实际用哪张材质画（整体覆盖 > 资产 / 快照材质槽）。可能为空 —— 空段画成引擎默认材质。 */
+	UFUNCTION(BlueprintPure, Category = "CS GPU Instanced Mesh")
+	UMaterialInterface* GetSectionMaterial(int32 SectionIndex) const;
+
+	/** 材质槽 SlotIndex 解析出来的材质（整体覆盖 > 资产 / 快照材质表）。可能为空。 */
+	UMaterialInterface* ResolveSlotMaterial(int32 SlotIndex) const;
+
+	/**
+	 * 这一族画的每个材质段，材质能不能真的画出来。空串 = 能；原因串带段号、槽号与材质来源（覆盖 / 资产）。
+	 *
+	 * **不阻塞**，只查 CPU 看得见的两条：解析出来的材质非空、母材质勾了这条渲染路要的用途标记
+	 * （经典路 bUsedWithInstancedStaticMeshes、Nanite 路 bUsedWithNanite）。缺哪条引擎都会静默换成默认材质，
+	 * 画面一片灰而 readback 断言照绿。"着色器到底编没编出来"要阻塞探针，见 DebugGetDrawnAssetMismatchSync。
+	 * 各 actor 的 `Get*UndrawableReason` 查材质都走这一条，不再各自只看 `InstanceMaterial`。
+	 */
+	UFUNCTION(BlueprintPure, Category = "CS GPU Instanced Mesh|Diagnostics")
+	FString GetMaterialUndrawableReason() const;
 
 	/** 这一族是不是交给引擎的 Nanite 管线画：BaseMesh 是一张开了 Nanite 的资产，且平台有 GPU-Scene。
 	 *  不是开关，是判据 —— 想换路就去资产上勾 / 取消 Nanite。 */
@@ -271,7 +361,10 @@ public:
 	void SetBaseMesh(UStaticMesh* InMesh);
 
 	/** Feed a GPU-generated mesh (e.g. a readback from another UCSGpuMeshComponent) as the single
-	 *  LOD0 base mesh instead of a UStaticMesh. Positions are taken as component-local. */
+	 *  LOD0 base mesh instead of a UStaticMesh. Positions are taken as component-local.
+	 *  材质段取自 `TriangleMaterialSlots`（同槽的三角按槽号归到一起，一槽一段；空 = 整张一段、槽 0），
+	 *  材质槽取自 `Materials` —— `CSHouseVine::BuildBaseMesh` 从资产 LOD0 把这两样一起抄过来，
+	 *  所以摆件走这条路也照样画资产自己的材质。 */
 	void SetBaseMeshFromGpuData(const FCSGpuMeshCPUData& InMeshData);
 
 	// -------------------------------------------------------------------------
@@ -465,6 +558,10 @@ public:
 
 	//~ UPrimitiveComponent interface
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
+	/** 每个材质槽解析出来的材质（与 UStaticMeshComponent 同口径：覆盖优先，否则资产槽）。 */
+	virtual void GetUsedMaterials(TArray<UMaterialInterface*>& OutMaterials, bool bGetDebugMaterials = false) const override;
+	virtual int32 GetNumMaterials() const override;
+	virtual UMaterialInterface* GetMaterial(int32 ElementIndex) const override;
 	/** Builds the GPU mesh that the mutators skipped while the component was unregistered. This runs
 	 *  before CreateRenderState_Concurrent, which is the whole point: the render state may be
 	 *  created off the game thread during the end-of-frame update, where the build's render flush
@@ -482,7 +579,8 @@ public:
 
 protected:
 	//~ UCSGpuMeshComponent interface
-	virtual UMaterialInterface* GetRenderMaterial() const override { return InstanceMaterial; }
+	/** 基座只认一张材质；多段时报第 0 段的（GetUsedMaterials 已被本类覆写成逐槽上报）。 */
+	virtual UMaterialInterface* GetRenderMaterial() const override { return GetSectionMaterial(0); }
 	/** Nanite 路上本组件没有代理（画的是替身），ReadbackMeshSync 那次 static_cast 必须拦在前面。 */
 	virtual bool IsGpuMeshProxyActive() const override { return !IsNaniteRenderPath(); }
 
@@ -572,6 +670,17 @@ private:
 	 *  SetBaseMeshFromGpuData (in which case bBaseMeshIsExternal suppresses re-extraction). */
 	FCSGpuInstancedBaseMesh BaseMeshSnapshot;
 	bool bBaseMeshIsExternal = false;
+
+	/**
+	 * 外部快照（SetBaseMeshFromGpuData）的材质槽表，取自数据自带的 `Materials`。资产路恒空 —— 那条路每次
+	 * 现读 `BaseMesh` 的材质槽，资产上改了槽不必等快照重建。UPROPERTY 只为压住 GC：快照是普通结构体，
+	 * 代理拿的是裸指针。
+	 */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UMaterialInterface>> BaseMeshMaterials;
+
+	/** "某一段的材质不能用于实例化、退回默认材质"只警告一次（代理每次重建都会再判一遍）。 */
+	bool bWarnedUnusableMaterial = false;
 
 	// GPU source layout, cluster order. 5 float4 per instance — see FCSGpuInstanceSourceGPU.
 	// Clusters are fixed-size runs of this array, so the cull shader derives an instance's cluster

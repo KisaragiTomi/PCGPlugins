@@ -8,11 +8,14 @@
 #include "CSHouseActor.h"                    // FrameBricksSurviveBake 借门框砖当被测对象
 #include "CSMesh.h"
 
-// 下面这五个只有烘焙那条用例要（真 world / 真资产）。unity 构建下它们恰好被邻居 TU 带进来，
+// 下面这几个只有烘焙与 TexCoordSets 两条用例要（真 world / 真资产）。unity 构建下它们恰好被邻居 TU 带进来，
 // 漏写只有 -SingleFile 才照得出来（坑表里那条）。
+#include "Components/SceneComponent.h"
 #include "EditorAssetLibrary.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
+#include "GameFramework/Actor.h"
+#include "Materials/Material.h"
 #include "Tests/AutomationEditorCommon.h"
 #include "UObject/Package.h"
 
@@ -29,6 +32,25 @@ namespace
 		Data.Indices = { 0, 1, 2 };
 		Data.SourceSpace = FCSGpuMeshCPUData::ESpace::ComponentLocal;
 		Data.AttrLayout = FCSGpuMeshCPUData::EAttrLayout::PerVertex;
+		return Data;
+	}
+
+	/** 第 Set 组 UV 在第 V 个顶点上的值。组号与顶点号都编进去，交错布局一旦错位（按组分段 / 步长写错）读出来就不一样。 */
+	FVector2f ExpectedTexCoord(int32 Set, int32 V)
+	{
+		return FVector2f(float(Set * 10 + V), float(Set * 10 + V) + 0.5f);
+	}
+
+	/** MakeUnitTriangle 带上 NumSets 组 UV（NumTexCoordChannels 如实写 NumSets，越界的组数留给调用方测钳位）。 */
+	FCSGpuMeshCPUData MakeUnitTriangleWithTexCoordSets(int32 NumSets)
+	{
+		FCSGpuMeshCPUData Data = MakeUnitTriangle();
+		Data.NumTexCoordChannels = NumSets;
+		for (int32 Set = 0; Set < FMath::Min(NumSets, FCSGpuMeshCPUData::MaxTexCoordChannels); ++Set)
+		{
+			Data.TexCoordChannels[Set].SetNum(Data.Positions.Num());
+			for (int32 V = 0; V < Data.Positions.Num(); ++V) Data.TexCoordChannels[Set][V] = ExpectedTexCoord(Set, V);
+		}
 		return Data;
 	}
 
@@ -458,6 +480,100 @@ bool FCSGpuInstancedMeshStreamResizeAutomationTest::RunTest(const FString& Param
 	TestFalse(TEXT("Neither can the per-LOD indirect args"),
 		Mesh->ResizeStreamSync(ECSGpuStreamRole::IndirectArgs, 0, 5 * 4));
 	TestEqual(TEXT("A refused resize leaves the draw layout alone"), Mesh->GetIndirectDrawCount(), int32(Layout.NumLODs));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSGpuInstancedMeshTexCoordSetsAutomationTest,
+	"PCGPlugins.ComputeShaderGenerator.GpuInstancedMesh.TexCoordSets",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/**
+ * 实例路的基础网格要把**全部** UV 组带上 GPU（2026-09-14 起，上限 MaxTexCoordChannels = 8）。
+ * 起因是 TG 叶卡：树冠材质读 UV1.xy / UV2.x 当卡片中心，而这条路以前只传 UV0。
+ *
+ * 失效是静默的：常驻流只声明一组时，引擎 manual fetch 把 TexCoord[1..] 钳回最后一组
+ * （LocalVertexFactory.ush:733 的 ClampedCoordinateIndex），材质读到的 UV1 / UV2 全是 UV0 ——
+ * 所有卡片塌向同一个"中心"，画面错、不报错、CPU 侧断言照绿。所以这里一路守到 GPU 回读：
+ *   ① 快照按交错布局存 N 组（第 V 个顶点的第 S 组在 [V×N+S]），一组的网格布局与改动前逐位相同；
+ *   ② 组数钳在 MaxTexCoordChannels，钳过的快照依然合法；
+ *   ③ 注册后常驻 TexCoord 流真的加宽到 2N，回读逐组逐顶点对得上；换回一组的网格，流收窄回 2。
+ */
+bool FCSGpuInstancedMeshTexCoordSetsAutomationTest::RunTest(const FString& Parameters)
+{
+	// --- ① 快照：交错布局
+	{
+		UCSGpuInstancedMeshComponent* Component = NewObject<UCSGpuInstancedMeshComponent>(GetTransientPackage());
+		Component->SetBaseMeshFromGpuData(MakeUnitTriangleWithTexCoordSets(3));
+		const FCSGpuInstancedBaseMesh& Snapshot = Component->GetBaseMeshSnapshot();
+		TestTrue(TEXT("三组 UV 的快照合法"), Snapshot.IsValid());
+		TestEqual(TEXT("快照记下三组"), Snapshot.NumTexCoordSets, 3);
+		const bool bSized = TestEqual(TEXT("TexCoords 长度 = 顶点数 × 组数"), Snapshot.TexCoords.Num(), Snapshot.Positions.Num() * 3);
+		for (int32 Index = 0; bSized && Index < Snapshot.TexCoords.Num(); ++Index) TestTrue(*FString::Printf(TEXT("顶点 %d 的第 %d 组落在 [V×3+S]（实际 %s）"), Index / 3, Index % 3, *Snapshot.TexCoords[Index].ToString()), Snapshot.TexCoords[Index].Equals(ExpectedTexCoord(Index % 3, Index / 3), 1e-4f));
+
+		// 一组的网格：布局必须与改动前逐位相同 —— 草 / 花 / 石阶都是这一类，不许为多组 UV 付一个字节。
+		UCSGpuInstancedMeshComponent* Single = NewObject<UCSGpuInstancedMeshComponent>(GetTransientPackage());
+		Single->SetBaseMeshFromGpuData(MakeUnitTriangle());
+		TestEqual(TEXT("一组 UV 的网格仍记一组"), Single->GetBaseMeshSnapshot().NumTexCoordSets, 1);
+		TestEqual(TEXT("...TexCoords 仍是每顶点一条"), Single->GetBaseMeshSnapshot().TexCoords.Num(), Single->GetBaseMeshSnapshot().Positions.Num());
+	}
+
+	// --- ② 钳位
+	{
+		FCSGpuMeshCPUData TooMany = MakeUnitTriangleWithTexCoordSets(FCSGpuMeshCPUData::MaxTexCoordChannels);
+		TooMany.NumTexCoordChannels = FCSGpuMeshCPUData::MaxTexCoordChannels + 4;
+		UCSGpuInstancedMeshComponent* Clamped = NewObject<UCSGpuInstancedMeshComponent>(GetTransientPackage());
+		Clamped->SetBaseMeshFromGpuData(TooMany);
+		TestEqual(TEXT("声明的组数超过上限时钳到 MaxTexCoordChannels"), Clamped->GetBaseMeshSnapshot().NumTexCoordSets, FCSGpuMeshCPUData::MaxTexCoordChannels);
+		TestTrue(TEXT("...钳过之后快照依然合法"), Clamped->GetBaseMeshSnapshot().IsValid());
+		const int32 LastSet = FCSGpuMeshCPUData::MaxTexCoordChannels - 1;
+		TestTrue(TEXT("...最后一组（UV7）照样带上"), Clamped->GetBaseMeshSnapshot().TexCoords[LastSet].Equals(ExpectedTexCoord(LastSet, 0), 1e-4f));
+	}
+
+	// --- ③ 真分配 + GPU 回读
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.ObjectFlags = RF_Transient;
+	AActor* Host = World->SpawnActor<AActor>(AActor::StaticClass(), FTransform::Identity, SpawnParameters);
+	if (!TestNotNull(TEXT("Host actor"), Host)) return false;
+	USceneComponent* Root = NewObject<USceneComponent>(Host, TEXT("Root"));
+	Host->SetRootComponent(Root);
+	Root->RegisterComponent();
+
+	UCSGpuInstancedMeshComponent* Instanced = NewObject<UCSGpuInstancedMeshComponent>(Host, NAME_None, RF_Transient);
+	Instanced->SetupAttachment(Root);
+	Instanced->RegisterComponent();
+	// 引擎默认材质为所有用途都编好了着色器，不会在测试里等一轮材质编译。
+	Instanced->InstanceMaterial = UMaterial::GetDefaultMaterial(MD_Surface);
+	Instanced->SetBaseMeshFromGpuData(MakeUnitTriangleWithTexCoordSets(3));
+	// 有实例才分配常驻网格；注册过的组件在这一步同步传完。
+	Instanced->AddInstance(FTransform::Identity);
+
+	auto TexCoordStreamWidth = [Instanced]()
+	{
+		const UCSMesh* Mesh = Instanced->GetGpuMesh();
+		const FCSMeshResident* Resident = Mesh ? Mesh->GetResidentPtr() : nullptr;
+		const FCSMeshResident::FStream* Stream = Resident ? Resident->FindStream(ECSGpuStreamRole::TexCoord, 0) : nullptr;
+		return Stream ? int32(Stream->Desc.ElementsPerUnit) : 0;
+	};
+	if (!TestEqual(TEXT("常驻 TexCoord 流加宽到每顶点 2 × 3 个 float"), TexCoordStreamWidth(), 6)) return false;
+
+	FCSGpuMeshCPUData Readback;
+	if (!TestTrue(TEXT("基础网格能从 GPU 回读"), Instanced->GetGpuMesh()->ReadbackMeshSync(Readback))) return false;
+	if (!TestEqual(TEXT("回读出三组 UV"), Readback.NumTexCoordChannels, 3)) return false;
+	for (int32 Set = 0; Set < 3; ++Set)
+	{
+		if (!TestEqual(*FString::Printf(TEXT("第 %d 组回读出每个顶点一条"), Set), Readback.TexCoordChannels[Set].Num(), 3)) continue;
+		for (int32 V = 0; V < 3; ++V) TestTrue(*FString::Printf(TEXT("GPU 上第 %d 组第 %d 个顶点对得上（实际 %s）"), Set, V, *Readback.TexCoordChannels[Set][V].ToString()), Readback.TexCoordChannels[Set][V].Equals(ExpectedTexCoord(Set, V), 1e-4f));
+	}
+
+	// 换回一组 UV 的网格：组数变了就是布局变了，流要收窄回 2，而不是留着上一张网格的宽度。
+	Instanced->SetBaseMeshFromGpuData(MakeUnitTriangle());
+	TestEqual(TEXT("换回一组 UV 的网格后常驻流收窄回 2"), TexCoordStreamWidth(), 2);
+
+	Instanced->DestroyComponent();
 	return true;
 }
 

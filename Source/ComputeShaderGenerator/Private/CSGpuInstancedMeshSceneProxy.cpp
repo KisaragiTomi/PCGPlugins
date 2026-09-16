@@ -132,10 +132,9 @@ public:
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RWLodCounters)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RWIndirectArgs)
-		SHADER_PARAMETER(FUintVector4, LodIndexCount)
-		SHADER_PARAMETER(FUintVector4, LodFirstIndex)
-		SHADER_PARAMETER(FUintVector4, LodBaseVertex)
-		SHADER_PARAMETER(uint32, NumLods)
+		// 每个 draw 一行 (IndexCount, FirstIndex, BaseVertex, Lod)；长度必须与 .usf 的数组同为 CS_GPU_INSTANCED_MAX_DRAWS。
+		SHADER_PARAMETER_ARRAY(FUintVector4, DrawTable, [CS_GPU_INSTANCED_MAX_DRAWS])
+		SHADER_PARAMETER(uint32, NumDraws)
 		SHADER_PARAMETER(uint32, MaxInstancesPerLod)
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -249,10 +248,12 @@ void FCSGpuInstancedMeshSceneProxy::EnsureCullServiceStarted()
 // FCSGpuInstancedMeshSceneProxy
 // -----------------------------------------------------------------------------
 
-FCSGpuInstancedMeshSceneProxy::FCSGpuInstancedMeshSceneProxy(UCSGpuInstancedMeshComponent* Component, const FCSMeshResidentRef& InResident)
-	: FCSGpuMeshSceneProxy(Component, Component->InstanceMaterial, "FCSGpuInstancedMeshSceneProxy")
+FCSGpuInstancedMeshSceneProxy::FCSGpuInstancedMeshSceneProxy(UCSGpuInstancedMeshComponent* Component, const FCSMeshResidentRef& InResident,
+	const TArray<UMaterialInterface*>& InDrawMaterials)
+	: FCSGpuMeshSceneProxy(Component, InDrawMaterials.Num() > 0 ? InDrawMaterials[0] : nullptr, "FCSGpuInstancedMeshSceneProxy")
 	, Resident(InResident)
 	, LODs(Component->GetBaseMeshSnapshot().LODs)
+	, Sections(Component->GetBaseMeshSnapshot().Sections)
 	, GpuSource(Component->GetInstanceSourceGPU())
 	, GpuPointSource(Component->GetInstancePointSourceGPU())
 	, EndCullDistance(FMath::Max(Component->InstanceEndCullDistance, 0.0f))
@@ -281,6 +282,22 @@ FCSGpuInstancedMeshSceneProxy::FCSGpuInstancedMeshSceneProxy(UCSGpuInstancedMesh
 	// RunCulling indexes LODs[Lod] straight out of it, and reading one LOD past the end is not a
 	// symptom anyone would trace back to a layout that disagreed with its own base mesh.
 	Layout.NumLODs = FMath::Clamp(Layout.NumLODs, 1u, uint32(FMath::Max(LODs.Num(), 1)));
+
+	// 同一个理由钳 draw 表：arg set 的个数是声明进常驻流的 NumDraws，多写一段就越过 args 缓冲的末尾。
+	// 属于已经被丢弃的 LOD 的段也一并去掉（快照丢 LOD 时本来就同步截了段，这里只是不信任何一方）。
+	Sections.SetNum(FMath::Min(Sections.Num(), int32(FMath::Min(Layout.NumDraws, uint32(CS_GPU_INSTANCED_MAX_DRAWS)))));
+	Sections.RemoveAll([this](const FCSGpuInstancedSection& Section) { return Section.LodIndex < 0 || Section.LodIndex >= int32(Layout.NumLODs); });
+
+	// 一段一张材质，恒非空。基座构造函数只按第 0 张算了相关性（不透明 / 双面 / 速度……），多段时必须并上
+	// 其余各张 —— 漏掉的话，比如"第 0 段不透明、第 1 段半透明"会让第 1 段根本进不了半透明通道。
+	DrawMaterials.Reserve(Sections.Num());
+	for (int32 Index = 0; Index < Sections.Num(); ++Index)
+	{
+		UMaterialInterface* DrawMaterial = InDrawMaterials.IsValidIndex(Index) ? InDrawMaterials[Index] : nullptr;
+		if (!DrawMaterial) DrawMaterial = UMaterial::GetDefaultMaterial(MD_Surface);
+		DrawMaterials.Add(DrawMaterial);
+		if (Index > 0) MaterialRelevance |= DrawMaterial->GetRelevance_Concurrent(GetScene().GetShaderPlatform());
+	}
 
 	// Each LOD needs its own fixed-size region in the visible buffers because SV_InstanceID
 	// restarts per draw, so the cost scales with LOD count as well as instance count. 80 bytes
@@ -493,17 +510,10 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 	const float ScreenMultiple = FMath::Max(0.5f * float(ProjMatrix.M[0][0]), 0.5f * float(ProjMatrix.M[1][1]));
 
 	FVector4f LodScreenSizes(ForceInit);
-	FUintVector4 LodIndexCount(ForceInit);
-	FUintVector4 LodFirstIndex(ForceInit);
-	FUintVector4 LodBaseVertex(ForceInit);
-	for (int32 Lod = 0; Lod < int32(Layout.NumLODs); ++Lod)
-	{
-		const FCSGpuInstancedLODRange& Range = LODs[Lod];
-		LodScreenSizes[Lod] = Range.ScreenSize * LodScreenSizeScale;
-		LodIndexCount[Lod] = Range.NumIndices;
-		LodFirstIndex[Lod] = Range.FirstIndex;
-		LodBaseVertex[Lod] = Range.BaseVertex;
-	}
+	for (int32 Lod = 0; Lod < int32(Layout.NumLODs); ++Lod) LodScreenSizes[Lod] = LODs[Lod].ScreenSize * LodScreenSizeScale;
+	// Draws with no sections to draw means a layout that disagrees with its own snapshot; culling into it is
+	// harmless but drawing is not, and GetDynamicMeshElements already draws nothing in that case.
+	if (Sections.IsEmpty()) return;
 
 	// The mesh's own render-thread edit. It registers every resident stream into the caller's graph
 	// exactly as UCSMesh::EditMeshSync does, takes back the ones last frame handed off in external
@@ -629,15 +639,19 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 			FComputeShaderUtils::GetGroupCount(Layout.InstanceCapacity, CullGroupSize));
 	}
 
-	// Indirect args, one set per LOD.
+	// Indirect args, one set per draw (a material section of a LOD). Every section of a LOD reads that
+	// LOD's compaction counter, so the per-material split costs draw calls and nothing in the cull.
 	{
 		FCSInstancedBuildArgsCS::FParameters* Params = GraphBuilder.AllocParameters<FCSInstancedBuildArgsCS::FParameters>();
 		Params->RWLodCounters = LodCountersUAV;
 		Params->RWIndirectArgs = IndirectArgsUAV;
-		Params->LodIndexCount = LodIndexCount;
-		Params->LodFirstIndex = LodFirstIndex;
-		Params->LodBaseVertex = LodBaseVertex;
-		Params->NumLods = Layout.NumLODs;
+		for (int32 Draw = 0; Draw < Sections.Num(); ++Draw)
+		{
+			const FCSGpuInstancedSection& Section = Sections[Draw];
+			Params->DrawTable[Draw] = FUintVector4(Section.NumIndices, Section.FirstIndex,
+				LODs[Section.LodIndex].BaseVertex, uint32(Section.LodIndex));
+		}
+		Params->NumDraws = uint32(Sections.Num());
 		Params->MaxInstancesPerLod = Layout.InstanceCapacity;
 
 		TShaderMapRef<FCSInstancedBuildArgsCS> Shader(ShaderMap);
@@ -648,20 +662,21 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 	if (DiagnosticState == EDiagnosticState::Pending)
 	{
 		DiagnosticReadback = new FRHIGPUBufferReadback(TEXT("CSGpuInstanced.DiagArgs"));
-		AddEnqueueCopyPass(GraphBuilder, DiagnosticReadback, IndirectArgs, sizeof(uint32) * IndirectArgsPerDraw * Layout.NumLODs);
+		AddEnqueueCopyPass(GraphBuilder, DiagnosticReadback, IndirectArgs, sizeof(uint32) * IndirectArgsPerDraw * uint32(Sections.Num()));
 		DiagnosticState = EDiagnosticState::Waiting;
 	}
 	else if (DiagnosticState == EDiagnosticState::Waiting && DiagnosticReadback && DiagnosticReadback->IsReady())
 	{
-		const uint32 NumArgs = IndirectArgsPerDraw * Layout.NumLODs;
+		const uint32 NumArgs = IndirectArgsPerDraw * uint32(Sections.Num());
 		if (const uint32* Args = static_cast<const uint32*>(DiagnosticReadback->Lock(sizeof(uint32) * NumArgs)))
 		{
-			for (uint32 Lod = 0; Lod < Layout.NumLODs; ++Lod)
+			for (int32 Draw = 0; Draw < Sections.Num(); ++Draw)
 			{
-				const uint32* A = Args + Lod * IndirectArgsPerDraw;
+				const uint32* A = Args + uint32(Draw) * IndirectArgsPerDraw;
 				UE_LOG(LogCSGpuInstancedProxy, Log,
-					TEXT("[CSGpuInstanced] %s LOD%u args: IndexCount=%u Instances=%u FirstIndex=%u BaseVertex=%u (capacity %u instances, %u live, %u clusters, verts %u, indices %u)"),
-					*GetOwnerName().ToString(), Lod, A[0], A[1], A[2], A[3],
+					TEXT("[CSGpuInstanced] %s draw %d (LOD%d, slot %d, '%s') args: IndexCount=%u Instances=%u FirstIndex=%u BaseVertex=%u (capacity %u instances, %u live, %u clusters, verts %u, indices %u)"),
+					*GetOwnerName().ToString(), Draw, Sections[Draw].LodIndex, Sections[Draw].MaterialIndex, *GetNameSafe(DrawMaterials[Draw]),
+					A[0], A[1], A[2], A[3],
 					Layout.InstanceCapacity, Layout.NumSourceInstances, Layout.NumClusters, VertexCapacity, IndexCapacity);
 			}
 			DiagnosticReadback->Unlock();
@@ -688,15 +703,16 @@ void FCSGpuInstancedMeshSceneProxy::GetDynamicMeshElements(const TArray<const FS
 {
 	if (!DrawDesc.bValid || DrawDesc.IndexBuffer == nullptr || !VertexFactory) return;
 	if (DrawDesc.IndirectArgsBuffer == nullptr || !Layout.IsValid()) return;
-
-	FMaterialRenderProxy* MaterialProxy = Material->GetRenderProxy();
+	if (Sections.IsEmpty() || DrawMaterials.Num() != Sections.Num()) return;
 
 	if (!bLoggedFirstDraw)
 	{
 		bLoggedFirstDraw = true;
+		FString MaterialNames;
+		for (const UMaterialInterface* DrawMaterial : DrawMaterials) MaterialNames += (MaterialNames.IsEmpty() ? TEXT("") : TEXT(", ")) + GetNameSafe(DrawMaterial);
 		UE_LOG(LogCSGpuInstancedProxy, Log,
-			TEXT("[CSGpuInstanced] %s first draw: %u LODs, material '%s', bounds radius %.1f"),
-			*GetOwnerName().ToString(), Layout.NumLODs, *Material->GetName(), GetBounds().SphereRadius);
+			TEXT("[CSGpuInstanced] %s first draw: %u LODs, %d draws, materials [%s], bounds radius %.1f"),
+			*GetOwnerName().ToString(), Layout.NumLODs, Sections.Num(), *MaterialNames, GetBounds().SphereRadius);
 	}
 
 	for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ++ViewIndex)
@@ -705,16 +721,21 @@ void FCSGpuInstancedMeshSceneProxy::GetDynamicMeshElements(const TArray<const FS
 
 		FDynamicPrimitiveUniformBuffer& DynamicPrimitiveUniformBuffer =
 			Collector.AllocateOneFrameResource<FDynamicPrimitiveUniformBuffer>();
+		// CustomPrimitiveData 必须送进来：这条路不走 GPU-Scene，材质的 `GetPrimitiveData(...).CustomPrimitiveData`
+		// 只读这个 uniform buffer。传 nullptr（2026-09-15 之前）会被 builder 清零，组件上
+		// `SetCustomPrimitiveData*` 设多少材质都读到 0 且不报错。proxy 这份由 `FScene::UpdateCustomPrimitiveData`
+		// 在渲染线程更新，每帧取当前值即可。
 		DynamicPrimitiveUniformBuffer.Set(Collector.GetRHICommandList(), GetLocalToWorld(), GetLocalToWorld(),
-			GetBounds(), GetLocalBounds(), GetLocalBounds(), ReceivesDecals(), false, false, nullptr);
+			GetBounds(), GetLocalBounds(), GetLocalBounds(), ReceivesDecals(), false, false, GetCustomPrimitiveData());
 
-		// One indirect draw per LOD. The instance count sits in the args the cull pass wrote, so a
-		// LOD nobody selected costs an empty draw call and nothing else.
-		for (uint32 Lod = 0; Lod < Layout.NumLODs; ++Lod)
+		// One indirect draw per material section of each LOD. The instance count sits in the args the
+		// cull pass wrote, so a LOD nobody selected costs empty draw calls and nothing else.
+		for (int32 Draw = 0; Draw < Sections.Num(); ++Draw)
 		{
+			const uint32 Lod = uint32(Sections[Draw].LodIndex);
 			FMeshBatch& Mesh = Collector.AllocateMesh();
 			Mesh.VertexFactory = VertexFactory.Get();
-			Mesh.MaterialRenderProxy = MaterialProxy;
+			Mesh.MaterialRenderProxy = DrawMaterials[Draw]->GetRenderProxy();
 			Mesh.ReverseCulling = IsLocalToWorldDeterminantNegative();
 			Mesh.Type = PT_TriangleList;
 			Mesh.DepthPriorityGroup = SDPG_World;
@@ -728,10 +749,11 @@ void FCSGpuInstancedMeshSceneProxy::GetDynamicMeshElements(const TArray<const FS
 			BatchElement.MaxVertexIndex = DrawDesc.MaxVertexIndex;
 			BatchElement.NumPrimitives = 0; // 0 => read the count from IndirectArgsBuffer
 			BatchElement.IndirectArgsBuffer = DrawDesc.IndirectArgsBuffer;
-			BatchElement.IndirectArgsOffset = Lod * IndirectArgsPerDraw * sizeof(uint32);
+			BatchElement.IndirectArgsOffset = uint32(Draw) * IndirectArgsPerDraw * sizeof(uint32);
 			// Start of this LOD's region in the visible-instance buffers; the vertex factory adds
-			// SV_InstanceID to it. The stride is the capacity the buffers were sized from, which is
-			// why the proxy copies the layout instead of re-deriving it from the live count.
+			// SV_InstanceID to it. Every section of the LOD reads the same region. The stride is the
+			// capacity the buffers were sized from, which is why the proxy copies the layout instead
+			// of re-deriving it from the live count.
 			BatchElement.UserIndex = int32(Lod * Layout.InstanceCapacity);
 			BatchElement.LooseParametersUniformBuffer = InstancedLooseUniformBuffer;
 			BatchElement.PrimitiveUniformBufferResource = &DynamicPrimitiveUniformBuffer.UniformBuffer;
@@ -746,4 +768,10 @@ void FCSGpuInstancedMeshSceneProxy::GetDynamicMeshElements(const TArray<const FS
 			Collector.AddMesh(ViewIndex, Mesh);
 		}
 	}
+}
+
+void FCSGpuInstancedMeshSceneProxy::GetBatchMaterials(TArray<FMaterialRenderProxy*, TInlineAllocator<8>>& OutMaterials) const
+{
+	OutMaterials.Reset(DrawMaterials.Num());
+	for (UMaterialInterface* DrawMaterial : DrawMaterials) OutMaterials.Add(DrawMaterial->GetRenderProxy());
 }

@@ -26,6 +26,11 @@
 // GPU LOD 选择能在几级之间挑（剔除 shader 用一个 float4 存阈值）。源网格多出的 LOD 忽略。
 #define CS_GPU_INSTANCED_MAX_LODS 4
 
+// 一族最多几个 DrawIndexedIndirect（= 进快照的各 LOD 的 section 数之和；section = 基础网格资产的一个材质段）。
+// BuildArgsCS 的绘制表是常量缓冲里的 uint4 数组，C++ 的 SHADER_PARAMETER_ARRAY 必须与它同长 —— 两边不一致是
+// 绑定尺寸错位，不是编译错误。装不下时快照整级丢弃后面的 LOD（见 UCSGpuInstancedMeshComponent::RebuildBaseMeshSnapshot）。
+#define CS_GPU_INSTANCED_MAX_DRAWS 32
+
 // ── 门框砖的逐路常量（CSHouseFrame.usf ↔ CSHouseFrame.cpp）──────────────────────────────
 // 每条砖路占几个 float4（布局见 CSHouseFrame.usf 文件头），以及 R4.x 的位标志。
 #define CS_HOUSE_FRAME_PATH_FLOAT4S 8

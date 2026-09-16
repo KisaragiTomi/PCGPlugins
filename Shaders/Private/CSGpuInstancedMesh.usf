@@ -6,8 +6,9 @@
 //   InstanceCullCS  fine level: one thread per instance, skipped outright if its cluster was
 //                   rejected; survivors pick a LOD from their screen size and are compacted
 //                   with an atomic into that LOD's region of the visible-instance buffers.
-//   BuildArgsCS     one DrawIndexedIndirect arg set per LOD, instance count straight from the
-//                   compaction counters — the visible set never reaches the CPU.
+//   BuildArgsCS     one DrawIndexedIndirect arg set per draw — a draw is one material section of
+//                   one LOD — instance count straight from that LOD's compaction counter, so the
+//                   visible set never reaches the CPU.
 //
 // Everything runs in COMPONENT-LOCAL space: the frustum planes and the view origin are
 // transformed on the CPU (in double precision, which also sidesteps LWC in the shader) and
@@ -23,6 +24,8 @@
 // ── source ───────────────────────────────────────────────────────────────────
 // 5 float4 per instance: [0..2] rows of the instance-to-component 3x3 (.w = 0),
 // [3] origin.xyz + per-instance random in .w, [4] cull sphere centre.xyz + radius in .w.
+// 随机数 < 0 = 这个实例藏起来（组件级契约，见 FCSGpuInstanceSourceGPU）：剔除在这里跳过它，
+// Nanite 路的 GPU-Scene 写入把它写成 HIDDEN，烘焙出口不带它。
 Buffer<float4> SrcInstances;
 Buffer<float>  SrcCustomData;     // CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS 个 / 实例（源序）
 uint           bHasCustomData;    // 0 = 生产者没给，可见槽写零
@@ -36,7 +39,7 @@ RWBuffer<float4> RWVisOrigins;     // 1 per visible slot
 RWBuffer<float4> RWVisLightmap;    // 1 per visible slot (always 0 — no baked lighting here)
 RWBuffer<float>  RWVisCustomData;  // CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS 个 / 可见槽
 RWBuffer<uint>   RWLodCounters;    // 1 per LOD, compaction cursor
-RWBuffer<uint>   RWIndirectArgs;   // 5 uints per LOD
+RWBuffer<uint>   RWIndirectArgs;   // 5 uints per draw (LOD × material section)
 
 // ── view / config ────────────────────────────────────────────────────────────
 float4 FrustumPlanes[6];      // component-local, normalised: outside when dot(N, C) - W > R
@@ -44,9 +47,10 @@ float3 ViewOriginLocal;
 float  ComponentScale;        // local unit -> world unit (largest axis scale)
 float  ScreenMultiple;        // 0.5 * max(ProjMatrix[0][0], ProjMatrix[1][1])
 float4 LodScreenSizes;        // per-LOD switch thresholds, already multiplied by the user scale
-uint4  LodIndexCount;
-uint4  LodFirstIndex;
-uint4  LodBaseVertex;
+// 绘制表：每个 draw 一行 (IndexCount, FirstIndex, BaseVertex, Lod)。draw = 某一级 LOD 的一个材质 section，
+// 同一级 LOD 的各 section 共用那一级的可见实例区段与计数器，只是索引区间不同。
+uint4  DrawTable[CS_GPU_INSTANCED_MAX_DRAWS];
+uint   NumDraws;
 uint   NumLods;
 uint   NumClusters;
 uint   ClusterSize;           // instances per cluster (0 => no cluster level)
@@ -59,21 +63,6 @@ uint   bLodSelect;
 float GetLodScreenSize(uint Lod)
 {
 	return (Lod == 0) ? LodScreenSizes.x : ((Lod == 1) ? LodScreenSizes.y : ((Lod == 2) ? LodScreenSizes.z : LodScreenSizes.w));
-}
-
-uint GetLodIndexCount(uint Lod)
-{
-	return (Lod == 0) ? LodIndexCount.x : ((Lod == 1) ? LodIndexCount.y : ((Lod == 2) ? LodIndexCount.z : LodIndexCount.w));
-}
-
-uint GetLodFirstIndex(uint Lod)
-{
-	return (Lod == 0) ? LodFirstIndex.x : ((Lod == 1) ? LodFirstIndex.y : ((Lod == 2) ? LodFirstIndex.z : LodFirstIndex.w));
-}
-
-uint GetLodBaseVertex(uint Lod)
-{
-	return (Lod == 0) ? LodBaseVertex.x : ((Lod == 1) ? LodBaseVertex.y : ((Lod == 2) ? LodBaseVertex.z : LodBaseVertex.w));
 }
 
 /** Sphere vs the six local-space frustum planes. Conservative: a sphere straddling a plane stays. */
@@ -202,6 +191,9 @@ void InstanceCullCS(uint3 Id : SV_DispatchThreadID)
 	}
 
 	const uint Base = Instance * CS_GPU_INSTANCED_ROW_FLOAT4S;
+	// 负的逐实例随机数 = 生产者要藏起来的实例（门框砖的转角墩剔除就是这么写的）。在这里跳过，
+	// 藏不藏就与这一族画什么材质无关 —— 以前靠材质的 OpacityMask 读它，换成资产材质就会整批冒出来。
+	if (SrcInstances[Base + 3u].w < 0.0f) return;
 	const float4 Sphere = SrcInstances[Base + 4u];
 	if (!PassesViewTests(Sphere.xyz, Sphere.w)) return;
 
@@ -243,24 +235,30 @@ void InstanceCullCS(uint3 Id : SV_DispatchThreadID)
 }
 
 // -----------------------------------------------------------------------------
-// One DrawIndexedIndirect arg set per LOD
+// One DrawIndexedIndirect arg set per draw (one material section of one LOD)
+//
+// 同一级 LOD 的各 section 读同一个压缩计数器、画同一段可见实例（代理给它们同一个 UserIndex），
+// 只是索引区间不同 —— 所以多材质不增加任何剔除工作，只多几次 draw call。
 // -----------------------------------------------------------------------------
-[numthreads(CS_GPU_INSTANCED_MAX_LODS, 1, 1)]
+[numthreads(CS_GPU_INSTANCED_MAX_DRAWS, 1, 1)]
 void BuildArgsCS(uint3 Id : SV_DispatchThreadID)
 {
-	const uint Lod = Id.x;
+	const uint Draw = Id.x;
 
-	// Bounded by NumLods, not by CS_GPU_INSTANCED_MAX_LODS. The args buffer is one of the mesh's declared
-	// streams and holds exactly NumLods arg sets, so a thread for an inactive LOD wrote five uints
+	// Bounded by NumDraws, not by CS_GPU_INSTANCED_MAX_DRAWS. The args buffer is one of the mesh's declared
+	// streams and holds exactly NumDraws arg sets, so a thread for an unused row wrote five uints
 	// past the end of it — silently dropped by a typed UAV's bounds check, which is not something to
-	// keep relying on. There is nothing to zero either: a set past NumLods does not exist.
-	if (Lod >= NumLods) return;
+	// keep relying on. There is nothing to zero either: a set past NumDraws does not exist.
+	if (Draw >= NumDraws) return;
 
-	const uint Args = Lod * 5u;
+	const uint4 Entry = DrawTable[Draw];
+	// 计数器缓冲固定 CS_GPU_INSTANCED_MAX_LODS 格；表是 C++ 按快照填的，钳一下只是不让一行坏数据读越界。
+	const uint Lod = min(Entry.w, uint(CS_GPU_INSTANCED_MAX_LODS - 1));
+	const uint Args = Draw * 5u;
 
-	RWIndirectArgs[Args + 0u] = GetLodIndexCount(Lod);                    // IndexCountPerInstance
+	RWIndirectArgs[Args + 0u] = Entry.x;                                   // IndexCountPerInstance
 	RWIndirectArgs[Args + 1u] = min(RWLodCounters[Lod], MaxInstancesPerLod); // InstanceCount
-	RWIndirectArgs[Args + 2u] = GetLodFirstIndex(Lod);                    // StartIndexLocation
-	RWIndirectArgs[Args + 3u] = GetLodBaseVertex(Lod);                    // BaseVertexLocation
-	RWIndirectArgs[Args + 4u] = 0u;                                       // StartInstanceLocation
+	RWIndirectArgs[Args + 2u] = Entry.y;                                   // StartIndexLocation
+	RWIndirectArgs[Args + 3u] = Entry.z;                                   // BaseVertexLocation
+	RWIndirectArgs[Args + 4u] = 0u;                                        // StartInstanceLocation
 }

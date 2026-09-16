@@ -9,6 +9,7 @@
 #include "CSMesh.h"
 #include "CSMeshOps.h"
 
+#include "Algo/BinarySearch.h" // LowerBound：外部快照的材质槽 → 段号
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"     // FWorldDelegates：资产重建后的延迟重判
 #include "MaterialShared.h"
@@ -188,6 +189,7 @@ void UCSGpuInstancedMeshComponent::SetBaseMesh(UStaticMesh* InMesh)
 void UCSGpuInstancedMeshComponent::SetBaseMeshFromGpuData(const FCSGpuMeshCPUData& InMeshData)
 {
 	BaseMeshSnapshot.Reset();
+	BaseMeshMaterials.Reset();
 	bBaseMeshIsExternal = true;
 #if WITH_EDITOR
 	// 不再是资产了，资产的重建与这一族无关。
@@ -204,11 +206,60 @@ void UCSGpuInstancedMeshComponent::SetBaseMeshFromGpuData(const FCSGpuMeshCPUDat
 
 	const int32 NumVerts = InMeshData.Positions.Num();
 	const bool bPerCorner = InMeshData.AttrLayout == FCSGpuMeshCPUData::EAttrLayout::PerCorner;
+	// 外部数据声明了几组 UV 就带几组。IsValid() 是按钳过的组数查各通道等长的，字段本身仍可能越界 ——
+	// 拿它当 TexCoordChannels 的下标之前同样钳一次。
+	const int32 NumSets = FMath::Clamp(InMeshData.NumTexCoordChannels, 1, FCSGpuMeshCPUData::MaxTexCoordChannels);
 
 	BaseMeshSnapshot.Positions = InMeshData.Positions;
-	BaseMeshSnapshot.Indices = InMeshData.Indices;
+	BaseMeshSnapshot.NumTexCoordSets = NumSets;
+
+	// 材质段：按 TriangleMaterialSlots 把三角**稳定地**归到各自的槽里，一槽一段、槽号升序。一个 draw 只能画一截
+	// 连续索引，所以同槽三角在数据里不相邻时这里要重排索引 —— 画出来的三角集合不变，只是顺序变了。
+	// 槽表长度对不上三角数（或根本没给）就整张一段、槽 0，与改动前逐位相同。
+	{
+		const int32 NumTriangles = InMeshData.Indices.Num() / 3;
+		const bool bHasSlots = InMeshData.TriangleMaterialSlots.Num() == NumTriangles;
+		TArray<int32> Slots;
+		if (bHasSlots)
+		{
+			for (int32 Slot : InMeshData.TriangleMaterialSlots) Slots.AddUnique(FMath::Max(Slot, 0));
+			Slots.Sort();
+		}
+		if (Slots.IsEmpty()) Slots.Add(0);
+		// 槽太多装不进绘制表：多出来的槽并进最后一段，用那一段的材质画（只告警，不丢三角）。
+		if (Slots.Num() > CS_GPU_INSTANCED_MAX_DRAWS)
+		{
+			UE_LOG(LogCSGpuInstancedMesh, Warning,
+				TEXT("%s: base mesh data uses %d material slots, more than the %d draws one instanced family can issue; slots %d.. share the material of slot %d."),
+				*GetPathName(), Slots.Num(), CS_GPU_INSTANCED_MAX_DRAWS, Slots[CS_GPU_INSTANCED_MAX_DRAWS - 1], Slots[CS_GPU_INSTANCED_MAX_DRAWS - 1]);
+		}
+		auto DrawOfSlot = [&Slots](int32 Slot)
+		{
+			const int32 Found = Algo::LowerBound(Slots, FMath::Max(Slot, 0));
+			return FMath::Min(FMath::Min(Found, Slots.Num() - 1), CS_GPU_INSTANCED_MAX_DRAWS - 1);
+		};
+		const int32 NumDraws = FMath::Min(Slots.Num(), CS_GPU_INSTANCED_MAX_DRAWS);
+
+		BaseMeshSnapshot.Indices.Reserve(NumTriangles * 3);
+		for (int32 Draw = 0; Draw < NumDraws; ++Draw)
+		{
+			FCSGpuInstancedSection Section;
+			Section.LodIndex = 0;
+			Section.FirstIndex = uint32(BaseMeshSnapshot.Indices.Num());
+			Section.MaterialIndex = Slots[Draw];
+			for (int32 Triangle = 0; Triangle < NumTriangles; ++Triangle)
+			{
+				if ((bHasSlots ? DrawOfSlot(InMeshData.TriangleMaterialSlots[Triangle]) : 0) != Draw) continue;
+				BaseMeshSnapshot.Indices.Append(&InMeshData.Indices[Triangle * 3], 3);
+			}
+			Section.NumIndices = uint32(BaseMeshSnapshot.Indices.Num()) - Section.FirstIndex;
+			if (Section.NumIndices > 0) BaseMeshSnapshot.Sections.Add(Section);
+		}
+	}
+	// 材质槽表跟着数据走。空槽保留空（解析时画默认材质），槽数少于用到的槽号也不补 —— 越界同样解析成空。
+	for (const TObjectPtr<UMaterialInterface>& Material : InMeshData.Materials) BaseMeshMaterials.Add(Material);
 	BaseMeshSnapshot.TangentBasis.SetNumUninitialized(NumVerts * 2);
-	BaseMeshSnapshot.TexCoords.SetNumUninitialized(NumVerts);
+	BaseMeshSnapshot.TexCoords.SetNumUninitialized(NumVerts * NumSets);
 	BaseMeshSnapshot.Colors.SetNumUninitialized(NumVerts);
 
 	// Per-corner attributes cannot be indexed by vertex; take the first corner that references
@@ -237,7 +288,7 @@ void UCSGpuInstancedMeshComponent::SetBaseMeshFromGpuData(const FCSGpuMeshCPUDat
 		BaseMeshSnapshot.TangentBasis[V * 2 + 0] = PackSnorm8888(FVector4f(Tangent, 0.0f));
 		BaseMeshSnapshot.TangentBasis[V * 2 + 1] = PackSnorm8888(FVector4f(Normal, Sign >= 0.0f ? 1.0f : -1.0f));
 
-		BaseMeshSnapshot.TexCoords[V] = InMeshData.TexCoordChannels[0].IsValidIndex(A) ? InMeshData.TexCoordChannels[0][A] : FVector2f::ZeroVector;
+		for (int32 Set = 0; Set < NumSets; ++Set) BaseMeshSnapshot.TexCoords[V * NumSets + Set] = InMeshData.TexCoordChannels[Set].IsValidIndex(A) ? InMeshData.TexCoordChannels[Set][A] : FVector2f::ZeroVector;
 
 		FLinearColor Color = FLinearColor::White;
 		if (InMeshData.Colors.IsValidIndex(A))
@@ -277,6 +328,8 @@ void UCSGpuInstancedMeshComponent::RebuildBaseMeshSnapshot()
 #endif
 
 	BaseMeshSnapshot.Reset();
+	// 资产路每次现读 BaseMesh 的材质槽（ResolveSlotMaterial），外部快照留下的表不许再被读到。
+	BaseMeshMaterials.Reset();
 
 	const FStaticMeshRenderData* RenderData = BaseMesh ? BaseMesh->GetRenderData() : nullptr;
 	if (!RenderData || RenderData->LODResources.Num() == 0)
@@ -288,6 +341,14 @@ void UCSGpuInstancedMeshComponent::RebuildBaseMeshSnapshot()
 	}
 
 	const int32 NumLODs = FMath::Min(RenderData->LODResources.Num(), CS_GPU_INSTANCED_MAX_LODS);
+
+	// UV 组数取**进快照的各 LOD 里最多的那个**，某个 LOD 缺的组补零。交错布局要求每个顶点等宽，只能统一一个数；
+	// 按 LOD0 定的话，别的 LOD 多出来的组会被静默丢掉。
+	int32 NumSets = 1;
+	for (int32 LODIndex = 0; LODIndex < NumLODs; ++LODIndex) NumSets = FMath::Max(NumSets, int32(RenderData->LODResources[LODIndex].VertexBuffers.StaticMeshVertexBuffer.GetNumTexCoords()));
+	NumSets = FMath::Min(NumSets, FCSGpuMeshCPUData::MaxTexCoordChannels);
+	BaseMeshSnapshot.NumTexCoordSets = NumSets;
+
 	for (int32 LODIndex = 0; LODIndex < NumLODs; ++LODIndex)
 	{
 		const FStaticMeshLODResources& LOD = RenderData->LODResources[LODIndex];
@@ -303,16 +364,59 @@ void UCSGpuInstancedMeshComponent::RebuildBaseMeshSnapshot()
 		Range.BaseVertex = uint32(BaseMeshSnapshot.Positions.Num());
 		Range.FirstIndex = uint32(BaseMeshSnapshot.Indices.Num());
 		Range.NumIndices = uint32(LODIndices.Num());
+
+		// 这一级的材质段：资产 LOD 的 FStaticMeshSection 就是它索引缓冲里连续的几截，一截一个 draw、材质槽照抄。
+		// 在搬顶点**之前**算：绘制表装不下这一级时整级不进快照（与上面两条 break 同一个口径），LODs / Sections 一起停。
+		TArray<FCSGpuInstancedSection, TInlineAllocator<4>> LODSections;
+		for (const FStaticMeshSection& Source : LOD.Sections)
+		{
+			const uint32 First = FMath::Min(Source.FirstIndex, uint32(LODIndices.Num()));
+			const uint32 Count = FMath::Min(Source.NumTriangles * 3u, uint32(LODIndices.Num()) - First);
+			if (Count < 3u) continue;
+			FCSGpuInstancedSection& Section = LODSections.AddDefaulted_GetRef();
+			Section.LodIndex = BaseMeshSnapshot.LODs.Num();
+			Section.FirstIndex = Range.FirstIndex + First;
+			Section.NumIndices = Count - Count % 3u;
+			Section.MaterialIndex = Source.MaterialIndex;
+		}
+		if (LODSections.IsEmpty())
+		{
+			// 渲染数据没有段表（极少见）：整级一段、槽 0 —— 改动前的画法。
+			FCSGpuInstancedSection& Whole = LODSections.AddDefaulted_GetRef();
+			Whole.LodIndex = BaseMeshSnapshot.LODs.Num();
+			Whole.FirstIndex = Range.FirstIndex;
+			Whole.NumIndices = Range.NumIndices;
+			Whole.MaterialIndex = 0;
+		}
+		if (BaseMeshSnapshot.Sections.Num() + LODSections.Num() > CS_GPU_INSTANCED_MAX_DRAWS)
+		{
+			if (LODIndex > 0)
+			{
+				UE_LOG(LogCSGpuInstancedMesh, Warning,
+					TEXT("%s: '%s' LOD%d would take the instanced draw count past %d; drawing LOD0..LOD%d only."),
+					*GetPathName(), *GetNameSafe(BaseMesh), LODIndex, CS_GPU_INSTANCED_MAX_DRAWS, LODIndex - 1);
+				break;
+			}
+			// LOD0 自己就超了：多出来的段并进最后一段（段在索引里是首尾相接的，并完仍是一截连续区间），
+			// 用那一段的材质画 —— 丢三角比错材质更难看出来。
+			UE_LOG(LogCSGpuInstancedMesh, Warning,
+				TEXT("%s: '%s' LOD0 has %d material sections, more than the %d draws one instanced family can issue; the last ones share one material."),
+				*GetPathName(), *GetNameSafe(BaseMesh), LODSections.Num(), CS_GPU_INSTANCED_MAX_DRAWS);
+			FCSGpuInstancedSection& Last = LODSections[CS_GPU_INSTANCED_MAX_DRAWS - 1];
+			const FCSGpuInstancedSection& Tail = LODSections.Last();
+			Last.NumIndices = (Tail.FirstIndex + Tail.NumIndices) - Last.FirstIndex;
+			LODSections.SetNum(CS_GPU_INSTANCED_MAX_DRAWS);
+		}
 		// Screen size at which this LOD takes over. LOD0's threshold is never tested (it is the
 		// fallback when nothing smaller matches), so only 1..N-1 matter.
 		Range.ScreenSize = (LODIndex < MAX_STATIC_MESH_LODS) ? RenderData->ScreenSize[LODIndex].Default : 0.0f;
 
 		const bool bHasColors = LOD.VertexBuffers.ColorVertexBuffer.GetNumVertices() == NumVerts;
-		const bool bHasUVs = LOD.VertexBuffers.StaticMeshVertexBuffer.GetNumTexCoords() > 0;
+		const int32 NumLODSets = int32(LOD.VertexBuffers.StaticMeshVertexBuffer.GetNumTexCoords());
 
 		BaseMeshSnapshot.Positions.Reserve(BaseMeshSnapshot.Positions.Num() + int32(NumVerts));
 		BaseMeshSnapshot.TangentBasis.Reserve(BaseMeshSnapshot.TangentBasis.Num() + int32(NumVerts) * 2);
-		BaseMeshSnapshot.TexCoords.Reserve(BaseMeshSnapshot.TexCoords.Num() + int32(NumVerts));
+		BaseMeshSnapshot.TexCoords.Reserve(BaseMeshSnapshot.TexCoords.Num() + int32(NumVerts) * NumSets);
 		BaseMeshSnapshot.Colors.Reserve(BaseMeshSnapshot.Colors.Num() + int32(NumVerts));
 
 		for (uint32 V = 0; V < NumVerts; ++V)
@@ -324,7 +428,7 @@ void UCSGpuInstancedMeshComponent::RebuildBaseMeshSnapshot()
 			BaseMeshSnapshot.TangentBasis.Add(PackSnorm8888(FVector4f(TangentX, 0.0f)));
 			BaseMeshSnapshot.TangentBasis.Add(PackSnorm8888(TangentZ));
 
-			BaseMeshSnapshot.TexCoords.Add(bHasUVs ? LOD.VertexBuffers.StaticMeshVertexBuffer.GetVertexUV(V, 0) : FVector2f::ZeroVector);
+			for (int32 Set = 0; Set < NumSets; ++Set) BaseMeshSnapshot.TexCoords.Add(Set < NumLODSets ? LOD.VertexBuffers.StaticMeshVertexBuffer.GetVertexUV(V, uint32(Set)) : FVector2f::ZeroVector);
 			// alpha 归本组件所有（逐实例随机的载体，见类注释那份通道字典），一律清零；
 			// 没有色流的资产退白也一样要清，否则烘焙路与实例路差一个常数 1.0。
 			BaseMeshSnapshot.Colors.Add(ClearPackedColorAlpha(
@@ -335,6 +439,7 @@ void UCSGpuInstancedMeshComponent::RebuildBaseMeshSnapshot()
 		// BaseVertexLocation, so they go in unmodified.
 		BaseMeshSnapshot.Indices.Append(LODIndices);
 		BaseMeshSnapshot.LODs.Add(Range);
+		BaseMeshSnapshot.Sections.Append(LODSections);
 	}
 
 	// Nanite 路画的是资产本身，读不到顶点只影响烘焙出口 —— 那条出口自己会说"没有快照"，这里不刷屏。
@@ -586,60 +691,160 @@ FString UCSGpuInstancedMeshComponent::DebugGetDrawnAssetMismatchSync() const
 		}
 	}
 
-	// --- 材质：引擎会不会把它静默换掉 ---
-	if (!InstanceMaterial)
-	{
-		// ⚠️ 这一条**同时**覆盖"本来就没绑"和"绑了但被换掉了"：`CreateSceneProxy` 在
-		// `CheckMaterialUsage_Concurrent` 不过时会把 `InstanceMaterial` 就地置空，
-		// 所以建过一次代理之后，被换掉的材质在这里表现为"没绑"。
-		return TEXT("没有绑材质（会用引擎默认表面材质画成一片灰）");
-	}
-	const UMaterial* Base = InstanceMaterial->GetMaterial();
-	if (!Base || !Base->bUsedWithInstancedStaticMeshes)
-	{
-		return FString::Printf(
-			TEXT("材质 '%s' 的母材质没有勾 bUsedWithInstancedStaticMeshes（引擎会静默换成默认材质）"),
-			*GetNameSafe(InstanceMaterial));
-	}
+	// --- 材质：每一段画的材质，引擎会不会把它静默换掉 ---
+	// 非阻塞的两条（解析出来非空、母材质勾了实例化用途）与各 actor 的 `Get*UndrawableReason` 共用一份。
+	// `CreateSceneProxy` 不再把不合格的材质就地置空（那会把"整体覆盖"悄悄改成"用资产材质"），
+	// 所以被换掉的材质在这里仍以原名出现、原因里说清是哪一条。
+	const FString MaterialReason = GetMaterialUndrawableReason();
+	if (!MaterialReason.IsEmpty()) return MaterialReason;
 
 	// 比"勾没勾"再进一步：**编译产物**里到底有没有本顶点工厂那一份。勾是输入，着色器映射
 	// 是输出 —— 母材质勾了但那一份没编出来（平台裁剪、编译失败）时，渲染器一样退默认材质。
+	// 逐段各探一次（同一张材质只探一次），全部挤进一次阻塞刷新。
 	//
 	// ⚠️ 三态，不是两态：无头进程里材质的渲染线程着色器映射可能压根还没建起来，那时候
 	// **判不了**。判不了就说判不了，不许当成通过 —— 本项目已经吃过"把判不了当绿"的亏。
-	bool bShaderMapKnown = false;
-	bool bHasFactoryShaders = false;
-	const UMaterialInterface* MaterialForProbe = InstanceMaterial;
+	struct FProbe
+	{
+		const UMaterialInterface* Material = nullptr;
+		bool bShaderMapKnown = false;
+		bool bHasFactoryShaders = false;
+	};
+	TArray<FProbe, TInlineAllocator<4>> Probes;
+	for (int32 Section = 0; Section < BaseMeshSnapshot.Sections.Num(); ++Section)
+	{
+		const UMaterialInterface* SectionMaterial = GetSectionMaterial(Section);
+		if (SectionMaterial && !Probes.ContainsByPredicate([SectionMaterial](const FProbe& P) { return P.Material == SectionMaterial; }))
+		{
+			Probes.AddDefaulted_GetRef().Material = SectionMaterial;
+		}
+	}
 	const ERHIFeatureLevel::Type FeatureLevel = GMaxRHIFeatureLevel;
 	ENQUEUE_RENDER_COMMAND(CSGpuInstancedProbeMaterialShaderMap)(
-		[MaterialForProbe, FeatureLevel, &bShaderMapKnown, &bHasFactoryShaders](FRHICommandListImmediate&)
+		[&Probes, FeatureLevel](FRHICommandListImmediate&)
 		{
-			const FMaterialRenderProxy* Proxy = MaterialForProbe->GetRenderProxy();
-			if (!Proxy) return;
-			const FMaterialRenderProxy* Fallback = nullptr;
-			const FMaterial& Material = Proxy->GetMaterialWithFallback(FeatureLevel, Fallback);
-			const FMaterialShaderMap* ShaderMap = Material.GetRenderingThreadShaderMap();
-			if (!ShaderMap) return;
-			bShaderMapKnown = true;
-			bHasFactoryShaders = ShaderMap->GetMeshShaderMap(&FCSGpuInstancedMeshVertexFactory::StaticType) != nullptr;
+			for (FProbe& Probe : Probes)
+			{
+				const FMaterialRenderProxy* Proxy = Probe.Material->GetRenderProxy();
+				if (!Proxy) continue;
+				const FMaterialRenderProxy* Fallback = nullptr;
+				const FMaterial& Material = Proxy->GetMaterialWithFallback(FeatureLevel, Fallback);
+				const FMaterialShaderMap* ShaderMap = Material.GetRenderingThreadShaderMap();
+				if (!ShaderMap) continue;
+				Probe.bShaderMapKnown = true;
+				Probe.bHasFactoryShaders = ShaderMap->GetMeshShaderMap(&FCSGpuInstancedMeshVertexFactory::StaticType) != nullptr;
+			}
 		});
 	UCSMesh::CountedBlockingFlush();
-	if (bShaderMapKnown && !bHasFactoryShaders)
+	for (const FProbe& Probe : Probes)
 	{
-		return FString::Printf(
-			TEXT("材质 '%s' 没有为本实例顶点工厂编出着色器（渲染器会退回默认材质）"),
-			*GetNameSafe(InstanceMaterial));
-	}
-	if (!bShaderMapKnown)
-	{
-		// **判不了要说出来**：空串在调用方那里读作"通过"，而这一路其实什么都没证明。
-		// 不打这行日志的话，这条判据会在无头环境里静默退化成"永远绿"，
-		// 而那正是本项目已经吃过三次亏的失效方式。
-		UE_LOG(LogCSGpuInstancedMesh, Log,
-			TEXT("%s: 材质 '%s' 的渲染线程着色器映射还没建起来，「引擎会不会静默换材质」这一条判不了（不算通过）。"),
-			*GetPathName(), *GetNameSafe(InstanceMaterial));
+		if (Probe.bShaderMapKnown && !Probe.bHasFactoryShaders)
+		{
+			return FString::Printf(
+				TEXT("材质 '%s' 没有为本实例顶点工厂编出着色器（渲染器会退回默认材质）"),
+				*GetNameSafe(Probe.Material));
+		}
+		if (!Probe.bShaderMapKnown)
+		{
+			// **判不了要说出来**：空串在调用方那里读作"通过"，而这一路其实什么都没证明。
+			// 不打这行日志的话，这条判据会在无头环境里静默退化成"永远绿"，
+			// 而那正是本项目已经吃过三次亏的失效方式。
+			UE_LOG(LogCSGpuInstancedMesh, Log,
+				TEXT("%s: 材质 '%s' 的渲染线程着色器映射还没建起来，「引擎会不会静默换材质」这一条判不了（不算通过）。"),
+				*GetPathName(), *GetNameSafe(Probe.Material));
+		}
 	}
 
+	return FString();
+}
+
+// -----------------------------------------------------------------------------
+// 材质：逐段解析（整体覆盖 > 资产 / 快照材质槽）—— 类注释「材质」一节
+// -----------------------------------------------------------------------------
+
+UMaterialInterface* UCSGpuInstancedMeshComponent::ResolveSlotMaterial(int32 SlotIndex) const
+{
+	if (InstanceMaterial) return InstanceMaterial;
+	if (bBaseMeshIsExternal) return BaseMeshMaterials.IsValidIndex(SlotIndex) ? BaseMeshMaterials[SlotIndex].Get() : nullptr;
+	// 现读资产：资产上改了材质槽，下一次建代理就用上，不必等快照重建。越界时 GetMaterial 自己返回空。
+	return BaseMesh ? BaseMesh->GetMaterial(SlotIndex) : nullptr;
+}
+
+UMaterialInterface* UCSGpuInstancedMeshComponent::GetSectionMaterial(int32 SectionIndex) const
+{
+	if (InstanceMaterial) return InstanceMaterial;
+	const int32 Slot = BaseMeshSnapshot.Sections.IsValidIndex(SectionIndex) ? BaseMeshSnapshot.Sections[SectionIndex].MaterialIndex : 0;
+	return ResolveSlotMaterial(Slot);
+}
+
+int32 UCSGpuInstancedMeshComponent::GetNumMaterials() const
+{
+	if (bBaseMeshIsExternal) return FMath::Max(BaseMeshMaterials.Num(), 1);
+	return BaseMesh ? FMath::Max(BaseMesh->GetStaticMaterials().Num(), 1) : 1;
+}
+
+UMaterialInterface* UCSGpuInstancedMeshComponent::GetMaterial(int32 ElementIndex) const
+{
+	return ResolveSlotMaterial(ElementIndex);
+}
+
+void UCSGpuInstancedMeshComponent::GetUsedMaterials(TArray<UMaterialInterface*>& OutMaterials, bool bGetDebugMaterials) const
+{
+	for (int32 Slot = 0; Slot < GetNumMaterials(); ++Slot)
+	{
+		if (UMaterialInterface* Material = ResolveSlotMaterial(Slot)) OutMaterials.AddUnique(Material);
+	}
+}
+
+void UCSGpuInstancedMeshComponent::SetInstanceMaterial(UMaterialInterface* InMaterial)
+{
+	if (InstanceMaterial == InMaterial) return;
+	InstanceMaterial = InMaterial;
+
+	// 常驻网格的材质表是回读存盘取槽的地方，跟着换（只广播，不碰任何几何）。
+	if (InstancedGpuMesh) InstancedGpuMesh->SetMaterial(0, GetSectionMaterial(0));
+	// Nanite 路：替身每帧从本体拉覆盖材质，这里推一次免得晚一帧。
+	if (NaniteComponent) NaniteComponent->SyncFromOwner(*this);
+	// 经典路：代理构造时把每段的材质抄走了，光写属性看不出变化。
+	MarkRenderStateDirty();
+}
+
+FString UCSGpuInstancedMeshComponent::GetMaterialUndrawableReason() const
+{
+	const bool bNanite = IsNaniteRenderPath();
+
+	// 经典路按快照的段查（画的就是这些段）；Nanite 路画的是资产自己的每一个材质槽。
+	TArray<int32, TInlineAllocator<8>> Slots;
+	if (bNanite)
+	{
+		for (int32 Slot = 0; Slot < GetNumMaterials(); ++Slot) Slots.Add(Slot);
+	}
+	else
+	{
+		for (const FCSGpuInstancedSection& Section : BaseMeshSnapshot.Sections) Slots.AddUnique(Section.MaterialIndex);
+	}
+	if (Slots.IsEmpty()) return TEXT("基础网格快照里一个材质段都没有（没有基础网格，或读不到它的 LOD0）");
+
+	const TCHAR* Source = InstanceMaterial ? TEXT("整体覆盖 InstanceMaterial") : TEXT("基础网格资产的材质槽");
+	const TCHAR* Usage = bNanite ? TEXT("bUsedWithNanite") : TEXT("bUsedWithInstancedStaticMeshes");
+	for (const int32 Slot : Slots)
+	{
+		const UMaterialInterface* Material = ResolveSlotMaterial(Slot);
+		// **石阶那个坑**：材质为空时组件照样画，只是退回引擎默认表面材质 —— 画面一片灰，readback 断言照绿。
+		if (!Material)
+		{
+			return FString::Printf(TEXT("材质槽 %d（%s）是空的（会用引擎默认表面材质画成一片灰）"), Slot, Source);
+		}
+		// 没勾这条渲染路要的用途标记，引擎在这条路上会**静默换成默认材质**，症状与"没绑材质"逐像素相同。
+		// ⚠️ 编辑器里引擎会在第一次实例化使用时自己把标志勾回去并重编（并把包弄脏），所以这一条在编辑器里
+		// 很难抵到东西，真正会发作的是烘培 / 非编辑器路径。
+		const UMaterial* Base = Material->GetMaterial();
+		if (!Base || !(bNanite ? Base->bUsedWithNanite : Base->bUsedWithInstancedStaticMeshes))
+		{
+			return FString::Printf(TEXT("材质槽 %d（%s）：材质 '%s' 的母材质没有勾 %s（引擎会静默换成默认材质）"),
+				Slot, Source, *Material->GetName(), Usage);
+		}
+	}
 	return FString();
 }
 
@@ -743,10 +948,28 @@ UStaticMesh* UCSGpuInstancedMeshComponent::SaveToStaticMesh(const FTransform& Ba
 	TArray<FVector4f> Row;
 	if (!ReadLiveInstanceRowsSync(Row)) return nullptr;
 
+	// 藏起来的实例（Origin.w < 0，组件级契约，见 FCSGpuInstanceSourceGPU）不烘：画面上没有它，资产里也不该有。
+	// 以前这里照烘、随机数钳成 0 —— 烘出来的门框砖在转角墩下面多出一截，而烘焙件没有任何材质能再把它藏回去。
+	{
+		const int32 NumRows = Row.Num() / CS_GPU_INSTANCED_ROW_FLOAT4S;
+		int32 Kept = 0;
+		for (int32 Instance = 0; Instance < NumRows; ++Instance)
+		{
+			const int32 From = Instance * CS_GPU_INSTANCED_ROW_FLOAT4S;
+			if (Row[From + 3].W < 0.0f) continue;
+			if (Kept != Instance)
+			{
+				for (int32 R = 0; R < CS_GPU_INSTANCED_ROW_FLOAT4S; ++R) Row[Kept * CS_GPU_INSTANCED_ROW_FLOAT4S + R] = Row[From + R];
+			}
+			++Kept;
+		}
+		Row.SetNum(Kept * CS_GPU_INSTANCED_ROW_FLOAT4S);
+	}
+
 	const int32 NumInstances = Row.Num() / CS_GPU_INSTANCED_ROW_FLOAT4S;
 	if (NumInstances <= 0)
 	{
-		UE_LOG(LogCSGpuInstancedMesh, Warning, TEXT("%s: 这一族一个实例都没有，不产资产。"), *GetPathName());
+		UE_LOG(LogCSGpuInstancedMesh, Warning, TEXT("%s: 这一族一个（可见的）实例都没有，不产资产。"), *GetPathName());
 		return nullptr;
 	}
 
@@ -767,24 +990,10 @@ UStaticMesh* UCSGpuInstancedMeshComponent::SaveToStaticMesh(const FTransform& Ba
 	const int32 TotalVerts = NumInstances * LodVertexCount;
 	const int32 TotalIndices = NumInstances * int32(LOD0.NumIndices);
 
-	// 裁决六 ②「多组 UV 必须随网格保住」：**常驻流只有 UV0**（FCSGpuInstancedBaseMesh::TexCoords
-	// 是每顶点一条，实例路从来没上传过第二组），所以额外的 UV 直接从基础网格资产的 LOD0 取。
-	// 快照的 LOD0 顶点与资产 LOD0 顶点是 1:1 同序拷贝（见 RebuildBaseMeshSnapshot），下标可以直用。
-	// 外部喂进来的快照（SetBaseMeshFromGpuData）没有资产可取，只能停在一组 —— 如实退化，不假装。
-	const FStaticMeshLODResources* AssetLod0 = nullptr;
-	if (!bBaseMeshIsExternal && BaseMesh)
-	{
-		const FStaticMeshRenderData* RenderData = BaseMesh->GetRenderData();
-		if (RenderData && RenderData->LODResources.Num() > 0
-			&& int32(RenderData->LODResources[0].VertexBuffers.PositionVertexBuffer.GetNumVertices()) == LodVertexCount)
-		{
-			AssetLod0 = &RenderData->LODResources[0];
-		}
-	}
-	const int32 NumUVChannels = AssetLod0
-		? FMath::Clamp(int32(AssetLod0->VertexBuffers.StaticMeshVertexBuffer.GetNumTexCoords()),
-			1, FCSGpuMeshCPUData::MaxTexCoordChannels)
-		: 1;
+	// 裁决六 ②「多组 UV 必须随网格保住」：快照自己就带着全部 UV 组（交错，见 FCSGpuInstancedBaseMesh::TexCoords），
+	// 直接从快照取 —— 资产喂的与 SetBaseMeshFromGpuData 喂的是同一个口径。
+	// 2026-09-14 以前快照只有 UV0，额外的组要回资产 LOD0 去捞，外部快照只能停在一组；实例路支持 8 组后那条旁路删了。
+	const int32 NumUVChannels = BaseMeshSnapshot.NumTexCoordSets;
 
 	FCSGpuMeshCPUData MeshData;
 	// 世界空间 + 逐顶点属性：落盘层按 SourceSpace 决定要不要烘回 BakeSpace 的局部空间，
@@ -800,9 +1009,38 @@ UStaticMesh* UCSGpuInstancedMeshComponent::SaveToStaticMesh(const FTransform& Ba
 	MeshData.Colors.SetNumUninitialized(TotalVerts);
 	MeshData.Indices.SetNumUninitialized(TotalIndices);
 
+	// 材质：整体覆盖设了就一格、三角全落槽 0（老口径逐位不变）；否则把资产 / 快照的材质槽表原样带过去，
+	// 每个三角落在它所在材质段的槽上 —— 烘出来的资产与实例路画面是同一套材质（裁决六 ②：通道随网格保住）。
+	const int32 NumLod0Triangles = int32(LOD0.NumIndices / 3);
+	TArray<UMaterialInterface*> Materials;
+	TArray<int32> Lod0TriangleSlots;
+	Lod0TriangleSlots.Init(0, NumLod0Triangles);
+	if (InstanceMaterial)
+	{
+		Materials.Add(InstanceMaterial.Get());
+	}
+	else
+	{
+		for (int32 Slot = 0; Slot < GetNumMaterials(); ++Slot) Materials.Add(ResolveSlotMaterial(Slot));
+		for (const FCSGpuInstancedSection& Section : BaseMeshSnapshot.Sections)
+		{
+			if (Section.LodIndex != 0 || Section.FirstIndex < LOD0.FirstIndex) continue;
+			const int32 FirstTriangle = int32((Section.FirstIndex - LOD0.FirstIndex) / 3u);
+			for (int32 Triangle = FirstTriangle; Triangle < FirstTriangle + int32(Section.NumIndices / 3u); ++Triangle)
+			{
+				if (Lod0TriangleSlots.IsValidIndex(Triangle)) Lod0TriangleSlots[Triangle] = FMath::Max(Section.MaterialIndex, 0);
+			}
+		}
+	}
+	MeshData.TriangleMaterialSlots.SetNumUninitialized(NumInstances * NumLod0Triangles);
+
 	for (int32 Instance = 0; Instance < NumInstances; ++Instance)
 	{
 		const int32 Base = Instance * CS_GPU_INSTANCED_ROW_FLOAT4S;
+		for (int32 Triangle = 0; Triangle < NumLod0Triangles; ++Triangle)
+		{
+			MeshData.TriangleMaterialSlots[Instance * NumLod0Triangles + Triangle] = Lod0TriangleSlots[Triangle];
+		}
 		const FVector4f R0 = Row[Base + 0];
 		const FVector4f R1 = Row[Base + 1];
 		const FVector4f R2 = Row[Base + 2];
@@ -846,12 +1084,7 @@ UStaticMesh* UCSGpuInstancedMeshComponent::SaveToStaticMesh(const FTransform& Ba
 				.TransformVectorNoScale(FVector(Tangent4.X, Tangent4.Y, Tangent4.Z)).GetSafeNormal());
 			MeshData.BinormalSigns[Dst] = TangentZ.W >= 0.0f ? 1.0f : -1.0f;
 
-			MeshData.TexCoordChannels[0][Dst] = BaseMeshSnapshot.TexCoords[Src];
-			for (int32 Channel = 1; Channel < NumUVChannels; ++Channel)
-			{
-				MeshData.TexCoordChannels[Channel][Dst] =
-					AssetLod0->VertexBuffers.StaticMeshVertexBuffer.GetVertexUV(uint32(V), uint32(Channel));
-			}
+			for (int32 Channel = 0; Channel < NumUVChannels; ++Channel) MeshData.TexCoordChannels[Channel][Dst] = BaseMeshSnapshot.TexCoords[Src * NumUVChannels + Channel];
 
 			const FLinearColor Color = CSGpuInstanced_UnpackColorARGB(BaseMeshSnapshot.Colors[Src]);
 			MeshData.Colors[Dst] = FVector4f(Color.R, Color.G, Color.B, InstanceRandom01);
@@ -866,10 +1099,6 @@ UStaticMesh* UCSGpuInstancedMeshComponent::SaveToStaticMesh(const FTransform& Ba
 			MeshData.Indices[DstIndexBase + int32(I)] = uint32(DstVertexBase) + Local;
 		}
 	}
-
-	// 材质表只有一格：实例路整族共用一份 InstanceMaterial（组件级契约，不是简化）。
-	TArray<UMaterialInterface*> Materials;
-	Materials.Add(InstanceMaterial ? InstanceMaterial.Get() : nullptr);
 
 	FCSGpuMeshConvertOptions ConvertOptions;
 	ConvertOptions.TargetTransform = BakeSpace;
@@ -1088,6 +1317,8 @@ void UCSGpuInstancedMeshComponent::RebuildGpuMesh()
 	// --- what the buffers have to be sized for
 	FCSGpuInstancedGpuLayout NewLayout;
 	NewLayout.NumLODs = uint32(FMath::Clamp(BaseMeshSnapshot.LODs.Num(), 1, CS_GPU_INSTANCED_MAX_LODS));
+	// 一个材质段一个 arg set。快照保证段数在 [1, CS_GPU_INSTANCED_MAX_DRAWS] 且每段的 LOD 都在 LODs 里（IsValid 查过）。
+	NewLayout.NumDraws = uint32(FMath::Clamp(BaseMeshSnapshot.Sections.Num(), 1, CS_GPU_INSTANCED_MAX_DRAWS));
 	if (bPackedGpuSource || bPointGpuSource)
 	{
 		// Instances live on the GPU: there is no cluster table to build from, so the coarse level is
@@ -1110,24 +1341,31 @@ void UCSGpuInstancedMeshComponent::RebuildGpuMesh()
 	}
 
 	if (!InstancedGpuMesh) InstancedGpuMesh = NewObject<UCSMesh>(this);
-	// One entry, and not the material anything draws with — the proxy draws every LOD with
-	// InstanceMaterial directly. This is where a save of the base mesh gets its single slot from,
-	// which is the same table the material-id stream is cleared to index.
-	InstancedGpuMesh->SetMaterial(0, InstanceMaterial);
+	// One entry, and not the material anything draws with — the proxy draws each section with the
+	// material GetSectionMaterial resolves for it. This is where a save of the base mesh gets its
+	// single slot from, which is the same table the material-id stream is cleared to index.
+	InstancedGpuMesh->SetMaterial(0, GetSectionMaterial(0));
 
-	// --- declare the stream set: one indirect arg set per LOD, plus this leaf's seven aux streams.
+	// --- declare the stream set: one indirect arg set per material section (over all LODs), plus
+	// this leaf's aux streams.
 	//
 	// Declared at the instance capacity the mesh ALREADY holds, not at the new one. A re-declaration
 	// reallocates and copies every resident stream, the base-mesh geometry included, and the only
 	// thing another instance changes is how many instances the aux streams have room for — which is
 	// a per-stream resize, applied right below. So the declaration only moves when the shape of the
-	// set moves: a LOD gained or lost, a different cluster size, or a packed GPU source appearing
-	// and taking the source-row stream down to a placeholder.
+	// set moves: a LOD or a material section gained or lost, a different cluster size, a packed GPU
+	// source appearing and taking the source-row stream down to a placeholder, or a base mesh with a
+	// different UV set count.
 	FCSGpuInstancedGpuLayout DeclaredLayout = NewLayout;
 	if (GpuLayout.IsValid()) DeclaredLayout.InstanceCapacity = GpuLayout.InstanceCapacity;
 
 	FCSMeshStreamLayout StreamLayout;
-	StreamLayout.NumIndirectDraws = DeclaredLayout.NumLODs;
+	StreamLayout.NumIndirectDraws = DeclaredLayout.NumDraws;
+	// UV 组数跟基础网格走：TexCoord 流加宽成每顶点 2×N 个 float（交错），代理按流宽把 NumTexCoords 设成 N
+	// （CSGpuMeshSceneProxy.cpp 的 TexCoord 分支），材质的 TexCoord[1..N-1] 才读得到东西 —— 只声明一组的话，
+	// manual fetch 把越界的组钳回最后一组，UV1/UV2 读出来全是 UV0，**不报错**。
+	// 组数变了就是布局变了：SetStreamLayoutSync 重分配并拷贝，加宽的这条流回来是零，下面的上传整条重写。
+	StreamLayout.NumTexCoordSets = uint32(BaseMeshSnapshot.NumTexCoordSets);
 	CSGpuInstancedBuildAuxStreamDescs(StreamLayout.ExtraStreams, DeclaredLayout, bPackedGpuSource);
 
 	// Refused rather than partially applied, and the return value is the only signal: a slot that
@@ -1136,8 +1374,8 @@ void UCSGpuInstancedMeshComponent::RebuildGpuMesh()
 	if (!InstancedGpuMesh->SetStreamLayoutSync(StreamLayout))
 	{
 		UE_LOG(LogCSGpuInstancedMesh, Error,
-			TEXT("%s: the GPU mesh refused this leaf's stream layout (%u LODs, %u instance slots). Nothing will be drawn."),
-			*GetPathName(), DeclaredLayout.NumLODs, DeclaredLayout.InstanceCapacity);
+			TEXT("%s: the GPU mesh refused this leaf's stream layout (%u LODs, %u draws, %u instance slots). Nothing will be drawn."),
+			*GetPathName(), DeclaredLayout.NumLODs, DeclaredLayout.NumDraws, DeclaredLayout.InstanceCapacity);
 		ReleaseGpuMesh();
 		return;
 	}
@@ -1219,7 +1457,7 @@ void UCSGpuInstancedMeshComponent::RebuildGpuMesh()
 		GraphBuilder.QueueBufferUpload(MeshCounters, Counters, sizeof(Counters), ERDGInitialDataFlags::None);
 
 		// Zeroed until the first cull pass runs, so an unculled frame draws nothing rather than
-		// whatever the buffer pool's previous tenant left in those five uints per LOD.
+		// whatever the buffer pool's previous tenant left in those five uints per draw.
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgs, PF_R32_UINT)), 0u);
 
 		// This leaf writes no material ids, but every UCSMesh carries that stream and the save path
@@ -1240,8 +1478,10 @@ void UCSGpuInstancedMeshComponent::RebuildGpuMesh()
 		// EditMeshSync, which restores every resident stream's access state for the whole edit.
 		// Doing either by hand is the failure that has no symptom but "it stopped drawing".
 
-		// The arg sets are per LOD here, not per material run. A section table would make the render
-		// side draw arg set i with material i, which for this mesh is LOD i's draw.
+		// The arg sets here are this leaf's own draw table (one per material section of each LOD, laid
+		// out by the snapshot and consumed only by FCSGpuInstancedMeshSceneProxy), not UCSMesh's
+		// material-run section table. Publishing one would have the render side pair arg set i with
+		// UCSMesh material i, which for this mesh means nothing.
 		UCSMeshOps::InvalidateSections(Context);
 		// Stated exactly, which is what lets the shrink below skip the counter readback that a
 		// GPU-decided size would force (a full stall) before it even reaches its own hysteresis.
@@ -1409,19 +1649,32 @@ FPrimitiveSceneProxy* UCSGpuInstancedMeshComponent::CreateSceneProxy()
 	const FCSMeshResidentRef Resident = InstancedGpuMesh ? InstancedGpuMesh->GetResident() : FCSMeshResidentRef();
 	if (!Resident.IsValid() || !Resident->IsAllocated() || !GpuLayout.IsValid()) return nullptr;
 
-	// The vertex factory only compiles for materials flagged for instancing; this both flags the
-	// material in the editor and warns when it cannot be flagged (same call ISM makes).
-	if (InstanceMaterial && !InstanceMaterial->CheckMaterialUsage_Concurrent(MATUSAGE_InstancedStaticMeshes))
+	// 每个材质段一张材质（整体覆盖 > 资产 / 快照材质槽）。The vertex factory only compiles for materials
+	// flagged for instancing; this both flags the material in the editor and warns when it cannot be
+	// flagged (same call ISM makes). 不合格的那一段画默认材质 —— **不再把 InstanceMaterial 就地置空**：
+	// 那会把"整体覆盖"悄悄变成"用资产材质"，而用户在属性面板里看到的还是原来那张。
+	TArray<UMaterialInterface*> DrawMaterials;
+	DrawMaterials.Reserve(BaseMeshSnapshot.Sections.Num());
+	for (int32 Section = 0; Section < BaseMeshSnapshot.Sections.Num(); ++Section)
 	{
-		UE_LOG(LogCSGpuInstancedMesh, Warning,
-			TEXT("%s: material '%s' is not usable with instanced static meshes; instances will draw with the default material."),
-			*GetPathName(), *GetNameSafe(InstanceMaterial));
-		InstanceMaterial = nullptr;
+		UMaterialInterface* SectionMaterial = GetSectionMaterial(Section);
+		if (SectionMaterial && !SectionMaterial->CheckMaterialUsage_Concurrent(MATUSAGE_InstancedStaticMeshes))
+		{
+			if (!bWarnedUnusableMaterial)
+			{
+				bWarnedUnusableMaterial = true;
+				UE_LOG(LogCSGpuInstancedMesh, Warning,
+					TEXT("%s: section %d material '%s' is not usable with instanced static meshes; that section draws with the default material."),
+					*GetPathName(), Section, *GetNameSafe(SectionMaterial));
+			}
+			SectionMaterial = nullptr;
+		}
+		DrawMaterials.Add(SectionMaterial);   // null → the proxy substitutes the default surface material
 	}
 
 	// The per-frame cull passes are driven by a shared view extension; create it here rather than
 	// from the proxy so registration stays on the game thread.
 	FCSGpuInstancedMeshSceneProxy::EnsureCullServiceStarted();
 
-	return new FCSGpuInstancedMeshSceneProxy(this, Resident);
+	return new FCSGpuInstancedMeshSceneProxy(this, Resident, DrawMaterials);
 }

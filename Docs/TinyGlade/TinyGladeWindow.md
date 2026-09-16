@@ -826,7 +826,7 @@ D8 剩下的最后一件事。谓词（`CSHouse_QueryOpening`）、clip 场、�
 | 件 | 位置 | 说明 |
 | --- | --- | --- |
 | 射线 / 就近打墙 | `CSHouseProfile.h` 的 `CSHouse_RayHitWall` / `CSHouse_NearestWall` | **纯函数**，无 world 依赖。`S`/`Z` 直接就是 `CenterS`/窗台高的同一口径 |
-| 花名册查询 | `UCSHouseSubsystem::PickHouse` / `PickHouseNear` | 遍历 GUID 升序花名册取最近，世界→局部那一步归房子（见下） |
+| 找宿主 | `UCSHouseLibrary::PickHouse` / `PickHouseNear`（09-16 起，原在 `UCSHouseSubsystem`） | 遍历 world 里全部房子（`TActorRange`，GUID 升序）取最近，世界→局部那一步归房子（见下） |
 | 房子侧入口 | `ACSHouseActor::RayHitWall` / `NearestWall` | 只做一件别处做不了的事：用 **`GetBuildTransform`**（烘常驻流的那个只取 yaw 的变换）解世界坐标 |
 | 登记表 | `ACSHouseActor::MarkerWindows` + `Register/UnregisterFeatureMarker` | **transient，故意不序列化**；`BuildWindowOpenings` 把它与属性面板那份 `Windows` 一起喂给同一条谓词 |
 | 标记 actor | `CSHouseFeatureMarker.{h,cpp}`：`ACSHouseFeatureMarker`（抽象基类）+ `ACSWindowMarker` | 零可视几何、零材质，`MakeDemand` 是子类唯一要实现的东西 |
@@ -1072,11 +1072,11 @@ flushes=0 · worst drift=0.000 cm over 12 frames · hops=0
 
 | 件 | 位置 | 角色 |
 | --- | --- | --- |
-| `UCSHouseSubsystem::PlaceMarkerAlongRay` | `CSHouseSubsystem.{h,cpp}` | **唯一执行面**。吃一条世界射线，命中墙就生成标记并直接交给它宿主与锚点；**打空什么都不生成** |
+| `UCSHouseLibrary::PlaceMarkerAlongRay`（09-16 起，原在 `UCSHouseSubsystem`） | `CSHouseLibrary.{h,cpp}` | **唯一执行面**。吃一条世界射线，命中墙就生成标记并直接交给它宿主与锚点；**打空什么都不生成** |
 | `ACSHouseFeatureMarker::AdoptAnchor` | `CSHouseFeatureMarker.{h,cpp}` | 直接认下宿主与锚点，一条射线都不打；无条件吸附（点击就是放置，没有"拖到一半"） |
 | `ACSHouseActor::StartWindowBrush()` + `OnWindowBrushRequest` + `WindowBrushClass` | `CSHouseActor.{h,cpp}` | `CallInEditor` 按钮 → 广播 → 编辑器模块应答（接线抄地面的 `StartVertexColorPaint`） |
 | `FCSWindowBrushEdMode` | `PCGEditorProcess/Private/CSWindowBrushEdMode.{h,cpp}` | `FCSBrushEdModeBase` 的第四个叶子 |
-| `UCSHouseSubsystem::GetHouseSubsystem(WorldContext)` | 同上 | ⚠️ **脚本侧够不着 world subsystem**（UE Python 没有 `SubsystemBlueprintLibrary`），没有这个口，点击加窗就只能靠鼠标点、等于没有自动化判据 |
+| ~~`UCSHouseSubsystem::GetHouseSubsystem(WorldContext)`~~（09-16 随 subsystem 删除：`PlaceMarkerAlongRay` 现在是静态 `BlueprintCallable`，Python 直接 `unreal.CSHouseLibrary.place_marker_along_ray(house, ...)`，WorldContext 参数显式传） | — | 历史理由：⚠️ **脚本侧够不着 world subsystem**（UE Python 没有 `SubsystemBlueprintLibrary`），没有这个口，点击加窗就只能靠鼠标点、等于没有自动化判据 |
 
 **EdMode 只是触发器**（与抓手族纪律 ⑤ 同型）：无头测试直接调 `PlaceMarkerAlongRay`，不需要视口、不需要 Slate。
 ⚠️ 但「只是触发器」**不等于「不用测」** —— 触发器自己也有三条错了不报红的接线（解析求交 / 外法线朝向 /
@@ -1147,7 +1147,7 @@ House 单测 **58 / 0**；回归 **241 PASS / 8 FAIL**（8 条红：2 条门/拱
 即便如此仍加了一道闸（`PlaceMarkerAlongRay` 开头）：`WindowBrushClass` 是个 `TSubclassOf`，
 用户或脚本完全可以把它指到一个抽象**蓝图**上，而 `SpawnActor` 对抽象类只会静静返回 nullptr ——
 症状就是"点了一下什么都没发生"。现在挡在最前面并打
-`UE_LOG(LogTinyGladeHouseSubsystem, Warning, ...)`，日志里直说是**哪个字段**填错了、该指向什么。
+`UE_LOG(LogTinyGladeHouseLibrary, Warning, ...)`，日志里直说是**哪个字段**填错了、该指向什么。
 单测用 `AddExpectedErrorPlain` 要求这句警告**恰好出现一次** —— 删掉它或改了措辞都会报红。
 
 ⚠️ 顺手抓到并修掉一个**与本任务无关的既存缺陷**：`CSHouseLogicTests.cpp` 用了

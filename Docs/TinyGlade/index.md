@@ -66,6 +66,7 @@
 | [`CSRockShellPattern.fallback.preview.png`](CSRockShellPattern.fallback.preview.png) | 后备生成器的图案（真 Voronoi + Lloyd × 6） | `CSRockShellPattern.md` |
 | [`img/TG_continuous_arches.png`](img/TG_continuous_arches.png) | 连续拱之间没有「墙」这个表面的实拍裁决 | 计划 D6、`CSHouseProfile.h` |
 | `img/tiny-glade-ref-*.jpg` | 五张 TG 实拍参考：拱间墩／角柱／垛口／双拱墩／深度融合无缝 | 计划 D6/D7 |
+| [`img/tiny-glade-ref-overhang-beam-post.png`](img/tiny-glade-ref-overhang-beam-post.png) | 上房悬挑实拍：竖缝出砖柱、底部横缝出横梁与落地木柱 ⇒ **接缝是「接触」的派生之一** | 计划 D7「接触基类与派生」 |
 | [`img/tiny-glade-ref-door-in-arch.png`](img/tiny-glade-ref-door-in-arch.png) | 门在拱里的实拍：轮廓严丝合缝贴着拱圈石内缘 ⇒ **门是比洞更大的矩形，被墙切出剪影**，不是拱形网格 | 卷零「D6 续」③ |
 | [`img/tiny-glade-ref-corner-arch-passage.png`](img/tiny-glade-ref-corner-arch-passage.png) | 转角实拍：**两道拱共用一根角柱，没有木门** | 卷零「D6 续」④ |
 
@@ -82,12 +83,12 @@
 | D6 门洞（逐像素 clip + 门框砖） | 已落地；**2026-09-04 重做触发与宽度口径**：门宽 = 路在墙上截出的弦长，过宽切成拱廊 | `CSHouseDoorRuns.h`、`CSHouseFrame.{h,cpp}`、`CSHouseFrame.usf` |
 | D6 门扇（`DoorLeafMesh` 一族） | **2026-09-04 新增**：一洞一个静态网格组件，按洞宽缩放 | `CSHouseActor::RebuildDoorLeaves`、`Scripts/TinyGladeSetupDoorLeaf.py` |
 | D9 承重柱 + 塑形物（裙边噪声 / 二次抬升 / 披挂岩壳） | 已落地 | `CSGroundShaperActor.cpp`、`CSGroundRockShell.{cpp,usf}` |
-| D10 subsystem / D11 Spline 块排布 | 已落地 | `CSHouseSubsystem.{h,cpp}` |
+| D10 subsystem / D11 Spline 块排布 | D10 **2026-09-16 晚删除**（名单 = `UCSHouseLibrary::GetHouses`，找宿主 / 放窗搬到 `CSHouseLibrary.{h,cpp}`）；D11 已落地 | `CSHouseLibrary.{h,cpp}` |
 | D13 藤蔓（枝 319 / 叶 216） | 第一档已落地 | `CSHouseVine.{h,cpp,usf}` |
 | D14 渲染与光照 | 观感一轮已落地 | `Scripts/TinyGladeSetupLighting.py` |
 | 楼梯 S1 + S2 + S3 | 已落地，**旧路已删干净** | `CSGroundStairs.{h,cpp,usf}` |
 | D5 拉尺寸 | **2026-08-31 机制层 + 2026-09-05 交互层，整条已通**：单边推拉纯函数 + `PushEdge` 入口 + `EnterResizeMode` 生成的四个抓手 actor（标准 gizmo 拖，失选自动退出）。尺寸禁带随四坡屋顶同日删除，见 D4 行 | `CSHouseResize.h`、`CSHouseResizeHandleActor.{h,cpp}`、`CSHouseResizeSelectionWatcher.{h,cpp}` |
-| D7 接缝（形状相交） | **2026-08-31 落地**：纯函数接缝砖，洞走 clip 不挖真几何 | `CSHouseSeam.h` |
+| D7 接缝（形状相交） | **2026-08-31 落地**纯函数接缝砖；**2026-09-16 改为接触记录**：共享记录两端各持、写入口验、谁动谁发、松手提交、一条缝只砌一次、三维聚簇 + TG 两条过滤；横缝只判定不出产物 | `CSHouseContact.{h,cpp}`、`CSHouseSeam.h` |
 | D7 转角角石（墙自身转角） | **2026-08-31 落地**：四角竖直砖柱，与接缝柱共用 `CSHouseFrame::AppendColumn`。**D7 两半至此都合上** | `CSHouseQuoin.h` |
 | D7 包边石（A8） | **2026-08-31 落地**：墙顶压顶 + 墙脚勒脚，共用 `CSHouseFrame::AppendFlatRun`；勒脚按洞切段 | `CSHouseTrim.h` |
 | D4 屋面（四坡 + 瓦） | **2026-08-31 落地**：双坡实体板整套删除，屋面全部由瓦铺成。脊向由长轴导出、平局归 X（**用户已裁掉裁决四**） | `CSHouseTile.{h,cpp,usf}` |

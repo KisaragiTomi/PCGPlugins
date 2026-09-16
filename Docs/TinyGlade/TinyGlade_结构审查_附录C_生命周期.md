@@ -95,6 +95,8 @@
 
 ### UCSHouseSubsystem（`Public/CSHouseSubsystem.h`）
 
+> 2026-09-16 晚：本类已整个删除（名单 = `UCSHouseLibrary::GetHouses`，快扫由根组件 `TransformUpdated` 取代，找宿主 / 放窗搬到 `UCSHouseLibrary`，见计划 D10 状态）。以下为删除前的审查记录。
+
 | 状态 | 行 | 分类 | UPROPERTY 说明符 | 一致？ |
 | --- | --- | --- | --- | --- |
 | `Tracked`（`FGuid` → 弱引用 + `TrackingHash`） | 126–133 | 跨 actor 登记 | 无 UPROPERTY | 部分：`Tick` 惰性清理失效项 ✓（`.cpp:139–143`）；键是 `HouseId`，复制撞键（C5） |

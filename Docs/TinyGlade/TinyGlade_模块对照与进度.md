@@ -94,7 +94,7 @@
 | D4 屋面收尾（瓦厚 / 密度 / 脊瓦 / 尖顶） | 瓦厚与尺寸系数、排距定档 827 片、`CSHouseTile` 脊瓦、`ACSHouseActor::RebuildRoofFinials` 尖顶（2026-08-31，见「屋面收尾一轮」一节） | 待办 |
 | D9 岩壳「石头隆起」 | `CSGroundRockShell.usf` 六参数（用户规格 2026-08-31），全部蓝图可调 | 待办 |
 | D9 岩壳体积（TG 两层） | `CSGroundRockShell.usf`：`:563` 基准偏移 + 表面起伏改坡度比例（见「岩壳体积再补两层」） | *（本轮新增）* |
-| D8 特征标记（A6） | `CSHouseFeatureMarker.{h,cpp}` + `UCSHouseSubsystem::PickHouse` + `ACSHouseActor::MarkerWindows`（见「D8 收口」） | *（本轮新增）* |
+| D8 特征标记（A6） | `CSHouseFeatureMarker.{h,cpp}` + `UCSHouseLibrary::PickHouse`（09-16 前在 `UCSHouseSubsystem`） + `ACSHouseActor::MarkerWindows`（见「D8 收口」） | *（本轮新增）* |
 | 楼梯 S3 | **旧路已删干净**：`AnalyticRingRadius` 全仓 0 命中，`BuildStepPlan` 只剩注释里的历史提及 | 「旧路一行没删」 |
 
 ✅ **验收门已跑过两轮**（2026-08-31 晚）：全量构建 `Result: Succeeded`；岩壳体积那一轮
@@ -112,7 +112,7 @@
 | D4 房屋 / 屋面 | ~~面板 + clip~~；屋面共享求值器；脊向滞回 | — | 屋面已落地；**墙体正按 2026-09-05 的两层裁决重做**（砖层 + 灰泥层，「面板 + clip」将退役，见「挖洞策略改成 TG 的真两层」一节） |
 | D6 门洞 | **逐像素 clip** + 门框砖 ⚠️ 「TG 原版做法」这个措辞是**误述**（卷二 A1）：TG 的门拱确实用逐像素 clip，但它同时靠 `flags&32` 把洞缘砖**贴合**过去；2026-09-05 起本项目照抄那套四级 | ⚠️ **触发规则与 TG 不同**，见下 | 已落地；砖排布 bug 已修（根因见「踩过的坑」） |
 | D9 承重柱 + 塑形物 | **链 A + 链 B 全部落地**（裙边噪声、二次抬升、披挂岩壳、石头隆起六参数、TG 的基准偏移 + 坡度比例起伏） | 图案用 TG 原件，但 `PatternScale=0.35`（**绝对密度锚点已被用户有意放弃**）；体积两层已对齐 TG，`rocky_terrain.y/.z` 与水体仍缺 | 完成；**岩壳材质裁决六已执行**（`M_TG_Texture` 本体已翻 `MSM_DefaultLit`，见同名小节） |
-| D10 subsystem | GUID 注册表 + 兜底快扫 | — | 已落地 |
+| D10 subsystem | GUID 注册表 + 兜底快扫 | — | **2026-09-16 晚删除**：名单改 `UCSHouseLibrary::GetHouses`（`TActorRange`），快扫被根组件 `TransformUpdated` 取代，找宿主 / 放窗搬到 `UCSHouseLibrary` |
 | D11 Spline 块排布 | `SolveBlockLayout` | — | 已落地，被石阶与门框复用 |
 | **楼梯** | **S1 + S2 + S3 全部已落地**：marching squares 等值线 + 定容 + `InterlockedAdd`（`CSGroundStairs.usf`） | 旧路**已删干净**（`AnalyticRingRadius` 全仓 0 命中，`BuildStepPlan` 只剩注释） | 完成（S3 于 2026-08-31 收尾，08-31 晚源码复核过） |
 | D5 拉尺寸 | `CSHouseResize.h`：单边推拉（纯函数）+ `PushEdge` 入口 + `CSHouseResizeHandleActor` 抓手（2026-09-05） | TG 的脊长是长宽比的**连续函数**，没有「翻轴」这个事件 | 已落地（2026-08-31）。⚠️ **C-D5-1 的裁决四当日即被推翻**：四坡屋顶落地后翻轴事件不存在，`RidgeSwitchRatio` 滞回与尺寸禁带（`FCSHouseResizeBand` / `CSHouseResize_ApplyBand` / `RawFootprintSize`）**一并删除** —— 逆向侧那条"连续函数"反而是对的。抓手 / gizmo / EdMode 交互仍不在范围内 |
@@ -2900,6 +2900,12 @@ Res   <UiSignifierStream>
 - **触发是 push 的脏墙集合，不是每帧全量 OBB 扫描**。
 - **增量判据放在系统的 `Local` 里**，不是放在一个 actor 上。这是计划 D7 `InputSignature`
   两级判断的对位物，但载体形态不同。
+
+**2026-09-15 反汇编补证**（[`evidence/inter-shape-stitches-20260915.asm`](evidence/inter-shape-stitches-20260915.asm)，dumpbin + PDB；此前「先开洞」只到符号名）：
+
+- `add_hole_at_shape_intersection(wall, [P0, P1], [y0, y1]) -> Option<hole>` 共 99 条指令：两个交点按中间高度 `(y0 + y1) / 2` 经 `WallSpaceCoord::from_world_space` 转进墙空间；`hole.center_s = project_clamp(s0 + ds / 2)`、`hole.width = ds`（`ComparativeSpace::subtract`，闭合墙绕回一整圈）、`hole.height = y1 − y0`；`ds ≤ 0` 返回 `None`（niche 值 5）。
+- 主函数在「沿墙循环相邻两个交点」的循环里调它（`Cycle<Iter<(InteractionMode, Vec2)>>`），只对模式位标成「这一段在对方形状内」的相邻交点对调；`[y0, y1]` 是两面墙高度区间的交（先过 `Range<f32>::intersects`，某种 `Roof::ty` 下 `max_y` 先减 0.67 m）。攒下的 `Vec<ShapeIntersectionHole>`（40 B/条：墙 id + 洞 + `HoleType` 字节）每帧逐条 `WallHoles::add` 回去（`WallHoles` 每帧清空）。
+- ⇒ 洞 = **本墙被对方 footprint 盖住的整段 × 两墙高度区间的交**，与本项目 `CutOnEdge` 输出的 `FCSWallCut`（`MinS..MaxS` × `BottomZ..TopZ`）逐项同义。**从室外看不到它**——整段都在对方房子里面；高过对方檐口的那截墙照旧保留。「两个房间内部连通」只对重叠高度成立。
 
 #### 2.3 缝砖：两级纯函数【确凿】
 

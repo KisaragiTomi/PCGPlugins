@@ -8,7 +8,7 @@
 - **v1 通知不用 CSSceneDirty3D，全部直推**（用户裁决）：任何变动必然触发更新，不做区域过滤。地面侧经 `ACSGroundActor::OnGroundChanged` 多播委托广播（已实装：逐笔落笔、全量重建、编辑器拖动三处触发）；房/窗自身变动由 `UCSHouseSubsystem` 每 tick 变换快扫捕获。消费者收到即无条件重求值，无效唤醒被幂等哈希吸收成零成本。广播携带变更世界盒但 v1 无视——它是将来量级上来后切回 [`cs-scene-dirty-3d-design.md`](../../../../doc/cs-scene-dirty-3d-design.md)（仍为零代码设计稿，藤蔓/道路/水体的接入计划不受影响）的过滤接缝。
 - **房屋 = 声明式重求值，不是事件驱动的增量补丁**：任何唤醒（移动、拉尺寸、地面直推、窗户增删移）都走同一条 `ReevaluateSite()`。"纯函数"说的是**推导那一步的形态**，不是不要 actor——门洞/柱/接触段这些目标状态由 `F(自身参数, 地面镜像, 邻居注册表, 特征标记列表)` 只读推导、不带历史不带副作用；actor 仍是目标状态的宿主与执行者（持参数、缓存哈希、比对后重建网格）。收益：N 种事件 × M 种中间状态的增量补丁矩阵收敛成一个入口，重复/自发唤醒被哈希短路——直推架构的"必然更新"因此可以粗暴而不出错；判定逻辑还能脱离场景直接进 automation 测试。
 - **开洞不走布尔：墙板按 2D 剖面直接生成带洞真几何**（用户裁决 2026-08-29「尽可能不用 MeshBoolean」，取代早先的「闭合实体 + `ApplyMeshBoolean` 减 cutter」；更早的网格跳格方案仍然作废）。三条路线权衡后的落点——按格跳面贴不住拱/圆的剪影会漏缝；布尔的洞缘精度受 cutter 三角化限制，且引擎侧至今没有"常驻房体 − 原型 cutter"的 mesh 操作数入口；而**洞的形状本来就是有限的原型集合**（拱 / 矩形 / 圆…），每种原型配一条手写 2D 剖面，`CSHouseMeshBuilder` 生成墙板时按剖面直接砌出带洞几何，洞缘精度只受剖面分段数控制、洞口内壁一并产出。当前落地的门拱（`RebuildBodyMesh` 的墙段盒 + 12 段半圆拱带）已经是这条路线的实例，D8 窗户沿用同一形态。**布尔降级为最后手段**：仅当某形状确实写不出剖面时才考虑，届时才需要重开"给 `ApplyMeshBoolean` 补 mesh 操作数入口"这条（已关闭的开放问题）。~~逐像素 clip（Tiny Glade 的做法）作为可选的精度/成本优化留在 D14，**受 GI 代理约束限制**。~~ ⚠️ **2026-08-30 用户裁决订正：避免所有真几何洞。** 剖面仍是唯一真源，但它现在喂的是 `FCSOpeningClipField` 的**逐像素判据**而不是「砌出带洞几何」——墙板是整块实心盒，洞一律在渲染层挖（顶点色或门洞那套 clip 场）。「带洞真几何」以及「另建带真洞的低模代理」都不再允许；代价（mesh SDF / 软件 Lumen / 硬件光追里拱门是实心墙）已由用户知情接受，见 D14。 ⚠️ **2026-09-05 用户裁决再次订正：挖洞策略改成 Tiny Glade 的真两层**（砖层铺满 + 灰泥面层），见 D4「墙的两层结构：砖层 + 灰泥层」。剖面 / `FCSOpeningClipField` **仍是唯一真源**，只是求值点从「整块墙板」下移到「每一块砖」；"墙板是整块实心盒"这句随之作废。
-- **接缝角柱不属于任何一个房子**（针对"归属"问题的裁决）：`UCSHouseSubsystem` 检测接触对，生成/销毁中立的 transient `ACSHouseSeamActor`，key 为两房 GUID 无序对。对称关系没有自然主从；中立宿主让"任一方移动/删除 → 重建/销毁"的生命周期单点化。备选"GUID 小者拥有"已否：owner 删除要转移、对称逻辑塞进房子内部、双方重建时序耦合。接缝不序列化——可从两房状态完全重导出，加载时重建。 ⚠️ **2026-08-30 用户裁决订正：两栋房交汇时只产生接缝砖，其它任何内容都是独立的。** `ACSHouseSeamActor` 这个 **actor 形态被否决**，接缝降成 TG 那种**纯函数**（输入两房 footprint / 朝向 / 高度，输出砖列；零共享状态、零跨房簿记、零撤销）；角柱邻近合并、接缝接受 openings、跨接缝仲裁**全部退出范围**。见 D7。
+- **接缝角柱不属于任何一个房子**（针对"归属"问题的裁决；⚠️ 2026-09-16 已改为「共享接触记录、一条缝只砌一次、无 subsystem」，见 D7 与 D10）：`UCSHouseSubsystem` 检测接触对，生成/销毁中立的 transient `ACSHouseSeamActor`，key 为两房 GUID 无序对。对称关系没有自然主从；中立宿主让"任一方移动/删除 → 重建/销毁"的生命周期单点化。备选"GUID 小者拥有"已否：owner 删除要转移、对称逻辑塞进房子内部、双方重建时序耦合。接缝不序列化——可从两房状态完全重导出，加载时重建。 ⚠️ **2026-08-30 用户裁决订正：两栋房交汇时只产生接缝砖，其它任何内容都是独立的。** `ACSHouseSeamActor` 这个 **actor 形态被否决**，接缝降成 TG 那种**纯函数**（输入两房 footprint / 朝向 / 高度，输出砖列；零共享状态、零跨房簿记、零撤销）；角柱邻近合并、接缝接受 openings、跨接缝仲裁**全部退出范围**。见 D7。
 - **公共基类 `ACSTinyGlade`**（用户裁决，已落地）：地面/房屋/接缝都是"CPU 权威数据 → 快照 → `UCSMesh`"的同构 actor，统一继承 `ACSTinyGlade`（`ComputeShaderGenerator/Public/CSTinyGlade.h`）。基类收敛：网格底座（`UCSMeshRenderComponent` + transient `UCSMesh` + `UploadTinyGladeSnapshot` 上传/材质绑定管道）、声明式重求值入口 `virtual ReevaluateSite()`（基类空实现；地面是权威源不消费世界变化，不 override）、未来 `UCSHouseSubsystem` 的统一注册类型。**无网格辅助 actor 是例外**，保持普通 `AActor`：拉尺寸 handle（gizmo 道具）、地形塑形物（隐形高度影响体）、特征标记（窗户等，见 D8——⚠️ 2026-09-06 起它**自带预制网格**（`UStaticMeshComponent`），但仍是普通 `AActor` 不进 `ACSTinyGlade`：它的网格是**资产**不是生成物，没有「CPU 权威数据 → 快照」那条链）。
 - **交互全部依托编辑器原生能力**：笔刷走既有 `FCSBrushEdModeBase` EdMode 曲线；移动房子用标准 transform gizmo（`PostEditMove` 触发）；**拉尺寸不做自定义 EdMode/HitProxy**（用户裁决）——`EnterResizeMode()` 生成挂在房子下的临时 handle actor，选中它用标准 gizmo 拖动，handle 在 `PostEditMove` 里把位移投影到所属墙法线并直推宿主房；失选或调用 `ExitResizeMode()` 即销毁（见 D5）。核心入口都是 Runtime 模块 BlueprintCallable，运行时（PIE 游玩）外壳后置。
 
@@ -82,7 +82,7 @@ Plugins/PCGPlugins/Source/CSHouse/          # 新 Runtime 模块，依赖 Comput
                                             #   唯一执行面 HandleDrag / 编辑器示意道具配法
   Public/CSHouseResizeHandleActor.h         # D5 拉尺寸 handle : ACSHouseHandleActor（已落地 2026-09-05）
                                             #   gizmo 道具、无 csmesh、RF_Transient；记账量法在 ConsumeDragToHost
-  Public/CSHouseSubsystem.h                 # 注册表 + 快扫 + 接触检测 + wake 分发
+  Public/CSHouseLibrary.h                   # 世界级查询：GetHouses / PickHouse / PlaceMarkerAlongRay（09-16 取代 CSHouseSubsystem，无登记表）
   Public/CSHouseRoof.h                      # 屋面共享求值器（EvalZ/EvalNormal/IsUnderRoof + FCSRoofDesc），见 D4
                                             #   已落地，但落在 ComputeShaderGenerator/Public 下（CSHouse 模块尚未拆出）
   Public/CSHouseProfile.h                   # 洞的剖面 / clip 场求值器 —— 砖层贴合 / 逐像素判据 / 重叠谓词唯一真源
@@ -520,6 +520,16 @@ Tiny Glade 的屋面是被瓦、梁、尖顶、雪、老虎窗**共同引用的�
 > 相交处互相插进对方房间的墙，要么由接缝砖遮挡，要么走渲染层 clip。
 > ⇒ **下面「归属形态」「一对房子可能有多处接缝」「复评：做成 actor 还剩哪些障碍」三节自此降级为历史留档，不再是路线。**
 
+> ⚠️ **用户裁决（2026-09-15）：接缝改为两端共持的链接记录，一条接缝只砌一次。**
+> 原话：「房子交叉时如何让对方知道已经存在了接缝砖？产生接缝砖在 CPU、有先后顺序，A 生成了接缝砖直接写 B 的某一个变量就行了。
+> 我想让接缝和 A、B 房子之间能知道对方的存在，特别是在接缝或者房子被删除时能通知对方。」
+> ⇒ **收回**裁决二里「零共享状态、零跨房簿记」两句，以及 `CSHouseSeam.h` 头注释「两栋房各画一份是有意的」那一段；
+>   **保留**裁决二其余全部：不做 actor、不 tick、不进事务、不撤销；几何仍是 `CSHouseSeam` 的纯函数，链接只是它的缓存 + 通知通道；
+>   角柱邻近合并、跨接缝仲裁、接缝接受 openings 仍在范围外。
+> ⇒ 方案原见「接缝链接 `FCSHouseSeamLink`」，**已被 2026-09-16 的[「接缝记录 `FCSHouseSeam`」](#接触记录-fcshousecontact-与派生2026-09-16-方案)取代**（共享记录 + 写入口验有效性 + 谁动谁写 + 松手提交）；`bSeamEnabled` 的语义随之从「我画不画我这一份」改为「我参不参与」（接缝存在 ⇔ 两端都开）。
+
+> ⚠️ 下面的代码块与「触发 / 归属 / 生成」三条是 actor 时代的旧文：除「触发 = footprint 真相交 + Z 区间相交」仍有效外，`FCSHouseSeam` 字段、subsystem 仲裁、`ACSHouseSeamActor`、`UCSMesh` 槽 2 均已作废，留档。
+
 ```cpp
 // 触发条件（用户裁决）：两房 footprint box 真正相交才生角柱——不是"靠得近"。
 // 一个轮廓交点 = 一根角柱；两矩形可交出 2/4 点（带 yaw 最多 8）。
@@ -536,6 +546,128 @@ struct FCSHouseSeam
 - **触发 = footprint box 相交**（用户裁决，取代早先的"间距 ≤ `LinkGapMax`"）：两房 2D footprint OBB 真正重叠、且 Z 区间相交，才生接缝；靠得再近只要没碰上就不生。所见即所得，没有"多近算近"的调参问题。检测与生命周期全部归 `UCSHouseSubsystem` 仲裁，算法、每帧顺序、迟滞与风险评估见 [D10](#d10-ucshousesubsystem注册表变换快扫接触仲裁)。
 - **归属**：中立 `ACSHouseSeamActor`（`RF_Transient`，不序列化，加载时重导出），由**本次运动的房子**创建、两端任一失效即自毁（见「复评」与「归属形态」）。任一端移动/拉尺寸/删除 → 交点表重算：变了重建，全空即销毁。
 - **生成**：每个交点一根**叠砖角柱**——按 `PanelCell` 模数逐层错缝堆块（**块列从柱底锚定**，避免交点微动导致整柱重排），截面 ≥ 两侧墙厚 + 余量以盖住穿插处，从 `Bottom` 砌到 `Top`；`ACSHouseSeamActor : ACSTinyGlade`，CPU 生成经基类上传管道进自己的 `UCSMesh`（材质槽 2 砖）。instanced 路线（`UCSGpuInstancedMeshComponent`）暂不用：`SetInstances` 是 `UPROPERTY() TArray<FTransform>`（96 B/实例进关卡包）且每次 mutator 全量 repack + Morton 重排 + 一次阻塞 flush，对静态小段墙无收益。**"无 per-instance custom data"这条理由已过期**——见 D14，它离可用只差顶点工厂里的两行；真要走实例化路线应直接用 `SetInstanceSourceGPU`（GPU 产实例、零回读），不要经 `PerInstanceTransforms`。
+
+### 接触记录 `FCSHouseContact` 与派生（2026-09-16 方案）
+
+> ✅ **2026-09-16 落地（基类 + 竖缝）**：`CSHouseContact.h/.cpp`（`FCSHouseContact` / `FCSHouseSeamContact` / `FCSHouseBearingContact`、`Classify`）；
+> `CSHouseSeam.h` 加 `IntersectsXY`、交点带两墙法线、`CornerNearVertex` / `CornerNearlyParallel`、`FPost` + `MergePosts`（三维聚簇）；
+> `ACSHouseActor`：`Contacts` / `ReceiveContactFrom` / `UpdateContacts` / `DetachContacts` / `ComputeSeamKey` / `CanCommitSeams`、根组件 `TransformUpdated` 标脏、
+> `PostEditMove` 与 `Push*` 的拖动标志（2 s 超时兜底）、`BearingTolerance` / `SeamPostMergeDistance` / `SeamVertexClearance` / `SeamMinPostBricks` / `SeamParallelDot` 五个参数、
+> `GetContactCount` / `GetSeamOwnedPostCount` / `IsInGizmoDrag` / `IsInGroundDrag` / `IsReevaluatePending` / `AuditContacts`；`GetTrackingHash` 不再含邻居。
+> 地面：`OnGroundChanged` 签名不动，广播前写 `bLastChangeCommitted`（全量重建 / 收笔 / 塑形物松手 = 提交；落笔 / 地面拖动 / 塑形物拖动 = 未提交），
+> `EndPaintStroke` 补一次提交广播，`RefreshHeightsInRegion(rect, bCommitted)`，塑形物 `RebuildTerrain(bCommitted)` 传 `PostEditMove` 的 `bFinished`。
+> 名单 = `UCSHouseLibrary::GetHouses`（`TActorRange`，无登记表；同日晚删掉 `UCSHouseSubsystem`，去向见 D10 状态）。名字与方案略有出入：派生叫 `FCSHouseSeamContact` / `FCSHouseBearingContact`，避开 `namespace CSHouseSeam`。
+> 验收：`House.*` 自动化 84/84（新增 `Contact{SingleOwner,ScriptedMoveCommits,CommitOnly,DetachOnDestroy,SpawnOrderInvariant,MultiMoveConverges,BearingNoPosts}` + `SeamPostMerge3D`，原 4 条 `Seam*` 照绿）；
+> 演示回归 228/25（基线 222/27；接缝一节 23/23 全绿 —— 结构审查 33 那条 Nanite 路 `GetGpuMesh()` 假红改成 Nanite 感知后转绿；其余 25 条失败与基线逐条相同）。
+> **未做**：横缝的梁 / 木柱（只判定不出产物）、Esc 取消拖动时 `PostEditMove(true)` 是否必来（靠超时兜底）、跨对聚簇的一致性。
+
+> 用户 09-16 四轮裁决：① 不要 subsystem，房子通过共享记录知道接缝的存在；② **房子只需要知道自己跟哪些缝有关，缝只需要知道自己跟哪些房子有关**——规范序、出砖方、种子都是缝自己的事，房子不再算 `Canonical`；③ 有效性检查挂在**被写入**的入口上：A 把与 B 的接缝**打包成一体**交给 B，B 先清掉自己手里所有涉及 A 的旧缝再收下，就完了——只有这一种消息；④ 多选拖动只在鼠标松开时做这件事，拖拽期间接缝一概不动；构造脚本重跑、`PostEditUndo`、脚本直设 transform、Alt 拖复制都要能标脏；⑤ 房子被删除时一并删除自己有关的接缝；⑥ 接缝只是「两栋房接触」的一种：基类是接触记录，按方向与位置派生——竖缝出接缝砖，横缝在底出梁与木柱（附图）。
+> 09-15 方案里的逐条 `InputSignature` / `Generation`、`DetachSeamLinks`、死讯一并取消。09-15 其余条款不变：不做 actor、不 tick、不进事务、几何仍是 `CSHouseSeam` 的纯函数、一条缝只砌一次。
+
+**接触基类与派生**（09-16 第五轮，用户裁决）：接缝只是「两栋房接触」的一种。基类是**接触记录**——房子知道自己跟哪些接触有关，接触知道自己跟哪两栋房有关，接收接口 / 谁动谁发 / 松手提交 / 删除这一整套协议全在基类上；派生按接触的**方向与位置**分：
+
+| 派生 | 触发（`Classify(A, B)` 纯函数） | 产物 | TG 对位 |
+| --- | --- | --- | --- |
+| 竖缝 `FCSHouseSeam` | footprint 相交 **且** Z 区间重叠——墙对墙穿插 | 接缝砖柱 + 两端墙的 clip 段（今天的 D7） | `inter_shape_stitches` |
+| 横缝在底 `FCSHouseBearing` | footprint 相交 **且** 上房底 ≈ 下房檐口（`abs(上底 − 下顶) ≤ BearingTolerance`）——上房被下房承托 / 悬挑 | 沿上房悬挑边的**横梁** + 落到下房屋顶或地面的**木柱 / 托架** | 悬挑支撑：L9172 那个系统读 `ShapeIntersections`、写 `RecalculateRectangleSupports / CircleSupports`，`OverhangSupportDirtySubscriptions`、`util_pillar_construction` |
+| （将来）屋顶对屋顶 | 两屋面相交 | 雉堞 | `inter_roof_merlons` |
+
+![上房悬挑：左侧小屋顶压进砖墙处竖缝出砖柱，右侧底部横缝出横梁与落地木柱](img/tiny-glade-ref-overhang-beam-post.png)
+
+TG 正是这个结构：一张 `ShapeIntersections` 派生三种产物，`intersect_shapes` 是同一个泛型（雉堞那份是它的第二个实例化）。图里木柱 + 横梁 + 斜托架是 TG 的 elevation support；砖墙顶上那排小方块是上房的墙裙（`add_skirts`），不是接触产物。
+
+两条边界：① 横缝与竖缝互斥——先按容差判横缝，不满足再按 Z 重叠判竖缝，一对房子至多一条接触。容差要挡的是「上房嵌进下房几十厘米」这个常态：落座只看地面（房底 = 地面最高点 + `HeightOffset`），把房摞上去靠用户拉 `HeightOffset` / 底部高度框，拉不到正好齐平、有时还故意压低一点让上房坐实，于是两房 Z 区间真的重叠几十厘米；没有容差就会按竖缝在轮廓交点立几十厘米高的矮墩子、再把两边墙在这一带互相 clip。TG 没有专门判「摞」，靠「柱高不足 1.5 m 不砌」把浅重叠当成了坐在上面（洞照开、悬挑木柱走支撑系统）。所以 `BearingTolerance` 取 1–1.5 m 量级，或直接与竖缝的柱高门槛共用一个数（「重叠带不够 N 块砖高就不算竖缝」）；上房完全落在下房 footprint 里（塔楼坐屋顶）时没有悬挑边，横缝什么都不出。**本轮**：浅重叠判成 `Bearing` 但不出产物（不立柱、不 clip），横缝的梁与木柱留待下一轮；② 横缝与 D9 承重柱的分工：D9 是房对**地**（按支撑点 gap 采样），横缝是房对**房**；重叠区内 D9 的石柱要让位给横缝，否则会穿过下房屋顶。梁与木柱落在哪个组件（新木构实例族，或复用 `CSHouseFrame::AppendFlatRun` 换木料）留到横缝落地时定；本轮只落基类 + 竖缝。
+
+**数据**（不是 UPROPERTY：不存盘、不进事务、复制 / PIE 得到空表，加载后第一次提交重建）：
+
+```cpp
+// 接触 = 一对房子之间的一条关系记录，打包成一体；一对房子至多一条。协议全在基类
+struct FCSHouseContact
+{
+	TWeakObjectPtr<ACSHouseActor> Houses[2];   // 接触知道自己跟哪两栋房有关；内部按 CSHouseSeam::Canonical 定序
+	ECSContactKind Kind;                       // Seam（竖缝）/ Bearing（横缝在底）/ …
+
+	bool IsAlive() const;                      // 两端都有效且都 bSeamEnabled
+	bool Involves(const ACSHouseActor*) const;
+	ACSHouseActor* Owner() const;              // 规范序里第一个能出砖的（bFrameEnabled 且有 FrameBrickMesh）
+	uint32 Seed() const;                       // = CSHouseSeam::SeamSeed
+	static TSharedPtr<FCSHouseContact> Classify(const CSHouseSeam::FHouse& A, const CSHouseSeam::FHouse& B);   // 纯函数：0 或 1 条
+};
+struct FCSHouseSeam : FCSHouseContact          // 竖缝：今天的 D7
+{
+	TArray<CSHouseSeam::FCorner> Corners;
+	TArray<FCSWallCut> Cuts[2];                // 与 Houses 同序
+	const TArray<FCSWallCut>& CutsFor(const ACSHouseActor*) const;
+};
+struct FCSHouseBearing : FCSHouseContact       // 横缝在底：梁 + 木柱，落地时再定字段
+{
+	// 悬挑边段表（上房 footprint 边落在下房 footprint 之外的段）、木柱落点（到下房屋顶 / 地面）
+};
+TArray<TSharedPtr<FCSHouseContact>> Contacts;  // 房子只知道自己跟哪些接触有关
+uint32 LastSeamKey = 0;                        // 上次提交时我的接触输入：量化摆位 / yaw / footprint / 底 Z / 墙高 / 墙厚 + bSeamEnabled + 能否出砖
+```
+
+**接收接口**（唯一的跨房通道，一种消息）：
+
+```text
+B.ReceiveContactFrom(A, Contact)     // Contact = Classify(A, B) 现在的结果（竖缝 / 横缝 / 空）；空 = 不再接触 / 任一端关着 / A 被删
+    清：丢掉 B.Contacts 里所有 Involves(A) 的旧接触，顺手丢掉 !IsAlive() 的
+    收：Contact 非空则并入 B.Contacts
+    RequestReevaluate()              // 只标脏；绝不同步重求值、不调 A 的 getter（A 正在遍历自己的表）
+```
+
+**重求值协议**（谁动了谁发；被发醒的一方只清、只用，不反发——否则互相叫醒不停）：
+
+```text
+X 重求值（ReevaluateSite 里、落座之后、房体之前）：
+    Key = 量化(MakeSeamHouse()) + 开关 + 能否出砖
+    Key == LastSeamKey 或 本次不可提交 ⇒ 只用：遍历 X.Contacts，跳过 !IsAlive()，按 Kind 消费：
+        竖缝：CurrentSeamCuts = ∪ CutsFor(X)；柱见「三维聚簇」，Owner() == X 的才砌
+        横缝：梁 / 木柱（落地时定）
+    Key != LastSeamKey 且 本次可提交 ⇒
+        Old = X.Contacts（副本）；X.Contacts 清空
+        Partners = Old 里的对端 ∪ 花名册里 WithinReach 的邻居
+        对每个 Y ∈ Partners：Contact = Classify(X, Y)（不接触或任一端关着 ⇒ 空）
+                              非空则 X.Contacts += Contact；Y.ReceiveContactFrom(X, Contact)
+        LastSeamKey = Key，再走一遍「只用」
+删除（EndPlay / Destroyed，幂等；世界卸载 / GExitPurge 期间不碰对端）：对 Old 里每个对端 Y.ReceiveContactFrom(X, 空)
+```
+
+同一对不会有两条活接触：X 只在清空自己的表之后才建，Y 收到之前先丢掉所有涉及 X 的。两栋同帧松手互发一轮、≤ 2 帧收敛（多算的一轮内容相同，砖哈希短路）。
+
+**何时可提交**（不逐个列边界，一条规则）：`bCanCommit = !bInGizmoDrag && !bInGroundDrag`。
+
+- `bInGizmoDrag`：`PostEditMove(false)` / `PushEdge、PushHeight、PushBase(bFinished=false)` 置真，`bFinished=true` 清。照标记那边 `MarkerDragIdleSeconds` 的先例加 2 s 无位移超时兜底——Esc 取消拖动时 `PostEditMove(true)` 是否必来，落地时实测。
+- `bInGroundDrag`：`OnGroundChanged` 加 `bCommitted`——塑形物传自己的 `bFinished`，笔刷逐笔落笔 false、`EndPaintStroke` 补一次 true，显式 rebuild / 塑形物注销 true。房子收到未提交广播置真、提交广播清。四个 `Broadcast` 站点一个不能漏。
+- 标脏来源：根组件的 `USceneComponent::TransformUpdated` 委托 → `RequestReevaluate()`。任何来源的 transform 变化（gizmo、脚本 `SetActorLocation`、Alt 拖复制、Undo 回滚、attach）都从这里进来，不需要快扫，也不需要给脚本加 `CommitEdit()`；构造脚本重跑 / `PostEditChangeProperty` / `PostEditUndo` 本来就进 `ReevaluateSite`。这些路径都不置拖动标志 ⇒ 下一次重求值就是提交。`bInReevaluate` 期间忽略该委托（落座 `SetActorZ` 会触发它）。
+- 拖拽帧一律冻结：不算、不发、不重建，缝跟着房子走。副产品：拖动时裁剪段不再逐帧变，`BodyHash` 在纯平移下稳定，重新走 `TransformMesh` 摆位快路径（今天靠近邻居拖动时房体每帧全量重建）。观感：自己那半跟着房子走（clip 缺口与自己出的柱偏离邻居）、邻居那半留在原地，松手归位；若要自己那半跟手，拖动帧可用纯函数本地算、不发邻居，代价是房体每帧全量重建——先按全冻结做，看了效果再定。
+
+**谁出砖**：`Owner()` = 规范序里第一个能出砖的；判据是当前状态、进 Key，不随重建顺序变。
+
+**三维聚簇与过滤**（恢复 08-30 划出范围的「角柱邻近合并」；TG 没做合并、只有过滤）：
+
+- 出砖前把交点按 XY 距离 < `csh.PostMergeDistance`（建议 30 cm = 砖深 20 + 余量）聚簇，簇内按 Z 区间相交或间隙 < 半块砖并成段，每段一根柱：XY 取簇质心（同簇各段上下对齐），Z 取段的 [min Bottom, max Top]，Owner = 段内贡献缝的 `Owner()` 里 GUID 最小者。Z 不重叠的两段就是上下叠放的两根柱——与 TG「每个交点自带 Z 区间」的自然行为一致。
+- 过滤（TG 实证，`evidence/inter-shape-stitches*.asm`）：交点离任一房 footprint 顶点 < `csh.SeamVertexClearance`（TG 0.2 m）不立（角石在那）；柱高不足 N 块砖不砌（TG 3 块，本项目建议 2）；两法线点积 ≥ 0.9 不出交点。08-30 前的 `SeamMinExposure`（外露走线长）作废，由顶点距离取代。
+- ⚠️ 跨对聚簇只在「同一簇的成员都在我手里」时两端结论一致。三房交汇处 A–B 与 B–C 的交点靠近时，A 看不见 B–C 的交点：C < A < B 的 GUID 序下 A、C 会各立一根。要严格一致得让每栋房按纯函数把邻域内所有对的交点算一遍（只为聚簇，不存）；本轮先接受。
+
+**花名册**（✅ 2026-09-16 晚用户裁决「删了」：不留任何登记表，名单 = `UCSHouseLibrary::GetHouses`，即 `TActorRange<ACSHouseActor>` 按 GUID 排序；`UCSHouseSubsystem` 整个删除，见 D10）。原候选：`TActorIterator<ACSHouseActor>`（关卡几千 actor 时几十微秒 / 次提交）或类静态弱引用表（`PostRegisterAllComponents` 里登记**先于**第一次重求值、`EndPlay` / `Destroyed` 注销、按 `GetWorld()` 过滤——编辑器 / PIE / 预览世界的房子会混在一张表里）。`PickHouse` / 窗找宿主一并搬过去后 `UCSHouseSubsystem` 可整体删除。
+
+**前置**：结构审查 13——复制走 `HouseId` 会让规范序打平、两栋副本 `SeamSeed` 相同、互不接缝。修法是 `HouseId` 加 `NonPIEDuplicateTransient`；`PostDuplicate` 太晚，`PasteActors` 里它排在注册与 `PostEditMove(true)` 之后（`EditorActor.cpp:444-445`）。
+
+**与 TG 的对位**：TG 是 3 个 Bevy 系统 + 全局表（`IntraShapeCorners` / `ShapeIntersections` / 私有洞表），键是墙 id、每条记录抄两个 id；删除 = 脏集 + 三张表各 `retain` 一遍；洞每帧重发、砖表每帧全量重生成、无 `run_if`。本方案把那张全局表按房子切开：TG 的「A 重写 (A,B) 的行」= 这里的「A 往 B 写记录」。逐条见 `tg-inter-shape-stitches` 记忆与 `evidence/`。
+
+**已知风险**（09-16 审，按最终形态）：
+
+1. 接收接口的重入：只标脏、不调对端 getter（getter 会 `FlushPendingReevaluate` 同步重求值，对端可能当场反发），发送方遍历副本。
+2. 钩子没跑（`GExitPurge` / 卸载顺序）时对端持着 `!IsAlive()` 的缝直到下次清理，且没有重建触发——「只用」跳过它，观感上要等对端下次重求值。
+3. 拖动标志卡住（`PostEditMove(true)` 未来）→ 永不提交；靠 2 s 超时兜底。
+4. `TransformUpdated` 在 attach / 父级移动 / 落座时也发：`bInReevaluate` 期间忽略，Key 在落座之后取，否则每次落座多提交一轮。
+5. `bCommitted` 标错一个广播站点 → 那条路的接缝永不更新，且没有断言会红；加 `AuditSeams()`（遍历所有房子：每条缝都 `IsAlive`、两端都持有它、两端真的相交），回归脚本逐路径调。
+6. 关卡加载：登记必须先于第一次重求值；两端都已登记时多一轮清建（幂等）。
+7. 柱与门框砖共用 `FrameReserveCapacity`，多邻居的枢纽房可能被静默截断。
+8. 跨对聚簇不一致、冻结期观感（上）。
+
+**测试**（建世界那组，真 RHI）：`House.SeamSingleOwner`、`House.SeamReceiveReplaces`（收到之前丢掉所有涉及发送方的旧缝）、`House.SeamCommitOnly`（拖拽帧不发、松手发一次）、`House.SeamDetachOnDestroy`、`House.SeamSpawnOrderInvariant`、`House.SeamMultiMoveConverges`（两栋同帧松手 ≤ 2 帧收敛、无重复缝）、`House.SeamScriptedMoveCommits`（脚本 `SetActorLocation` 下一帧提交）、`House.SeamPostMerge3D`（同 XY 不同 Z 两段 / Z 重叠并一根）。纯函数单测 `House.SeamIsAPureFunction` 不动。回归脚本「the neighbour's half of it」改成「出砖方 > 0、非出砖方 = 0、两端 cuts 都 > 0」。
 
 ### 归属形态：自管理接缝 actor vs subsystem 集中管理
 
@@ -603,7 +735,7 @@ uint32 SeamsHash      = 0;             // 交点表哈希，决定要不要重�
 - `ACSHouseActor` 持类静态房屋登记表 + 自己参与的接缝列表；变更结束时扫表，新叠上的由**本次运动的房子**创建接缝，已有的收到通知。
 - `ACSHouseSeamActor`（原 `ACSHouseLinkActor`）持两个弱引用，收到通知只**标脏**（不同步重算，避开读到半更新的房子），自 tick 里 `RefreshFromOperands()`；两端任一失效即自毁。
 - 角柱邻近合并在 `RefreshFromOperands()` 内、对两端房子各调一次 `EnsureRefreshed(Gen)` 之后做，邻居经两端房子的接缝表取得，归属按 key 定序。
-- `UCSHouseSubsystem` **保留但瘦身**：不再负责接触检测与接缝生死，只留"地面直推分发 + 低频兜底快扫（捕捉不发通知的改动）+ 调试统计"。若这些也能挂到房子自身，subsystem 可以完全去掉——留作落地时的取舍。
+- ~~`UCSHouseSubsystem` **保留但瘦身**~~（2026-09-16 晚已整个删除，见 D10 状态）：不再负责接触检测与接缝生死，只留"地面直推分发 + 低频兜底快扫（捕捉不发通知的改动）+ 调试统计"。若这些也能挂到房子自身，subsystem 可以完全去掉——留作落地时的取舍。
 
 ## D8 特征标记：`ACSHouseFeatureMarker`（窗户等）
 
@@ -968,6 +1100,13 @@ uint32 RockShellInputHash() const;                              // 塑形物集�
 低角度阳光下没有自投影。它是第一个**贴着坡面**的产物，缺自投影最显眼。
 
 ## D10 `UCSHouseSubsystem`：注册表、变换快扫、接触仲裁
+
+> 🛑 **2026-09-16 晚已整个删除**（用户裁决「先把它删了」，紧接着 D7 接触记录落地）。三件遗留职责的去向：
+> ① **花名册** → `UCSHouseLibrary::GetHouses`（`Public/CSHouseLibrary.h`）：`TActorRange<ACSHouseActor>` 按 GUID 升序，**没有登记表**。房子只在自己提交接缝的那一刻需要名单（去发现从没碰过它的陌生房子），而世界本身就是这份名单；自建登记表在接缝路上换不来任何东西。
+> ② **兜底快扫** → 不再需要：任何来源的 transform 变化都从根组件 `TransformUpdated` 进 `RequestReevaluate()`（脚本直设 / 物理 / Undo / Alt 拖复制，`House.ContactScriptedMoveCommits` 钉着），`Push*` 本就同步 `ReevaluateSite()`，原来夹在中间的 `MarkHouseDirty` 只是让 subsystem 下一 tick **再重求值一遍**（拖动期每帧两次）。随之删掉 `GetTrackingHash` 与「落座后回写哈希基线」。**代价**：运行时蓝图直接 Set 非 transform 属性（如 `WallHeight`）不再被任何人捕捉 —— 请走 `PushHeight` 等机制入口；编辑器里 `set_editor_property` 走 `PostEditChangeProperty`，不受影响。
+> ③ **找宿主 / 放窗** `PickHouse` / `PickHouseNear` / `PlaceMarkerAlongRay` → `UCSHouseLibrary` 静态函数（`PlaceMarkerAlongRay` 是静态 `BlueprintCallable`，Python 调 `unreal.CSHouseLibrary.place_marker_along_ray(house, ...)`，WorldContext 参数在 Python 里是普通显式参数）。`GetHouseSubsystem` 那个「脚本够不着 world subsystem」的口随之作废。
+> 下文是删除前的设计与瘦身记录，保留供追溯；「地面直推分发」那一条从未在 subsystem 里落地过（房子一直自己订阅 `OnGroundChanged`）。
+> 删除后复跑：`Automation RunTests PCGPlugins` 156 条 154 过（只剩藤蔓 2 条既有失败）；演示回归 229/25，失败集合与删前逐条相同，接缝一节 24/24（多出的 `the seam bricks join the door-frame bricks in one component` 只在演示房恰好是出砖方时才检查，随 GUID 抽签时有时无，总数在 253/254 间浮动）。
 
 **已瘦身**（见 [D7 复评](#复评做成-actor-还剩哪些障碍)）：接触检测、接缝生死、角柱合并都已下放给房子与接缝 actor 自管理。这里只剩三件事——**地面直推分发**、**低频兜底快扫**（捕捉蓝图直设/物理这类不发通知的改动）、**调试统计**。下面保留的每帧顺序与风险评估，在自管理形态下由「房子变更 → 通知 → 接缝标脏 → 接缝自 tick 两相刷新」承担，**相位约束一条不变**（尤其"落座改 Z 必须先于接缝重算"）。若最终连分发也挂到房子自身订阅，本 subsystem 可整体去掉。
 
@@ -1720,7 +1859,7 @@ TG 的 VS 第 3 步（§1.6【确凿】）：世界坐标 ×0.4（2.5 m 晶格�
 - **P2 四项已全部落地**：
   1. **算子拆 `AddXxxPasses` + 整栋一次 `EditMeshAsync`**。`CopyFromMeshSnapshot` 拆成「游戏线程打包 `BuildUploadPayload` + 录图 `AddCopyFromSnapshotPasses`」；`BuildMaterialSections` 拆成 `AddMaterialSectionPasses`（录图）+ `PublishMaterialSections`（GT 尾巴）；`TransformMesh` 同样拆出 `AddTransformPasses`。房体把「上传基体 → 排序分段」组进**同一个** `EditMeshAsync`；在途被拒走 pending 最新态合并。笔刷同治：落笔只写镜像 + 排队，EdMode 每帧一次 `FlushPaintToGpu()` 把一批落笔录进一张图。
   2. **洞 = 剖面 + 摆位**：新 `Public/CSHouseProfile.h` —— `FCSWallOpening`（`Z0/Z1/AxisUS/Skew` 齐备，容纳楼梯）+ Arch/Rect/Circle 三种原型剖面 + 二维 `(S, Z)` 重叠谓词。分段数随半径自适应，顶带合并成单 quad，圆弧按**外接**建。`ACSHouseActor::QueryFeaturePlacement` 已就位（门拱优先于特征标记）。
-  3. **`UCSHouseSubsystem`**：GUID 注册表 + 低频兜底快扫 + 落座后回写哈希基线；`DoesSupportWorldType` 放行 Editor、`IsTickableInEditor` 为 true。
+  3. ~~**`UCSHouseSubsystem`**~~（2026-09-16 晚删除，见 D10）：GUID 注册表 + 低频兜底快扫 + 落座后回写哈希基线；`DoesSupportWorldType` 放行 Editor、`IsTickableInEditor` 为 true。
   4. **房体顶点色通道字典冻结**：`R = 构件色号 ECSHousePart / G = 洞 Tag / B、A 保留`，写进 `ACSHouseActor` 类注释作为全项目唯一仲裁点。
 
 进度注记（2026-08-29 第三轮：异步链缺陷修复 + 回归自动化）：

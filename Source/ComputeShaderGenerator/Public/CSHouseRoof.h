@@ -235,3 +235,9 @@ inline bool CSHouseRoof_IsUnderRoof(const FCSRoofDesc& Desc, const FVector2D& Lo
 {
 	return Desc.Footprint.IsValidFootprint() && Desc.InsetDistance(LocalXY) >= -double(Desc.Overhang);
 }
+
+// 屋面**不起伏、檐口不起翘**（用户 2026-09-15 看实拍后裁决）。TG 的瓦 VS 两项都有 ——
+// `_nani_instanced_roof…b903…vs_main.glsl` :213 檐口起翘、:224-283 按离屋顶基准 `roof_pivot_y` 的高度加权的
+// value-noise 起伏 —— 是**有意不移植**，不是漏了（09-14/15 移植过两版，都被否掉）。瓦只保留材质 WPO 里的
+// 瓦端抬高与水平抖动（`Scripts/TinyGladeMakeRoofMaterial.py` 文件头），所以尖顶、檐口 / 屋脊摆件直接落在
+// 上面这组屋面求值器上，不需要位移孪生函数。

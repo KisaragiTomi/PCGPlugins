@@ -43,6 +43,12 @@ float3   TileBlockSize;                  // 1 / 网格自身三轴尺寸（把�
 uint     TileRecordCount;
 uint     TileMaxInstances;
 
+// `M_TinyGladeRoof` 的 WPO 在剔除之后才推顶点（`Scripts/TinyGladeMakeRoofMaterial.py` 文件头）：
+// 沿瓦法线的瓦端补抬 ≤ 3 cm + 水平抖动每轴 ±3 cm ⇒ |位移| ≤ 3 + |(3, 3)| = 7.3 cm（屋面起伏与檐口起翘
+// 按用户 09-15 裁决不移植）。剔除 pass 看不见 WPO，球不放大的话抬起的瓦端在视锥边缘会整块闪掉。
+// 常量而不是参数：改它不动 FParameters，旧 DLL 也照常绑定。
+static const float TileWpoReach = 8.0f;
+
 [numthreads(THREADGROUPSIZE_X, 1, 1)]
 void PackHouseTileCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
@@ -89,5 +95,5 @@ void PackHouseTileCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	// 剔除球必须包住**变换后**的基础网格。基向量已经带着缩放了，所以这里按最大轴长度放大 ——
 	// 少放大一点点就会在视锥边缘闪掉实例，而且只在斜看时出现，最难复现。
 	const float MaxAxisScale = max(length(LocalX), max(length(LocalY), length(LocalZ)));
-	RWTileInstances[Base + 4u] = float4(SphereCentre, TileBaseSphereRadius * max(MaxAxisScale, 1e-3f));
+	RWTileInstances[Base + 4u] = float4(SphereCentre, TileBaseSphereRadius * max(MaxAxisScale, 1e-3f) + TileWpoReach);
 }

@@ -3529,6 +3529,7 @@ CSShaperSteps::EHandoverResult ACSHouseActor::EnsureRoofTileComponent()
 		FMath::Max(RoofTileRowPitch, RoofTileColumnPitch),
 		FMath::Max(RoofTileAxes.NativeAlongSlope(), RoofTileAxes.NativeAcrossRow())))
 		* double(FMath::Max(RoofTileRowOverlap, RoofTileColumnOverlap)) * (1.0 + double(RoofTileScaleJitter));
+	// `M_TinyGladeRoof` 的 WPO（瓦端补抬 ≤ 3 cm + 水平抖动每轴 ±3 cm）远小于 TileReach，不另加余量。
 	const double Reach = CSShaperSteps::QuantizeUp(
 		GetFootprint().GetCenteredSpan() * 0.5 + double(RoofOverhang) + TileReach);
 	const double Top = CSShaperSteps::QuantizeUp(

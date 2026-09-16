@@ -225,8 +225,10 @@ float2 lip = (g / gl) * (band * LipStrength);
 return float4(saturate(max(peelM, prot)), band, lip.x, lip.y);
 """
 
-# 高度图存得很暗（stone_floor_2 的 R 通道峰值只有 0.30），直接用的话砖缝几乎没有明暗差、
-# 凸出砖的阈值也全挤在低位。先归一化一次，两个消费者（侵蚀场 / albedo）共用同一份。
+# 两个消费者（侵蚀场 / albedo）共用同一份高度。Gain 默认 1 = 读 TG 原值。
+# ⚠️ 2026-09-14 之前默认 3.4：那是在补导出 bug —— tex2png.py 把 BC4 图压成 0..76（峰值 0.30），
+#    3.4 ≈ 255/76。图按 TinyGladeFixBc4Textures.py 重导（0..255、线性灰度）之后，1.0 与旧的
+#    3.4×旧图逐值相差不到 1.3%，ProtrudeLevel 等阈值不用动。
 HEIGHT_HLSL = """
 return saturate(H * Gain);
 """
@@ -372,18 +374,18 @@ def lerp3(mat, a, b, alpha, x, y):
 
 
 # ---------------------------------------------------------------------------
-# 数据贴图的 sRGB：高度 / 粗糙度 / seed 是数据不是颜色，导进来时都带着 sRGB=true。
-# 不改的话阈值全落在 gamma 曲线上（不会报错，只是手感对不上参数）。
+# 数据贴图：高度 / 粗糙度是 TG 的 BC4_UNORM 线性数据。导入设置（TC_Grayscale、sRGB 关）与
+# "导出图被压成 0..76" 的修正都归 TinyGladeFixBc4Textures.py 管，这里只调它，别再各写一份。
+# 不是线性灰度导入的话，BrickHeight 的 LinearGrayscale 采样器会编译报错。
 # ---------------------------------------------------------------------------
 def fix_data_textures():
-    fixed = []
-    for n in ("stone_floor_2_height", "stone_floor_2_roughness"):
-        t = unreal.EditorAssetLibrary.load_asset("%s/%s" % (TEX, n))
-        if t and t.get_editor_property("srgb"):
-            t.set_editor_property("srgb", False)
-            unreal.EditorAssetLibrary.save_loaded_asset(t)
-            fixed.append(n)
-    return fixed
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location("tg_bc4_fix", Path(__file__).with_name("TinyGladeFixBc4Textures.py"))
+    bc4 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bc4)
+    # 全部 17 张一起：本脚本末尾还会重建屋顶材质，它断言 roof_tile_damage 已是线性灰度导入。
+    return ["%s %s" % r for r in bc4.main()]
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +439,7 @@ def build_wall():
     t_brickn = texparam(mat, "BrickNormal", "stone_floor_2_normal",
                         unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL, "01 Brick", 2, -1650, -700)
     t_brickh = texparam(mat, "BrickHeight", "stone_floor_2_height",
-                        unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, "01 Brick", 3, -1650, -500)
+                        unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_GRAYSCALE, "01 Brick", 3, -1650, -500)
     t_plas = texparam(mat, "PlasterColor", "plaster_colors_layer04",
                       unreal.MaterialSamplerType.SAMPLERTYPE_COLOR, "02 Plaster", 2, -1650, -100)
     t_plasn = texparam(mat, "PlasterNormal", "default_normal",
@@ -448,7 +450,7 @@ def build_wall():
                   (t_plas, uv_plas), (t_plasn, uv_plas), (t_mort, uv_mort)):
         MEL.connect_material_expressions(uv, "", s, "UVs")
 
-    p_gain = scalar(mat, "BrickHeightGain", 3.4, "01 Brick", 8, -1400, -430)
+    p_gain = scalar(mat, "BrickHeightGain", 1.0, "01 Brick", 8, -1400, -430)
     brick_h = custom(mat, "TGBrickHeight", HEIGHT_HLSL, ["H", "Gain"],
                      unreal.CustomMaterialOutputType.CMOT_FLOAT1, -1200, -470)
     MEL.connect_material_expressions(t_brickh, "R", brick_h, "H")
@@ -604,7 +606,7 @@ def build_plain(name, r, g, b):
 def main():
     fixed = fix_data_textures()
     if fixed:
-        unreal.log("sRGB fixed on data textures: %s" % ", ".join(fixed))
+        unreal.log("BC4 data textures: %s" % ", ".join(fixed))
 
     wall = build_wall()
     wall_mi = build_wall_instance(wall)

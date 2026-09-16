@@ -14,6 +14,8 @@ def module(name):
 
 
 def main():
+    # The extracted roof_tile_damage.png is scaled to 0..76 (see that script); the material needs TG's real mask.
+    module('TinyGladeFixBc4Textures').main()
     mat=module('TinyGladeMakeRoofMaterial').build()
     mesh=module('TinyGladeMakeRoofMesh').build(mat)
     bp=unreal.load_asset('/PCGPlugins/HouseTest/BP_TinyGladeHouse');assert bp

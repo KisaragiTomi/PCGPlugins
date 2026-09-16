@@ -39,10 +39,15 @@ STONE_RGB = unreal.LinearColor(0.52, 0.49, 0.44, 1.0)
 TILE_CM = 200.0        # 三平面的世界平铺尺寸；石阶长边约 100 cm，取 2 倍避免图案重复得太密
 
 
-def world_aligned(mat, tex_path, x, y, tile):
+def world_aligned(mat, tex_path, x, y, tile, sampler):
     """
     用引擎自带的 WorldAlignedTexture 做三平面。拿不到函数或贴图就返回 None，
     调用方退回常数 —— 这份脚本的**首要价值是天光**，材质细节不该成为它跑不完的理由。
+
+    `sampler` 必须与贴图的导入设置一致（TextureObject 的采样器类型会被校验）：
+    法线图 NORMAL；stone_floor_roughness 是 TG 的 BC4 线性数据，按 TinyGladeFixBc4Textures.py
+    导成 TC_Grayscale + sRGB 关 ⇒ LINEAR_GRAYSCALE（2026-09-14 之前按 sRGB 颜色读、值域又被压成 0..76，
+    粗糙度实际只有 0..0.07）。
     """
     tex = unreal.EditorAssetLibrary.load_asset(tex_path)
     fn = unreal.EditorAssetLibrary.load_asset(WORLD_ALIGNED)
@@ -52,6 +57,7 @@ def world_aligned(mat, tex_path, x, y, tile):
     try:
         obj = MEL.create_material_expression(mat, unreal.MaterialExpressionTextureObject, x - 300, y)
         obj.set_editor_property("texture", tex)
+        obj.set_editor_property("sampler_type", sampler)
         size = MEL.create_material_expression(mat, unreal.MaterialExpressionConstant, x - 300, y + 120)
         size.set_editor_property("r", tile)
         call = MEL.create_material_expression(mat, unreal.MaterialExpressionMaterialFunctionCall, x, y)
@@ -107,11 +113,11 @@ except Exception as exc:
     color_out = base
 MEL.connect_material_property(color_out, "", unreal.MaterialProperty.MP_BASE_COLOR)
 
-norm = world_aligned(mat, NORMAL_TEX, -250, 420, TILE_CM)
+norm = world_aligned(mat, NORMAL_TEX, -250, 420, TILE_CM, unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL)
 if norm:
     MEL.connect_material_property(norm, "", unreal.MaterialProperty.MP_NORMAL)
 
-rough = world_aligned(mat, ROUGH_TEX, -250, 700, TILE_CM)
+rough = world_aligned(mat, ROUGH_TEX, -250, 700, TILE_CM, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_GRAYSCALE)
 if rough:
     MEL.connect_material_property(rough, "", unreal.MaterialProperty.MP_ROUGHNESS)
 else:

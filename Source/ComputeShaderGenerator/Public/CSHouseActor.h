@@ -27,6 +27,7 @@ class UCSMeshRenderComponent;
 class UMaterialInterface;
 class UStaticMesh;
 struct FCSGpuMeshCPUData;
+enum class ECSHouseHeightHandleSide : uint8;   // CSHouseHeightHandleActor.h —— 檐口框 / 房底框
 
 /**
  * 进入 / 退出拉尺寸模式（计划 D5）。`bEntered = false` 表示退出。
@@ -54,8 +55,8 @@ DECLARE_MULTICAST_DELEGATE_OneParam(FCSHouseWindowBrushRequest, ACSHouseActor*);
 /**
  * 门洞滞回的一条记忆：某条边上一帧的一个洞区间（沿边弧长，与 `CSHouse_GetEdge` 同口径）。
  *
- * 扁平数组而不是 `TMap<边, TArray<区间>>`：UHT 不支持容器套容器，而边最多 4 条、
- * 每条边的洞是个位数，线性扫描比建索引便宜。
+ * 扁平数组而不是 `TMap<边, TArray<区间>>`：UHT 不支持容器套容器，而边数与每条边的洞数
+ * 都是个位数，线性扫描比建索引便宜。
  */
 USTRUCT()
 struct FCSDoorRunMemory
@@ -259,8 +260,11 @@ public:
 	 * 迁移。代价是改尺寸会非等比地拉伸形状 —— 那正是"包围盒尺寸"这个量的本义。
 	 *
 	 * 顶点按逆时针给（顺时针的会被翻过来）；第 k 条边从第 k 个顶点走到第 k+1 个，门窗锚点、
-	 * 拉尺寸抓手都按这个边号。**必须严格凸**：凹角、共线顶点、自交一律退回矩形（屋顶直骨架与
-	 * 接缝裁剪只对凸成立）。
+	 * 拉尺寸抓手都按这个边号。**不是严格凸的形状按凸包使用**（2026-09-14 用户裁决，凹 footprint 不做）：
+	 * 凹角处的点、共线点、重复点被包进去丢掉，乱序的点按凸包重排；边号于是按**凸包**数，拉尺寸锥子也
+	 * 按凸包的边数生成。凸包只在使用时取（`GetFootprint`），**这个属性本身不回写** —— 在细节面板里
+	 * 逐个加顶点时中间态常常是凹的，回写会把刚加的点当场删掉。凸包与输入不一致时重求值打一次
+	 * Warning（同一个形状只打一次）。凸包退化（点全共线）时退回矩形。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House")
 	TArray<FVector2D> FootprintShape;
@@ -898,9 +902,10 @@ public:
 	// -------------------------------------------------------------------------
 	// Quoin（D7 的**墙自身转角**那一半，合卷卷一 A7 / 卷五 A11）
 	//
-	// 四面墙是精确 butt joint，**没有穿模要遮**；角石盖的是外角那条竖直棱上的 UV 岛断裂
-	// （三块 quad 各自从局部 (0,0) 起算 UV，砖纹到角就断）与 90° 硬棱。判据因此是"棱被遮住"，
-	// 不是"不穿模"。算法与"为什么不另起一套排布"见 CSHouseQuoin.h。
+	// 相邻两面墙在转角上**斜接**（footprint 折线化 3a-2 起；此前是直角对接），**没有穿模要遮**；
+	// 角石盖的是外角那条竖直棱上的 UV 岛断裂（两面墙各自从局部 (0,0) 起算 UV，砖纹到角就断）
+	// 与硬棱。判据因此是"棱被遮住"，不是"不穿模"。只出在转角 ∈ (0°, 90°] 的凸角上；
+	// 算法与"为什么不另起一套排布"见 CSHouseQuoin.h。
 	//
 	// 角石与接缝砖、门框砖**共用一个组件与一份容量**（`FrameReserveCapacity`）——
 	// TG 全库也只有一块 `brick`，且它的每砖记录里根本没有 mesh 索引字段（合卷卷五 §1）。
@@ -1480,6 +1485,27 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "CS House")
 	float PushHeight(float Offset, bool bFinished = false);
 
+	/**
+	 * 改房底（与 `PushHeight` 对称的第三个自由度，用户裁决 2026-09-14「底动顶不动」）：
+	 * `HeightOffset += Offset`、`WallHeight -= Offset`，**同一次调用里两个量一起改完**再重求值。
+	 * 返回**实际**生效的变化（契约同 `PushHeight` 与 `CSHouseResize.h`：记账用返回值，不用请求值）。
+	 *
+	 * 往上（Offset > 0）：房子离地变高、墙变矮，悬空部分照现有规则长承重柱；往下反过来。落座公式
+	 * `房底 Z = max(footprint 地面) + HeightOffset` 不变，所以**檐口与屋顶的世界高度不动**
+	 * （`House.BaseHandle` 钉着；落座有 0.5 cm 的迟滞，亚厘米级的单步会攒到越过它才一起落地）。
+	 *
+	 * 两条下限都夹，顶在任一条上时请求值与生效值不等：
+	 *  ① `WallHeight ≥ MinWallHeight` —— 限制往上；已经矮于下限的旧存档不许再往上，但往下照常。
+	 *  ② `HeightOffset ≥ min(0, 当前 HeightOffset)` —— 贴地为止；旧存档里 `HeightOffset` 已经是负数的
+	 *     以当前值为界（**不许一抓就跳到 0**）。
+	 *
+	 * ⚠️ 与 `PushHeight` 的关键不同：这条路**会动 actor 变换**（重求值落座 `SetActorLocation`），而抓手
+	 * attach 在房子下 —— 父级 Z 移动会把底框一起带走，正是拉尺寸锥子那边写过的 2× 回路。底框走同一套
+	 * 记账量法 + 推完统一重摆（`ACSHouseHeightHandleActor::OnHandleDrag`），拖一下房底恰好走一下。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CS House")
+	float PushBase(float Offset, bool bFinished = false);
+
 	// -------------------------------------------------------------------------
 	// 拉尺寸模式（计划 D5 的交互层）
 	// -------------------------------------------------------------------------
@@ -1491,13 +1517,17 @@ public:
 	static FCSHouseResizeModeChanged OnResizeModeChanged;
 
 	/**
-	 * 生成五个抓手 actor：四面墙各一个**锥子**（水平推拉那面墙），外加一个套在房子外面的
-	 * **矩形框**（`ACSHouseHeightHandleActor`，上下拖它改墙高）。选中任一个用编辑器原生
-	 * gizmo 拖即可。
+	 * 生成 N + 2 个抓手 actor：footprint 的每条边一个**锥子**（水平推拉那面墙；N = `GetFootprint()`
+	 * 的边数，也就是**取完凸包之后**的边数），外加两个套在房子外面的**矩形框**
+	 * （`ACSHouseHeightHandleActor`，画的是包围盒）：檐口那个上下拖改墙高、房底那个上下拖改房底
+	 * （`PushBase`，底动顶不动）。选中任一个用编辑器原生 gizmo 拖即可。
 	 *
 	 * 这就是"点一个蓝图函数，冒出几个能拖的把手"的那个函数：`CallInEditor` 让它直接出现在
 	 * 房子详情面板上，`BlueprintCallable` 让蓝图 / Python 也能调。**幂等** —— 已经在模式里
-	 * 再调一次只把抓手摆回规范位置，不会生出第二组。
+	 * 再调一次只把锥子数对齐边数、把抓手摆回规范位置，不会生出第二组。
+	 *
+	 * 在模式里改了边数（改 `FootprintShape`、撤销等）时，锥子在下一次重求值里按新边数对齐
+	 * （`SyncEdgeHandlesToFootprint`），两个框不动。
 	 *
 	 * 抓手是 `RF_Transient` 的，不存盘、不进 outliner 的保存路径；房子被删或调
 	 * `ExitResizeMode()` 即销毁。
@@ -1513,20 +1543,25 @@ public:
 	bool IsInResizeMode() const { return ResizeHandles.Num() > 0; }
 
 	/**
-	 * 当前抓手（失效的已剔除）：四个水平锥子 + 一个高度框，**混在同一个数组里**。
+	 * 当前抓手（失效的已剔除）：每条边一个水平锥子 + 檐口框 + 房底框，**混在同一个数组里**，
+	 * 顺序不承诺（边数变了补生的锥子排在末尾）—— 按类型取用走下面几个接口。
 	 * 类型是共同基类 `ACSHouseHandleActor` —— 房子对它们只做三件无差别的事
 	 * （摆位、注销、销毁），没有一处需要区分是哪一种。
 	 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Resize")
 	TArray<ACSHouseHandleActor*> GetResizeHandles() const;
 
-	/** 只要那四个水平推拉锥子（无头测试按边号取用）。 */
+	/** 只要水平推拉锥子（每条边一个，无头测试按边号取用）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Resize")
 	TArray<ACSHouseResizeHandleActor*> GetEdgeHandles() const;
 
-	/** 那个调高度的框；不在模式里返回 nullptr。 */
+	/** 檐口那个调墙高的框；不在模式里返回 nullptr。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Resize")
 	ACSHouseHeightHandleActor* GetHeightHandle() const;
+
+	/** 房底那个框（`PushBase`，底动顶不动）；不在模式里返回 nullptr。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Resize")
+	ACSHouseHeightHandleActor* GetBaseHandle() const;
 
 	/**
 	 * 把**全部**抓手摆回各自的规范位置，并按当前 footprint 重算"窗框"四条边的长度。
@@ -2008,13 +2043,45 @@ protected:
 
 private:
 	/**
-	 * 当前的四个拉尺寸抓手（计划 D5）。
+	 * 当前的拉尺寸抓手（计划 D5）：每条边一个锥子 + 檐口框 + 房底框。
 	 *
 	 * `Transient` 且刻意**不进任何 desc 哈希**：抓手是纯编辑设施，房子的几何与它无关 ——
 	 * 混进哈希的症状是"一进拉尺寸模式整栋房子重建一次"，而那正是零阻塞纪律要挡的东西。
 	 */
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<ACSHouseHandleActor>> ResizeHandles;
+
+	/** 生成一个锥子（attach → 认宿主与边号 → 摆位 → 进表）。`EnterResizeMode` 与边数对齐共用。 */
+	ACSHouseResizeHandleActor* SpawnEdgeHandle(int32 EdgeIndex);
+
+	/** 生成一个高度框（檐口 / 房底），同上。竖直抓手将来再加一种也只是再调一次它。 */
+	ACSHouseHeightHandleActor* SpawnHeightHandle(ECSHouseHeightHandleSide Side);
+
+	/**
+	 * 在拉尺寸模式里时，把锥子数对齐到 `GetFootprint().NumEdges()`（用户裁决 2026-09-14：
+	 * "折线有多少折手柄就有多少个"，按**凸包之后**的边数）。不在模式里什么都不做；已经一一对上时
+	 * 零成本返回（每次重求值都会走到）。
+	 *
+	 * **复用而不是整组重建**：按边号排好，前 min(旧, 新) 个锥子改认 0..k-1 号边，只销毁多出来的、
+	 * 只补生缺的 —— 被选中的锥子因此多半留得住，编辑器侧的失选监听（选中集里没有归属者就退模式）
+	 * 不会因为改了一下形状就把模式退掉。两个框不动。
+	 */
+	void SyncEdgeHandlesToFootprint();
+
+	/** `SyncEdgeHandlesToFootprint` 的重入保护（补生锥子期间不许再对齐一次）。 */
+	bool bSyncingResizeHandles = false;
+
+	/** 上一次抓手对齐 / 重摆时的摆位几何哈希（footprint 顶点 + 墙厚 + 墙高）。边数没变、几何变了只重摆。transient。 */
+	uint32 ResizeHandleGeometryHash = 0;
+
+	/**
+	 * `FootprintShape` 不是严格凸、按凸包 / 矩形使用时打一次 Warning（顶点数 N → M）。
+	 * 同一个形状只打一次：记下已告警形状的哈希，形状没变就不重复（重求值每帧都会来）。
+	 */
+	void WarnIfFootprintShapeFixed();
+
+	/** 上一次已告警的 (形状, 处置) 哈希；0 = 当前形状无需告警。transient。 */
+	uint32 FootprintShapeWarnedHash = 0;
 
 	/** 材质三槽重绑（房体墙/顶 + 柱），不碰几何 —— 计划 D14「纯外观量绝不进 desc 哈希」。 */
 	void BindHouseMaterials();
@@ -2567,7 +2634,8 @@ private:
 	 * （`FCSWallAnchor::SConvention`），在 `CSHouse_AnchorS` 里就地换算。
 	 *
 	 * ⚠️ **默认必须是 0**：这个字段是后加的，旧存档里没有它，读进来拿到的是默认值。新生成的
-	 * actor 在 `PostActorCreated` 里写 1。
+	 * actor 在 `PostActorCreated` 里写 1。**模板（蓝图 CDO）恒为 0**、`PostLoad` 不碰它 ——
+	 * 实例按原型增量存盘，原型被置 1 会让旧实例继承到 1 而漏迁（理由见 `PostLoad`）。
 	 */
 	UPROPERTY()
 	int32 WallSConvention = 0;

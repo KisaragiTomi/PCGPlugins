@@ -156,6 +156,9 @@ inline int32 BuildQuoins(const FTransform& World, const FVector2D& Footprint, fl
  * 逐实例随机数从 **房子身份 + 角序号** 派生，不从槽位派生 —— 与接缝砖同一条理由的另一半：
  * 槽位会被"这栋房多开一扇门"推走，于是将来谁给砖材质接上 `PerInstanceRandom` 色差，
  * 开一扇门就会让四个角的角石整体换色，而所有几何断言全绿。
+ *
+ * 角序号取 `FQuoin::CornerIndex`，**不取数组下标**：折线上凹角 / 锐角不出角石，下标会跳过它们
+ * 往前挤 —— 改一下形状让某个角变锐，后面每一根角石的随机就整体换一遍。矩形四角都出，两者逐位相同。
  */
 inline int32 BuildQuoinElements(const TArray<FQuoin>& Quoins, uint32 Seed,
 	const CSHouseFrame::FBrickParams& Params, TArray<CSHouseFrame::FElement>& InOutElements,
@@ -169,7 +172,7 @@ inline int32 BuildQuoinElements(const TArray<FQuoin>& Quoins, uint32 Seed,
 		// `AppendColumn` 要么追加**恰好一条**元素、要么一条都不加（半块砖摆不下 / 容量用尽），
 		// 返回砖数即可分辨 —— 剔除高度粘在刚追加的那一条上。
 		const int32 Added = CSHouseFrame::AppendColumn(Q.Point, Q.Outward, Q.BottomZ, Q.TopZ,
-			CSHouseFrame::PathRandomBase(Seed, CSHouseFrame::EPathFamily::Quoin, Index),
+			CSHouseFrame::PathRandomBase(Seed, CSHouseFrame::EPathFamily::Quoin, Q.CornerIndex),
 			Params, InOutElements, Cursor);
 		if (Added > 0 && !InOutElements.IsEmpty())
 		{

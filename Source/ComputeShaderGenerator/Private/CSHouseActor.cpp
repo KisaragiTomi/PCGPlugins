@@ -196,15 +196,15 @@ uint32 CSHouse_Hash(const TArray<int32>& Values)
 int32 CSHouse_Q(double Value, double Quantum) { return int32(FMath::RoundToInt(Value / Quantum)); }
 
 /**
- * footprint 进哈希：顶点数 + 逐顶点量化到 1 cm。
+ * footprint 进哈希：顶点数 + 逐顶点量化（口径与理由见 `FCSHouseFootprint::AppendQuantizedHash`）。
  *
  * 原来各家哈希写的是 `CSHouse_Q(FootprintSize.X, 1), CSHouse_Q(FootprintSize.Y, 1)` —— 两个数只能
- * 描述居中矩形。顶点数必须进去：加一个顶点而位置不动的折线，量化后的坐标序列可能与原来的前缀相同。
+ * 描述居中矩形。⚠️ 2026-09-14 起顶点量子从 1 cm 改成 0.5 cm：矩形上 1 cm 的顶点量子等于 2 cm 的尺寸量子，
+ * 比折线化之前粗了一倍。量化只留一份，单测直接钉那个成员函数。
  */
 void CSHouse_AppendFootprintHash(TArray<int32>& H, const FCSHouseFootprint& Footprint)
 {
-	H.Add(Footprint.NumEdges());
-	for (const FVector2D& V : Footprint.Verts) H.Append({ CSHouse_Q(V.X, 1), CSHouse_Q(V.Y, 1) });
+	Footprint.AppendQuantizedHash(H);
 }
 
 /**
@@ -398,6 +398,11 @@ void ACSHouseActor::ReanchorMarkersToPreserveWorld()
 			// ③ 重新表达。近角约定照旧（存哪一端只是度量方式，物理点没变）。
 			A.bFromEndCorner = NewS > NewF.Len * 0.5f;
 			A.DistFromCorner = A.bFromEndCorner ? (NewF.Len - NewS) : NewS;
+			// ⚠️ **口径必须一起改写成斜接**：`NewS` 是在斜接框架上量的。旧锚点（口径 0，斜接之前存的档）
+			// 留着 0 的话，`CSHouse_AnchorS` 在奇数边上会把这个新距离**再补一个 T** ——
+			// 每改一次墙几何（拖边的每一帧），东西墙上的窗就沿墙滑一个墙厚，而且越滑越远。
+			// `OldS` 那一步已经按旧口径换算过了，所以这里恒写 1。单测 `House.LegacyAnchorSurvivesResize`。
+			A.SConvention = 1;
 
 			Entry.Anchor = A;
 			if (ACSHouseFeatureMarker* M = Entry.Marker.Get()) M->Reanchor(A);
@@ -1089,6 +1094,9 @@ void ACSHouseActor::ReevaluateSite()
 
 	ResolveGroundAndSubscribe();
 
+	// 形状不是严格凸时按凸包使用（`GetFootprint`），这里只负责"出声一次"。
+	WarnIfFootprintShapeFixed();
+
 	// ① 落座：绝对式，升降对称（计划 D4）。
 	const double SeatZ = ComputeSeatZ();
 	FVector Loc = GetActorLocation();
@@ -1160,8 +1168,50 @@ void ACSHouseActor::ReevaluateSite()
 	//    `CurrentFeatureVerdicts`，而那份表由 ② 的落位循环产出。
 	NotifyMarkersRebuilt();
 
+	// ⑨ 拉尺寸模式里边数变了（改 `FootprintShape`、撤销……）：锥子按新边数对齐。不在模式里 / 已经对上时零成本。
+	//    放在最后是因为它只读 footprint、会摆放抓手，不影响上面任何一样派生物。
+	SyncEdgeHandlesToFootprint();
+
 	bForceFullRebuild = false;
 	++ReevaluateCount;   // 合批的观测量（`GetReevaluateCount`），只数真正跑完的
+}
+
+void ACSHouseActor::WarnIfFootprintShapeFixed()
+{
+	if (FootprintShape.Num() < 3)
+	{
+		FootprintShapeWarnedHash = 0;
+		return;
+	}
+
+	ECSFootprintShapeFix Fix = ECSFootprintShapeFix::Kept;
+	const FCSHouseFootprint Used = FCSHouseFootprint::FromShape(FootprintShape, FootprintSize, &Fix);
+	if (Fix == ECSFootprintShapeFix::Kept || Fix == ECSFootprintShapeFix::Rect)
+	{
+		FootprintShapeWarnedHash = 0;
+		return;
+	}
+
+	// 只哈希**形状本身**（不含尺寸）：正缩放保凸、保共线，拖 FootprintSize 不改变"要不要取凸包"，
+	// 所以拖尺寸的每一帧都不该重复告警。处置方式也拼进去：同一个形状从"凸包"变成"退化"要再说一次。
+	uint32 Hash = FCrc::MemCrc32(FootprintShape.GetData(), FootprintShape.Num() * sizeof(FVector2D));
+	Hash = HashCombine(Hash, uint32(Fix) + 1u);
+	if (Hash == FootprintShapeWarnedHash) return;
+	FootprintShapeWarnedHash = Hash;
+
+	if (Fix == ECSFootprintShapeFix::Hulled)
+	{
+		UE_LOG(LogTinyGladeHouse, Warning,
+			TEXT("[TinyGladeHouse] %s 的 FootprintShape 不是严格凸的（凹角 / 共线点 / 重复点 / 乱序）：按凸包使用，顶点数 %d → %d。")
+			TEXT("属性本身不改写；凹 footprint 不支持（2026-09-14 裁决：取凸包）。"),
+			*GetName(), FootprintShape.Num(), Used.NumEdges());
+	}
+	else
+	{
+		UE_LOG(LogTinyGladeHouse, Warning,
+			TEXT("[TinyGladeHouse] %s 的 FootprintShape 退化（%d 个点的凸包不足 3 个顶点或面积为零）：按矩形使用。"),
+			*GetName(), FootprintShape.Num());
+	}
 }
 
 FCSHouseWindowBrushRequest ACSHouseActor::OnWindowBrushRequest;
@@ -1231,6 +1281,9 @@ float ACSHouseActor::PushEdge(int32 EdgeIndex, float Offset, bool bFinished)
 	{
 		// 异形：推完的折线已经按包围盒居中 ⇒ 它的包围盒就是新尺寸、它本身就是新形状
 		// （`FromShape` 会再拉伸一次，比例恰好是 1）。
+		// ⚠️ `Current` 是**凸包之后**的折线：输入里被凸包丢掉的点（凹角处 / 共线 / 重复）在推边之后不再回来 ——
+		// 推边是显式的几何编辑，写回的就是被推的那个凸包。与"凸包只在使用时取、不回写"不矛盾：
+		// 那条挡的是细节面板逐个加顶点的中间态，拖锥子不经过那条路。
 		FCSHouseFootprint Local = Current;
 		Applied = CSHouse_ApplyEdgePushPolyline(Local, NewCentre, EdgeIndex,
 			float(GetActorRotation().Yaw), Offset, MinFootprint);
@@ -1287,72 +1340,205 @@ float ACSHouseActor::PushHeight(float Offset, bool bFinished)
 	return Applied;
 }
 
+float ACSHouseActor::PushBase(float Offset, bool bFinished)
+{
+	// 底动顶不动（用户裁决 2026-09-14）：房底抬 Δ ⇔ `HeightOffset += Δ`、`WallHeight -= Δ`。
+	// 两条下限同时夹，生效量取两者都允许的那一段：
+	//  · 往上受墙高下限管：墙最多矮到 `MinWallHeight`；已经矮于下限的旧存档往上一步都不给（不许再矮），往下照常。
+	//  · 往下受贴地管：`HeightOffset` 最低到 `min(0, 当前值)` —— 旧存档里已经是负数的以当前值为界，
+	//    **不许一抓就跳到 0**（那一跳在画面上是房子自己蹦起来）。
+	const float WallFloor = FMath::Max(MinWallHeight, 1.0f);
+	const float MaxRaise = FMath::Max(WallHeight - WallFloor, 0.0f);
+	const float OffsetFloor = FMath::Min(HeightOffset, 0.0f);
+	const float MaxLower = FMath::Max(HeightOffset - OffsetFloor, 0.0f);
+	const float Applied = FMath::Clamp(Offset, -MaxLower, MaxRaise);
+
+	// 顶在下限上每帧都会走到这里：没动就一步都不走（同 PushHeight）。
+	if (Applied == 0.0f && !bFinished) return 0.0f;
+
+	// **同一次调用里两个量一起改完**再重求值：分两次改的话中间那一刻檐口会先掉 Δ、再回来，
+	// 重求值若恰好插在中间（合批 tick、快扫），屋顶会闪一帧。
+	HeightOffset += Applied;
+	WallHeight -= Applied;
+
+	// 波及面是 PushHeight 的超集（墙高 + 落座 Z ⇒ 柱、门的离地收窄、藤的悬空判据、摆件落高），走完整重求值。
+	if (bFinished) bForceFullRebuild = true;
+	ReevaluateSite();
+	return Applied;
+}
+
 // -----------------------------------------------------------------------------
 // 拉尺寸模式（D5 交互层）：抓手 actor 的生成 / 回位 / 销毁
 // -----------------------------------------------------------------------------
 
 FCSHouseResizeModeChanged ACSHouseActor::OnResizeModeChanged;
 
-void ACSHouseActor::EnterResizeMode()
+namespace
+{
+/**
+ * 抓手的生成参数（锥子与高度框共用一份）。
+ *
+ * `RF_Transient` 不存盘（计划 D5）。**顺带丢掉 `RF_Transactional`**：抓手的位移本身没有
+ * 撤销语义——真正该被撤销的是 FootprintSize / WallHeight / HeightOffset，而它们由 Push* 直接写。
+ * 两者各记一半的话 Ctrl+Z 会撤回抓手却留下尺寸，下一次拖动从一个自相矛盾的状态起步。
+ */
+FActorSpawnParameters CSHouse_HandleSpawnParams(AActor* Owner)
+{
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.ObjectFlags = RF_Transient;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	SpawnParams.Owner = Owner;
+	return SpawnParams;
+}
+}
+
+ACSHouseResizeHandleActor* ACSHouseActor::SpawnEdgeHandle(int32 EdgeIndex)
 {
 	UWorld* World = GetWorld();
-	if (!World) return;
+	if (!World) return nullptr;
 
-	// 幂等（计划 D5）：先把已经失效的格子摘掉，还剩抓手就只归位、不再生一组。
-	// 用户在详情面板上连点两下这个按钮是常态，不挡的话场景里会攒出八个锥子。
+	ACSHouseResizeHandleActor* Handle = World->SpawnActor<ACSHouseResizeHandleActor>(
+		GetActorLocation(), GetActorRotation(), CSHouse_HandleSpawnParams(this));
+	if (!Handle) return nullptr;
+
+	// ⚠️ 顺序在两种抓手里都一样：**先 attach 再 Initialize**。`InitializeHandle` 末尾的
+	// `SnapToCanonical` 写的是世界位置，attach 会把它换算成相对量；反过来的话抓手的相对位置
+	// 会被算成"世界原点到规范位置"，房子一移动抓手就飞了。
+	Handle->AttachToActor(this, FAttachmentTransformRules::KeepWorldTransform);
+	Handle->InitializeHandle(this, EdgeIndex);
+#if WITH_EDITOR
+	Handle->SetActorLabel(FString::Printf(TEXT("%s_ResizeHandle_%d"), *GetActorLabel(), EdgeIndex));
+#endif
+	ResizeHandles.Add(Handle);
+	return Handle;
+}
+
+ACSHouseHeightHandleActor* ACSHouseActor::SpawnHeightHandle(ECSHouseHeightHandleSide Side)
+{
+	UWorld* World = GetWorld();
+	if (!World) return nullptr;
+
+	ACSHouseHeightHandleActor* Handle = World->SpawnActor<ACSHouseHeightHandleActor>(
+		GetActorLocation(), GetActorRotation(), CSHouse_HandleSpawnParams(this));
+	if (!Handle) return nullptr;
+
+	Handle->AttachToActor(this, FAttachmentTransformRules::KeepWorldTransform);
+	Handle->InitializeHandle(this, Side);
+#if WITH_EDITOR
+	Handle->SetActorLabel(FString::Printf(TEXT("%s_%s"), *GetActorLabel(),
+		Side == ECSHouseHeightHandleSide::Base ? TEXT("BaseHandle") : TEXT("HeightHandle")));
+#endif
+	ResizeHandles.Add(Handle);
+	return Handle;
+}
+
+void ACSHouseActor::EnterResizeMode()
+{
+	if (!GetWorld()) return;
+
+	// 幂等（计划 D5）：先把已经失效的格子摘掉，还剩抓手就只对齐边数、归位，不再生一组。
+	// 用户在详情面板上连点两下这个按钮是常态，不挡的话场景里会攒出两组锥子。
 	ResizeHandles.RemoveAll([](const TObjectPtr<ACSHouseHandleActor>& H) { return !IsValid(H); });
 	if (ResizeHandles.Num() > 0)
 	{
+		SyncEdgeHandlesToFootprint();
 		SnapResizeHandles();
 		return;
 	}
 
-	FActorSpawnParameters SpawnParams;
-	// `RF_Transient` 不存盘（计划 D5）。**顺带丢掉 `RF_Transactional`**：抓手的位移本身没有
-	// 撤销语义——真正该被撤销的是 FootprintSize，而它由 PushEdge 直接写。两者各记一半的话
-	// Ctrl+Z 会撤回抓手却留下尺寸，下一次拖动从一个自相矛盾的状态起步。
-	SpawnParams.ObjectFlags = RF_Transient;
-	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-	SpawnParams.Owner = this;
-
-	// ⚠️ 顺序在两处生成里都一样：**先 attach 再 Initialize**。`InitializeHandle` 末尾的
-	// `SnapToCanonical` 写的是世界位置，attach 会把它换算成相对量；反过来的话抓手的相对位置
-	// 会被算成"世界原点到规范位置"，房子一移动抓手就飞了。
+	// 边数 = **取完凸包之后**的 footprint 边数（用户裁决 2026-09-14："折线有多少折手柄就有多少个"）。
 	const int32 NumEdges = GetFootprint().NumEdges();
-	ResizeHandles.Reserve(NumEdges + 1);
+	ResizeHandles.Reserve(NumEdges + 2);
 
 	// ① 每面墙一个锥子：水平推拉，每条边一个独立自由度 ⇒ 每条边一个 actor（矩形四个）。
-	for (int32 Edge = 0; Edge < NumEdges; ++Edge)
-	{
-		ACSHouseResizeHandleActor* Handle = World->SpawnActor<ACSHouseResizeHandleActor>(
-			GetActorLocation(), GetActorRotation(), SpawnParams);
-		if (!Handle) continue;
+	for (int32 Edge = 0; Edge < NumEdges; ++Edge) SpawnEdgeHandle(Edge);
 
-		Handle->AttachToActor(this, FAttachmentTransformRules::KeepWorldTransform);
-		Handle->InitializeHandle(this, Edge);
-#if WITH_EDITOR
-		Handle->SetActorLabel(FString::Printf(TEXT("%s_ResizeHandle_%d"), *GetActorLabel(), Edge));
-#endif
-		ResizeHandles.Add(Handle);
-	}
-
-	// ② 一个套在房子外面的矩形框：上下拖改墙高。**只有一个自由度 ⇒ 只有一个 actor**
-	//    （拆成四根的话用户抓哪根都在改同一个量，四个 gizmo 互相打架）。
-	if (ACSHouseHeightHandleActor* Height = World->SpawnActor<ACSHouseHeightHandleActor>(
-		GetActorLocation(), GetActorRotation(), SpawnParams))
-	{
-		Height->AttachToActor(this, FAttachmentTransformRules::KeepWorldTransform);
-		Height->InitializeHandle(this);
-#if WITH_EDITOR
-		Height->SetActorLabel(FString::Printf(TEXT("%s_HeightHandle"), *GetActorLabel()));
-#endif
-		ResizeHandles.Add(Height);
-	}
+	// ② 两个套在房子外面的矩形框：檐口那个上下拖改墙高，房底那个上下拖改房底（底动顶不动）。
+	//    **一个框只有一个自由度 ⇒ 一个框一个 actor**（拆成四根的话用户抓哪根都在改同一个量，
+	//    四个 gizmo 互相打架）。将来再加竖直抓手也只是在这里多调一次 `SpawnHeightHandle`。
+	SpawnHeightHandle(ECSHouseHeightHandleSide::Eave);
+	SpawnHeightHandle(ECSHouseHeightHandleSide::Base);
 
 	if (ResizeHandles.Num() > 0)
 	{
 		OnResizeModeChanged.Broadcast(this, true);
 	}
+}
+
+void ACSHouseActor::SyncEdgeHandlesToFootprint()
+{
+	if (ResizeHandles.Num() == 0 || bSyncingResizeHandles) return;
+	TGuardValue<bool> Guard(bSyncingResizeHandles, true);
+
+	const FCSHouseFootprint Footprint = GetFootprint();
+	const int32 NumEdges = Footprint.NumEdges();
+	TArray<ACSHouseResizeHandleActor*> Cones;
+	for (const TObjectPtr<ACSHouseHandleActor>& Handle : ResizeHandles)
+	{
+		ACSHouseResizeHandleActor* Cone = Cast<ACSHouseResizeHandleActor>(Handle);
+		if (IsValid(Cone)) Cones.Add(Cone);
+	}
+
+	// 抓手摆位吃的几何：footprint 顶点 + 墙厚 + 墙高（锥子挂在墙外皮中点、`WallHeight × HandleHeightFraction`，
+	// 框吃包围盒与檐口）。边数没变而它们变了（细节面板里挪一个顶点、改墙高、撤销……）只需重摆，不需要重建。
+	TArray<int32> GeometryInput;
+	Footprint.AppendQuantizedHash(GeometryInput);
+	GeometryInput.Append({ int32(FMath::RoundToInt(WallThickness * 2.0f)), int32(FMath::RoundToInt(WallHeight * 2.0f)) });
+	const uint32 GeometryHash = FCrc::MemCrc32(GeometryInput.GetData(), GeometryInput.Num() * sizeof(int32));
+
+	// 稳态：锥子数 = 边数，且边号恰好铺满 0..N-1。每次重求值都会走到这里，稳态下不许有任何动作。
+	if (Cones.Num() == NumEdges)
+	{
+		TBitArray<> Seen(false, NumEdges);
+		bool bMatched = true;
+		for (const ACSHouseResizeHandleActor* Cone : Cones)
+		{
+			const int32 Edge = Cone->GetEdgeIndex();
+			if (Edge < 0 || Edge >= NumEdges || Seen[Edge]) { bMatched = false; break; }
+			Seen[Edge] = true;
+		}
+		if (bMatched)
+		{
+			if (GeometryHash != ResizeHandleGeometryHash)
+			{
+				ResizeHandleGeometryHash = GeometryHash;
+				SnapResizeHandles();
+			}
+			return;
+		}
+	}
+	ResizeHandleGeometryHash = GeometryHash;
+
+	// 按边号排好，**复用**前 min(旧, 新) 个（改认 0..k-1 号边），多的销毁、缺的补生。
+	// 复用是为了让被选中的锥子留得住：销毁一个选中的 actor 会触发选中集变化，编辑器侧的失选监听
+	// 在选中集里找不到归属者时就把整个模式退掉 —— 用户只是改了一下形状，锥子却全没了。
+	// （`TArray<T*>::Sort` 会解引用，谓词拿到的是对象引用。）
+	Cones.Sort([](const ACSHouseResizeHandleActor& A, const ACSHouseResizeHandleActor& B)
+	{
+		return A.GetEdgeIndex() < B.GetEdgeIndex();
+	});
+	const int32 Keep = FMath::Min(Cones.Num(), NumEdges);
+	for (int32 Edge = 0; Edge < Keep; ++Edge)
+	{
+		Cones[Edge]->InitializeHandle(this, Edge);
+#if WITH_EDITOR
+		Cones[Edge]->SetActorLabel(FString::Printf(TEXT("%s_ResizeHandle_%d"), *GetActorLabel(), Edge));
+#endif
+	}
+	for (int32 Index = Keep; Index < Cones.Num(); ++Index)
+	{
+		// **先摘表再销毁**：`Destroy` 会同步走到抓手的 `Destroyed` → `NotifyResizeHandleDestroyed`，
+		// 表里还有它的话会被当成"模式里最后一个抓手没了"去判退出。
+		ResizeHandles.Remove(Cones[Index]);
+		Cones[Index]->Destroy();
+	}
+	for (int32 Edge = Keep; Edge < NumEdges; ++Edge) SpawnEdgeHandle(Edge);
+
+	UE_LOG(LogTinyGladeHouse, Log, TEXT("[TinyGladeHouse] %s resize cones re-synced to %d edges (had %d)"),
+		*GetName(), NumEdges, Cones.Num());
+
+	// 边数变了，框的包围盒、其余锥子的规范位置多半也变了。
+	SnapResizeHandles();
 }
 
 void ACSHouseActor::ExitResizeMode()
@@ -1420,7 +1606,18 @@ ACSHouseHeightHandleActor* ACSHouseActor::GetHeightHandle() const
 {
 	for (const TObjectPtr<ACSHouseHandleActor>& Handle : ResizeHandles)
 	{
-		if (ACSHouseHeightHandleActor* Height = Cast<ACSHouseHeightHandleActor>(Handle)) return Height;
+		ACSHouseHeightHandleActor* Height = Cast<ACSHouseHeightHandleActor>(Handle);
+		if (IsValid(Height) && Height->GetSide() == ECSHouseHeightHandleSide::Eave) return Height;
+	}
+	return nullptr;
+}
+
+ACSHouseHeightHandleActor* ACSHouseActor::GetBaseHandle() const
+{
+	for (const TObjectPtr<ACSHouseHandleActor>& Handle : ResizeHandles)
+	{
+		ACSHouseHeightHandleActor* Base = Cast<ACSHouseHeightHandleActor>(Handle);
+		if (IsValid(Base) && Base->GetSide() == ECSHouseHeightHandleSide::Base) return Base;
 	}
 	return nullptr;
 }
@@ -4310,7 +4507,15 @@ void ACSHouseActor::BindHouseMaterials()
 void ACSHouseActor::PostLoad()
 {
 	Super::PostLoad();
-	if (WallSConvention >= 1) return;
+	// ⚠️ **模板（蓝图 CDO / 原型）不迁、口径字段也不写**。`WallSConvention` 是普通属性，关卡里的实例
+	// 按**原型**做增量存盘，而蓝图 CDO 同样会走到这里（`UClass::PostLoadDefaultObject`）：
+	//   · CDO 若先被置 1，磁盘上根本没有这个字段的旧实例就从原型继承到 1 ⇒ 跳过迁移；
+	//   · 实例若先于 CDO 构造，迁完写回的 1 又与之后被置 1 的 CDO 相等 ⇒ 不落盘 ⇒ 下次加载再迁一遍
+	//     （奇数边的窗每存读一轮就挪一个墙厚）。
+	// 两种加载次序各错一边。模板恒为 0，实例的 1 就永远与原型不同、必定落盘，迁不迁只由实例自己的
+	// 存盘数据决定。代价：斜接之前存的蓝图若在 CDO 里带着奇数边的默认 `Windows`，从它新拖出来的
+	// 实例会继承未换算的值 —— 现有资产没有这种默认值（2026-09-14 核对 BP_TinyGladeHouse）。
+	if (IsTemplate() || WallSConvention >= 1) return;
 
 	// 直角对接 → 斜接（2026-09-13）。只迁**存下来的绝对弧长**：锚点自带口径字段、在
 	// `CSHouse_AnchorS` 里就地换算，门的位置每轮从道路重算，都不需要在这里动。

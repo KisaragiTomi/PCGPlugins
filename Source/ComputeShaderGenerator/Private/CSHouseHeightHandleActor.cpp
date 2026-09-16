@@ -26,9 +26,10 @@ ACSHouseHeightHandleActor::ACSHouseHeightHandleActor()
 	}
 }
 
-void ACSHouseHeightHandleActor::InitializeHandle(ACSHouseActor* InHost)
+void ACSHouseHeightHandleActor::InitializeHandle(ACSHouseActor* InHost, ECSHouseHeightHandleSide InSide)
 {
 	SetHost(InHost);
+	Side = InSide;
 
 	for (UStaticMeshComponent* Bar : BarComponents) ApplyHighlightMaterial(Bar);
 
@@ -41,8 +42,10 @@ FVector ACSHouseHeightHandleActor::ComputeCanonicalWorldLocation() const
 	// 宿主没了就原地不动：跳回世界原点会让"房子删了但抓手还在"这一瞬间变成"抓手飞走了"。
 	if (!H) return GetActorLocation();
 
-	// 房心正上方、檐口高度。框因此同时是"墙有多高"的读数。
-	return H->GetActorTransform().TransformPosition(FVector(0.0, 0.0, H->WallHeight));
+	// 房心正上方：檐口框在檐口高度（它因此同时是"墙有多高"的读数），房底框在房底（局部 Z = 0，
+	// 与檐口框的算法只差这一个高度）。
+	const double LocalZ = (Side == ECSHouseHeightHandleSide::Base) ? 0.0 : double(H->WallHeight);
+	return H->GetActorTransform().TransformPosition(FVector(0.0, 0.0, LocalZ));
 }
 
 void ACSHouseHeightHandleActor::SnapToCanonical()
@@ -117,14 +120,19 @@ bool ACSHouseHeightHandleActor::OnHandleDrag(bool bFinished)
 	// 只取**世界 Z**：把框拖歪不该改高度。歪掉的水平分量在下面的统一回位里被清掉。
 	//
 	// ⚠️ 用 `GetActorLocation() − LastConsumedWorld` 而不是"当前位置 − 规范位置"，理由与拉尺寸
-	// 抓手逐字相同：顶在 `MinWallHeight` 上时 `Applied != Offset`，拿请求值记账残差会一路
-	// 累积，松手瞬间房子跳一大截。
+	// 抓手逐字相同：顶在下限上时 `Applied != Offset`，拿请求值记账残差会一路累积，松手瞬间房子跳一大截。
+	// **必须在推之前读**：房底框那一路推完之后房子已经带着它挪了 `Applied`（父子回路），再读就把
+	// 父级带走的那一截也算成了用户拖的。
 	const float Offset = float(GetActorLocation().Z - LastConsumedWorld.Z);
 
-	const float Applied = H->PushHeight(Offset, bFinished);
+	const float Applied = (Side == ECSHouseHeightHandleSide::Base)
+		? H->PushBase(Offset, bFinished)
+		: H->PushHeight(Offset, bFinished);
 
-	// 全部抓手统一重摆（含自己）：改墙高会让四个拉尺寸锥子的规范高度一起变
-	// （它们挂在 `WallHeight × HandleHeightFraction` 上），不重摆就会留在原来的高度上。
+	// 全部抓手统一重摆（含自己）：改墙高会让拉尺寸锥子的规范高度一起变（它们挂在
+	// `WallHeight × HandleHeightFraction` 上）、改房底会让房子整体抬降，不重摆就会留在原来的高度上。
+	// 对房底框自己这一条是**承重的**：重摆把 attach 带走的那一截直接覆盖成规范位置、并在同一步里把
+	// `LastConsumedWorld` 置成它，于是下一次事件读到的差仍是纯 gizmo 增量 —— 拖 δ 恰好走 δ，没有 2× 回路。
 	H->SnapResizeHandles();
 
 	LastAppliedOffset = Applied;

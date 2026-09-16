@@ -233,7 +233,7 @@ struct FPlan
  */
 struct FSite
 {
-	/** 四面墙的外皮矩形。**与藤蔓、房体面板同一份 `CSHouse_GetEdge`** —— 墙在哪儿只能有一个真源。 */
+	/** 每面墙的外皮条带（折线有几条边就几条）。**与藤蔓、房体面板同一份 `CSHouse_GetEdge`** —— 墙在哪儿只能有一个真源。 */
 	TArray<CSHouseVine::FWallStrip> Strips;
 	TArray<FCSWallOpening> Openings;
 	/** 屋面。檐口/屋脊的高度一律过 `CSHouseRoof_*` 求值器，**不在这里另写屋顶方程**（计划 D4）。 */

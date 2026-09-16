@@ -675,6 +675,19 @@ struct FCSHouseEdgeFrame
 	}
 };
 
+/** `FCSHouseFootprint::FromShape` 对输入形状做了什么。诊断用（告警 / 单测），**结果本身不看它**。 */
+enum class ECSFootprintShapeFix : uint8
+{
+	/** 形状少于 3 个点：矩形（空形状 = 矩形，旧存档与新放的房子都是这样）。 */
+	Rect,
+	/** 输入本身严格凸：原样使用。顺时针的翻成逆时针、首顶点不动 —— 一个顶点都没丢，不算改动。 */
+	Kept,
+	/** 凹角 / 共线点 / 重复点 / 乱序（自交）：按**凸包**使用，被包进去的点丢弃（2026-09-14 用户裁决）。 */
+	Hulled,
+	/** 包围盒退化，或凸包不足 3 个顶点 / 面积约为零（点全共线）：退回矩形。 */
+	Degenerate,
+};
+
 /**
  * 房屋 footprint：**闭合折线**（2026-09-12 用户裁决，取代原来的 `FVector2D` 矩形）。
  *
@@ -832,41 +845,166 @@ struct COMPUTESHADERGENERATOR_API FCSHouseFootprint
 	}
 
 	/**
+	 * 形状哈希的量化输入：顶点数 + 逐顶点量化到 **0.5 cm**。房屋各家 desc 哈希、快扫跟踪哈希都拼它。
+	 *
+	 * 顶点数必须进去：加一个顶点而位置不动的折线，量化后的坐标序列可能与原来的前缀相同。
+	 *
+	 * ⚠️ **量子是 0.5 不是 1**（2026-09-14）：矩形的顶点是 `±Size/2`，半边长量化到 1 cm 等于把尺寸
+	 * 量化粗到 **2 cm** —— 折线化之前各家哈希写的是 `CSHouse_Q(FootprintSize.X, 1)`，粒度是 1 cm。
+	 * 顶点量到 0.5 cm 恰好还原那个粒度（`House.FootprintHashGranularity` 钉着）。
+	 */
+	void AppendQuantizedHash(TArray<int32>& Out) const
+	{
+		Out.Add(NumEdges());
+		for (const FVector2D& V : Verts)
+		{
+			Out.Append({ int32(FMath::RoundToInt(V.X / 0.5)), int32(FMath::RoundToInt(V.Y / 0.5)) });
+		}
+	}
+
+	/**
 	 * **形状 × 尺寸 → footprint**（`ACSHouseActor::FootprintShape` × `FootprintSize`）。
 	 *
-	 * 形状是任意坐标系下的一条闭合折线：这里把它的**包围盒**拉伸到 `Size`、居中到原点；顺时针的
-	 * 翻成逆时针（首顶点不动）。于是形状只描述"长什么样"，大小永远由 `Size` 说了算 —— 拖尺寸、
-	 * 蓝图、脚本里写 `FootprintSize` 的每一条旧路径在异形房子上照样成立。
+	 * 形状是任意坐标系下的一组顶点：这里把它的**包围盒**拉伸到 `Size`、居中到原点。于是形状只描述
+	 * "长什么样"，大小永远由 `Size` 说了算 —— 拖尺寸、蓝图、脚本里写 `FootprintSize` 的每一条旧路径
+	 * 在异形房子上照样成立。
 	 *
-	 * 退回矩形的三种情形：形状少于 3 个点（空 = 矩形，旧存档就是这样）、包围盒退化、
-	 * 不是严格凸的（共线顶点、凹角、自交）—— 凹 footprint 还没有落地（屋顶直骨架与接缝裁剪都只对凸成立）。
+	 * - **严格凸**的输入原样使用：顺时针的翻成逆时针、首顶点不动（`Kept`）。
+	 * - **不是严格凸的**（凹角、共线点、重复点、乱序 / 自交）按**凸包**使用（`Hulled`，2026-09-14 用户裁决
+	 *   "让折线取最后的凸包就行了"；凹 footprint 不做）。凸包逆时针、去掉共线点，从**原下标最小**的那个
+	 *   凸包顶点起算 —— 输入已凸时它就是 `Verts[0]`，所以凸包与原样使用两条路的边号口径一致。
+	 *   ⚠️ **只在使用时取，调用方别回写 `FootprintShape`**：用户在细节面板里逐个加顶点，中间态常常是凹的，
+	 *   回写会把刚加的点当场删掉，面板里就根本加不了点。
+	 * - 退回矩形：少于 3 个点（空 = 矩形，旧存档就是这样，`Rect`）；包围盒退化、或凸包不足 3 个顶点 /
+	 *   面积约为零（点全共线，`Degenerate`）。退化兜底取矩形而不是"最后一个合法形状"：本函数是纯函数，
+	 *   没有历史可退；矩形也是折线化之前这条路唯一的兜底口径。
 	 */
-	static FCSHouseFootprint FromShape(TConstArrayView<FVector2D> Shape, const FVector2D& Size)
+	static FCSHouseFootprint FromShape(TConstArrayView<FVector2D> Shape, const FVector2D& Size,
+		ECSFootprintShapeFix* OutFix = nullptr)
 	{
+		auto Report = [OutFix](ECSFootprintShapeFix Fix) { if (OutFix) *OutFix = Fix; };
 		const int32 N = Shape.Num();
-		if (N < 3) return MakeRect(Size);
+		if (N < 3)
+		{
+			Report(ECSFootprintShapeFix::Rect);
+			return MakeRect(Size);
+		}
 
 		FBox2D Box(ForceInit);
 		for (const FVector2D& V : Shape) Box += V;
 		const FVector2D Extent = Box.GetSize();
-		if (Extent.X <= UE_KINDA_SMALL_NUMBER || Extent.Y <= UE_KINDA_SMALL_NUMBER) return MakeRect(Size);
+		if (Extent.X <= UE_KINDA_SMALL_NUMBER || Extent.Y <= UE_KINDA_SMALL_NUMBER)
+		{
+			Report(ECSFootprintShapeFix::Degenerate);
+			return MakeRect(Size);
+		}
 		const FVector2D Centre = Box.GetCenter();
 
+		// 正缩放是保凸、保共线、保绕向的仿射变换，所以"先拉伸再判凸 / 取凸包"与"先取再拉伸"是同一个结果；
+		// 在拉伸后的厘米空间里判，容差才有物理意义。
 		FCSHouseFootprint FP;
 		FP.Verts.Reserve(N);
 		for (const FVector2D& V : Shape)
 		{
 			FP.Verts.Add(FVector2D((V.X - Centre.X) / Extent.X * Size.X, (V.Y - Centre.Y) / Extent.Y * Size.Y));
 		}
-		if (FP.GetSignedArea() < 0.0)
+
+		// 快路：已经严格凸（任一绕向）。与折线化 3f 以来的输出**逐位相同** —— 已有的异形存档一个 bit 都不许变。
 		{
-			FCSHouseFootprint Reversed;
-			Reversed.Verts.Reserve(N);
-			for (int32 Index = 0; Index < N; ++Index) Reversed.Verts.Add(FP.Verts[(N - Index) % N]);
-			FP = MoveTemp(Reversed);
+			FCSHouseFootprint Oriented = FP;
+			if (Oriented.GetSignedArea() < 0.0)
+			{
+				for (int32 Index = 0; Index < N; ++Index) Oriented.Verts[Index] = FP.Verts[(N - Index) % N];
+			}
+			if (Oriented.IsStrictlyConvexCCW())
+			{
+				Report(ECSFootprintShapeFix::Kept);
+				return Oriented;
+			}
 		}
-		if (!FP.IsStrictlyConvexCCW()) return MakeRect(Size);
-		return FP;
+
+		FCSHouseFootprint Hull;
+		Hull.Verts = ConvexHullCCW(FP.Verts);
+		if (Hull.Verts.Num() < 3 || Hull.GetSignedArea() <= 1.0e-6 * FMath::Max(Size.X * Size.Y, 1.0) || !Hull.IsStrictlyConvexCCW())
+		{
+			Report(ECSFootprintShapeFix::Degenerate);
+			return MakeRect(Size);
+		}
+		Report(ECSFootprintShapeFix::Hulled);
+		return Hull;
+	}
+
+	/**
+	 * 点集的**严格凸包**：逆时针、不含共线点与重复点（Andrew 单调链）；从**原下标最小**的凸包顶点起算。
+	 *
+	 * 共线判据与 `IsStrictlyConvexCCW` 同一个口径（转角正弦 ≤ `MinTurnSin` 不算凸角）：单调链先按叉积
+	 * 严格剔一遍，再把近共线的顶点逐个摘掉，保证结果一定过得了 `IsStrictlyConvexCCW`。
+	 * 不足 3 个点时原样返回剩下的（调用方按退化处理）。
+	 */
+	static TArray<FVector2D> ConvexHullCCW(TConstArrayView<FVector2D> Points, double MinTurnSin = 1.0e-4)
+	{
+		const int32 N = Points.Num();
+		TArray<int32> Order;
+		Order.Reserve(N);
+		for (int32 Index = 0; Index < N; ++Index) Order.Add(Index);
+		// 按 (x, y, 原下标) 排：重复点里下标小的排前面，单调链会留下它。
+		Order.Sort([&Points](int32 A, int32 B)
+		{
+			if (Points[A].X != Points[B].X) return Points[A].X < Points[B].X;
+			if (Points[A].Y != Points[B].Y) return Points[A].Y < Points[B].Y;
+			return A < B;
+		});
+
+		auto Cross = [&Points](int32 O, int32 A, int32 B)
+		{
+			return (Points[A].X - Points[O].X) * (Points[B].Y - Points[O].Y) - (Points[A].Y - Points[O].Y) * (Points[B].X - Points[O].X);
+		};
+
+		TArray<int32> Chain;
+		Chain.Reserve(2 * N);
+		for (int32 K = 0; K < N; ++K)   // 下链
+		{
+			while (Chain.Num() >= 2 && Cross(Chain[Chain.Num() - 2], Chain.Last(), Order[K]) <= 0.0) Chain.Pop(EAllowShrinking::No);
+			Chain.Add(Order[K]);
+		}
+		const int32 LowerSize = Chain.Num() + 1;
+		for (int32 K = N - 2; K >= 0; --K)   // 上链
+		{
+			while (Chain.Num() >= LowerSize && Cross(Chain[Chain.Num() - 2], Chain.Last(), Order[K]) <= 0.0) Chain.Pop(EAllowShrinking::No);
+			Chain.Add(Order[K]);
+		}
+		if (Chain.Num() > 1) Chain.Pop(EAllowShrinking::No);   // 末点 = 起点
+
+		// 近共线的顶点逐个摘掉（每摘一个，它两侧的转角都变了，所以要重扫）。
+		auto TurnSin = [&Points](int32 Prev, int32 Here, int32 Next)
+		{
+			const FVector2D UIn = (Points[Here] - Points[Prev]).GetSafeNormal();
+			const FVector2D UOut = (Points[Next] - Points[Here]).GetSafeNormal();
+			return UIn.X * UOut.Y - UIn.Y * UOut.X;
+		};
+		for (bool bRemoved = true; bRemoved && Chain.Num() >= 3; )
+		{
+			bRemoved = false;
+			for (int32 K = 0; K < Chain.Num(); ++K)
+			{
+				const int32 M = Chain.Num();
+				if (TurnSin(Chain[(K + M - 1) % M], Chain[K], Chain[(K + 1) % M]) > MinTurnSin) continue;
+				Chain.RemoveAt(K);
+				bRemoved = true;
+				break;
+			}
+		}
+
+		// 从原下标最小的顶点起算（保持逆时针）。
+		int32 Start = 0;
+		for (int32 K = 1; K < Chain.Num(); ++K)
+		{
+			if (Chain[K] < Chain[Start]) Start = K;
+		}
+		TArray<FVector2D> Out;
+		Out.Reserve(Chain.Num());
+		for (int32 K = 0; K < Chain.Num(); ++K) Out.Add(Points[Chain[(Start + K) % Chain.Num()]]);
+		return Out;
 	}
 };
 
@@ -936,7 +1074,7 @@ inline FCSHouseEdgeFrame CSHouse_GetEdge(int32 EdgeIndex, const FCSHouseFootprin
 /**
  * 矩形口径的便捷重载：0 南(+X 向) 1 东(+Y 向) 2 北(-X 向) 3 西(-Y 向)。
  *
- * 与折线版**逐位等价**（`House.FootprintPolylineMatchesRect` 钉住）：这里不重排顶点、不走
+ * 与折线版**逐位等价**（`House.FootprintMitreCorners` 钉住）：这里不重排顶点、不走
  * `TArray`，只是把 `MakeRect` 的四个顶点就地算出来喂同一个核，免掉热路径上的堆分配
  * （门框砖 / 藤条 / 摆件都在逐实例的循环里问边框架）。
  */
@@ -1028,7 +1166,7 @@ struct FCSWallHit
 };
 
 /**
- * 射线 × 四面外墙，取最近的一次命中（**解析求交，不是引擎 trace**）。
+ * 射线 × 每一面外墙（折线有几条边就几面），取最近的一次命中（**解析求交，不是引擎 trace**）。
  *
  * ⚠️ **必须解析求交**：房子的 gpumesh 全线 `NoCollision`（`CSGpuMeshComponent.cpp`），
  * `LineTraceSingle` 永远打不到 —— 计划 D8 明写这条，照 trace 写会得到"窗户一放就没"，
@@ -1072,7 +1210,7 @@ inline FCSWallHit CSHouse_RayHitWall(
 }
 
 /**
- * 就近找墙：把点投到四面外墙上取最近的一面（计划 D8 的 `csh.WindowSnapDist` 退路）。
+ * 就近找墙：把点投到每一面外墙上取最近的一面（计划 D8 的 `csh.WindowSnapDist` 退路）。
  *
  * 射线版是"朝向摆正了"的通路；这条兜的是"贴着墙但朝向没摆正"——两条都空才判无宿主。
  * S / Z 都夹到墙面内，所以它返回的永远是墙上一个**合法**位置，谓词那关照旧另判。
@@ -1238,8 +1376,8 @@ inline FTransform CSHouse_AnchorToLocal(
 	const FCSHouseEdgeFrame F = CSHouse_GetEdge(A.EdgeIndex, Footprint, T);
 	const float S = CSHouse_AnchorS(A, Footprint, T);
 
-	// 外表面上的点 + 沿**外**法线站开一点。`F.Start` 本来就在外皮上（东西两面缩 T 是为了避开转角
-	// 重叠，缩的是长度不是法向），所以这里不需要再补半个墙厚。
+	// 外表面上的点 + 沿**外**法线站开一点。`F.Start` 本来就是外皮上的外角点（斜接口径：转角让出的
+	// 是内皮沿边的长度，不是法向），所以这里不需要再补半个墙厚。
 	const FVector2D P2 = F.Start + F.U * double(S) - F.In * double(FMath::Max(Standoff, 0.0f));
 	const FVector Pos(P2.X, P2.Y, double(A.SillZ + HalfHeight));
 

@@ -28,7 +28,14 @@ namespace
 constexpr float CSDecorTest_WallHeight = 300.0f;
 constexpr float CSDecorTest_WallThickness = 24.0f;
 
-/** 四面墙 + 屋面 + 摆位，口径与 `ACSHouseActor::BuildVineStrips` / `CSHouse_GetEdge` 一致。 */
+/**
+ * 四面墙 + 屋面 + 摆位。
+ *
+ * ⚠️ 墙条带仍是**直角对接**时代的手抄表（奇数边两端各缩 `T`），与今天的 `CSHouse_GetEdge`（斜接：
+ * 每条边从外角点起、外皮全长）**不再一致** —— `ACSHouseActor::BuildVineStrips` 产出的是后者。
+ * 这一族断言都是相对传进去的条带判的（锚点在不在墙外、门口留没留空、身份稳不稳），与条带怎么切转角
+ * 无关，所以夹具没有跟着改；要拿它对照产线几何时先换成 `CSHouse_GetEdge`。
+ */
 CSHouseDecor::FSite CSDecorTest_MakeSite(const FVector2D& Footprint, const FVector& Origin = FVector::ZeroVector)
 {
 	CSHouseDecor::FSite Site;

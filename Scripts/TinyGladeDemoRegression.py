@@ -42,6 +42,35 @@ def find(label):
     return None
 
 
+def find_ground():
+    """找 Ground_Demo，并把笔刷钉回"画路"那一档（R 通道、覆盖、满强度）。
+
+    ⚠️ 笔刷颜色 / 通道 / 混合 / 强度是**用户在编辑器里画东西时会改的工具状态**，关卡会连同地面一起存盘：
+    2026-09-13 的 L_HouseGroundDemo 把 `PaintColor` 存成了 (0,0,0,1)，脚本画的"路"R = 0，一扇门都开不出来 ——
+    `road across the house opens 6 arches doors=0` 连带「really opened arches」一串前置检查红了 9 条，而代码一行没动
+    （2026-09-14 在那份关卡的副本上把 PaintColor 钉回 R，失败集合逐条回到 09-11 基线的 27 条）。
+    笔刷**半径不钉**：它决定路宽，门宽 / 裙边断言本来就读关卡里的值（见 skirt 那段 `BrushRadius`）。
+    只在值不同时才写：地面每改一个属性都会整张重建并清派生链哈希，无谓地写会改变后面几段的起始状态。
+    """
+    ground = find("Ground_Demo")
+    if not ground:
+        return None
+
+    def color_differs(name, want):
+        got = ground.get_editor_property(name)
+        return any(abs(a - b) > 1e-6 for a, b in zip((got.r, got.g, got.b, got.a), want))
+
+    if color_differs("PaintColor", (1.0, 0.0, 0.0, 1.0)):
+        ground.set_editor_property("PaintColor", unreal.LinearColor(1.0, 0.0, 0.0, 1.0))
+    if color_differs("PaintChannelMask", (1.0, 0.0, 0.0, 0.0)):
+        ground.set_editor_property("PaintChannelMask", unreal.LinearColor(1.0, 0.0, 0.0, 0.0))
+    if ground.get_editor_property("PaintBlendOp") != unreal.CSMeshPaintBlendOp.REPLACE:
+        ground.set_editor_property("PaintBlendOp", unreal.CSMeshPaintBlendOp.REPLACE)
+    if abs(ground.get_editor_property("BrushStrength") - 1.0) > 1e-6:
+        ground.set_editor_property("BrushStrength", 1.0)
+    return ground
+
+
 def settle_tris(mesh, tries=8):
     """等在途的异步编辑落地后再读三角形数。
 
@@ -85,7 +114,7 @@ def demo_house_ground():
     unreal.log("========== L_HouseGroundDemo ==========")
     unreal.EditorLoadingAndSavingUtils.load_map("/PCGPlugins/HouseTest/L_HouseGroundDemo")
 
-    ground = find("Ground_Demo")
+    ground = find_ground()
     road_house = find("House_Road")
     pillar_house = find("House_Pillar")
     check("actors present", ground and road_house and pillar_house)
@@ -544,7 +573,7 @@ def demo_terrain_ops():
     unreal.log("========== L_TerrainOpsDemo ==========")
     unreal.EditorLoadingAndSavingUtils.load_map("/PCGPlugins/HouseTest/L_TerrainOpsDemo")
 
-    ground = find("Ground_Demo")
+    ground = find_ground()
     shaper = find("Shaper_Mound")
     check("actors present", ground and shaper)
     if not (ground and shaper):
@@ -677,7 +706,7 @@ def demo_gpu_stairs():
     unreal.log("========== L_TerrainOpsDemo / GPU stairs (S1 + S2 jitter) ==========")
     unreal.EditorLoadingAndSavingUtils.load_map("/PCGPlugins/HouseTest/L_TerrainOpsDemo")
 
-    ground = find("Ground_Demo")
+    ground = find_ground()
     shaper = find("Shaper_Mound")
     step_mesh = unreal.load_asset(STAIR_MESH)
     pebble_mesh = unreal.load_asset(PEBBLE_MESH)
@@ -927,7 +956,7 @@ def demo_rock_shell():
     unreal.log("========== L_TerrainOpsDemo / rock shell (链 B) ==========")
     unreal.EditorLoadingAndSavingUtils.load_map("/PCGPlugins/HouseTest/L_TerrainOpsDemo")
 
-    ground = find("Ground_Demo")
+    ground = find_ground()
     shaper = find("Shaper_Mound")
     check("rock shell: actors present", ground and shaper)
     if not (ground and shaper):
@@ -1210,7 +1239,7 @@ def demo_skirt_decor():
     unreal.log("========== L_TerrainOpsDemo :: skirt decor ==========")
     unreal.EditorLoadingAndSavingUtils.load_map("/PCGPlugins/HouseTest/L_TerrainOpsDemo")
 
-    ground = find("Ground_Demo")
+    ground = find_ground()
     shaper = find("Shaper_Mound")
     material = unreal.load_asset(SKIRT_MATERIAL)
     meshes = [unreal.load_asset(CLUTTER % (n, n)) for n in SKIRT_MESHES]
@@ -1374,7 +1403,7 @@ def demo_house_vine():
     """
     unreal.log("========== L_HouseGroundDemo :: vine ==========")
     unreal.EditorLoadingAndSavingUtils.load_map("/PCGPlugins/HouseTest/L_HouseGroundDemo")
-    ground = find("Ground_Demo")
+    ground = find_ground()
     house = find("House_Road")
     check("vine: actors present", ground and house)
     if not (ground and house):
@@ -1501,7 +1530,7 @@ def demo_house_decor():
     """
     unreal.log("========== L_HouseGroundDemo :: decor ==========")
     unreal.EditorLoadingAndSavingUtils.load_map("/PCGPlugins/HouseTest/L_HouseGroundDemo")
-    ground = find("Ground_Demo")
+    ground = find_ground()
     house = find("House_Road")
     check("decor: actors present", ground and house)
     if not (ground and house):
@@ -1621,7 +1650,7 @@ def demo_house_window():
     """
     unreal.log("========== L_HouseGroundDemo :: window ==========")
     unreal.EditorLoadingAndSavingUtils.load_map("/PCGPlugins/HouseTest/L_HouseGroundDemo")
-    ground = find("Ground_Demo")
+    ground = find_ground()
     house = find("House_Road")
     check("window: actors present", ground and house)
     if not (ground and house):
@@ -1637,7 +1666,9 @@ def demo_house_window():
     check("a house with no window requests has no windows", house.get_window_count() == 0,
           "windows=%d" % house.get_window_count())
 
-    # ---- 三扇窗：短墙（边 1 长 400 - 2x24 = 352，护角 60 ⇒ 可用 [60, 292]）----
+    # ---- 三扇窗：短墙（斜接口径：边 1 从外角点量起、长 400，护角 60 ⇒ 可用 [60, 340]；
+    #      直角对接时代是 352 长、[60, 292]。center_s 是运行时写的，不走 PostLoad 迁移，所以这三扇窗
+    #      的物理位置比 09-13 之前朝起点角挪了一个墙厚 —— 断言只数窗，不受影响）----
     windows = [
         make_window(1, 120.0, 78.0, 90.0, 110.0),
         make_window(1, 232.0, 78.0, 90.0, 110.0),
@@ -2029,7 +2060,7 @@ def demo_house_seam():
     """
     unreal.log("========== L_HouseGroundDemo :: seam ==========")
     unreal.EditorLoadingAndSavingUtils.load_map("/PCGPlugins/HouseTest/L_HouseGroundDemo")
-    ground = find("Ground_Demo")
+    ground = find_ground()
     house = find("House_Road")
     check("seam: actors present", ground and house)
     if not (ground and house):
@@ -2186,7 +2217,7 @@ def demo_house_resize():
     unreal.log("========== L_HouseGroundDemo: D5 resize ==========")
     unreal.EditorLoadingAndSavingUtils.load_map("/PCGPlugins/HouseTest/L_HouseGroundDemo")
 
-    ground = find("Ground_Demo")
+    ground = find_ground()
     house = find("House_Road")
     check("resize actors present", ground and house)
     if not (ground and house):

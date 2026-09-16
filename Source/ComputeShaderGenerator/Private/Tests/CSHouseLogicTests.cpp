@@ -3,6 +3,7 @@
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 
 #include "CSGpuMeshTypes.h"
+#include "CSGroundActor.h"       // House.BaseHandle —— 落座要一块地
 #include "CSGroundShaperSteps.h"
 #include "CSHouseActor.h"
 #include "CSHouseDoorRuns.h"
@@ -20,6 +21,7 @@
 #include "CSHouseResizeHandleActor.h"
 #include "CSHouseSubsystem.h"
 #include "CSSplineBlockActor.h"
+#include "Components/StaticMeshComponent.h"   // House.BaseHandle 数框的四根条子
 #include "Engine/StaticMesh.h"   // House.WindowMarker 里 LoadObject<UStaticMesh> 要完整类型
 #include "Engine/World.h"
 #include "Tests/AutomationEditorCommon.h"
@@ -542,7 +544,8 @@ bool FCSHouseEdgePushPolylineTest::RunTest(const FString& Parameters)
 		}
 	}
 
-	// ---- ④ 形状 × 尺寸：任意坐标系、顺时针也行；凹的、退化的退回矩形 ----
+	// ---- ④ 形状 × 尺寸：任意坐标系、顺时针也行；凹的取凸包（2026-09-14 裁决），退化的退回矩形 ----
+	//      凸包的逐条判据（共线、乱序、重复点、起点口径）在 `House.FootprintConvexHull`。
 	{
 		const FVector2D Size(600.0, 519.6152422706632);
 		TArray<FVector2D> Shape = CSHouseTest_RegularPolygon(6, 3.0);
@@ -562,11 +565,194 @@ bool FCSHouseEdgePushPolylineTest::RunTest(const FString& Parameters)
 			FromCW.EqualsApprox(FromCCW, 1.0e-9));
 
 		TArray<FVector2D> LShape = { FVector2D(0, 0), FVector2D(2, 0), FVector2D(2, 1), FVector2D(1, 1), FVector2D(1, 2), FVector2D(0, 2) };
-		TestTrue(TEXT("a concave shape falls back to the rectangle"),
-			FCSHouseFootprint::FromShape(LShape, Size).EqualsApprox(FCSHouseFootprint::MakeRect(Size), 0.0));
+		const FCSHouseFootprint LHull = FCSHouseFootprint::FromShape(LShape, Size);
+		TestEqual(TEXT("a concave shape is used as its convex hull (the inner corner is dropped)"), LHull.NumEdges(), 5);
+		TestTrue(TEXT("and the hull is strictly convex and counter-clockwise"), LHull.IsStrictlyConvexCCW());
 		TestTrue(TEXT("an empty shape is the rectangle bit for bit"),
 			FCSHouseFootprint::FromShape(TArray<FVector2D>(), Size).EqualsApprox(FCSHouseFootprint::MakeRect(Size), 0.0));
 	}
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// footprint 形状取凸包（2026-09-14 用户裁决："让折线取最后的凸包就行了"，凹 footprint 不做）
+//
+// 此前非严格凸的形状一律**静默**退回矩形：用户在细节面板里加一个凹的点，整栋房子当场变回方盒子，
+// 而日志、断言都不出声。现在按凸包使用（`FCSHouseFootprint::FromShape`），处置方式经 `ECSFootprintShapeFix`
+// 报给调用方（房子据此在重求值里打一次 Warning）。这一条钉凸包本身：顶点、起点口径、绕向、各种坏输入。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseFootprintConvexHullTest,
+	"PCGPlugins.ComputeShaderGenerator.House.FootprintConvexHull",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseFootprintConvexHullTest::RunTest(const FString& Parameters)
+{
+	const FVector2D Size(600.0, 400.0);
+	auto Shaped = [&Size](TConstArrayView<FVector2D> Shape, ECSFootprintShapeFix& OutFix)
+	{
+		OutFix = ECSFootprintShapeFix::Rect;
+		return FCSHouseFootprint::FromShape(Shape, Size, &OutFix);
+	};
+	auto SameVerts = [](const FCSHouseFootprint& FP, const TArray<FVector2D>& Want, double Tolerance)
+	{
+		if (FP.Verts.Num() != Want.Num()) return false;
+		for (int32 Index = 0; Index < Want.Num(); ++Index)
+		{
+			if (!FP.Verts[Index].Equals(Want[Index], Tolerance)) return false;
+		}
+		return true;
+	};
+
+	// ① 凹（L 形）：内角那一点被包进去丢掉，6 → 5；从原下标 0 起、逆时针。
+	//    包围盒 [0,2]² 居中拉到 600×400 ⇒ x' = (x − 1)·300、y' = (y − 1)·200。
+	{
+		const TArray<FVector2D> L = { FVector2D(0, 0), FVector2D(2, 0), FVector2D(2, 1), FVector2D(1, 1), FVector2D(1, 2), FVector2D(0, 2) };
+		ECSFootprintShapeFix Fix;
+		const FCSHouseFootprint FP = Shaped(L, Fix);
+		TestTrue(TEXT("concave: reported as hulled"), Fix == ECSFootprintShapeFix::Hulled);
+		TestEqual(TEXT("concave: six input points give a five-edge footprint"), FP.NumEdges(), 5);
+		TestTrue(TEXT("concave: the hull vertices, from input vertex 0, counter-clockwise"),
+			SameVerts(FP, { FVector2D(-300, -200), FVector2D(300, -200), FVector2D(300, 0), FVector2D(0, 200), FVector2D(-300, 200) }, 1.0e-9));
+		TestTrue(TEXT("concave: the hull is strictly convex and counter-clockwise"), FP.IsStrictlyConvexCCW());
+	}
+
+	// ② 共线点：矩形四条边各插一个中点（8 点）⇒ 4 条边，而且逐位就是那个矩形（起点 = 原下标 0 的角）。
+	{
+		const TArray<FVector2D> Mid = { FVector2D(0, 0), FVector2D(1, 0), FVector2D(2, 0), FVector2D(2, 1),
+			FVector2D(2, 2), FVector2D(1, 2), FVector2D(0, 2), FVector2D(0, 1) };
+		ECSFootprintShapeFix Fix;
+		const FCSHouseFootprint FP = Shaped(Mid, Fix);
+		TestTrue(TEXT("collinear: reported as hulled"), Fix == ECSFootprintShapeFix::Hulled);
+		TestEqual(TEXT("collinear: eight input points give a four-edge footprint"), FP.NumEdges(), 4);
+		TestTrue(TEXT("collinear: the result is the rectangle of that size"), FP.EqualsApprox(FCSHouseFootprint::MakeRect(Size), 1.0e-9));
+	}
+
+	// ③ **近**共线（转角正弦低于 `IsStrictlyConvexCCW` 的 1e-4）同样摘掉 —— 否则凸包过不了凸性判据又被打回矩形。
+	{
+		const TArray<FVector2D> Bump = { FVector2D(0, 0), FVector2D(1, -1.0e-6), FVector2D(2, 0), FVector2D(2, 2), FVector2D(0, 2) };
+		ECSFootprintShapeFix Fix;
+		const FCSHouseFootprint FP = Shaped(Bump, Fix);
+		TestTrue(TEXT("nearly collinear: reported as hulled"), Fix == ECSFootprintShapeFix::Hulled);
+		TestEqual(TEXT("nearly collinear: the hair-thin bump is dropped"), FP.NumEdges(), 4);
+		TestTrue(TEXT("nearly collinear: still strictly convex"), FP.IsStrictlyConvexCCW());
+	}
+
+	// ④ 乱序（自交的"领结"）：正六边形的 6 个顶点打乱 ⇒ 还原成逆时针六边形，首顶点仍是原下标 0 那个。
+	{
+		const TArray<FVector2D> Hex = CSHouseTest_RegularPolygon(6, 1.0);
+		const TArray<FVector2D> Shuffled = { Hex[0], Hex[3], Hex[1], Hex[5], Hex[2], Hex[4] };
+		const FVector2D HexSize(600.0, 519.6152422706632);
+		ECSFootprintShapeFix Fix = ECSFootprintShapeFix::Rect;
+		const FCSHouseFootprint FP = FCSHouseFootprint::FromShape(Shuffled, HexSize, &Fix);
+		TestTrue(TEXT("shuffled: reported as hulled"), Fix == ECSFootprintShapeFix::Hulled);
+		TestEqual(TEXT("shuffled: six points give a six-edge footprint"), FP.NumEdges(), 6);
+		FCSHouseFootprint Expected;
+		Expected.Verts = CSHouseTest_RegularPolygon(6, 300.0);
+		TestTrue(TEXT("shuffled: the hexagon comes back in counter-clockwise order from input vertex 0"), FP.EqualsApprox(Expected, 1.0e-6));
+	}
+
+	// ⑤ 重复点：三角形的一个角写了两遍 ⇒ 3 条边（边长为零的那条不许留下来）。
+	{
+		const TArray<FVector2D> Dup = { FVector2D(0, 0), FVector2D(2, 0), FVector2D(2, 0), FVector2D(1, 2) };
+		ECSFootprintShapeFix Fix;
+		const FCSHouseFootprint FP = Shaped(Dup, Fix);
+		TestTrue(TEXT("duplicate: reported as hulled"), Fix == ECSFootprintShapeFix::Hulled);
+		TestEqual(TEXT("duplicate: a triangle with a repeated corner has three edges"), FP.NumEdges(), 3);
+		TestTrue(TEXT("duplicate: strictly convex"), FP.IsStrictlyConvexCCW());
+	}
+
+	// ⑥ 内点：凸五边形里多给一个中心点 ⇒ 5 条边，中心点不出现。
+	{
+		TArray<FVector2D> Penta = CSHouseTest_RegularPolygon(5, 1.0);
+		Penta.Insert(FVector2D(0.1, -0.05), 2);
+		ECSFootprintShapeFix Fix;
+		const FCSHouseFootprint FP = Shaped(Penta, Fix);
+		TestTrue(TEXT("interior point: reported as hulled"), Fix == ECSFootprintShapeFix::Hulled);
+		TestEqual(TEXT("interior point: the pentagon keeps five edges"), FP.NumEdges(), 5);
+	}
+
+	// ⑦ **严格凸的输入不算"修过"**：逆时针原样、顺时针翻过来（首顶点不动），两者逐位相同，都报 Kept。
+	//    这一条守的是"已有的异形存档一个 bit 都不许变"：快路必须在凸包之前。
+	{
+		const TArray<FVector2D> Hex = CSHouseTest_RegularPolygon(6, 3.0);
+		TArray<FVector2D> Clockwise;
+		for (int32 Index = 0; Index < Hex.Num(); ++Index) Clockwise.Add(Hex[(Hex.Num() - Index) % Hex.Num()]);
+		ECSFootprintShapeFix FixCCW = ECSFootprintShapeFix::Rect;
+		ECSFootprintShapeFix FixCW = ECSFootprintShapeFix::Rect;
+		const FCSHouseFootprint FromCCW = FCSHouseFootprint::FromShape(Hex, Size, &FixCCW);
+		const FCSHouseFootprint FromCW = FCSHouseFootprint::FromShape(Clockwise, Size, &FixCW);
+		TestTrue(TEXT("convex CCW: kept"), FixCCW == ECSFootprintShapeFix::Kept);
+		TestTrue(TEXT("convex CW: kept (a flip is not a fix)"), FixCW == ECSFootprintShapeFix::Kept);
+		TestTrue(TEXT("convex CW and CCW come out bit for bit the same"), FromCW.EqualsApprox(FromCCW, 0.0));
+		TestTrue(TEXT("the hull of an already convex shape is that shape (same start, same order)"),
+			SameVerts(FromCCW, FCSHouseFootprint::ConvexHullCCW(FromCCW.Verts), 0.0));
+	}
+
+	// ⑧ 退化兜底：凸包不足 3 个顶点 / 包围盒零宽 ⇒ 矩形（Degenerate）；少于 3 个点 ⇒ 矩形（Rect）。
+	{
+		const TArray<FVector2D> Line = { FVector2D(0, 0), FVector2D(1, 1), FVector2D(2, 2), FVector2D(3, 3) };
+		const TArray<FVector2D> Flat = { FVector2D(0, 0), FVector2D(1, 0), FVector2D(2, 0) };
+		const TArray<FVector2D> Two = { FVector2D(0, 0), FVector2D(1, 1) };
+		ECSFootprintShapeFix Fix;
+		TestTrue(TEXT("all collinear (tilted): the rectangle"), Shaped(Line, Fix).EqualsApprox(FCSHouseFootprint::MakeRect(Size), 0.0));
+		TestTrue(TEXT("all collinear (tilted): reported as degenerate"), Fix == ECSFootprintShapeFix::Degenerate);
+		TestTrue(TEXT("zero-height bounding box: the rectangle"), Shaped(Flat, Fix).EqualsApprox(FCSHouseFootprint::MakeRect(Size), 0.0));
+		TestTrue(TEXT("zero-height bounding box: reported as degenerate"), Fix == ECSFootprintShapeFix::Degenerate);
+		TestTrue(TEXT("two points: the rectangle"), Shaped(Two, Fix).EqualsApprox(FCSHouseFootprint::MakeRect(Size), 0.0));
+		TestTrue(TEXT("two points: reported as plain rect, not a fix"), Fix == ECSFootprintShapeFix::Rect);
+	}
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// footprint 哈希的粒度（2026-09-14）：矩形上必须还是折线化之前的 1 cm 尺寸粒度
+//
+// 折线化把各家哈希里的 `Q(FootprintSize.X, 1)` 换成了"逐顶点量化到 1 cm"，而矩形顶点是 ±Size/2 ⇒
+// 尺寸粒度悄悄粗到了 2 cm：拖尺寸 1 cm 可能一次重建都不触发，哈希短路把一次真实改动吞掉。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseFootprintHashGranularityTest,
+	"PCGPlugins.ComputeShaderGenerator.House.FootprintHashGranularity",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseFootprintHashGranularityTest::RunTest(const FString& Parameters)
+{
+	auto HashOf = [](const FCSHouseFootprint& Footprint)
+	{
+		TArray<int32> H;
+		Footprint.AppendQuantizedHash(H);
+		return H;
+	};
+	auto Rect = [](double X, double Y) { return FCSHouseFootprint::MakeRect(FVector2D(X, Y)); };
+
+	const TArray<int32> Base = HashOf(Rect(600.0, 400.0));
+
+	// ① 相差 1 cm 的尺寸都分得开（X 与 Y 两个方向）。⚠️ **基准必须带小数**：顶点量到 1 cm 时，
+	//    整数尺寸恰好落在四舍五入的奇点上（±300.5 一边进一边不进），整数对照一个都不红 —— 带 0.25 的
+	//    偏移，1 cm 顶点量子会有一半（10 / 20）合并，而折线化之前的 `Q(FootprintSize, 1)` 一个都不合并。
+	int32 MergedX = 0;
+	int32 MergedY = 0;
+	for (int32 Cm = 0; Cm < 20; ++Cm)
+	{
+		if (HashOf(Rect(600.25 + Cm, 400.0)) == HashOf(Rect(601.25 + Cm, 400.0))) ++MergedX;
+		if (HashOf(Rect(600.0, 400.25 + Cm)) == HashOf(Rect(600.0, 401.25 + Cm))) ++MergedY;
+	}
+	TestEqual(TEXT("every centimetre of length is a different footprint"), MergedX, 0);
+	TestEqual(TEXT("every centimetre of width is a different footprint"), MergedY, 0);
+	// 最直白的反例：差 1.6 cm。1 cm 顶点量子下两者同一个哈希，旧口径与新口径都分得开。
+	TestTrue(TEXT("599.2 and 600.8 are different footprints"), HashOf(Rect(599.2, 400.0)) != HashOf(Rect(600.8, 400.0)));
+
+	// ② 亚厘米的抖动照旧被吸收（同旧口径 `Q(600.4, 1) == Q(600, 1)`）。
+	TestTrue(TEXT("+0.4 cm is absorbed"), HashOf(Rect(600.4, 400.0)) == Base);
+	TestTrue(TEXT("-0.4 cm is absorbed"), HashOf(Rect(599.6, 400.0)) == Base);
+
+	// ③ 顶点数照旧进哈希：同一个矩形多一个共线顶点，边的划分已经换了一套。
+	FCSHouseFootprint WithMid = Rect(600.0, 400.0);
+	WithMid.Verts.Insert(FVector2D(0.0, -200.0), 1);
+	TestTrue(TEXT("an extra vertex changes the hash even when every coordinate is shared"), HashOf(WithMid) != Base);
 	return true;
 }
 
@@ -3294,7 +3480,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FCSHouseQuoinCoversOuterEdgeTest::RunTest(const FString& Parameters)
 {
-	// ⚠️ **判据不是"不穿模"** —— 四面墙是精确 butt joint，那条恒真、测了也永远绿。
+	// ⚠️ **判据不是"不穿模"** —— 转角是精确斜接（3a-2 之前是直角对接），那条恒真、测了也永远绿。
 	// 角石要盖的是外角那条竖直棱上的 UV 岛断裂，所以判据是：砖的横截面必须在**两个相邻墙面**
 	// 的外法线方向上都伸出墙外表面。只伸出一个方向 = 只遮住半条棱，另一半照旧断纹。
 	struct FCase { const TCHAR* What; FVector2D Footprint; float Yaw; FVector2D Center; float Inset; };
@@ -4651,8 +4837,9 @@ bool FCSHouseWindowBrushPlacementTest::RunTest(const FString& Parameters)
 	// ② AdoptAnchor：给一个**已知**的 FCSWallHit，三份坐标必须互相印证
 	// -------------------------------------------------------------------------
 	//
-	// 取边 1（+X 那面短墙）弧长 120、命中高度 150 —— 边 1 长 400 − 2×24 = 352，护角 60 ⇒
-	// 可用区间 [60, 292]，120 稳稳落在里面（贴着 `demo_house_window` 里那三扇窗的选点理由）。
+	// 取边 1（+X 那面短墙）弧长 120、命中高度 150 —— 斜接口径下边 1 从外角点量起、长 400，
+	// 护角 max(60, 让出量 24) = 60 ⇒ 可用区间 [60, 340]，120 稳稳落在里面（直角对接时代是 352 长、
+	// [60, 292]，选点理由同 `demo_house_window` 里那三扇窗）。
 	{
 		ACSWindowMarker* Marker = World->SpawnActor<ACSWindowMarker>(FVector::ZeroVector, FRotator::ZeroRotator);
 		if (!TestNotNull(TEXT("Window marker"), Marker)) return false;
@@ -4833,8 +5020,11 @@ bool FCSHouseResizeHandleTest::RunTest(const FString& Parameters)
 	House->EnterResizeMode();
 	TestTrue(TEXT("Entering resize mode reports the mode is on"), House->IsInResizeMode());
 
-	// 五个抓手：四个水平锥子 + 一个高度框。
-	TestEqual(TEXT("Five handles: four cones plus the height frame"), House->GetResizeHandles().Num(), 5);
+	// 六个抓手：四个水平锥子 + 檐口框 + 房底框（2026-09-14 加房底框：N + 2）。
+	TestEqual(TEXT("Six handles: four cones plus the eave frame and the base frame"), House->GetResizeHandles().Num(), 6);
+	TestNotNull(TEXT("The eave frame is there"), House->GetHeightHandle());
+	TestNotNull(TEXT("The base frame is there"), House->GetBaseHandle());
+	TestTrue(TEXT("The eave frame and the base frame are two different actors"), House->GetHeightHandle() != House->GetBaseHandle());
 
 	TArray<ACSHouseResizeHandleActor*> Handles = House->GetEdgeHandles();
 	if (!TestEqual(TEXT("One cone per wall"), Handles.Num(), 4)) return false;
@@ -4873,7 +5063,7 @@ bool FCSHouseResizeHandleTest::RunTest(const FString& Parameters)
 
 	// 幂等：再进一次不许生出第二组（详情面板上的按钮会被连点）。
 	House->EnterResizeMode();
-	TestEqual(TEXT("Re-entering resize mode does not spawn a second set"), House->GetResizeHandles().Num(), 5);
+	TestEqual(TEXT("Re-entering resize mode does not spawn a second set"), House->GetResizeHandles().Num(), 6);
 
 	// ---- ② 拖 1 m 墙恰好走 1 m：父子回路那个 2x 缺陷的钉子 ----
 	ACSHouseResizeHandleActor* East = nullptr;
@@ -4980,7 +5170,7 @@ bool FCSHouseResizeHandleTest::RunTest(const FString& Parameters)
 		House->EnterResizeMode();
 		TArray<TWeakObjectPtr<ACSHouseHandleActor>> Weak;
 		for (ACSHouseHandleActor* Handle : House->GetResizeHandles()) Weak.Add(Handle);
-		if (!TestEqual(TEXT("Handles for the destroy pass"), Weak.Num(), 5)) return false;
+		if (!TestEqual(TEXT("Handles for the destroy pass"), Weak.Num(), 6)) return false;
 
 		World->DestroyActor(House);
 		for (const TWeakObjectPtr<ACSHouseHandleActor>& Handle : Weak)
@@ -5020,7 +5210,7 @@ bool FCSHouseResizeHandlePolylineTest::RunTest(const FString& Parameters)
 	if (!TestEqual(TEXT("the shaped house really is a hexagon"), Before.NumEdges(), 6)) return false;
 
 	House->EnterResizeMode();
-	TestEqual(TEXT("seven handles: six cones plus the height frame"), House->GetResizeHandles().Num(), 7);
+	TestEqual(TEXT("eight handles: six cones plus the eave frame and the base frame"), House->GetResizeHandles().Num(), 8);
 	TArray<ACSHouseResizeHandleActor*> Handles = House->GetEdgeHandles();
 	if (!TestEqual(TEXT("one cone per hexagon edge"), Handles.Num(), 6)) return false;
 
@@ -5080,6 +5270,129 @@ bool FCSHouseResizeHandlePolylineTest::RunTest(const FString& Parameters)
 
 	House->ExitResizeMode();
 	TestEqual(TEXT("leaving resize mode destroys every handle"), House->GetResizeHandles().Num(), 0);
+	World->DestroyActor(House);
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// 拉尺寸模式里改边数：锥子跟着边数走（2026-09-14 用户裁决："折线有多少折手柄就有多少个"）
+//
+// 此前锥子只在 `EnterResizeMode` 那一刻按边数生成一次：模式开着时把矩形改成六边形，锥子还是四个，
+// 五、六号边根本拖不动；反过来从六边形改回矩形，多出来的两个锥子认着不存在的边号悬在原地。
+// 边数按**凸包之后**算（凹形输入按凸包的边数）。两个高度框不受影响、不许被重建。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseResizeHandlesFollowEdgeCountTest,
+	"PCGPlugins.ComputeShaderGenerator.House.ResizeHandlesFollowEdgeCount",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseResizeHandlesFollowEdgeCountTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	constexpr float Yaw = 37.0f;
+	ACSHouseActor* House = World->SpawnActor<ACSHouseActor>(FVector(1000.0, 2000.0, 0.0), FRotator(0.0f, Yaw, 0.0f));
+	if (!TestNotNull(TEXT("House"), House)) return false;
+	House->Windows.Reset();
+	House->FootprintSize = FVector2D(600.0, 400.0);
+	House->MinFootprint = 200.0f;
+	House->ReevaluateSite();
+
+	// 一个阶段的完整判据：边数、锥子数、N + 2、边号铺满 0..N-1、每个锥子都在自己那面墙外的规范位置上。
+	auto CheckCones = [this, House](const TCHAR* Stage, int32 WantEdges)
+	{
+		const FCSHouseFootprint Footprint = House->GetFootprint();
+		if (!TestEqual(FString::Printf(TEXT("%s: the footprint has %d edges"), Stage, WantEdges), Footprint.NumEdges(), WantEdges)) return false;
+		const TArray<ACSHouseResizeHandleActor*> Cones = House->GetEdgeHandles();
+		if (!TestEqual(FString::Printf(TEXT("%s: one cone per edge"), Stage), Cones.Num(), WantEdges)) return false;
+		TestEqual(FString::Printf(TEXT("%s: N + 2 handles in all"), Stage), House->GetResizeHandles().Num(), WantEdges + 2);
+		TestTrue(FString::Printf(TEXT("%s: still in resize mode"), Stage), House->IsInResizeMode());
+
+		TSet<int32> Edges;
+		for (const ACSHouseResizeHandleActor* Cone : Cones)
+		{
+			if (!TestNotNull(FString::Printf(TEXT("%s: cone"), Stage), Cone)) return false;
+			Edges.Add(Cone->GetEdgeIndex());
+			TestTrue(FString::Printf(TEXT("%s: cone %d knows its host"), Stage, Cone->GetEdgeIndex()), Cone->GetHost() == House);
+			TestTrue(FString::Printf(TEXT("%s: cone %d sits on its canonical spot"), Stage, Cone->GetEdgeIndex()),
+				Cone->GetActorLocation().Equals(Cone->ComputeCanonicalWorldLocation(), 1.0e-2));
+			const FCSHouseEdgeFrame F = CSHouse_GetEdge(Cone->GetEdgeIndex(), Footprint, House->WallThickness);
+			TestTrue(FString::Printf(TEXT("%s: cone %d points along a real wall"), Stage, Cone->GetEdgeIndex()), F.Len > 0.0f);
+		}
+		bool bCovered = Edges.Num() == WantEdges;
+		for (int32 Edge = 0; Edge < WantEdges; ++Edge) bCovered &= Edges.Contains(Edge);
+		return TestTrue(FString::Printf(TEXT("%s: the cones cover edges 0..%d exactly once"), Stage, WantEdges - 1), bCovered);
+	};
+
+	House->EnterResizeMode();
+	if (!CheckCones(TEXT("rectangle"), 4)) return false;
+	const ACSHouseHeightHandleActor* Eave = House->GetHeightHandle();
+	const ACSHouseHeightHandleActor* Base = House->GetBaseHandle();
+	if (!TestNotNull(TEXT("eave frame"), Eave) || !TestNotNull(TEXT("base frame"), Base)) return false;
+	const TArray<ACSHouseResizeHandleActor*> RectCones = House->GetEdgeHandles();
+
+	// ① 模式开着把矩形改成六边形（细节面板改属性 = PostEditChange → 构造脚本 → 重求值）⇒ 六个锥子。
+	House->FootprintShape = CSHouseTest_RegularPolygon(6, 1.0);
+	House->FootprintSize = FVector2D(600.0, 519.6152422706632);
+	House->PostEditChange();
+	if (!CheckCones(TEXT("hexagon"), 6)) return false;
+	{
+		// 复用而不是整组重建：原来那四个都还在（被选中的锥子因此不会因为改形状而被销毁、把模式退掉）。
+		int32 Reused = 0;
+		const TArray<ACSHouseResizeHandleActor*> Now = House->GetEdgeHandles();
+		for (ACSHouseResizeHandleActor* Cone : RectCones) if (IsValid(Cone) && Now.Contains(Cone)) ++Reused;
+		TestEqual(TEXT("growing the edge count keeps every existing cone"), Reused, 4);
+		TestTrue(TEXT("the two frames are untouched by a shape change"), House->GetHeightHandle() == Eave && House->GetBaseHandle() == Base);
+	}
+
+	// ② 凹形（L）⇒ 按**凸包**的 5 条边；属性本身不改写。
+	House->FootprintShape = { FVector2D(0, 0), FVector2D(2, 0), FVector2D(2, 1), FVector2D(1, 1), FVector2D(1, 2), FVector2D(0, 2) };
+	House->FootprintSize = FVector2D(600.0, 600.0);
+	House->PostEditChange();
+	if (!CheckCones(TEXT("concave L used as its hull"), 5)) return false;
+	TestEqual(TEXT("the concave shape property is not rewritten to its hull"), House->FootprintShape.Num(), 6);
+
+	// ③ 形状清空回到矩形 ⇒ 四个；多出来的那个被销毁（边号越界的锥子不许留着）。
+	{
+		TArray<TWeakObjectPtr<ACSHouseResizeHandleActor>> Before;
+		for (ACSHouseResizeHandleActor* Cone : House->GetEdgeHandles()) Before.Add(Cone);
+		House->FootprintShape.Reset();
+		House->FootprintSize = FVector2D(600.0, 400.0);
+		House->PostEditChange();
+		if (!CheckCones(TEXT("back to the rectangle"), 4)) return false;
+		int32 Gone = 0;
+		for (const TWeakObjectPtr<ACSHouseResizeHandleActor>& Cone : Before) if (!Cone.IsValid() || Cone->IsActorBeingDestroyed()) ++Gone;
+		TestEqual(TEXT("shrinking from five to four edges destroys exactly one cone"), Gone, 1);
+	}
+
+	// ④ 直接走重求值（撤销也落到这里：PostEditUndo → PostEditChange / ReevaluateSite）同样对齐。
+	House->FootprintShape = CSHouseTest_RegularPolygon(5, 1.0);
+	House->ReevaluateSite();
+	if (!CheckCones(TEXT("pentagon via a bare reevaluate"), 5)) return false;
+
+	// ⑤ 推一条边不改边数 ⇒ 锥子一个都不许换（稳态零动作；被拖的那个在拖动途中绝不能被销毁）。
+	{
+		const TArray<ACSHouseResizeHandleActor*> Stable = House->GetEdgeHandles();
+		ACSHouseResizeHandleActor* Pushed = nullptr;
+		for (ACSHouseResizeHandleActor* Cone : Stable) if (Cone->GetEdgeIndex() == 2) Pushed = Cone;
+		if (!TestNotNull(TEXT("cone on edge 2"), Pushed)) return false;
+		Pushed->SetActorLocation(Pushed->GetActorLocation() + Pushed->GetOuterNormalWorld() * 30.0);
+		TestEqual(TEXT("a 30 cm push on the pentagon applies 30 cm"), double(Pushed->ConsumeDragToHost(false)), 30.0, 1.0e-2);
+		const TArray<ACSHouseResizeHandleActor*> After = House->GetEdgeHandles();
+		bool bSame = After.Num() == Stable.Num();
+		for (ACSHouseResizeHandleActor* Cone : Stable) bSame &= After.Contains(Cone);
+		TestTrue(TEXT("pushing an edge keeps the very same cones"), bSame);
+		CheckCones(TEXT("pentagon after a push"), 5);
+	}
+
+	// ⑥ 不在模式里改形状不许生出抓手。
+	House->ExitResizeMode();
+	House->FootprintShape = CSHouseTest_RegularPolygon(6, 1.0);
+	House->ReevaluateSite();
+	TestEqual(TEXT("outside resize mode a shape change spawns no handles"), House->GetResizeHandles().Num(), 0);
+
 	World->DestroyActor(House);
 	return true;
 }
@@ -5263,6 +5576,169 @@ bool FCSHouseHeightHandleTest::RunTest(const FString& Parameters)
 		}
 	}
 
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// 房底框（2026-09-14 用户裁决「底动顶不动」）：上下拖房底 = HeightOffset 与 WallHeight 反向同改
+//
+// 与 `House.HeightHandle` 的区别只在一件事上，而那件事正是这条用例存在的理由：**房底框会动 actor 变换**。
+// 改 HeightOffset ⇒ 重求值落座 `SetActorLocation` ⇒ attach 在房子下的框被父级一起带走 —— 拉尺寸锥子那条
+// 2× 回路的竖直版。所以逐步钉"拖 δ 房底恰好走 δ"，以及檐口世界高度全程不动。
+//
+// 要一块地：落座公式 `房底 Z = max(地面) + HeightOffset` 没有地面时不起作用（房子原地不动），
+// 那样下面每一条"檐口不动"都是恒真的。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseBaseHandleTest,
+	"PCGPlugins.ComputeShaderGenerator.House.BaseHandle",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseBaseHandleTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	// 平地。岩壳 / 石阶 / 地被关掉：本条只要一个高度场，多几条 GPU 路只会多耗时与噪声。
+	ACSGroundActor* Ground = World->SpawnActorDeferred<ACSGroundActor>(ACSGroundActor::StaticClass(), FTransform::Identity);
+	if (!TestNotNull(TEXT("Ground"), Ground)) return false;
+	Ground->bRockShell = false;
+	Ground->StairMesh = nullptr;
+	Ground->bGroundCoverEnabled = false;
+	Ground->FinishSpawning(FTransform::Identity);
+
+	constexpr float Yaw = 37.0f;
+	const FVector Centre(800.0, 800.0, 0.0);
+	ACSHouseActor* House = World->SpawnActor<ACSHouseActor>(Centre, FRotator(0.0f, Yaw, 0.0f));
+	if (!TestNotNull(TEXT("House"), House)) return false;
+	House->Windows.Reset();
+	House->Ground = Ground;
+	House->FootprintSize = FVector2D(600.0, 400.0);
+	// 墙高 400、下限 200：②③ 一共抬 100 之后，④ 顶墙高下限时还剩 100 的余量 —— 否则 ④ 是在已经顶住的
+	// 状态下测"只给可能的那一截"，生效量恒为 0，那条断言就成了空话。
+	House->WallHeight = 400.0f;
+	House->MinWallHeight = 200.0f;
+	House->HeightOffset = 0.0f;
+	House->ReevaluateSite();
+
+	auto BaseZ = [House]() { return House->GetActorLocation().Z; };
+	auto EaveZ = [House]() { return House->GetActorLocation().Z + double(House->WallHeight); };
+	const double GroundZ = Ground->SampleHeight(FVector2D(Centre.X, Centre.Y));
+	if (!TestEqual(TEXT("the house starts seated on the ground"), BaseZ(), GroundZ, 1.0e-2)) return false;
+	const double Eave0 = EaveZ();
+
+	House->EnterResizeMode();
+	ACSHouseHeightHandleActor* Base = House->GetBaseHandle();
+	ACSHouseHeightHandleActor* Top = House->GetHeightHandle();
+	if (!TestNotNull(TEXT("base frame"), Base) || !TestNotNull(TEXT("eave frame"), Top)) return false;
+	TestTrue(TEXT("the base frame knows which end it is"), Base->GetSide() == ECSHouseHeightHandleSide::Base);
+	TestTrue(TEXT("the eave frame knows which end it is"), Top->GetSide() == ECSHouseHeightHandleSide::Eave);
+
+	// ---- ① 规范位置：房心正下方的房底（局部 Z = 0）；四根条子与檐口框同一副框 ----
+	{
+		const FVector Local = House->GetActorTransform().InverseTransformPosition(Base->GetActorLocation());
+		TestTrue(TEXT("the base frame sits under the house centre"),
+			FMath::IsNearlyZero(Local.X, 1.0e-2) && FMath::IsNearlyZero(Local.Y, 1.0e-2));
+		TestEqual(TEXT("the base frame sits at the base"), Local.Z, 0.0, 1.0e-2);
+		TArray<UStaticMeshComponent*> Bars;
+		Base->GetComponents<UStaticMeshComponent>(Bars);
+		TestEqual(TEXT("the base frame is made of four bars too"), Bars.Num(), 4);
+	}
+	const FVector TopWorld0 = Top->GetActorLocation();
+
+	// ---- ② 上拖 50：墙矮 50、房子离地高 50、檐口与檐口框的世界位置不动，一次到位 ----
+	{
+		Base->SetActorLocation(Base->GetActorLocation() + FVector(0.0, 0.0, 50.0));
+		const float Applied = Base->ConsumeDragToHost(false);
+		TestEqual(TEXT("dragging the base up 50 applies 50"), double(Applied), 50.0, 1.0e-2);
+		TestEqual(TEXT("HeightOffset follows the drag"), double(House->HeightOffset), 50.0, 1.0e-2);
+		TestEqual(TEXT("the wall gets exactly that much shorter"), double(House->WallHeight), 350.0, 1.0e-2);
+		TestEqual(TEXT("the house lifts off the ground by the drag"), BaseZ(), GroundZ + 50.0, 1.0e-2);
+		TestEqual(TEXT("the eave stays put in the world"), EaveZ(), Eave0, 1.0e-2);
+		TestTrue(TEXT("the eave frame stays put in the world"), Top->GetActorLocation().Equals(TopWorld0, 1.0e-2));
+		TestTrue(TEXT("the base frame is back on its canonical spot"),
+			Base->GetActorLocation().Equals(Base->ComputeCanonicalWorldLocation(), 1.0e-2));
+	}
+
+	// ---- ③ 连续 10 步 +5：每步恰好 5、房底共走 50 —— 父级带着框走的那一截不许被算成用户拖的 ----
+	{
+		const double Before = BaseZ();
+		int32 Jumps = 0;
+		for (int32 Step = 0; Step < 10; ++Step)
+		{
+			Base->SetActorLocation(Base->GetActorLocation() + FVector(0.0, 0.0, 5.0));
+			if (FMath::Abs(double(Base->ConsumeDragToHost(false)) - 5.0) > 1.0e-2) ++Jumps;
+		}
+		TestEqual(TEXT("every base step applies exactly the drag"), Jumps, 0);
+		TestEqual(TEXT("ten steps lift the base by ten steps, not twice that"), BaseZ() - Before, 50.0, 1.0e-2);
+		TestEqual(TEXT("and the eave still has not moved"), EaveZ(), Eave0, 1.0e-2);
+		// 锥子挂在 `WallHeight × HandleHeightFraction` 上：墙变矮、房底抬高之后它们也要跟着重摆。
+		for (const ACSHouseResizeHandleActor* Cone : House->GetEdgeHandles())
+		{
+			const double LocalZ = House->GetActorTransform().InverseTransformPosition(Cone->GetActorLocation()).Z;
+			TestEqual(FString::Printf(TEXT("cone %d rides the new wall"), Cone->GetEdgeIndex()),
+				LocalZ, double(House->WallHeight * Cone->HandleHeightFraction), 1.0e-2);
+		}
+	}
+
+	// ---- ④ 往上顶在 MinWallHeight：只给可能的那一截，再往上一步都不给，拉回来恰好走拉回的量 ----
+	{
+		const double WallBefore = House->WallHeight;
+		if (!TestTrue(TEXT("the clamp step starts with headroom above the wall floor"), WallBefore > double(House->MinWallHeight) + 1.0)) return false;
+		Base->SetActorLocation(Base->GetActorLocation() + FVector(0.0, 0.0, 10000.0));
+		const float Applied = Base->ConsumeDragToHost(false);
+		TestEqual(TEXT("the wall floor holds"), double(House->WallHeight), double(House->MinWallHeight), 1.0e-2);
+		TestEqual(TEXT("raising past the wall floor applies only what was possible"),
+			double(Applied), WallBefore - double(House->MinWallHeight), 1.0e-2);
+		Base->SetActorLocation(Base->GetActorLocation() + FVector(0.0, 0.0, 5000.0));
+		TestEqual(TEXT("raising further past the floor applies nothing"), double(Base->ConsumeDragToHost(false)), 0.0, 1.0e-2);
+		Base->SetActorLocation(Base->GetActorLocation() - FVector(0.0, 0.0, 20.0));
+		TestEqual(TEXT("lowering back applies exactly the drag, not the swallowed residue"),
+			double(Base->ConsumeDragToHost(false)), -20.0, 1.0e-2);
+		TestEqual(TEXT("the eave has not moved through the clamp"), EaveZ(), Eave0, 1.0e-2);
+	}
+
+	// ---- ⑤ 往下顶在贴地（HeightOffset = 0）：墙变高、房底落回地面，再往下一步都不给 ----
+	{
+		const double OffsetBefore = House->HeightOffset;
+		Base->SetActorLocation(Base->GetActorLocation() - FVector(0.0, 0.0, 10000.0));
+		const float Applied = Base->ConsumeDragToHost(true);   // 顺带走一次松手
+		TestEqual(TEXT("lowering past the ground applies only what was possible"), double(Applied), -OffsetBefore, 1.0e-2);
+		TestEqual(TEXT("the base comes to rest at HeightOffset 0"), double(House->HeightOffset), 0.0, 1.0e-2);
+		TestEqual(TEXT("the house is seated on the ground again"), BaseZ(), GroundZ, 1.0e-2);
+		TestEqual(TEXT("the wall took the whole difference"), EaveZ(), Eave0, 1.0e-2);
+		Base->SetActorLocation(Base->GetActorLocation() - FVector(0.0, 0.0, 5000.0));
+		TestEqual(TEXT("lowering further past the ground applies nothing"), double(Base->ConsumeDragToHost(false)), 0.0, 1.0e-2);
+		Base->SetActorLocation(Base->GetActorLocation() + FVector(0.0, 0.0, 30.0));
+		TestEqual(TEXT("raising again applies exactly the drag"), double(Base->ConsumeDragToHost(false)), 30.0, 1.0e-2);
+	}
+
+	// ---- ⑥ 旧存档里 HeightOffset 已经是负数：以当前值为界，**不许一抓就跳到 0** ----
+	House->ExitResizeMode();
+	House->HeightOffset = -30.0f;
+	House->WallHeight = 300.0f;
+	House->ReevaluateSite();
+	{
+		const double Eave = EaveZ();
+		TestEqual(TEXT("legacy negative offset: a zero push applies zero"), double(House->PushBase(0.0f)), 0.0, 1.0e-4);
+		TestEqual(TEXT("legacy negative offset: grabbing does not jump it to zero"), double(House->HeightOffset), -30.0, 1.0e-4);
+		TestEqual(TEXT("legacy negative offset: pushing further down is refused"), double(House->PushBase(-10.0f)), 0.0, 1.0e-4);
+		TestEqual(TEXT("legacy negative offset: and leaves it where it was"), double(House->HeightOffset), -30.0, 1.0e-4);
+		TestEqual(TEXT("legacy negative offset: pushing up applies"), double(House->PushBase(10.0f)), 10.0, 1.0e-4);
+		TestEqual(TEXT("legacy negative offset: HeightOffset -30 -> -20"), double(House->HeightOffset), -20.0, 1.0e-4);
+		TestEqual(TEXT("legacy negative offset: the eave does not move"), EaveZ(), Eave, 1.0e-2);
+	}
+
+	// ---- ⑦ 已经矮于 MinWallHeight 的旧存档：往上一步都不给（不许再矮），往下照常 ----
+	House->HeightOffset = 40.0f;
+	House->WallHeight = 150.0f;
+	House->ReevaluateSite();
+	TestEqual(TEXT("a wall already under the floor cannot be made shorter"), double(House->PushBase(5.0f)), 0.0, 1.0e-4);
+	TestEqual(TEXT("but it can be made taller"), double(House->PushBase(-5.0f)), -5.0, 1.0e-4);
+
+	World->DestroyActor(House);
+	World->DestroyActor(Ground);
 	return true;
 }
 
@@ -5638,6 +6114,87 @@ bool FCSHouseFootprintMitreCornersTest::RunTest(const FString& Parameters)
 			CSHouse_GetEdge(9, FCSHouseFootprint::MakeRect(FVector2D(600.0, 400.0)), T).Len == 0.0f);
 	}
 
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// footprint 折线化（3a-2）的存量锚点：旧口径的窗经过拉尺寸之后仍守恒世界位置，而且不会越拉越偏
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseLegacyAnchorResizeTest,
+	"PCGPlugins.ComputeShaderGenerator.House.LegacyAnchorSurvivesResize",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseLegacyAnchorResizeTest::RunTest(const FString& Parameters)
+{
+	// `ReanchorMarkersToPreserveWorld` 在斜接框架上重新量出距离，却曾把锚点的口径字段原样留着：
+	// 旧锚点（`SConvention = 0`）于是被 `CSHouse_AnchorS` 在奇数边上**再补一个 T** —— 拉一次尺寸，
+	// 东西墙上的窗就沿墙滑一个墙厚，拖边的每一帧再滑一个。`House.FootprintMitreCorners` ④ 只验了
+	// "旧锚点读得对"，没验"旧锚点被重新表达之后读得对"；重新表达只发生在房子的重求值里，所以这条要 world。
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	ACSHouseActor* House = World->SpawnActor<ACSHouseActor>(FVector::ZeroVector, FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("House"), House)) return false;
+	// 与 `House.WindowMarker` 同一条理由：把道路驱动的门那一路摘干净，只测锚点这一环。
+	House->Windows.Reset();
+	House->FootprintSize = FVector2D(600.0, 400.0);
+	House->ReevaluateSite();
+	const float T = House->WallThickness;
+
+	ACSWindowMarker* Marker = World->SpawnActor<ACSWindowMarker>(FVector::ZeroVector, FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("Window marker"), Marker)) return false;
+	// 必须关自毁：spawn 那一瞬间标记在原点、还没 adopt（理由同 `House.WindowBrushPlacement`）。
+	Marker->bDestroyWhenHostless = false;
+
+	// 东墙（边 1，奇数边）上一个**旧口径**锚点：从起点角缩进 T 的那一点量起 100 ⇒ 斜接口径下 S = 100 + T。
+	// 起点角是东南角 —— 下面推的是南墙，这个角会动，所以锚点距离必须被重新表达。
+	const float HalfHeight = Marker->GetDemandHalfHeight();
+	FCSWallAnchor Legacy;
+	Legacy.EdgeIndex = 1;
+	Legacy.bFromEndCorner = false;
+	Legacy.DistFromCorner = 100.0f;
+	Legacy.SillZ = FMath::Max(0.0f, 150.0f - HalfHeight);
+	Legacy.SConvention = 0;
+	Marker->AdoptAnchor(House, Legacy);
+	TestEqual(TEXT("the legacy window is accepted"), Marker->GetLastReject(), ECSFeatureReject::None);
+	if (Marker->GetLastReject() != ECSFeatureReject::None) return false;
+	TestTrue(TEXT("a legacy odd-edge anchor reads back one wall thickness past its old origin"),
+		FMath::IsNearlyEqual(CSHouse_AnchorS(Marker->GetAnchor(), House->GetFootprint(), T), 100.0f + T, 0.01f));
+	const FVector Before = House->AnchorToWorld(Marker->GetAnchor(), HalfHeight, Marker->WallStandoff).GetLocation();
+
+	auto WindowCentreS = [House]()
+	{
+		const TArray<FCSWallOpening> Openings = House->GetCurrentOpenings();
+		const FCSWallOpening* Window = Openings.FindByPredicate(
+			[](const FCSWallOpening& O) { return O.Type == ECSOpeningType::Window; });
+		return Window ? Window->CenterS : -1.0f;
+	};
+
+	// 连推三次（有进有出）：修之前第一次就偏一个 T，之后每次再叠一个 T。
+	int32 Step = 0;
+	for (const float Push : { 50.0f, -30.0f, 20.0f })
+	{
+		++Step;
+		House->PushEdge(0, Push, true);
+		const FCSWallAnchor Now = Marker->GetAnchor();
+		const FVector After = House->AnchorToWorld(Now, HalfHeight, Marker->WallStandoff).GetLocation();
+		TestEqual(FString::Printf(TEXT("push %d: the re-expressed anchor is written in the mitre convention"), Step),
+			int32(Now.SConvention), 1);
+		TestTrue(FString::Printf(TEXT("push %d: the window keeps its world position (%s vs %s)"), Step,
+				*After.ToCompactString(), *Before.ToCompactString()),
+			After.Equals(Before, 0.05));
+		TestTrue(FString::Printf(TEXT("push %d: the marker sits on its anchor"), Step),
+			Marker->GetActorLocation().Equals(After, 0.5));
+		const float WantS = CSHouse_AnchorS(Now, House->GetFootprint(), T);
+		TestTrue(FString::Printf(TEXT("push %d: the hole follows the same anchor (%.2f vs %.2f)"), Step, WindowCentreS(), WantS),
+			FMath::IsNearlyEqual(WindowCentreS(), WantS, 0.01f));
+		TestTrue(FString::Printf(TEXT("push %d: and it is still cut"), Step), Marker->CausesCut());
+	}
+
+	World->DestroyActor(Marker);
+	World->DestroyActor(House);
 	return true;
 }
 

@@ -129,7 +129,12 @@ void ACSTinyGlade::SubmitMeshSlotAsync(UCSMeshRenderComponent* Component, TObjec
 	// 的设计前提。
 	const bool bSort = Upload.bSortSections;
 	const int32 NumSlots = FMath::Max(Target->Materials.Num(), 1);
-	Target->EnsureCapacitySync(CSShaperSteps::ReserveCount(Payload.VertexCount), CSShaperSteps::ReserveCount(Payload.IndexCount));
+	// ⚠️ **只在精确数装不下时才涨**（2026-09-14，与 `CSVineTube::BuildTubeIntoMesh` 同一处订正）：台阶按请求值
+	// 取整，无条件要 `ReserveCount(精确数)` 会在精确数越过"现容量 / 1.5"时就重分配，留出的 50% 余量只剩一半可用。
+	if (Target->GetVertexCapacity() < int32(Payload.VertexCount) || Target->GetIndexCapacity() < int32(Payload.IndexCount))
+	{
+		Target->EnsureCapacitySync(CSShaperSteps::ReserveCount(Payload.VertexCount), CSShaperSteps::ReserveCount(Payload.IndexCount));
+	}
 	if (bSort) Target->EnsureIndirectDrawCapacitySync(NumSlots);
 	Component->SetGpuMesh(Target);
 

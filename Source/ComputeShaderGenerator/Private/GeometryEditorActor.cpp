@@ -2,6 +2,7 @@
 #include "GeometryEditorActor.h"
 
 #include "CSVineTube.h"
+#include "CSGroundShaperSteps.h"   // CSShaperSteps::ReserveCount —— 管子容量的台阶（unity 构建下别指望别人替你带进来）
 
 #include "EngineUtils.h"
 #include "Engine/StaticMesh.h"
@@ -2891,7 +2892,12 @@ static bool AddVineFusedSCConcatPasses(FRDGBuilder& GraphBuilder, const FVineFus
 // 异步：录完图就返回，游戏线程不等渲染线程。Input 按值吃进来再整体 MoveTemp 进 lambda——
 // bundle 本来就是自持有的（数组按值、pooled ref 计数、FusedSC 内嵌、体素输入 MoveTemp 进来），
 // 所以「让图持有它」只差这一步。OnBuilt 在图跑完之后回到游戏线程，参数是 pass 到底有没有录进去。
-static bool BuildVineGeometryIntoMeshAsync(UCSMesh* Target, FVineBuildInput Input, TFunction<void(bool)> OnBuilt)
+//
+// `RetainVertexCapacity` / `RetainIndexCapacity`：完成回调里缩容时**至少留下**这么多（0 = 只留本次精确数，
+// 空间殖民那条老路的行为）。管子路径传台阶预留值 —— 不传的话，调用方刚按台阶要足的余量会在这一趟构建
+// 完成时被缩回精确数，下一帧长一点点的管子照样扩容、照样阻塞（2026-09-14 `TubeRegrowthZeroFlush` 实测）。
+static bool BuildVineGeometryIntoMeshAsync(UCSMesh* Target, FVineBuildInput Input, TFunction<void(bool)> OnBuilt,
+	uint32 RetainVertexCapacity = 0u, uint32 RetainIndexCapacity = 0u)
 {
 	if (!Target || !Input.bValid) return false;
 	if (Input.OutputVertexCount == 0u || Input.OutputIndexCount == 0u) return false;
@@ -3021,7 +3027,8 @@ static bool BuildVineGeometryIntoMeshAsync(UCSMesh* Target, FVineBuildInput Inpu
 		Context.SetWorldBounds(Input.LocalBounds);
 		bBuilt = true;
 	},
-		[Built, WeakTarget = TWeakObjectPtr<UCSMesh>(Target), VertexCapacity, IndexCapacity, OnBuilt = MoveTemp(OnBuilt)](bool bMeshAlive) mutable
+		[Built, WeakTarget = TWeakObjectPtr<UCSMesh>(Target), VertexCapacity, IndexCapacity,
+			RetainVertexCapacity, RetainIndexCapacity, OnBuilt = MoveTemp(OnBuilt)](bool bMeshAlive) mutable
 	{
 		UCSMesh* Mesh = WeakTarget.Get();
 		const bool bOk = bMeshAlive && Mesh != nullptr && Built.Get();
@@ -3038,11 +3045,18 @@ static bool BuildVineGeometryIntoMeshAsync(UCSMesh* Target, FVineBuildInput Inpu
 		// ShrinkCapacitySync pay for a counter readback — a full GPU stall — before it even reaches its
 		// own hysteresis check. 它留在完成回调里而不是录图前，正是因为它阻塞：放在前面会把异步刚
 		// 省下的那段等待原样加回去，放在这里则只有真要还容量的那一次才付。
+		//
+		// 门槛与 ShrinkCapacitySync 自己的滞回同一个口径（留下量 × (1 + ShrinkSlackRatio)）：在余量之内它反正会拒，
+		// 从前只比"留下量 < 现容量"，于是只要有一点余量就先付一次计数回读、再被滞回拒掉 —— 管子按台阶预留之后
+		// 每一趟都有余量，那等于每趟构建白付一次阻塞。
 		if (bOk)
 		{
-			const bool bVineNeedsLessThanItHolds = int32(VertexCapacity) < Mesh->GetVertexCapacity()
-				|| int32(IndexCapacity) < Mesh->GetIndexCapacity();
-			if (bVineNeedsLessThanItHolds) Mesh->ShrinkCapacitySync(int32(VertexCapacity), int32(IndexCapacity));
+			const uint32 KeepVertices = FMath::Max(VertexCapacity, RetainVertexCapacity);
+			const uint32 KeepIndices = FMath::Max(IndexCapacity, RetainIndexCapacity);
+			const double Slack = 1.0 + double(FMath::Max(Mesh->ShrinkSlackRatio, 0.0f));
+			const bool bWorthShrinking = double(Mesh->GetVertexCapacity()) > double(KeepVertices) * Slack
+				|| double(Mesh->GetIndexCapacity()) > double(KeepIndices) * Slack;
+			if (bWorthShrinking) Mesh->ShrinkCapacitySync(int32(KeepVertices), int32(KeepIndices));
 		}
 
 		if (OnBuilt) OnBuilt(bOk);
@@ -4855,9 +4869,38 @@ bool BuildTubeIntoMesh(
 	if (bGrowth) Input.PathPointGrowth = PathPointGrowth;
 	if (!UCSMeshOps::EnsureTexCoordSets(Target, int32(Input.NumTexCoordSets))) return false;
 
+	// ⚠️ **容量按 `CSShaperSteps::ReserveCount` 的台阶预留，不按精确数要**（2026-09-14 回归
+	// `dragging FootprintSize for 12 frames blocks the game thread zero times flushes=1` 的根因）。
+	// 下面 `BuildVineGeometryIntoMeshAsync` 里那次 `EnsureCapacitySync` 要的是**精确**顶点/索引数，
+	// 而管子的点数是 footprint 的非单调函数（拖 5 cm 可能多出几段藤）⇒ 只要这一帧的管子比网格
+	// 历史上最大的那根多出一个点，就付一次重分配 + 拷贝的阻塞刷新。实测 L_HouseGroundDemo
+	// 09-09 版：600×400 时 2472 顶点 / 14592 索引，拖到 605×400 要 2664 / 15744 ⇒ 第 1 帧阻塞一次。
+	// 房体 / 柱的槽上传（`ACSTinyGlade::SubmitMeshSlotAsync`）早就走这条台阶，只有管子漏了。
+	// 在这里先按台阶要足，里面那次精确的 `EnsureCapacitySync` 就恒走早退分支。
+	// 单测 `TinyGladeHouse.Vine.TubeRegrowthZeroFlush` 钉着。
+	// ⚠️ **只在精确数真的装不下时才涨，涨就涨到台阶**：无条件地要 `ReserveCount(精确数)` 会在精确数越过
+	// "现容量 / 1.5"时就重分配（台阶是按请求值取整的，请求值一动台阶就可能跳一格），1.5 倍余量只剩一半可用
+	// —— 09-09 版关卡往回拖 5 cm 的那根管子（2976 顶点）正好落在这一段里。
+	// 前两条拒绝条件与 `BuildVineGeometryIntoMeshAsync` 开头逐条相同：先挡掉，免得为一次注定被拒的构建分配显存。
+	if (Input.OutputVertexCount == 0u || Input.OutputIndexCount == 0u) return false;
+	if (GMaxRHIFeatureLevel < ERHIFeatureLevel::SM5) return false;
+	const int32 ExactVertices = int32(FMath::Min<uint32>(Input.OutputVertexCount, uint32(MAX_int32)));
+	const int32 ExactIndices = int32(FMath::Min<uint32>(Input.OutputIndexCount, uint32(MAX_int32)));
+	if ((Target->GetVertexCapacity() < ExactVertices || Target->GetIndexCapacity() < ExactIndices)
+		&& !Target->EnsureCapacitySync(CSShaperSteps::ReserveCount(ExactVertices), CSShaperSteps::ReserveCount(ExactIndices)))
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[CSVineTube] 管子容量预留被拒（%u 顶点 / %u 索引，含台阶余量），未生成管子。"),
+			Input.OutputVertexCount, Input.OutputIndexCount);
+		return false;
+	}
+
 	// 几何在世界空间，宿主组件钉在恒等世界变换上（见头文件的警告）。两者必须一起动。
 	Input.VineWorldToLocal = FMatrix44f::Identity;
 
-	return BuildVineGeometryIntoMeshAsync(Target, MoveTemp(Input), MoveTemp(OnBuilt));
+	// 台阶值同时交给完成回调当"缩容时至少留下"的量：不交的话，上面刚要足的余量会在这一趟构建完成时被
+	// 缩回精确数（回调按精确数缩），下一帧长一点点的管子照样扩容 —— 预留等于白做。
+	return BuildVineGeometryIntoMeshAsync(Target, MoveTemp(Input), MoveTemp(OnBuilt),
+		uint32(CSShaperSteps::ReserveCount(ExactVertices)), uint32(CSShaperSteps::ReserveCount(ExactIndices)));
 }
 }

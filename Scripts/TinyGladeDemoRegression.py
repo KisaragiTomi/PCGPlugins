@@ -450,6 +450,11 @@ def demo_house_ground():
     # 必须在**有门**的状态下测：门框砖是唯一走实例化交接（SetInstanceSourceGPU，
     # 内部 SetStreamLayoutSync / ResizeStreamsSync / EnsureCapacitySync + 无条件 EditMeshSync）
     # 的一路，没砖的话这条断言就算交接路整个坏掉也照样绿。
+    #
+    # ⚠️ 2026-09-14 在 09-09 版关卡上报过 `flushes=1`：不是交接，是**藤蔓管子**的常驻网格按精确数要容量
+    # （`CSVineTube::BuildTubeIntoMesh` → `EnsureCapacitySync`），第 1 帧的管子比 600×400 那根多了 192 个顶点
+    # 就重分配一次。已改成按 `CSShaperSteps::ReserveCount` 台阶预留。这条断言只在关卡**恰好**长出更长的管子时才红
+    # （当前关卡就不红），不依赖关卡的判据是 C++ 单测 `TinyGladeHouse.Vine.TubeRegrowthZeroFlush`。
     paint_line(ground, loc.x, loc.y - 800.0, loc.x, loc.y + 800.0, 16)
     road_house.set_editor_property("FootprintSize", unreal.Vector2D(600.0, 400.0))
     road_house.rebuild_house()      # 容量与包围盒的一次性成本付在这里，不许落进拖动里

@@ -3,10 +3,15 @@
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 
 #include "CSGpuMeshTypes.h"
+#include "CSGroundShaperSteps.h"  // (17) CSShaperSteps::CapacityStep —— 管子容量的台阶
 #include "CSHouseActor.h"
 #include "CSHouseProfile.h"
 #include "CSHouseVine.h"
+#include "CSMesh.h"             // (17) 管子常驻网格的容量与阻塞刷新计数器
+#include "CSVineTube.h"         // (17) 折线 → 管子的对外入口
 #include "Math/NumericLimits.h"
+#include "RenderingThread.h"    // (17) FlushRenderingCommands —— 泵异步编辑的游戏线程尾巴
+#include "UObject/Package.h"    // (17) GetTransientPackage
 
 // -----------------------------------------------------------------------------
 // 墙面藤蔓（D13）的验收。
@@ -1106,6 +1111,86 @@ bool FCSHouseVineTurnRateTest::RunTest(const FString& Parameters)
 		}
 	}
 	TestEqual(TEXT("两次规划的折线逐位相同"), PointDiff, 0);
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// (17) 管子变长不阻塞：常驻容量按台阶预留（2026-09-14 拖尺寸回归 `flushes=1` 的守门人）
+//
+// ⚠️ **本文件里碰 RHI 的一条**（`NonNullRHI`）。它钉的不是规划，而是 `CSVineTube::BuildTubeIntoMesh`
+// 向常驻网格**要容量的方式**：按精确数要的话，管子只要比这张网格历史上最长的那根多出一个点，就付一次
+// 重分配 + 拷贝的阻塞刷新。拖尺寸时藤的点数随 footprint 非单调地跳（5 cm 就可能多一段），于是"拖动的
+// 第一帧阻塞一次"—— L_HouseGroundDemo 09-09 版实测：600×400 的管子 2472 顶点 / 14592 索引，605×400
+// 要 2664 / 15744。演示回归那条 `flushes=0` 只在关卡恰好长出更长的管子时才红（当前关卡就不红），
+// 这一条不依赖任何关卡内容。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseVineTubeRegrowthZeroFlushTest,
+	"PCGPlugins.TinyGladeHouse.Vine.TubeRegrowthZeroFlush",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter | EAutomationTestFlags::NonNullRHI)
+
+bool FCSHouseVineTubeRegrowthZeroFlushTest::RunTest(const FString& Parameters)
+{
+	TArray<CSHouseVine::FWallStrip> Strips;
+	Strips.Add(CSVineTest_MakeStrip());
+	const CSHouseVine::FParams Params = CSVineTest_MakeParams();
+	CSHouseVine::FPlan Plan;
+	CSHouseVine::BuildPlan(Strips, TArray<FCSWallOpening>(), Params, Plan);
+	if (!TestTrue(TEXT("规划出了折线"), Plan.Strands.Num() > 0)) return false;
+
+	// 同一份规划、细分 2 → 3：第二根管子**严格更长**（点与段各多约三分之一），仍在台阶的 1.5 倍余量之内
+	// —— 与"拖 5 cm 多出几段藤"同一个量级。CircleScale 取房子那条路的实际值（`CSHouseVine_TubeCircleScale`）。
+	constexpr float CircleScale = 0.2f;
+	CSHouseVine::FTubePath Short;
+	CSHouseVine::FTubePath Long;
+	CSHouseVine::PackTubePath(Strips, Plan, Params, 2, CircleScale, TArrayView<const float>(), Short);
+	CSHouseVine::PackTubePath(Strips, Plan, Params, 3, CircleScale, TArrayView<const float>(), Long);
+
+	// 反空判据：第二根不真的更长的话，下面那条"零阻塞"恒真，精确要容量的实现也会绿。
+	if (!TestTrue(FString::Printf(TEXT("第二根管子的点更多（%d > %d）"), Long.Points.Num(), Short.Points.Num()),
+		Long.Points.Num() > Short.Points.Num())) return false;
+	if (!TestTrue(FString::Printf(TEXT("第二根管子的段更多（%d > %d）"), Long.SegmentMeta.Num(), Short.SegmentMeta.Num()),
+		Long.SegmentMeta.Num() > Short.SegmentMeta.Num())) return false;
+
+	UCSMesh* Mesh = NewObject<UCSMesh>(GetTransientPackage());
+	if (!TestNotNull(TEXT("管子网格"), Mesh)) return false;
+	CSVineTube::FParams TubeParams;
+	TubeParams.CircleScale = CircleScale;
+
+	auto Build = [&](const CSHouseVine::FTubePath& Path)
+	{
+		return CSVineTube::BuildTubeIntoMesh(Mesh, Path.Points, Path.Axes, Path.PointMeta, Path.SegmentMeta,
+			Path.Growth, TubeParams, nullptr);
+	};
+	// 异步编辑的完成回调是一个游戏线程任务，只有 flush 泵得到它；在途时第二次递交会被直接拒掉。
+	auto Settle = [&]()
+	{
+		for (int32 Pump = 0; Pump < 8 && Mesh->IsEditInFlight(); ++Pump) FlushRenderingCommands();
+		return !Mesh->IsEditInFlight();
+	};
+
+	// ① 第一根：空网格第一次要容量本来就是阻塞的（分配），不在测量窗口里。
+	if (!TestTrue(TEXT("第一根管子递交成功"), Build(Short))) return false;
+	if (!TestTrue(TEXT("第一根管子的异步编辑已落地"), Settle())) return false;
+	const int32 VertexCapacity = Mesh->GetVertexCapacity();
+	const int32 IndexCapacity = Mesh->GetIndexCapacity();
+	AddInfo(FString::Printf(TEXT("短管 %d 点 / %d 段，容量 %d 顶点 / %d 索引；长管 %d 点 / %d 段"),
+		Short.Points.Num(), Short.SegmentMeta.Num(), VertexCapacity, IndexCapacity, Long.Points.Num(), Long.SegmentMeta.Num()));
+	// 构建**完成回调**会按需缩容。它若按精确数缩，上面按台阶要足的余量建完就没了，下面那条"零阻塞"必红 ——
+	// 09-14 第一版修复正是这么栽的（容量 4096 建完被缩回精确的 2496）。顶点容量只可能来自台阶，所以必是台阶的整数倍。
+	TestEqual(TEXT("第一根管子建完之后顶点容量仍停在台阶上（完成回调没有缩回精确数）"),
+		VertexCapacity % CSShaperSteps::CapacityStep, 0);
+
+	// ② 第二根更长：**零阻塞、零重分配**。
+	const int64 FlushesBefore = UCSMesh::GetBlockingFlushCount();
+	const bool bIssued = Build(Long);
+	const int64 Flushes = UCSMesh::GetBlockingFlushCount() - FlushesBefore;
+	TestTrue(TEXT("第二根管子递交成功"), bIssued);
+	TestEqual(TEXT("管子变长的那次重建不付阻塞刷新（容量按台阶预留，不按精确数要）"), Flushes, int64(0));
+	TestEqual(TEXT("顶点容量没有被重新分配"), Mesh->GetVertexCapacity(), VertexCapacity);
+	TestEqual(TEXT("索引容量没有被重新分配"), Mesh->GetIndexCapacity(), IndexCapacity);
+	TestTrue(TEXT("第二根管子的异步编辑已落地"), Settle());
 	return true;
 }
 

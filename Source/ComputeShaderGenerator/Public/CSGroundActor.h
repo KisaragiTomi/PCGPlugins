@@ -1110,7 +1110,15 @@ public:
 	 * 调用方负责给出 union(旧足迹, 新足迹) —— 撤掉旧位置的隆起与压出新位置的隆起是同一趟。
 	 * 公式是"基底 0 与全部塑形物取 max"的绝对式，所以区域内重算与全量重算结果逐位相同。
 	 */
-	void RefreshHeightsInRegion(const FBox2D& WorldRectXY);
+	void RefreshHeightsInRegion(const FBox2D& WorldRectXY, bool bCommitted = true);
+
+	/**
+	 * 最近一次 `OnGroundChanged` 广播是不是**提交**（松手 / 收笔 / 显式重建），而不是拖动 / 落笔途中的一帧。
+	 *
+	 * 房子（D7 接缝）只在提交广播上做跨房的接缝写入：塑形物拖动是每帧重导出 + 广播、房子每帧落座，
+	 * 接缝写入若跟着落座走，拖一次塑形物就是每帧写邻居。委托签名不动，订阅者在回调里读这个标记。
+	 */
+	bool IsLastChangeCommitted() const { return bLastChangeCommitted; }
 
 	/** 塑形物高度场的 GPU 参数（每座 2 个 float4），CPU 镜像与 compute pass 共用同一份构造。 */
 	void BuildShaperGpuParams(TArray<FVector4f>& OutParams) const;
@@ -1467,7 +1475,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "CS Ground")
 	void ApplyPaintStroke(FVector WorldCenter);
 
-	/** Stroke 括号：Begin 清累计脏盒，End 标脏包。变更通知不在这里——每次落笔已直推 OnGroundChanged。 */
+	/** Stroke 括号：Begin 清累计脏盒，End 标脏包并补一次**提交**广播（逐笔落笔的广播是未提交的，见 IsLastChangeCommitted）。 */
 	UFUNCTION(BlueprintCallable, Category = "CS Ground")
 	void BeginPaintStroke();
 
@@ -1760,6 +1768,9 @@ private:
 	/** 本次 stroke 的累计世界脏盒：EndPaintStroke 判断要不要标脏包；也是将来切 dirty 系统时的区域发布素材。 */
 	FBox StrokeDirtyBounds = FBox(ForceInit);
 	bool bPaintStrokeOpen = false;
+
+	/** 见 `IsLastChangeCommitted`。每个 `OnGroundChanged.Broadcast` 站点广播前先写它。 */
+	bool bLastChangeCommitted = true;
 
 	/**
 	 * 还没推给 GPU 的落笔队列（按落笔顺序）。混合公式对同一顶点是可结合地按序作用的，

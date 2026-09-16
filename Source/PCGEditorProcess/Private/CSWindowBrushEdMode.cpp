@@ -3,7 +3,7 @@
 #include "CSHouseActor.h"
 #include "CSHouseFeatureMarker.h"
 #include "CSHouseProfile.h"
-#include "CSHouseSubsystem.h"
+#include "CSHouseLibrary.h"
 #include "Editor.h"
 #include "Engine/HitResult.h"
 #include "Engine/World.h"
@@ -23,11 +23,10 @@ AActor* FCSWindowBrushEdMode::GetBrushTargetActor() const
 	return TargetActor.Get();
 }
 
-UCSHouseSubsystem* FCSWindowBrushEdMode::GetHouseSubsystem() const
+UWorld* FCSWindowBrushEdMode::GetTargetWorld() const
 {
 	const ACSHouseActor* Target = TargetActor.Get();
-	const UWorld* World = Target ? Target->GetWorld() : nullptr;
-	return World ? World->GetSubsystem<UCSHouseSubsystem>() : nullptr;
+	return Target ? Target->GetWorld() : nullptr;
 }
 
 FCSBrushSettings FCSWindowBrushEdMode::GetBrushSettings() const
@@ -50,8 +49,8 @@ bool FCSWindowBrushEdMode::TraceCandidatePoint(const FVector& Start, const FVect
 {
 	bLastHitValid = false;
 
-	UCSHouseSubsystem* Subsystem = GetHouseSubsystem();
-	if (!Subsystem) return false;
+	const UWorld* World = GetTargetWorld();
+	if (!World) return false;
 
 	const FVector Delta = End - Start;
 	const double Len = Delta.Size();
@@ -59,10 +58,10 @@ bool FCSWindowBrushEdMode::TraceCandidatePoint(const FVector& Start, const FVect
 	const FVector Dir = Delta / Len;
 
 	// **解析求交，不是引擎 trace**：房子的 gpumesh 全线 `NoCollision`，`LineTraceSingle` 一栋都
-	// 打不到（计划 D8 明写）。这里扫的是**花名册上所有房子**，不只是按钮所属的那一栋 ——
+	// 打不到（计划 D8 明写）。这里扫的是**world 里所有房子**，不只是按钮所属的那一栋 ——
 	// 笔刷开着的时候点哪栋就该往哪栋上放。
 	FCSWallHit Hit;
-	ACSHouseActor* House = Subsystem->PickHouse(Start, Dir, float(Len), Hit);
+	ACSHouseActor* House = UCSHouseLibrary::PickHouse(World, Start, Dir, float(Len), Hit);
 	if (!House || !Hit.bHit) return false;
 
 	// `FCSWallHit` 是**房子局部空间**的 (边号, 弧长, 高度)，要还原成世界点与外法线。
@@ -97,8 +96,7 @@ void FCSWindowBrushEdMode::SamplePendingPoints()
 void FCSWindowBrushEdMode::CommitSamples(const TArray<FCSBrushSample>& /*Samples*/)
 {
 	ACSHouseActor* Target = TargetActor.Get();
-	UCSHouseSubsystem* Subsystem = GetHouseSubsystem();
-	if (!Target || !Subsystem || !bLastHitValid) return;
+	if (!Target || !bLastHitValid) return;
 
 	// 从命中点往墙里反推一条短射线。⚠️ 不复用相机射线：那样掠射角点击会落在别处，而这条
 	// 恒垂直于墙、必然重新命中同一面（`CSHouse_RayHitWall` 只认外表面，`dot(Dir, 外法线) < 0`
@@ -112,7 +110,7 @@ void FCSWindowBrushEdMode::CommitSamples(const TArray<FCSBrushSample>& /*Samples
 	if (!Class) Class = ACSWindowMarker::StaticClass();
 
 	FScopedTransaction Transaction(NSLOCTEXT("CSWindowBrush", "PlaceWindow", "Place Window"));
-	ACSHouseFeatureMarker* Marker = Subsystem->PlaceMarkerAlongRay(Class, Origin, -LastHitNormal, Reach);
+	ACSHouseFeatureMarker* Marker = UCSHouseLibrary::PlaceMarkerAlongRay(Target, Class, Origin, -LastHitNormal, Reach);
 
 	// 打空不算错：`PlaceMarkerAlongRay` 在没命中时**什么都不生成**（没有"游离标记"这种状态），
 	// 所以这里也没有需要回滚的东西。

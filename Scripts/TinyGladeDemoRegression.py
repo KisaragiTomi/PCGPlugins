@@ -1830,12 +1830,14 @@ def demo_house_window():
     # `EditorActorSubsystem` 那条是先放置、回调之后才 `SetActorLocationAndRotation`（回调那一刻
     # forward 还是默认 +X，实测咬上 11 m 外的另一栋房）。点击给的是相机射线 + 精确命中点，
     # 不依赖 actor 自身朝向 —— 从根上没有那个问题，所以那条路连同它的三道闸一起退役了。
-    hs = unreal.CSHouseSubsystem.get_house_subsystem(house)
-    check("the house subsystem is reachable from script (world subsystems have no Python binding)",
+    # 2026-09-16 起没有 subsystem：执行面是 `UCSHouseLibrary::PlaceMarkerAlongRay`（静态 BlueprintCallable），
+    # WorldContext 参数在 Python 里是普通的显式参数，传房子本身最顺手。
+    hs = getattr(unreal, "CSHouseLibrary", None)
+    check("the house library is reachable from script (the placement entry is a static BlueprintCallable)",
           hs is not None)
     half_y = house.get_editor_property("FootprintSize").y * 0.5
     placed = hs.place_marker_along_ray(
-        unreal.CSWindowMarker,
+        house, unreal.CSWindowMarker,
         unreal.Vector(loc.x - 150.0, loc.y - half_y - 120.0, loc.z + 150.0),
         unreal.Vector(0.0, 1.0, 0.0), 400.0) if hs else None
     check("one brush click on a wall cuts exactly one window",
@@ -1850,7 +1852,7 @@ def demo_house_window():
     # 是不够的，必须连计数一起判，否则"生成了但没登记"会静静地漏过去。
     before_miss = (house.get_window_count(), house.get_feature_marker_count())
     miss = hs.place_marker_along_ray(
-        unreal.CSWindowMarker, unreal.Vector(loc.x, loc.y - 5000.0, loc.z + 5000.0),
+        house, unreal.CSWindowMarker, unreal.Vector(loc.x, loc.y - 5000.0, loc.z + 5000.0),
         unreal.Vector(0.0, 0.0, 1.0), 400.0) if hs else None
     check("a click that misses every wall creates nothing at all",
           miss is None and before_miss == (house.get_window_count(), house.get_feature_marker_count()),
@@ -1861,7 +1863,7 @@ def demo_house_window():
     gothic_bp = unreal.load_asset("/PCGPlugins/HouseTest/BP_Window_Gothic_1x1")
     if gothic_bp and hs:
         g = hs.place_marker_along_ray(
-            gothic_bp.generated_class(),
+            house, gothic_bp.generated_class(),
             unreal.Vector(loc.x + 150.0, loc.y - half_y - 120.0, loc.z + 150.0),
             unreal.Vector(0.0, 1.0, 0.0), 400.0)
         gw, gh = (g.get_demand_size() if g else (0.0, 0.0))
@@ -1888,7 +1890,7 @@ def demo_house_window():
     # 也走笔刷那条路生成 —— `ACSHouseFeatureMarker` 自 2026-09-06 起是 `NotPlaceable`
     # （拖放入口已退役），`spawn_actor_from_class` 那条不再是它的生成方式。
     marker = hs.place_marker_along_ray(
-        unreal.CSWindowMarker,
+        house, unreal.CSWindowMarker,
         unreal.Vector(loc.x + half_x + 120.0, loc.y, loc.z + 150.0),
         unreal.Vector(-1.0, 0.0, 0.0), 400.0) if hs else None
     check("window marker: placed by a brush click", marker is not None)
@@ -2045,18 +2047,15 @@ def spawn_house(label, x, y, z, size_x, size_y):
 
 
 def demo_house_seam():
-    """D7 接缝（裁决二）。
+    """D7 接缝（2026-09-16 接触记录）。
 
-    接缝是**纯函数**：输入两房 footprint / 朝向 / 高度，输出砖列。零共享状态、零跨房簿记、
-    零撤销 —— 没有接缝 actor，两栋房各自算出**同一条**缝，两边都画。
+    两栋房之间是一条共享的接触记录：房子只知道自己跟哪些接触有关，接触只知道自己跟哪两栋房有关。
+    谁动了谁发（`ReceiveContactFrom`），被发方只验只用；拖拽帧冻结、松手才提交；**一条缝只砌一次**
+    —— 规范序里第一个能出砖的（GUID 小者）出砖，另一端 0 块。
 
-    ⚠️ **"逐位相同"那条硬证据在单测里**（`House.SeamIsAPureFunction`，memcmp 级别）。这一节
-    是它的端到端回声：两栋房报出来的交点数与砖数必须一致，且**只重建其中一栋**不改变任何一边。
-
-    ⚠️ `get_seam_undrawable_reason()` 那条才是本节的重点，数量断言只是它的前提。接缝有**两半**，
-    两半各自能静默失效：洞那一半根本不是几何（墙材质不是 Masked ⇒ 两栋房的墙原样互相插着），
-    砖那一半走 GPU 实例路（母材质没勾 ISM ⇒ 引擎静默换默认材质）。两种情形下交点数 / 砖数 /
-    裁剪段数 / 三角形数**全部照绿**。
+    ⚠️ 纯函数那半（交点 / 裁剪 / 逐位相同）在单测 `House.Seam*`，协议那半在 `House.Contact*`。这一节是
+    端到端回声：真材质、真砖、真 GPU 实例路。`get_seam_undrawable_reason()` 那条仍是重点 —— 接缝有**两半**，
+    两半各自能静默失效（墙材质不是 Masked / 砖材质没勾 ISM），数量断言对它们一个字都说不了。
     """
     unreal.log("========== L_HouseGroundDemo :: seam ==========")
     unreal.EditorLoadingAndSavingUtils.load_map("/PCGPlugins/HouseTest/L_HouseGroundDemo")
@@ -2071,12 +2070,11 @@ def demo_house_seam():
     house.set_editor_property("FootprintSize", unreal.Vector2D(600.0, 400.0))
     house.rebuild_house()
 
-    base_corners = house.get_seam_corner_count()
     base_cuts = house.get_seam_cut_count()
     base_bricks = house.get_frame_brick_count()
     base_tris = settle_tris(house.get_tiny_glade_mesh())
-    check("a lone house has no seam", base_corners == 0 and base_cuts == 0,
-          "corners=%d cuts=%d" % (base_corners, base_cuts))
+    check("a lone house has no contact", house.get_contact_count() == 0 and base_cuts == 0,
+          "contacts=%d cuts=%d" % (house.get_contact_count(), base_cuts))
 
     # ---- 摆一栋压上来的邻居：600x400 与 500x500 偏移 (250, 150) ⇒ 轮廓真相交 ----
     loc = house.get_actor_location()
@@ -2088,50 +2086,55 @@ def demo_house_seam():
     try:
         house.rebuild_house()
         other.rebuild_house()
+        owner = house if house.get_seam_owned_post_count() > 0 else other
+        guest = other if owner is house else house
 
+        check("two overlapping houses share one contact", house.get_contact_count() == 1 and other.get_contact_count() == 1,
+              "A=%d B=%d" % (house.get_contact_count(), other.get_contact_count()))
+        check("both walls are clipped where they poke into each other",
+              house.get_seam_cut_count() > 0 and other.get_seam_cut_count() > 0,
+              "A cuts=%d B cuts=%d" % (house.get_seam_cut_count(), other.get_seam_cut_count()))
+        check("both report the same crossings", house.get_seam_corner_count() > 0
+              and house.get_seam_corner_count() == other.get_seam_corner_count(),
+              "A=%d B=%d" % (house.get_seam_corner_count(), other.get_seam_corner_count()))
+        check("exactly one end builds the posts (a seam is bricked once)",
+              owner.get_seam_owned_post_count() > 0 and owner.get_seam_brick_count() > 0
+              and guest.get_seam_owned_post_count() == 0 and guest.get_seam_brick_count() == 0,
+              "owner(posts=%d bricks=%d) guest(posts=%d bricks=%d)"
+              % (owner.get_seam_owned_post_count(), owner.get_seam_brick_count(),
+                 guest.get_seam_owned_post_count(), guest.get_seam_brick_count()))
+        if owner is house:
+            check("the seam bricks join the door-frame bricks in one component",
+                  house.get_frame_brick_count() == base_bricks + house.get_seam_brick_count(),
+                  "bricks=%d base=%d seam=%d" % (house.get_frame_brick_count(), base_bricks, house.get_seam_brick_count()))
+        check("both contact tables audit clean", len(house.audit_contacts()) == 0 and len(other.audit_contacts()) == 0,
+              "A=%s B=%s" % (list(house.audit_contacts()), list(other.audit_contacts())))
+
+        # 只重建**其中一栋**：输入没变 ⇒ 不重发，两边一个数都不动。
         corners = house.get_seam_corner_count()
-        cuts = house.get_seam_cut_count()
-        bricks = house.get_frame_brick_count()
-        seam_bricks = house.get_seam_brick_count()
-        check("two overlapping houses grow a seam", corners > 0 and seam_bricks > 0,
-              "corners=%d seam_bricks=%d" % (corners, seam_bricks))
-        check("the seam clips the walls that poke into the neighbour", cuts > 0, "cuts=%d" % cuts)
-        check("the seam bricks join the door-frame bricks in one component",
-              bricks == base_bricks + seam_bricks,
-              "bricks=%d base=%d seam=%d" % (bricks, base_bricks, seam_bricks))
-
-        # ---- 纯函数性：两栋房各自算出同一条缝（逐位那条在单测里）----
-        check("both houses see the same seam", other.get_seam_corner_count() == corners
-              and other.get_seam_brick_count() == seam_bricks,
-              "A(corners=%d bricks=%d) B(corners=%d bricks=%d)"
-              % (corners, seam_bricks, other.get_seam_corner_count(), other.get_seam_brick_count()))
-
-        # 只重建**其中一栋**：没有归属、没有簿记 ⇒ 两边一个数都不许动。
+        owner_bricks = owner.get_seam_brick_count()
         other.rebuild_house()
-        check("rebuilding only one house leaves both seams untouched",
-              house.get_seam_corner_count() == corners and house.get_seam_brick_count() == seam_bricks
-              and other.get_seam_corner_count() == corners and other.get_seam_brick_count() == seam_bricks,
-              "A(corners=%d bricks=%d) B(corners=%d bricks=%d)"
-              % (house.get_seam_corner_count(), house.get_seam_brick_count(),
-                 other.get_seam_corner_count(), other.get_seam_brick_count()))
+        check("rebuilding only one house leaves both ends untouched",
+              house.get_seam_corner_count() == corners and owner.get_seam_brick_count() == owner_bricks
+              and guest.get_seam_brick_count() == 0,
+              "corners=%d owner_bricks=%d guest_bricks=%d"
+              % (house.get_seam_corner_count(), owner.get_seam_brick_count(), guest.get_seam_brick_count()))
 
-        # ---- 邻居的 `bSeamEnabled` 不许影响这栋房（顺序无关的执行面）----
-        #
-        # ⚠️ **这一条真的红过。** 第一版让 `GatherSeamNeighbours` 读了邻居的 `bSeamEnabled`
-        # （"一条缝要么两边都出，要么都不出"），于是分两句改开关时，先重建的那栋看到的是对方的
-        # 旧值：出图里 A 报 corners=0 而 B 报 corners=2 —— 正好是本轮要证的对称性的反面。
-        # `bSeamEnabled` 是"**我**画不画我这一份"，不是世界状态；裁决二列的输入里也没有它。
+        # ---- 参不参与：任一端关掉，缝整体消失（09-15 裁决，取代早先"我画不画我这一份"）----
         other.set_editor_property("bSeamEnabled", False)
         other.rebuild_house()
         house.rebuild_house()
-        check("the neighbour's own seam switch does not touch this house's half",
-              house.get_seam_corner_count() == corners and house.get_seam_brick_count() == seam_bricks
-              and other.get_seam_brick_count() == 0,
-              "A(corners=%d bricks=%d) B(bricks=%d)"
-              % (house.get_seam_corner_count(), house.get_seam_brick_count(), other.get_seam_brick_count()))
+        check("switching off either end removes the whole seam",
+              house.get_contact_count() == 0 and house.get_seam_cut_count() == 0
+              and house.get_seam_brick_count() == 0 and other.get_seam_brick_count() == 0,
+              "A(contacts=%d cuts=%d bricks=%d) B(bricks=%d)"
+              % (house.get_contact_count(), house.get_seam_cut_count(), house.get_seam_brick_count(), other.get_seam_brick_count()))
         other.set_editor_property("bSeamEnabled", True)
         other.rebuild_house()
         house.rebuild_house()
+        check("switching it back on restores the seam",
+              house.get_contact_count() == 1 and owner.get_seam_owned_post_count() > 0,
+              "contacts=%d owner_posts=%d" % (house.get_contact_count(), owner.get_seam_owned_post_count()))
 
         # ---- 洞是 clip 出来的，几何仍然实心（裁决三，全局不变量）----
         seam_tris = settle_tris(house.get_tiny_glade_mesh())
@@ -2139,63 +2142,60 @@ def demo_house_seam():
               "tris=%d (was %d)" % (seam_tris, base_tris))
 
         # ---- 它真的会被画出来（渲染侧逐环 + 墙材质必须是 Masked + 砖材质必须支持实例化）----
-        # 调原因版，不调 is_seam_drawable()：后者不可画时返回 None，str(None) 会伪造一句原因。
-        why = str(house.get_seam_undrawable_reason())
-        check("the seam is actually drawable (Masked wall material / seam bricks / ISM-capable material)",
+        why = str(owner.get_seam_undrawable_reason())
+        check("the owner's seam is actually drawable (Masked wall material / posts / ISM-capable material)",
               why == "", why)
-        why_other = str(other.get_seam_undrawable_reason())
-        check("and so is the neighbour's half of it", why_other == "", why_other)
+        why_guest = str(guest.get_seam_undrawable_reason())
+        check("the guest's clip is drawable too (it builds no posts by design)", why_guest == "", why_guest)
 
         # ---- 幂等 ----
         house.reevaluate_site()
         check("seam rebuild is idempotent",
-              house.get_seam_corner_count() == corners and house.get_seam_brick_count() == seam_bricks,
-              "corners=%d bricks=%d" % (house.get_seam_corner_count(), house.get_seam_brick_count()))
+              house.get_seam_corner_count() == corners and owner.get_seam_brick_count() == owner_bricks,
+              "corners=%d owner_bricks=%d" % (house.get_seam_corner_count(), owner.get_seam_brick_count()))
 
-        # ---- 零阻塞：拖尺寸 12 帧，接缝开着 ----
-        #
-        # 接缝砖与门框砖共用**同一份常驻容量**，所以这条钉的是"别为了接缝把扩容加回来"。
-        # 起始尺寸显式钉死再 rebuild_house()，一次性的容量与包围盒成本不许落进测量窗口。
-        house.set_editor_property("FootprintSize", unreal.Vector2D(600.0, 400.0))
-        house.rebuild_house()
-        check("the seam resize test starts with a seam", house.get_seam_brick_count() > 0,
-              "seam_bricks=%d" % house.get_seam_brick_count())
+        # ---- 拖拽帧冻结、松手提交：拖 12 帧对端一次都不被写，松手后写一次 ----
+        other.get_contact_count()
         before = unreal.CSMesh.get_blocking_flush_count()
         for i in range(1, 13):
-            house.set_editor_property("FootprintSize", unreal.Vector2D(600.0 + i * 5.0, 400.0))
-            house.reevaluate_site()
+            house.push_edge(1, 5.0, False)
         flush_delta = unreal.CSMesh.get_blocking_flush_count() - before
-        check("dragging FootprintSize for 12 frames with a seam on blocks the game thread zero times",
+        check("dragging an edge for 12 frames with a seam on blocks the game thread zero times",
               flush_delta == 0, "flushes=%d" % flush_delta)
-        check("the dragged house still has a seam", house.get_seam_brick_count() > 0,
-              "seam_bricks=%d" % house.get_seam_brick_count())
+        check("the neighbour is not written while dragging", house.is_in_gizmo_drag() and not other.is_reevaluate_pending(),
+              "drag=%s pending=%s" % (house.is_in_gizmo_drag(), other.is_reevaluate_pending()))
+        house.push_edge(1, 0.0, True)
+        check("release writes the neighbour once", (not house.is_in_gizmo_drag()) and other.is_reevaluate_pending(),
+              "drag=%s pending=%s" % (house.is_in_gizmo_drag(), other.is_reevaluate_pending()))
+        check("the dragged house still has a seam", house.get_contact_count() == 1 and house.get_seam_cut_count() > 0,
+              "contacts=%d cuts=%d" % (house.get_contact_count(), house.get_seam_cut_count()))
+        check("both tables audit clean after the drag", len(house.audit_contacts()) == 0 and len(other.audit_contacts()) == 0,
+              "A=%s B=%s" % (list(house.audit_contacts()), list(other.audit_contacts())))
 
-        # ---- 关掉开关 ⇒ 砖与裁剪**逐位**消失（对照组，也是出图脚本用的那个开关）----
+        # ---- 关掉自己的开关 ⇒ 砖与裁剪**逐位**消失（对照组，也是出图脚本用的那个开关）----
         house.set_editor_property("FootprintSize", unreal.Vector2D(600.0, 400.0))
         house.rebuild_house()
-        on_bricks = house.get_frame_brick_count()
         house.set_editor_property("bSeamEnabled", False)
         house.rebuild_house()
         check("switching the seam off removes exactly the bricks and cuts it added",
-              house.get_seam_corner_count() == 0 and house.get_seam_brick_count() == 0
+              house.get_contact_count() == 0 and house.get_seam_brick_count() == 0
               and house.get_seam_cut_count() == 0 and house.get_frame_brick_count() == base_bricks,
-              "corners=%d seam_bricks=%d cuts=%d bricks=%d/%d (on: %d)"
-              % (house.get_seam_corner_count(), house.get_seam_brick_count(), house.get_seam_cut_count(),
-                 house.get_frame_brick_count(), base_bricks, on_bricks))
+              "contacts=%d seam_bricks=%d cuts=%d bricks=%d/%d"
+              % (house.get_contact_count(), house.get_seam_brick_count(), house.get_seam_cut_count(),
+                 house.get_frame_brick_count(), base_bricks))
         house.set_editor_property("bSeamEnabled", True)
         house.rebuild_house()
 
-        # ---- 触发条件是 footprint **真重叠**，不是"靠得近"：挪开就没缝 ----
+        # ---- 触发条件是 footprint **真重叠**，不是"靠得近"：挪开就没缝（脚本直设 transform 也提交）----
         other.set_actor_location(unreal.Vector(loc.x + 1400.0, loc.y, loc.z), False, False)
         other.rebuild_house()
         house.rebuild_house()
         check("moving the neighbour clear of the footprint drops the seam entirely",
-              house.get_seam_corner_count() == 0 and house.get_seam_brick_count() == 0
+              house.get_contact_count() == 0 and house.get_seam_brick_count() == 0
               and house.get_frame_brick_count() == base_bricks,
-              "corners=%d seam_bricks=%d bricks=%d/%d"
-              % (house.get_seam_corner_count(), house.get_seam_brick_count(),
+              "contacts=%d seam_bricks=%d bricks=%d/%d"
+              % (house.get_contact_count(), house.get_seam_brick_count(),
                  house.get_frame_brick_count(), base_bricks))
-        # 挪开之后房体也要回到原样：接缝裁剪是派生物，没有残留。
         check("and the body goes back to the shape it had before the neighbour arrived",
               settle_tris(house.get_tiny_glade_mesh()) == base_tris,
               "tris=%d want=%d" % (settle_tris(house.get_tiny_glade_mesh()), base_tris))
@@ -2280,7 +2280,7 @@ def demo_house_resize():
     # ---- ③ 拖动期零阻塞（第十一条 flushes=0），且派生物跟得住 ----
     #
     # 与上面那些 set_editor_property 拖动的区别：push_edge 是**机制入口**，它会多做两件事
-    # （标脏 subsystem、按 MinFootprint 修正尺寸）。这条断言保证那两件事没有把容量/包围盒的稳态破掉。
+    # （按 MinFootprint 修正尺寸、同步重求值）。这条断言保证那两件事没有把容量/包围盒的稳态破掉。
     house.set_editor_property("FootprintSize", unreal.Vector2D(600.0, 400.0))
     house.rebuild_house()
     check("the push-edge flush test starts with frame bricks", house.get_frame_brick_count() > 0,

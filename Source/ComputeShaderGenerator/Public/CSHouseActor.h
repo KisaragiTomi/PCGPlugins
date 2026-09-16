@@ -10,6 +10,7 @@
 #include "CSHouseResize.h"
 #include "CSHouseRoof.h"
 #include "CSHouseSeam.h"
+#include "Components/SceneComponent.h"   // EUpdateTransformFlags：根组件 TransformUpdated 的回调签名
 #include "CSHouseTile.h"
 #include "CSHouseTrim.h"
 #include "CSHouseVine.h"
@@ -17,6 +18,7 @@
 #include "CSHouseActor.generated.h"
 
 class ACSGroundActor;
+struct FCSHouseContact;
 class ACSHouseFeatureMarker;
 class ACSHouseHandleActor;
 class ACSHouseHeightHandleActor;
@@ -886,11 +888,12 @@ public:
 	int32 EffectiveFrameCapacity() const;
 
 	// -------------------------------------------------------------------------
-	// Seam（D7 接缝，2026-08-30 裁决二）—— 纯函数，零共享状态
+	// Seam（D7 接缝，2026-09-16「接触记录」）—— 共享记录，谁动了谁发，松手才提交
 	//
-	// 两栋房 footprint 真重叠时**只**产生两样东西：轮廓交点上的接缝砖柱，以及把插进邻居
-	// 房间里的那截墙抹掉的裁剪场。除此之外两栋房的任何内容都保持独立 —— 没有接缝 actor、
-	// 没有归属、没有跨房簿记、没有撤销。算法与"为什么两栋房各画一份是有意的"见 CSHouseSeam.h。
+	// 两栋房之间的关系是一条 `FCSHouseContact`（见 CSHouseContact.h）：房子只知道自己跟哪些接触
+	// 有关（`Contacts`），接触只知道自己跟哪两栋房有关。两栋房各持一个 TSharedPtr 指向同一个对象。
+	// 竖缝产生两样东西：轮廓交点上的接缝砖柱（只由 `Owner()` 那一端砌**一次**），以及把插进邻居
+	// 房间里的那截墙抹掉的裁剪场（两端各裁自己的）。协议见 `ReceiveContactFrom` / `UpdateContacts`。
 	//
 	// 接缝砖**共用门框砖那一个组件**（`FrameComponent`）：TG 全库也只有一块 `brick`，
 	// 而且这样容量、交接、剔除球、`SaveToStaticMesh` 出口、以及"材质勾没勾
@@ -898,16 +901,55 @@ public:
 	// -------------------------------------------------------------------------
 
 	/**
-	 * 关掉即**这栋房**不出接缝（它那一份砖与裁剪一起没）。
-	 *
-	 * 出图脚本靠它拍"同机位只切开关"的对照图。
-	 *
-	 * ⚠️ **它是"我画不画我这一份"，不是"这条缝存不存在"** —— 一栋房**不读**邻居的这个开关。
-	 * 读了的话几何就取决于两栋房谁先重建（实测：分两句改开关时，先重建的那栋看到对方的旧值，
-	 * A 报 0 根缝而 B 报 2 根），而顺序无关正是本模块要保证的东西。裁决二列的输入里也没有它。
+	 * 关掉即**这栋房不参与接缝**：接缝存在 ⇔ 两端都开着（09-15 裁决，取代早先"我画不画我这一份"）。
+	 * 任一端关掉，那条接触整个消失 —— 两端的砖与裁剪一起没。出图脚本靠它拍"同机位只切开关"的对照图。
+	 * 08-31 那条"不读邻居开关"的教训已被协议吸收：开关变化经提交发给对端，顺序不再影响结果。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Seam")
 	bool bSeamEnabled = true;
+
+	/**
+	 * 横缝容差 cm：上房底与下房檐口相差不超过它 ⇒ 判横缝（承托 / 悬挑），不出竖缝。
+	 * 挡的是「上房嵌进下房几十厘米」这个常态；TG 用 1.5 m 的柱高门槛顶替这条（计划 D7）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Seam", meta = (ClampMin = "0"))
+	float BearingTolerance = 100.0f;
+
+	/** 交点聚簇距离 cm（XY）：更近的交点并成一根柱（三维聚簇，见 `CSHouseSeam::MergePosts`）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Seam", meta = (ClampMin = "0"))
+	float SeamPostMergeDistance = 30.0f;
+
+	/** 交点离任一房 footprint 顶点不足它就不立柱（角石已在那儿）。TG 0.2 m。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Seam", meta = (ClampMin = "0"))
+	float SeamVertexClearance = 20.0f;
+
+	/** 柱高不足 N 块砖（`FrameBrickLength`）不砌。TG 3 块（1.5 m）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Seam", meta = (ClampMin = "0"))
+	int32 SeamMinPostBricks = 2;
+
+	/** 两墙外法线点积 ≥ 它（近平行同向）不出交点。TG 0.9。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Seam", meta = (ClampMin = "-1", ClampMax = "1"))
+	float SeamParallelDot = 0.9f;
+
+	/** 这栋房参不参与接缝（`bSeamEnabled`）。接触的 `IsAlive()` 读它。 */
+	bool IsSeamParticipant() const { return bSeamEnabled; }
+
+	/** 这栋房能不能砌接缝砖：`Owner()` 的判据。 */
+	bool CanBuildSeamBricks() const { return bFrameEnabled && FrameBrickMesh != nullptr; }
+
+	/** 这栋房喂给接缝纯函数的那份输入（身份 + 摆位 + 尺寸，无任何派生表）。`FCSHouseContact::Classify` 读两端的。 */
+	CSHouseSeam::FHouse MakeSeamHouse() const;
+
+	/**
+	 * 唯一的跨房通道（09-16 裁决）。`Contact` = `From` 与我之间现在的接触；空 = 不再接触 / 任一端关着 / `From` 被删。
+	 *
+	 * 验 → 改 → 标脏：先丢掉我手里所有涉及 `From` 的旧接触（顺手丢掉不活的），非空则收下，然后
+	 * `RequestReevaluate()`。**绝不同步重求值、不调 `From` 的 getter** —— `From` 正在遍历它自己的表。
+	 */
+	void ReceiveContactFrom(ACSHouseActor* From, TSharedPtr<FCSHouseContact> Contact);
+
+	/** 我手里是否持有这条接触（审计用：两端必须持有同一个对象）。 */
+	bool HoldsContact(const FCSHouseContact* Contact) const;
 
 	// -------------------------------------------------------------------------
 	// Quoin（D7 的**墙自身转角**那一半，合卷卷一 A7 / 卷五 A11）
@@ -1398,7 +1440,7 @@ public:
 	 * 现在一帧里来多少个通知，都只在 `Tick` 里兑现**一次**，与 N 无关。落在本帧还是下一帧，看通知
 	 * 在世界 tick 之前还是之后到：gizmo 拖动走 `PostEditMove`，在世界 tick 之前 ⇒ 本帧；EdMode
 	 * 的画笔在世界 tick 之后 ⇒ 下一帧。**至多延迟一帧**（用户裁决：视觉上无差别，且不经
-	 * `UCSHouseSubsystem` —— 房子自己决定什么时候更新）。
+	 * 任何 subsystem —— 房子自己决定什么时候更新）。
 	 *
 	 * "改完立刻读得到"不靠时机，靠的是每个派生物 getter 读前的 `FlushPendingReevaluate`：
 	 * 无头脚本与单测整段跑在同一帧里，`Tick` 根本插不进来。
@@ -1455,11 +1497,12 @@ public:
 	 * ⚠️ 这一轮**不做**抓手 / gizmo / EdMode（与 D8 窗户同一条纪律）。这里是"尺寸连续变化时
 	 * 派生物跟得住"的那套机制的唯一入口，将来的 handle actor 也只是往这里喂 Offset。
 	 *
-	 * 三件事都在这条路上一次做完，分开做就会各漏一样：
+	 * 两件事都在这条路上一次做完，分开做就会各漏一样：
 	 *  ① `MinFootprint` 下限（`CSHouse_ApplyEdgePush`，纯函数、可单测）——⚠️ 早先这里还写着
 	 *     "禁带"，那一套已随四坡屋顶于 2026-08-31 删除，`ApplyEdgePush` 只剩硬下界这一条 clamp；
-	 *  ② `UCSHouseSubsystem::MarkHouseDirty` —— 拖动期不必等 0.25 s 的兜底快扫；
-	 *  ③ `ReevaluateSite()` —— 走的是与平移完全相同的那条零阻塞路径，不另开快路。
+	 *  ② `ReevaluateSite()` —— 走的是与平移完全相同的那条零阻塞路径，不另开快路。
+	 *     （曾经夹在中间的 `UCSHouseSubsystem::MarkHouseDirty` 随 subsystem 于 2026-09-16 删除：它只是让
+	 *     subsystem 下一 tick 再重求值一遍，与这里的同步重求值重复。）
 	 *
 	 * `bFinished` 传 true 表示"松手"：等价于 gizmo 的 `PostEditMove(bFinished=true)`，
 	 * 会置 `bForceFullRebuild` 把拖动期为了不阻塞而留下的容量/包围盒余量重新收紧。
@@ -1609,14 +1652,6 @@ public:
 	FGuid GetHouseId() const { return HouseId; }
 
 	/**
-	 * 兜底快扫比对的量：量化世界变换 + footprint + 檐口高。
-	 *
-	 * 只包含**别人会关心的**状态（摆位与占地），不含门集合 —— 门是房子自己的派生物，
-	 * 由 ReevaluateSite 内部的形状哈希守卫，混进来只会让快扫在门变化时白唤醒一次。
-	 */
-	uint32 GetTrackingHash() const;
-
-	/**
 	 * 这个洞放得下吗（D8 的可行性谓词，纯参数判定、零 GPU 回读）：与任一已有洞的面板格按
 	 * OpeningClearance 膨胀相交即拒绝（**同边一维 S 区间**，Z 不参与 —— 用户裁决 2026-08-30，
 	 * C1 选甲：永久放弃"门上开窗"），落在墙面之外或超出墙高也拒绝。
@@ -1699,7 +1734,7 @@ public:
 	 * 一起传给 `SpawnActor`，`EditorActorSubsystem` 那条却是先放置、回调之后才设朝向）。点击给的
 	 * 是相机射线 + 精确命中点，不依赖 actor 自身朝向 —— 从根上没有那个问题。
 	 *
-	 * 落地全在 `UCSHouseSubsystem::PlaceMarkerAlongRay`，本函数只发一个请求。
+	 * 落地全在 `UCSHouseLibrary::PlaceMarkerAlongRay`，本函数只发一个请求。
 	 */
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "CS House|Window", meta = (DevelopmentOnly))
 	void StartWindowBrush();
@@ -1738,6 +1773,38 @@ public:
 	/** 这一轮被接缝抹掉的墙段数（clip，不是几何洞）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Seam")
 	int32 GetSeamCutCount() const { FlushPendingReevaluate(); return CurrentSeamCuts.Num(); }
+
+	/** 我手里的接触数（竖缝 + 横缝）。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Seam")
+	int32 GetContactCount() const { FlushPendingReevaluate(); return Contacts.Num(); }
+
+	/** 我出砖的柱数（聚簇之后）。非出砖方恒为 0 —— 这是"一条缝只砌一次"的观测量。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Seam")
+	int32 GetSeamOwnedPostCount() const { FlushPendingReevaluate(); return CurrentSeamOwnedPostCount; }
+
+	/** 正在被 gizmo / 抓手拖动（接缝冻结期）。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Seam")
+	bool IsInGizmoDrag() const { return bInGizmoDrag; }
+
+	/** 地面正在被拖动 / 落笔途中（最近一次地面广播未提交，接缝冻结期）。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Seam")
+	bool IsInGroundDrag() const { return bInGroundDrag; }
+
+	/** 欠着一次重求值（`RequestReevaluate` 之后、`Tick` / getter 补票之前）。 */
+	UFUNCTION(BlueprintPure, Category = "CS House")
+	bool IsReevaluatePending() const { return bReevaluatePending; }
+
+	/**
+	 * 接触表审计（调试与回归用）：每条接触都活着、两端持有同一个对象、两端现在真的接触、同一对没有两条、
+	 * 不在拖拽时没有欠着的提交。返回违反项，空即通过 —— 它把"静默陈旧"变成会红的断言。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CS House|Seam")
+	TArray<FString> AuditContacts() const;
+
+	/** 测试用：当前裁剪段（读前补票）。 */
+	const TArray<FCSWallCut>& DebugGetSeamCuts() const { FlushPendingReevaluate(); return CurrentSeamCuts; }
+	/** 测试用：接触表（读前补票）。 */
+	const TArray<TSharedPtr<FCSHouseContact>>& DebugGetContacts() const { FlushPendingReevaluate(); return Contacts; }
 
 	/** 角石砖数（同样含在 `GetFrameBrickCount()` 里 —— 三者共用一个组件与一份容量）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Quoin")
@@ -2217,19 +2284,31 @@ private:
 	 */
 	uint32 BuildFrameArches(TArray<CSHouseFrame::FElement>& OutElements, int32& OutBrickCount) const;
 
-	/** 这栋房喂给接缝纯函数的那份输入（身份 + 摆位 + 尺寸，无任何派生表）。 */
-	CSHouseSeam::FHouse MakeSeamHouse() const;
+	/**
+	 * world 里外接圆够得着的邻居，**按 GUID 升序**。名单 = `UCSHouseLibrary::GetHouses`（`TActorRange`），
+	 * 2026-09-16 起没有登记表：只在提交那一刻翻一次，开销可忽略。
+	 */
+	void GatherSeamCandidates(TArray<ACSHouseActor*>& Out) const;
+
+	/** 我的接缝输入（量化摆位 / yaw / footprint / 底 Z / 墙高 / 墙厚 + 开关 + 能否出砖 + 判定参数）。变了才提交。 */
+	uint32 ComputeSeamKey() const;
+
+	/** 本次重求值能否提交接缝：不在 gizmo 拖动、不在地面拖动。拖动标志有 2 s 无位移超时兜底。 */
+	bool CanCommitSeams();
 
 	/**
-	 * 外接圆够得着的邻居，**按 GUID 升序**。
-	 *
-	 * 读的是邻居的权威属性（变换 / footprint / 墙高），**不是它的任何缓存或派生表** ——
-	 * 裁决二那句"零共享状态"约束的是状态，不是只读的输入。粗筛用外接圆而不是"最近 N 个"：
-	 * 前者是纯几何谓词（谁在谁不在只由当前摆位决定），后者要排序、会在并列时抖。
+	 * 接触协议（09-16）：验 → （输入变了且可提交）清空自己的表、对"旧对端 ∪ 当前邻居"逐个 `Classify` 并
+	 * `ReceiveContactFrom` 发过去（不接触发空）。被发醒的一方只验只用不反发。
 	 */
-	void GatherSeamNeighbours(TArray<CSHouseSeam::FHouse>& Out) const;
+	void UpdateContacts(bool bCanCommit);
 
-	/** 接缝裁剪段（写 `CurrentSeamCuts`），返回它对房体形状哈希的贡献。 */
+	/** 删除路径：对每个旧对端发空。幂等；世界卸载 / 引擎退出期间不碰对端。 */
+	void DetachContacts();
+
+	/** 根组件的 `TransformUpdated`：任何来源的 transform 变化（gizmo / 脚本 / 复制 / Undo）都从这里标脏。 */
+	void HandleRootTransformUpdated(USceneComponent* UpdatedComponent, EUpdateTransformFlags UpdateTransformFlags, ETeleportType Teleport);
+
+	/** 接缝裁剪段（先跑接触协议，再从竖缝接触取我这一端的裁剪段写 `CurrentSeamCuts`），返回它对房体形状哈希的贡献。 */
 	uint32 ComputeSeamCuts();
 
 	/**
@@ -2449,10 +2528,26 @@ private:
 
 	uint32 FrameDescHash = 0;
 
-	/** 这一轮的接缝裁剪段（D7）。**派生物，每轮从两房的摆位重算**，不序列化、不做增量。 */
+	/** 这一轮的接缝裁剪段（D7）：从竖缝接触取我这一端的那份。派生物，不序列化。 */
 	TArray<FCSWallCut> CurrentSeamCuts;
 	int32 CurrentSeamCornerCount = 0;
 	int32 CurrentSeamBrickCount = 0;
+	int32 CurrentSeamOwnedPostCount = 0;
+
+	/**
+	 * 我参与的接触（09-16）。**故意不是 UPROPERTY**：不存盘、不进事务、复制 / PIE 得到空表，加载后第一次
+	 * 提交重建。两端各持一个指针指向同一个对象；对端失效 / 关掉开关的记录在下次「验」时丢弃。
+	 */
+	TArray<TSharedPtr<FCSHouseContact>> Contacts;
+	/** 上次提交时的 `ComputeSeamKey()`；`bSeamKeyValid` 为假 = 还没提交过（首次重求值即提交）。 */
+	uint32 LastSeamKey = 0;
+	bool bSeamKeyValid = false;
+	/** gizmo / 抓手拖动中（`PostEditMove(false)` / `Push*(bFinished=false)` 置，`true` 清）。接缝冻结期。 */
+	bool bInGizmoDrag = false;
+	double GizmoDragTouchedAt = 0.0;
+	/** 地面最近一次广播未提交（塑形物拖动 / 落笔途中）。接缝冻结期。 */
+	bool bInGroundDrag = false;
+	FDelegateHandle RootTransformUpdatedHandle;
 
 	/** 这一轮的角石（D7 墙自身转角）。同样是派生物，每轮从 footprint 重算。 */
 	int32 CurrentQuoinColumnCount = 0;

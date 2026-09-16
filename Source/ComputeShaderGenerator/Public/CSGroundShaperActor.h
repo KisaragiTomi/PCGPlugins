@@ -133,7 +133,8 @@ public:
 
 	/** 全量：让地面按塑形物重导出高度（区域更新 + 广播）。参数改动/移动都走这条。 */
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "CS Shaper")
-	void RebuildTerrain();
+	/** `bCommitted = false` 只在拖动帧（`PostEditMove(false)`）：地面的广播随之标成未提交，房子只落座、不写接缝。 */
+	void RebuildTerrain(bool bCommitted = true);
 
 	/** 声明式入口（基类语义）：等价于 RebuildTerrain，幂等。 */
 	virtual void ReevaluateSite() override;

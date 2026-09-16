@@ -1,6 +1,6 @@
 #include "CSHouseFeatureMarker.h"
 
-#include "CSHouseSubsystem.h"
+#include "CSHouseLibrary.h"
 #include "Components/SceneComponent.h"
 #include "Components/BillboardComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -64,12 +64,6 @@ ACSHouseFeatureMarker::ACSHouseFeatureMarker()
 	// 身份在构造期就定下来，而不是等第一次登记 —— 登记时才掷的话，"先 spawn 后摆位"这条
 	// 常见路径上会出现"同一个标记两次登记拿到两个 SourceId"，谓词随之把它当成两扇窗。
 	MarkerId = FGuid::NewGuid();
-}
-
-UCSHouseSubsystem* ACSHouseFeatureMarker::GetHouseSubsystem() const
-{
-	const UWorld* World = GetWorld();
-	return World ? World->GetSubsystem<UCSHouseSubsystem>() : nullptr;
 }
 
 void ACSHouseFeatureMarker::PostRegisterAllComponents()
@@ -328,8 +322,8 @@ void ACSHouseFeatureMarker::RegisterAnchor(ACSHouseActor& InHost)
 
 bool ACSHouseFeatureMarker::OnHandleDrag(bool bFinal)
 {
-	UCSHouseSubsystem* Subsystem = GetHouseSubsystem();
-	if (!Subsystem) return false;
+	const UWorld* HouseWorld = GetWorld();
+	if (!HouseWorld) return false;
 
 	const FVector Origin = GetActorLocation();
 
@@ -340,14 +334,14 @@ bool ACSHouseFeatureMarker::OnHandleDrag(bool bFinal)
 	// `PlaceMarkerAlongRay`，它自带命中、不经过本函数），闸门随之作废。本函数现在只服务
 	// **gizmo 拖动**——那时 actor 早已构造完整，朝向可信。
 	FCSWallHit Hit;
-	ACSHouseActor* Found = Subsystem->PickHouse(Origin, GetActorForwardVector(), HostProbeDistance, Hit);
+	ACSHouseActor* Found = UCSHouseLibrary::PickHouse(HouseWorld, Origin, GetActorForwardVector(), HostProbeDistance, Hit);
 
 	// ② 落空了再就近找一次：兜"贴着墙但朝向没摆正"。两条都空才算无宿主。
 	//    ⚠️ 这一条同时是**吸附之后的退路**：`SnapToAnchor` 把标记摆在外皮外 `WallStandoff` 处，
 	//    `WallStandoff = 0` 时射线的 `Dist` 恰好是 0、被 `Dist <= 0` 挡掉，只剩就近版能咬住。
 	if (!Found && SnapDistance > 0.0f)
 	{
-		Found = Subsystem->PickHouseNear(Origin, SnapDistance, Hit);
+		Found = UCSHouseLibrary::PickHouseNear(HouseWorld, Origin, SnapDistance, Hit);
 	}
 
 	if (!Found)

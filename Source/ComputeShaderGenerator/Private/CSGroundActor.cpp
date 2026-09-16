@@ -205,6 +205,7 @@ void ACSGroundActor::RebuildGroundMesh()
 	const TArray<TObjectPtr<UMaterialInterface>> Materials = { GroundMaterial };
 	if (!UploadTinyGladeSnapshot(Snapshot, Materials)) return;
 	MeshBuiltAtLocation = GetActorLocation();
+	bLastChangeCommitted = true;   // 全量重建永远算提交
 	OnGroundChanged.Broadcast(this, ComputeGroundWorldBox());
 	// 全量重建换掉了整份常驻流（石阶扫描与岩壳披挂都要读它的色流），所以这里必须重扫一遍。
 	RebuildStairs();
@@ -254,8 +255,13 @@ void ACSGroundActor::EndPaintStroke()
 	// 收笔：把队列彻底清空。EdMode 退出后没人再每帧推，剩下的笔不推就永远停在上一帧的画面。
 	FlushPaintToGpu(/*bBlockIfNeeded*/ true);
 
-	// 变更通知已在每次落笔时直推（OnGroundChanged），这里只负责序列化脏标记。
-	if (StrokeDirtyBounds.IsValid) MarkPackageDirty();
+	// 逐笔的广播都是未提交的（房子只落座、不写接缝）；收笔这里补一次**提交**广播，接缝在这一下跨房写入。
+	if (StrokeDirtyBounds.IsValid)
+	{
+		MarkPackageDirty();
+		bLastChangeCommitted = true;
+		OnGroundChanged.Broadcast(this, StrokeDirtyBounds);
+	}
 }
 
 void ACSGroundActor::FlushPaintToGpu(bool bBlockIfNeeded)
@@ -351,7 +357,8 @@ void ACSGroundActor::ApplyPaintStroke(FVector WorldCenter)
 	const FBox TickBounds(WorldCenter - Extent, WorldCenter + Extent);
 	StrokeDirtyBounds += TickBounds;
 
-	// 逐笔直推：画的过程中消费者（房屋）就实时重判，不等 stroke 结束。
+	// 逐笔直推：画的过程中消费者（房屋）就实时重判，不等 stroke 结束。**未提交**：收笔时 EndPaintStroke 再补一次提交广播。
+	bLastChangeCommitted = false;
 	OnGroundChanged.Broadcast(this, TickBounds);
 }
 
@@ -629,7 +636,7 @@ void ACSGroundActor::RebuildHeightsFromShapers()
 	RefreshHeightsInRegion(GetWorldRect2D());
 }
 
-void ACSGroundActor::RefreshHeightsInRegion(const FBox2D& WorldRectXY)
+void ACSGroundActor::RefreshHeightsInRegion(const FBox2D& WorldRectXY, bool bCommitted)
 {
 	EnsureMirrorInitialized();
 	if (!Mirror.IsInitialized()) return;
@@ -723,6 +730,7 @@ void ACSGroundActor::RefreshHeightsInRegion(const FBox2D& WorldRectXY)
 	const FBox ChangedBox(
 		FVector(Origin.X + X0 * Mirror.CellSize, Origin.Y + Y0 * Mirror.CellSize, Origin.Z - MaxAbsHeight - 1.0),
 		FVector(Origin.X + X1 * Mirror.CellSize, Origin.Y + Y1 * Mirror.CellSize, Origin.Z + MaxAbsHeight + 1.0));
+	bLastChangeCommitted = bCommitted;   // 塑形物拖动途中传 false，松手 / 改参 / 注销传 true
 	OnGroundChanged.Broadcast(this, ChangedBox);
 
 	// 高度场变了 ⇒ 等值线变了。石阶不订阅 OnGroundChanged（它就归本 actor，订阅自己的广播
@@ -2318,7 +2326,8 @@ void ACSGroundActor::PostEditMove(bool bFinished)
 	if (Delta.IsNearlyZero()) return;
 	UCSMeshOps::TranslateMesh(TinyGladeMesh, Delta);
 	MeshBuiltAtLocation = GetActorLocation();
-	// 地面挪了，压在上面的查询结果全变——拖动中也逐帧直推。
+	// 地面挪了，压在上面的查询结果全变——拖动中也逐帧直推（未提交；松手那次走 RebuildGroundMesh = 提交）。
+	bLastChangeCommitted = false;
 	OnGroundChanged.Broadcast(this, ComputeGroundWorldBox());
 }
 #endif

@@ -16,10 +16,12 @@
 #include "CSHouseResize.h"
 #include "CSHouseRoof.h"
 #include "CSHouseSeam.h"
+#include "CSHouseContact.h"   // D7 接触记录
+#include "Algo/Reverse.h"
 #include "CSHouseFeatureMarker.h"
 #include "CSHouseHeightHandleActor.h"
 #include "CSHouseResizeHandleActor.h"
-#include "CSHouseSubsystem.h"
+#include "CSHouseLibrary.h"
 #include "CSSplineBlockActor.h"
 #include "Components/StaticMeshComponent.h"   // House.BaseHandle 数框的四根条子
 #include "Engine/StaticMesh.h"   // House.WindowMarker 里 LoadObject<UStaticMesh> 要完整类型
@@ -4826,9 +4828,8 @@ bool FCSHouseWindowBrushPlacementTest::RunTest(const FString& Parameters)
 	House->Windows.Reset();
 	House->ReevaluateSite();
 
-	UCSHouseSubsystem* Sub = World->GetSubsystem<UCSHouseSubsystem>();
-	if (!TestNotNull(TEXT("House subsystem in the editor world"), Sub)) return false;
-	TestEqual(TEXT("the house registered itself with the subsystem"), Sub->GetTrackedHouseCount(), 1);
+	// 没有登记表（2026-09-16）：名单就是 world 本身，`UCSHouseLibrary::GetHouses` 走 `TActorRange`。
+	TestEqual(TEXT("the world enumerates exactly this one house"), UCSHouseLibrary::GetHouseCount(House), 1);
 
 	const FVector2D Footprint = House->FootprintSize;
 	const float T = House->WallThickness;
@@ -4934,7 +4935,7 @@ bool FCSHouseWindowBrushPlacementTest::RunTest(const FString& Parameters)
 		// ⚠️ 这一条是上面那个 `CLASS_Abstract` 断言的**执行面对照**：类标志说"能 spawn"，
 		// 这里证明它**真的**被 spawn 出来并落到了墙上。只判标志不判这条的话，
 		// 将来谁在 `PlaceMarkerAlongRay` 里加一道把退路挡掉的闸，标志断言照样绿。
-		ACSHouseFeatureMarker* Fallback = Sub->PlaceMarkerAlongRay(
+		ACSHouseFeatureMarker* Fallback = UCSHouseLibrary::PlaceMarkerAlongRay(World,
 			ACSWindowMarker::StaticClass(), Origin, Dir, 400.0f);
 		if (!TestNotNull(TEXT("the C++ fallback class (empty WindowBrushClass) really spawns"), Fallback))
 		{
@@ -4956,14 +4957,14 @@ bool FCSHouseWindowBrushPlacementTest::RunTest(const FString& Parameters)
 		// 静默变成另一条正则。
 		AddExpectedErrorPlain(TEXT("is abstract and cannot be spawned"),
 			EAutomationExpectedErrorFlags::Contains, 1);
-		ACSHouseFeatureMarker* Abstract = Sub->PlaceMarkerAlongRay(
+		ACSHouseFeatureMarker* Abstract = UCSHouseLibrary::PlaceMarkerAlongRay(World,
 			ACSHouseFeatureMarker::StaticClass(), Origin, Dir, 400.0f);
 		TestNull(TEXT("an abstract marker class places nothing"), Abstract);
 		TestEqual(TEXT("and leaves the window count alone"), House->GetWindowCount(), WindowsBefore);
 		TestEqual(TEXT("and the demand list alone"), House->GetFeatureMarkerCount(), MarkersBefore);
 
 		// —— 打空：同样什么都不生成（没有"游离标记"这种状态）——
-		ACSHouseFeatureMarker* Miss = Sub->PlaceMarkerAlongRay(
+		ACSHouseFeatureMarker* Miss = UCSHouseLibrary::PlaceMarkerAlongRay(World,
 			ACSWindowMarker::StaticClass(), FVector(0.0, 0.0, 100000.0), FVector::UpVector, 400.0f);
 		TestNull(TEXT("a ray that misses every wall places nothing"), Miss);
 		TestEqual(TEXT("and changes nothing"), House->GetWindowCount(), WindowsBefore);
@@ -6252,6 +6253,366 @@ bool FCSHouseMasonryContactTest::RunTest(const FString& Parameters)
 		}
 		TestTrue(TEXT("Support reaches the requested embedded bottom"), FMath::IsNearlyEqual(LastBottom,300.0f-Length,0.001f));
 	}
+	return true;
+}
+
+
+// =============================================================================
+// D7 接触记录（2026-09-16）—— 共享记录 / 写入口验 / 谁动了谁发 / 松手提交 / 一条缝只砌一次
+//
+// 纯函数那半（交点 / 裁剪 / 逐位相同）仍由 House.Seam* 三条钉着；这一组钉的是**协议**：
+// 两端持同一个对象、只有 Owner 砌砖、拖拽帧不发、松手才发、删除时对端清空、两栋同帧动也收敛。
+// =============================================================================
+
+namespace
+{
+struct FCSContactPair
+{
+	ACSHouseActor* A = nullptr;
+	ACSHouseActor* B = nullptr;
+};
+
+/** 两栋真相交的房（600×400 与 500×500 偏移 (250,150)，同回归脚本），都能出砖（引擎 cube 当砖）。 */
+FCSContactPair CSHouseTest_SpawnContactPair(UWorld* World, const FVector& AtA, const FVector& AtB, bool bSpawnBFirst = false)
+{
+	UStaticMesh* Brick = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	auto Spawn = [&](const FVector& At, const FVector2D& Size) -> ACSHouseActor*
+	{
+		ACSHouseActor* House = World->SpawnActor<ACSHouseActor>(At, FRotator::ZeroRotator);
+		if (!House) return nullptr;
+		House->Windows.Reset();
+		House->bSeamEnabled = true;
+		House->bFrameEnabled = true;
+		House->FrameBrickMesh = Brick;
+		House->FootprintSize = Size;
+		House->ReevaluateSite();
+		return House;
+	};
+	FCSContactPair Pair;
+	if (bSpawnBFirst)
+	{
+		Pair.B = Spawn(AtB, FVector2D(500.0, 500.0));
+		Pair.A = Spawn(AtA, FVector2D(600.0, 400.0));
+	}
+	else
+	{
+		Pair.A = Spawn(AtA, FVector2D(600.0, 400.0));
+		Pair.B = Spawn(AtB, FVector2D(500.0, 500.0));
+	}
+	return Pair;
+}
+
+const FCSHouseContact* CSHouseTest_FirstContact(const ACSHouseActor* House)
+{
+	const TArray<TSharedPtr<FCSHouseContact>>& Contacts = House->DebugGetContacts();
+	return Contacts.Num() > 0 ? Contacts[0].Get() : nullptr;
+}
+
+bool CSHouseTest_SameCuts(const TArray<FCSWallCut>& L, const TArray<FCSWallCut>& R)
+{
+	if (L.Num() != R.Num()) return false;
+	for (int32 I = 0; I < L.Num(); ++I)
+	{
+		if (L[I].EdgeIndex != R[I].EdgeIndex || L[I].MinS != R[I].MinS || L[I].MaxS != R[I].MaxS
+			|| L[I].BottomZ != R[I].BottomZ || L[I].TopZ != R[I].TopZ) return false;
+	}
+	return true;
+}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseContactSingleOwnerTest,
+	"PCGPlugins.ComputeShaderGenerator.House.ContactSingleOwner",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseContactSingleOwnerTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+	const FCSContactPair P = CSHouseTest_SpawnContactPair(World, FVector::ZeroVector, FVector(250.0, 150.0, 0.0));
+	if (!TestNotNull(TEXT("A"), P.A) || !TestNotNull(TEXT("B"), P.B)) return false;
+
+	TestEqual(TEXT("A holds one contact"), P.A->GetContactCount(), 1);
+	TestEqual(TEXT("B holds one contact"), P.B->GetContactCount(), 1);
+	const FCSHouseContact* CA = CSHouseTest_FirstContact(P.A);
+	const FCSHouseContact* CB = CSHouseTest_FirstContact(P.B);
+	TestTrue(TEXT("both ends hold the same object"), CA != nullptr && CA == CB);
+	if (CA) TestTrue(TEXT("it is a vertical seam"), CA->Kind == ECSHouseContactKind::Seam);
+	TestTrue(TEXT("A is cut where it pokes into B"), P.A->GetSeamCutCount() > 0);
+	TestTrue(TEXT("B is cut where it pokes into A"), P.B->GetSeamCutCount() > 0);
+	TestTrue(TEXT("both report the same crossings"),
+		P.A->GetSeamCornerCount() > 0 && P.A->GetSeamCornerCount() == P.B->GetSeamCornerCount());
+
+	// 一条缝只砌一次：规范序槽 0（GUID 小者）出砖，另一端一块都不砌。
+	const bool bAOwns = CSHouseSeam::IdLess(P.A->GetHouseId(), P.B->GetHouseId());
+	ACSHouseActor* Owner = bAOwns ? P.A : P.B;
+	ACSHouseActor* Guest = bAOwns ? P.B : P.A;
+	TestTrue(FString::Printf(TEXT("the GUID-smaller house builds the posts (posts=%d bricks=%d)"), Owner->GetSeamOwnedPostCount(), Owner->GetSeamBrickCount()),
+		Owner->GetSeamOwnedPostCount() > 0 && Owner->GetSeamBrickCount() > 0);
+	TestEqual(TEXT("the other house builds no posts"), Guest->GetSeamOwnedPostCount(), 0);
+	TestEqual(TEXT("and has no seam bricks"), Guest->GetSeamBrickCount(), 0);
+	if (CA) TestTrue(TEXT("Owner() agrees with the GUID order"), CA->Owner() == Owner);
+	TestEqual(TEXT("A audits clean"), P.A->AuditContacts().Num(), 0);
+	TestEqual(TEXT("B audits clean"), P.B->AuditContacts().Num(), 0);
+
+	// 只重建其中一栋：输入没变 ⇒ 不重发，两边一个数都不动，对象还是同一个。
+	P.B->ReevaluateSite();
+	TestTrue(TEXT("rebuilding one house alone keeps the shared object"), CSHouseTest_FirstContact(P.A) == CA && CSHouseTest_FirstContact(P.B) == CA);
+
+	World->DestroyActor(P.B);
+	World->DestroyActor(P.A);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseContactScriptedMoveTest,
+	"PCGPlugins.ComputeShaderGenerator.House.ContactScriptedMoveCommits",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseContactScriptedMoveTest::RunTest(const FString& Parameters)
+{
+	// 脚本直设 transform 没有"松手"：根组件 TransformUpdated 标脏，下一次重求值就是提交，对端收到**新对象**。
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+	const FCSContactPair P = CSHouseTest_SpawnContactPair(World, FVector::ZeroVector, FVector(250.0, 150.0, 0.0));
+	if (!TestNotNull(TEXT("A"), P.A) || !TestNotNull(TEXT("B"), P.B)) return false;
+
+	const FCSHouseContact* Before = CSHouseTest_FirstContact(P.B);
+	const TArray<FCSWallCut> BCutsBefore = P.B->DebugGetSeamCuts();
+	if (!TestNotNull(TEXT("a contact exists before the move"), Before)) return false;
+
+	P.A->SetActorLocation(FVector(40.0, 0.0, 0.0));
+	TestTrue(TEXT("SetActorLocation marks A pending through TransformUpdated"), P.A->IsReevaluatePending());
+	TestEqual(TEXT("A commits on its next evaluation and still holds one contact"), P.A->GetContactCount(), 1);
+	TestTrue(TEXT("B was written a new object"), CSHouseTest_FirstContact(P.B) != Before && P.B->GetContactCount() == 1);
+	TestTrue(TEXT("both ends hold the new object"), CSHouseTest_FirstContact(P.A) == CSHouseTest_FirstContact(P.B));
+	TestFalse(TEXT("B's cuts moved with A"), CSHouseTest_SameCuts(BCutsBefore, P.B->DebugGetSeamCuts()));
+	TestEqual(TEXT("A audits clean"), P.A->AuditContacts().Num(), 0);
+	TestEqual(TEXT("B audits clean"), P.B->AuditContacts().Num(), 0);
+
+	World->DestroyActor(P.B);
+	World->DestroyActor(P.A);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseContactCommitOnlyTest,
+	"PCGPlugins.ComputeShaderGenerator.House.ContactCommitOnly",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseContactCommitOnlyTest::RunTest(const FString& Parameters)
+{
+	// 拖拽帧（bFinished=false）接缝一概不动：自己的裁剪冻结、对端不被写；松手那一次才提交。
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+	const FCSContactPair P = CSHouseTest_SpawnContactPair(World, FVector::ZeroVector, FVector(250.0, 150.0, 0.0));
+	if (!TestNotNull(TEXT("A"), P.A) || !TestNotNull(TEXT("B"), P.B)) return false;
+
+	P.B->GetContactCount();   // 补票，让 B 不再欠账 —— 下面要断言"拖动期间 B 没被写"
+	const FCSHouseContact* P0 = CSHouseTest_FirstContact(P.B);
+	const TArray<FCSWallCut> ACutsBefore = P.A->DebugGetSeamCuts();
+	if (!TestNotNull(TEXT("a contact exists before the drag"), P0)) return false;
+
+	for (int32 Frame = 0; Frame < 3; ++Frame) P.A->PushEdge(1, 10.0f, /*bFinished=*/false);   // 东墙外推，拖动中
+	TestTrue(TEXT("A is in gizmo drag"), P.A->IsInGizmoDrag());
+	TestTrue(TEXT("A's own seam is frozen while dragging"), CSHouseTest_SameCuts(ACutsBefore, P.A->DebugGetSeamCuts()));
+	TestTrue(TEXT("B is not written during the drag"), CSHouseTest_FirstContact(P.B) == P0 && !P.B->IsReevaluatePending());
+	TestEqual(TEXT("the audit exempts the drag"), P.A->AuditContacts().Num(), 0);
+
+	P.A->PushEdge(1, 0.0f, /*bFinished=*/true);
+	TestFalse(TEXT("release ends the drag"), P.A->IsInGizmoDrag());
+	TestTrue(TEXT("release commits: B holds a new object"), CSHouseTest_FirstContact(P.B) != P0 && P.B->GetContactCount() == 1);
+	TestTrue(TEXT("both ends hold the new object"), CSHouseTest_FirstContact(P.A) == CSHouseTest_FirstContact(P.B));
+	TestFalse(TEXT("A's seam follows the new footprint after release"), CSHouseTest_SameCuts(ACutsBefore, P.A->DebugGetSeamCuts()));
+	TestEqual(TEXT("A audits clean"), P.A->AuditContacts().Num(), 0);
+	TestEqual(TEXT("B audits clean"), P.B->AuditContacts().Num(), 0);
+
+	World->DestroyActor(P.B);
+	World->DestroyActor(P.A);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseContactDetachOnDestroyTest,
+	"PCGPlugins.ComputeShaderGenerator.House.ContactDetachOnDestroy",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseContactDetachOnDestroyTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+	const FCSContactPair P = CSHouseTest_SpawnContactPair(World, FVector::ZeroVector, FVector(250.0, 150.0, 0.0));
+	if (!TestNotNull(TEXT("A"), P.A) || !TestNotNull(TEXT("B"), P.B)) return false;
+	TestEqual(TEXT("B starts with a contact"), P.B->GetContactCount(), 1);
+
+	World->DestroyActor(P.A);
+	TestEqual(TEXT("B drops the contact when A is destroyed"), P.B->GetContactCount(), 0);
+	TestEqual(TEXT("B has no cuts left"), P.B->GetSeamCutCount(), 0);
+	TestEqual(TEXT("B has no seam bricks left"), P.B->GetSeamBrickCount(), 0);
+	TestEqual(TEXT("B audits clean"), P.B->AuditContacts().Num(), 0);
+
+	World->DestroyActor(P.B);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseContactSpawnOrderTest,
+	"PCGPlugins.ComputeShaderGenerator.House.ContactSpawnOrderInvariant",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseContactSpawnOrderTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+	auto Measure = [&](bool bSpawnBFirst, int32& OutCutsA, int32& OutCutsB, int32& OutOwnerPosts, int32& OutOwnerBricks) -> bool
+	{
+		const FCSContactPair P = CSHouseTest_SpawnContactPair(World, FVector::ZeroVector, FVector(250.0, 150.0, 0.0), bSpawnBFirst);
+		if (!P.A || !P.B) return false;
+		OutCutsA = P.A->GetSeamCutCount();
+		OutCutsB = P.B->GetSeamCutCount();
+		ACSHouseActor* Owner = CSHouseSeam::IdLess(P.A->GetHouseId(), P.B->GetHouseId()) ? P.A : P.B;
+		OutOwnerPosts = Owner->GetSeamOwnedPostCount();
+		OutOwnerBricks = Owner->GetSeamBrickCount();
+		const bool bClean = P.A->AuditContacts().Num() == 0 && P.B->AuditContacts().Num() == 0
+			&& P.A->GetContactCount() == 1 && P.B->GetContactCount() == 1;
+		World->DestroyActor(P.B);
+		World->DestroyActor(P.A);
+		return bClean;
+	};
+	int32 CutsA1 = 0, CutsB1 = 0, Posts1 = 0, Bricks1 = 0, CutsA2 = 0, CutsB2 = 0, Posts2 = 0, Bricks2 = 0;
+	TestTrue(TEXT("A then B: one clean contact"), Measure(false, CutsA1, CutsB1, Posts1, Bricks1));
+	TestTrue(TEXT("B then A: one clean contact"), Measure(true, CutsA2, CutsB2, Posts2, Bricks2));
+	TestEqual(TEXT("A's cuts do not depend on spawn order"), CutsA2, CutsA1);
+	TestEqual(TEXT("B's cuts do not depend on spawn order"), CutsB2, CutsB1);
+	TestEqual(TEXT("the owner's posts do not depend on spawn order"), Posts2, Posts1);
+	TestEqual(TEXT("the owner's bricks do not depend on spawn order"), Bricks2, Bricks1);
+	TestTrue(TEXT("and there are posts at all"), Posts1 > 0 && Bricks1 > 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseContactMultiMoveTest,
+	"PCGPlugins.ComputeShaderGenerator.House.ContactMultiMoveConverges",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseContactMultiMoveTest::RunTest(const FString& Parameters)
+{
+	// 两栋同帧动（多选拖动松手）：互发一轮就停，不重复、不互相叫醒不停。
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+	const FCSContactPair P = CSHouseTest_SpawnContactPair(World, FVector::ZeroVector, FVector(250.0, 150.0, 0.0));
+	if (!TestNotNull(TEXT("A"), P.A) || !TestNotNull(TEXT("B"), P.B)) return false;
+
+	P.A->SetActorLocation(FVector(30.0, 0.0, 0.0));
+	P.B->SetActorLocation(FVector(280.0, 160.0, 0.0));
+	P.A->GetContactCount();
+	P.B->GetContactCount();
+	P.A->GetContactCount();
+	P.B->GetContactCount();
+	TestEqual(TEXT("A holds one contact"), P.A->GetContactCount(), 1);
+	TestEqual(TEXT("B holds one contact"), P.B->GetContactCount(), 1);
+	TestTrue(TEXT("both ends hold the same object"),
+		CSHouseTest_FirstContact(P.A) != nullptr && CSHouseTest_FirstContact(P.A) == CSHouseTest_FirstContact(P.B));
+	TestEqual(TEXT("A audits clean"), P.A->AuditContacts().Num(), 0);
+	TestEqual(TEXT("B audits clean"), P.B->AuditContacts().Num(), 0);
+
+	// 收敛：之后再补票谁都不再重求值。
+	const int64 CountA = P.A->GetReevaluateCount();
+	const int64 CountB = P.B->GetReevaluateCount();
+	P.A->GetContactCount();
+	P.B->GetContactCount();
+	P.A->GetContactCount();
+	TestEqual(TEXT("A does not re-evaluate again (no ping-pong)"), P.A->GetReevaluateCount(), CountA);
+	TestEqual(TEXT("B does not re-evaluate again (no ping-pong)"), P.B->GetReevaluateCount(), CountB);
+
+	World->DestroyActor(P.B);
+	World->DestroyActor(P.A);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseSeamPostMerge3DTest,
+	"PCGPlugins.ComputeShaderGenerator.House.SeamPostMerge3D",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseSeamPostMerge3DTest::RunTest(const FString& Parameters)
+{
+	// 三维聚簇：XY 近的归一簇；簇内 Z 重叠的并成一根、Z 不重叠的上下叠放；Owner 取簇内最小 GUID。
+	const FGuid G1(3u, 0u, 0u, 0u), G2(2u, 0u, 0u, 0u), G3(9u, 0u, 0u, 0u);
+	auto Post = [](double X, double Y, float Bottom, float Top, const FGuid& Owner, uint32 Seed)
+	{
+		CSHouseSeam::FPost P;
+		P.Point = FVector2D(X, Y); P.BottomZ = Bottom; P.TopZ = Top; P.OwnerId = Owner; P.Seed = Seed;
+		return P;
+	};
+	TArray<CSHouseSeam::FPost> In = {
+		Post(0.0, 0.0, 0.0f, 300.0f, G1, 7u),      // 簇 1
+		Post(10.0, 0.0, 100.0f, 400.0f, G2, 5u),   // 簇 1，Z 重叠 ⇒ 并入
+		Post(0.0, 0.0, 500.0f, 800.0f, G3, 9u),    // 簇 1，Z 隔 100 ⇒ 第二段
+		Post(100.0, 0.0, 0.0f, 300.0f, G3, 1u),    // 簇 2
+	};
+	TArray<CSHouseSeam::FPost> Out;
+	const int32 N = CSHouseSeam::MergePosts(In, 30.0f, 13.0f, Out);
+	TestEqual(TEXT("three posts come out"), N, 3);
+	if (N != 3) return false;
+	TestTrue(TEXT("the merged post spans the union of the overlapping Z ranges"), Out[0].BottomZ == 0.0f && Out[0].TopZ == 400.0f);
+	TestTrue(TEXT("the merged post sits at the cluster centroid"), Out[0].Point.Equals(FVector2D(10.0 / 3.0, 0.0), 1.0e-6));
+	TestTrue(TEXT("the merged post belongs to the smallest GUID"), Out[0].OwnerId == G2);
+	TestEqual(TEXT("and takes the smallest seed"), int32(Out[0].Seed), 5);
+	TestTrue(TEXT("the stacked segment stays separate at the same XY"),
+		Out[1].BottomZ == 500.0f && Out[1].TopZ == 800.0f && Out[1].Point.Equals(Out[0].Point, 1.0e-6));
+	TestTrue(TEXT("the far post is its own cluster"), Out[2].Point.Equals(FVector2D(100.0, 0.0), 1.0e-6) && Out[2].OwnerId == G3);
+
+	// 顺序无关：倒着喂，聚簇出同一个集合（输出顺序按最小输入下标，比较前先排一下）。
+	TArray<CSHouseSeam::FPost> Reversed = In;
+	Algo::Reverse(Reversed);
+	TArray<CSHouseSeam::FPost> Out2;
+	CSHouseSeam::MergePosts(Reversed, 30.0f, 13.0f, Out2);
+	auto Key = [](const CSHouseSeam::FPost& P) { return P.Point.X * 1.0e6 + P.Point.Y * 1.0e3 + double(P.BottomZ); };
+	Out.Sort([&](const CSHouseSeam::FPost& L, const CSHouseSeam::FPost& R) { return Key(L) < Key(R); });
+	Out2.Sort([&](const CSHouseSeam::FPost& L, const CSHouseSeam::FPost& R) { return Key(L) < Key(R); });
+	bool bSame = Out.Num() == Out2.Num();
+	for (int32 I = 0; bSame && I < Out.Num(); ++I)
+	{
+		bSame = Out[I].Point.Equals(Out2[I].Point, 1.0e-6) && Out[I].BottomZ == Out2[I].BottomZ && Out[I].TopZ == Out2[I].TopZ
+			&& Out[I].OwnerId == Out2[I].OwnerId && Out[I].Seed == Out2[I].Seed;
+	}
+	TestTrue(TEXT("feeding the posts in reverse order merges to the same set"), bSame);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseContactBearingTest,
+	"PCGPlugins.ComputeShaderGenerator.House.ContactBearingNoPosts",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseContactBearingTest::RunTest(const FString& Parameters)
+{
+	// 上房嵌进下房几十厘米（容差内）⇒ 横缝：不立矮墩子、不 clip；嵌得比容差深 ⇒ 竖缝。
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+	// 下房墙高 300；上房底 270（嵌 30 cm，BearingTolerance 默认 100）。没有地面 ⇒ 落座不改 Z。
+	const FCSContactPair P = CSHouseTest_SpawnContactPair(World, FVector::ZeroVector, FVector(200.0, 0.0, 270.0));
+	if (!TestNotNull(TEXT("A"), P.A) || !TestNotNull(TEXT("B"), P.B)) return false;
+
+	TestEqual(TEXT("a bearing contact exists on both ends"), P.A->GetContactCount() + P.B->GetContactCount(), 2);
+	const FCSHouseContact* C = CSHouseTest_FirstContact(P.A);
+	if (TestNotNull(TEXT("A holds it"), C)) TestTrue(TEXT("it is classified as bearing"), C->Kind == ECSHouseContactKind::Bearing);
+	TestEqual(TEXT("no vertical-seam cuts on A"), P.A->GetSeamCutCount(), 0);
+	TestEqual(TEXT("no vertical-seam cuts on B"), P.B->GetSeamCutCount(), 0);
+	TestEqual(TEXT("no stub posts on A"), P.A->GetSeamOwnedPostCount(), 0);
+	TestEqual(TEXT("no stub posts on B"), P.B->GetSeamOwnedPostCount(), 0);
+	TestEqual(TEXT("A audits clean"), P.A->AuditContacts().Num(), 0);
+
+	// 压下去 150 cm（> 容差）：这才是两栋房穿插，走竖缝。
+	P.B->SetActorLocation(FVector(200.0, 0.0, 150.0));
+	P.B->GetContactCount();
+	const FCSHouseContact* C2 = CSHouseTest_FirstContact(P.A);
+	if (TestNotNull(TEXT("A still holds a contact"), C2)) TestTrue(TEXT("deeper overlap is a vertical seam"), C2->Kind == ECSHouseContactKind::Seam);
+	TestTrue(TEXT("and it cuts"), P.A->GetSeamCutCount() > 0 && P.B->GetSeamCutCount() > 0);
+
+	World->DestroyActor(P.B);
+	World->DestroyActor(P.A);
 	return true;
 }
 

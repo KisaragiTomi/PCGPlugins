@@ -7,7 +7,7 @@
 #include "CSBrushEdModeBase.h"
 #include "CSHouseActor.h"
 #include "CSHouseFeatureMarker.h"
-#include "CSHouseSubsystem.h"
+#include "CSHouseLibrary.h"
 #include "CoreGlobals.h"                    // IsRunningCommandlet
 #include "Editor.h"                         // GEditor / GLevelEditorModeTools
 #include "EditorModeManager.h"              // FEditorModeTools
@@ -25,7 +25,7 @@
 // -----------------------------------------------------------------------------
 // 窗笔刷 EdMode 本体（D8，2026-09-06 用户裁决："点一下加一扇窗"）
 //
-// **为什么这一层需要单独的用例。** 落地那一步 `UCSHouseSubsystem::PlaceMarkerAlongRay` 已经被
+// **为什么这一层需要单独的用例。** 落地那一步 `UCSHouseLibrary::PlaceMarkerAlongRay` 已经被
 // `House.WindowBrushPlacement`（纯 CPU）与 `demo_house_window`（真演示关卡）两头钉住了，但
 // EdMode 这一层**一行断言都没有** —— 而它恰恰是三条"错了不报红"的接线所在：
 //
@@ -240,10 +240,10 @@ bool FCSWindowBrushEdModeTest::RunTest(const FString& Parameters)
 	}
 
 	// -------------------------------------------------------------------------
-	// 花名册全扫：笔刷开着时点哪栋就往哪栋上放，不限于按钮所属的那一栋
+	// 全世界扫：笔刷开着时点哪栋就往哪栋上放，不限于按钮所属的那一栋
 	// -------------------------------------------------------------------------
 	//
-	// ⚠️ 这条钉的是 `TraceCandidatePoint` 里"扫 `PickHouse`（全花名册）而不是只算 `TargetActor`"
+	// ⚠️ 这条钉的是 `TraceCandidatePoint` 里"扫 `PickHouse`（world 里全部房子）而不是只算 `TargetActor`"
 	// 那句注释。写成只算目标房的话，用户点第二栋房时笔刷球会贴在第一栋上 —— 而目标房那边的
 	// 每一条断言照绿。
 	{

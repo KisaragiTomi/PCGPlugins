@@ -11,7 +11,6 @@
 #include "Components/StaticMeshComponent.h"
 #include "CSHouseFeatureMarker.generated.h"
 
-class UCSHouseSubsystem;
 class UBillboardComponent;
 
 /**
@@ -72,7 +71,7 @@ class UBillboardComponent;
 // 什么时候被应用在两条 spawn 路径上不一样 —— `UEditorEngine::AddActor` 把 Rotation 一起传给
 // `SpawnActor`（回调时已对），`EditorActorSubsystem` 那条却是先放置、回调之后才设朝向（回调
 // 那一刻 forward 还是默认 +X，实测咬上 11 m 外的另一栋房并判 `SillTooLow`）。
-// 生成的正路现在是 `UCSHouseSubsystem::PlaceMarkerAlongRay` —— 它吃的是**视口点击那条射线**，
+// 生成的正路现在是 `UCSHouseLibrary::PlaceMarkerAlongRay` —— 它吃的是**视口点击那条射线**，
 // 与 actor 自身朝向无关。
 UCLASS(Abstract, NotBlueprintable, NotPlaceable)
 class COMPUTESHADERGENERATOR_API ACSHouseFeatureMarker : public ACSHouseHandleActor
@@ -360,8 +359,6 @@ protected:
 	void SetMeshPiecesVisible(bool bVisible);
 
 private:
-	UCSHouseSubsystem* GetHouseSubsystem() const;
-
 	/** 拖拽态：tick 开着的累计静止时长，超过 `DragIdleSeconds` 就自己收尾。 */
 	float IdleSeconds = 0.0f;
 	FVector LastTickLocation = FVector::ZeroVector;

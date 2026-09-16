@@ -110,7 +110,7 @@ void ACSGroundShaperActor::ReevaluateSite()
 	RebuildTerrain();
 }
 
-void ACSGroundShaperActor::RebuildTerrain()
+void ACSGroundShaperActor::RebuildTerrain(bool bCommitted)
 {
 	if (IsTemplate() || !GetWorld()) return;   // CDO / 未进世界的模板不碰场景
 	ResolveGroundAndRegister();
@@ -123,7 +123,7 @@ void ACSGroundShaperActor::RebuildTerrain()
 		FBox2D Region = NewFootprint;
 		if (LastAppliedFootprint.bIsValid) Region += LastAppliedFootprint;
 		LastAppliedFootprint = NewFootprint;
-		Ground->RefreshHeightsInRegion(Region);   // 高度真变了才广播（地面自己的石阶随之重扫）
+		Ground->RefreshHeightsInRegion(Region, bCommitted);   // 高度真变了才广播（地面自己的石阶随之重扫）
 	}
 }
 
@@ -185,6 +185,7 @@ void ACSGroundShaperActor::PostEditMove(bool bFinished)
 {
 	Super::PostEditMove(bFinished);
 	// v1 直推：拖动中每帧重导出，但只重算受影响的矩形 + 一个 GPU compute pass（见计划 D3/D9）。
-	RebuildTerrain();
+	// 拖动帧的广播标成未提交：房子每帧落座，但接缝的跨房写入等松手（D7）。
+	RebuildTerrain(/*bCommitted=*/bFinished);
 }
 #endif

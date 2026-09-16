@@ -180,10 +180,8 @@ inline bool OverlapZ(const FHouse& A, const FHouse& B, float& OutBottom, float& 
  * 凹折线上它是**保守**的：找到分离轴就一定分离，找不到时可能误报相交。误报无害 ——
  * 下游的交点与裁剪段是逐边精确求的，误报的一对算出来什么都没有。
  */
-inline bool Intersects(const FHouse& A, const FHouse& B)
+inline bool IntersectsXY(const FHouse& A, const FHouse& B)
 {
-	float Bottom = 0.0f, Top = 0.0f;
-	if (!OverlapZ(A, B, Bottom, Top)) return false;
 	if (!A.Footprint.IsValidFootprint() || !B.Footprint.IsValidFootprint()) return false;
 
 	FContour CornersA, CornersB;
@@ -220,7 +218,15 @@ inline bool Intersects(const FHouse& A, const FHouse& B)
 	return true;
 }
 
-/** 粗筛：外接圆都够不着就连交点都不用算（也是"邻居进不进哈希"的判据，见 `GetTrackingHash`）。 */
+/** footprint 真重叠 **且** Z 区间相交。横缝（承托 / 悬挑）只看前一半，见 `FCSHouseContact::Classify`。 */
+inline bool Intersects(const FHouse& A, const FHouse& B)
+{
+	float Bottom = 0.0f, Top = 0.0f;
+	if (!OverlapZ(A, B, Bottom, Top)) return false;
+	return IntersectsXY(A, B);
+}
+
+/** 粗筛：外接圆都够不着就连交点都不用算。 */
 inline bool WithinReach(const FHouse& A, const FHouse& B)
 {
 	return FVector2D::DistSquared(A.Center, B.Center) <= FMath::Square(A.Reach() + B.Reach());
@@ -233,6 +239,9 @@ struct FCorner
 	FVector2D Point = FVector2D::ZeroVector;
 	/** 两墙外法线的角平分（单位，世界 XY）：砖的进深轴朝它，也就是朝"两栋房外面"那个象限。 */
 	FVector2D Outward = FVector2D(1.0, 0.0);
+	/** 两面墙各自的外法线（单位，世界 XY）：`CornerNearlyParallel` 用它判"近乎贴合、不出柱"。 */
+	FVector2D NormalA = FVector2D(1.0, 0.0);
+	FVector2D NormalB = FVector2D(0.0, 1.0);
 	/** 世界 Z 区间：底取两房房底的较高者，顶取两檐口的较低者。 */
 	float BottomZ = 0.0f;
 	float TopZ = 0.0f;
@@ -286,6 +295,8 @@ inline int32 BuildCorners(const FHouse& A, const FHouse& B, TArray<FCorner>& Out
 			// 都一样，重要的是别产出一个零向量把整根柱子变成镜像。
 			const FVector2D Bisect = NI + NJ;
 			Corner.Outward = Bisect.SizeSquared() > UE_DOUBLE_KINDA_SMALL_NUMBER ? Bisect.GetSafeNormal() : NI;
+			Corner.NormalA = NI;
+			Corner.NormalB = NJ;
 			Corner.BottomZ = Bottom;
 			Corner.TopZ = Top;
 			OutCorners.Add(Corner);
@@ -373,5 +384,115 @@ inline int32 BuildCornerElements(const TArray<FCorner>& Corners, uint32 Seed,
 			Params, InOutElements, Cursor);
 	}
 	return Cursor - Before;
+}
+/**
+ * 交点离任一房 footprint 顶点是否不足 `Clearance` cm（世界 XY）。
+ *
+ * TG 的对位是 `spawn_stitches` 里那条「tag=1 且离最近矩形顶点 < 0.2 m 就不砌」：转角砖（角石）
+ * 已经在顶点上，再立一根缝柱只会撞在一起。用它取代早先计划里的「外露走线长 SeamMinExposure」。
+ */
+inline bool CornerNearVertex(const FHouse& A, const FHouse& B, const FVector2D& Point, float Clearance)
+{
+	if (Clearance <= 0.0f) return false;
+	const double ClearSq = double(Clearance) * double(Clearance);
+	for (const FHouse* H : { &A, &B })
+	{
+		for (const FVector2D& V : H->Footprint.Verts)
+		{
+			if (FVector2D::DistSquared(ToWorld(*H, V), Point) < ClearSq) return true;
+		}
+	}
+	return false;
+}
+
+/** 两墙外法线近乎平行同向（点积 ≥ MinDot）：两面墙近乎贴合，没有穿插要遮。TG 用 0.9。 */
+inline bool CornerNearlyParallel(const FCorner& Corner, float MinDot)
+{
+	return FVector2D::DotProduct(Corner.NormalA, Corner.NormalB) >= MinDot;
+}
+
+/**
+ * 一根待砌的柱（交点经过滤之后的样子，也是聚簇的输入与输出）。
+ *
+ * `OwnerId` 是"谁出砖"：来自所属接触的 `Owner()`；聚簇后取簇内最小者（`IdLess`）。
+ * `Seed` 是逐实例随机数的基：聚簇后取簇内最小者 —— 只要输入顺序确定，输出就逐位确定。
+ */
+struct FPost
+{
+	FVector2D Point = FVector2D::ZeroVector;
+	FVector2D Outward = FVector2D(1.0, 0.0);
+	float BottomZ = 0.0f;
+	float TopZ = 0.0f;
+	FGuid OwnerId;
+	uint32 Seed = 0;
+};
+
+/**
+ * 三维聚簇（2026-09-16 裁决，恢复 08-30 划出范围的「角柱邻近合并」）：
+ * ① XY 距离 < `MergeDistance` 的交点归一簇（并查集，与输入顺序无关）；
+ * ② 簇内按 Z 区间相交或间隙 < `ZGap` 并成段，每段一根柱：XY 取簇质心（同簇各段上下对齐）、
+ *    朝向取成员平均、Z 取段的 [min Bottom, max Top]、Owner 取段内最小 GUID、Seed 取段内最小。
+ * 同 XY 不同 Z 的两对交点 ⇒ 两根上下叠放的柱（与 TG「每个交点自带 Z 区间」的自然行为一致）；
+ * Z 重叠的并成一根，去掉 TG 那种两根柱互相打架。返回柱数。
+ *
+ * ⚠️ 每栋房只拿得到**自己参与的**接触的交点：三房交汇处 A–B 与 B–C 的交点靠近时 A 看不见 B–C
+ * 的，两端可能各立一根。要严格一致得按纯函数把邻域内所有对都算一遍；本轮接受（计划 D7）。
+ */
+inline int32 MergePosts(const TArray<FPost>& In, float MergeDistance, float ZGap, TArray<FPost>& Out)
+{
+	Out.Reset();
+	const int32 N = In.Num();
+	if (N == 0) return 0;
+
+	TArray<int32> Parent;
+	Parent.SetNumUninitialized(N);
+	for (int32 I = 0; I < N; ++I) Parent[I] = I;
+	auto Find = [&Parent](int32 I) { while (Parent[I] != I) { Parent[I] = Parent[Parent[I]]; I = Parent[I]; } return I; };
+	const double MergeSq = double(MergeDistance) * double(MergeDistance);
+	for (int32 I = 0; I < N; ++I)
+	{
+		for (int32 J = I + 1; J < N; ++J)
+		{
+			if (FVector2D::DistSquared(In[I].Point, In[J].Point) >= MergeSq) continue;
+			const int32 RI = Find(I), RJ = Find(J);
+			if (RI != RJ) Parent[FMath::Max(RI, RJ)] = FMath::Min(RI, RJ);   // 根恒为最小下标 ⇒ 与顺序无关
+		}
+	}
+
+	// 簇按最小成员下标出场 ⇒ 输出顺序只由输入顺序决定。
+	for (int32 Root = 0; Root < N; ++Root)
+	{
+		if (Find(Root) != Root) continue;
+		TArray<int32> Members;
+		for (int32 I = 0; I < N; ++I) if (Find(I) == Root) Members.Add(I);
+
+		FVector2D Centroid = FVector2D::ZeroVector, Outward = FVector2D::ZeroVector;
+		for (const int32 M : Members) { Centroid += In[M].Point; Outward += In[M].Outward; }
+		Centroid /= double(Members.Num());
+		Outward = Outward.SizeSquared() > UE_DOUBLE_KINDA_SMALL_NUMBER ? Outward.GetSafeNormal() : In[Members[0]].Outward;
+
+		// 稳定排序：先按 BottomZ，再按输入下标 —— 同底不同源时顺序仍然确定。
+		Members.Sort([&In](int32 L, int32 R) { return In[L].BottomZ != In[R].BottomZ ? In[L].BottomZ < In[R].BottomZ : L < R; });
+		FPost Current;
+		bool bOpen = false;
+		for (const int32 M : Members)
+		{
+			const FPost& P = In[M];
+			if (bOpen && P.BottomZ <= Current.TopZ + ZGap)
+			{
+				Current.TopZ = FMath::Max(Current.TopZ, P.TopZ);
+				if (P.OwnerId.IsValid() && (!Current.OwnerId.IsValid() || IdLess(P.OwnerId, Current.OwnerId))) Current.OwnerId = P.OwnerId;
+				Current.Seed = FMath::Min(Current.Seed, P.Seed);
+				continue;
+			}
+			if (bOpen) Out.Add(Current);
+			Current = P;
+			Current.Point = Centroid;
+			Current.Outward = Outward;
+			bOpen = true;
+		}
+		if (bOpen) Out.Add(Current);
+	}
+	return Out.Num();
 }
 }

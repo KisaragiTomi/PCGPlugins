@@ -320,13 +320,14 @@ struct FElement
 	 */
 	float CrossScale = 1.0f;
 	/**
-	 * **世界 Z 低于它的砖在材质里被 discard**（2026-09-05 用户裁决："转角门处角柱要剔除"）。
+	 * **世界 Z 低于它的砖不画**（2026-09-05 用户裁决："转角门处角柱要剔除"）。
 	 * `<= 0` = 不剔（默认，所有既有砖路逐位不变）。
 	 *
-	 * 实现走**逐实例随机数的负值哨兵**：kernel 给要剔的砖写 `-1` 到 packed 行的 `.w`
-	 * （那一格就是材质的 `PerInstanceRandom`），`M_TinyGladeBrick` 的
-	 * `OpacityMask = saturate(PerInstanceRandom + 1)` 把它裁掉。随机数本身恒 ≥ 0，
+	 * 实现走**逐实例随机数的负值哨兵**：kernel 给要剔的砖写 `-1` 到 packed 行的 `.w`。随机数本身恒 ≥ 0，
 	 * 负值因此是一个不会与任何真实取值相撞的哨兵；而被剔掉的砖也不需要色差。
+	 * 2026-09-15 起哨兵是 `UCSGpuInstancedMeshComponent` 的组件级契约（剔除 pass 跳过、Nanite 路写 HIDDEN、
+	 * 烘焙不带），与门框砖画什么材质无关 —— `FrameMaterial` 留空改画资产材质之后，
+	 * `M_TinyGladeBrick` 的 `OpacityMask = saturate(PerInstanceRandom + 1)` 已经不在画面上了。
 	 *
 	 * ⚠️ **为什么不走 `PerInstanceCustomData`**：那条通道在 `FCSGpuInstancedMeshVertexFactory`
 	 * 里是关的（`NumCustomDataFloats = 0`），接通它要给 packed 实例加一个 float 流，

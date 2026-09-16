@@ -21,7 +21,7 @@
 //   [3] BaseZ | LeftS | RightS | MidMeasure（圆弧 = 扫角，平顶 = 长度）
 //   [4] asuint 位标志 | asuint 砖序起点 | asuint 砖数 | Pitch（相邻砖中心距）
 //   [5] HalfLen（首块砖的弧长）| LayoutScale（长度轴铺装缩放）| asuint 随机数基 | CrossScale（横截面缩放，柱头/柱础）
-//   [6] CullBelowZ（世界 Z 低于它的砖写负值随机数 ⇒ 材质 discard；≤ 0 = 不剔）
+//   [6] CullBelowZ（世界 Z 低于它的砖写负值随机数 ⇒ 实例组件把它藏掉；≤ 0 = 不剔）
 //       | ShearAtS0 | ShearAtS1 | Jitter；角石分支下 yz = 1 / 基础网格的 X、Z 尺寸
 //   [7] SplitJitter（分层抖动幅度 cm，≤ 0 = 等分）| 本条路的总弧长（kernel 拿它把 cm 归一化）| QuoinScale（> 0 = 按相邻墙面包角）
 //       | 角石所在角的 cos(转角/2)（≤ 0 = 直角）
@@ -313,9 +313,10 @@ void ScatterHouseFrameCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	RWFrameInstances[Row + 0u] = float4(ScaledX, 0.0f);   // .w 必须是 0：引擎拿它做选中/hitproxy
 	RWFrameInstances[Row + 1u] = float4(ScaledY, 0.0f);
 	RWFrameInstances[Row + 2u] = float4(ScaledZ, 0.0f);
-	// 逐实例随机数的**负值哨兵** = 材质里的剔除位（`FElement::CullBelowZ`）。真实随机数恒 ≥ 0，
-	// 所以 −1 不会与任何取值相撞；`M_TinyGladeBrick` 的 OpacityMask = saturate(PerInstanceRandom + 1)
-	// 把它裁掉。比较用**世界** Z（`WorldPos` 还没进组件空间），与 CPU 侧填的口径一致。
+	// 逐实例随机数的**负值哨兵** = 剔除位（`FElement::CullBelowZ`）。真实随机数恒 ≥ 0，所以 −1 不会与
+	// 任何取值相撞。认它的是实例组件（剔除 pass 跳过 / GPU-Scene 写 HIDDEN / 烘焙不带，组件级契约），
+	// 不再靠砖材质的 OpacityMask —— 门框砖留空时画的是资产材质。比较用**世界** Z（`WorldPos` 还没进组件空间），
+	// 与 CPU 侧填的口径一致。
 	const float CullBelowZ = R6.x;
 	const float InstanceRandom = (CullBelowZ > 0.0f && WorldPos.z < CullBelowZ)
 		? -1.0f

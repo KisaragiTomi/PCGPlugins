@@ -1862,7 +1862,8 @@ void ACSHouseActor::EnsurePillarBrickComponent()
 	// 新组件身上没有实例源，交接缓存必须一起作废 —— 缓存说"交接过了"而组件是空的，
 	// 下一趟就会被判成稳态而跳过，画面永远空白且不报错。
 	if (CSShaperSteps::EnsureInstancedComponent(this, PillarBrickComponent)) PillarHandover.Capacities.Reset();
-	PillarBrickComponent->InstanceMaterial = PillarMaterial;
+	// 空 = 画砖网格资产自己的材质（逐 section）；设了才整体覆盖。变了才让代理重建。
+	PillarBrickComponent->SetInstanceMaterial(PillarMaterial);
 	PillarBrickComponent->SetBaseMesh(PillarBrickMesh);   // 同一张网格时内部直接早退
 
 	if (PillarGpuBuffers.Num() != 1)
@@ -1982,12 +1983,57 @@ void ACSHouseActor::RebuildPillarMesh(const TArray<FVector>& Centers, const TArr
 	UE_LOG(LogTinyGladeHouse, Log, TEXT("[TinyGladeHouse] %s pillars rebuilt: count=%d tris=%d"), *GetName(), Centers.Num(), TriangleCount);
 }
 
+namespace
+{
+/**
+ * 方盒柱（`bPillarUseBricks` 关掉时的占位路）画什么材质：`PillarMaterial` 设了就用它；空 = 砖柱那张网格资产
+ * 0 号材质槽上挂的材质。方盒是砖柱的替身，这条路上没有自己的资产，"空 = 用资产材质"就取它顶替的那一张
+ * —— 否则清掉 `PillarMaterial` 之后切到方盒对照会是一片默认灰（2026-09-15）。
+ */
+UMaterialInterface* CSHouse_PillarBoxMaterial(const ACSHouseActor& House)
+{
+	if (House.PillarMaterial) return House.PillarMaterial;
+	return House.PillarBrickMesh ? House.PillarBrickMesh->GetMaterial(0) : nullptr;
+}
+
+/**
+ * 普通静态网格组件（尖顶 / 门扇）的材质口径，与实例组件的 `InstanceMaterial` 同一个意思：
+ * `Override` 设了就盖住**每一个**材质槽；空 = 清掉组件上的覆盖，逐槽画网格资产自己挂的材质。
+ * 以前只写 0 号槽、留空时什么都不做 —— 多槽资产（`balcony_door_rank*` = 木 + 铁）只盖了一半，
+ * 而复用的组件在属性被清空之后还带着上一次写进去的那张（2026-09-15）。调用前必须已经 SetStaticMesh。
+ */
+void CSHouse_ApplyMeshComponentMaterial(UStaticMeshComponent& Component, UMaterialInterface* Override)
+{
+	if (!Override)
+	{
+		if (Component.OverrideMaterials.Num() > 0) Component.EmptyOverrideMaterials();
+		return;
+	}
+	for (int32 Slot = 0; Slot < Component.GetNumMaterials(); ++Slot)
+	{
+		if (Component.GetMaterial(Slot) != Override) Component.SetMaterial(Slot, Override);
+	}
+}
+
+/** 普通静态网格组件每个材质槽都有材质吗；空串 = 都有。`Label` 是原因串前缀（"第 0 根" / "门扇 1"）。 */
+FString CSHouse_MeshComponentMaterialReason(const UStaticMeshComponent& Component, const FString& Label)
+{
+	for (int32 Slot = 0; Slot < Component.GetNumMaterials(); ++Slot)
+	{
+		// **石阶那个坑的同一条**：材质槽为空时组件仍然会画，只是退回引擎默认表面材质 ——
+		// 画面上是一片灰，而所有 readback 断言照绿。
+		if (!Component.GetMaterial(Slot)) return FString::Printf(TEXT("%s：%d 号材质槽是空的（会画成一片灰）"), *Label, Slot);
+	}
+	return FString();
+}
+}
+
 void ACSHouseActor::SubmitPillarMesh(TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> Snapshot)
 {
 	// 柱子只有一个材质槽，不需要排序分段 —— 一次上传就是全部工作。容量同房体按台阶预留：
 	// 柱数会随周界（=FootprintSize）跳变，按精确数要就是每次跳变一次阻塞重分配。
 	FCSMeshSlotUpload Upload;
-	Upload.Materials = { PillarMaterial };
+	Upload.Materials = { CSHouse_PillarBoxMaterial(*this) };
 	SubmitMeshSlotAsync(PillarMeshComponent, PillarMesh, PillarSlot, Snapshot, Upload, [this]() { OnPillarEditComplete(); });
 }
 
@@ -2135,7 +2181,9 @@ bool ACSHouseActor::ApplyPillarPlacement()
 CSShaperSteps::EHandoverResult ACSHouseActor::EnsureFrameComponent()
 {
 	CSShaperSteps::EnsureInstancedComponent(this, FrameComponent);
-	FrameComponent->InstanceMaterial = FrameMaterial;
+	// 空 = 画砖网格资产自己的材质；设了才整体覆盖。转角墩要剔的砖靠组件级的"负随机数 = 隐藏"契约藏
+	// （剔除 pass / GPU-Scene 写入），不再依赖 `M_TinyGladeBrick` 的 OpacityMask，所以换成资产材质也不会冒出来。
+	FrameComponent->SetInstanceMaterial(FrameMaterial);
 	FrameComponent->SetBaseMesh(FrameBrickMesh);   // 同一张网格时内部直接早退
 
 	if (FrameGpuBuffers.Num() != 1)
@@ -3736,8 +3784,9 @@ void ACSHouseActor::RebuildRoofFinials()
 		if (!IsValid(Component)) continue;
 
 		Component->SetStaticMesh(RoofFinialMesh);
-		// 留空 = 用网格自带的材质槽（`SetMaterial(nullptr)` 会清成空槽画成灰，不能这么写）。
-		if (RoofFinialMaterial) Component->SetMaterial(0, RoofFinialMaterial);
+		// 留空 = 逐槽用网格资产自带的材质（清掉覆盖，不是 `SetMaterial(nullptr)` —— 那会清成空槽画成灰）；
+		// 设了 = 盖住每一个槽。
+		CSHouse_ApplyMeshComponentMaterial(*Component, RoofFinialMaterial);
 
 		const FVector2D XY = (WantCount == 2) ? ((Index == 0) ? Skeleton.TopA : Skeleton.TopB)
 			: (Skeleton.TopA + Skeleton.TopB) * 0.5;
@@ -3916,8 +3965,9 @@ void ACSHouseActor::RebuildDoorLeaves()
 		const int32 UpAxis = Rank.UpAxis, WidthAxis = Rank.WidthAxis, DepthAxis = Rank.DepthAxis;
 
 		Component->SetStaticMesh(Rank.Mesh);
-		// 留空 = 用网格自带材质槽（`SetMaterial(nullptr)` 会清成空槽画成灰，不能这么写）。
-		if (DoorLeafMaterial) Component->SetMaterial(0, DoorLeafMaterial);
+		// 留空 = 逐槽用网格资产自带的材质（`balcony_door_rank*` 是木 + 铁两槽）；设了 = 盖住每一个槽。
+		// 同一个组件会换挂不同档的网格，所以每次都按当前网格的槽数重新套一遍。
+		CSHouse_ApplyMeshComponentMaterial(*Component, DoorLeafMaterial);
 
 		// 资产的"上"送到局部 +Z、"宽"送到局部 +X。`FMatrix(X, Y, Z, O)` 把 e0/e1/e2 分别送到三个
 		// 轴参数上。深度那根取 Z×X 保右手，否则门扇会镜像。**逐档算** —— 不同档可能轴向不同。
@@ -3997,6 +4047,8 @@ FString ACSHouseActor::GetDoorLeafUndrawableReason() const
 		if (!Component->IsVisible()) return FString::Printf(TEXT("门扇 %d：组件不可见"), Index);
 		if (!Component->GetStaticMesh()) return FString::Printf(TEXT("门扇 %d：网格是空的"), Index);
 		if (Component->GetComponentScale().IsNearlyZero()) return FString::Printf(TEXT("门扇 %d：缩放退化成 0"), Index);
+		const FString MaterialReason = CSHouse_MeshComponentMaterialReason(*Component, FString::Printf(TEXT("门扇 %d"), Index));
+		if (!MaterialReason.IsEmpty()) return MaterialReason;
 	}
 	return FString();
 }
@@ -4018,9 +4070,9 @@ FString ACSHouseActor::GetRoofFinialUndrawableReason() const
 		if (!Component->IsRegistered()) return FString::Printf(TEXT("第 %d 根的组件没注册"), Index);
 		if (!Component->IsVisible()) return FString::Printf(TEXT("第 %d 根不可见"), Index);
 		if (Component->GetStaticMesh() != RoofFinialMesh) return FString::Printf(TEXT("第 %d 根挂的不是 RoofFinialMesh"), Index);
-		// **石阶那个坑的同一条**：材质槽为空时组件仍然会画，只是退回引擎默认表面材质 ——
-		// 画面上是一片灰，而所有 readback 断言照绿。
-		if (!Component->GetMaterial(0)) return FString::Printf(TEXT("第 %d 根 0 号材质槽是空的（会画成一片灰）"), Index);
+		// 逐槽查（不只 0 号槽）：留空时画的是资产自己的每个槽，任何一个槽空着都是一片灰。
+		const FString MaterialReason = CSHouse_MeshComponentMaterialReason(*Component, FString::Printf(TEXT("第 %d 根"), Index));
+		if (!MaterialReason.IsEmpty()) return MaterialReason;
 	}
 	return FString();
 }
@@ -4049,7 +4101,9 @@ CSShaperSteps::EHandoverResult ACSHouseActor::EnsureDecorComponents()
 
 	// ⚠️ 组件数一变就必须重建基础网格快照：palette 与组件是**按下标**对齐的，少一个就全体错位。
 	if (CSShaperSteps::EnsureInstancedComponents(this, DecorComponents, Wanted.Num())) bDecorBaseMeshReady = false;
-	for (const TObjectPtr<UCSGpuInstancedMeshComponent>& Component : DecorComponents) Component->InstanceMaterial = DecorMaterial;
+	// 空 = 每个 palette 逐段画自己那张网格资产挂的材质（`barrel` = 贴图木头 + 顶点色铁箍）；设了才整体覆盖。
+	// 材质表随 `CSHouseVine::BuildBaseMesh` 抄进快照，变了才让代理重建。
+	for (const TObjectPtr<UCSGpuInstancedMeshComponent>& Component : DecorComponents) Component->SetInstanceMaterial(DecorMaterial);
 
 	if (DecorGpuBuffers.Num() != Wanted.Num())
 	{
@@ -4273,26 +4327,15 @@ FString ACSHouseActor::GetDecorUndrawableReason() const
 		}
 		if (!Component->GetGpuMesh()) { OutReason = FString::Printf(TEXT("palette %d：GPU 网格没分配"), Index); return OutReason; }
 
-		// **这一条就是石阶那个坑**：材质为空时组件仍然会画，只是退回引擎默认表面材质 ——
-		// 画面上是一片灰，而所有 readback 断言照绿。
-		const UMaterialInterface* Material = Component->InstanceMaterial;
-		if (!Material)
+		// **这一条就是石阶那个坑**：材质为空时组件仍然会画，只是退回引擎默认表面材质 —— 画面上是一片灰，
+		// 而所有 readback 断言照绿。⚠️ 比石阶那条**多一环**：没勾 `bUsedWithInstancedStaticMeshes` 的材质在
+		// 实例路径上会被引擎**静默替换**成默认材质，症状与"没绑材质"逐像素相同。
+		// 2026-09-15 起摆件默认逐段画资产自己的材质（`DecorMaterial` 留空），所以要查的是**每一段解析出来的**那张，
+		// 不再只是 `InstanceMaterial` —— 判据收在组件里（`GetMaterialUndrawableReason`），各 actor 共用一份。
+		const FString MaterialReason = Component->GetMaterialUndrawableReason();
+		if (!MaterialReason.IsEmpty())
 		{
-			OutReason = FString::Printf(TEXT("palette %d：没有绑材质（会用引擎默认表面材质画成一片灰）"), Index);
-			return OutReason;
-		}
-		// ⚠️ 比石阶那条**多一环**：没勾 `bUsedWithInstancedStaticMeshes` 的材质在实例路径上
-		// 会被引擎**静默替换**成默认材质，症状与"没绑材质"逐像素相同。藤蔓那轮就是被
-		// `M_TG_Texture`（459 个 MI 的母材质，没勾）绊过 —— clutter 的材质同样别去挂它。
-		const UMaterial* Base = Material->GetMaterial();
-		if (!Base || !Base->bUsedWithInstancedStaticMeshes)
-		{
-			// ⚠️ 编辑器里引擎会在第一次实例化使用时**自己把这个标志勾回去**并重编（实测：
-			// 手动摩掉它再出图，画面逐像素不变）。所以这一条在编辑器里很难抵到东西，
-			// 真正会发作的是烘培/非编辑器路径。留着不代表它白写 —— 但也别拿它当唯一的门。
-			OutReason = FString::Printf(
-				TEXT("palette %d：材质 '%s' 的母材质没有勾 bUsedWithInstancedStaticMeshes（引擎会静默换成默认材质）"),
-				Index, *Material->GetName());
+			OutReason = FString::Printf(TEXT("palette %d：%s"), Index, *MaterialReason);
 			return OutReason;
 		}
 	}
@@ -4448,6 +4491,8 @@ bool ACSHouseActor::DebugBakeFrameBricksSync(const FString& AssetPath, int32& Ou
 	bOutRandomsMatchGpu = GpuRandoms.Num() > 0;
 	for (const float Random : GpuRandoms)
 	{
+		// 负值 = 藏起来的砖（转角墩剔除的哨兵，组件级契约）：出口按契约不烘它，烘焙件里本来就不该有这一桶。
+		if (Random < 0.0f) continue;
 		const int32 Bucket = Quantize(Random);
 		if (!BakedRandoms.Contains(Bucket) && !BakedRandoms.Contains(Bucket - 1) && !BakedRandoms.Contains(Bucket + 1))
 		{
@@ -4491,17 +4536,23 @@ void ACSHouseActor::BindHouseMaterials()
 	// 瓦与房体的屋顶槽共用 `RoofMaterial`：它们是同一样东西的两半（槽 1 现在没有三角，
 	// 屋面全在瓦上）。⚠️ 实例路径要求母材质勾了 `bUsedWithInstancedStaticMeshes`，
 	// 没勾会被引擎**静默换成默认材质** —— `GetRoofTileUndrawableReason` 专门查这一条。
-	if (IsValid(RoofTileComponent)) RoofTileComponent->InstanceMaterial = RoofMaterial;
-	if (PillarMesh) BindMeshSlotMaterials(PillarMeshComponent, PillarMesh, { PillarMaterial });
-
-	// 门框砖走另一条组件（实例化），漏了它的症状与 D14 开篇描述的一模一样：在细节面板里改
-	// FrameMaterial 静默无效，必须手点 RebuildHouse()。这里补上，重绑不重建的纪律才算完整。
-	// 代理在构造时就把 InstanceMaterial 抄走了（FCSGpuInstancedMeshSceneProxy 的初始化列表），
-	// 光写属性不重建代理是看不出变化的 —— 必须自己脏一次渲染状态。
-	if (IsValid(FrameComponent) && FrameComponent->InstanceMaterial != FrameMaterial)
+	// 与下面门框砖同理：代理构造时抄走了材质，换 RoofMaterial 要自己脏一次渲染状态。
+	if (IsValid(RoofTileComponent) && RoofTileComponent->InstanceMaterial != RoofMaterial)
 	{
-		FrameComponent->InstanceMaterial = FrameMaterial;
-		FrameComponent->MarkRenderStateDirty();
+		RoofTileComponent->InstanceMaterial = RoofMaterial;
+		RoofTileComponent->MarkRenderStateDirty();
+	}
+	if (PillarMesh) BindMeshSlotMaterials(PillarMeshComponent, PillarMesh, { CSHouse_PillarBoxMaterial(*this) });
+
+	// 门框砖 / 柱砖 / 摆件走另一条组件（实例化），漏了它们的症状与 D14 开篇描述的一模一样：在细节面板里改
+	// 材质静默无效，必须手点 RebuildHouse()。这里补上，重绑不重建的纪律才算完整。
+	// 代理在构造时就把每段的材质抄走了，光写属性不重建代理是看不出变化的 —— `SetInstanceMaterial`
+	// 变了才写、变了才脏一次渲染状态；传空 = 退回各自网格资产的材质。
+	if (IsValid(FrameComponent)) FrameComponent->SetInstanceMaterial(FrameMaterial);
+	if (IsValid(PillarBrickComponent)) PillarBrickComponent->SetInstanceMaterial(PillarMaterial);
+	for (const TObjectPtr<UCSGpuInstancedMeshComponent>& Component : DecorComponents)
+	{
+		if (IsValid(Component)) Component->SetInstanceMaterial(DecorMaterial);
 	}
 }
 
@@ -4592,7 +4643,8 @@ void ACSHouseActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChange
 	if (Name == GET_MEMBER_NAME_CHECKED(ACSHouseActor, WallMaterial)
 		|| Name == GET_MEMBER_NAME_CHECKED(ACSHouseActor, RoofMaterial)
 		|| Name == GET_MEMBER_NAME_CHECKED(ACSHouseActor, PillarMaterial)
-		|| Name == GET_MEMBER_NAME_CHECKED(ACSHouseActor, FrameMaterial))
+		|| Name == GET_MEMBER_NAME_CHECKED(ACSHouseActor, FrameMaterial)
+		|| Name == GET_MEMBER_NAME_CHECKED(ACSHouseActor, DecorMaterial))
 	{
 		BindHouseMaterials();
 	}

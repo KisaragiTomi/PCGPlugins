@@ -357,6 +357,9 @@ COMPUTESHADERGENERATOR_API void PackTubePath(const TArray<FWallStrip>& Strips, c
  * `LengthAxis` 是**源网格**的长度轴（0=X 1=Y 2=Z），换轴后一律变成 +Z ——
  * `CSHouseVine.usf` 的基约定只认 +Z，两种网格共用一支 kernel。
  *
+ * 材质也照抄 LOD0：`TriangleMaterialSlots` = 每个三角所在段的材质槽，`Materials` = 资产的材质槽表
+ * （2026-09-15）。实例组件没设整体覆盖材质时靠这两样逐段画资产自己的材质（摆件 / 裙边摆件就是这么画的）。
+ *
  * 返回是否读出了可用的几何（读不出时 Out 被清空，调用方应当据此报错而不是画一块灰）。
  */
 COMPUTESHADERGENERATOR_API bool BuildBaseMesh(UStaticMesh* Source, int32 LengthAxis, FCSGpuMeshCPUData& Out);

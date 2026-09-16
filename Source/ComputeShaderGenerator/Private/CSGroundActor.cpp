@@ -763,7 +763,8 @@ bool ACSGroundActor::EnsureStairComponent()
 	}
 
 	CSShaperSteps::EnsureInstancedComponent(this, StairComponent);
-	StairComponent->InstanceMaterial = StairMaterial;
+	// 空 = 逐段画石阶网格资产自带的材质；设了才整体覆盖。变了才让代理重建。
+	StairComponent->SetInstanceMaterial(StairMaterial);
 	StairComponent->SetBaseMesh(StairMesh);    // 同一张网格时内部直接早退
 
 	// 从网格推导三个量：包围球（剔除用）、块缩放、抬升。
@@ -794,7 +795,7 @@ bool ACSGroundActor::EnsureStairComponent()
 	if (StairPebbleMesh)
 	{
 		CSShaperSteps::EnsureInstancedComponent(this, StairPebbleComponent);
-		StairPebbleComponent->InstanceMaterial = StairPebbleMaterial;
+		StairPebbleComponent->SetInstanceMaterial(StairPebbleMaterial);   // 空 = 石子网格资产自带的材质
 		StairPebbleComponent->SetBaseMesh(StairPebbleMesh);
 
 		const FBox PebbleLocal = StairPebbleMesh->GetBoundingBox();
@@ -1480,7 +1481,9 @@ bool ACSGroundActor::EnsureSkirtDecorComponents(bool& bOutHandedOver)
 
 	// ⚠️ 组件数一变就必须重建基础网格快照：palette 与组件是**按下标**对齐的，少一个就全体错位。
 	if (CSShaperSteps::EnsureInstancedComponents(this, SkirtDecorComponents, Wanted.Num())) bSkirtDecorBaseMeshReady = false;
-	for (const TObjectPtr<UCSGpuInstancedMeshComponent>& Component : SkirtDecorComponents) Component->InstanceMaterial = SkirtDecorMaterial;
+	// 空 = 每个 palette 逐段画自己那张网格资产挂的材质（材质表随 `CSHouseVine::BuildBaseMesh` 抄进快照）；
+	// 设了才整体覆盖。变了才让代理重建。
+	for (const TObjectPtr<UCSGpuInstancedMeshComponent>& Component : SkirtDecorComponents) Component->SetInstanceMaterial(SkirtDecorMaterial);
 
 	if (SkirtDecorGpuBuffers.Num() != Wanted.Num())
 	{
@@ -1703,22 +1706,12 @@ FString ACSGroundActor::GetSkirtDecorUndrawableReason() const
 		}
 		if (!Component->GetGpuMesh()) return FString::Printf(TEXT("palette %d：GPU 网格没分配"), Index);
 
-		// **这一条就是石阶那个坑**：材质为空时组件仍然会画，只是退回引擎默认表面材质 ——
-		// 画面上是一片灰，而所有 readback 断言照绿。
-		const UMaterialInterface* Material = Component->InstanceMaterial;
-		if (!Material)
-		{
-			return FString::Printf(TEXT("palette %d：没有绑材质（会用引擎默认表面材质画成一片灰）"), Index);
-		}
-		// ⚠️ 比石阶那条**多一环**：没勾 `bUsedWithInstancedStaticMeshes` 的材质在实例路径上
-		// 会被引擎**静默替换**成默认材质，症状与"没绑材质"逐像素相同。
-		const UMaterial* Base = Material->GetMaterial();
-		if (!Base || !Base->bUsedWithInstancedStaticMeshes)
-		{
-			return FString::Printf(
-				TEXT("palette %d：材质 '%s' 的母材质没有勾 bUsedWithInstancedStaticMeshes（引擎会静默换成默认材质）"),
-				Index, *Material->GetName());
-		}
+		// **这一条就是石阶那个坑**：材质为空时组件仍然会画，只是退回引擎默认表面材质 —— 画面上是一片灰，
+		// 而所有 readback 断言照绿。⚠️ 比石阶那条**多一环**：没勾 `bUsedWithInstancedStaticMeshes` 的材质在
+		// 实例路径上会被引擎**静默替换**成默认材质，症状与"没绑材质"逐像素相同。
+		// 查的是**每一段解析出来的**材质（`SkirtDecorMaterial` 留空时是资产自己的），判据收在组件里。
+		const FString MaterialReason = Component->GetMaterialUndrawableReason();
+		if (!MaterialReason.IsEmpty()) return FString::Printf(TEXT("palette %d：%s"), Index, *MaterialReason);
 	}
 	return FString();
 }

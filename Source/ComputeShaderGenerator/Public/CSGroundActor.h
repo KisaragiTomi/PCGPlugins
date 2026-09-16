@@ -390,7 +390,8 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Stairs")
 	TObjectPtr<UStaticMesh> StairMesh;
 
-	/** 石阶材质。GPU 实例化只有一个材质槽；必须勾 "Used with Instanced Static Meshes"。 */
+	/** 石阶的整体覆盖材质。**留空 = 逐段画 `StairMesh` 资产自带的材质**；设了 = 盖住每一段。
+	 *  母材质必须勾 "Used with Instanced Static Meshes"（资产开了 Nanite 时是 "Used with Nanite"）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Stairs")
 	TObjectPtr<UMaterialInterface> StairMaterial;
 
@@ -520,7 +521,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Stairs|Pebble")
 	TObjectPtr<UStaticMesh> StairPebbleMesh;
 
-	/** 石子材质。同石阶：GPU 实例化只有一个材质槽，必须勾 "Used with Instanced Static Meshes"。 */
+	/** 石子的整体覆盖材质。同石阶：**留空 = 逐段画 `StairPebbleMesh` 资产自带的材质**，设了 = 盖住每一段。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Stairs|Pebble")
 	TObjectPtr<UMaterialInterface> StairPebbleMaterial;
 
@@ -993,13 +994,14 @@ public:
 	TArray<TObjectPtr<UStaticMesh>> SkirtDecorMeshes;
 
 	/**
-	 * 摆件材质。
+	 * 摆件的整体覆盖材质。
 	 *
-	 * ⚠️ **必须勾 `bUsedWithInstancedStaticMeshes`**：没勾的材质在实例路径上会被引擎
+	 * **留空 = 每张摆件网格逐段画它资产上挂的材质**（2026-09-15，与房子摆件的 `DecorMaterial` 同一口径）；
+	 * 设了 = 盖住每一张网格的每一段（旧用法：`Scripts/TinyGladeMakeDecorMaterial.py` 那张只读顶点色的 `M_TinyGladeDecor`）。
+	 *
+	 * ⚠️ **母材质必须勾 `bUsedWithInstancedStaticMeshes`**：没勾的材质在实例路径上会被引擎
 	 * **静默换成默认材质**，画面一片灰而所有 readback 断言照绿。`GetSkirtDecorUndrawableReason()`
-	 * 把这条做成了显式判据；供给侧是 `Scripts/TinyGladeMakeDecorMaterial.py` 那张
-	 * `M_TinyGladeDecor`（房子那四家用的也是它 —— clutter 的颜色全烘在顶点流里，
-	 * 一张母材质就够，两张只会在下一次调色时分叉）。
+	 * 逐段查每一张解析出来的材质（覆盖或资产）。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Skirt Decor")
 	TObjectPtr<UMaterialInterface> SkirtDecorMaterial;

@@ -389,8 +389,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Finial")
 	TObjectPtr<UStaticMesh> RoofFinialMesh;
 
-	/** 留空 = 用网格自带的材质槽。尖顶走普通 `UStaticMeshComponent`，**不吃**实例化路径，
-	 *  所以这里不需要 `bUsedWithInstancedStaticMeshes`（瓦/藤蔓那条坑在这儿不成立）。 */
+	/** 整体覆盖材质。**留空 = 逐槽用网格资产自带的材质**（组件上的覆盖会被清掉）；设了 = 盖住每一个槽。
+	 *  尖顶走普通 `UStaticMeshComponent`，**不吃**实例化路径，所以这里不需要 `bUsedWithInstancedStaticMeshes`
+	 *  （瓦/藤蔓那条坑在这儿不成立）；资产开了 Nanite 时母材质要有 `bUsedWithNanite`。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Finial")
 	TObjectPtr<UMaterialInterface> RoofFinialMaterial;
 
@@ -431,7 +432,8 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door Leaf")
 	TArray<TObjectPtr<UStaticMesh>> DoorLeafMeshes;
 
-	/** 留空 = 用网格自带材质槽。门扇走普通 `UStaticMeshComponent`，不吃实例化路径。 */
+	/** 整体覆盖材质。**留空 = 逐槽用网格资产自带的材质**（`balcony_door_rank*` 是木 + 铁两槽）；设了 = 盖住每一个槽。
+	 *  门扇走普通 `UStaticMeshComponent`，不吃实例化路径。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door Leaf")
 	TObjectPtr<UMaterialInterface> DoorLeafMaterial;
 
@@ -540,6 +542,8 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Material")
 	TObjectPtr<UMaterialInterface> RoofMaterial;
 
+	/** 承重柱的整体覆盖材质。**留空 = 砖柱逐段画 `PillarBrickMesh` 资产自带的材质**（方盒占位路取那张资产 0 号槽）；
+	 *  设了 = 盖住砖的每一段。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Material")
 	TObjectPtr<UMaterialInterface> PillarMaterial;
 
@@ -777,7 +781,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Frame")
 	TObjectPtr<UStaticMesh> FrameBrickMesh;
 
-	/** 门框砖材质。GPU 实例化只有一个材质槽，必须勾 "Used with Instanced Static Meshes"。 */
+	/**
+	 * 门框砖（含接缝 / 角石 / 包边 / 砖层）的整体覆盖材质。**留空 = 逐段画 `FrameBrickMesh` 资产自带的材质**；
+	 * 设了 = 盖住每一段。母材质必须勾 "Used with Instanced Static Meshes"（资产开了 Nanite 时是 "Used with Nanite"）。
+	 *
+	 * 转角墩下要剔的砖不靠材质藏（2026-09-15 起）：kernel 写负随机数，实例组件的剔除 / GPU-Scene 写入按契约把它藏掉，
+	 * 所以留空换成资产材质也不会冒砖。`M_TinyGladeBrick` 的 OpacityMask 仍然认那个哨兵，但已经不是唯一的防线。
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Frame")
 	TObjectPtr<UMaterialInterface> FrameMaterial;
 
@@ -1258,11 +1268,16 @@ public:
 	TArray<TObjectPtr<UStaticMesh>> DecorRoofMeshes;
 
 	/**
-	 * 摆件材质（三家共用一张）。
+	 * 摆件的整体覆盖材质（三家共用一张）。
+	 *
+	 * **留空 = 每张摆件网格逐段画它资产上挂的材质**（2026-09-15 用户："让它使用我的资产的正确材质"）：
+	 * `barrel` / `crates_w_flowers` / `stall_veggies` 是贴图木头（`MI_nani_solid_albedo_layer03`）+ 顶点色两段，
+	 * `firewood` / `birdnest` 是 `MI_TG_VertexColor` 一段。设了 = 盖住每一张网格的每一段（旧用法，比如
+	 * `Scripts/TinyGladeMakeDecorMaterial.py` 建的那张只读顶点色的 `M_TinyGladeDecor`）。
 	 *
 	 * ⚠️ **母材质必须勾 `bUsedWithInstancedStaticMeshes`**，否则引擎在实例路径上会
 	 * **静默换成默认材质**，症状与"没绑材质"逐像素相同（一片灰），而所有 readback 断言照绿。
-	 * `IsDecorDrawable()` 把这条做成了显式判据；供给侧是 `Scripts/TinyGladeMakeDecorMaterial.py`。
+	 * `IsDecorDrawable()` 逐段查每一张解析出来的材质（覆盖或资产）。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Decor")
 	TObjectPtr<UMaterialInterface> DecorMaterial;

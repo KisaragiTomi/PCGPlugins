@@ -771,7 +771,18 @@ bool BuildBaseMesh(UStaticMesh* Source, int32 LengthAxis, FCSGpuMeshCPUData& Out
 	}
 
 	Out.BinormalSigns.Init(1.0f, int32(NumVerts));
+
+	// 材质段与材质槽照抄资产 LOD0（2026-09-15）：实例组件没设整体覆盖材质时按它们逐段画资产自己的材质。
+	// 以前这里一律槽 0、不带材质表，于是摆件这类多材质资产（`barrel` = 贴图木头 + 顶点色铁箍）只能整张盖一张
+	// `M_TinyGladeDecor`。索引没有重排，段在索引里本来就是连续的，`Indices` 与改动前逐位相同。
 	Out.TriangleMaterialSlots.Init(0, Out.Indices.Num() / 3);
+	for (const FStaticMeshSection& Section : LOD.Sections)
+	{
+		const int32 FirstTriangle = int32(Section.FirstIndex / 3u);
+		const int32 EndTriangle = FMath::Min(FirstTriangle + int32(Section.NumTriangles), Out.TriangleMaterialSlots.Num());
+		for (int32 Triangle = FirstTriangle; Triangle < EndTriangle; ++Triangle) Out.TriangleMaterialSlots[Triangle] = FMath::Max(Section.MaterialIndex, 0);
+	}
+	for (const FStaticMaterial& Material : Source->GetStaticMaterials()) Out.Materials.Add(Material.MaterialInterface);
 	return true;
 }
 

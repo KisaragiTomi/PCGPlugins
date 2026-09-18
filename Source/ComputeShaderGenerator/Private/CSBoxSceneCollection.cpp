@@ -65,7 +65,8 @@ FCSBoxScenePreparedData CSBoxSceneCollection::CollectBoxSceneTriangles(
 	ImplData->TotalStaticMeshTriangleCount = ResolveStaticMeshTriangleRequests(
 		Requests, Options.ExcludedActor, Options.ExcludedActorTags, true, ImplData->ResolvedRequests, &ImplData->MaterialRegistry,
 		Options.bUseMeshDescriptionSourceTriangles ? &ImplData->NaniteTriangles : nullptr,
-		Options.bPreserveSourceMaterialSlots);
+		Options.bPreserveSourceMaterialSlots,
+		Options.bCollectNaniteRenderComponents ? &ImplData->NaniteRenderComponents : nullptr);
 
 	ImplData->ReferencePoints = Options.ReferencePoints;
 	ImplData->ReferenceFilterDistance = SafeRefDist;

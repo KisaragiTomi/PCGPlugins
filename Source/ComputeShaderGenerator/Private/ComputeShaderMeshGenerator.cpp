@@ -1,5 +1,6 @@
 #include "ComputeShaderMeshGenerator.h"
 #include "CSBoxSceneCollectionImpl.h"
+#include "CSNaniteHeightCapture.h"
 #include "MeshGeneratorBrushCache.h"
 #include "MeshGeneratorInternal.h"
 
@@ -1410,13 +1411,16 @@ uint64 CSMeshGenInternal::ResolveStaticMeshTriangleRequests(
 	TArray<FResolvedStaticMeshTriangleRequest>& OutResolvedRequests,
 	TArray<TObjectPtr<UMaterialInterface>>* OutMaterialRegistry,
 	FCSNaniteSourceTriangleData* OutNaniteTriangles,
-	bool bPreserveSourceMaterialSlots)
+	bool bPreserveSourceMaterialSlots,
+	TArray<TWeakObjectPtr<UPrimitiveComponent>>* OutNaniteRenderComponents)
 {
 	OutResolvedRequests.Reset();
 	OutResolvedRequests.Reserve(Requests.Num());
 
 	TArray<TObjectPtr<UMaterialInterface>> MaterialRegistry;
 	TMap<FCSMaterialRegistryKey, int32> MaterialToRegistry;
+	// ISM 每个实例一个 request，而"按不按 Nanite 画"是组件级的（还要做材质审计），按组件只判一次。
+	TMap<const UStaticMeshComponent*, bool> NaniteRenderByComponent;
 
 	// 返回值仅统计 render-resolve 出的三角（= OutResolvedRequests[i].TriangleCount 之和）。Nanite 全细节源三角
 	// 单独累积进 *OutNaniteTriangles（其自带 NumTriangles），容量核算在 AddResolvedStaticMeshTrianglesToRDGInternal
@@ -1440,6 +1444,19 @@ uint64 CSMeshGenInternal::ResolveStaticMeshTriangleRequests(
 #else
             UE_LOG(LogTemp, Warning, TEXT("[ResolveStaticMeshTriangleRequests] Nanite mesh '%s' requires editor MeshDescription; using render fallback."), *Request.StaticMesh->GetPathName());
 #endif
+		}
+
+		// 按 Nanite 画着的组件交给渲染器去拍：这里 resolve 出来的只会是 fallback 低模。
+		if (OutNaniteRenderComponents && Request.SourceComponent)
+		{
+			const UStaticMeshComponent* Component = Request.SourceComponent;
+			const bool* bCached = NaniteRenderByComponent.Find(Component);
+			const bool bRenderNanite = bCached ? *bCached : NaniteRenderByComponent.Add(Component, CSNaniteHeightCapture::IsCapturableNaniteComponent(Component));
+			if (bRenderNanite)
+			{
+				OutNaniteRenderComponents->AddUnique(Request.SourceComponent.Get());
+				continue;
+			}
 		}
 
 		FResolvedStaticMeshTriangleRequest Resolved;

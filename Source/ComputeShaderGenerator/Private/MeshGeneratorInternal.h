@@ -18,6 +18,7 @@ class FRDGBuilder;
 class FRHICommandListImmediate;
 class FTextureRenderTargetResource;
 class UMaterialInterface;
+class UPrimitiveComponent;
 
 // Voxel cache cell key. The public headers unify the cell key type on FIntVector; this alias keeps
 // the legacy name used throughout the cache implementation pointing at that same type.
@@ -129,6 +130,7 @@ FRDGTextureRef RegisterRenderTargetTexture(FRDGBuilder& GraphBuilder, FTextureRe
 
 // [game thread] 把 request 列表 resolve 成可跨线程携带的 render 资源引用 + 材质注册表。
 // 返回值仅统计 render-resolve 出的三角；Nanite 全细节源三角单独累积进 *OutNaniteTriangles。
+// OutNaniteRenderComponents 非空时，按 Nanite 画着的组件不 resolve，去重收进它（交给渲染器去拍）。
 uint64 ResolveStaticMeshTriangleRequests(
 	const TArray<FCSStaticMeshTriangleRequest>& Requests,
 	const AActor* ExcludedActor,
@@ -137,7 +139,8 @@ uint64 ResolveStaticMeshTriangleRequests(
 	TArray<FResolvedStaticMeshTriangleRequest>& OutResolvedRequests,
 	TArray<TObjectPtr<UMaterialInterface>>* OutMaterialRegistry = nullptr,
 	FCSNaniteSourceTriangleData* OutNaniteTriangles = nullptr,
-	bool bPreserveSourceMaterialSlots = true);
+	bool bPreserveSourceMaterialSlots = true,
+	TArray<TWeakObjectPtr<UPrimitiveComponent>>* OutNaniteRenderComponents = nullptr);
 
 // [game thread] 枚举 QueryBox 内的 static mesh component，生成提取 request。
 // RequiredActorTags 非空时在枚举阶段就跳过不带任一 tag 的 actor——放到 request 建完再筛，

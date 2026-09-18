@@ -119,6 +119,12 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capturer", Meta=(Priority=1000))
 	float CaptureSize = 10000;
 
+	/** Nanite 网格用渲染器拍深度（俯视正交、只画深度的 custom render pass），得到与画面一致的全精度高度。
+	 *  关掉则 Nanite 网格也走三角形光栅化，只读得到 fallback 低模，没有 fallback 的网格直接缺席。
+	 *  非 Nanite 网格与地形不受影响。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capturer", Meta=(Priority=1000))
+	bool bCaptureNaniteWithRenderer = true;
+
 	// -------------------------------------------------------------------------
 	// Bake System
 	// -------------------------------------------------------------------------

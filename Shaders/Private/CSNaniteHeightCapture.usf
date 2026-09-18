@@ -1,0 +1,34 @@
+// Nanite 深度并入高度图：custom render pass 俯视正交拍出的 SceneDepth（相对渲染相机平面）
+// 换算成高度图的 depth = CameraHeight - WorldZ，按 min 合并（更高的面赢）。
+// 与 StaticMeshPointSampler.usf 的 MergeHeightmapUintToFloatMinCS / LandscapeG16ToDepthCS 同一约定，
+// 三者按任意顺序叠加进同一张图结果都一样。
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float4>   T_RenderedDepth;
+RWTexture2D<float4> RW_Heightmap;
+int2  TileOffset;      // 本块左上角在整张高度图里的 texel 坐标
+int2  TileSize;
+int2  HeightmapSize;
+float DepthOffset;     // 渲染相机高度 - CameraHeight（渲染相机抬在所有几何之上）
+float EmptyDepth;      // 不小于它 = 这个像素没画到东西（远平面深度）
+
+[numthreads(8, 8, 1)]
+void MergeRenderedDepthCS(uint3 DTid : SV_DispatchThreadID)
+{
+	if (any(DTid.xy >= (uint2)TileSize))
+		return;
+	int2 Dst = TileOffset + int2(DTid.xy);
+	if (any(Dst >= HeightmapSize))
+		return;
+
+	float RenderedDepth = T_RenderedDepth[DTid.xy].r;
+	// 写成 !(a < b)：NaN 也走"没画到"这条，不会污染输出
+	if (!(RenderedDepth < EmptyDepth))
+		return;
+
+	// 比 CameraHeight 还高的几何按三角形路径的约定钳成 0（高度 = CameraHeight）
+	float Depth = max(RenderedDepth - DepthOffset, 0.0f);
+	float Existing = RW_Heightmap[Dst].r;
+	RW_Heightmap[Dst] = float4(min(Existing, Depth), 0, 0, 1);
+}

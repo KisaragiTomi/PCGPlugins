@@ -1,6 +1,7 @@
 #include "ComputeShaderShallowWater.h"
 #include "CSBoxSceneCollection.h"
 #include "CSBoxSceneCollectionImpl.h"
+#include "CSNaniteHeightCapture.h"
 #include "ComputeShaderGenerateHelper.h"
 #include "EngineUtils.h"
 #include "Landscape.h"
@@ -1076,12 +1077,21 @@ void ACSShallowWaterCapture::CaptureAll()
 
 	// 走公用的无状态收集器；actor 只交出自身的排除策略、LOD 与三角上限，
 	// 「只收带 SWCaptureTag 的道具」是本次捕获的策略，故在这里显式给出。
-	// 深度捕获只需要位置：Nanite 走 render fallback（不做 MeshDescription 全精度 CPU 提取），
-	// 地形不走 CPU 逐 quad 提取而是下面的 GPU RenderHeightmap——这两处正是旧路径的内存大头。
+	// 深度捕获只需要位置：Nanite 不做 MeshDescription 全精度 CPU 提取（交给下面的渲染器拍，
+	// 关掉 bCaptureNaniteWithRenderer 时退回 render fallback），地形不走 CPU 逐 quad 提取而是
+	// 下面的 GPU RenderHeightmap——这两处正是旧路径的内存大头。
 	FCSBoxSceneCollectOptions CollectOptions = MakeBoxSceneCollectOptions(QueryBox);
 	if (!SWCaptureTag.IsNone()) CollectOptions.RequiredActorTags = { SWCaptureTag };
 	CollectOptions.bIncludeLandscape = false;
 	CollectOptions.bUseMeshDescriptionSourceTriangles = false;
+	const bool bRenderNanite = bCaptureNaniteWithRenderer && CSNaniteHeightCapture::IsAvailable(World);
+	if (bRenderNanite)
+	{
+		// 分流看的是组件当前的场景代理：刚改过可见性 / 网格的组件要先把帧末更新推下去，
+		// 否则会按旧代理分流（渲染器随后在 CaptureScene 里反正也要推这一次）。
+		World->SendAllEndOfFrameUpdates();
+		CollectOptions.bCollectNaniteRenderComponents = true;
+	}
 	FCSBoxScenePreparedData Prepared = CSBoxSceneCollection::CollectBoxSceneTriangles(World, CollectOptions);
 
 	FTextureRenderTargetResource* R_SceneDepth = RT_SceneDepth->GameThread_GetRenderTargetResource();
@@ -1106,6 +1116,18 @@ void ACSShallowWaterCapture::CaptureAll()
 
 			GraphBuilder.Execute();
 		});
+	}
+
+	// 按 Nanite 画着的道具：渲染器俯视正交拍深度（与画面一致的全精度，含 WPO / masked），同样 min 合并。
+	// 渲染在这里立刻入队，与上面的光栅化、下面的地形合并及随后的求解保持命令队列顺序。
+	if (bRenderNanite && Prepared.IsValid() && !Prepared.Impl->NaniteRenderComponents.IsEmpty())
+	{
+		CSNaniteHeightCapture::FHeightmapRequest NaniteRequest;
+		NaniteRequest.Components = Prepared.Impl->NaniteRenderComponents;
+		NaniteRequest.Heightmap = RT_SceneDepth;
+		NaniteRequest.WorldBounds = CapturedBounds;
+		NaniteRequest.CameraHeight = CapturedCameraHeight;
+		if (!CSNaniteHeightCapture::CaptureIntoHeightmap(World, NaniteRequest)) UE_LOG(LogTemp, Warning, TEXT("[CSSW] %s: renderer capture failed, %d Nanite component(s) are missing from RT_SceneDepth"), *GetName(), NaniteRequest.Components.Num());
 	}
 
 	// 地形：ALandscape::RenderHeightmap 在 GPU 上出 G16 高度图，LandscapeG16ToDepthCS 按 min

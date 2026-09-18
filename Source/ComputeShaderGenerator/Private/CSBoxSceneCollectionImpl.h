@@ -27,4 +27,6 @@ struct FCSBoxScenePreparedDataImpl
 	// Nanite 网格的全细节源三角（editor MeshDescription 提取，world-space + UV0 + 材质 id）。
 	// game thread 在 CollectBoxSceneTriangles 里填充，render thread 在 AddPreparedBoxSceneTrianglesToRDG 追加进 soup。
 	CSMeshGenInternal::FCSNaniteSourceTriangleData NaniteTriangles;
+	// bCollectNaniteRenderComponents 时：按 Nanite 画着、留给渲染器去拍的组件（去重）。它们不进 ResolvedRequests。
+	TArray<TWeakObjectPtr<UPrimitiveComponent>> NaniteRenderComponents;
 };

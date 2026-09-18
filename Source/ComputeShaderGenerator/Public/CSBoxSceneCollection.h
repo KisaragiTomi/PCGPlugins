@@ -100,6 +100,12 @@ struct COMPUTESHADERGENERATOR_API FCSBoxSceneCollectOptions
 	 *  bUseMeshDescriptionSourceTriangles 勾选项；其余系统一律用 render fallback。 */
 	bool bUseMeshDescriptionSourceTriangles = false;
 
+	/** true：此刻按 Nanite 画在场景里的组件不解析成三角形（那只拿得到 fallback 低模，没有 fallback
+	 *  的直接被跳过），改为去重收进 prepared data 的 NaniteRenderComponents，由调用方交给渲染器去拍
+	 *  （CSNaniteHeightCapture）。渲染器拍不到的（隐藏等，判定见 IsCapturableNaniteComponent）照旧
+	 *  留在三角形路径上。与 bUseMeshDescriptionSourceTriangles 同开时 MeshDescription 提取优先。 */
+	bool bCollectNaniteRenderComponents = false;
+
 	/** true keeps one registry entry per source (mesh, material slot), so a mesh with five
 	 *  slots yields five output slots even when they share a material or are all unassigned.
 	 *  false dedupes by material pointer only, giving the most compact list but losing the

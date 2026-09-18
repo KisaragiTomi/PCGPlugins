@@ -412,10 +412,10 @@ inline bool CornerNearlyParallel(const FCorner& Corner, float MinDot)
 }
 
 /**
- * 一根待砌的柱（交点经过滤之后的样子，也是聚簇的输入与输出）。
+ * 一根待砌的柱（交点经过滤之后的样子，也是邻近合并的输入与输出）。
  *
- * `OwnerId` 是"谁出砖"：来自所属接触的 `Owner()`；聚簇后取簇内最小者（`IdLess`）。
- * `Seed` 是逐实例随机数的基：聚簇后取簇内最小者 —— 只要输入顺序确定，输出就逐位确定。
+ * 没有归属、没有种子：柱只在它所属的那条接触里产生与合并，两者都是接触自己的（`FCSHouseContact::Owner` /
+ * `Seed`）。早先的 `OwnerId` / `Seed` 字段是给跨接触聚簇用的，随 2026-09-16 晚的裁决一起删掉。
  */
 struct FPost
 {
@@ -423,22 +423,36 @@ struct FPost
 	FVector2D Outward = FVector2D(1.0, 0.0);
 	float BottomZ = 0.0f;
 	float TopZ = 0.0f;
-	FGuid OwnerId;
-	uint32 Seed = 0;
+};
+
+/** 出柱的四道门槛，都取**出砖方自己**的参数（`ACSHouseActor::MakeSeamPostParams`）。 */
+struct FPostParams
+{
+	/** 交点离任一房 footprint 顶点不足它就不立（角石已在那儿）。TG 0.2 m。 */
+	float VertexClearance = 20.0f;
+	/** 两墙外法线点积 ≥ 它（近乎平行同向）不立。TG 0.9。 */
+	float ParallelDot = 0.9f;
+	/** 同一条接触里 XY 更近的交点并成一根。 */
+	float MergeDistance = 30.0f;
+	/** 柱高不足它不砌。TG 1.5 m（3 块砖）。 */
+	float MinHeight = 0.0f;
 };
 
 /**
- * 三维聚簇（2026-09-16 裁决，恢复 08-30 划出范围的「角柱邻近合并」）：
- * ① XY 距离 < `MergeDistance` 的交点归一簇（并查集，与输入顺序无关）；
- * ② 簇内按 Z 区间相交或间隙 < `ZGap` 并成段，每段一根柱：XY 取簇质心（同簇各段上下对齐）、
- *    朝向取成员平均、Z 取段的 [min Bottom, max Top]、Owner 取段内最小 GUID、Seed 取段内最小。
- * 同 XY 不同 Z 的两对交点 ⇒ 两根上下叠放的柱（与 TG「每个交点自带 Z 区间」的自然行为一致）；
- * Z 重叠的并成一根，去掉 TG 那种两根柱互相打架。返回柱数。
+ * 同一条接触内的邻近合并：XY 距离 < `MergeDistance` 的交点并成一根柱 —— XY 取簇质心、朝向取成员平均、
+ * Z 取 [min Bottom, max Top]。并查集的根恒为最小下标，输出按簇的最小成员下标排列 ⇒ 只由输入顺序决定。
+ * 返回柱数。
  *
- * ⚠️ 每栋房只拿得到**自己参与的**接触的交点：三房交汇处 A–B 与 B–C 的交点靠近时 A 看不见 B–C
- * 的，两端可能各立一根。要严格一致得按纯函数把邻域内所有对都算一遍；本轮接受（计划 D7）。
+ * 🛑 **只喂一条接触的交点，跨接触绝不合并**（2026-09-16 晚用户裁决「数量上必须要对应」）。A 在下、B 摞在
+ * A 上、C 从地面横穿两栋：C 手里 A–C 与 B–C 两组交点 XY 相同、Z 相接，仍是**两组**柱，各归各的出砖方。
+ * 跨接触合并的毛病不只是数量：合并柱的归属取决于每栋房各自看得到哪些接触（C 看得到两条，A、B 各一条），
+ * 三栋的 GUID 六种序里四种会少砌一截（`House.ContactStackedPostsPerPair` 钉着）。同一条接触的交点两端
+ * 看到的是同一个对象，合并结果天然一致。
+ *
+ * 同一条接触的交点 Z 区间相同（两房的 [max 房底, min 檐口]），所以这里不分上下段；取并集只为将来逐点底高
+ * （TG 取交点处地形高）进来时仍然成立。
  */
-inline int32 MergePosts(const TArray<FPost>& In, float MergeDistance, float ZGap, TArray<FPost>& Out)
+inline int32 MergePosts(const TArray<FPost>& In, float MergeDistance, TArray<FPost>& Out)
 {
 	Out.Reset();
 	const int32 N = In.Num();
@@ -455,44 +469,54 @@ inline int32 MergePosts(const TArray<FPost>& In, float MergeDistance, float ZGap
 		{
 			if (FVector2D::DistSquared(In[I].Point, In[J].Point) >= MergeSq) continue;
 			const int32 RI = Find(I), RJ = Find(J);
-			if (RI != RJ) Parent[FMath::Max(RI, RJ)] = FMath::Min(RI, RJ);   // 根恒为最小下标 ⇒ 与顺序无关
+			if (RI != RJ) Parent[FMath::Max(RI, RJ)] = FMath::Min(RI, RJ);   // 根恒为最小下标 ⇒ 与合并先后无关
 		}
 	}
 
-	// 簇按最小成员下标出场 ⇒ 输出顺序只由输入顺序决定。
 	for (int32 Root = 0; Root < N; ++Root)
 	{
 		if (Find(Root) != Root) continue;
-		TArray<int32> Members;
-		for (int32 I = 0; I < N; ++I) if (Find(I) == Root) Members.Add(I);
-
+		FPost Post = In[Root];
 		FVector2D Centroid = FVector2D::ZeroVector, Outward = FVector2D::ZeroVector;
-		for (const int32 M : Members) { Centroid += In[M].Point; Outward += In[M].Outward; }
-		Centroid /= double(Members.Num());
-		Outward = Outward.SizeSquared() > UE_DOUBLE_KINDA_SMALL_NUMBER ? Outward.GetSafeNormal() : In[Members[0]].Outward;
-
-		// 稳定排序：先按 BottomZ，再按输入下标 —— 同底不同源时顺序仍然确定。
-		Members.Sort([&In](int32 L, int32 R) { return In[L].BottomZ != In[R].BottomZ ? In[L].BottomZ < In[R].BottomZ : L < R; });
-		FPost Current;
-		bool bOpen = false;
-		for (const int32 M : Members)
+		int32 Count = 0;
+		for (int32 I = Root; I < N; ++I)   // 簇成员的下标都不小于根
 		{
-			const FPost& P = In[M];
-			if (bOpen && P.BottomZ <= Current.TopZ + ZGap)
-			{
-				Current.TopZ = FMath::Max(Current.TopZ, P.TopZ);
-				if (P.OwnerId.IsValid() && (!Current.OwnerId.IsValid() || IdLess(P.OwnerId, Current.OwnerId))) Current.OwnerId = P.OwnerId;
-				Current.Seed = FMath::Min(Current.Seed, P.Seed);
-				continue;
-			}
-			if (bOpen) Out.Add(Current);
-			Current = P;
-			Current.Point = Centroid;
-			Current.Outward = Outward;
-			bOpen = true;
+			if (Find(I) != Root) continue;
+			Centroid += In[I].Point;
+			Outward += In[I].Outward;
+			Post.BottomZ = FMath::Min(Post.BottomZ, In[I].BottomZ);
+			Post.TopZ = FMath::Max(Post.TopZ, In[I].TopZ);
+			++Count;
 		}
-		if (bOpen) Out.Add(Current);
+		Post.Point = Centroid / double(Count);
+		if (Outward.SizeSquared() > UE_DOUBLE_KINDA_SMALL_NUMBER) Post.Outward = Outward.GetSafeNormal();
+		Out.Add(Post);
 	}
+	return Out.Num();
+}
+
+/**
+ * 一条接触出几根柱、各在哪。`First` / `Second` 是求交那一刻两房的快照（与交点表同一份输入），`Corners` 是
+ * 它们的交点表。TG 的两道过滤（近平行不立、贴顶点不立）→ 同接触内邻近合并 → 柱高门槛。
+ * 纯函数：同一条接触、同一份参数，逐位相同。返回柱数。
+ */
+inline int32 BuildPosts(const FHouse& First, const FHouse& Second, const TArray<FCorner>& Corners,
+	const FPostParams& Params, TArray<FPost>& Out)
+{
+	TArray<FPost> Candidates;
+	Candidates.Reserve(Corners.Num());
+	for (const FCorner& Corner : Corners)
+	{
+		if (CornerNearlyParallel(Corner, Params.ParallelDot)) continue;
+		if (CornerNearVertex(First, Second, Corner.Point, Params.VertexClearance)) continue;
+		FPost& Post = Candidates.AddDefaulted_GetRef();
+		Post.Point = Corner.Point;
+		Post.Outward = Corner.Outward;
+		Post.BottomZ = Corner.BottomZ;
+		Post.TopZ = Corner.TopZ;
+	}
+	MergePosts(Candidates, Params.MergeDistance, Out);
+	Out.RemoveAll([&Params](const FPost& Post) { return Post.TopZ - Post.BottomZ < Params.MinHeight; });   // 保序
 	return Out.Num();
 }
 }

@@ -56,12 +56,16 @@ struct COMPUTESHADERGENERATOR_API FCSHouseContact
 	/**
 	 * 纯函数：两栋房现在的接触 —— 竖缝 / 横缝 / 空。
 	 *
-	 * 先按容差判横缝（`abs(上房底 − 下房檐口) ≤ BearingTolerance` 且 footprint 相交），不满足再按
+	 * 先按容差判横缝（`abs(上房底 − 下房檐口) ≤ 容差` 且 footprint 相交），不满足再按
 	 * 「footprint 相交且 Z 区间重叠」判竖缝。容差挡的是「上房嵌进下房几十厘米」这个常态：落座只看地面，
 	 * 摞房靠用户拉 `HeightOffset`，拉不到正好齐平；没有容差就会在轮廓交点立几十厘米高的矮墩子。
 	 * TG 没有专门判「摞」，靠「柱高不足 1.5 m 不砌」把浅重叠当成了坐在上面。
+	 *
+	 * ⚠️ **与参数顺序无关**（谁提交谁是 A）：上下按房底**严格**高低定，房底相同就没有上房、不判横缝；
+	 * 容差取两栋 `BearingTolerance` 的较大者。2026-09-16 晚改：早先 `>=` 让 A 在平局时当上房、容差只读 A 的，
+	 * 同一对房子的种类会随谁最后提交翻转（`House.ContactClassifySymmetric`）。
 	 */
-	static TSharedPtr<FCSHouseContact> Classify(ACSHouseActor* A, ACSHouseActor* B, float BearingTolerance);
+	static TSharedPtr<FCSHouseContact> Classify(ACSHouseActor* A, ACSHouseActor* B);
 };
 
 /** 竖缝：一对房子之间的全部接缝几何，打包成一体。 */
@@ -70,8 +74,23 @@ struct COMPUTESHADERGENERATOR_API FCSHouseSeamContact final : public FCSHouseCon
 	TArray<CSHouseSeam::FCorner> Corners;
 	/** 两端各自的裁剪段，与 `Houses` 同序。 */
 	TArray<FCSWallCut> Cuts[2];
+	/**
+	 * 求交那一刻两房的输入快照，与 `Houses` 同序（交点与裁剪段都是它们的纯函数）。出柱时的贴顶点过滤读它、
+	 * 不读活的房子：一条缝出几根柱只由这条记录 + 出砖方参数决定 —— 对端拖动冻结期间出砖方因别的原因重砌，
+	 * 也不会拿对端的新位置去配旧交点。
+	 */
+	CSHouseSeam::FHouse Shapes[2];
 
 	const TArray<FCSWallCut>& CutsFor(const ACSHouseActor* House) const;
+
+	/**
+	 * 这条缝的柱（`CSHouseSeam::BuildPosts`）。**只属于这条接触，永不与别的接触合并**
+	 * （2026-09-16 晚用户裁决「数量上必须要对应」）；由 `Owner()` 那一端按自己的参数砌。
+	 */
+	int32 BuildPosts(const CSHouseSeam::FPostParams& Params, TArray<CSHouseSeam::FPost>& Out) const
+	{
+		return CSHouseSeam::BuildPosts(Shapes[0], Shapes[1], Corners, Params, Out);
+	}
 };
 
 /** 横缝在底：本轮只判定不出产物（梁 / 木柱落地时再加字段）。 */

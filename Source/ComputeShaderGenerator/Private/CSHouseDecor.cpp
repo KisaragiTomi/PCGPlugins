@@ -137,6 +137,9 @@ void BuildAnchors(const FSite& Site, const FParams& Params, TArray<FAnchor>& Out
 		// ⚠️ **窗户那两家（`add_autoclutter_{around,on}_windows`）本轮不实现** ——
 		// D8 窗户整个卡在 C1，窗一扇都长不出来。这个 `continue` 就是那道预留的接口：
 		// C1 拍板、窗落地之后，在这里按 `_flowerbed_locations` 的候选点表展开即可。
+		// ⚠️ 附属物的门形态（窗贴墙脚变成的门，`bDoorForm`）**不走这一家**：TG 的门侧挂件是另一套
+		// （`add_door_autoclutter`：门铃 / 花环挂在门上，附录 E §7），由 `ACSWindowMarker` 自己带；
+		// 这里的 `add_autoclutter_around_gates` 只服务道路推导出来的拱门。
 		if (O.Type != ECSOpeningType::Door) continue;
 
 		const CSHouseVine::FWallStrip* Strip = CSHouseDecor_FindStrip(Site.Strips, O.EdgeIndex);

@@ -15,7 +15,7 @@
 
 - 计划：[D8 特征标记](#d8-特征标记acshousefeaturemarker窗户等) · [锚点 `FCSWallAnchor`](#锚点-fcswallanchor2026-09-06) · [三个具名网格组件](#三个具名网格组件只有一件定洞2026-09-06-用户裁决) · [蓝图分层](#蓝图分层总蓝图调参子蓝图换网格) · [窗不出框砖，门照旧出](#窗不出框砖门照旧出2026-09-06-用户裁决的直接后果) · [落地与本节的三处出入](#落地与本节的三处出入2026-09-06-实现时改的) · [洞的记录形式](#洞的记录形式剖面--摆位不存任何切出几何也不切) · [拖拽握手与吸附回位](#拖拽握手与吸附回位零回读)
 - TG 对照：[一 窗户不是门那套机制](#一窗户不是门那套机制--两边都不是而且本项目其实更强) · [二 触发规则](#二窗户的触发规则玩家手放不是墙面剩余空间自动填充确凿) · [三 `FCSWallOpening` 够不够](#三fcswallopening-够不够表达窗户够挖洞不够摆框) · [四 怎么让位](#四cshouse_openingcell--solveblocklayout-要怎么给窗户让位) · [7.2 可用资产](#72-窗户可用资产基本齐全) · [C4 措辞订正](#c4-d8-计划里逐像素-clip-是-tiny-glade-的做法这句对窗户不成立)
-- 时间线：[C1（08-30）](#c1-已拍板窗户谓词降维成一维-s-区间2026-08-30) · [D8 收口（08-31）](#d8-收口acswindowmarker-已落地2026-08-31-对照文档-a6) · [窗退出框砖产线（09-06）](#窗退出框砖产线门留着2026-09-06) · [三件网格 + 蓝图分层（09-06）](#三件网格--蓝图分层已落地2026-09-06-用户裁决)
+- 时间线：[C1（08-30）](#c1-已拍板窗户谓词降维成一维-s-区间2026-08-30) · [D8 收口（08-31）](#d8-收口acswindowmarker-已落地2026-08-31-对照文档-a6) · [窗退出框砖产线（09-06）](#窗退出框砖产线门留着2026-09-06) · [三件网格 + 蓝图分层（09-06）](#三件网格--蓝图分层已落地2026-09-06-用户裁决) · [窗贴墙脚变门（09-16）](#窗贴墙脚变门2026-09-16tg-snap_balcony_door)
 
 ⚠️ **证据等级标注沿用来源文档的口径**：【确凿】= PDB 符号 / 反汇编 GLSL / 资产字节 / 本仓源码直接给出，不含推理；
 【推测】= 由确凿证据推理得出，推理链在正文写明；【待确认】= 证据不足，正文写明需要什么才能确证。
@@ -43,6 +43,7 @@
 | 11 | **程序回写 actor 变换只在最终裁决时做**（加载 / 房子重建 / 撤销三条路只读锚点，不打射线）。⚠️ 「不回写」≠「不解析」—— spawn 那一次仍要**降级解析**，见下面第 12 行 | 2026-09-06 | `OnHandleDrag` 里 `SnapToAnchor()` 只在 `bFinal` 分支；回归 `demo_house_window` 的拖动段 `worst drift=0.000 cm over 12 frames` |
 | 12 | **笔刷是创建窗户的唯一入口**：进笔刷 → 在墙上点一下 → 立刻退出。`ACSHouseFeatureMarker` 已改 `NotPlaceable`，拖进视口那条路连同它的三道闸一起退役 | 2026-09-06 | 回归 `demo_house_window`：`one brush click on a wall cuts exactly one window` / `a click that misses every wall creates nothing at all` / `swapping the brush class swaps the hole it cuts`；单测 `House.WindowBrushPlacement`（`AdoptAnchor` 三份坐标互证 + 退路可 spawn + 抽象类被挡）与 `PCGEditorProcess.House.WindowBrushEdMode` / `.WindowBrushModeActivation` / `.WindowBrushBlueprints`（EdMode 那一层，2026-09-06 收尾补的） |
 | 13 | **窗的可画性不挂在门的砖上**：砖组件只在"还有人用"时查健康，砖层开着却零砖才算失败 | 2026-09-06 | 回归 `demo_house_window`：关掉门/角石/包边后 `bricks=0 windows=3 why=<ok>` |
+| 14 | **窗贴墙脚变门**：同一个标记，形态存锚点 `FCSWallAnchor::bDoorForm`；窗底低于 `max(DoorSnapHeight, WindowMinSillZ)` 变门、门底升过它变回窗；门形态放过窗台下限、`Type` 仍是 `Window`（不出门框砖 / 门扇），自带门铃 / 花环、门前踏步与栏杆 | 2026-09-16 | 单测 `House.DoorFormRule` / `House.WindowBecomesDoor` / `Stairs.DoorSteps`；TG 证据 [附录 E](TinyGlade_窗变门逆向_附录E.md) |
 
 ⚠️ 第 11 条的教训要推广到**所有会回写 transform 的抓手**：中途回写会把一次本来能自愈的误判变成不可逆的锁定 ——
 因为下一次判据的输入正是你刚写进去的那个错值。逐条见合卷卷零「🐛 spawn 期的误吸附会**自我固化**」（该节留在原处，主题是 spawn 时序不是窗）。
@@ -1154,6 +1155,46 @@ House 单测 **58 / 0**；回归 **241 PASS / 8 FAIL**（8 条红：2 条门/拱
 `LoadObject<UStaticMesh>` 却没 include `Engine/StaticMesh.h`。全量 unity 构建一路绿灯，
 UBT `-SingleFile` 一过就是 `error C2027: 使用了未定义类型"UStaticMesh"`。本仓库的老毛病（见 MEMORY）：
 **凡碰过的 TU 都该单独过一遍 `-SingleFile`**，否则 Live Coding 会在别人手上炸。
+
+### 窗贴墙脚变门（2026-09-16，TG `snap_balcony_door`）
+
+用户："在 TG 中窗子在接近底边时会变成门"。TG 侧的逐条证据与常量见 [附录 E](TinyGlade_窗变门逆向_附录E.md)，
+门前踏步的砌法见 [附录 D §6](TinyGlade_楼梯逆向_附录D_玩家绘制楼梯.md)。
+
+**门是窗的派生形态，不是另一个类型。** TG 存档里没有「门」：`CottageWindow` / `GothicWindow` 的锚点上
+`is_bottom_door` 被拖拽交互写上之后，每帧派生的子类型从 `*WallWindow` 变成 `*BalconyDoor`，rank 原样保留。
+本项目照抄这个形态 —— 同一个 `ACSWindowMarker`、同一个 `MarkerId`，形态存 `FCSWallAnchor::bDoorForm`
+（撤销、拉尺寸时的重新表达、松手回退全都自动带着它走），诉求与洞带 `bDoorForm`，`Type` 仍是 `Window`。
+
+| 项 | TG（确凿） | 本项目 | 为什么不同 |
+| --- | --- | --- | --- |
+| 判据 | 窗碰撞盒底边低于墙脚，阈值 0 | `CSHouse_ResolveDoorForm`，阈值 `max(DoorSnapHeight = 0, WindowMinSillZ)` | 本项目把窗台低于 `WindowMinSillZ` 的窗拒掉；不取 max，拖下去窗先消失、再往下才变门 |
+| 迟滞 | 鼠标模式没有：进出门同一条判据 | 门形态按**门**的半高判 | TG 的门心在门高/2，按窗判立刻回窗；本项目改一下属性就重新解析，照抄就是一碰参数门变回窗 |
+| 洞底 | 墙脚 + 5 cm | 墙脚（`SillZ = 0`） | 与道路门同口径；5 cm 窄缝下的砖会被整块删掉 |
+| 洞宽 | 碰撞网格包围盒（rank 1 = 114.8） | 渲染网格宽 − 2 × `DoorHoleInset`（2.6） | 没导入 `_collision` 网格 |
+| 洞高 | 碰撞盒高；门顶 ≥ 墙顶即剔除 | 门矮于墙时洞顶夹到 `WallHeight − LintelBand`；门高于墙照旧 `AboveEave` | 默认房 300 − 40 = 260 < 262.5，不夹一扇门都放不下 |
+| 件 | 门扇（含框）、gothic 帽；不出过梁 / 窗台 / 花槽 | `DoorMesh` / `DoorHatMesh`；窗那一组（含子蓝图里没打 `DoorForm` 标签的件）门形态下全藏 | — |
+| 挂件 | `hash(seed) & 3`：门铃 / 花环各 25% | `DoorBellMesh` / `DoorKransMesh`，按 `MarkerId` 的哈希选 | — |
+| 门前踏步 | 门槛贴地 ≤ 20 cm 且门外 106 cm 下沉 10–150 cm | `CSStairs::BuildDoorSteps` → `DoorStepBricks` | — |
+| 栏杆 | 墙脚高出地面 15 cm 且没出踏步 | `CSStairs::ShouldAddDoorRails` → `DoorRailsMesh` | — |
+
+⚠️ 道路门的两样配套件**不给**门形态，且这是按 `Type` 分流自动得到的：门框砖（`CSHouseFrame` 的 `Type != Window`）、
+门扇（`RebuildDoorLeaves` 的 `Type == Door`）。附属物自带门框与门扇，房子再补一份就是双份几何。
+门侧摆件同理走附属物自己的门铃 / 花环，**不**进道路门那一家（`add_autoclutter_around_gates`）。
+
+验证：
+
+- `House.DoorFormRule`：判据的两个不动点、进出门的迟滞、谓词只放过窗台下限（地面以下与过梁带照拒）。
+- `House.WindowBecomesDoor`：拖下去变门（洞底 0、洞宽、洞高夹子、吸附到门心、网格件换组）→ 原地重解析不翻 →
+  墙矮过门被拒、恢复后回来 → 抬上去变回窗 → 笔刷点在墙脚直接落成门。
+- `Stairs.DoorSteps`：门前踏步的判据三关、金字塔砌法（层 / 排 / 进深 / 横向铺满）与栏杆判据。
+
+**没做**：
+
+- gothic 那一档没配门形态：`BP_Window_Gothic_1x1` 没换 `DoorMesh`，目前变出来的是 cottage 门；TG 的 gothic 门洞是
+  按 rank 叠三块矩形的阶梯状尖拱（附录 E 结论 5），本项目仍是一个矩形。
+- TG 另两路吸附：窗对准别的墙的平顶变阳台门、窗下 50 cm 内有玩家楼梯变楼梯门 —— 本项目没有平顶墙，楼梯 actor 也不挂墙，暂无落点。
+- 拖拽途中变了门，门网格按 actor 中心摆、要松手吸附后才落到墙脚（中途回写变换违反「吸附只在最终裁决时做」）。
 
 ## 四、已作废但保留的结论（索引）
 

@@ -30,6 +30,10 @@
 #include "Math/NumericLimits.h"
 #include "Math/RandomStream.h"
 #include "UObject/Class.h"   // HasAnyClassFlags / GetBoolMetaDataHierarchical（unity 构建会替你藏起来）
+#include "UObject/UnrealType.h"   // FindFProperty —— House.ContactStackedPostsPerPair 给私有的 HouseId 定序
+#include "Editor.h"                              // GEditor —— House.DuplicateGetsOwnId 走编辑器复制
+#include "Subsystems/EditorActorSubsystem.h"     // DuplicateActor = Ctrl+D / Alt 拖同一条 T3D 路
+#include "HAL/PlatformProcess.h"                 // FPlatformProcess::Sleep —— House.ContactDragTimeoutCommits
 
 // -----------------------------------------------------------------------------
 // TinyGladeHouse 的判定纯函数用例：不碰 RHI / world，只钉数学 ——
@@ -4991,6 +4995,194 @@ bool FCSHouseWindowBrushPlacementTest::RunTest(const FString& Parameters)
 }
 
 // -----------------------------------------------------------------------------
+// 窗贴墙脚变门（2026-09-16，TG `snap_balcony_door`，附录 E）
+//
+// 纯函数那条钉判据本身：两个形态各自是解析的不动点、进出门之间有迟滞、门形态只放过窗台下限
+// 不放过过梁带。actor 那条钉接线：拖下去变门、原地重解析不翻、抬上去变回窗、笔刷点在墙脚直接出门、
+// 墙矮过门就被拒 —— 每一步都顺带核对洞与网格件的显隐，因为"洞对了、网格没换"不会有别的断言报红。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseDoorFormRuleTest,
+	"PCGPlugins.ComputeShaderGenerator.House.DoorFormRule",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseDoorFormRuleTest::RunTest(const FString& Parameters)
+{
+	// TG cottage 1x1：窗碰撞盒 160 高，门 262.5 高（附录 E §3.5）。
+	const float WinH = 160.0f;
+	const float DoorH = 262.5f;
+
+	// 两档阈值：TG 原值 0，与本项目默认生效的 max(0, WindowMinSillZ = 40)。
+	for (const float Snap : { 0.0f, 40.0f })
+	{
+		const FString Tag = FString::Printf(TEXT("[snap=%.0f]"), Snap);
+		TestFalse(Tag + TEXT(" a window whose bottom clears the threshold stays a window"),
+			CSHouse_ResolveDoorForm(Snap + WinH * 0.5f + 1.0f, WinH, DoorH, Snap, false));
+		TestTrue(Tag + TEXT(" a window whose bottom dips below the threshold becomes a door"),
+			CSHouse_ResolveDoorForm(Snap + WinH * 0.5f - 1.0f, WinH, DoorH, Snap, false));
+
+		// 不动点：吸附之后再解析一次必须拿回同一个形态，否则松手即翻、改个属性也翻。
+		TestTrue(Tag + TEXT(" a snapped door (centre = door height / 2) is a fixed point"),
+			CSHouse_ResolveDoorForm(DoorH * 0.5f, WinH, DoorH, Snap, true));
+		TestFalse(Tag + TEXT(" a window sitting exactly on the threshold is a fixed point"),
+			CSHouse_ResolveDoorForm(Snap + WinH * 0.5f, WinH, DoorH, Snap, false));
+
+		// 迟滞：刚变成门的那个高度不会把门翻回窗；门底抬过阈值才回窗。
+		TestTrue(Tag + TEXT(" the height that turned the window into a door keeps it a door"),
+			CSHouse_ResolveDoorForm(Snap + WinH * 0.5f - 1.0f, WinH, DoorH, Snap, true));
+		TestFalse(Tag + TEXT(" lifting the door until its bottom clears the threshold turns it back"),
+			CSHouse_ResolveDoorForm(FMath::Max(Snap, 1.0f) + DoorH * 0.5f + 1.0f, WinH, DoorH, Snap, true));
+	}
+	TestFalse(TEXT("no door mesh ⇒ never a door"), CSHouse_ResolveDoorForm(0.0f, WinH, 0.0f, 40.0f, false));
+
+	// 谓词：同一个落地洞，窗判 SillTooLow、门形态放行；门形态**不**放过地面以下与过梁带。
+	FCSOpeningSite Site;   // 600 × 400、墙高 300、过梁带 40、护角 60
+	Site.MinSillZ = 40.0f;
+	FCSWallOpening Hole;
+	Hole.Type = ECSOpeningType::Window;
+	Hole.Shape = ECSOpeningShape::Rect;
+	Hole.EdgeIndex = 0;
+	Hole.CenterS = 300.0f;
+	Hole.Width = 114.8f;
+	Hole.Z0 = 0.0f;
+	Hole.Z1 = Site.WallHeight - Site.LintelBand;
+	TestEqual(TEXT("a floor-level window is still SillTooLow"), CSHouse_QueryOpening(Site, Hole), ECSFeatureReject::SillTooLow);
+	Hole.bDoorForm = true;
+	TestEqual(TEXT("the same hole in door form is accepted"), CSHouse_QueryOpening(Site, Hole), ECSFeatureReject::None);
+	FCSWallOpening Sunk = Hole;
+	Sunk.Z0 = -1.0f;
+	TestEqual(TEXT("door form does not excuse a hole below the ground"), CSHouse_QueryOpening(Site, Sunk), ECSFeatureReject::SillTooLow);
+	FCSWallOpening Tall = Hole;
+	Tall.Z1 = DoorH;
+	TestEqual(TEXT("nor one that eats the lintel band"), CSHouse_QueryOpening(Site, Tall), ECSFeatureReject::AboveEave);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseWindowBecomesDoorTest,
+	"PCGPlugins.ComputeShaderGenerator.House.WindowBecomesDoor",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseWindowBecomesDoorTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	ACSHouseActor* House = World->SpawnActor<ACSHouseActor>(FVector::ZeroVector, FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("House"), House)) return false;
+	House->Windows.Reset();
+
+	ACSWindowMarker* Marker = World->SpawnActor<ACSWindowMarker>(FVector::ZeroVector, FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("Window marker"), Marker)) return false;
+	Marker->bDestroyWhenHostless = false;   // 理由同 House.WindowMarker：先 spawn 后摆位
+	if (!TestTrue(TEXT("the TG door asset is loaded (otherwise every check below is vacuous)"), Marker->CanBecomeDoor())) return false;
+
+	float WinW = 0.0f, WinH = 0.0f, DoorW = 0.0f, DoorH = 0.0f;
+	Marker->GetFormSize(false, WinW, WinH);
+	Marker->GetFormSize(true, DoorW, DoorH);
+	TestTrue(FString::Printf(TEXT("the door is taller than the window (%.1f vs %.1f)"), DoorH, WinH), DoorH > WinH);
+	{
+		const UStaticMesh* DoorAsset = Marker->DoorMesh->GetStaticMesh();
+		const float FrameWidth = float(DoorAsset->GetBounds().TransformBy(Marker->DoorMesh->GetRelativeTransform()).BoxExtent.Y) * 2.0f;
+		TestTrue(FString::Printf(TEXT("the door hole is narrower than its frame by the inset (%.1f vs %.1f)"), DoorW, FrameWidth),
+			FMath::IsNearlyEqual(DoorW, FrameWidth - 2.0f * Marker->DoorHoleInset, 0.05f));
+	}
+
+	const double HalfY = House->FootprintSize.Y * 0.5;
+	const float Threshold = FMath::Max(Marker->DoorSnapHeight, House->WindowMinSillZ);
+	auto ReleaseAt = [&](double CentreZ)
+	{
+		Marker->SetActorLocation(FVector(0.0, -HalfY - 100.0, CentreZ));
+		Marker->SetActorRotation(FRotator(0.0, 90.0, 0.0));   // +X 指向墙
+		return Marker->ResolveHostAndRegister(true);
+	};
+	auto FindCut = [&](const FGuid& Id, FCSWallOpening& Out)
+	{
+		for (const FCSWallOpening& O : House->GetCurrentOpenings())
+		{
+			if (O.SourceId == Id) { Out = O; return true; }
+		}
+		return false;
+	};
+	auto WindowPiecesShown = [&]() { return Marker->OpeningMesh->GetVisibleFlag() && Marker->SillMesh->GetVisibleFlag(); };
+	auto DoorPiecesShown = [&]() { return Marker->DoorMesh->GetVisibleFlag(); };
+
+	// ① 高于阈值：窗。
+	TestTrue(TEXT("① resolves a host"), ReleaseAt(Threshold + WinH * 0.5f + 30.0f));
+	TestFalse(TEXT("① well above the threshold it is a window"), Marker->IsDoorForm());
+	TestTrue(TEXT("① and it cuts"), Marker->CausesCut());
+	TestTrue(TEXT("① window pieces shown, door pieces hidden"), WindowPiecesShown() && !DoorPiecesShown());
+
+	// ② 往下拖到窗底低于阈值：门。
+	TestTrue(TEXT("② resolves a host"), ReleaseAt(Threshold + WinH * 0.5f - 10.0f));
+	TestTrue(TEXT("② dipping the window's bottom below the threshold makes it a door"), Marker->IsDoorForm());
+	TestTrue(TEXT("② the anchor carries the form"), Marker->GetAnchor().bDoorForm);
+	TestEqual(TEXT("② and its floor snapped to the wall foot"), Marker->GetAnchor().SillZ, 0.0f);
+	TestEqual(TEXT("② the house accepts it"), Marker->GetLastReject(), ECSFeatureReject::None);
+	TestTrue(TEXT("② and cuts a hole for it"), Marker->CausesCut());
+	{
+		FCSWallOpening Cut;
+		if (TestTrue(TEXT("② the hole is registered under the marker's id"), FindCut(Marker->GetMarkerId(), Cut)))
+		{
+			TestEqual(TEXT("② it is still a marker hole (no road-door frame bricks / leaves)"), Cut.Type, ECSOpeningType::Window);
+			TestTrue(TEXT("② flagged as door form"), Cut.bDoorForm);
+			TestEqual(TEXT("② starting at the wall foot"), Cut.Z0, 0.0f);
+			TestTrue(FString::Printf(TEXT("② as wide as the door hole (%.1f vs %.1f)"), Cut.Width, DoorW), FMath::IsNearlyEqual(Cut.Width, DoorW, 0.05f));
+			const float Usable = House->WallHeight - House->LintelBand;
+			TestTrue(FString::Printf(TEXT("② as tall as the door, clamped under the lintel band (%.1f)"), Cut.Z1),
+				FMath::IsNearlyEqual(Cut.Z1, FMath::Min(DoorH, Usable), 0.05f));
+		}
+	}
+	TestTrue(FString::Printf(TEXT("② the marker snapped to the door's centre (z=%.2f)"), Marker->GetActorLocation().Z),
+		FMath::IsNearlyEqual(Marker->GetActorLocation().Z, double(DoorH) * 0.5, 0.5));
+	TestTrue(TEXT("② door pieces shown, window pieces hidden"), DoorPiecesShown() && !WindowPiecesShown());
+	TestEqual(TEXT("② the marker door gets no road-door leaf"), House->GetDoorLeafCount(), 0);
+
+	// ③ 不动点：从吸附位原地再解析，形态与锚点都不变。
+	{
+		const FCSWallAnchor Before = Marker->GetAnchor();
+		Marker->ResolveHostAndRegister(true);
+		TestTrue(TEXT("③ re-resolving from the snapped spot keeps the door"), Marker->IsDoorForm());
+		TestTrue(TEXT("③ and the anchor does not move"), Marker->GetAnchor() == Before);
+	}
+
+	// ④ 墙矮过门（TG 剔除）：拒；墙恢复：回来。
+	{
+		const float SavedHeight = House->WallHeight;
+		House->WallHeight = DoorH - 10.0f;
+		House->RebuildHouse();
+		TestFalse(TEXT("④ a wall lower than the door rejects it"), Marker->CausesCut());
+		TestFalse(TEXT("④ and hides its pieces"), DoorPiecesShown());
+		House->WallHeight = SavedHeight;
+		House->RebuildHouse();
+		TestTrue(TEXT("④ restoring the wall brings the door back"), Marker->CausesCut());
+	}
+
+	// ⑤ 抬上去：门底升过阈值就变回窗，窗台落在合理高度。
+	TestTrue(TEXT("⑤ resolves a host"), ReleaseAt(FMath::Max(Threshold, 1.0f) + DoorH * 0.5f + 5.0f));
+	TestFalse(TEXT("⑤ lifting the door clear of the threshold makes it a window again"), Marker->IsDoorForm());
+	TestTrue(FString::Printf(TEXT("⑤ with a sill above the threshold (%.1f)"), Marker->GetAnchor().SillZ), Marker->GetAnchor().SillZ >= Threshold);
+	TestTrue(TEXT("⑤ accepted"), Marker->CausesCut());
+	TestTrue(TEXT("⑤ window pieces back, door pieces gone"), WindowPiecesShown() && !DoorPiecesShown());
+
+	// ⑥ 笔刷点在墙脚附近：直接落成门（与拖拽同一个口径）。
+	{
+		ACSHouseFeatureMarker* Placed = UCSHouseLibrary::PlaceMarkerAlongRay(House, ACSWindowMarker::StaticClass(),
+			FVector(160.0, -HalfY - 300.0, 40.0), FVector(0.0, 1.0, 0.0), 1000.0f);
+		const ACSWindowMarker* PlacedWindow = Cast<ACSWindowMarker>(Placed);
+		if (TestNotNull(TEXT("⑥ the brush placed a window marker"), PlacedWindow))
+		{
+			TestTrue(TEXT("⑥ clicked at the wall foot it lands as a door"), PlacedWindow->IsDoorForm());
+			TestTrue(TEXT("⑥ and cuts"), PlacedWindow->CausesCut());
+			World->DestroyActor(Placed);
+		}
+	}
+
+	return true;
+}
+
+// -----------------------------------------------------------------------------
 // 拉尺寸抓手（D5 交互层）：父子回路的 2x 缺陷、下限记账、模式生命周期
 //
 // 这一条要 world —— 抓手是真 actor、attach 在房子下，而"父级移动 Applied/2 会把抓手一起
@@ -6531,53 +6723,73 @@ bool FCSHouseContactMultiMoveTest::RunTest(const FString& Parameters)
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FCSHouseSeamPostMerge3DTest,
-	"PCGPlugins.ComputeShaderGenerator.House.SeamPostMerge3D",
+	FCSHouseSeamPostMergeWithinContactTest,
+	"PCGPlugins.ComputeShaderGenerator.House.SeamPostMergeWithinContact",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
-bool FCSHouseSeamPostMerge3DTest::RunTest(const FString& Parameters)
+bool FCSHouseSeamPostMergeWithinContactTest::RunTest(const FString& Parameters)
 {
-	// 三维聚簇：XY 近的归一簇；簇内 Z 重叠的并成一根、Z 不重叠的上下叠放；Owner 取簇内最小 GUID。
-	const FGuid G1(3u, 0u, 0u, 0u), G2(2u, 0u, 0u, 0u), G3(9u, 0u, 0u, 0u);
-	auto Post = [](double X, double Y, float Bottom, float Top, const FGuid& Owner, uint32 Seed)
+	// 同一条接触内：XY 近的交点并成一根（质心、Z 取并集），远的各自一根，与输入顺序无关。
+	// 「跨接触绝不合并」是接触层面的事（2026-09-16 晚用户裁决），由 `House.ContactStackedPostsPerPair` 在真房子上钉。
+	auto Post = [](double X, double Y, float Bottom, float Top)
 	{
 		CSHouseSeam::FPost P;
-		P.Point = FVector2D(X, Y); P.BottomZ = Bottom; P.TopZ = Top; P.OwnerId = Owner; P.Seed = Seed;
+		P.Point = FVector2D(X, Y); P.BottomZ = Bottom; P.TopZ = Top;
 		return P;
 	};
-	TArray<CSHouseSeam::FPost> In = {
-		Post(0.0, 0.0, 0.0f, 300.0f, G1, 7u),      // 簇 1
-		Post(10.0, 0.0, 100.0f, 400.0f, G2, 5u),   // 簇 1，Z 重叠 ⇒ 并入
-		Post(0.0, 0.0, 500.0f, 800.0f, G3, 9u),    // 簇 1，Z 隔 100 ⇒ 第二段
-		Post(100.0, 0.0, 0.0f, 300.0f, G3, 1u),    // 簇 2
+	const TArray<CSHouseSeam::FPost> In = {
+		Post(0.0, 0.0, 0.0f, 300.0f),      // 簇 1
+		Post(100.0, 0.0, 0.0f, 300.0f),    // 簇 2
+		Post(10.0, 0.0, 20.0f, 320.0f),    // 簇 1（将来逐点底高不同时也取并集）
 	};
 	TArray<CSHouseSeam::FPost> Out;
-	const int32 N = CSHouseSeam::MergePosts(In, 30.0f, 13.0f, Out);
-	TestEqual(TEXT("three posts come out"), N, 3);
-	if (N != 3) return false;
-	TestTrue(TEXT("the merged post spans the union of the overlapping Z ranges"), Out[0].BottomZ == 0.0f && Out[0].TopZ == 400.0f);
-	TestTrue(TEXT("the merged post sits at the cluster centroid"), Out[0].Point.Equals(FVector2D(10.0 / 3.0, 0.0), 1.0e-6));
-	TestTrue(TEXT("the merged post belongs to the smallest GUID"), Out[0].OwnerId == G2);
-	TestEqual(TEXT("and takes the smallest seed"), int32(Out[0].Seed), 5);
-	TestTrue(TEXT("the stacked segment stays separate at the same XY"),
-		Out[1].BottomZ == 500.0f && Out[1].TopZ == 800.0f && Out[1].Point.Equals(Out[0].Point, 1.0e-6));
-	TestTrue(TEXT("the far post is its own cluster"), Out[2].Point.Equals(FVector2D(100.0, 0.0), 1.0e-6) && Out[2].OwnerId == G3);
+	const int32 N = CSHouseSeam::MergePosts(In, 30.0f, Out);
+	TestEqual(TEXT("two posts come out"), N, 2);
+	if (N != 2) return false;
+	TestTrue(TEXT("the merged post sits at the cluster centroid"), Out[0].Point.Equals(FVector2D(5.0, 0.0), 1.0e-6));
+	TestTrue(TEXT("and spans the union of its members' Z"), Out[0].BottomZ == 0.0f && Out[0].TopZ == 320.0f);
+	TestTrue(TEXT("the far post stays on its own"), Out[1].Point.Equals(FVector2D(100.0, 0.0), 1.0e-6));
 
-	// 顺序无关：倒着喂，聚簇出同一个集合（输出顺序按最小输入下标，比较前先排一下）。
+	// 顺序无关：倒着喂，并出同一个集合（输出顺序按最小输入下标，比较前先排一下）。
 	TArray<CSHouseSeam::FPost> Reversed = In;
 	Algo::Reverse(Reversed);
 	TArray<CSHouseSeam::FPost> Out2;
-	CSHouseSeam::MergePosts(Reversed, 30.0f, 13.0f, Out2);
+	CSHouseSeam::MergePosts(Reversed, 30.0f, Out2);
 	auto Key = [](const CSHouseSeam::FPost& P) { return P.Point.X * 1.0e6 + P.Point.Y * 1.0e3 + double(P.BottomZ); };
 	Out.Sort([&](const CSHouseSeam::FPost& L, const CSHouseSeam::FPost& R) { return Key(L) < Key(R); });
 	Out2.Sort([&](const CSHouseSeam::FPost& L, const CSHouseSeam::FPost& R) { return Key(L) < Key(R); });
 	bool bSame = Out.Num() == Out2.Num();
 	for (int32 I = 0; bSame && I < Out.Num(); ++I)
 	{
-		bSame = Out[I].Point.Equals(Out2[I].Point, 1.0e-6) && Out[I].BottomZ == Out2[I].BottomZ && Out[I].TopZ == Out2[I].TopZ
-			&& Out[I].OwnerId == Out2[I].OwnerId && Out[I].Seed == Out2[I].Seed;
+		bSame = Out[I].Point.Equals(Out2[I].Point, 1.0e-6) && Out[I].BottomZ == Out2[I].BottomZ && Out[I].TopZ == Out2[I].TopZ;
 	}
 	TestTrue(TEXT("feeding the posts in reverse order merges to the same set"), bSame);
+
+	// BuildPosts 的门槛：同回归脚本那一对（600x400 与 500x500 偏 (250,150)），两个交点、两墙正交、离顶点都远。
+	CSHouseSeam::FHouse A, B;
+	A.Id = FGuid(1u, 0u, 0u, 0u);
+	A.Footprint = FCSHouseFootprint::MakeRect(FVector2D(600.0, 400.0));
+	B.Id = FGuid(2u, 0u, 0u, 0u);
+	B.Center = FVector2D(250.0, 150.0);
+	B.Footprint = FCSHouseFootprint::MakeRect(FVector2D(500.0, 500.0));
+	TArray<CSHouseSeam::FCorner> Corners;
+	CSHouseSeam::BuildCorners(A, B, Corners);
+	TestEqual(TEXT("the pair crosses at two points"), Corners.Num(), 2);
+	const CSHouseSeam::FPostParams Params;
+	TArray<CSHouseSeam::FPost> Posts;
+	TestEqual(TEXT("default thresholds keep both posts"), CSHouseSeam::BuildPosts(A, B, Corners, Params, Posts), 2);
+	CSHouseSeam::FPostParams Far = Params;
+	Far.MergeDistance = 100000.0f;
+	TestEqual(TEXT("a huge merge distance folds one contact's posts into one"), CSHouseSeam::BuildPosts(A, B, Corners, Far, Posts), 1);
+	CSHouseSeam::FPostParams Tall = Params;
+	Tall.MinHeight = 301.0f;
+	TestEqual(TEXT("posts shorter than MinHeight are dropped"), CSHouseSeam::BuildPosts(A, B, Corners, Tall, Posts), 0);
+	CSHouseSeam::FPostParams Clear = Params;
+	Clear.VertexClearance = 100000.0f;
+	TestEqual(TEXT("posts near a footprint vertex are dropped"), CSHouseSeam::BuildPosts(A, B, Corners, Clear, Posts), 0);
+	CSHouseSeam::FPostParams Parallel = Params;
+	Parallel.ParallelDot = -1.0f;
+	TestEqual(TEXT("posts whose walls count as parallel are dropped"), CSHouseSeam::BuildPosts(A, B, Corners, Parallel, Posts), 0);
 	return true;
 }
 
@@ -6613,6 +6825,310 @@ bool FCSHouseContactBearingTest::RunTest(const FString& Parameters)
 
 	World->DestroyActor(P.B);
 	World->DestroyActor(P.A);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseContactStackedPostsTest,
+	"PCGPlugins.ComputeShaderGenerator.House.ContactStackedPostsPerPair",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseContactStackedPostsTest::RunTest(const FString& Parameters)
+{
+	// 用户裁决 2026-09-16 晚「数量上必须要对应」：A 在下、B 摞在 A 上（房底 = A 檐口 ⇒ 横缝）、C 从地面横穿两栋。
+	// C 手里 A–C 与 B–C 两组交点 XY 相同、Z 相接，仍是**两组**柱，各归各的出砖方，永不跨接触合并。
+	// 早先跨接触聚簇时，合并柱的归属取决于每栋房各自看得到哪些接触，GUID 六种序里四种少砌一截 —— 所以六种都跑。
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+	UStaticMesh* Brick = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	const FStructProperty* IdProperty = FindFProperty<FStructProperty>(ACSHouseActor::StaticClass(), TEXT("HouseId"));
+	if (!TestNotNull(TEXT("HouseId is reflected"), IdProperty)) return false;
+
+	// 先在远处生成（互不接触）并改好 GUID，再挪进位：改 GUID 的那一刻手里没有任何接触，不会留下旧序的记录。
+	auto Spawn = [&](double FarX, const FVector2D& Size, float Height, const FGuid& Id) -> ACSHouseActor*
+	{
+		ACSHouseActor* House = World->SpawnActor<ACSHouseActor>(FVector(FarX, 0.0, 0.0), FRotator::ZeroRotator);
+		if (!House) return nullptr;
+		House->Windows.Reset();
+		House->bSeamEnabled = true;
+		House->bFrameEnabled = true;
+		House->FrameBrickMesh = Brick;
+		House->FootprintSize = Size;
+		House->WallHeight = Height;
+		*IdProperty->ContainerPtrToValuePtr<FGuid>(House) = Id;
+		House->ReevaluateSite();
+		return House;
+	};
+	// 挪进位之后一路兑现：谁动了谁发，收到的被标脏，读 getter 补票，直到没人欠账。
+	auto Settle = [](const TArray<ACSHouseActor*>& Houses)
+	{
+		for (int32 Round = 0; Round < 8; ++Round)
+		{
+			bool bPending = false;
+			for (const ACSHouseActor* House : Houses) bPending |= House->IsReevaluatePending();
+			if (!bPending) return true;
+			for (const ACSHouseActor* House : Houses) House->GetContactCount();
+		}
+		return false;
+	};
+	auto CountKind = [](const ACSHouseActor* House, ECSHouseContactKind Kind)
+	{
+		int32 N = 0;
+		for (const TSharedPtr<FCSHouseContact>& Contact : House->DebugGetContacts())
+		{
+			if (Contact.IsValid() && Contact->Kind == Kind) ++N;
+		}
+		return N;
+	};
+
+	const FGuid Ids[3] = { FGuid(1u, 0u, 0u, 0u), FGuid(2u, 0u, 0u, 0u), FGuid(3u, 0u, 0u, 0u) };
+	const int32 Orders[6][3] = { { 0, 1, 2 }, { 0, 2, 1 }, { 1, 0, 2 }, { 1, 2, 0 }, { 2, 0, 1 }, { 2, 1, 0 } };
+	for (const auto& Order : Orders)
+	{
+		const FString Tag = FString::Printf(TEXT("[GUID rank A=%d B=%d C=%d] "), Order[0], Order[1], Order[2]);
+		// A 600x400 墙高 300；B 同轮廓摞在 A 上（房底 300）；C 200x800 墙高 700 从地面起。
+		// 交点：C 的两条长墙 x = ±100 × A / B 的两条长墙 y = ±200 ⇒ 每对 4 个，离任何顶点都 ≥ 200 cm。
+		ACSHouseActor* A = Spawn(20000.0, FVector2D(600.0, 400.0), 300.0f, Ids[Order[0]]);
+		ACSHouseActor* B = Spawn(40000.0, FVector2D(600.0, 400.0), 300.0f, Ids[Order[1]]);
+		ACSHouseActor* C = Spawn(60000.0, FVector2D(200.0, 800.0), 700.0f, Ids[Order[2]]);
+		if (!TestTrue(Tag + TEXT("three houses spawned"), A && B && C)) return false;
+		A->SetActorLocation(FVector(0.0, 0.0, 0.0));
+		B->SetActorLocation(FVector(0.0, 0.0, 300.0));
+		C->SetActorLocation(FVector(0.0, 0.0, 0.0));
+		TestTrue(Tag + TEXT("the three houses settle"), Settle({ A, B, C }));
+
+		TestEqual(Tag + TEXT("C holds two vertical seams (A-C and B-C)"), CountKind(C, ECSHouseContactKind::Seam), 2);
+		TestEqual(Tag + TEXT("A holds one vertical seam"), CountKind(A, ECSHouseContactKind::Seam), 1);
+		TestEqual(Tag + TEXT("B holds one vertical seam"), CountKind(B, ECSHouseContactKind::Seam), 1);
+		TestEqual(Tag + TEXT("A and B rest on each other (one bearing each)"),
+			CountKind(A, ECSHouseContactKind::Bearing) + CountKind(B, ECSHouseContactKind::Bearing), 2);
+
+		// 逐条竖缝：4 根柱、Z 只是自己那一对的区间（没有 0-600 的合并柱），记到它的出砖方名下。
+		TMap<const ACSHouseActor*, int32> Expected;
+		int32 Total = 0;
+		for (const TSharedPtr<FCSHouseContact>& Contact : C->DebugGetContacts())
+		{
+			if (!Contact.IsValid() || Contact->Kind != ECSHouseContactKind::Seam) continue;
+			const FCSHouseSeamContact& Seam = static_cast<const FCSHouseSeamContact&>(*Contact);
+			const ACSHouseActor* Owner = Seam.Owner();
+			if (!TestNotNull(Tag + TEXT("each seam has an owner"), Owner)) continue;
+			const bool bLower = Seam.Involves(A);
+			const float WantBottom = bLower ? 0.0f : 300.0f;
+			const float WantTop = bLower ? 300.0f : 600.0f;
+			TArray<CSHouseSeam::FPost> Posts;
+			Seam.BuildPosts(Owner->MakeSeamPostParams(), Posts);
+			TestEqual(Tag + (bLower ? TEXT("A-C has four posts") : TEXT("B-C has four posts")), Posts.Num(), 4);
+			for (const CSHouseSeam::FPost& Post : Posts)
+			{
+				TestTrue(Tag + TEXT("each post spans only its own pair's Z"),
+					FMath::IsNearlyEqual(Post.BottomZ, WantBottom, 0.01f) && FMath::IsNearlyEqual(Post.TopZ, WantTop, 0.01f));
+			}
+			Expected.FindOrAdd(Owner) += Posts.Num();
+			Total += Posts.Num();
+		}
+		TestEqual(Tag + TEXT("two seams x four posts = eight"), Total, 8);
+		for (const ACSHouseActor* House : { A, B, C })
+		{
+			TestEqual(Tag + FString::Printf(TEXT("%s builds exactly the posts of the seams it owns"), *House->GetName()),
+				House->GetSeamOwnedPostCount(), Expected.FindRef(House));
+			TestEqual(Tag + FString::Printf(TEXT("%s audits clean"), *House->GetName()), House->AuditContacts().Num(), 0);
+		}
+		TestEqual(Tag + TEXT("the three houses together build all eight"),
+			A->GetSeamOwnedPostCount() + B->GetSeamOwnedPostCount() + C->GetSeamOwnedPostCount(), 8);
+
+		World->DestroyActor(C);
+		World->DestroyActor(B);
+		World->DestroyActor(A);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseContactClassifySymmetricTest,
+	"PCGPlugins.ComputeShaderGenerator.House.ContactClassifySymmetric",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseContactClassifySymmetricTest::RunTest(const FString& Parameters)
+{
+	// 同一对房子的接触种类不许取决于谁提交（谁当 `Classify` 的第一个参数）。早先有两处会翻：
+	// ① 房底相同时 `>=` 让 A 当上房 —— B 矮墙 + 大容差时，A 提交判横缝、B 提交判竖缝；
+	// ② 容差只读 A 的 —— 两栋设得不同时，结论随谁最后动翻转。
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+	const FCSContactPair P = CSHouseTest_SpawnContactPair(World, FVector::ZeroVector, FVector(250.0, 150.0, 0.0));
+	if (!TestNotNull(TEXT("A"), P.A) || !TestNotNull(TEXT("B"), P.B)) return false;
+	auto KindOf = [](const TSharedPtr<FCSHouseContact>& Contact) { return Contact.IsValid() ? int32(Contact->Kind) : -1; };
+
+	// ① 同房底；B 墙高 120、两栋容差都 150 ⇒「A 底 0 与 B 檐口 120 差 120 ≤ 150」是早先 A 视角的横缝。
+	P.A->BearingTolerance = 150.0f;
+	P.B->BearingTolerance = 150.0f;
+	P.B->WallHeight = 120.0f;
+	const int32 AB1 = KindOf(FCSHouseContact::Classify(P.A, P.B));
+	const int32 BA1 = KindOf(FCSHouseContact::Classify(P.B, P.A));
+	TestEqual(TEXT("same base: the kind does not depend on who classifies"), AB1, BA1);
+	TestEqual(TEXT("same base means nobody sits on anybody: a vertical seam"), AB1, int32(ECSHouseContactKind::Seam));
+
+	// ② B 摞在 A 上、嵌进 20 cm；A 容差 100、B 容差 0 ⇒ 取较大者，两个方向都是横缝。
+	P.B->WallHeight = 300.0f;
+	P.A->BearingTolerance = 100.0f;
+	P.B->BearingTolerance = 0.0f;
+	P.B->SetActorLocation(FVector(250.0, 150.0, 280.0));
+	const int32 AB2 = KindOf(FCSHouseContact::Classify(P.A, P.B));
+	const int32 BA2 = KindOf(FCSHouseContact::Classify(P.B, P.A));
+	TestEqual(TEXT("different tolerances: the kind does not depend on who classifies"), AB2, BA2);
+	TestEqual(TEXT("the larger tolerance wins: bearing"), AB2, int32(ECSHouseContactKind::Bearing));
+
+	World->DestroyActor(P.B);
+	World->DestroyActor(P.A);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseDuplicateGetsOwnIdTest,
+	"PCGPlugins.ComputeShaderGenerator.House.DuplicateGetsOwnId",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseDuplicateGetsOwnIdTest::RunTest(const FString& Parameters)
+{
+	// 结构审查 13（2026-09-16 晚编辑器实测）：复制出的房子与原件同 GUID ⇒ 规范序打平、`Classify` 判成同一栋，
+	// 两栋永远不出缝。① 编辑器复制（Ctrl+C/V、Ctrl+D、Alt 拖同一条 T3D 路）给副本新 GUID，并与原件正常出缝；
+	// ② 已经撞上的（此前存盘的旧副本）注册时查重、换一个确定性的。
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+	const FCSContactPair P = CSHouseTest_SpawnContactPair(World, FVector::ZeroVector, FVector(20000.0, 0.0, 0.0));
+	if (!TestNotNull(TEXT("A"), P.A) || !TestNotNull(TEXT("B"), P.B)) return false;
+	UEditorActorSubsystem* EditorActors = GEditor ? GEditor->GetEditorSubsystem<UEditorActorSubsystem>() : nullptr;
+	if (!TestNotNull(TEXT("EditorActorSubsystem"), EditorActors)) return false;
+	const FStructProperty* IdProperty = FindFProperty<FStructProperty>(ACSHouseActor::StaticClass(), TEXT("HouseId"));
+	if (!TestNotNull(TEXT("HouseId is reflected"), IdProperty)) return false;
+	TestTrue(TEXT("HouseId is skipped by non-PIE text export (so Ctrl+C text carries no HouseId)"),
+		IdProperty->HasAnyPropertyFlags(CPF_NonPIEDuplicateTransient));
+
+	// ① 与原件重叠地复制一份（600x400 偏 (250,150)，同回归脚本那一对的摆法）。
+	const FGuid AId = P.A->GetHouseId();
+	ACSHouseActor* Copy = Cast<ACSHouseActor>(EditorActors->DuplicateActor(P.A, World, FVector(250.0, 150.0, 0.0)));
+	if (!TestNotNull(TEXT("the editor duplicates the house"), Copy)) return false;
+	TestTrue(TEXT("the copy gets a valid id of its own"), Copy->GetHouseId().IsValid() && Copy->GetHouseId() != AId);
+	TestTrue(TEXT("and the original keeps its id"), P.A->GetHouseId() == AId);
+	for (int32 Round = 0; Round < 4; ++Round)
+	{
+		P.A->GetContactCount();
+		Copy->GetContactCount();
+	}
+	TestEqual(TEXT("so the copy seams with the original (original end)"), P.A->GetContactCount(), 1);
+	TestEqual(TEXT("so the copy seams with the original (copy end)"), Copy->GetContactCount(), 1);
+	TestTrue(TEXT("and exactly one of them builds the posts"),
+		(P.A->GetSeamOwnedPostCount() > 0) != (Copy->GetSeamOwnedPostCount() > 0));
+
+	// ② 模拟旧副本：把 B 的 GUID 写成 A 的（反射写私有属性），重新注册 ⇒ B 换一个，A 不动；同一栋再撞一次得到同一个值。
+	*IdProperty->ContainerPtrToValuePtr<FGuid>(P.B) = AId;
+	P.B->ReregisterAllComponents();
+	const FGuid Reassigned = P.B->GetHouseId();
+	TestTrue(TEXT("a house registering with a taken id takes a new one"), Reassigned.IsValid() && Reassigned != AId);
+	TestTrue(TEXT("while the house that already had it keeps it"), P.A->GetHouseId() == AId);
+	*IdProperty->ContainerPtrToValuePtr<FGuid>(P.B) = AId;
+	P.B->ReregisterAllComponents();
+	TestTrue(TEXT("the replacement is deterministic for the same actor (reloads do not reshuffle its bricks)"), P.B->GetHouseId() == Reassigned);
+
+	World->DestroyActor(Copy);
+	World->DestroyActor(P.B);
+	World->DestroyActor(P.A);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseContactDragTimeoutTest,
+	"PCGPlugins.ComputeShaderGenerator.House.ContactDragTimeoutCommits",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseContactDragTimeoutTest::RunTest(const FString& Parameters)
+{
+	// 松手事件没来（抓手收到的第一个 bFinished 被降级成拖动帧、Esc 取消、选中不拖）时，拖动兜底要**自己**兑现。
+	// 2026-09-16 晚编辑器实测：标志卡在 true，而只在下次重求值里查超时 —— 没人再叫醒这栋房，拖完一直不出缝。
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+	const FCSContactPair P = CSHouseTest_SpawnContactPair(World, FVector::ZeroVector, FVector(250.0, 150.0, 0.0));
+	if (!TestNotNull(TEXT("A"), P.A) || !TestNotNull(TEXT("B"), P.B)) return false;
+	const FCSHouseContact* Before = CSHouseTest_FirstContact(P.B);
+	if (!TestNotNull(TEXT("B holds the contact before the drag"), Before)) return false;
+
+	P.A->GizmoDragIdleSeconds = 0.1f;
+	P.A->PushEdge(1, 40.0f, false);   // 一帧拖动，之后再没有任何事件
+	TestTrue(TEXT("A is frozen mid-drag"), P.A->IsInGizmoDrag());
+	TestTrue(TEXT("B is not written during the drag"), CSHouseTest_FirstContact(P.B) == Before);
+	TestTrue(TEXT("the dragged house keeps its tick on to time the drag out"), P.A->IsActorTickEnabled());
+
+	FPlatformProcess::Sleep(0.25f);
+	++GFrameCounter;
+	World->Tick(LEVELTICK_ViewportsOnly, 1.0f / 30.0f);
+	TestFalse(TEXT("the stuck drag flag times out on the house's own tick"), P.A->IsInGizmoDrag());
+	const FCSHouseContact* After = CSHouseTest_FirstContact(P.B);
+	TestTrue(TEXT("and the seam is re-sent without any release event"), After != nullptr && After != Before);
+	TestTrue(TEXT("to both ends"), CSHouseTest_FirstContact(P.A) == After);
+
+	++GFrameCounter;
+	World->Tick(LEVELTICK_ViewportsOnly, 1.0f / 30.0f);
+	TestFalse(TEXT("after that the house goes idle again (tick off)"), P.A->IsActorTickEnabled());
+
+	World->DestroyActor(P.B);
+	World->DestroyActor(P.A);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseBodyBottomFaceTest,
+	"PCGPlugins.ComputeShaderGenerator.House.BodyBottomFace",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseBodyBottomFaceTest::RunTest(const FString& Parameters)
+{
+	// 房体底面（2026-09-17）：墙内皮围出的那块在房底高度封上，朝下的单面；墙板自己的底不重复铺。
+	FCSHouseBodyDesc Desc;
+	Desc.Footprint = FCSHouseFootprint::MakeRect(FVector2D(600.0, 400.0));
+	Desc.WallThickness = 24.0f;
+	Desc.WallHeight = 300.0f;
+
+	Desc.bBottomFace = false;
+	FCSGpuMeshCPUData Open;
+	CSHouse_BuildBodySoup(Desc, Open);
+	Desc.bBottomFace = true;
+	FCSGpuMeshCPUData Closed;
+	CSHouse_BuildBodySoup(Desc, Closed);
+
+	const int32 OpenTris = Open.Indices.Num() / 3, ClosedTris = Closed.Indices.Num() / 3;
+	TestEqual(TEXT("a rectangle's bottom face is exactly two extra triangles"), ClosedTris - OpenTris, 2);
+	if (ClosedTris - OpenTris != 2) return false;
+	// 追加写 ⇒ 底面是最后两个三角（墙在前、底面在屋顶注释之前、之后再无几何）。
+	double Area = 0.0;
+	int32 BadNormal = 0, BadHeight = 0, OutsideInner = 0;
+	const double HX = 300.0 - 24.0, HY = 200.0 - 24.0;
+	for (int32 Tri = OpenTris; Tri < ClosedTris; ++Tri)
+	{
+		const FVector P[3] = { FVector(Closed.Positions[Closed.Indices[Tri * 3]]), FVector(Closed.Positions[Closed.Indices[Tri * 3 + 1]]),
+			FVector(Closed.Positions[Closed.Indices[Tri * 3 + 2]]) };
+		for (int32 V = 0; V < 3; ++V)
+		{
+			if (!FMath::IsNearlyZero(P[V].Z, 1.0e-3)) ++BadHeight;
+			if (FMath::Abs(P[V].X) > HX + 1.0e-3 || FMath::Abs(P[V].Y) > HY + 1.0e-3) ++OutsideInner;
+			if (Closed.Normals[Closed.Indices[Tri * 3 + V]].Z > -0.999f) ++BadNormal;
+		}
+		Area += 0.5 * FVector::CrossProduct(P[1] - P[0], P[2] - P[0]).Size();
+	}
+	TestEqual(TEXT("the bottom face lies on the house base"), BadHeight, 0);
+	TestEqual(TEXT("and faces down"), BadNormal, 0);
+	TestEqual(TEXT("and stays inside the inner wall skin (the wall slabs close their own bottoms)"), OutsideInner, 0);
+	TestTrue(FString::Printf(TEXT("and covers the whole inner rectangle (%.1f cm^2)"), Area),
+		FMath::IsNearlyEqual(Area, 4.0 * HX * HY, 1.0));
+
+	// 墙厚超过房子一半：内皮翻过来，屋里没有空腔，不铺。
+	Desc.WallThickness = 250.0f;
+	Desc.bBottomFace = false;
+	FCSGpuMeshCPUData ThickOpen;
+	CSHouse_BuildBodySoup(Desc, ThickOpen);
+	Desc.bBottomFace = true;
+	FCSGpuMeshCPUData ThickClosed;
+	CSHouse_BuildBodySoup(Desc, ThickClosed);
+	TestEqual(TEXT("no bottom face when the walls leave no inside"), ThickClosed.Indices.Num(), ThickOpen.Indices.Num());
 	return true;
 }
 

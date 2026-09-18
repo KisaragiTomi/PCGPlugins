@@ -439,6 +439,7 @@ void ACSHouseActor::BuildWindowOpenings(TArray<FCSWallOpening>& OutCandidates) c
 		Opening.Width = Request.Width;
 		Opening.Z0 = Request.SillZ;
 		Opening.Z1 = Request.SillZ + Request.Height;
+		Opening.bDoorForm = Request.bDoorForm;
 		// AxisUS / Skew 一律留默认：对普通窗恒为 (0,1) 与 0，它们是给楼梯洞与将来的转角窗
 		// 预留的（CSHouseProfile.h 的字段注释写明了）。现在拿来用，转角窗真做时语义会打架。
 
@@ -474,6 +475,7 @@ void ACSHouseActor::BuildWindowOpenings(TArray<FCSWallOpening>& OutCandidates) c
 		Opening.Width = Entry.Window.Width;
 		Opening.Z0 = Entry.Window.SillZ;
 		Opening.Z1 = Entry.Window.SillZ + Entry.Window.Height;
+		Opening.bDoorForm = Entry.Window.bDoorForm;
 		Opening.SourceId = Entry.MarkerId;
 		// Tag 与属性面板那半共用同一段（0x80 起），从列表尾部往回编，两半在 128 扇窗以内不会撞。
 		Opening.Tag = uint8(0x80 | ((0x7F - Index) & 0x7F));
@@ -832,7 +834,9 @@ uint32 ACSHouseActor::ComputeDoors()
 			CSHouse_Q(O.AxisUS.X, 0.01), CSHouse_Q(O.AxisUS.Y, 0.01),
 			// StyleFlags 是**决定顶点位置**的量（墩侧的面板格收到洞缘、跨度只从墩顶往上砌），
 			// 不是外观通道，所以它必须在这份哈希里。漏掉它 = 迟回翻了但房体不重建。
-			int32(O.StyleFlags) });
+			int32(O.StyleFlags),
+			// 门形态决定谓词放不放它（窗台下限），进哈希与 `Type` 同一条理由。
+			int32(O.bDoorForm) });
 	}
 	H.Append({ CSHouse_Q(OpeningChordTolerance, 0.01) });   // 容差决定分段数 ⇒ 决定索引数
 	return CSHouse_Hash(H);
@@ -1054,9 +1058,17 @@ void ACSHouseActor::FlushPendingReevaluate() const
 void ACSHouseActor::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
+	// 拖动兜底**自己兑现**（D7 09-16 晚）：松手事件没来就没人再叫醒这栋房，只在下次重求值里查超时等于永远不查。
+	// 超时 = 按松手处理：清标志、强制全量重建一次（同 `PostEditMove(true)`）、重求值里接缝照常提交。
+	if (bInGizmoDrag && FPlatformTime::Seconds() - GizmoDragTouchedAt > FMath::Max(GizmoDragIdleSeconds, 0.0f))
+	{
+		bInGizmoDrag = false;
+		bForceFullRebuild = true;
+		bReevaluatePending = true;
+	}
 	// **先关再跑**：重建途中若又来了通知，`RequestReevaluate` 会把 tick 重新打开、留给下一帧。
-	// 顺序反过来，那次打开就被这一行关掉，新诉求要等到下一次别的唤醒才兑现。
-	SetActorTickEnabled(false);
+	// 顺序反过来，那次打开就被这一行关掉，新诉求要等到下一次别的唤醒才兑现。还在拖（等超时）就留着。
+	SetActorTickEnabled(bInGizmoDrag);
 	FlushPendingReevaluate();
 }
 
@@ -1097,7 +1109,7 @@ void ACSHouseActor::ReevaluateSite()
 	ReanchorMarkersToPreserveWorld();
 
 	const uint32 SeamCutHash = ComputeSeamCuts();
-	const uint32 BodyHash = CSHouse_Hash({ int32(ComputeDoors()), int32(SeamCutHash) });
+	const uint32 BodyHash = CSHouse_Hash({ int32(ComputeDoors()), int32(SeamCutHash), int32(bBottomFace) });
 	// "网格在不在"不够：删除后撤销，复活的网格对象还在、显存却已被渲染组件还掉了（IsSlotMeshLive）。
 	ReconcileMeshSlot(BodySlot, BodyHash, PlacementHash, bForceFullRebuild || !IsSlotMeshLive(TinyGladeMesh),
 		[this]() { RebuildBodyMesh(); }, [this]() { return ApplyBodyPlacement(); });
@@ -1239,8 +1251,7 @@ void ACSHouseActor::RebuildHouse()
 float ACSHouseActor::PushEdge(int32 EdgeIndex, float Offset, bool bFinished)
 {
 	// 抓手拖动 = 接缝冻结期（D7 09-16），松手提交；与 PostEditMove 同一对标志。
-	bInGizmoDrag = !bFinished;
-	GizmoDragTouchedAt = FPlatformTime::Seconds();
+	NoteGizmoDrag(bFinished);
 
 	FVector2D NewSize = FootprintSize;
 	FVector NewCentre = GetActorLocation();
@@ -1292,8 +1303,7 @@ float ACSHouseActor::PushEdge(int32 EdgeIndex, float Offset, bool bFinished)
 float ACSHouseActor::PushHeight(float Offset, bool bFinished)
 {
 	// 抓手拖动 = 接缝冻结期（D7 09-16），松手提交；与 PostEditMove 同一对标志。
-	bInGizmoDrag = !bFinished;
-	GizmoDragTouchedAt = FPlatformTime::Seconds();
+	NoteGizmoDrag(bFinished);
 
 	const float Desired = FMath::Max(WallHeight + Offset, FMath::Max(MinWallHeight, 1.0f));
 	const float Applied = Desired - WallHeight;
@@ -1314,8 +1324,7 @@ float ACSHouseActor::PushHeight(float Offset, bool bFinished)
 float ACSHouseActor::PushBase(float Offset, bool bFinished)
 {
 	// 抓手拖动 = 接缝冻结期（D7 09-16），松手提交；与 PostEditMove 同一对标志。
-	bInGizmoDrag = !bFinished;
-	GizmoDragTouchedAt = FPlatformTime::Seconds();
+	NoteGizmoDrag(bFinished);
 
 	// 底动顶不动（用户裁决 2026-09-14）：房底抬 Δ ⇔ `HeightOffset += Δ`、`WallHeight -= Δ`。
 	// 两条下限同时夹，生效量取两者都允许的那一段：
@@ -1748,6 +1757,45 @@ void CSHouse_BuildBodySoup(const FCSHouseBodyDesc& Desc, FCSGpuMeshCPUData& S)
 		// （`BuildFrameArches` -> `CSHouseFrame::BuildEdgeElements`），与 clip 判据同源。
 	}
 
+	// ---- 底面（2026-09-17 用户要求「房子产生底面」）----
+	//
+	// 只铺**墙内皮**围出的那块：墙板自己的底已由 `AddWallPrism` 封住，外皮到内皮这一圈再铺一层会与之共面打架。
+	// 内皮角点 = 外角沿角平分线内缩到墙厚 T（`PointAtDepth`，与斜接墙板同一个真源），footprint 取凸包 ⇒ 内皮也凸，扇形即可。
+	// **朝下的单面**：墙材质不双面，从屋里往下看是背面、被剔除 —— 平地上房底正好压在地形上，双面就会透过门洞闪烁。
+	// 不带裁剪场（UV1 哨兵，恒保留），语义色按墙面，UV0 按局部 XY 平铺（与墙面同一个周期）。
+	if (Desc.bBottomFace)
+	{
+		const int32 NumCorners = Desc.Footprint.NumEdges();
+		TArray<FVector> Inner;
+		Inner.Reserve(NumCorners);
+		for (int32 Corner = 0; Corner < NumCorners; ++Corner)
+		{
+			const FVector2D P = CSHouse_GetCorner(Corner, Desc.Footprint).PointAtDepth(T);
+			Inner.Add(FVector(P.X, P.Y, 0.0));
+		}
+		// 墙厚大于房子一半时内皮会翻过来（有向面积 <= 0）：那时屋里本来就没有空腔，不铺。
+		double TwiceArea = 0.0;
+		for (int32 K = 0; K < Inner.Num(); ++K)
+		{
+			const FVector& A = Inner[K];
+			const FVector& B = Inner[(K + 1) % Inner.Num()];
+			TwiceArea += A.X * B.Y - B.X * A.Y;
+		}
+		if (Inner.Num() >= 3 && TwiceArea > 1.0)
+		{
+			Writer.SetPanel(FVector::ZeroVector, FVector::ForwardVector, FCSOpeningClipField(), ECSHousePart::Wall, 0);
+			auto FloorUV = [](const FVector& P) { return FVector2f(float(P.X) / CSHouse_UVScale, float(P.Y) / CSHouse_UVScale); };
+			for (int32 K = 1; K + 1 < Inner.Num(); ++K)
+			{
+				// 内皮环是逆时针（俯视）：按 0 → K+1 → K 反着连，面法线 cross(B−A, C−A) 才朝 −Z。
+				const FVector& A = Inner[0];
+				const FVector& B = Inner[K + 1];
+				const FVector& C = Inner[K];
+				Writer.AddTri(A, B, C, SlotWall, FloorUV(A), FloorUV(B), FloorUV(C));
+			}
+		}
+	}
+
 	// ---- 屋顶：四坡 + 全瓦片。房体三角汤里**一片屋面都不产**（2026-08-31）。 ----
 	//
 	// 这里原本是「两块实体坡板 + 两端山墙棱柱 + 两条檐口封口楔形」那一整套双坡结构，整段删除：
@@ -1774,6 +1822,7 @@ void ACSHouseActor::RebuildBodyMesh()
 	Desc.PierWidth = PierWidth;
 	Desc.Openings = CurrentOpenings;
 	Desc.SeamCuts = CurrentSeamCuts;
+	Desc.bBottomFace = bBottomFace;
 	Desc.World = GetBuildTransform();
 
 	FCSGpuMeshCPUData S;
@@ -2420,6 +2469,16 @@ CSHouseSeam::FHouse ACSHouseActor::MakeSeamHouse() const
 	return H;
 }
 
+CSHouseSeam::FPostParams ACSHouseActor::MakeSeamPostParams() const
+{
+	CSHouseSeam::FPostParams P;
+	P.VertexClearance = SeamVertexClearance;
+	P.ParallelDot = SeamParallelDot;
+	P.MergeDistance = SeamPostMergeDistance;
+	P.MinHeight = float(FMath::Max(SeamMinPostBricks, 0)) * FMath::Max(FrameBrickLength, 1.0f);   // TG：柱高不足 N 块砖不砌
+	return P;
+}
+
 void ACSHouseActor::GatherSeamCandidates(TArray<ACSHouseActor*>& Out) const
 {
 	Out.Reset();
@@ -2453,10 +2512,28 @@ uint32 ACSHouseActor::ComputeSeamKey() const
 
 bool ACSHouseActor::CanCommitSeams()
 {
-	// 拖动标志卡住（Esc 取消拖动时 `PostEditMove(true)` 未必来）：2 s 无位移超时兜底，
-	// 照标记那边 `MarkerDragIdleSeconds` 的先例。
-	if (bInGizmoDrag && FPlatformTime::Seconds() - GizmoDragTouchedAt > 2.0) bInGizmoDrag = false;
+	// 拖动标志卡住（松手事件没来）：`GizmoDragIdleSeconds` 无位移超时兜底，照特征标记 `DragIdleSeconds` 的先例。
+	// 这里查是为了重求值恰好先于 `Tick` 时不白等一帧；真正保证会查的是 `Tick`（`NoteGizmoDrag` 开着它）。
+	if (bInGizmoDrag && FPlatformTime::Seconds() - GizmoDragTouchedAt > FMath::Max(GizmoDragIdleSeconds, 0.0f)) bInGizmoDrag = false;
 	return !bInGizmoDrag && !bInGroundDrag;
+}
+
+void ACSHouseActor::NoteGizmoDrag(bool bFinished)
+{
+	bInGizmoDrag = !bFinished;
+	GizmoDragTouchedAt = FPlatformTime::Seconds();
+	if (bInGizmoDrag && !IsTemplate()) SetActorTickEnabled(true);
+}
+
+bool ACSHouseActor::IsHouseIdTakenByOther(const FGuid& Id) const
+{
+	const UWorld* World = GetWorld();
+	if (!Id.IsValid() || !World) return false;
+	for (const ACSHouseActor* Other : TActorRange<ACSHouseActor>(World))
+	{
+		if (Other != this && IsValid(Other) && !Other->IsTemplate() && Other->HouseId == Id) return true;
+	}
+	return false;
 }
 
 void ACSHouseActor::UpdateContacts(bool bCanCommit)
@@ -2487,7 +2564,7 @@ void ACSHouseActor::UpdateContacts(bool bCanCommit)
 
 	for (ACSHouseActor* Y : Partners)
 	{
-		TSharedPtr<FCSHouseContact> Contact = FCSHouseContact::Classify(this, Y, BearingTolerance);
+		TSharedPtr<FCSHouseContact> Contact = FCSHouseContact::Classify(this, Y);
 		if (Contact.IsValid()) Contacts.Add(Contact);
 		Y->ReceiveContactFrom(this, Contact);
 	}
@@ -2575,69 +2652,50 @@ uint32 ACSHouseActor::BuildSeamBricks(TArray<CSHouseFrame::FElement>& InOutEleme
 	CurrentSeamOwnedPostCount = 0;
 	if (!bSeamEnabled || !CanBuildSeamBricks() || Contacts.IsEmpty()) return 0;
 
-	// 接触按规范序 GUID 对排序：柱的输出顺序（随机数基的下标）只由几何决定，不由记录到达的先后决定。
-	TArray<const FCSHouseSeamContact*> Seams;
+	// 只砌自己是出砖方的竖缝（一条缝只砌一次）。按规范序 GUID 对排序：柱的输出顺序只由几何决定，
+	// 不由记录到达的先后决定。
+	TArray<const FCSHouseSeamContact*> Owned;
 	for (const TSharedPtr<FCSHouseContact>& C : Contacts)
 	{
-		if (C.IsValid() && C->Kind == ECSHouseContactKind::Seam) Seams.Add(static_cast<const FCSHouseSeamContact*>(C.Get()));
+		if (!C.IsValid() || C->Kind != ECSHouseContactKind::Seam || C->Owner() != this) continue;
+		Owned.Add(static_cast<const FCSHouseSeamContact*>(C.Get()));
 	}
-	Seams.Sort([](const FCSHouseSeamContact& L, const FCSHouseSeamContact& R)
+	if (Owned.IsEmpty()) return 0;
+	Owned.Sort([](const FCSHouseSeamContact& L, const FCSHouseSeamContact& R)
 	{
 		return CSHouseSeam::IdLess(L.Ids[0], R.Ids[0]) || (L.Ids[0] == R.Ids[0] && CSHouseSeam::IdLess(L.Ids[1], R.Ids[1]));
 	});
 
-	// 交点 → 待砌的柱：先按 TG 的两条过滤（近平行不出、贴顶点不出），再三维聚簇，只砌 Owner 是我的。
-	TArray<CSHouseSeam::FPost> Posts;
-	for (const FCSHouseSeamContact* Seam : Seams)
-	{
-		ACSHouseActor* A = Seam->Houses[0].Get();
-		ACSHouseActor* B = Seam->Houses[1].Get();
-		if (!IsValid(A) || !IsValid(B)) continue;
-		const ACSHouseActor* PostOwner = Seam->Owner();   // 别叫 Owner：会遮住 AActor::Owner（C4458 按错误处理）
-		const FGuid OwnerId = PostOwner ? PostOwner->GetHouseId() : FGuid();
-		const CSHouseSeam::FHouse HA = A->MakeSeamHouse();
-		const CSHouseSeam::FHouse HB = B->MakeSeamHouse();
-		for (const CSHouseSeam::FCorner& Corner : Seam->Corners)
-		{
-			if (CSHouseSeam::CornerNearlyParallel(Corner, SeamParallelDot)) continue;
-			if (CSHouseSeam::CornerNearVertex(HA, HB, Corner.Point, SeamVertexClearance)) continue;
-			CSHouseSeam::FPost Post;
-			Post.Point = Corner.Point;
-			Post.Outward = Corner.Outward;
-			Post.BottomZ = Corner.BottomZ;
-			Post.TopZ = Corner.TopZ;
-			Post.OwnerId = OwnerId;
-			Post.Seed = Seam->Seed();
-			Posts.Add(Post);
-		}
-	}
-	if (Posts.IsEmpty()) return 0;
-
-	const float BrickLength = FMath::Max(FrameBrickLength, 1.0f);
-	TArray<CSHouseSeam::FPost> Merged;
-	CSHouseSeam::MergePosts(Posts, SeamPostMergeDistance, BrickLength * 0.5f, Merged);
-
 	CSHouseFrame::FBrickParams Params;
-	Params.Length = BrickLength;
+	Params.Length = FMath::Max(FrameBrickLength, 1.0f);
 	Params.Gap = FMath::Max(FrameBrickGap, 0.0f);
 	// **与门框砖共用同一份常驻容量**：接缝砖只是同一个组件里排在后面的那些行，超了一起截断。
 	Params.MaxBricks = EffectiveFrameCapacity();
+	const CSHouseSeam::FPostParams PostParams = MakeSeamPostParams();
 	int32 Cursor = CSHouseFrame::NextBrickSlot(InOutElements);
 	const int32 Before = Cursor;
-	const float MinHeight = float(FMath::Max(SeamMinPostBricks, 0)) * BrickLength;
 
 	TArray<int32> H;
-	for (int32 Index = 0; Index < Merged.Num(); ++Index)
+	TArray<CSHouseSeam::FPost> Posts;
+	for (const FCSHouseSeamContact* Seam : Owned)
 	{
-		const CSHouseSeam::FPost& Post = Merged[Index];
-		if (Post.OwnerId != HouseId) continue;                     // 一条缝只砌一次：Owner 才砌
-		if (Post.TopZ - Post.BottomZ < MinHeight) continue;       // TG：柱高不足 N 块砖不砌
-		CSHouseFrame::AppendColumn(Post.Point, Post.Outward, Post.BottomZ, Post.TopZ,
-			CSHouseFrame::PathRandomBase(Post.Seed, CSHouseFrame::EPathFamily::Seam, Index), Params, InOutElements, Cursor);
-		++CurrentSeamOwnedPostCount;
-		// 哈希只记标量：柱位 + 柱高。逐砖的位置是它们的纯函数。
-		H.Append({ CSHouse_Q(Post.Point.X, 1), CSHouse_Q(Post.Point.Y, 1), CSHouse_Q(Post.Outward.X, 0.01), CSHouse_Q(Post.Outward.Y, 0.01),
-			CSHouse_Q(Post.BottomZ, 1), CSHouse_Q(Post.TopZ, 1) });
+		// 一条接触一组柱，**永不与别的接触合并**（2026-09-16 晚用户裁决「数量上必须要对应」）：
+		// A 在下、B 摞在上、C 横穿两栋时，C 上是 A–C 与 B–C 两组柱，不是一根通高的柱。
+		Seam->BuildPosts(PostParams, Posts);
+		const uint32 Seed = Seam->Seed();
+		// 种子进哈希：柱位没变而对端换了身份（复制出新 GUID）时，砖的随机花样也要跟着重砌。
+		if (!Posts.IsEmpty()) H.Add(int32(Seed));
+		for (int32 Index = 0; Index < Posts.Num(); ++Index)
+		{
+			const CSHouseSeam::FPost& Post = Posts[Index];
+			// 随机数基 = 这条接触的种子 + 它自己的柱号：别的接触增减不会让这条缝的砖换花样。
+			CSHouseFrame::AppendColumn(Post.Point, Post.Outward, Post.BottomZ, Post.TopZ,
+				CSHouseFrame::PathRandomBase(Seed, CSHouseFrame::EPathFamily::Seam, Index), Params, InOutElements, Cursor);
+			++CurrentSeamOwnedPostCount;
+			// 哈希只记标量：柱位 + 柱高。逐砖的位置是它们的纯函数。
+			H.Append({ CSHouse_Q(Post.Point.X, 1), CSHouse_Q(Post.Point.Y, 1), CSHouse_Q(Post.Outward.X, 0.01), CSHouse_Q(Post.Outward.Y, 0.01),
+				CSHouse_Q(Post.BottomZ, 1), CSHouse_Q(Post.TopZ, 1) });
+		}
 	}
 	CurrentSeamBrickCount = Cursor - Before;
 	InOutBrickCount += CurrentSeamBrickCount;
@@ -2661,11 +2719,27 @@ TArray<FString> ACSHouseActor::AuditContacts() const
 		bool bDuplicate = false;
 		Seen.Add(Other->GetHouseId(), &bDuplicate);
 		if (bDuplicate) Problems.Add(FString::Printf(TEXT("%s：同一对房子有两条接触"), *Pair));
-		const TSharedPtr<FCSHouseContact> Now = FCSHouseContact::Classify(const_cast<ACSHouseActor*>(this), const_cast<ACSHouseActor*>(Other), BearingTolerance);
+		const TSharedPtr<FCSHouseContact> Now = FCSHouseContact::Classify(const_cast<ACSHouseActor*>(this), const_cast<ACSHouseActor*>(Other));
 		if (!Now.IsValid()) Problems.Add(FString::Printf(TEXT("%s：两房已不接触，记录还在"), *Pair));
 		else if (Now->Kind != C->Kind) Problems.Add(FString::Printf(TEXT("%s：接触种类已变（记录 %d，现在 %d）"), *Pair, int32(C->Kind), int32(Now->Kind)));
 	}
 	if (!bInGizmoDrag && !bInGroundDrag && (!bSeamKeyValid || ComputeSeamKey() != LastSeamKey)) Problems.Add(TEXT("欠着一次提交（不在拖拽却 Key ≠ LastSeamKey）"));
+	// 数量对应（09-16 晚裁决）：我砌的柱数 = 我是出砖方的那些竖缝各自的柱数之和，一根不多一根不少。
+	if (bSeamEnabled && CanBuildSeamBricks())
+	{
+		const CSHouseSeam::FPostParams PostParams = MakeSeamPostParams();
+		TArray<CSHouseSeam::FPost> Posts;
+		int32 Expected = 0;
+		for (const TSharedPtr<FCSHouseContact>& C : Contacts)
+		{
+			if (!C.IsValid() || C->Kind != ECSHouseContactKind::Seam || C->Owner() != this) continue;
+			Expected += static_cast<const FCSHouseSeamContact&>(*C).BuildPosts(PostParams, Posts);
+		}
+		if (Expected != CurrentSeamOwnedPostCount)
+		{
+			Problems.Add(FString::Printf(TEXT("柱数不对应：砌了 %d 根，我出砖的接触合计 %d 根"), CurrentSeamOwnedPostCount, Expected));
+		}
+	}
 	return Problems;
 }
 
@@ -4741,7 +4815,11 @@ void ACSHouseActor::PostRegisterAllComponents()
 	}
 
 	// 没有登记表（2026-09-16 删掉 `UCSHouseSubsystem`）：世界本身就是名单，见 `UCSHouseLibrary::GetHouses`。
+	// 身份：无效（新生成 / T3D 复制跳过了它）就发新的；与同 world 里别的房子撞了（此前存盘的旧副本）也换 ——
+	// 撞 GUID 的两栋永远不出缝。换的这栋取路径派生的确定性 GUID：不标脏包，下次加载同一栋仍得同一个值，
+	// 砖的随机花样不会每次加载都变；存一次盘就落定。
 	if (!HouseId.IsValid()) HouseId = FGuid::NewGuid();
+	else if (IsHouseIdTakenByOther(HouseId)) HouseId = FGuid::NewDeterministicGuid(GetPathName());
 	ReevaluateSite();
 }
 
@@ -4801,8 +4879,7 @@ void ACSHouseActor::PostEditMove(bool bFinished)
 	Super::PostEditMove(bFinished);
 
 	// 接缝冻结期（D7 09-16）：拖动帧不算、不发、不重建，松手那一次才提交（CanCommitSeams）。
-	bInGizmoDrag = !bFinished;
-	GizmoDragTouchedAt = FPlatformTime::Seconds();
+	NoteGizmoDrag(bFinished);
 
 	// 连续 N 次增量 TransformMesh 会攒浮点误差：松手做一次全量重建对齐并清零
 	// （ACSGroundActor::PostEditMove 已经是这个模式，照抄）。拖动中走摆位快路径。

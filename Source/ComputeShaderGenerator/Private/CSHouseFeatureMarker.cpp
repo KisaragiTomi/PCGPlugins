@@ -1,6 +1,10 @@
 #include "CSHouseFeatureMarker.h"
 
+#include "CSGpuInstancedMeshComponent.h"   // 门前踏步的砖（窗的门形态）
+#include "CSGroundActor.h"                 // 门口采地面：踏步 / 栏杆的判据
 #include "CSHouseLibrary.h"
+#include "CSStairs.h"                      // BuildDoorSteps / ShouldAddDoorRails
+#include "Materials/MaterialInterface.h"
 #include "Components/SceneComponent.h"
 #include "Components/BillboardComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -226,6 +230,7 @@ void ACSHouseFeatureMarker::SnapToAnchor()
 	// 锚点存的是**洞底**，标记本体锚在窗**心** ⇒ 抬半个窗高（口径与 MakeDemand 同源，
 	// 两处写岔的症状是"窗整体偏高半扇"）。构建空间的合成归房子（三处必须同一个变换）。
 	SetActorTransform(H->AnchorToWorld(Anchor, DemandHeight * 0.5f, WallStandoff));
+	OnAnchorSnapped();
 }
 
 #if WITH_EDITOR
@@ -256,6 +261,9 @@ void ACSHouseFeatureMarker::RefreshPieceLayout()
 		if (Piece) Piece->SetRelativeScale3D(Scale);
 	}
 
+	// 子类多出来的件（窗的门形态）**排在下面那几个早退之前**：没挂过梁的窗也得把门摆对。
+	RefreshExtraPieceLayout();
+
 	// 过梁抬到框体顶上。**现算而不是写死 87.5**：换 2x1 / 3x1 / gothic 或者一动倍率，
 	// 常数就错了 —— 而"过梁陷进框里"和"浮在半空"都不会有任何断言报红。
 	if (!LintelMesh || !OpeningMesh) return;
@@ -278,8 +286,18 @@ void ACSHouseFeatureMarker::SetMeshPiecesVisible(bool bVisible)
 	GetComponents(Pieces);
 	for (UStaticMeshComponent* Piece : Pieces)
 	{
-		if (Piece) Piece->SetVisibility(bVisible);
+		// 形态不对的那一组照藏：窗贴墙脚变成门之后，窗框 / 窗台 / 玻璃不能还挂在门上。
+		if (Piece) Piece->SetVisibility(bVisible && IsPieceInCurrentForm(Piece));
 	}
+	OnMeshPiecesVisibilityChanged(bVisible);
+}
+
+FCSWallAnchor ACSHouseFeatureMarker::MakeAnchorFromHit(const FCSWallHit& Hit, const ACSHouseActor& InHost) const
+{
+	// 命中点是本体**心**的高度，而锚点存的是洞底 ⇒ 减半个洞高。不减的症状是"窗整体偏高半扇"，
+	// 而且贴着檐口拖的时候会莫名其妙判 `AboveEave`。夹到 0 以上，负数由谓词判 `SillTooLow`。
+	const float SillZ = FMath::Max(0.0f, Hit.Z - GetDemandHalfHeight());
+	return CSHouse_MakeWallAnchor(Hit, InHost.GetFootprint(), InHost.WallThickness, SillZ);
 }
 
 void ACSHouseFeatureMarker::ApplyHostVerdict(ECSFeatureReject Reason)
@@ -308,6 +326,9 @@ void ACSHouseFeatureMarker::RegisterAnchor(ACSHouseActor& InHost)
 	Probe.Width = Demand.Width;
 	Probe.Z0 = Demand.SillZ;
 	Probe.Z1 = Demand.SillZ + Demand.Height;
+	// 与 `BuildWindowOpenings` 同一份字段：探针漏带它的话，门形态在这里判 `SillTooLow`、
+	// 房子重求值时却放行 —— 回执与画面互相矛盾，直到下一次重建才被盖掉。
+	Probe.bDoorForm = Demand.bDoorForm;
 	Probe.SourceId = MarkerId;
 	const ECSFeatureReject Reason = InHost.QueryFeatureReject(Probe);
 
@@ -370,15 +391,13 @@ bool ACSHouseFeatureMarker::OnHandleDrag(bool bFinal)
 
 	// **世界位置 → 锚点**（拖 gizmo 的方向）。反方向（锚点 → 世界）是 `SnapToAnchor`，
 	// 两条路千万别混：房子变了的时候走反方向，重新射线就是让洞去追标记。
-	float DemandWidth = 0.0f, DemandHeight = 0.0f;
-	GetDemandSize(DemandWidth, DemandHeight);
-	// 命中点是窗**心**的高度，而锚点存的是洞底 ⇒ 减半个窗高。不减的症状是"窗整体偏高半扇"，
-	// 而且贴着檐口拖的时候会莫名其妙判 `AboveEave`。夹到 0 以上，负数由谓词判 `SillTooLow`。
-	const float SillZ = FMath::Max(0.0f, Hit.Z - DemandHeight * 0.5f);
+	// 口径（洞底 = 命中 Z − 半高、窗贴墙脚变门）在 `MakeAnchorFromHit` 一处，笔刷落笔也走它。
+	// ⚠️ **先算、后写**：子类拿当前 `Anchor` 做窗 ↔ 门的迟滞，先改了锚点迟滞就没有参照了。
+	const FCSWallAnchor Resolved = MakeAnchorFromHit(Hit, *Found);
 
 	// `Modify()` 让锚点进事务 —— 撤销要能把它一起回滚，否则 `PostEditUndo` 拿到的是新锚点。
 	Modify();
-	Anchor = CSHouse_MakeWallAnchor(Hit, Found->GetFootprint(), Found->WallThickness, SillZ);
+	Anchor = Resolved;
 
 	RegisterAnchor(*Found);
 
@@ -405,19 +424,264 @@ bool ACSHouseFeatureMarker::OnHandleDrag(bool bFinal)
 
 FCSHouseWindow ACSWindowMarker::MakeDemand(const FCSWallAnchor& InAnchor, const ACSHouseActor& InHost) const
 {
+	// 形态读**入参锚点**而不是成员 `Anchor`：诉求必须是入参的函数（两者此刻恰好相同，但别依赖它）。
+	const bool bDoor = InAnchor.bDoorForm && CanBecomeDoor();
 	float DemandWidth = 0.0f, DemandHeight = 0.0f;
-	GetDemandSize(DemandWidth, DemandHeight);
+	GetFormSize(bDoor, DemandWidth, DemandHeight);
 
 	FCSHouseWindow Out;
 	Out.EdgeIndex = InAnchor.EdgeIndex;
 	// **诉求的弧长从锚点现算**，不是存下来的 —— 房子一改尺寸，同一个锚点算出来的就是新墙上
 	// 的新弧长。这正是"推第 e 条边，e+1 那面墙没动窗却滑了 Δ"那个 bug 的修法。
 	Out.CenterS = CSHouse_AnchorS(InAnchor, InHost.GetFootprint(), InHost.WallThickness);
+	if (bDoor)
+	{
+		// TG 的门只要**门顶低于墙顶**就合法（`cull_oob_decorators`，附录 E §6.2），本项目的谓词还要求洞顶
+		// 让出 `LintelBand`。门本身放得下时把**洞**夹到过梁带之下、网格不动 —— 门框顶压进过梁带几厘米，
+		// 框的翻边本来就凸在墙面外。不夹的话默认档（262.5 高的门 vs 300 − 40 = 260）差 2.5 cm，
+		// 默认房子上一扇门都放不下。门比墙还高就不夹，照旧由谓词判 `AboveEave`（= TG 剔除）。
+		const float Usable = InHost.WallHeight - InHost.LintelBand;
+		if (DemandHeight < InHost.WallHeight && DemandHeight > Usable) DemandHeight = FMath::Max(Usable, 1.0f);
+	}
+
 	Out.Width = DemandWidth;
 	Out.Height = DemandHeight;
 	Out.Shape = Shape;
-	Out.SillZ = InAnchor.SillZ;
+	// 门恒落地。锚点在门形态下本来就写 0（`MakeAnchorFromHit`），这里再钉一次是防"锚点说门、
+	// 高度却不是 0"的手改存档 —— 那种门会悬在半空、却被谓词当门放行。
+	Out.SillZ = bDoor ? 0.0f : InAnchor.SillZ;
+	Out.bDoorForm = bDoor;
 	return Out;
+}
+
+bool ACSWindowMarker::CanBecomeDoor() const
+{
+	return bCanBecomeDoor && DoorMesh && DoorMesh->GetStaticMesh() != nullptr;
+}
+
+FCSWallAnchor ACSWindowMarker::MakeAnchorFromHit(const FCSWallHit& Hit, const ACSHouseActor& InHost) const
+{
+	float WindowWidth = 0.0f, WindowHeight = 0.0f;
+	GetFormSize(false, WindowWidth, WindowHeight);
+
+	bool bDoor = false;
+	if (CanBecomeDoor())
+	{
+		float DoorWidth = 0.0f, DoorHeight = 0.0f;
+		GetFormSize(true, DoorWidth, DoorHeight);
+		// 阈值取 `max(DoorSnapHeight, WindowMinSillZ)`：TG 是 0（窗底低于墙脚才变门），而本项目的房子会把
+		// 窗台低于 `WindowMinSillZ` 的窗直接拒掉 —— 不取 max，这一段拖下去窗先消失、再往下才变门。
+		const float Threshold = FMath::Max(DoorSnapHeight, InHost.WindowMinSillZ);
+		// 迟滞的参照是**当前**形态（`IsDoorForm` 读成员锚点）——所以基类要求"先调本函数、再写锚点"。
+		bDoor = CSHouse_ResolveDoorForm(Hit.Z, WindowHeight, DoorHeight, Threshold, IsDoorForm());
+	}
+
+	// 门：洞底吸到墙脚（TG `is_bottom_door`）。窗：命中点是窗心 ⇒ 洞底 = 命中 Z − 半个窗高。
+	const float SillZ = bDoor ? 0.0f : FMath::Max(0.0f, Hit.Z - WindowHeight * 0.5f);
+	FCSWallAnchor Out = CSHouse_MakeWallAnchor(Hit, InHost.GetFootprint(), InHost.WallThickness, SillZ);
+	Out.bDoorForm = bDoor;
+	return Out;
+}
+
+bool ACSWindowMarker::IsPieceInCurrentForm(const UStaticMeshComponent* Piece) const
+{
+	// 门那一组：四个具名件，外加子蓝图里打了 `DoorForm` 标签的件。其余一律算窗那一组 ——
+	// 子蓝图里新加、没打标签的件（花箱之类）是照着窗设计的，挂到门上不对（TG 的门同样不出过梁、
+	// 窗台、花槽，附录 E §5.2）。
+	static const FName DoorFormTag(TEXT("DoorForm"));
+	const bool bDoorPiece = Piece == DoorMesh || Piece == DoorHatMesh || Piece == DoorBellMesh || Piece == DoorKransMesh
+		|| Piece == DoorRailsMesh || (Piece && Piece->ComponentHasTag(DoorFormTag));
+	if (bDoorPiece != IsDoorForm()) return false;
+	// 门铃 / 花环四选一（TG `add_door_autoclutter`）：同一扇门恒定，拖来拖去不换。
+	if (Piece == DoorBellMesh) return GetDoorClutterChoice() == 0;
+	if (Piece == DoorKransMesh) return GetDoorClutterChoice() == 1;
+	// 栏杆看上一次吸附时判出来的结果（要采地面，见 `RefreshDoorDressing`）。
+	if (Piece == DoorRailsMesh) return bWantDoorRails;
+	return true;
+}
+
+void ACSWindowMarker::OnAnchorSnapped()
+{
+	RefreshDoorDressing();
+}
+
+void ACSWindowMarker::OnMeshPiecesVisibilityChanged(bool bVisible)
+{
+	if (DoorStepBricks) DoorStepBricks->SetVisibility(bVisible && IsDoorForm() && DoorStepBrickCount > 0);
+}
+
+void ACSWindowMarker::RefreshDoorDressing()
+{
+	const ACSHouseActor* H = Host.Get();
+	TArray<CSStairs::FBrick> Bricks;
+	bool bSteps = false;
+	bWantDoorRails = false;
+
+	if (IsDoorForm() && bCausesCut && H && Anchor.IsValidAnchor() && IsValid(H->Ground))
+	{
+		const ACSGroundActor* G = H->Ground;
+		const CSStairs::FGroundSampler Sampler = [G](const FVector2D& XY) { return G->SampleHeight(XY); };
+
+		float DoorWidth = 0.0f, DoorHeight = 0.0f;
+		GetFormSize(true, DoorWidth, DoorHeight);
+
+		// 门心取在**墙厚中线**上：派生变换站在外皮外 `WallStandoff` 处、+X 朝墙内，沿 +X 走回
+		// `WallStandoff + T/2` 就是中线。TG 的第一排踏步中心离门心 28 cm、进深 38（N = 2），
+		// 按外皮算的话第一排和墙之间会留 9 cm 的缝，按中线算正好顶进墙里 3 cm。
+		const FVector Forward = GetActorForwardVector();
+		const FVector Location = GetActorLocation();
+		const FVector Mid = Location + Forward * double(WallStandoff + H->WallThickness * 0.5f);
+
+		CSStairs::FDoorStepsInput Door;
+		Door.DoorXY = FVector2D(Mid.X, Mid.Y);
+		Door.Outward = FVector2D(-Forward.X, -Forward.Y);
+		Door.DoorBottomZ = float(Location.Z) - DoorHeight * 0.5f;
+		Door.Width = DoorWidth;
+
+		if (bDoorSteps && DoorStepBrickMesh)
+		{
+			bSteps = CSStairs::BuildDoorSteps(Door, CSStairs::FDoorStepsParams(), Sampler, GetTypeHash(MarkerId), Bricks);
+		}
+		// 栏杆：墙脚（= 门洞底）比门下地面高出 15 cm、又没出踏步（TG 两者二选一兜底）。
+		if (bDoorRails && DoorRailsMesh && DoorRailsMesh->GetStaticMesh())
+		{
+			bWantDoorRails = CSStairs::ShouldAddDoorRails(Door.DoorBottomZ, Sampler(Door.DoorXY), bSteps);
+		}
+	}
+
+	// 砖 → 实例。按砖网格自己的包围盒换算（同 `ACSStairsActor::RebuildStairs`）。
+	TArray<FTransform> Transforms;
+	if (DoorStepBrickMesh && !Bricks.IsEmpty())
+	{
+		const FBox MeshBox = DoorStepBrickMesh->GetBoundingBox();
+		const FVector MeshSize = MeshBox.GetSize().ComponentMax(FVector(UE_KINDA_SMALL_NUMBER));
+		const FVector MeshCenter = MeshBox.GetCenter();
+		Transforms.Reserve(Bricks.Num());
+		for (const CSStairs::FBrick& Brick : Bricks)
+		{
+			const FVector Scale = Brick.Size / MeshSize;
+			Transforms.Add(FTransform(Brick.Rotation, Brick.Center - Brick.Rotation.RotateVector(MeshCenter * Scale), Scale));
+		}
+	}
+	DoorStepBrickCount = Transforms.Num();
+
+	if (DoorStepBricks)
+	{
+		// 幂等短路：砖表 + 网格 / 材质身份 + 组件变换（实例存的是组件局部量）。
+		TArray<int32> HashInput;
+		auto Q = [](double V) { return int32(FMath::RoundToDouble(V * 10.0)); };
+		HashInput.Append({ int32(GetTypeHash(DoorStepBrickMesh.Get())), int32(GetTypeHash(DoorStepMaterial.Get())), Transforms.Num() });
+		const FTransform ComponentTransform = DoorStepBricks->GetComponentTransform();
+		for (const FVector& V : { ComponentTransform.GetLocation(), ComponentTransform.GetRotation().Euler() }) HashInput.Append({ Q(V.X), Q(V.Y), Q(V.Z) });
+		for (const FTransform& T : Transforms)
+		{
+			const FVector L = T.GetLocation();
+			const FVector S = T.GetScale3D();
+			const FQuat R = T.GetRotation();
+			HashInput.Append({ Q(L.X), Q(L.Y), Q(L.Z), Q(S.X * 100.0), Q(S.Y * 100.0), Q(S.Z * 100.0), Q(R.Z * 1000.0), Q(R.W * 1000.0) });
+		}
+		const uint32 NewHash = FCrc::MemCrc32(HashInput.GetData(), HashInput.Num() * sizeof(int32));
+		if (NewHash != DoorStepHash || DoorStepBricks->GetInstanceCount() != Transforms.Num())
+		{
+			DoorStepHash = NewHash;
+			if (Transforms.IsEmpty())
+			{
+				// 没有砖就别碰网格：每扇窗都带着这个组件，不出踏步的那些连基础网格快照都不该建。
+				if (DoorStepBricks->GetInstanceCount() > 0) DoorStepBricks->ClearInstances();
+			}
+			else
+			{
+				DoorStepBricks->SetInstanceMaterial(DoorStepMaterial);
+				DoorStepBricks->SetBaseMesh(DoorStepBrickMesh);
+				DoorStepBricks->SetInstances(Transforms, /*bWorldSpace*/ true);
+			}
+		}
+	}
+
+	// 栏杆与踏步的显隐跟着这一轮的判据重算（门铃 / 花环 / 门扇不受影响，重设一遍是幂等的）。
+	SetMeshPiecesVisible(bCausesCut);
+}
+
+void ACSWindowMarker::RefreshExtraPieceLayout()
+{
+	if (!DoorMesh) return;
+
+	// 与窗的四件同一个倍率（一扇缩小了的窗，变成门也该是缩小了的门）；进深不缩，理由同 `RefreshPieceLayout`。
+	const FVector Scale(PieceScale.X, 1.0, PieceScale.Y);
+	DoorMesh->SetRelativeScale3D(Scale);
+	if (DoorHatMesh) DoorHatMesh->SetRelativeScale3D(Scale);
+
+	// **把门网格的包围盒中心压到 actor 原点的 Y/Z 上**（原点 = 洞心，见 `SnapToAnchor`）。
+	// 窗框资产的枢轴恰好居中所以窗那几件零偏移；门资产的枢轴不保证 —— 落地件常把枢轴放在底边，
+	// 照搬零偏移的话门整体高出洞半扇，而谓词、洞、砖数全都是对的，一条断言都不会红。
+	// 进深（X）保留资产自己的枢轴，与窗的几件同一口径（贴墙的深度由资产作者定）。
+	FVector Offset = FVector::ZeroVector;
+	if (const UStaticMesh* Mesh = DoorMesh->GetStaticMesh())
+	{
+		const FTransform NoMove(DoorMesh->GetRelativeRotation(), FVector::ZeroVector, Scale);
+		const FVector Center = Mesh->GetBounds().TransformBy(NoMove).Origin;
+		Offset = FVector(0.0, -Center.Y, -Center.Z);
+	}
+	DoorMesh->SetRelativeLocation(Offset);
+	// 帽子跟门**同一个平移**：TG 的 `*_hat` 是在门的局部空间里预摆好的，单独居中就会和门错开。
+	if (DoorHatMesh) DoorHatMesh->SetRelativeLocation(Offset);
+
+	// 门铃 / 花环：TG 在**门的局部**摆（原点 = 门的资产原点，X 沿墙、Y 上、Z 朝外，附录 E §7）。
+	// 换到 UE 资产轴（+X 宽、+Y 朝外、+Z 上）再转上墙面；偏移跟着倍率走，挂件本身不缩（门铃拉扁了不像门铃）。
+	const FQuat FacingQuat = DoorMesh->GetRelativeRotation().Quaternion();
+	auto PlaceClutter = [&](UStaticMeshComponent* Piece, const FVector& TGLocal)
+	{
+		if (!Piece) return;
+		const FVector AssetLocal(TGLocal.X * Scale.X, TGLocal.Z, TGLocal.Y * Scale.Z);
+		Piece->SetRelativeLocation(Offset + FacingQuat.RotateVector(AssetLocal));
+	};
+	PlaceClutter(DoorBellMesh, FVector(-25.0, 74.0, 10.0));
+	PlaceClutter(DoorKransMesh, FVector(0.0, 50.0, 20.0));
+
+	// 栏杆：资产原点即门心（附录 E §3.5），与门同倍率、同平移。
+	if (DoorRailsMesh)
+	{
+		DoorRailsMesh->SetRelativeScale3D(Scale);
+		DoorRailsMesh->SetRelativeLocation(Offset);
+	}
+}
+
+void ACSWindowMarker::GetFormSize(bool bDoorForm, float& OutWidth, float& OutHeight) const
+{
+	if (bDoorForm)
+	{
+		OutWidth = 0.0f;
+		OutHeight = 0.0f;
+		// 门形态只认 `DoorMesh`（不算帽子，理由同窗不算过梁）。没挂网格 ⇒ 零尺寸 ⇒ `CanBecomeDoor`
+		// 本来就是 false，调用方不会走到这里来要一扇不存在的门。
+		const UStaticMesh* Mesh = DoorMesh ? DoorMesh->GetStaticMesh() : nullptr;
+		if (!Mesh) return;
+		const FBoxSphereBounds B = Mesh->GetBounds().TransformBy(DoorMesh->GetRelativeTransform());
+		// 洞比门框每侧窄 `DoorHoleInset`（TG 的洞取碰撞网格，比渲染网格窄 —— 框的翻边压住洞缘）。
+		OutWidth = FMath::Max(float(B.BoxExtent.Y) * 2.0f - 2.0f * DoorHoleInset * float(PieceScale.X), 1.0f);
+		OutHeight = float(B.BoxExtent.Z) * 2.0f;
+		return;
+	}
+
+	OutWidth = Width;
+	OutHeight = Height;
+	// ⚠️ **只读 `OpeningMesh`，不碰过梁与窗台。** 这条纪律的理由写在 `OpeningMesh` 的声明处：
+	// 把盖顶件算进来，洞会悄悄变宽而画面上被它自己盖住，一条断言都不会红。
+	if (!bAutoSizeFromMesh || !OpeningMesh) return;
+
+	const UStaticMesh* Mesh = OpeningMesh->GetStaticMesh();
+	// **没挂网格就退回手填值**，不要产出零尺寸：谓词对零宽洞只会淡淡地说一句 `Degenerate`，
+	// 而画面上"窗没了"与"窗被门挤掉了"长得一模一样。
+	// （三件都是"组件恒在、网格可空"：空槽就是这一件不存在，不另设开关。）
+	if (!Mesh) return;
+
+	// 洞开在墙面上 ⇒ 量的是 actor 局部的 **YZ 平面**（+X 是墙的内法线，见 `CSHouse_AnchorToLocal`）。
+	// 网格自己的相对变换要算进来 —— 资产的朝向/缩放全靠它调。
+	const FBoxSphereBounds B = Mesh->GetBounds().TransformBy(OpeningMesh->GetRelativeTransform());
+	const float MeshWidth = float(B.BoxExtent.Y) * 2.0f;
+	const float MeshHeight = float(B.BoxExtent.Z) * 2.0f;
+	if (MeshWidth > 1.0f) OutWidth = MeshWidth;
+	if (MeshHeight > 1.0f) OutHeight = MeshHeight;
 }
 
 const TCHAR* ACSWindowMarker::DefaultFrameMeshPath =
@@ -431,6 +695,21 @@ const TCHAR* ACSWindowMarker::DefaultSillMeshPath =
 
 const TCHAR* ACSWindowMarker::DefaultGlassMeshPath =
 	TEXT("/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/window_cottage_1x1_glass");
+
+const TCHAR* ACSWindowMarker::DefaultDoorMeshPath =
+	TEXT("/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/balcony_door_rank1");
+
+const TCHAR* ACSWindowMarker::DefaultDoorBellMeshPath =
+	TEXT("/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/door_bell");
+
+const TCHAR* ACSWindowMarker::DefaultDoorKransMeshPath =
+	TEXT("/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/door_krans");
+
+const TCHAR* ACSWindowMarker::DefaultDoorRailsMeshPath =
+	TEXT("/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/balcony_door_rank1_rails");
+
+const TCHAR* ACSWindowMarker::DefaultBrickMeshPath =
+	TEXT("/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/brick");
 
 ACSWindowMarker::ACSWindowMarker()
 {
@@ -458,6 +737,42 @@ ACSWindowMarker::ACSWindowMarker()
 	// 玻璃与框体同一个朝向、同一个原点 —— 它就是嵌在框里的那一层（78 × 1.7 × 160）。
 	GlassMesh->SetRelativeRotation(Facing);
 
+	// 门形态的四件（2026-09-16）。配法与基类的四件逐项相同（挂根下、可动、无碰撞）；
+	// 子对象名一经发布就别改 —— 已经存进关卡 / 蓝图的标记靠它认出这一件。
+	const TPair<TObjectPtr<UStaticMeshComponent>*, const TCHAR*> DoorPieces[] = {
+		{ &DoorMesh, TEXT("DoorMesh") }, { &DoorHatMesh, TEXT("DoorHat") },
+		{ &DoorBellMesh, TEXT("DoorBell") }, { &DoorKransMesh, TEXT("DoorKrans") },
+		{ &DoorRailsMesh, TEXT("DoorRails") } };
+	for (const TPair<TObjectPtr<UStaticMeshComponent>*, const TCHAR*>& Entry : DoorPieces)
+	{
+		TObjectPtr<UStaticMeshComponent>* Slot = Entry.Key;
+		UStaticMeshComponent* Piece = CreateDefaultSubobject<UStaticMeshComponent>(Entry.Value);
+		Piece->SetupAttachment(RootComponent);
+		Piece->SetMobility(EComponentMobility::Movable);
+		Piece->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		// 与窗那几件同一个朝向：TG 的门资产与窗资产同一套局部轴（+X 宽、+Y 朝外）。
+		Piece->SetRelativeRotation(Facing);
+		// 出生时是窗 ⇒ 门那一组先藏着。之后的显隐一律由 `ApplyHostVerdict` 按形态重算。
+		Piece->SetVisibility(false);
+		*Slot = Piece;
+	}
+	static ConstructorHelpers::FObjectFinderOptional<UStaticMesh> DoorAsset(DefaultDoorMeshPath);
+	static ConstructorHelpers::FObjectFinderOptional<UStaticMesh> DoorBellAsset(DefaultDoorBellMeshPath);
+	static ConstructorHelpers::FObjectFinderOptional<UStaticMesh> DoorKransAsset(DefaultDoorKransMeshPath);
+	static ConstructorHelpers::FObjectFinderOptional<UStaticMesh> DoorRailsAsset(DefaultDoorRailsMeshPath);
+	static ConstructorHelpers::FObjectFinderOptional<UStaticMesh> BrickAsset(DefaultBrickMeshPath);
+	if (UStaticMesh* Mesh = DoorAsset.Get()) DoorMesh->SetStaticMesh(Mesh);
+	if (UStaticMesh* Mesh = DoorBellAsset.Get()) DoorBellMesh->SetStaticMesh(Mesh);
+	if (UStaticMesh* Mesh = DoorKransAsset.Get()) DoorKransMesh->SetStaticMesh(Mesh);
+	if (UStaticMesh* Mesh = DoorRailsAsset.Get()) DoorRailsMesh->SetStaticMesh(Mesh);
+	DoorStepBrickMesh = BrickAsset.Get();
+
+	// 门前踏步的实例组件：**不在构造里设基础网格**，等真要出踏步时才设（`RefreshDoorDressing`）——
+	// 每扇窗都带着它，绝大多数一辈子不出踏步，没理由每扇都建一份基础网格快照。
+	DoorStepBricks = CreateDefaultSubobject<UCSGpuInstancedMeshComponent>(TEXT("DoorStepBricks"));
+	DoorStepBricks->SetupAttachment(RootComponent);
+	DoorStepBricks->SetVisibility(false);
+
 	// 窗台**零偏移**：`setdressing_window_sill` 的 origin 是 (0, +28, −76)，已经在窗的局部空间里
 	// 预摆好了（−76 正落在 160 高窗的下沿，+28 是朝外挑的鼻子）。
 	// 过梁的 origin 居中 ⇒ 要自己抬到窗顶，抬多少由 `RefreshPieceLayout` 现算。
@@ -466,23 +781,7 @@ ACSWindowMarker::ACSWindowMarker()
 
 void ACSWindowMarker::GetDemandSize(float& OutWidth, float& OutHeight) const
 {
-	OutWidth = Width;
-	OutHeight = Height;
-	// ⚠️ **只读 `OpeningMesh`，不碰过梁与窗台。** 这条纪律的理由写在 `OpeningMesh` 的声明处：
-	// 把盖顶件算进来，洞会悄悄变宽而画面上被它自己盖住，一条断言都不会红。
-	if (!bAutoSizeFromMesh || !OpeningMesh) return;
-
-	const UStaticMesh* Mesh = OpeningMesh->GetStaticMesh();
-	// **没挂网格就退回手填值**，不要产出零尺寸：谓词对零宽洞只会淡淡地说一句 `Degenerate`，
-	// 而画面上"窗没了"与"窗被门挤掉了"长得一模一样。
-	// （三件都是"组件恒在、网格可空"：空槽就是这一件不存在，不另设开关。）
-	if (!Mesh) return;
-
-	// 洞开在墙面上 ⇒ 量的是 actor 局部的 **YZ 平面**（+X 是墙的内法线，见 `CSHouse_AnchorToLocal`）。
-	// 网格自己的相对变换要算进来 —— 资产的朝向/缩放全靠它调。
-	const FBoxSphereBounds B = Mesh->GetBounds().TransformBy(OpeningMesh->GetRelativeTransform());
-	const float MeshWidth = float(B.BoxExtent.Y) * 2.0f;
-	const float MeshHeight = float(B.BoxExtent.Z) * 2.0f;
-	if (MeshWidth > 1.0f) OutWidth = MeshWidth;
-	if (MeshHeight > 1.0f) OutHeight = MeshHeight;
+	// **当前**形态的洞尺寸。`SnapToAnchor` / `GetDemandHalfHeight` 都经这里，所以门形态的标记
+	// 自动按门高摆到墙脚上，基类一行不用改。
+	GetFormSize(IsDoorForm(), OutWidth, OutHeight);
 }

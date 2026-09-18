@@ -119,10 +119,9 @@ ACSHouseFeatureMarker* UCSHouseLibrary::PlaceMarkerAlongRay(const UObject* World
 		MarkerClass.Get(), FTransform(RayOrigin), SpawnInfo);
 	if (!Marker) return nullptr;
 
-	// 命中点是窗**心**的高度，锚点存的是**洞底** ⇒ 减半个窗高（口径与 `OnHandleDrag` 同源；
-	// 两处写岔的症状是"窗整体偏高半扇"，而且贴檐口时会莫名判 `AboveEave`）。
-	const float SillZ = FMath::Max(0.0f, Hit.Z - Marker->GetDemandHalfHeight());
-	Marker->AdoptAnchor(House, CSHouse_MakeWallAnchor(Hit, House->GetFootprint(), House->WallThickness, SillZ));
+	// 命中 → 锚点与拖 gizmo 走**同一个**函数（洞底 = 命中 Z − 半高；窗点在墙脚附近直接落成门）。
+	// 早先这里自己抄了一遍"减半个窗高"，与 `OnHandleDrag` 靠注释保持同源。
+	Marker->AdoptAnchor(House, Marker->MakeAnchorFromHit(Hit, *House));
 	return Marker;
 }
 

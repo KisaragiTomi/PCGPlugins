@@ -45,7 +45,7 @@ ACSHouseActor* FCSHouseContact::Owner() const
 	return nullptr;
 }
 
-TSharedPtr<FCSHouseContact> FCSHouseContact::Classify(ACSHouseActor* A, ACSHouseActor* B, float BearingTolerance)
+TSharedPtr<FCSHouseContact> FCSHouseContact::Classify(ACSHouseActor* A, ACSHouseActor* B)
 {
 	if (!IsValid(A) || !IsValid(B) || A == B) return nullptr;
 	if (!A->IsSeamParticipant() || !B->IsSeamParticipant()) return nullptr;
@@ -71,19 +71,26 @@ TSharedPtr<FCSHouseContact> FCSHouseContact::Classify(ACSHouseActor* A, ACSHouse
 	};
 
 	// 横缝：上房底 ≈ 下房檐口（容差内）且 footprint 相交 —— 不看 Z 重叠。
-	const CSHouseSeam::FHouse& Upper = HA.BaseZ >= HB.BaseZ ? HA : HB;
-	const CSHouseSeam::FHouse& Lower = HA.BaseZ >= HB.BaseZ ? HB : HA;
-	if (FMath::Abs(Upper.BaseZ - Lower.EaveZ()) <= FMath::Max(BearingTolerance, 0.0f) && CSHouseSeam::IntersectsXY(HA, HB))
+	// 两处都不许取决于参数顺序（谁提交谁是 A）：房底相同就没有上房；容差取两栋的较大者（见头文件）。
+	const float Tolerance = FMath::Max3(A->BearingTolerance, B->BearingTolerance, 0.0f);
+	if (HA.BaseZ != HB.BaseZ)
 	{
-		TSharedPtr<FCSHouseBearingContact> Bearing = MakeShared<FCSHouseBearingContact>();
-		Fill(*Bearing, ECSHouseContactKind::Bearing);
-		return Bearing;
+		const CSHouseSeam::FHouse& Upper = HA.BaseZ > HB.BaseZ ? HA : HB;
+		const CSHouseSeam::FHouse& Lower = HA.BaseZ > HB.BaseZ ? HB : HA;
+		if (FMath::Abs(Upper.BaseZ - Lower.EaveZ()) <= Tolerance && CSHouseSeam::IntersectsXY(HA, HB))
+		{
+			TSharedPtr<FCSHouseBearingContact> Bearing = MakeShared<FCSHouseBearingContact>();
+			Fill(*Bearing, ECSHouseContactKind::Bearing);
+			return Bearing;
+		}
 	}
 
 	// 竖缝：footprint 真重叠且 Z 区间相交。
 	if (!CSHouseSeam::Intersects(HA, HB)) return nullptr;
 	TSharedPtr<FCSHouseSeamContact> Seam = MakeShared<FCSHouseSeamContact>();
 	Fill(*Seam, ECSHouseContactKind::Seam);
+	Seam->Shapes[0] = *First;
+	Seam->Shapes[1] = *Second;
 	CSHouseSeam::BuildCorners(*First, *Second, Seam->Corners);
 	for (int32 Slot = 0; Slot < 2; ++Slot)
 	{

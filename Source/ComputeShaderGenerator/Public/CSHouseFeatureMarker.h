@@ -12,6 +12,8 @@
 #include "CSHouseFeatureMarker.generated.h"
 
 class UBillboardComponent;
+class UCSGpuInstancedMeshComponent;
+class UMaterialInterface;
 
 /**
  * 附属物（计划 D8）：**自己持有预制网格**，同时告诉房子"这里有一扇窗，请挖个洞"。
@@ -284,6 +286,18 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "CS Feature Marker")
 	void RefreshPieceLayout();
 
+	/**
+	 * **墙面命中 → 锚点。** 拖 gizmo（`OnHandleDrag`）与笔刷落笔（`UCSHouseLibrary::PlaceMarkerAlongRay`）
+	 * 两条路共用这一处。
+	 *
+	 * 基类口径：命中点是本体**中心**的高度 ⇒ 洞底 = 命中 Z − 半个洞高，夹到 0 以上（负数由谓词判
+	 * `SillTooLow`）。这条口径早先在两个调用点各抄一遍、靠注释喊"两处必须同源"；收成一个虚函数之后，
+	 * 子类改口径（窗贴近墙脚吸附成门，2026-09-16）只改一处，漏改另一条路的静默分叉不再可能。
+	 *
+	 * ⚠️ 子类可以拿**当前**锚点做迟滞（窗 ↔ 门），所以调用方要先调它、再把结果写回 `Anchor`。
+	 */
+	virtual FCSWallAnchor MakeAnchorFromHit(const FCSWallHit& Hit, const ACSHouseActor& InHost) const;
+
 protected:
 	/**
 	 * 把**锚点**翻成本类型的诉求。子类实现（窗 = `ACSWindowMarker`）。
@@ -355,8 +369,29 @@ protected:
 	/** 按当前 `Anchor` 算诉求 → 过谓词 → 登记 → 回写裁决。解析与加载两条路共用这一段。 */
 	void RegisterAnchor(ACSHouseActor& InHost);
 
-	/** 显隐**全部网格件**（按类型找，编辑器拾取件不受影响）。理由见 `PickSprite`。 */
+	/**
+	 * 显隐**全部网格件**（按类型找，编辑器拾取件不受影响）。理由见 `PickSprite`。
+	 * `bVisible = true` 时只亮**属于当前形态**的那几件（`IsPieceInCurrentForm`），其余照藏。
+	 */
 	void SetMeshPiecesVisible(bool bVisible);
+
+	/**
+	 * 这一件属不属于当前形态（窗 / 门）。基类只有一种形态 ⇒ 恒 true。
+	 * 窗子类按锚点的 `bDoorForm` 分两组（见 `ACSWindowMarker::IsPieceInCurrentForm`）。
+	 */
+	virtual bool IsPieceInCurrentForm(const UStaticMeshComponent* Piece) const { return true; }
+
+	/** `RefreshPieceLayout` 的子类段：基类四件摆完之后调，子类摆自己多出来的件（窗的门形态网格）。 */
+	virtual void RefreshExtraPieceLayout() {}
+
+	/**
+	 * `SnapToAnchor` 摆好派生变换之后调。子类在这里补**依赖世界位置**的件 —— 窗的门前踏步 / 栏杆要采
+	 * 门口的地面，只能等标记落到墙上之后算。拖拽途中不吸附，所以也不会来（与"吸附只在最终裁决时做"同一条纪律）。
+	 */
+	virtual void OnAnchorSnapped() {}
+
+	/** `SetMeshPiecesVisible` 的尾巴：不是 `UStaticMeshComponent` 的件（实例组件）由子类自己跟着显隐。 */
+	virtual void OnMeshPiecesVisibilityChanged(bool bVisible) {}
 
 private:
 	/** 拖拽态：tick 开着的累计静止时长，超过 `DragIdleSeconds` 就自己收尾。 */
@@ -370,8 +405,10 @@ private:
 /**
  * 窗（D8 的首个附属物子类）。
  *
- * 它**只多四个字段**（宽 / 高 / 形状 / 自动取尺寸）—— 其余全部继承。这正是计划要的扩展形态：
+ * 窗本身只多四个字段（宽 / 高 / 形状 / 自动取尺寸）—— 其余全部继承。这正是计划要的扩展形态：
  * 将来加"烟囱 / 雨棚 / 花箱"也只是再写一个 `MakeDemand` + 挂一个预制网格，不动通知与生命周期。
+ * 2026-09-16 起多了一组**门形态**（窗贴墙脚变门，TG `snap_balcony_door`）：形态存锚点，
+ * 判据 `CSHouse_ResolveDoorForm`，门那几件与门前踏步 / 栏杆见下面「门形态」一节。
  *
  * ## 蓝图分层：总蓝图调参，子蓝图换网格
  *
@@ -450,8 +487,156 @@ public:
 	 */
 	static const TCHAR* DefaultGlassMeshPath;
 
+	// -------------------------------------------------------------------------
+	// 门形态（2026-09-16）：窗拖到贴近墙脚时吸附成一扇落地门
+	//
+	// TG 侧（附录 E）：存档里**没有「门」这个类型** —— `CottageWindow` / `GothicWindow` 这条记录不变，
+	// 只是锚点上的 `is_bottom_door` 被 `snap_balcony_door` 写上之后，每帧派生的子类型从 `*WallWindow`
+	// 变成 `*BalconyDoor`，档位（rank）原样保留，门的宽高取那一档门网格的包围盒。
+	// 本项目同构：同一个标记、同一个 `MarkerId`，形态存在 `FCSWallAnchor::bDoorForm` 里。
+	// -------------------------------------------------------------------------
+
+	/**
+	 * **门形态下决定洞有多大的那一件**（窗形态下是 `OpeningMesh`）。默认 TG `balcony_door_rank1`，
+	 * 与默认窗框 `decorators_window_cottage_1x1` 同为 rank 1（TG 窗 rank *n* ↔ 门 rank *n*）。
+	 *
+	 * **空槽 = 这扇窗变不成门**（同"组件恒在、网格可空"那条口径，不另设开关以外的第二个判据）。
+	 * 摆位由 `RefreshExtraPieceLayout` 现算：包围盒中心压到 actor 原点（洞心），与资产枢轴在哪无关。
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Window|Door Form")
+	TObjectPtr<UStaticMeshComponent> DoorMesh;
+
+	/**
+	 * 门形态的盖顶件（gothic 的 `balcony_door_gothic_rank*_hat`；cottage 那一档 TG 没有，默认留空）。
+	 * **不参与定洞**（同 `LintelMesh`）。与 `DoorMesh` 共用同一个平移 —— TG 的帽子是在门的局部空间里
+	 * 预摆好的，跟着门一起挪才对得上。
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Window|Door Form")
+	TObjectPtr<UStaticMeshComponent> DoorHatMesh;
+
+	/**
+	 * 门铃（TG `add_door_autoclutter`，附录 E §7）。**每扇门至多挂一件**，按 `MarkerId` 的哈希四选一：
+	 * 0 → 门铃、1 → 花环、2/3 → 不挂（TG `hash(seed) & 3`，各 25%）。门的局部偏移照抄 TG，见 `RefreshExtraPieceLayout`。
+	 * 属于门那一组：窗形态下永远不出。
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Window|Door Form")
+	TObjectPtr<UStaticMeshComponent> DoorBellMesh;
+
+	/** 门上的花环（同上，四选一里的 1）。TG 另有 `door_krans_autumn`，子蓝图换网格即可。 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Window|Door Form")
+	TObjectPtr<UStaticMeshComponent> DoorKransMesh;
+
+	/**
+	 * 门口的栏杆（TG `balcony_door_rank*_rails`，附录 E §4.2）：**墙脚比门下地面高出 15 cm、又没出门前踏步**时才出。
+	 * 资产原点即门心，与门网格共用平移。
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Window|Door Form")
+	TObjectPtr<UStaticMeshComponent> DoorRailsMesh;
+
+	/**
+	 * 门前踏步的砖（TG §4.0，`CSStairs::BuildDoorSteps`）：门槛贴地、门外地面下沉 10–150 cm 时出一座 56 cm 外伸的小台阶。
+	 * 与楼梯同一块 `brick` 单位盒、同一条 CPU 实例路。
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Window|Door Form")
+	TObjectPtr<UCSGpuInstancedMeshComponent> DoorStepBricks;
+
+	/** 出不出门前踏步（判据归 TG，这里只是总开关）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Window|Door Form")
+	bool bDoorSteps = true;
+
+	/** 出不出栏杆（同上）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Window|Door Form")
+	bool bDoorRails = true;
+
+	/** 门前踏步的砖网格（TG `brick`，100 cm 居中单位盒）。留空 = 不出踏步。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Window|Door Form")
+	TObjectPtr<UStaticMesh> DoorStepBrickMesh;
+
+	/** 门前踏步的整体覆盖材质。留空 = 画砖网格资产自带的材质。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Window|Door Form")
+	TObjectPtr<UMaterialInterface> DoorStepMaterial;
+
+	/** 这一轮门前踏步出了几块砖（0 = 没出）。 */
+	UFUNCTION(BlueprintPure, Category = "CS Window|Door Form")
+	int32 GetDoorStepBrickCount() const { return DoorStepBrickCount; }
+
+	/** 这一轮门口有没有栏杆。 */
+	UFUNCTION(BlueprintPure, Category = "CS Window|Door Form")
+	bool HasDoorRails() const { return bWantDoorRails && IsDoorForm() && bCausesCut; }
+
+	/** 允不允许变门。TG 的 `ArrowSlit`（箭孔）永远变不成门，子蓝图做那一类时关掉它。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Window|Door Form")
+	bool bCanBecomeDoor = true;
+
+	/**
+	 * 吸附成门的阈值 cm（墙空间，从墙脚量起）：窗的底边低于它就变门，门的底边升过它就变回窗。
+	 * 判据本体在 `CSHouse_ResolveDoorForm`（为什么门那一侧按门的半高判写在那里）。
+	 *
+	 * **默认 0 = TG 原值**：窗碰撞盒的底边低于墙脚才变门（附录 E §1.3，容差 0）。
+	 * ⚠️ 实际生效的阈值是 **`max(本值, 宿主的 WindowMinSillZ)`**：本项目的房子会把窗台低于
+	 * `WindowMinSillZ`（默认 40）的窗判 `SillTooLow`，TG 没有这条下限。不取 max 的话，窗台从 40 往下拖到 0
+	 * 那一段既不是窗（被拒、藏起来）也不是门 —— 拖着拖着窗没了，再往下才冒出一扇门。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Window|Door Form", meta = (ClampMin = "0.0"))
+	float DoorSnapHeight = 0.0f;
+
+	/**
+	 * 门洞比门网格**每侧**窄多少 cm（沿墙）。TG 的门洞取 `balcony_door_rank*_collision` 的包围盒，
+	 * 比渲染网格窄（rank 1/2/3：114.8 / 146.5 / 172.3 vs 120 / 150 / 180，附录 E §3.5）——
+	 * 门框的翻边因此压住洞缘。本项目没导入碰撞网格，用这个量补：默认 2.6 = rank 1 的实测差的一半。
+	 * 高度不收（TG 碰撞盒与渲染网格同高 262.5）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Window|Door Form", meta = (ClampMin = "0.0", ClampMax = "50.0"))
+	float DoorHoleInset = 2.6f;
+
+	/** 默认门网格（TG `balcony_door_rank1`，120 cm 宽一档）。 */
+	static const TCHAR* DefaultDoorMeshPath;
+	/** 默认门铃 / 花环（TG `clutter/door_bell`、`clutter/door_krans`）。 */
+	static const TCHAR* DefaultDoorBellMeshPath;
+	static const TCHAR* DefaultDoorKransMeshPath;
+	/** 默认栏杆（TG `balcony_door_rank1_rails`）与门前踏步的砖（TG `brick`）。 */
+	static const TCHAR* DefaultDoorRailsMeshPath;
+	static const TCHAR* DefaultBrickMeshPath;
+
+	/** 门上挂哪一件：0 门铃、1 花环、其余不挂（TG `hash(seed) & 3`）。由 `MarkerId` 定，同一扇门恒定。 */
+	UFUNCTION(BlueprintPure, Category = "CS Window|Door Form")
+	int32 GetDoorClutterChoice() const { return int32(GetTypeHash(MarkerId) & 3u); }
+
+	/** 现在是门形态吗：锚点说是门，且这扇窗确实变得成门（挂着门网格、没被关掉）。 */
+	UFUNCTION(BlueprintPure, Category = "CS Window|Door Form")
+	bool IsDoorForm() const { return Anchor.bDoorForm && CanBecomeDoor(); }
+
+	/** 这扇窗变得成门吗（`bCanBecomeDoor` 开着且 `DoorMesh` 上挂着网格）。 */
+	UFUNCTION(BlueprintPure, Category = "CS Window|Door Form")
+	bool CanBecomeDoor() const;
+
+	/**
+	 * 指定形态的洞尺寸 cm（窗 = `OpeningMesh`、门 = `DoorMesh` 的包围盒）。`GetDemandSize` 取的是
+	 * **当前**形态，判窗 ↔ 门时两种都要量，所以单独开一个。
+	 */
+	UFUNCTION(BlueprintPure, Category = "CS Window|Door Form")
+	void GetFormSize(bool bDoorForm, float& OutWidth, float& OutHeight) const;
+
 	virtual void GetDemandSize(float& OutWidth, float& OutHeight) const override;
+	virtual FCSWallAnchor MakeAnchorFromHit(const FCSWallHit& Hit, const ACSHouseActor& InHost) const override;
 
 protected:
 	virtual FCSHouseWindow MakeDemand(const FCSWallAnchor& InAnchor, const ACSHouseActor& InHost) const override;
+	virtual bool IsPieceInCurrentForm(const UStaticMeshComponent* Piece) const override;
+	virtual void RefreshExtraPieceLayout() override;
+	virtual void OnAnchorSnapped() override;
+	virtual void OnMeshPiecesVisibilityChanged(bool bVisible) override;
+
+private:
+	/**
+	 * 按当前落位重算门口的两样依赖地面的件：门前踏步（砖）与栏杆（显隐）。
+	 * 只在吸附之后调（`OnAnchorSnapped`）—— 拖拽途中标记不在墙上，采到的地面是错的。
+	 */
+	void RefreshDoorDressing();
+
+	/** 这一轮判出来要不要栏杆（`IsPieceInCurrentForm` 读它）。 */
+	bool bWantDoorRails = false;
+	int32 DoorStepBrickCount = 0;
+	/** 门前踏步砖表的哈希：`SetInstances` 带一次阻塞刷新，房子每重建一次都会来一遍，没变就不传。 */
+	uint32 DoorStepHash = 0;
 };

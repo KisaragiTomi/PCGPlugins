@@ -94,6 +94,9 @@ struct FCSHouseBodyDesc
 
 	/** 把局部坐标烘成世界坐标（常驻流口径）。测试传 Identity 即得局部坐标。 */
 	FTransform World = FTransform::Identity;
+
+	/** 铺不铺底面（墙内皮围出的那块、朝下的单面，见 `CSHouse_BuildBodySoup`）。 */
+	bool bBottomFace = true;
 };
 
 /**
@@ -165,6 +168,14 @@ struct COMPUTESHADERGENERATOR_API FCSHouseWindow
 	ECSOpeningShape Shape = ECSOpeningShape::Rect;
 
 	/**
+	 * 门形态（2026-09-16）：这条诉求是一扇**落地门**，不是窗。附属物把窗拖到贴近墙脚时写它
+	 * （`ACSWindowMarker::ResolveDoorForm`），此时 `SillZ` 恒 0、宽高取门那一档的网格。
+	 * 房子只按它放过窗台下限（`CSHouse_QueryOpening`），洞照旧是附属物的洞：不出门框砖、不装门扇。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Window")
+	bool bDoorForm = false;
+
+	/**
 	 * 逐字段相等。标记每 tick 都会重登记一次诉求，靠它把"没动"的那些**在标脏之前**挡掉 ——
 	 * 少了它，拖动一扇窗会让宿主每帧重求值一次（幂等，所以不会出错，只会白烧）。
 	 * 浮点直接比不做容差：诉求是标记算出来的确定值，同一摆位逐位相同。
@@ -172,7 +183,9 @@ struct COMPUTESHADERGENERATOR_API FCSHouseWindow
 	bool operator==(const FCSHouseWindow& Other) const
 	{
 		return EdgeIndex == Other.EdgeIndex && CenterS == Other.CenterS && Width == Other.Width
-			&& SillZ == Other.SillZ && Height == Other.Height && Shape == Other.Shape;
+			&& SillZ == Other.SillZ && Height == Other.Height && Shape == Other.Shape
+			// 漏掉它 = 窗与门恰好同宽同高同位时，变门那一下诉求"没变"、房子不重求值。
+			&& bDoorForm == Other.bDoorForm;
 	}
 	bool operator!=(const FCSHouseWindow& Other) const { return !(*this == Other); }
 };
@@ -287,6 +300,14 @@ public:
 	/** 墙厚 cm。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House", meta = (ClampMin = "5.0"))
 	float WallThickness = 24.0f;
+
+	/**
+	 * 房体底面（2026-09-17 用户要求「房子产生底面」）：在房底高度把墙内皮围出的那块封上，朝下的单面。
+	 * 墙板自己的底早由墙棱柱封住，所以只铺内皮以内；从屋里往下看是背面、被剔除，不会与地形共面闪烁 ——
+	 * 只有从房子底下往上看（摞在别的房上、架在柱子上、悬挑）才看得到它。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House")
+	bool bBottomFace = true;
 
 	/** 双坡屋顶坡度（度）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House", meta = (ClampMin = "5.0", ClampMax = "70.0"))
@@ -911,11 +932,15 @@ public:
 	/**
 	 * 横缝容差 cm：上房底与下房檐口相差不超过它 ⇒ 判横缝（承托 / 悬挑），不出竖缝。
 	 * 挡的是「上房嵌进下房几十厘米」这个常态；TG 用 1.5 m 的柱高门槛顶替这条（计划 D7）。
+	 * 一对房子取两栋里的较大者 —— 种类不能取决于谁最后提交。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Seam", meta = (ClampMin = "0"))
 	float BearingTolerance = 100.0f;
 
-	/** 交点聚簇距离 cm（XY）：更近的交点并成一根柱（三维聚簇，见 `CSHouseSeam::MergePosts`）。 */
+	/**
+	 * 同一条接触里 XY 更近的交点并成一根柱 cm（`CSHouseSeam::MergePosts`）。
+	 * **不同接触的柱永不合并**：一条接触一组柱，数量与接触一一对应（2026-09-16 晚用户裁决）。
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Seam", meta = (ClampMin = "0"))
 	float SeamPostMergeDistance = 30.0f;
 
@@ -931,6 +956,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Seam", meta = (ClampMin = "-1", ClampMax = "1"))
 	float SeamParallelDot = 0.9f;
 
+	/**
+	 * 拖动兜底 s：拖动事件停了这么久还没等到松手（`PostEditMove(true)` / `Push*(bFinished=true)`），就按松手处理 ——
+	 * 清掉拖动标志、重求值一次，接缝照常提交。房子为此在拖动标志亮着时自己 tick（同特征标记的 `DragIdleSeconds`）。
+	 * 防的是松手事件不来：抓手收到的第一个 `bFinished` 会被降级成拖动帧、Esc 取消、选中不拖。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, AdvancedDisplay, Category = "CS House|Seam", meta = (ClampMin = "0.1"))
+	float GizmoDragIdleSeconds = 2.0f;
+
 	/** 这栋房参不参与接缝（`bSeamEnabled`）。接触的 `IsAlive()` 读它。 */
 	bool IsSeamParticipant() const { return bSeamEnabled; }
 
@@ -939,6 +972,9 @@ public:
 
 	/** 这栋房喂给接缝纯函数的那份输入（身份 + 摆位 + 尺寸，无任何派生表）。`FCSHouseContact::Classify` 读两端的。 */
 	CSHouseSeam::FHouse MakeSeamHouse() const;
+
+	/** 出砖方出柱时用的四道门槛（贴顶点 / 近平行 / 同接触内合并距离 / 最低柱高），全是本房参数。 */
+	CSHouseSeam::FPostParams MakeSeamPostParams() const;
 
 	/**
 	 * 唯一的跨房通道（09-16 裁决）。`Contact` = `From` 与我之间现在的接触；空 = 不再接触 / 任一端关着 / `From` 被删。
@@ -2542,9 +2578,17 @@ private:
 	/** 上次提交时的 `ComputeSeamKey()`；`bSeamKeyValid` 为假 = 还没提交过（首次重求值即提交）。 */
 	uint32 LastSeamKey = 0;
 	bool bSeamKeyValid = false;
-	/** gizmo / 抓手拖动中（`PostEditMove(false)` / `Push*(bFinished=false)` 置，`true` 清）。接缝冻结期。 */
+	/**
+	 * gizmo / 抓手拖动中（`PostEditMove(false)` / `Push*(bFinished=false)` 置，`true` 清）。接缝冻结期。
+	 * 松手事件没来时由 `Tick` 按 `GizmoDragIdleSeconds` 自己清 —— 只在下次重求值里查超时等于没人查
+	 * （09-16 晚编辑器实测：标志卡在 true、没人再叫醒这栋房、拖完一直不出缝）。
+	 */
 	bool bInGizmoDrag = false;
 	double GizmoDragTouchedAt = 0.0;
+	/** 记一次拖动事件：置 / 清拖动标志、记时间，拖着时把 tick 打开等超时。`PostEditMove` 与三个 `Push*` 共用。 */
+	void NoteGizmoDrag(bool bFinished);
+	/** 同一 world 里别的房子已经用着 `Id`（此前存盘的旧副本、不走 T3D 的属性拷贝）。 */
+	bool IsHouseIdTakenByOther(const FGuid& Id) const;
 	/** 地面最近一次广播未提交（塑形物拖动 / 落笔途中）。接缝冻结期。 */
 	bool bInGroundDrag = false;
 	FDelegateHandle RootTransformUpdatedHandle;
@@ -2730,8 +2774,16 @@ private:
 	/** 逐藤的生长历史，键 = `FStrand::RootKey`。transient：相位不该跨关卡保留。 */
 	TMap<uint32, FVineStrandHistory> VineStrandHistory;
 
-	/** 稳定身份，随关卡序列化；首次注册时生成。 */
-	UPROPERTY()
+	/**
+	 * 稳定身份，随关卡序列化；首次注册时生成。
+	 *
+	 * `NonPIEDuplicateTransient`（2026-09-16 晚，结构审查 13 / 计划 D7「前置」）：编辑器里 Ctrl+C/V、Ctrl+D、
+	 * Alt 拖复制全走 T3D 文本导出再导入（`PasteActors`），这个说明符让导出跳过它 ⇒ 副本导入后仍是无效 GUID，
+	 * 注册时发新的。不加的话副本与原件同 GUID：接缝规范序打平、`Classify` 判成同一栋，两栋永远不出缝
+	 * （09-16 编辑器实测 House_Pillar / House_Pillar2）。PIE 复制（`PPF_DuplicateForPIE`）照旧保留；
+	 * `DuplicateTransient` 连 PIE 也清，别换成它。已经撞上的（此前存盘的旧副本）由 `PostRegisterAllComponents` 查重。
+	 */
+	UPROPERTY(NonPIEDuplicateTransient)
 	FGuid HouseId;
 
 	/**

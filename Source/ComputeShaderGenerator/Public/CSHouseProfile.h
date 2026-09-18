@@ -129,6 +129,22 @@ struct COMPUTESHADERGENERATOR_API FCSWallOpening
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Opening")
 	float ArchRise = 0.0f;
 
+	/**
+	 * 附属物的**门形态**（2026-09-16）：窗被拖到贴近墙脚时吸附成门，洞底落在墙脚（`Z0 = 0`）。
+	 * 从 `FCSHouseWindow::bDoorForm` 原样带过来。
+	 *
+	 * ⚠️ **`Type` 仍是 `Window`，别改成 `Door`**：`Type` 记的是**谁产的洞**（道路 / 附属物 / 注入方），
+	 * 不是洞的形状。TG 同构 —— 存档里的 `DecoratorType` 始终是 `CottageWindow` / `GothicWindow`，
+	 * 只有每帧派生的 `DecoratorSubtype` 变成 `*BalconyDoor`（附录 E §3.1）。改成 `Door` 的话，
+	 * 门扇（`RebuildDoorLeaves`）与门框砖（`CSHouseFrame`）都会按道路门再给它补一份，
+	 * 而附属物自己已经带着门的网格 —— 双份几何，一条断言都不会红。
+	 *
+	 * 房子这边**只有谓词**读它：不再拿 `WindowMinSillZ` 卡它（门本来就落地）。门侧挂件（门铃 / 花环）
+	 * 归附属物自己带，**不**进道路门那家摆件（TG 那边也是两套，附录 E §7）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Opening")
+	bool bDoorForm = false;
+
 	float HalfWidth() const { return Width * 0.5f; }
 	/** 实际拱高：`ArchRise` 为 0 时退回半宽（正半圆），并夹在洞高之内。 */
 	float Rise() const
@@ -1299,6 +1315,21 @@ struct COMPUTESHADERGENERATOR_API FCSWallAnchor
 	UPROPERTY()
 	uint8 SConvention = 0;
 
+	/**
+	 * **落地门**（2026-09-16）：窗被拖到贴近墙脚时吸附成门，此时 `SillZ` 恒 0。
+	 *
+	 * 对位 TG `WallAttachmentAnchor.is_bottom_door` —— TG 把门/窗的分界**存在锚点里**，每帧的
+	 * `derive_decorator_subtypes` 只读这个字段、不重判高度（附录 E §3.2 / §3.3）。本项目照抄这个
+	 * 形态：形态是锚点的一部分，所以撤销、拉尺寸时的重新表达、松手回退（`LastAcceptedAnchor`）
+	 * 全都自动带着它走，一行额外代码都不用写。
+	 *
+	 * ⚠️ **别改成从 `SillZ` 现推**（"洞底低于阈值就是门"）：阈值是标记上的可调参数，改一下阈值
+	 * 已经摆好的窗就会集体变门 —— 而且变过去之后派生变换挪了位置，再改回阈值也回不来。
+	 * 旧存档里没有这个字段，读进来是 `false`（窗），与这个特性之前的行为逐位相同。
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Wall Anchor")
+	bool bDoorForm = false;
+
 	/** 边号只查下界：折线化之后边数不再是 4，上界由调用方拿 footprint 自己判。 */
 	bool IsValidAnchor() const { return EdgeIndex >= 0 && DistFromCorner >= 0.0f; }
 
@@ -1306,7 +1337,8 @@ struct COMPUTESHADERGENERATOR_API FCSWallAnchor
 	bool operator==(const FCSWallAnchor& O) const
 	{
 		return EdgeIndex == O.EdgeIndex && bFromEndCorner == O.bFromEndCorner
-			&& DistFromCorner == O.DistFromCorner && SillZ == O.SillZ && SConvention == O.SConvention;
+			&& DistFromCorner == O.DistFromCorner && SillZ == O.SillZ && SConvention == O.SConvention
+			&& bDoorForm == O.bDoorForm;
 	}
 	bool operator!=(const FCSWallAnchor& O) const { return !(*this == O); }
 };
@@ -1333,6 +1365,38 @@ inline FCSWallAnchor CSHouse_MakeWallAnchor(const FCSWallHit& Hit, const FCSHous
 	A.DistFromCorner = A.bFromEndCorner ? (F.Len - S) : S;
 	A.SillZ = SillZ;
 	return A;
+}
+
+/**
+ * **窗 ↔ 门的形态判据**（2026-09-16，TG `decorator_interaction_intent::snap_balcony_door` 的对位物）。
+ * 纯函数：拖 gizmo 与笔刷落笔都经 `ACSWindowMarker::MakeAnchorFromHit` 调到这里，单测直接调。
+ *
+ * TG 的判据（附录 E §1.3，确凿）：**窗碰撞盒的底边低于墙脚** ⇒ 变门，门心吸到墙脚 + 半个门高。
+ * 阈值就是墙脚本身（容差 0）。本函数的 `SnapHeight` 就是"墙脚往上多高算墙脚"。
+ *
+ * ⚠️ **门形态按门的半高判，不是恒按窗判** —— 这是与 TG 唯一的有意差异。TG 鼠标模式每帧只看光标、
+ * 进出门同一条判据（附录 E §1.4），代价是"抓起一扇已落地的门、原地不动，它立刻变回窗"
+ * （门心在 `门高/2`，按窗的半高算底边 = (门高 − 窗高)/2 = 51 cm，高过墙脚）。TG 只在拖拽时解析，
+ * 这个回弹藏在手感里；**本项目改一下属性面板就会重新解析一次**（`PostEditChangeProperty`），
+ * 照抄的话门一碰参数就变回窗。按当前形态判之后，门的底边恒为 0、窗的底边恒为窗台高，
+ * 两个形态各自都是解析的不动点（同 `WallStandoff` 那条纪律）；顺带得到一段迟滞，拖过阈值附近不闪。
+ *
+ * @param CenterZ       命中点高度 = 本体中心（墙空间 cm）
+ * @param WindowHeight  窗形态的洞高
+ * @param DoorHeight    门形态的洞高；≤ 0 = 这扇窗变不成门
+ * @param SnapHeight    底边低于它即吸附成门（TG = 0）
+ * @param bWasDoor      当前锚点的形态
+ */
+inline bool CSHouse_ResolveDoorForm(float CenterZ, float WindowHeight, float DoorHeight, float SnapHeight, bool bWasDoor)
+{
+	if (DoorHeight <= UE_KINDA_SMALL_NUMBER) return false;
+	if (bWasDoor)
+	{
+		// 吸附后的门底**恰好**是 0。阈值取 TG 原值 0 时 `0 < 0` 不成立 ⇒ 刚吸附的门下一次解析就翻回窗，
+		// 所以门这一侧至少留 1 cm 的"还贴着墙脚"。
+		return CenterZ - DoorHeight * 0.5f < FMath::Max(SnapHeight, 1.0f);
+	}
+	return CenterZ - WindowHeight * 0.5f < SnapHeight;
 }
 
 /**
@@ -1459,7 +1523,8 @@ inline ECSFeatureReject CSHouse_QueryOpening(const FCSOpeningSite& Site, const F
 	const float MarginEnd = FMath::Max(Site.CornerMargin, F.InsetEnd);
 	if (Candidate.S0() < MarginStart || Candidate.S1() > F.Len - MarginEnd) return ECSFeatureReject::NearCorner;
 	if (Candidate.Z0 < 0.0f) return ECSFeatureReject::SillTooLow;
-	if (Candidate.Type != ECSOpeningType::Door && Candidate.Z0 < Site.MinSillZ) return ECSFeatureReject::SillTooLow;
+	// 窗台下限只卡**窗**：道路门与附属物的门形态本来就落地，拿它卡门等于把所有门都拒了。
+	if (Candidate.Type != ECSOpeningType::Door && !Candidate.bDoorForm && Candidate.Z0 < Site.MinSillZ) return ECSFeatureReject::SillTooLow;
 	if (Candidate.Z1 + FMath::Abs(Candidate.Skew) * Candidate.HalfWidth() > Site.WallHeight - Site.LintelBand) return ECSFeatureReject::AboveEave;
 
 	for (const FCSWallOpening& Existing : Site.Openings)

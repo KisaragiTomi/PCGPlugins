@@ -1,7 +1,8 @@
 # Tiny Glade 复刻：结构审查
 
-对 `ACSGroundActor` / `ACSHouseActor` / `UCSHouseSubsystem` 一族（[`Docs/TinyGlade/`](Docs/TinyGlade/index.md) 所记的 D1–D14）做一次整体结构审查。只谈结构性问题，不收集单点 bug；单点缺陷只在它能证明某个结构性问题时才列出。
+对 `ACSGroundActor` / `ACSHouseActor` / `UCSHouseSubsystem`（2026-09-16 已删）一族（[`Docs/TinyGlade/`](Docs/TinyGlade/index.md) 所记的 D1–D14）做一次整体结构审查。只谈结构性问题，不收集单点 bug；单点缺陷只在它能证明某个结构性问题时才列出。
 
+- **2026-09-18 补记**：09-16 接缝改为接触记录、`UCSHouseSubsystem` 整个删除之后，受影响的 9 条（2、6、8、9、13、18、27、29、34）的现状见「补记（2026-09-18）」一节；正文与复核总览仍是 09-11 的文字。
 - **2026-09-11 复核**：对照当日工作区重核全部 30 条。基准是插件仓库 HEAD `4820ca3`，加上未提交的 43 个源文件（+2599 / −1427 行），内容包括基类网格槽与实例族清单、房子自 Tick 合批、交接收敛、共享布局头、组件自放显存、实例组件 Nanite 路。五个只读子代理分组核查，主审查抽查了推翻原结论与新发现的关键引文。逐条现状见「复核总览（2026-09-11）」，新发现编为 31–38。各条开头的「**现状（09-11）**」段用复核时刻的行号；原句里的旧行号保留不改，仍按函数名定位。
 - 审查基准：2026-09-06 14:50 前后的工作区，含尚未提交的改动（`git diff --stat -- Source`：32 个文件，+7997 / −1446）。源码在审查期间仍在被修改，行号按读取时刻记录，引用以函数名为主，行号在 ±30 内自行核对。
 - 三条深挖：A「实例化产物管线」与 B「重求值数据流与哈希覆盖」已完成，结论并入对应小节；C「墙体 / 剖面契约 / 矩形假设」当日中断，2026-09-07 由子代理 A 补完并并入大问题 3、4（完整报告见附录 A）。
@@ -76,6 +77,7 @@
 
 - 2026-09-12：**footprint 升闭合折线**。矩形不再是终局，大问题 3 从「方向待拍板」转为待排期的重构。落地顺序与内部分期见「建议顺序」新的第 3 步；逐函数清单与规模在附录 A。本裁决同时决定了大问题 3 的「若升，排在哪个模块之前」那半：排在族结构（第 2 步）之后、`FCSHouseSiteState` 固化（原第 3 步）之前 —— 数据表示先定，控制流再收敛，否则切片类型与哈希口径要按矩形定一次、按折线再改一次。
 - 2026-09-15：**接缝改为两端共持的链接记录**（`FCSHouseSeamLink`，非 UPROPERTY 的 `TSharedRef`，规范序首位出砖、不转移，对端一律 `RequestReevaluate()`）。这收回 08-30 裁决二的「零共享状态、零跨房簿记」与「两栋房各画一份」，也给 34 定了修法：链接签名不等就重算并通知对端，一帧收敛，快扫降为兜底。前置是 13（复制撞 GUID）。方案见计划 D7「接缝链接」。
+- 2026-09-16：接缝定型为**接触记录** `FCSHouseContact`（取代上一条的链接记录写法）：房子只知道自己跟哪些接触有关，接触只知道自己跟哪两栋房有关；谁动谁发，被发方只清、只用、不反发；拖动期冻结、松手提交；标脏统一走根组件 `TransformUpdated`。同日晚 **`UCSHouseSubsystem` 整个删除**（名单 = `UCSHouseLibrary::GetHouses`，快扫不再需要），并定下柱逐接触出、永不跨接触合并（「数量上必须要对应」）。13、34 的去向见「补记（2026-09-18）」。
 - 2026-09-13：用户要求「解决剩下的问题」，两处开放项按本文建议的默认值落地，不是另起的裁决：① 凸 / 凹 —— **先凸**，表示与接口按含凹留好（斜接对凹角天然成立、角框架带转角正负、裁剪段本来就是列表），非严格凸的形状一律退回矩形；② 奇数边的 `S` 原点随斜接移动 `T` —— 旧锚点带口径标记就地换算（`FCSWallAnchor::SConvention`），属性表里的窗在 `PostLoad` 迁移一次（`WallSConvention`）。
 
 ### 09-11 二轮上提候选（只读审计，未做）
@@ -108,6 +110,24 @@
 - 第 29 条：`ActiveHouses` 的残留绑定只活到下一次选择变化，因为 `EvaluateSelection` 末尾也调 `UpdateSelectionBinding`。
 - 深挖 G 引言「`bRunConstructionScriptOnDrag` 默认真」只对 `UBlueprint` 的同名开关成立。`AActor` 那一位默认假，原生 TG 类拖动帧不重跑构造脚本。
 - 「已知但不算结构问题」一节说回归「只用 `Windows` 属性表」，错：自 `109b28d` 起回归就有标记段（笔刷落窗、两份并存、拖动、删除）。只用 `Windows` 的只有 `TinyGladeShotWindow.py`。
+
+## 补记（2026-09-18）：子系统删除、接缝改接触记录之后
+
+2026-09-16 的改动拿掉了审查的几条前提：接缝改为两端共持的接触记录（计划 D7「接触记录 `FCSHouseContact` 与派生」）；`UCSHouseSubsystem` 整个删除，名单改为 `UCSHouseLibrary::GetHouses`（`TActorRange` 按 GUID 排序），0.25 s 快扫与 `GetTrackingHash` 删掉，transform 变化走根组件 `TransformUpdated` 标脏；复制出的房子重发 `HouseId`。下表只记受影响条目的现状，按 2026-09-18 的代码核对，行号指 `CSHouseActor.{h,cpp}`（另注明的除外）。[`tiny-glade-module-interaction.svg`](Docs/TinyGlade/tiny-glade-module-interaction.svg)、[`tiny-glade-reevaluate-hidden-dataflow.svg`](Docs/TinyGlade/tiny-glade-reevaluate-hidden-dataflow.svg)、[`tiny-glade-undo-chain.svg`](Docs/TinyGlade/tiny-glade-undo-chain.svg) 已按同一天的代码重画。
+
+| 条 | 09-18 现状 | 依据 |
+| --- | --- | --- |
+| 2 隐式数据流 | 成立，步骤多一步：落座之后的 `ReanchorMarkersToPreserveWorld` 现在带「必须排在 `ComputeDoors()` 之前」的注释（否则框洞分家）；接缝一步改为读写 `Contacts`，而 `Contacts` 还会被对端的提交从外部写入 —— 隐式总线多了一个跨 actor 的写者 | `.cpp:1105–1112`、`:2539–2585` |
+| 6 一次改动几次重求值 | 抓手 2 → 1（`MarkHouseDirty` 那次随子系统删除）；改属性 2、gizmo 松手 2、撤销 3 不变 | `PushEdge` / `PushHeight` / `PushBase` `.cpp:1251–1352` |
+| 8 依赖方向 | 成立；`CSHouseSubsystem.cpp` 的重复 include 随文件删除；include `CSHouseActor.h` 的文件 14 → 16，编辑器模块仍占 5 个 | grep |
+| 9 唤醒协议 | 换形态（收窄）：执行面从四种收成三种 —— 同步入口 8 处（房子 7 + 基类 `OnConstruction`）、房子自己的 Tick、读时补票约 53 处；只标脏的来源 5 处（地面广播、标记登记 / 注销、对端 `ReceiveContactFrom`、根组件 `TransformUpdated`） | `.cpp:1042–1073`，grep `ReevaluateSite();` / `RequestReevaluate();` |
+| 13 GUID 复制撞键 | 房子侧已修：`HouseId` 加 `NonPIEDuplicateTransient`，`PostRegisterAllComponents` 再查重（撞了取 `NewDeterministicGuid(GetPathName())`），测试 `House.DuplicateGetsOwnId`；花名册撞键随登记表一起消失。标记侧成立：`MarkerId` 仍只在构造期掷一次，复制照抄 | `.h:2786`、`.cpp:4821–4822`、`CSHouseFeatureMarker.h:333` |
+| 18 探针面 | `CSHouseActor.h` 里 `BlueprintPure` 61 个、非 Pure 的 `BlueprintCallable` 13 个 | grep |
+| 27 撤销链 | 成立：仍 3 次同步重求值，`MarkerRef*` 仍非 UPROPERTY，仍无 `PreEditUndo`。新增的 `Contacts` 不进事务，但撤销后第一次重求值时接缝 Key 变了就向新旧对端重发，能自愈 | `.h:2254–2257`、`.cpp:4894–4903` |
+| 29 跨 actor 登记与释放 | 部分修：子系统登记表没了；`Destroyed` 与 `EndPlay` 都调 `DetachContacts`（幂等，对每个旧对端发空），`TransformUpdated` 句柄在 `EndPlay` / `BeginDestroy` 解绑。地面订阅仍以句柄代状态（C7），静态委托仍无守卫 | `.cpp:4826–4857` |
+| 34 执行面并存 / 快扫基线 | 前提消失：快扫、跟踪哈希与基线回写整个删除。邻居落座改出的新 Z 改由接缝提交传播：接缝 Key 含量化后的房底 Z，Key 变了才向对端发记录、对端只标脏；拖动与地面未提交广播期间冻结不发 | `ComputeSeamKey` `.cpp:2502–2511`、`UpdateContacts` `:2539–2575` |
+
+测试基线（09-17 加房体底面之后）：`PCGPlugins` 全套 167 条 165 过，只剩两条既有藤蔓失败；演示回归 229 条 25 条失败，失败集合与此前逐条相同。
 
 ## 审查范围与量化
 

@@ -751,7 +751,7 @@ CPU 孪生 `Public/CSGroundShaperField.h` 与 GPU 权威 `Shaders/Private/CSGrou
 实测噪声关 42 级 / 噪声开 40 级 —— 差的 2 级是噪声让高度沿半径**不再单调**、个别方向括号取不到跨越，
 那一格诚实判为"不属于本座"。
 
-**文档那句「裙边噪声是一次架构选择」确认过期**：`AnalyticRingRadius` 现在只剩旧路在用，
+**文档那句「裙边噪声是一次架构选择」确认过期**：`AnalyticRingRadius` 当时只剩旧路在用（S3 已把它随旧路一起删掉，全仓 0 命中），
 代价已被 S1 的 marching squares 付掉。
 
 #### 默认值依据
@@ -766,7 +766,7 @@ CPU 孪生 `Public/CSGroundShaperField.h` 与 GPU 权威 `Shaders/Private/CSGrou
 整条逻辑的图见 [`CSGroundStairs_Logic.svg`](CSGroundStairs_Logic.svg)（管线 / 单格八步 / 一格的几何 / 鞍点消歧 / 弦长驱动的长度 / 随机源）。
 
 **只加不删**：`CSGroundStairs.usf` / `CSGroundStairs.{h,cpp}` / `Tests/CSGroundStairsTests.cpp` 全新，
-旧的 `CSShaperSteps` + `BuildStepPlan` + `RDG_SmoothSpline` 原样保留。
+旧的 `CSShaperSteps` + `BuildStepPlan` + `RDG_SmoothSpline` 原样保留（S1 落地时如此；S3 随后删掉了旧路，`RDG_SmoothSpline` 因另有消费者留着）。
 
 **唯一动到的既有文件是 `CSMeshOps.usf`，而且动法是对的**：高度场抽进新共享头
 `CSGroundShaperField.ush`，`GroundShaperHeightAt(uint,uint)` 退化成一行包装、数学逐字未变。
@@ -1055,7 +1055,7 @@ D7 的两半至此都合上：**形状相交**那半（接缝砖）2026-08-31 �
 
 #### 判据不是"不穿模"，是"那条棱被遮住了"
 
-⚠️ 这一条差点写错。四面墙是**精确 butt joint**（合卷卷一 §4.1 已经量过：零重叠、零缝隙），
+⚠️ 这一条差点写错。四面墙是**精确 butt joint**（合卷卷一 §4.1 已经量过：零重叠、零缝隙；这是 08-31 的状态，2026-09-13 起转角改为斜接），
 所以"角石不能穿模"是一条**恒真**断言，写了也永远绿。真正的破绽是外角那个立面由三块 quad 拼成
 （0 号墙端盖 / 1 号墙外面 / 2 号墙端盖），而 `AddQuad` 的 UV 从 quad 局部 (0,0) 起算
 ⇒ 那两条一个墙厚宽的端盖是**各自独立的 UV 岛、横轴还沿墙厚方向**，砖纹到角就断。
@@ -2609,6 +2609,8 @@ HandleDrag(bFinished);
 
 > 原文件 `TinyGlade_拉尺寸与接缝对照.md`，原标题「Tiny Glade 拉尺寸（D5）与接缝角柱（D7）对照」。
 
+> ⚠️ **时效（2026-09-18 补注）**：本卷写于 2026-08-30 / 31，文中「本项目今天」的实现描述停在那一刻。之后变了的三件：`UCSHouseSubsystem`（0.25 s 快扫 / 花名册 / `MarkHouseDirty`）已于 09-16 删除，名单改为 `UCSHouseLibrary::GetHouses`、移动由根组件 `TransformUpdated` 标脏；接缝从「两栋房各画一份的纯函数」改为两端共持的接触记录 `FCSHouseContact`（一条缝只砌一次、柱逐接触出）；footprint 自 09-13 起是闭合凸折线，抓手按边数生成。现行设计以计划 D5 / D7 为准，本卷的 TG 侧对照结论不受影响。
+
 本文回答四件事：**TG 怎么拉尺寸**、**TG 怎么收口（转角 / 墙-地 / 墙-顶 / 房-房）**、
 **本项目今天差在哪**、**接进来要动哪些设施**。
 
@@ -3094,6 +3096,8 @@ bool bOpen = Coverage >= (bWasOpen ? SlotOffCoverage : SlotOnCoverage);
 
 #### 4.1 墙角：精确对接，问题不是穿模而是 UV 岛断裂
 
+> ⚠️ 2026-09-13 起转角改为斜接（`CSHouse_GetEdge` 每条边从外角点起、跑满外皮长），下面的 butt joint 实体范围与 UV 岛分析是 08-31 的状态。
+
 `CSHouse_GetEdge`（`CSHouseActor.cpp:132-154`）——0/2 号墙跑满 `Footprint.X`、**独占四个角**；
 1/3 号墙两端各内缩 `T`（`Len = Footprint.Y - 2T`）。四面墙的实体范围：
 
@@ -3136,7 +3140,7 @@ Edge 3: X∈[-HX+T, -HX]   Y∈[-HY+T, HY-T]
 | --- | --- | --- |
 | **檐口** | `Z(HalfSpan) = EaveZ = WallHeight`，屋面板底面**只擦过墙外顶棱一条线**；往内屋面抬升 | 墙顶面（Z=H）与屋面底之间留楔形空隙，外侧 0、内侧 `T·tan(35°) ≈ 24×0.70 ≈ **17 cm**。**从室内看是贯通两面檐墙的一条开口**，无物封闭 |
 | **山墙斜边** | 山墙棱柱的斜边与屋面底**恰好共面**（零余量） | 任何浮点/阴影偏置都会露出**发丝缝** |
-| **屋脊** | `SlopeLen = |Slope| + RoofThickness*0.5` 故意过冲，两板互穿 | 各自尖端露出对方顶面约 `RoofThickness·sin(35°) ≈ 12×0.57 ≈ **7 cm**`，形成交叉小尖。**没有脊瓦** |
+| **屋脊** | `SlopeLen = \|Slope\| + RoofThickness*0.5` 故意过冲，两板互穿 | 各自尖端露出对方顶面约 `RoofThickness·sin(35°) ≈ 12×0.57 ≈ **7 cm**`，形成交叉小尖。**没有脊瓦** |
 | **山墙端出挑** | `LAtot = LA + 2*RoofOverhang` | 自由边无任何收边 |
 
 TG 对位物：`generate_roof_stone_floor_and_roof_bottom` + `_nani_roof_floor` 的
@@ -4155,7 +4159,7 @@ TG 的六家生产者写同一张 `ResMut<WallHoles>`，顺序由 Bevy 的 `.bef
 
 | TG | 本项目对位物 | 差在哪 | 取舍建议 |
 | --- | --- | --- | --- |
-| §4.3 岩地台阶 | **`ACSGroundShaperActor` 的塑形物石阶**（`BuildStepPlan` + `CSGroundSteps.usf`） | 等高线求解方式（CPU 闭式 vs GPU marching squares）；已由 D9「石阶改造」裁决对齐 | 已在计划内，本文不重复。骨架对照见 [`CSGroundShaper.md`](CSGroundShaper.md) 的「石阶：骨架几乎一样，两处关键分歧」 |
+| §4.3 岩地台阶 | **地面的石阶** `ACSGroundActor::RebuildStairs`（`CSGroundStairs.usf`，GPU marching squares；塑形物自持的 `BuildStepPlan` + `CSGroundSteps.usf` 旧路已于 08-30 删除） | 等高线求解方式（CPU 闭式 vs GPU marching squares）；已由 D9「石阶改造」裁决对齐 | 已在计划内，本文不重复。骨架对照见 [`CSGroundShaper.md`](CSGroundShaper.md) 的「石阶：骨架几乎一样，两处关键分歧」 |
 | §4.2 平台楼梯 | **零** | 缺**两个**模型概念（见下节） | 维持排除。且**不作为入口**（`[二轮]` L1393③ 已定死） |
 | §4.1 玩家绘制 | **零** | 图状态 + 撤销 + gizmo 交互层 | 维持排除；但第一步（自由路径踏步）可与图状态解耦 |
 | **§4.0 门前踏步** | **零，但落点已经全部就位** | 只缺「谁来摆这些砖」这一段 | **建议新增为第一步的备选入口**，见第五节 |
@@ -4230,6 +4234,10 @@ hint_stairs::{hint_stairs, StairsHintConditions}
 ---
 
 ### 五、最小可行第一步：现有设施能走多远
+
+> ⚠️ **2026-09-16 已按 [附录 D](TinyGlade_楼梯逆向_附录D_玩家绘制楼梯.md) 落地，本节的两处口径被订正**（附录 D §9.0）：
+> ① 踏步不是「按高差 / 18 cm 分级」—— 那是用户 Godot 原型的做法，TG 是 3D 弧长按 50 cm 重采样；
+> ② `BuildFramePlan` 那条样条 + 逐砖记录的路已删，MVP 走 CPU 实例路（`ACSStairsActor` + `CSStairs.h`）。下面保留作当时的推理记录。
 
 计划给的顺序是「沿自由路径的踏步 + 底下砖石支撑（不穿墙、不进图状态）→ 穿墙开洞 → 图状态」。
 `[二轮]` L1094 把起点指定为「已跑通的 `CSGroundShaperActor` 分层铺装链（`.cpp:286-341`）」。
@@ -4686,7 +4694,7 @@ UE 的 `MSM_DefaultLit` 走的是 **Lambert**；要复刻这一条需要在材�
 | --- | --- |
 | 级联选择 | `view_constants[2 + c]`，`c ∈ {0,1,2}`；scale 10 / 5 / 5×(2/7) ⇒ 覆盖半径比 1 : 2 : 7，与 `[分析]` §1.5 的「`[0,1]/[1,2]/[2,7]`」一致 |
 | 法线偏移 bias | 沿法线推 `0.0667 × saturate(1 − NdotL)`，**在阴影视图空间里推** |
-| 斜率 bias | `max(0.3/scale × (1 − |NdotL|), 0.025)`，深度上再减 `bias/1024` |
+| 斜率 bias | `max(0.3/scale × (1 − \|NdotL\|), 0.025)`，深度上再减 `bias/1024` |
 | **blocker search** | 5 抽，黄金角 `2.39996` 螺旋，半径 `0.2 × scale` 纹素；求命中遮挡体的**平均深度** |
 | **penumbra 宽度** | `w = (z − z_blocker) × 17.07 × scale × pow(10, smoothstep(0,0.25,fog.w)) / z_blocker`，再软钳位 `w / pow((w/(scale−1))^5 + 1, 0.2) + 1` |
 | **PCF** | 10 抽同螺旋，`sampler2DArrayShadow` 硬件比较，半径 = penumbra；带**感受野斜率补偿** `min(0, dot(dz/dxy, offset))` |
@@ -4790,7 +4798,7 @@ vec3 R = normalize(mix(N, reflect(V, N), r*(sqrt(r)+r2)));
 | 0 | 跑逐像素接触阴影步进 | 需要接触阴影的实体 |
 | 1 | 高光乘 `mix(ao, 1, 0.3)` | 参与 AO 的高光 |
 | 2 | 乘 `(1−contact)·(1−cascade)` | 接收阳光阴影 |
-| 4 | 走「远景/编辑高亮」分支（`|x|>65 || |z|>65` 判定） | 出界回退 |
+| 4 | 走「远景/编辑高亮」分支（`\|x\|>65 \|\| \|z\|>65` 判定） | 出界回退 |
 | 5 | 直接光乘 `mix(0.6, 1, ao)` | 参与 AO 的漫反射 |
 | 6 | 跳过高亮 | 非编辑对象 |
 

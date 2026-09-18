@@ -21,12 +21,13 @@ UE 侧各参数的含义写在 [`CSGroundShaperActor.h`](../../Source/ComputeSha
 | 链 | 产物 | 道路条件 | UE 现状 |
 | --- | --- | --- | --- |
 | A 高度场 | 隆起的地面本体 | 无（road 在这里被刷上） | 已落地（含裙边噪声与二次抬升） |
-| B 侧面碎石 | 坡面上的 Voronoi 碎石 | **只在 `@road == 0` 的坡面** | **未实现** |
-| C 石阶 | 沿等高线的踏步 | **只在 `@road > 0` 的坡面** | 已落地，做法替换 |
+| B 侧面碎石 | 坡面上的 Voronoi 碎石 | **只在 `@road == 0` 的坡面** | 已落地，做法替换（TG 式披挂岩壳，归地面） |
+| C 石阶 | 沿等高线的踏步 | **只在 `@road > 0` 的坡面** | 已落地，做法替换（GPU marching squares，归地面） |
 
 **关键读法**：`road` 是把坡面**一分为二**的开关 —— `blast10` 把有路的点从碎石源里删掉，
 `blast8` 把没路的点从石阶候选里删掉。原型里坡面的每一段要么长石阶、要么长碎石。
-UE 目前只接了石阶那一半，所以没画路的坡面是光秃的插值面。
+UE 两半都接上了：石阶按格心路权过阈才长；岩壳不做 road 显隐，在路上连续下沉
+（`1/RockShellRoadFade` < `StairRoadThreshold` 保证互补，单测 `RockShell.Contract`）。
 
 ## 原型的可读性限制
 
@@ -117,9 +118,9 @@ CPU 孪生在 `Public/CSGroundShaperField.h`。参数是 `SkirtNoiseAmount`（**
 
 `AnalyticRingRadius` 的闭式解随之失效 —— 但**架构代价已经被 S1 顺带付掉了**：
 S1/S2 的 GPU marching squares（`ACSGroundActor::RebuildStairs`）直接读高度场，
-根本不关心等高线是不是圆。只有旧路 `BuildStepPlan` 还在用闭式解，它现在在
-`HasAnalyticProfile()` 为假时退回逐方向数值求交（验证 + 割线 + 二分，那条分支本来就在）。
-实测：噪声关 42 级 / 噪声开 40 级，退化后仍然摆得出石阶。
+根本不关心等高线是不是圆。当时只剩旧路 `BuildStepPlan` 还在用闭式解（`HasAnalyticProfile()`
+为假时退回逐方向数值求交，实测噪声关 42 级 / 开 40 级）；该路已随 2026-08-30 裁决一（S3）删除，
+`AnalyticRingRadius` / `HasAnalyticProfile` 全仓不再存在。
 
 ### 二次抬升（已落地，默认开）
 
@@ -147,7 +148,8 @@ f@dot = dot(@N, set(0, 1, 0));
 ```
 
 `blast10` 删 `@road>0`、`blast1` 留 `@dot<1`，两步之后得到**「没有路的坡面」**，
-它是链 B 唯一的输入。UE 侧没有等价物（UE 不需要，因为没有链 B）。
+它是链 B 唯一的输入。UE 侧没有逐点的等价物：岩壳的显隐只看坡度 mask
+（`smoothstep(0.75, 1.25, |∇h|)`），路不参与显隐、只让壳连续下沉。
 
 ## ⚠️ 链 B 已被用户在 Houdini 里重构（2026-08-31 现场实测，本节后的旧链描述已成历史）
 
@@ -305,13 +307,14 @@ vector origdir = normalize(getbbox_center(1) - @P);
 
 ## 链 C：石阶
 
-原型把「分层 → 套环 → 投影 → 过滤 → 摆块」拆成 13 个节点，UE 压成
+原型把「分层 → 套环 → 投影 → 过滤 → 摆块」拆成 13 个节点，UE 旧路曾压成
 「CPU 解闭式环半径 + 弧段 + 铺装」→「GPU 求曲线 + 直写实例行」两段。
 
-> ⚠️ **本节描述的是 2026-08-30 之前的实现。** 用户已裁决改走 100% GPU 决策
-> （marching squares，见[计划 D9「石阶改造」](TinyGladeHouse_Plan.md)），
-> `BuildStepPlan` / `RDG_SmoothSpline` / `SolveBlockLayout` 那条路会被删掉。
-> 保留本节是为了读懂现有代码，以及记录那两处**将要放弃**的能力（变长铺装、B 样条平滑）。
+> ⚠️ **本节描述的是 2026-08-30 之前的实现，那条路已随裁决一（S3）整条删除。** 现行石阶是
+> 100% GPU 决策的 marching squares（`ACSGroundActor::RebuildStairs` + `CSGroundStairs.usf`，
+> 逻辑图 [`CSGroundStairs_Logic.svg`](CSGroundStairs_Logic.svg)）；`BuildStepPlan` / `CSGroundSteps.usf`
+> 已不在仓库里（`RDG_SmoothSpline` / `SolveBlockLayout` 本体因别的消费者保留）。
+> 保留本节只为记录原型口径，以及那两处**已放弃**的能力（变长铺装、B 样条平滑）。
 
 ### 分层
 
@@ -587,7 +590,7 @@ TG 的 `_rocky_terrain_stairs_stairs.cs`（8×8 线程，域 = `contouring_grid_
 **marching squares 意味着对地形形状零假设** —— 这正是本项目那条已知缺陷
 （*路穿过两座相接土台时接合处石阶弧段断掉*，逆向报告第一轮）的根因所在。
 用户已于 2026-08-30 裁决改走 100% GPU 决策，方案见
-[计划 D9「石阶改造」](TinyGladeHouse_Plan.md)；本表右列即将成为历史。
+[计划 D9「石阶改造」](TinyGladeHouse_Plan.md)；本表右列已成为历史（S3 已删旧路）。
 
 **TG 的门控阈值比我们严得多**：`path > 0.99` 几乎要求路完全盖住该格，石阶只在路正中心长；
 我们 0.35 宽松，路边缘也会长。要贴 TG 观感，阈值得往上提。
@@ -600,11 +603,12 @@ TG 的 `_rocky_terrain_stairs_stairs.cs`（8×8 线程，域 = `contouring_grid_
 | 石阶 `stairs.cs`（8×8 线程） | `atomicAdd(draw_commands[..].instanceCount, 1)` | GPU 计数 + indirect draw |
 
 石阶那条还带第二个 indirect（`pebble_indirect_draw_idx`，台阶旁撒鹅卵石）。
-本项目现状恰好同形：石阶走 `CSGroundSteps.usf` 的 `InterlockedAdd` + indirect，碎石按计划走定长壳。
+本项目现状恰好同形：石阶走 `CSGroundStairs.usf` 的 `InterlockedAdd` + indirect（石子另开一对 buffer），
+碎石走定长壳（`CSGroundRockShell.usf`）。
 
 ## 参数对照
 
-Houdini 值为场景单位，UE 值为 `CSGroundShaperActor.h` 的默认值。
+Houdini 值为场景单位；UE 值：塑形物那几行取 `CSGroundShaperActor.h`，石阶那几行取 `CSGroundActor.h`（石阶 2026-08-30 起归地面）的默认值（2026-09-18 核对）。
 「归一化」列以台顶半径为 1，用来看两侧比例是否一致。
 
 | 原型参数 | Houdini 值 | 归一化 | UE 符号 | UE 默认 | 归一化 |
@@ -612,16 +616,16 @@ Houdini 值为场景单位，UE 值为 `CSGroundShaperActor.h` 的默认值。
 | `DeformSource/scale` | 0.6 | 1.000 | `Radius` | 150 cm | 1.000 |
 | `deformbyinfluence1/maxdist` | 0.67 | 1.117 | `FalloffDistance` | 200 cm | 1.333 |
 | `deformbyinfluence1/scale` | 1.7 | 2.833 | `LiftHeight` | 300 cm | 2.000 |
-| `resample1/length` | 0.2 | 0.333 | `StepHeight` | 30 cm | 0.200 |
-| `attribwrangle7/Noffset` | 0.163 | 0.272 | `StepEmbed` | 25 cm | 0.167 |
-| `Step` 盒长（Z 轴） | 0.7 | 1.167 | `SM_StoneStep_{S,M,L}` | 60 / 100 / 150 cm | 0.4 / 0.67 / 1.0 |
+| `resample1/length` | 0.2 | 0.333 | `StairStepHeight`（地面） | 30 cm | 0.200 |
+| `attribwrangle7/Noffset` | 0.163 | 0.272 | `StairEmbed`（地面） | 30 cm | 0.200 |
+| `Step` 盒长（Z 轴） | 0.7 | 1.167 | `StairMesh`（单一网格；长度 = max(弦长, 名义) × `StairLengthBloat`） | 1.06 倍 | — |
 | `noisebysourcestress` 幅度 | 1.0（归一化 dist 域） | — | `SkirtNoiseAmount` | 0.5（同域） | — |
 | `noisebysourcestress` 频率 | 无法从 HDA 确证 | — | `SkirtNoiseWavelength` | 300 cm | 2.000 |
 | `attribwrangle5/scale` | 0.021 | — | `SecondaryLiftScale` | 0.021 | — |
-| `blast8` `@road>0` | 阈值 0 | — | `StepRoadThreshold` | 0.35 | — |
-| `resample2/length` | 0.278 | 0.463 | 无（改由 `SolveBlockLayout` 决定间距） | — | — |
-| — | — | — | `StepGap` | 3 cm | 0.02 |
-| — | — | — | `StepAngleStepDeg` | 3° | — |
+| `blast8` `@road>0` | 阈值 0 | — | `StairRoadThreshold`（地面，格心判） | 0.35 | — |
+| `resample2/length` | 0.278 | 0.463 | `StairCellSize`（地面，扫描格边长 ≈ 石阶长） | 100 cm | 0.667 |
+
+旧路的 `StepGap` / `StepAngleStepDeg` / `SM_StoneStep_{S,M,L}` 随 2026-08-30 删路一起没了（三块石阶网格 09-11 也已删）。
 
 碎石链的参数在 UE 侧全部没有对应物：`scatter1/npts=15`、`fuse1/tol3d=0.5916`、
 `attribwrangle3/offset=0.072`、`attribwrangle3/Noffset=0.051`、`polyextrude1/dist=0.12`、
@@ -640,9 +644,9 @@ Houdini 是 Y-up、UE 是 Z-up，石阶盒的三轴按下表对应，**长度轴
 | 石阶长度（环切向） | `sizez` = 0.7 | 局部 `+Y` |
 | 石阶高度（世界上） | `sizey` = 0.3 | 局部 `+Z` |
 
-`BuildStepPlan` 取 `StaticMesh` 包围盒的 **Y** 当长度；同一份
-`ACSSplineBlockActor::SolveBlockLayout` 的另一个消费者 `ACSSplineBlockActor` 取的是 **X**，
-两边口径已分叉（见 `TinyGlade_对比逆向报告.md` 卷二）。
+现行石阶（`CSGroundStairs.usf`）以网格局部 **Y** 为长度轴（`StairBaseSizeY`）。已删的旧路 `BuildStepPlan` 同样取 **Y**，
+而 `SolveBlockLayout` 的另一个消费者 `ACSSplineBlockActor` 取的是 **X** —— 旧路删掉之后，这处口径分叉只剩样条块自己一侧
+（见 `TinyGlade_对比逆向报告.md` 卷二）。
 
 原型里 `Step` 盒高 0.3 大于层距 0.2，踏步在竖直方向是**互相叠压**的，不是首尾相接。
 
@@ -650,27 +654,27 @@ Houdini 是 Y-up、UE 是 Z-up，石阶盒的三轴按下表对应，**长度轴
 
 | 环节 | 原型 | UE 现状 | 性质 |
 | --- | --- | --- | --- |
-| 羽化曲线 | B 样条 ramp | `smoothstep` | 等效替换，换来闭式反函数 |
-| 裙边噪声 | `dist −= \|turb·(1−dist)\|` | `SkirtNoiseAmount`（默认 0.5），加在 `max` 之前 | 已落地；闭式环半径随之只作数值求交的初值 |
+| 羽化曲线 | B 样条 ramp | `smoothstep` | 等效替换（它的闭式反函数只服务过已删的旧路） |
+| 裙边噪声 | `dist −= \|turb·(1−dist)\|` | `SkirtNoiseAmount`（默认 0.5），加在 `max` 之前 | 已落地；marching squares 不假设等高线是圆，不受影响 |
 | 二次抬升 | `pow(dist/max, 1.5)·max·0.021` | `SecondaryLiftScale`（默认 0.021） | 已落地；台顶因此是 `LiftHeight × 1.021` |
 | 噪声实现 | Houdini `turbnoise` | 自写整数哈希 value noise + 3 倍频 fbm | 换实现，为的是 CPU/GPU 逐位可复刻 |
 | 坡面碎石 | Voronoi 15 节点链（cook 时） | TG 式披挂岩壳（`CSGroundRockShell.usf`） | 已落地；原型那条链整体作废，改抄 TG 的运行时披挂 |
 | 壳的体积 | — | 基准偏移 `mix(−BaseSink, +BaseLift, Rock−Road)` + 起伏幅度 ∝ 坡度 | 已落地（2026-08-31），逐项对位 TG `displace:563` / `:721` |
 | 壳的岩石度输入 | — | 只有坡度那一路（TG `rocky_terrain.x` 的对位物） | **缺失** `rocky_terrain.y/.z`（笔画自带的岩石度）与全部水体项 |
 | 碎石归属 | — | — | 由塑形物翻给**地面**（推翻计划 D9 :504 的岩石那一半） |
-| 等高线求解 | 线性锥近似 + `ray` 投影 | `smoothstep` 闭式反函数 | 即将换成 GPU marching squares |
-| 石阶尺寸 | 单一 `Step` 盒等距 | palette + `SolveBlockLayout` 变长铺装 | 即将回退成单一网格 + 逐实例哈希（同 TG） |
-| 石阶埋深 | 盒心落在地表，半埋 | `PaletteRise` 抬半个身位 | UE 修正 |
-| 石阶朝向 | `orientalongcurve` | 着色器内 `tangent × up` + 径向翻转 | 等效 |
-| 道路耦合 | 有路长石阶 / 无路长碎石 | 只有石阶那一半 | **缺失一半** |
-| 求值位置 | SOP cook，全 CPU | CPU 只解布局，几何全在 RDG 图 | UE 架构差异 |
+| 等高线求解 | 线性锥近似 + `ray` 投影 | GPU marching squares（`CSGroundStairs.usf`） | 已落地；闭式反函数随旧路于 2026-08-30 删除 |
+| 石阶尺寸 | 单一 `Step` 盒等距 | 单一 `StairMesh` + 格身份哈希抖动，长度跟弦长走 | 已落地（同 TG）；变长铺装随旧路删除 |
+| 石阶埋深 | 盒心落在地表，半埋 | `StairRise`（沿用旧路 `PaletteRise` 的修正）抬半个身位 | UE 修正 |
+| 石阶朝向 | `orientalongcurve` | 着色器内 `tangent × up`，+X 按 −∇h 翻到下坡 | 等效 |
+| 道路耦合 | 有路长石阶 / 无路长碎石 | 石阶按格心路权门控；壳在路上连续下沉 | 已补齐（`1/RockShellRoadFade` < `StairRoadThreshold`） |
+| 求值位置 | SOP cook，全 CPU | CPU 只递交参数，层 / 段 / 摆位与几何全在 RDG 图 | UE 架构差异 |
 
 ## 待验证 / 开放问题
 
 - **`scale` 的作用点**：hip 内 `deformbyinfluence` 的 `scale = 1.7` 在 v2 / v3 里都没有对应参数，
   无法逐字确证它乘在哪一步。按 `@P.y += f@dist` 与台高实际值反推只能是对 `lerp` 的整体缩放，
   移植时按这个口径即可（UE 的 `LiftHeight` 已经是这么用的）。
-- **碎石与石阶的接缝**（方案已裁决，待实测）：原型靠 `road` 硬切（`blast10` / `blast8` 互补），
+- ~~**碎石与石阶的接缝**（方案已裁决，待实测）~~（已被计划 D9 裁决五与石阶 S1 取代：壳不再按 road 取阈、改为连续下沉，石阶按格心路权门控；两者的约束见上表「道路耦合」行）。原文：原型靠 `road` 硬切（`blast10` / `blast8` 互补），
   两者不会重叠。计划 D9 已定为两侧共用同一个 `StepRoadThreshold`；
   但阈值相同不等于边界严丝合缝 —— 石阶按**弧段**取阈（连续方向采样连成段），
   碎石按**三角的三个顶点**取阈（任一过阈即保留整个三角，同 TG），
@@ -679,11 +683,13 @@ Houdini 是 Y-up、UE 是 Z-up，石阶盒的三轴按下表对应，**长度轴
   `AnalyticRingRadius`，是一次架构选择"。**架构代价已经被石阶 S1 顺带付掉了** ——
   `AnalyticRingRadius` 现在只剩旧路 `BuildStepPlan` 在用，S1/S2 的 GPU marching squares
   直接读高度场、不关心等高线是不是圆。旧路已改为在 `HasAnalyticProfile()` 为假时退回
-  逐方向数值求交（复用非孤立分支那套割线 + 二分）。**它的存废仍是挂起的决策，没有删。**
+  逐方向数值求交（复用非孤立分支那套割线 + 二分）。~~**它的存废仍是挂起的决策，没有删。**~~ 已于 2026-08-30「裁决一」（S3）随旧路删除，`AnalyticRingRadius` / `HasAnalyticProfile` 全仓 0 命中。
   一个已知的退化：噪声让高度沿半径不再单调，个别方向上括号取不到跨越，那一格诚实地判为
   "不属于本座"、不摆石阶（实测 42 → 40 级）。
 - **塑形物尺度装不下胞腔**：披挂壳的胞腔按 ~3 m 给（对齐 TG 的三角边长），
   而默认 `Radius=150` / `FalloffDistance=200` 的裙边只有 2 m 宽 —— 一块碎石都不会出现。
   动工前必须二选一：放大演示塑形物，或缩小胞腔并接受 4× 的三角数。见计划 D9「密度与尺度」。
-- **烘焙图案从哪来**：`CellId` / `DirToCentroid` / `bIsCorner` 都是 KALOU `Voronoiscatter` 现成的输出，
-  但导出通路（Houdini → UE aux 流）还没有；P1 先用手工规则六边形图案绕开这一项。
+  （⚠️ 改用 TG 原件图案之后胞腔是 5.53 m，更装不下；只剩出路 1 —— 放大演示塑形物，缩小胞腔在原件路线下不存在。见 [`CSRockShellPattern.md`](CSRockShellPattern.md) 与 [`CSGroundTuning.md`](CSGroundTuning.md)。）
+- ~~**烘焙图案从哪来**：`CellId` / `DirToCentroid` / `bIsCorner` 都是 KALOU `Voronoiscatter` 现成的输出，
+  但导出通路（Houdini → UE aux 流）还没有；P1 先用手工规则六边形图案绕开这一项。~~
+  已解决：直接用 TG 原件 `rocky_terrain_shell.glb`（609 胞腔，`TinyGladeImportRockShell.py` 导入），原件不可用时才用后备生成器 `BakeRockShellPattern.py`（真 Voronoi + Lloyd × 6），见 [`CSRockShellPattern.md`](CSRockShellPattern.md)。

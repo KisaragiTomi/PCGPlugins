@@ -273,17 +273,18 @@ AVineContainer::GenerateVineGPU()          # 录完图即返回（"已递交"）
 | `ACSTinyGlade` | 抽象基类：「CPU 权威数据 → 快照 → `UCSMesh`」的网格槽（异步上传、在途只留最新）、声明式重求值入口 `ReevaluateSite()`、实例族清单（诊断 / 烘焙）；显存各归各，gpumesh 组件销毁时自己放 | [`CSTinyGlade.h`](Source/ComputeShaderGenerator/Public/CSTinyGlade.h) |
 | `ACSGroundActor` | 地面：高度 + 顶点色的 CPU 权威镜像（R = 道路权重）与顶点色笔刷；由它派生地面网格、高度场、石阶、岩壳、裙边摆件、地被（草 + 花）六条链 | [`CSGroundActor.h`](Source/ComputeShaderGenerator/Public/CSGroundActor.h) |
 | `ACSGroundShaperActor` | 塑形物：放在地面上的不可见高度影响体，地面从「基底 + 相交塑形物」声明式重导出高度 | [`CSGroundShaperActor.h`](Source/ComputeShaderGenerator/Public/CSGroundShaperActor.h) |
-| `ACSHouseActor` | 房屋：落座、道路驱动的门拱与门扇、墙体与门框砖、四坡瓦顶、承重柱、接缝、角石、包边石、窗洞、藤蔓、摆件 | [`CSHouseActor.h`](Source/ComputeShaderGenerator/Public/CSHouseActor.h) |
-| `ACSWindowMarker`（基类 `ACSHouseFeatureMarker`） | 窗：自带预制网格，序列化的是锚点（边号 + 离角距离 + 窗台高）而非世界变换；房子只按诉求挖洞并裁决可行性（门拱优先） | [`CSHouseFeatureMarker.h`](Source/ComputeShaderGenerator/Public/CSHouseFeatureMarker.h) |
-| `ACSHouseResizeHandleActor` / `ACSHouseHeightHandleActor` | 拉尺寸抓手：四面墙各一个锥子推拉墙面，外加一个高度框改墙高；公共基类 `ACSHouseHandleActor`，用编辑器原生 gizmo 拖 | [`CSHouseResizeHandleActor.h`](Source/ComputeShaderGenerator/Public/CSHouseResizeHandleActor.h) |
-| `UCSHouseSubsystem` | 房屋花名册（按 GUID 升序）、0.25 s 兜底变换快扫、点击放窗的执行面 `PlaceMarkerAlongRay` | [`CSHouseSubsystem.h`](Source/ComputeShaderGenerator/Public/CSHouseSubsystem.h) |
+| `ACSHouseActor` | 房屋：落座、道路驱动的门拱与门扇、墙体（含朝下的底面）与门框砖、四坡瓦顶、承重柱、接缝、角石、包边石、窗洞、藤蔓、摆件；与相交邻居共持接触记录 `FCSHouseContact`（[`CSHouseContact.h`](Source/ComputeShaderGenerator/Public/CSHouseContact.h)），谁动谁发、松手提交 | [`CSHouseActor.h`](Source/ComputeShaderGenerator/Public/CSHouseActor.h) |
+| `ACSWindowMarker`（基类 `ACSHouseFeatureMarker`） | 窗：自带预制网格，序列化的是锚点（边号 + 离角距离 + 窗台高）而非世界变换；房子只按诉求挖洞并裁决可行性（门拱优先）；贴墙脚时变成门，附门前踏步 / 栏杆 / 门铃 / 花环 | [`CSHouseFeatureMarker.h`](Source/ComputeShaderGenerator/Public/CSHouseFeatureMarker.h) |
+| `ACSHouseResizeHandleActor` / `ACSHouseHeightHandleActor` | 拉尺寸抓手：footprint 每条边一个锥子推拉墙面，外加檐口 / 房底两个高度框（改墙高 / 底动顶不动）；公共基类 `ACSHouseHandleActor`，用编辑器原生 gizmo 拖 | [`CSHouseResizeHandleActor.h`](Source/ComputeShaderGenerator/Public/CSHouseResizeHandleActor.h) |
+| `UCSHouseLibrary` | 静态函数库、无状态：房屋名单 `GetHouses`（`TActorRange` 按 GUID 升序，没有登记表）、`PickHouse` / `PickHouseNear` 解析拾取、点击放窗的执行面 `PlaceMarkerAlongRay`。取代 2026-09-16 删除的 `UCSHouseSubsystem` | [`CSHouseLibrary.h`](Source/ComputeShaderGenerator/Public/CSHouseLibrary.h) |
+| `ACSStairsActor` | 玩家绘制楼梯（TG §4.1 的 MVP）：默认带样条组件，按 50 cm 弧长重采样出级，踏步块底下按层砌砖到地面；订阅地面广播，只在变更盒与样条包围盒相交时重算 | [`CSStairsActor.h`](Source/ComputeShaderGenerator/Public/CSStairsActor.h) |
 | `ACSSplineBlockActor` | 样条块排布：刚体块沿样条排列，只缩沿线步距、恰好占满样条（不是 SplineMesh 弯曲） | [`CSSplineBlockActor.h`](Source/ComputeShaderGenerator/Public/CSSplineBlockActor.h) |
 
-纯函数层（剖面 / 接缝 / 角石 / 包边 / 屋面 / 拉尺寸 / 门段）是 header-inline 的 `CSHouseProfile.h`、`CSHouseSeam.h`、`CSHouseQuoin.h`、`CSHouseTrim.h`、`CSHouseRoof.h`、`CSHouseResize.h`、`CSHouseDoorRuns.h`，带逻辑单测。实例化产物各有一个打包 / 散布 kernel，直接写 `UCSGpuInstancedMeshComponent` 的 GPU 实例行：门框砖 `CSHouseFrame.usf`、瓦 `CSHouseTile.usf`、藤蔓 `CSHouseVine.usf`、摆件 `CSHouseDecor.usf`、承重柱砖 `CSHousePillar.usf`、石阶 `CSGroundStairs.usf`、地被 `CSGroundCover.usf`；岩壳则是一张 `UCSMesh`，由 `CSGroundRockShell.usf` 在常驻流上做位移、法线平均与倒角载荷。
+纯函数层（剖面 / 接缝 / 角石 / 包边 / 屋面 / 拉尺寸 / 门段）是 header-inline 的 `CSHouseProfile.h`、`CSHouseSeam.h`、`CSHouseQuoin.h`、`CSHouseTrim.h`、`CSHouseRoof.h`、`CSHouseResize.h`、`CSHouseDoorRuns.h`，以及玩家楼梯的 `CSStairs.h`，带逻辑单测。实例化产物各有一个打包 / 散布 kernel，直接写 `UCSGpuInstancedMeshComponent` 的 GPU 实例行：门框砖 `CSHouseFrame.usf`、瓦 `CSHouseTile.usf`、藤蔓 `CSHouseVine.usf`、摆件 `CSHouseDecor.usf`、承重柱砖 `CSHousePillar.usf`、石阶 `CSGroundStairs.usf`、地被 `CSGroundCover.usf`；岩壳则是一张 `UCSMesh`，由 `CSGroundRockShell.usf` 在常驻流上做位移、法线平均与倒角载荷。
 
 贯穿全系统的四条约定（逐条理由见设计文档）：
 
-- **声明式重求值**：任何唤醒（移动、改参、`OnGroundChanged` 直推、subsystem 快扫）都汇到同一个 `ReevaluateSite()`，目标状态 = 当前输入的纯函数，哈希变了才重建。重复唤醒收敛为零成本，所以不需要脏标记系统来防自环。
+- **声明式重求值**：任何唤醒（移动、改参、`OnGroundChanged` 直推、邻居发来的接触记录）都汇到同一个 `ReevaluateSite()`（被动唤醒只标脏，在房子自己的 Tick 里合批兑现），目标状态 = 当前输入的纯函数，哈希变了才重建。重复唤醒收敛为零成本，所以不需要脏标记系统来防自环。
 - **CPU 镜像是权威，GPU 网格只是投影**：道路权重、地面高度、拾取等查询只打镜像，永不回读 GPU。gpumesh 全线 `NoCollision`，拾取一律解析求交——照引擎 trace 写，窗户会「一放就没」（找不到宿主即自毁，且不报任何错）。
 - **开洞不挖几何**：门、窗、接缝裁剪都是逐像素 clip。房体 UV1 传解析裁剪场，材质里的判据与 `CSHouse_ClipKeeps()` 逐字对应；洞缘断口由门框砖或预制窗框盖住。与 TG 原版同构，也不走 MeshBoolean。
 - **交互热路径零阻塞**：拖房子、拖抓手、画笔刷期间一次设备同步都不许有。回归脚本在这些路径上断言 `UCSMesh::GetBlockingFlushCount()` 增量为 0；摆件、藤蔓这类「松手才生成」的提交链允许异步回读。
@@ -301,7 +302,7 @@ AVineContainer::GenerateVineGPU()          # 录完图即返回（"已递交"）
 | `FCSInstanceBrushEdMode` | `AMeshGeneratorBrushCache` | 往 actor 自己的实例化网格组件上画实例 |
 | `FCSPointBrushEdMode` | `ACSPointBrushActor` | 采样 GPU 深度缓冲，把点直接追加进 actor 的 GPU 点 buffer（见下节） |
 | `FCSGroundPaintEdMode` | `ACSGroundActor` | 画地面顶点色（道路权重）；拾取走地面自己的解析射线，不靠碰撞 |
-| `FCSWindowBrushEdMode` | `ACSHouseActor` | 在墙上点一下放一扇窗（`UCSHouseSubsystem::PlaceMarkerAlongRay`），随即退出 |
+| `FCSWindowBrushEdMode` | `ACSHouseActor` | 在墙上点一下放一扇窗（`UCSHouseLibrary::PlaceMarkerAlongRay`），随即退出 |
 
 - **视口叠加面板** `FViewEditCategoryViewportOverlay`：把任意选中 actor 细节面板里的 `ViewEdit` 分类搬进视口（基类 `FSelectedActorViewportOverlayBase`，前身是藤蔓专用的 `FVineContainerViewportOverlay`）。
 - **浅水烘焙** `UCSShallowWaterProcess`：`SaveSWData` 在模块启动时绑到 `ACSShallowWaterCapture::OnBakeResultMeshDelegate`；另有 `StartSWSolver` / `StopSWSolver`、`DebugDumpSWPassResults`。

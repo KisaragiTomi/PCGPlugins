@@ -138,7 +138,7 @@ v2 把邻接整个绕开了 —— 折痕位置烘成顶点色的慢变量，材
 投影 clamp（经典的 single-pass wireframe 技巧）。
 
 顺带比 TG 更准：TG 用 `min(min(C2.x, C2.y), C2.z)` 在**原始重心坐标**上选最近边
-（`ps_main.glsl:104`），各向异性三角形上 `min λ ≠ min λ·h` ⇒ 它会选错边；v3 直接对真实垂距取 min。
+（`ps_main.glsl:107`；`:104` 是 `void main()`），各向异性三角形上 `min λ ≠ min λ·h` ⇒ 它会选错边；v3 直接对真实垂距取 min。
 
 ⚠️ 这给的是到**直线**的距离，TG 取的是**线段**距离（`:152` 有 `clamp(t,0,1)`）。钝角三角形上垂足会
 落到线段外，差异只在距顶点一个 `band` 之内。
@@ -313,7 +313,7 @@ BevelHardThreshold    = 0.5    # 硬支里 band 内哪一段算 chamfer 面；Ha
 直接摆放的图案 StaticMesh 上**没有 v3 那几条 UV**，所以这条路继续走顶点色载荷。两份子图
 就此分叉，v3 的任何改动都不会自动跟过来。
 
-![缺口法线的生成（v2 链路）](CSRockShellEdgeBevel_Logic.svg)
+![缺口法线的生成：左 v3（运行时壳，现役）、右 v2（直摆资产，legacy）两条链路并排](CSRockShellEdgeBevel_Logic.svg)
 
 生产：`Scripts/BakeRockShellBevelChannels.py`（系统 python，读 glb 重写 `COLOR_0`）→
 `Scripts/SetupRockShellBevel.py` 重导。四个逐顶点量打包进顶点色：

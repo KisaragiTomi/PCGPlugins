@@ -1,4 +1,4 @@
-<svg viewBox="0 0 1440 1176" width="1440" height="1176" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Microsoft YaHei, sans-serif">
+<svg viewBox="0 0 1440 1384" width="1440" height="1384" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Microsoft YaHei, sans-serif">
   <defs>
     <pattern id="autoobject-dot-bg" patternUnits="userSpaceOnUse" width="12" height="12">
       <rect width="12" height="12" fill="#cffafe"/>
@@ -18,9 +18,6 @@
 
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0 0L10 5L0 10z" fill="#475569"/>
-    </marker>
-    <marker id="arrowo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-      <path d="M0 0L10 5L0 10z" fill="#b45309"/>
     </marker>
     <marker id="arrowc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
       <path d="M0 0L10 5L0 10z" fill="#0e7490"/>
@@ -58,11 +55,12 @@
     .chord   { stroke: #0e7490; stroke-width: 1.8; fill: none; marker-end: url(#arrowc); marker-start: url(#arrowc); }
     .tick    { stroke: #64748b; stroke-width: 1.2; fill: none; marker-end: url(#arrow); marker-start: url(#arrow); }
     .wall    { fill: #cbd5e1; stroke: #334155; stroke-width: 1; }
-    .wall13  { fill: #eef2f7; stroke: #64748b; stroke-width: 1; }
-    .cblock  { fill: #fde68a; stroke: #b45309; stroke-width: 1.2; }
+    .cblock  { fill: #fde68a; stroke: #b45309; stroke-width: 1; }
+    .ringloop{ stroke: #b45309; stroke-width: 2; fill: none; }
+    .ringhead{ fill: #b45309; }
+    .piece   { stroke: #0e7490; stroke-width: 3; fill: none; }
     .quoin   { fill: #ffffff; stroke: #0e7490; stroke-width: 1.6; }
     .pier    { fill: #ffffff; stroke: #15803d; stroke-width: 1.8; }
-    .ring    { stroke: #b45309; stroke-width: 1.4; fill: none; marker-end: url(#arrowo); }
     .lead    { stroke: #0e7490; stroke-width: 1; fill: none; }
     .leadk   { stroke: #15803d; stroke-width: 1; fill: none; }
     .badrow  { fill: #fee2e2; stroke: #b91c1c; stroke-width: 1; }
@@ -70,247 +68,323 @@
   </style>
 
   <text x="26" y="30" class="title">当前门洞逻辑：路是连续场，门宽是就地量出来的弦长；转角与拱廊是同一种东西 —— 一个墩</text>
-  <text x="26" y="50" class="sub">ACSHouseActor::ComputeDoors + ResolvePierSpans（2026-09-06 口径）。四条边接成闭合周界求解，跨角的段按边切成两片、再跨角配成墩。默认参数：footprint 600×400、T=24、周长 1904、77 个采样点、步长 24.73 cm。</text>
+  <text x="26" y="50" class="sub">ACSHouseActor::ComputeDoors + ResolvePierSpans（2026-09-18 口径，逐条对代码复核）。footprint 是闭合凸折线 FCSHouseFootprint（09-12 起；09-14 起非严格凸按凸包用、退化回矩形），</text>
+  <text x="26" y="66" class="sub">N 条边按斜接框架（09-13 起）首尾相接成外皮周界求解；跨角的段按边切成两片、再跨角配成墩。默认 600×400 矩形、T = 24：周长 2000、80 个采样点、步长 25.00 cm。</text>
 
   <!-- ================================================= ① 主链 -->
-  <rect x="24" y="64" width="1392" height="190" rx="6" class="panel"/>
-  <rect x="24" y="64" width="1392" height="26" rx="6" class="phead"/>
-  <text x="38" y="82" class="ptext">① 主链：顶点色 R 场 → 一维剖面 → 弦长 → 洞表 → 墩位。门与窗每轮从权威源重算，只有第三方注入的洞原样留着</text>
+  <rect x="24" y="80" width="1392" height="228" rx="6" class="panel"/>
+  <rect x="24" y="80" width="1392" height="26" rx="6" class="phead"/>
+  <text x="38" y="98" class="ptext">① 主链：顶点色 R 场 → 一维剖面 → 弦长 → 洞表 → 墩位。门与窗每轮从权威源重算，只有第三方注入的洞原样留着</text>
 
-  <rect x="36" y="102" width="196" height="70" rx="5" class="resident"/>
-  <text x="46" y="120" class="h">地面顶点色 R</text>
-  <text x="46" y="136" class="t">SampleRoadWeight(XY)</text>
-  <text x="46" y="151" class="t">镜像双线性场，CellSize 50</text>
-  <text x="46" y="166" class="s">不是样条、不是几何</text>
+  <rect x="36" y="118" width="196" height="86" rx="5" class="resident"/>
+  <text x="46" y="136" class="h">地面顶点色 R</text>
+  <text x="46" y="152" class="t">SampleRoadWeight(XY)</text>
+  <text x="46" y="167" class="t">镜像双线性场，CellSize 50</text>
+  <text x="46" y="182" class="s">不是样条、不是几何</text>
 
-  <rect x="250" y="102" width="206" height="70" rx="5" class="box"/>
-  <text x="260" y="120" class="h">闭环等距采样</text>
-  <text x="260" y="136" class="t">Steps = ⌈周长 / 25⌉ = 77</text>
-  <text x="260" y="151" class="t">内外两条探测线取 max</text>
-  <text x="260" y="166" class="s">DoorProbeOffset = ±30</text>
+  <rect x="250" y="118" width="206" height="86" rx="5" class="box"/>
+  <text x="260" y="136" class="h">闭环等距采样</text>
+  <text x="260" y="152" class="t">Steps = ⌈周长 / 25⌉ = 80</text>
+  <text x="260" y="167" class="t">采样点在外皮线上（F.Start + U·s）</text>
+  <text x="260" y="182" class="t">沿本边法线 ±30 两条探测线取 max</text>
+  <text x="260" y="197" class="s">DoorProbeOffset = 30</text>
 
-  <rect x="474" y="102" width="240" height="70" rx="5" class="core"/>
-  <text x="484" y="120" class="h">CSHouse_SolveRoadRuns（闭环）</text>
-  <text x="484" y="136" class="t">0.5 等值线 + 亚采样求根</text>
-  <text x="484" y="151" class="t">碎环段并掉 30 · 滞回 40 / 32</text>
-  <text x="484" y="166" class="s">纯函数，单测直接喂剖面</text>
+  <rect x="474" y="118" width="240" height="86" rx="5" class="core"/>
+  <text x="484" y="136" class="h">CSHouse_SolveRoadRuns（闭环）</text>
+  <text x="484" y="152" class="t">0.5 等值线 + 亚采样求根</text>
+  <text x="484" y="167" class="t">碎环段并掉 30 · 滞回 40 / 32</text>
+  <text x="484" y="182" class="s">纯函数，单测直接喂剖面</text>
 
-  <rect x="732" y="102" width="196" height="70" rx="5" class="box"/>
-  <text x="742" y="120" class="h">环段 → 按边切</text>
-  <text x="742" y="136" class="t">与 4 条边求交（3 副本）</text>
-  <text x="742" y="151" class="t">跨角段 ⇒ 两片，不打标记</text>
-  <text x="742" y="166" class="s">超宽切分放在切边之后</text>
+  <rect x="732" y="118" width="196" height="86" rx="5" class="box"/>
+  <text x="742" y="136" class="h">环段 → 按边切</text>
+  <text x="742" y="152" class="t">与 N 条边求交（−P / 0 / +P）</text>
+  <text x="742" y="167" class="t">跨角段 ⇒ 两片，不打标记</text>
+  <text x="742" y="182" class="s">超宽切分放在切边之后</text>
 
-  <rect x="946" y="102" width="196" height="70" rx="5" class="box"/>
-  <text x="956" y="120" class="h">拱廊 / 收窄 / 量化 / 夹回</text>
-  <text x="956" y="136" class="t">&gt; 160 切多拱 ⇒ Arcade</text>
-  <text x="956" y="151" class="t">中心与宽各量化到 2 cm</text>
-  <text x="956" y="166" class="ok">再夹回 [0, F.Len] 才算完</text>
+  <rect x="946" y="118" width="196" height="86" rx="5" class="box"/>
+  <text x="956" y="136" class="h">拱廊 / 收窄 / 量化 / 夹回</text>
+  <text x="956" y="152" class="t">&gt; 160 切多拱 ⇒ Arcade</text>
+  <text x="956" y="167" class="t">中心与宽各量化到 2 cm</text>
+  <text x="956" y="182" class="ok">夹回 [0, F.Len]（只防外推）</text>
+  <text x="956" y="197" class="s">逐片 &lt; DoorMinWidth 40 就丢</text>
 
-  <rect x="1160" y="102" width="244" height="70" rx="5" class="owner"/>
-  <text x="1170" y="120" class="h">FCSWallOpening[] → 墩位</text>
-  <text x="1170" y="136" class="t">EdgeIndex / CenterS / Width</text>
-  <text x="1170" y="151" class="t">Z0=0 · Z1=220 · ArchRise</text>
-  <text x="1170" y="166" class="ok">ResolvePierSpans 打 Pier 两位</text>
+  <rect x="1160" y="118" width="244" height="86" rx="5" class="owner"/>
+  <text x="1170" y="136" class="h">FCSWallOpening[] → 墩位</text>
+  <text x="1170" y="152" class="t">EdgeIndex / CenterS / Width</text>
+  <text x="1170" y="167" class="t">Z0 = 0 · Z1 = 165 · ArchRise</text>
+  <text x="1170" y="182" class="ok">ResolvePierSpans 打 Pier 两位</text>
 
-  <path d="M232 137 H248" class="flow"/>
-  <path d="M456 137 H472" class="flow"/>
-  <path d="M714 137 H730" class="flow"/>
-  <path d="M928 137 H944" class="flow"/>
-  <path d="M1142 137 H1158" class="flow"/>
+  <path d="M232 161 H248" class="flow"/>
+  <path d="M456 161 H472" class="flow"/>
+  <path d="M714 161 H730" class="flow"/>
+  <path d="M928 161 H944" class="flow"/>
+  <path d="M1142 161 H1158" class="flow"/>
 
-  <rect x="36" y="184" width="1368" height="58" rx="5" class="card"/>
-  <text x="46" y="202" class="h">路根本没有「宽度」这个量被传下来 —— 传下来的是一个标量场，门宽是在墙上现场量出来的弦长。</text>
-  <text x="46" y="220" class="t">弦长沿墙量，不是路的法向宽度：路斜着 θ 角过来 ⇒ 弦长 ≈ 路宽 / sin θ。路边缘的羽化也算进弦长（半宽 60 + 过渡 20 ⇒ 0.5 落在 70 ⇒ 弦长 140）。</text>
-  <text x="46" y="236" class="t">Width 还继续决定：ArchRise = min(70, W/2) → 起拱线 · clip 场的 InvHalfWidth（材质逐像素挖的洞形）· OpeningCell（墙板跨度）· 门樘砖 LeftS/RightS · 门扇挑档。</text>
+  <rect x="36" y="216" width="1368" height="82" rx="5" class="card"/>
+  <text x="46" y="234" class="h">路根本没有「宽度」这个量被传下来 —— 传下来的是一个标量场，门宽是在墙上现场量出来的弦长。</text>
+  <text x="46" y="251" class="t">弦长沿墙量，不是路的法向宽度：路斜着 θ 角过来 ⇒ 弦长 ≈ 路宽 / sin θ + 2 · 30 · |cot θ|（两条探测线的并集；45° 时 140 宽的路 → 258，离线复现）。路边缘的羽化也算进弦长（半宽 60 + 过渡 20 ⇒ 0.5 落在 70 ⇒ 弦长 140）。</text>
+  <text x="46" y="267" class="t">Width 还继续决定：ArchRise = min(70, W/2) → 起拱线 Z1 − Rise（Z1 = min(DoorHeight 165, 墙高 300 − LintelBand 40)）· clip 场的 InvHalfWidth（材质逐像素挖的洞形）· OpeningCell（墙板跨度）· 门樘砖 LeftS/RightS · 门扇挑档。</text>
+  <text x="46" y="285" class="good">落地洞不只来自路：附属物的窗贴墙脚变门（09-16，bDoorForm）也进同一张洞表 —— Type 仍是 Window、Z0 = 0、洞形默认 Rect；它排在道路门之后逐个过谓词（门拱优先），④ 各框末行写着各消费者怎么对它分流。</text>
 
   <!-- ================================================= ② 弦长 -->
-  <rect x="24" y="266" width="704" height="368" rx="6" class="panel"/>
-  <rect x="24" y="266" width="704" height="26" rx="6" class="phead"/>
-  <text x="38" y="284" class="ptext">② 宽度在这里诞生：跨阈两点之间线性求根</text>
+  <rect x="24" y="320" width="644" height="410" rx="6" class="panel"/>
+  <rect x="24" y="320" width="644" height="26" rx="6" class="phead"/>
+  <text x="38" y="338" class="ptext">② 宽度在这里诞生：跨阈两点之间线性求根</text>
 
-  <text x="44" y="310" class="t">Root(A, B) = clamp((On − A) / (B − A), 0, 1)　　入参序恒「先段内、后段外」，写反得到 1 − t</text>
+  <text x="44" y="366" class="t">Root(A, B) = clamp((On − A) / (B − A), 0, 1)　　入参序恒「先段内、后段外」，写反得到 1 − t</text>
 
-  <rect x="52" y="320" width="656" height="188" rx="4" class="card"/>
-  <path d="M60 456 H700" class="axis"/>
-  <path d="M60 334 V456" class="axis"/>
-  <text x="42" y="338" class="s">1.0</text>
-  <text x="46" y="460" class="s">0</text>
+  <rect x="52" y="376" width="596" height="188" rx="4" class="card"/>
+  <path d="M60 512 H640" class="axis"/>
+  <path d="M60 390 V512" class="axis"/>
+  <text x="42" y="394" class="s">1.0</text>
+  <text x="46" y="516" class="s">0</text>
 
-  <path d="M60 395 H700" class="level"/>
-  <text x="662" y="391" class="good">On = 0.5</text>
+  <path d="M60 451 H640" class="level"/>
+  <text x="598" y="447" class="good">On = 0.5</text>
 
-  <path d="M165.6 395 L240 395 L360 395 L440.4 395 L440.4 456 L165.6 456 Z" class="roadfill"/>
-  <polyline points="60,456 120,441.4 180,380.4 240,334 300,334 360,334 420,373 480,437.7 540,456 600,456 660,456" class="prof"/>
+  <path d="M155.04 451 L402.36 451 L402.36 512 L155.04 512 Z" class="roadfill"/>
+  <polyline points="60,512 114,497.4 168,436.4 222,390 276,390 330,390 384,429 438,493.7 492,512 546,512 600,512" class="prof"/>
 
-  <circle cx="60" cy="456" r="2.6" fill="#b45309"/>
-  <circle cx="120" cy="441.4" r="2.6" fill="#b45309"/>
-  <circle cx="180" cy="380.4" r="2.6" fill="#b45309"/>
-  <circle cx="240" cy="334" r="2.6" fill="#b45309"/>
-  <circle cx="300" cy="334" r="2.6" fill="#b45309"/>
-  <circle cx="360" cy="334" r="2.6" fill="#b45309"/>
-  <circle cx="420" cy="373" r="2.6" fill="#b45309"/>
-  <circle cx="480" cy="437.7" r="2.6" fill="#b45309"/>
-  <circle cx="540" cy="456" r="2.6" fill="#b45309"/>
-  <circle cx="600" cy="456" r="2.6" fill="#b45309"/>
-  <circle cx="660" cy="456" r="2.6" fill="#b45309"/>
+  <circle cx="60" cy="512" r="2.6" fill="#b45309"/>
+  <circle cx="114" cy="497.4" r="2.6" fill="#b45309"/>
+  <circle cx="168" cy="436.4" r="2.6" fill="#b45309"/>
+  <circle cx="222" cy="390" r="2.6" fill="#b45309"/>
+  <circle cx="276" cy="390" r="2.6" fill="#b45309"/>
+  <circle cx="330" cy="390" r="2.6" fill="#b45309"/>
+  <circle cx="384" cy="429" r="2.6" fill="#b45309"/>
+  <circle cx="438" cy="493.7" r="2.6" fill="#b45309"/>
+  <circle cx="492" cy="512" r="2.6" fill="#b45309"/>
+  <circle cx="546" cy="512" r="2.6" fill="#b45309"/>
+  <circle cx="600" cy="512" r="2.6" fill="#b45309"/>
 
-  <circle cx="165.6" cy="395" r="4" class="quoin"/>
-  <circle cx="440.4" cy="395" r="4" class="quoin"/>
-  <path d="M165.6 395 V472" class="drop"/>
-  <path d="M440.4 395 V472" class="drop"/>
-  <text x="161" y="382" class="good" text-anchor="end">S0</text>
-  <text x="447" y="382" class="good">S1</text>
+  <circle cx="155.04" cy="451" r="4" class="quoin"/>
+  <circle cx="402.36" cy="451" r="4" class="quoin"/>
+  <path d="M155.04 451 V528" class="drop"/>
+  <path d="M402.36 451 V528" class="drop"/>
+  <text x="150" y="438" class="good" text-anchor="end">S0</text>
+  <text x="409" y="438" class="good">S1</text>
 
-  <path d="M165.6 484 H440.4" class="chord"/>
-  <text x="216" y="500" class="good">Width = S1 − S0（弦长）</text>
+  <path d="M155.04 540 H402.36" class="chord"/>
+  <text x="200" y="556" class="good">Width = S1 − S0（弦长）</text>
 
-  <path d="M540 468 H600" class="tick"/>
-  <text x="508" y="486" class="s">Step = 24.73（周长 / 77）</text>
+  <path d="M492 524 H546" class="tick"/>
+  <text x="452" y="542" class="s">Step = 25.00（周长 2000 / 80）</text>
 
-  <rect x="52" y="518" width="656" height="108" rx="4" class="card"/>
-  <text x="62" y="536" class="h">分辨率的真相：亚采样求根只在「路边缘比采样步长软」时才连续</text>
-  <text x="62" y="553" class="t">路半宽 60→75 逐 cm 变宽，本机复现 CSHouse_SolveRoadRuns 得到的门宽：</text>
-  <text x="62" y="572" class="mono">路半宽      60      63      66      68      70      71      75</text>
-  <text x="62" y="588" class="mono">软边 f=25   144.14  151.66  159.61  163.94  167.37  168.97  174.36   ← 连续跟随</text>
-  <text x="62" y="604" class="monod">硬边 f=2    123.64  123.64  123.64  123.64  138.06  148.36  148.36   ← 卡在 Step 整数倍</text>
-  <text x="62" y="620" class="warn">硬边那一行全是 24.73 的整数倍（5× / 6×）：重做要消灭的「门一格一格跳」，在羽化 &lt; DoorSampleStep 时原样回来。</text>
+  <rect x="52" y="574" width="596" height="146" rx="4" class="card"/>
+  <text x="62" y="592" class="h">分辨率的真相：亚采样求根只在「路边缘比采样步长软」时才连续</text>
+  <text x="62" y="609" class="t">离线复现（Python 复刻 CSHouse_SolveRoadRuns）：路垂直穿过 edge 0 中点 S = 300，半宽 60→75 逐 cm 变宽：</text>
+  <text x="62" y="628" class="mono">路半宽</text>
+  <text x="166" y="628" class="mono" text-anchor="end">60</text>
+  <text x="214" y="628" class="mono" text-anchor="end">63</text>
+  <text x="262" y="628" class="mono" text-anchor="end">66</text>
+  <text x="310" y="628" class="mono" text-anchor="end">68</text>
+  <text x="358" y="628" class="mono" text-anchor="end">70</text>
+  <text x="406" y="628" class="mono" text-anchor="end">71</text>
+  <text x="454" y="628" class="mono" text-anchor="end">75</text>
+  <text x="62" y="644" class="mono">软边 f=25</text>
+  <text x="166" y="644" class="mono" text-anchor="end">141.67</text>
+  <text x="214" y="644" class="mono" text-anchor="end">151.92</text>
+  <text x="262" y="644" class="mono" text-anchor="end">160.94</text>
+  <text x="310" y="644" class="mono" text-anchor="end">165.28</text>
+  <text x="358" y="644" class="mono" text-anchor="end">168.75</text>
+  <text x="406" y="644" class="mono" text-anchor="end">170.24</text>
+  <text x="454" y="644" class="mono" text-anchor="end">175.00</text>
+  <text x="468" y="644" class="mono">← 连续跟随</text>
+  <text x="62" y="660" class="monod">硬边 f=2</text>
+  <text x="166" y="660" class="monod" text-anchor="end">125.00</text>
+  <text x="214" y="660" class="monod" text-anchor="end">125.00</text>
+  <text x="262" y="660" class="monod" text-anchor="end">125.00</text>
+  <text x="310" y="660" class="monod" text-anchor="end">125.00</text>
+  <text x="358" y="660" class="monod" text-anchor="end">125.00</text>
+  <text x="406" y="660" class="monod" text-anchor="end">125.00</text>
+  <text x="454" y="660" class="monod" text-anchor="end">175.00</text>
+  <text x="468" y="660" class="monod">← 卡在 Step 整数倍</text>
+  <text x="62" y="679" class="warn">硬边那一行全是 Step = 25 的整数倍（5× → 7×：路心 300 恰是第 12 个采样点，两端同时跳，一跳 50）；</text>
+  <text x="62" y="694" class="warn">重做要消灭的「门一格一格跳」，在羽化 &lt; DoorSampleStep 时原样回来。</text>
+  <text x="62" y="711" class="s">剖面 w = clamp((半宽 + f − |d|) / f, 0, 1)；同一模型在旧环（1904 / 77 点）上逐位复现 09-06 版这张表。</text>
 
   <!-- ================================================= ③ 转角 -->
-  <rect x="736" y="266" width="680" height="368" rx="6" class="panel"/>
-  <rect x="736" y="266" width="680" height="26" rx="6" class="phead"/>
-  <text x="750" y="284" class="ptext">③ 四条边怎么接成环：butt joint，0/2 号墙独占四个角</text>
+  <rect x="676" y="320" width="740" height="410" rx="6" class="panel"/>
+  <rect x="676" y="320" width="740" height="26" rx="6" class="phead"/>
+  <text x="690" y="338" class="ptext">③ N 条边怎么接成环：斜接（09-13），采样环就是外皮折线；0 / 2 号墙不再独占四角</text>
 
-  <rect x="780" y="336" width="300" height="200" fill="#ffffff" stroke="#334155" stroke-width="1"/>
-  <rect x="780" y="524" width="300" height="12" class="wall"/>
-  <rect x="780" y="336" width="300" height="12" class="wall"/>
-  <rect x="1068" y="348" width="12" height="176" class="wall13"/>
-  <rect x="780" y="348" width="12" height="176" class="wall13"/>
-  <rect x="780" y="524" width="12" height="12" class="cblock"/>
-  <rect x="1068" y="524" width="12" height="12" class="cblock"/>
-  <rect x="780" y="336" width="12" height="12" class="cblock"/>
-  <rect x="1068" y="336" width="12" height="12" class="cblock"/>
+  <text x="770" y="380" class="s">探测线（只画 edge 2）：外皮 ±30 各一条，取 max</text>
+  <path d="M764 389 H1064" class="drop"/>
 
-  <path d="M806 516 H1050" class="ring"/>
-  <path d="M1058 508 V368" class="ring"/>
-  <path d="M1050 358 H812" class="ring"/>
-  <path d="M800 368 V508" class="ring"/>
+  <!-- 四面墙：斜接梯形，转角方块沿角平分线一分为二 -->
+  <polygon points="764,604 1064,604 1052,592 776,592" class="wall"/>
+  <polygon points="1064,604 1064,404 1052,416 1052,592" class="wall"/>
+  <polygon points="1064,404 764,404 776,416 1052,416" class="wall"/>
+  <polygon points="764,404 764,604 776,592 776,416" class="wall"/>
+  <polygon points="764,604 776,604 776,592" class="cblock"/>
+  <polygon points="764,604 764,592 776,592" class="cblock"/>
+  <polygon points="1064,604 1052,604 1052,592" class="cblock"/>
+  <polygon points="1064,604 1064,592 1052,592" class="cblock"/>
+  <polygon points="1064,404 1064,416 1052,416" class="cblock"/>
+  <polygon points="1064,404 1052,404 1052,416" class="cblock"/>
+  <polygon points="764,404 776,404 776,416" class="cblock"/>
+  <polygon points="764,404 764,416 776,416" class="cblock"/>
 
-  <text x="830" y="510" class="t">edge 0 · 600（含四角）</text>
-  <text x="830" y="372" class="t">edge 2 · 600</text>
-  <text x="978" y="440" class="t">edge 1 · 352</text>
-  <text x="806" y="440" class="t">edge 3 · 352</text>
-  <text x="880" y="452" class="s">1 / 3 号墙两端各内缩一个墙厚 T</text>
-  <text x="880" y="468" class="s">黄块 = 转角方块，归 0 / 2 号墙的面板</text>
+  <path d="M776 419 H1052" class="drop"/>
 
-  <path d="M745 604 L865 484 L889 508 L769 628 Z" class="roadfill"/>
-  <circle cx="780" cy="536" r="6" class="quoin"/>
-  <circle cx="797" cy="519" r="4.5" class="pier"/>
-  <path d="M780 536 L756 568" class="lead"/>
-  <path d="M797 519 L905 562" class="leadk"/>
-  <text x="740" y="582" class="good">角石（恒 4 根）</text>
-  <text x="740" y="596" class="s">S = 0，墩顶以下让路</text>
-  <text x="908" y="566" class="ok">转角墩：角点内缩 T/√2</text>
-  <text x="908" y="580" class="s">= 两面墙墙厚中线的交点</text>
-  <text x="908" y="600" class="t">一条压过转角的路</text>
+  <!-- 采样环 = 外皮折线（S 从 SW 角起逆时针） -->
+  <path d="M764 604 H1064 V404 H764 Z" class="ringloop"/>
+  <polygon points="909,599 920,604 909,609" class="ringhead"/>
+  <polygon points="1059,509 1064,498 1069,509" class="ringhead"/>
+  <polygon points="919,399 908,404 919,409" class="ringhead"/>
+  <polygon points="759,499 764,510 769,499" class="ringhead"/>
 
-  <rect x="1100" y="306" width="304" height="126" rx="4" class="card"/>
-  <text x="1110" y="324" class="h">环参数 EdgeStart（逐边前缀和）</text>
-  <text x="1110" y="342" class="mono">edge0 [   0,  600)　edge1 [ 600,  952)</text>
-  <text x="1110" y="357" class="mono">edge2 [ 952, 1552)　edge3 [1552, 1904)</text>
-  <text x="1110" y="376" class="t">周长 1904，真实外周界 2000。</text>
-  <text x="1110" y="393" class="warn">环少掉 4T = 96：每个转角跳 24 cm，</text>
-  <text x="1110" y="408" class="warn">转角方块的外立面不在采样环上。</text>
-  <text x="1110" y="424" class="s">S 连续，物理位置不连续。</text>
+  <text x="880" y="434" class="t">edge 2 · 600</text>
+  <text x="782" y="470" class="t">edge 3 · 400</text>
+  <text x="986" y="540" class="t">edge 1 · 400</text>
+  <text x="930" y="586" class="t">edge 0 · 600</text>
+  <text x="872" y="470" class="s">每条边从外角点起，取外皮全长</text>
+  <text x="872" y="485" class="s">内皮两端各让 Inset（直角 = T = 24）</text>
+  <text x="872" y="500" class="s">黄块 = 转角方块，沿角平分线一分为二，</text>
+  <text x="872" y="515" class="s">两条边各拿一半（09-13 前归 0 / 2 号墙）</text>
 
-  <rect x="1100" y="444" width="304" height="176" rx="4" class="card"/>
-  <text x="1110" y="462" class="h">跨角的段 → 两片洞 + 一个墩</text>
-  <text x="1110" y="480" class="t">① 环上解出一条跨角段</text>
-  <text x="1110" y="496" class="t">② 与每条边求交，试 −P / 0 / +P</text>
-  <text x="1110" y="511" class="t">③ 量化后夹回边内 ⇒ 端点正落在墙端</text>
-  <text x="1110" y="527" class="ok">④ ResolvePierSpans 跨角配对：</text>
-  <text x="1110" y="542" class="mono">k 边顶 Len × k+1 边顶 0 ⇒ 墩位</text>
-  <text x="1110" y="557" class="mono">跨度 = 墙厚 24，同一套双阈迟回</text>
-  <text x="1110" y="576" class="s">转角与拱廊从此是同一种东西：门樘、</text>
-  <text x="1110" y="591" class="s">门扇、墙板三个下游零特判，转角特有</text>
-  <text x="1110" y="606" class="s">的只剩「中间那根柱子立在角上」。</text>
+  <!-- 一条沿 SW 角平分线进屋的路（离线例） -->
+  <polygon points="710.97,607.53 788.75,529.75 838.25,579.25 760.47,657.03" class="roadfill"/>
+  <path d="M764.5 611 H829.5" class="piece"/>
+  <path d="M757 538.5 V603.5" class="piece"/>
+  <text x="834" y="615" class="good">e0 片</text>
+  <text x="752" y="560" class="good" text-anchor="end">e3 片</text>
+  <text x="684" y="578" class="s">环原点 S = 0</text>
+
+  <circle cx="764" cy="604" r="6" class="quoin"/>
+  <circle cx="770" cy="598" r="4" class="pier"/>
+  <path d="M760 609 L738 668" class="lead"/>
+  <path d="M773 595 L846 553" class="leadk"/>
+  <text x="850" y="549" class="ok">转角墩 = PointAtDepth(T/2)</text>
+  <text x="850" y="563" class="s">墙厚中线交点，直角 = 平分线内缩 T/√2 ≈ 17</text>
+  <text x="872" y="626" class="s">橙线 = 采样环 = 外皮折线，S 从 SW 角起逆时针</text>
+  <text x="800" y="650" class="t">一条沿 SW 角平分线进屋的路（0.5 等值宽 140，③⑤ 的离线例）</text>
+  <text x="686" y="682" class="good">角石：外棱在角点（QuoinInset 0）</text>
+  <text x="686" y="697" class="s">凸角且内角 ≥ 90° 各一根（矩形 4 根）</text>
+  <text x="686" y="711" class="s">墩顶以下让路（CullBelowZ）</text>
+
+  <rect x="1100" y="356" width="304" height="140" rx="4" class="card"/>
+  <text x="1110" y="374" class="h">环参数 EdgeStart（逐边前缀和）</text>
+  <text x="1110" y="392" class="mono">edge0 [0, 600)</text>
+  <text x="1236" y="392" class="mono">edge1 [600, 1000)</text>
+  <text x="1110" y="407" class="mono">edge2 [1000, 1600)</text>
+  <text x="1236" y="407" class="mono">edge3 [1600, 2000)</text>
+  <text x="1110" y="425" class="t">周长 2000 = 真实外周界（直角对接时是 1904，少 4T）。</text>
+  <text x="1110" y="442" class="ok">角点被前后两条边共享：S 连续，外皮上的</text>
+  <text x="1110" y="457" class="ok">物理位置也连续（旧口径每个转角跳 24 cm）。</text>
+  <text x="1110" y="474" class="s">只有探测线的法线在角上随边转向；4 个角点恰是</text>
+  <text x="1110" y="488" class="s">第 0 / 24 / 40 / 64 个采样点（落在边界上归后一条边）。</text>
+
+  <rect x="1100" y="506" width="304" height="216" rx="4" class="card"/>
+  <text x="1110" y="524" class="h">跨角的段 → 两片洞 + 一个墩（离线例）</text>
+  <text x="1110" y="541" class="t">① 环上解出一条跨角段 [1869.49, 2130.51]</text>
+  <text x="1110" y="557" class="t">② 与每条边求交，试 −P / 0 / +P：</text>
+  <text x="1122" y="572" class="mono">e3 [269.49, 400.00] · e0 [0.00, 130.51]</text>
+  <text x="1110" y="589" class="t">③ 中心、宽各量化 2 cm，再夹回 [0, Len]：</text>
+  <text x="1122" y="604" class="mono">e3 [269, 399] · e0 [1, 131]</text>
+  <text x="1110" y="620" class="warn">只夹外推，内缩 ≤ 1 cm 不补（见 ⑤ 末条）</text>
+  <text x="1110" y="637" class="ok">④ ResolvePierSpans 跨角配对：</text>
+  <text x="1122" y="652" class="mono">k 边 S1 ≈ Len × k+1 边 S0 ≈ 0（±2）⇒ 墩位</text>
+  <text x="1122" y="667" class="mono">跨度记墙厚 T = 24（名义）≤ 60 ⇒ 成墩</text>
+  <text x="1110" y="684" class="t">两片 W 130 · Rise 65 ⇒ 墩顶 165 − 65 = 100</text>
+  <text x="1110" y="700" class="s">转角与拱廊从此是同一种东西：门樘、门扇、墙板</text>
+  <text x="1110" y="714" class="s">三个下游零特判，只剩「中间那根柱子立在角上」。</text>
 
   <!-- ================================================= ④ 消费者 -->
-  <rect x="24" y="646" width="1392" height="196" rx="6" class="panel"/>
-  <rect x="24" y="646" width="1392" height="26" rx="6" class="phead"/>
-  <text x="38" y="664" class="ptext">④ 洞表的四个消费者：普通门、拱廊、转角走的是同一条路，差别只有墩位这两位</text>
+  <rect x="24" y="742" width="1392" height="258" rx="6" class="panel"/>
+  <rect x="24" y="742" width="1392" height="26" rx="6" class="phead"/>
+  <text x="38" y="760" class="ptext">④ 读墩位的四个消费者：普通门、拱廊、转角走的是同一条路，差别只有墩位这两位</text>
 
-  <rect x="36" y="684" width="330" height="144" rx="5" class="core"/>
-  <text x="46" y="702" class="h">BuildBodySoup —— 墙面板</text>
-  <text x="46" y="719" class="t">沿 S 单游标扫掠，一块面板一个裁剪场。</text>
-  <text x="46" y="734" class="t">洞不在几何里：实心盒 + 材质逐像素 discard。</text>
-  <text x="46" y="752" class="mono">Cell = OpeningCell(O, PierWidth)</text>
-  <text x="46" y="767" class="mono">墩侧收回洞缘再咬 PierBite = 0.1</text>
-  <text x="46" y="782" class="mono">Clamp 进 [Cursor, F.Len]</text>
-  <text x="46" y="800" class="monok">Visible = min(S1,Len) − max(S0,0)</text>
-  <text x="46" y="817" class="ok">「装不下」按落在墙里那一截判，不按名义宽</text>
+  <rect x="36" y="780" width="330" height="192" rx="5" class="core"/>
+  <text x="46" y="798" class="h">BuildBodySoup —— 墙面板</text>
+  <text x="46" y="815" class="t">沿 S 单游标扫掠，一块面板一个裁剪场。</text>
+  <text x="46" y="830" class="t">洞不在几何里：实心盒 + 材质逐像素 discard。</text>
+  <text x="46" y="848" class="mono">Cell = OpeningCell(O, PierWidth)</text>
+  <text x="46" y="863" class="mono">墩侧收回洞缘再咬 PierBite = 0.1</text>
+  <text x="46" y="878" class="mono">Clamp 进 [Cursor, F.Len]</text>
+  <text x="46" y="896" class="monok">Visible = min(S1,Len) − max(S0,0)</text>
+  <text x="46" y="911" class="ok">「装不下」按落在墙里那一截判，不按名义宽</text>
+  <text x="46" y="929" class="s">顶到墙端的面板内皮按斜接让 Inset（InnerSpan）；</text>
+  <text x="46" y="944" class="s">面板循环按 N 条边走，不再假定 4。</text>
+  <text x="46" y="962" class="s">门形态窗：照常出洞面板（它自己的 Rect 裁剪场）。</text>
 
-  <rect x="382" y="684" width="330" height="144" rx="5" class="box"/>
-  <text x="392" y="702" class="h">BuildEdgeElements —— 门樘 + 拱圈石</text>
-  <text x="392" y="719" class="t">沿 clip 场那条解析曲线铺，与洞形同源。</text>
-  <text x="392" y="734" class="t">墩侧不出门樘，那一截交给墩自己的砖路：</text>
-  <text x="392" y="752" class="mono">if (Flags &amp; PierBefore) bLeftJamb  = false;</text>
-  <text x="392" y="767" class="mono">if (Flags &amp; PierAfter)  bRightJamb = false;</text>
-  <text x="392" y="787" class="ok">转角片现在也带墩位 ⇒ 转角侧门樘自动关掉，</text>
-  <text x="392" y="802" class="ok">此前挤在角上的三根砖柱随之消失。</text>
-  <text x="392" y="819" class="s">同边相邻的墩仍由左邻那一拱沿墙边产出。</text>
+  <rect x="382" y="780" width="330" height="192" rx="5" class="box"/>
+  <text x="392" y="798" class="h">BuildEdgeElements —— 门樘 + 拱圈石</text>
+  <text x="392" y="815" class="t">沿 clip 场那条解析曲线铺，与洞形同源。</text>
+  <text x="392" y="830" class="t">墩侧不出门樘，那一截交给墩自己的砖路：</text>
+  <text x="392" y="848" class="mono">if (Flags &amp; PierBefore) bLeftJamb  = false;</text>
+  <text x="392" y="863" class="mono">if (Flags &amp; PierAfter)  bRightJamb = false;</text>
+  <text x="392" y="881" class="ok">转角片现在也带墩位 ⇒ 转角侧门樘自动关掉，</text>
+  <text x="392" y="896" class="ok">此前挤在角上的三根砖柱随之消失。</text>
+  <text x="392" y="914" class="s">同边相邻的墩仍由左邻那一拱沿墙边产出</text>
+  <text x="392" y="929" class="s">（MakePierPath，墩顶读 CSHouse_PierSpanBetween）。</text>
+  <text x="392" y="947" class="s">Type == Window 整洞不出砖（含门形态）：</text>
+  <text x="392" y="962" class="s">附属物自带预制框（CSHouseFrame.cpp:260）。</text>
 
-  <rect x="728" y="684" width="330" height="144" rx="5" class="box"/>
-  <text x="738" y="702" class="h">BuildCornerPierBricks + 角石</text>
-  <text x="738" y="719" class="t">转角墩 = 柱础 + 柱身 + 柱头，与拱廊的墩</text>
-  <text x="738" y="734" class="t">同一对参数（CapitalScale 1.5 / Height 14）。</text>
-  <text x="738" y="749" class="t">柱心 = 角点沿角平分线内缩 T/√2。</text>
-  <text x="738" y="767" class="t">角石在同一个墩顶以下让路：</text>
-  <text x="738" y="784" class="mono">Quoin.CullBelowZ = BaseZ + CornerPierTopZ[k]</text>
-  <text x="738" y="802" class="s">剔除走逐实例随机数的负值哨兵；砖材质的</text>
-  <text x="738" y="817" class="s">OpacityMask = saturate(PerInstanceRandom + 1)</text>
+  <rect x="728" y="780" width="330" height="192" rx="5" class="box"/>
+  <text x="738" y="798" class="h">BuildCornerPierBricks + 角石</text>
+  <text x="738" y="815" class="t">转角墩 = 柱础 + 柱身 + 柱头，与拱廊的墩</text>
+  <text x="738" y="830" class="t">同一对参数（CapitalScale 1.5 / Height 14）。</text>
+  <text x="738" y="845" class="t">柱心 = CSHouse_GetCorner(k).PointAtDepth(T/2)，</text>
+  <text x="738" y="860" class="t">直角上即沿平分线内缩 T/√2；墩顶 = CornerPierTopZ[k]。</text>
+  <text x="738" y="878" class="t">角石在同一个墩顶以下让路：</text>
+  <text x="738" y="893" class="mono">Quoin.CullBelowZ = BaseZ + CornerPierTopZ[k]</text>
+  <text x="738" y="911" class="s">剔除 = 逐实例随机数写 −1 哨兵，由实例组件认它</text>
+  <text x="738" y="926" class="s">（剔除 pass 跳过 / GPU-Scene 写 HIDDEN），不再靠</text>
+  <text x="738" y="941" class="s">砖材质的 OpacityMask（CSHouseFrame.usf:316）。</text>
+  <text x="738" y="959" class="s">门形态窗是 Rect，过不了「两侧都是落地拱」，不配墩。</text>
 
-  <rect x="1074" y="684" width="330" height="144" rx="5" class="box"/>
-  <text x="1084" y="702" class="h">RebuildDoorLeaves —— 门扇</text>
-  <text x="1084" y="719" class="t">掩码里已经没有 CornerDoor 了：</text>
-  <text x="1084" y="737" class="mono">NoLeafMask = PierBefore|PierAfter|Arcade</text>
-  <text x="1084" y="752" class="mono">if (O.StyleFlags &amp; NoLeafMask) continue;</text>
-  <text x="1084" y="772" class="h">单拱 = 拱 + 木门扇；</text>
-  <text x="1084" y="788" class="h">墩两侧 / 拱廊 = 敞开过道。</text>
-  <text x="1084" y="805" class="s">附带变化：两扇独立的门挨到被判成墩时也不</text>
-  <text x="1084" y="820" class="s">装门扇 —— 与 TG 实测「并排只有拱」一致。</text>
+  <rect x="1074" y="780" width="330" height="192" rx="5" class="box"/>
+  <text x="1084" y="798" class="h">RebuildDoorLeaves —— 门扇</text>
+  <text x="1084" y="815" class="t">掩码里已经没有 CornerDoor 了：</text>
+  <text x="1084" y="833" class="mono">if (O.Type != Door) continue;</text>
+  <text x="1084" y="848" class="mono">NoLeafMask = PierBefore|PierAfter|Arcade</text>
+  <text x="1084" y="863" class="mono">if (O.StyleFlags &amp; NoLeafMask) continue;</text>
+  <text x="1084" y="883" class="h">单拱 = 拱 + 木门扇；</text>
+  <text x="1084" y="899" class="h">墩两侧 / 拱廊 = 敞开过道。</text>
+  <text x="1084" y="917" class="s">附带变化：两扇独立的门挨到被判成墩时也不</text>
+  <text x="1084" y="932" class="s">装门扇 —— 与 TG 实测「并排只有拱」一致。</text>
+  <text x="1084" y="950" class="s">门形态窗 Type 仍是 Window ⇒ 不装（附属物自带</text>
+  <text x="1084" y="965" class="s">门网格；单测 House.WindowBecomesDoor 钉着）。</text>
+
+  <text x="38" y="990" class="s">其余读洞表、不看墩位的：砖层 BuildBrickWallBricks（bBrickWallEnabled 默认关）· 包边带 BuildTrimBricks · 藤蔓 CSHouseVine::BuildPlan · 门侧摆件（只认 Type == Door）· 窗谓词 CSHouse_QueryOpening。</text>
 
   <!-- ================================================= ⑤ 状态 -->
-  <rect x="24" y="854" width="1392" height="268" rx="6" class="panel"/>
-  <rect x="24" y="854" width="1392" height="26" rx="6" class="phead"/>
-  <text x="38" y="872" class="ptext">⑤ 现状：09-05 / 09-06 两轮改掉的，与仍然开着的（数字全部来自本机复现或编辑器实测，非推断）</text>
+  <rect x="24" y="1012" width="1392" height="316" rx="6" class="panel"/>
+  <rect x="24" y="1012" width="1392" height="26" rx="6" class="phead"/>
+  <text x="38" y="1030" class="ptext">⑤ 现状（2026-09-18 逐条对代码复核）：已修的，与仍然开着的</text>
 
-  <rect x="36" y="890" width="678" height="216" rx="4" class="okrow"/>
-  <text x="48" y="909" class="okb">已修（House 全套 55 / 55：52 条 NullRHI + 3 条真 RHI）</text>
-  <text x="48" y="928" class="t">· 面板「装不下」判据改按 <tspan class="monok">Visible = min(S1,Len) − max(S0,0)</tspan> 算。</text>
-  <text x="62" y="943" class="monok">edge3 S=[227,352] avail 124.90 ≥ need 124.00 → 建</text>
-  <text x="62" y="958" class="mono">（此前 S1=353 越界，124.90 &lt; 125.00 → 整个洞被丢）</text>
-  <text x="48" y="977" class="t">· 量化后夹回边内：中心与宽各自四舍五入会把端点推出墙端最多</text>
-  <text x="62" y="992" class="t">2 cm，转角片那一端本来就是被墙端切出来的，夹回才对得上。</text>
-  <text x="48" y="1011" class="t">· <tspan class="mono">DoorMinWallSegment = 30</tspan>：环上两洞之间的碎墙并掉，含绕回那一段。</text>
-  <text x="48" y="1030" class="t">· 转角改走墩位，<tspan class="mono">CSHouse_StyleCornerDoor</tspan> 删除（<tspan class="mono">1&lt;&lt;2</tspan> 空着不复用）。</text>
-  <text x="48" y="1049" class="t">· 跨角配对 + 转角墩 + 角石让路，转角处从三根挤在一起的砖柱</text>
-  <text x="62" y="1064" class="t">变成一根带柱头的墩。</text>
-  <text x="48" y="1083" class="t">· 闭环分支补 4 条单测：跨原点合一条 / 碎段并 / 绕回并 / 墩不受影响。</text>
+  <rect x="36" y="1048" width="678" height="268" rx="4" class="okrow"/>
+  <text x="48" y="1067" class="okb">已修（C++ 全套 165 / 167：计划 D4「底面」条目记的 09-17 数，未过的 2 条是藤蔓）</text>
+  <text x="48" y="1086" class="t">· 面板「装不下」判据改按 <tspan class="monok">Visible = min(S1,Len) − max(S0,0)</tspan> 算（09-05）。此前按名义宽判，</text>
+  <text x="62" y="1101" class="t">转角片端点被量化推出墙端，差 0.10 cm 就整洞被丢、砖拱照砌、墙没挖洞</text>
+  <text x="62" y="1116" class="s">（L_HouseGroundDemo 实测，见 CSHouseActor.cpp:740-745 的注释）。</text>
+  <text x="48" y="1135" class="t">· 量化后夹回边内（09-05）：推出墙端的那一截不再落到任何面板都盖不到的地方。</text>
+  <text x="48" y="1154" class="t">· <tspan class="mono">DoorMinWallSegment = 30</tspan>：环上两洞之间的碎墙并掉，含绕回那一段（09-05）。</text>
+  <text x="48" y="1173" class="t">· 转角改走墩位，<tspan class="mono">CSHouse_StyleCornerDoor</tspan> 删除（<tspan class="mono">1&lt;&lt;2</tspan> 空着不复用）（09-06）。</text>
+  <text x="48" y="1192" class="t">· 跨角配对 + 转角墩 + 角石让路，转角处从三根挤在一起的砖柱变成一根带柱头的墩（09-06）。</text>
+  <text x="48" y="1211" class="t">· 闭环分支补 4 条单测：跨原点合一条 / 碎段并 / 绕回并 / 墩不受影响（House.DoorRuns ⑨–⑫）。</text>
+  <text x="48" y="1230" class="ok">· 斜接（09-13）：采样环 = 外皮折线，周长 2000 = 真实外周界；旧口径「每个转角跳 24 cm、</text>
+  <text x="62" y="1245" class="ok">转角方块外立面不在环上」随之消失。旧存档 PostLoad 按 WallSConvention 0 → 1 迁移、清环记忆。</text>
+  <text x="48" y="1264" class="t">· 跨角配对、转角墩、角石都按 N 个角走（角数 = 边数），不再写死 4；角石只出在内角 ≥ 90° 的凸角上。</text>
 
-  <rect x="726" y="890" width="678" height="216" rx="4" class="badrow"/>
-  <text x="738" y="909" class="warnb">仍然开着（都不是这两轮的回归，是已知未做）</text>
-  <text x="738" y="928" class="t">· 起拱线仍逐片算：<tspan class="mono">Rise = min(70, W/2)</tspan>，转角两片不等宽就不等高</text>
-  <text x="752" y="943" class="t">（本机 64.0 / 62.5，差 1.5 cm）。墩顶取两条起拱线的较低者兜住了，</text>
-  <text x="752" y="958" class="t">但两侧拱脚仍不共线，宽度差大时会到 30 cm 量级。</text>
-  <text x="738" y="977" class="t">· 转角两片仍各自过 <tspan class="mono">DoorMinWidth</tspan>：一条路偏心压角时，窄的那片仍</text>
-  <text x="752" y="992" class="t">单独丢掉（半条过道）。<tspan class="mono">MinWallSegment</tspan> 只解决「两条路夹碎墙」。</text>
-  <text x="738" y="1011" class="t">· 环原点角（e3 ↔ e0）的滞回仍是废的：闭环用不取模的 S，</text>
-  <text x="752" y="1026" class="monod">half=14.0 → [1904.00, 1950.31]　half=13.5 → [1.18, 45.41]</text>
-  <text x="752" y="1041" class="t">窄 0.5 cm 就整体平移一个周期。修法 = 按周期取模比较（−P / 0 / +P）。</text>
-  <text x="738" y="1060" class="t">· 路压在环原点角上时门的发出顺序仍是旋转的；末尾 Sort 兜住了下游，</text>
-  <text x="752" y="1075" class="t">只剩窗谓词的墩跨度邻接判断受影响。</text>
-  <text x="738" y="1090" class="t">· <tspan class="mono">PierSpanBetween</tspan> 的墩顶用半宽而非 <tspan class="mono">Rise()</tspan>：W &gt; 140 时拱廊墩比起拱线矮几厘米。</text>
+  <rect x="726" y="1048" width="678" height="268" rx="4" class="badrow"/>
+  <text x="738" y="1067" class="warnb">仍然开着（都不是回归，是已知未做；例子数字 = 离线复现）</text>
+  <text x="738" y="1086" class="t">· 起拱线仍逐片算：<tspan class="mono">Rise = min(70, W/2)</tspan>（CSHouseActor.cpp:757-761），转角两片不等宽就不等高。</text>
+  <text x="752" y="1101" class="t">例：③ 那条路沿 +X 平移 30 ⇒ e0 W 160 / e3 W 98 ⇒ Rise 70 / 49 ⇒ 起拱线 95 / 116，差 21 cm；</text>
+  <text x="752" y="1116" class="t">墩顶取两条起拱线的较低者 95 兜住了，但两侧拱脚不共线。</text>
+  <text x="738" y="1135" class="t">· 转角两片仍各自过 <tspan class="mono">DoorMinWidth</tspan>（:752）：平移 90 ⇒ e3 片宽 38 &lt; 40 被丢，e0 靠角那一拱</text>
+  <text x="752" y="1150" class="t">[1, 99] 独自顶到角上、不配墩（半条过道）。<tspan class="mono">MinWallSegment</tspan> 只解决「两条路夹碎墙」。</text>
+  <text x="738" y="1169" class="t">· 环原点角（e3 ↔ e0）的滞回仍是废的：<tspan class="mono">Overlaps</tspan> 比的是不取模的 S（CSHouseDoorRuns.h:61 / 250），</text>
+  <text x="752" y="1184" class="monod">半宽 11.2 → [−60.34, 60.34]　　半宽 11.3 → [1939.57, 2060.43]</text>
+  <text x="752" y="1199" class="t">宽 0.1 cm 就整体平移一个周期 2000 ⇒ 这一帧按 MinWidth 严判。修法 = 按周期取模比较（−P / 0 / +P）。</text>
+  <text x="738" y="1218" class="t">· 路压在环原点角上时门的发出顺序仍是旋转的（③ 那条路：e2, e2, e0, e3）；:814 的 Sort 兜住了下游，</text>
+  <text x="752" y="1233" class="t">只剩 :807 按序插窗时，谓词的墩跨度邻接判断拿到的是乱序表。</text>
+  <text x="738" y="1252" class="t">· <tspan class="mono">PierSpanBetween</tspan> 的墩顶仍用半宽（CSHouseProfile.h:547）而非 <tspan class="mono">Rise()</tspan>：W &gt; 140 时同边墩比起拱线</text>
+  <text x="752" y="1267" class="t">矮 W/2 − 70（DoorMaxWidth 160 ⇒ 至多 10 cm）。转角墩那一份（CSHouseActor.cpp:937）已用 Rise()。</text>
+  <text x="738" y="1286" class="warn">· 推断、未实测：③ 例的 e0 [1, 131] 离墙端还差 1 cm，配对容差 2 cm 照样配上，但墙端剩下那块</text>
+  <text x="752" y="1301" class="warn">1.1 cm ≥ 0.5 的面板照常砌实（:1671 / 1721-1744）⇒ 角上可能沿斜接面立着一片灰泥薄片。</text>
 
-  <text x="38" y="1150" class="s">复现环境：L_HouseGroundDemo / House_Road（1100, 1600），UnrealEditor 5.7.4，ComputeShaderGenerator 于 2026-09-06 重编。转角实测：edge0 S=[0,128] 与 edge3 S=[227,352] 各带一位墩位，0x04 一处不剩，墩跨度 4 = 拱廊 3 + 转角 1。</text>
+  <text x="38" y="1350" class="s">数字来源：② 表与 ③⑤ 的例子 = Python 离线复刻 ComputeDoors → CSHouse_SolveRoadRuns → ResolvePierSpans（默认 600×400 矩形、T 24、平地、解析直路 w = clamp((半宽 + f − 距离) / f, 0, 1)；③⑤ 例为半宽 60 / f 20、沿 SW 角平分线）。</text>
+  <text x="38" y="1366" class="s">同一模型在旧环（1904 / 77 点）上逐位复现 09-06 版 ② 表；未在编辑器重测。09-06 版在 L_HouseGroundDemo / House_Road 上的实测数字属直角对接口径，已不适用。</text>
 </svg>

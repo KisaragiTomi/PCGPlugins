@@ -74,6 +74,7 @@
   </style>
 
   <text x="26" y="30" class="title">CSGroundStairs：石阶的 GPU 逻辑（marching squares · 100% GPU 决策 · 零回读）</text>
+  <text x="1334" y="30" class="sub" text-anchor="end">S3（2026-08-30 裁决一）删掉旧路后，这是全项目唯一的石阶路 · 按 2026-09-18 代码</text>
   <text x="26" y="49" class="sub">一线程一格，从解析高度场直接推导等值线段，每段出一级石阶并直接写 packed 实例行。CPU 全程不知道有几级台阶 —— 不排记录、不求曲线、不回读一个字节。</text>
 
   <!-- ============================================================ 带 1：管线 -->
@@ -95,7 +96,7 @@
   <rect x="36" y="162" width="176" height="62" rx="5" class="box"/>
   <text x="46" y="180" class="h">ACSGroundActor</text>
   <text x="46" y="196" class="t">::RebuildStairs()</text>
-  <text x="46" y="212" class="s">注册 / 加载 / 改配置 / 每 dab</text>
+  <text x="46" y="212" class="s">注册 · 加载 · 改参 · 塑形物 · 每 dab</text>
 
   <rect x="228" y="162" width="186" height="62" rx="5" class="owner"/>
   <text x="238" y="180" class="h">EnsureBuffers()</text>
@@ -141,29 +142,30 @@
   <text x="52" y="331" class="h">① 四角高度</text>
   <text x="52" y="347" class="t">GroundShaperHeightAtXY(P) 解析求值 —— 不采 heightmap（TG 要采）</text>
 
-  <rect x="40" y="360" width="504" height="40" rx="4" class="card"/>
-  <text x="52" y="377" class="h">② 两道早退</text>
-  <text x="52" y="393" class="t">L1 &lt; L0（整格落在同一层区间）→ return；格心道路权重 &lt; 阈值 → return</text>
+  <rect x="40" y="358" width="504" height="54" rx="4" class="card"/>
+  <text x="52" y="375" class="h">② 四道早退</text>
+  <text x="52" y="391" class="t">L1 &lt; L0（整格落在同一层区间）→ return；格心道路权重 &lt; 阈值 → return</text>
+  <text x="52" y="405" class="t">矮包门控 StairMinMoundHeight（只含高包的场 ≤ 0 → return）；掐顶 L1 ≤ ⌈Peak/Step⌉ − 2</text>
 
-  <rect x="40" y="406" width="504" height="40" rx="4" class="card"/>
-  <text x="52" y="423" class="h">③ 层循环</text>
-  <text x="52" y="439" class="t">L0 = ⌊HMin/Step⌋+1 … L1 = ⌊HMax/Step⌋，再按 StairMaxLayers 钳位</text>
+  <rect x="40" y="416" width="504" height="40" rx="4" class="card"/>
+  <text x="52" y="433" class="h">③ 层循环</text>
+  <text x="52" y="449" class="t">L0 = ⌊HMin/Step⌋+1 … L1 = ⌊HMax/Step⌋，再按 StairMaxLayers 钳位</text>
 
-  <rect x="40" y="452" width="504" height="40" rx="4" class="card"/>
-  <text x="52" y="469" class="h">④ marching squares</text>
-  <text x="52" y="485" class="t">Case 四位；min(Case, 15−Case) 收成六支；Case 5/10 鞍点看格心消歧</text>
+  <rect x="40" y="460" width="504" height="40" rx="4" class="card"/>
+  <text x="52" y="477" class="h">④ marching squares</text>
+  <text x="52" y="493" class="t">Case 四位；min(Case, 15−Case) 收成六支；Case 5/10 鞍点看格心消歧</text>
 
-  <rect x="40" y="498" width="504" height="40" rx="4" class="card"/>
-  <text x="52" y="515" class="h">⑤ 解穿越点</text>
-  <text x="52" y="531" class="t">CSStairs_SolveEdge：线性插值 + 2 次割线精化 → 弦的两端 A、B</text>
+  <rect x="40" y="504" width="504" height="40" rx="4" class="card"/>
+  <text x="52" y="521" class="h">⑤ 解穿越点</text>
+  <text x="52" y="537" class="t">CSStairs_SolveEdge：线性插值 + 2 次割线精化 → 弦的两端 A、B</text>
 
-  <rect x="40" y="544" width="504" height="40" rx="4" class="card"/>
-  <text x="52" y="561" class="h">⑥ 组正交基</text>
-  <text x="52" y="577" class="t">Z = 世界 +Z（踏面必水平）、Y = 切线、X = Z×Y 并按 −∇h 定向到下坡</text>
+  <rect x="40" y="548" width="504" height="40" rx="4" class="card"/>
+  <text x="52" y="565" class="h">⑥ 组正交基</text>
+  <text x="52" y="581" class="t">Z = 世界 +Z（踏面必水平）、Y = 切线、X = Z×Y 并按 −∇h 定向到下坡</text>
 
-  <rect x="40" y="590" width="504" height="40" rx="4" class="card"/>
-  <text x="52" y="607" class="h">⑦ S2 逐实例抖动</text>
-  <text x="52" y="623" class="t">种子 = 格身份 CellSeed(Cell, L, Seg, Salt)，不是 InterlockedAdd 的槽位</text>
+  <rect x="40" y="592" width="504" height="40" rx="4" class="card"/>
+  <text x="52" y="609" class="h">⑦ S2 逐实例抖动</text>
+  <text x="52" y="625" class="t">种子 = 格身份 CellSeed(Cell, L, Seg, Salt)，不是 InterlockedAdd 的槽位</text>
 
   <rect x="40" y="636" width="504" height="40" rx="4" class="card"/>
   <text x="52" y="653" class="h">⑧ 领槽 + 写行</text>
@@ -179,7 +181,7 @@
   <rect x="572" y="276" width="764" height="26" rx="6" class="phead"/>
   <text x="586" y="294" class="ptext">③ 一格里发生了什么：等值线段 → 一级石阶</text>
 
-  <text x="586" y="322" class="t">扫描格铺在合成后的高度场上（全部塑形物重叠取 max）。等值线在两座相接土台的接缝处只是普通的一格 —— 旧路的星形闭式解正是在那里断掉。</text>
+  <text x="586" y="322" class="t">扫描格铺在合成后的高度场上（全部塑形物重叠取 max）。等值线在两座相接土台的接缝处只是普通的一格 —— 旧路（S3 已删）的星形闭式解正是在那里断掉。</text>
   <text x="586" y="344" class="s">高 ←—— 上坡</text>
   <text x="1326" y="344" class="s" text-anchor="end">下坡 ——→ 低</text>
   <rect x="586" y="358" width="16" height="10" class="road"/>
@@ -351,7 +353,7 @@
 
   <text x="922" y="976" class="good">✓ 用格身份当种子</text>
   <rect x="922" y="984" width="400" height="76" rx="5" fill="#ecfeff" stroke="#a5f3fc"/>
-  <text x="934" y="1004" class="t">CSStairs_CellSeed(Cell.xy, L, Seg, Salt) ^ JitterSeed</text>
+  <text x="934" y="1004" class="t">CSStairs_CellSeed(Cell.xy, L, Seg, Salt)，函数内再混入 StairJitterSeed</text>
   <text x="934" y="1022" class="t">四条通道各取独立的盐：长度 11 / 进深 23 / 高 37 / 偏航 53</text>
   <text x="934" y="1040" class="t">石子另取 89 / 97 / 101 / 103；PerInstanceRandom 取 71</text>
 

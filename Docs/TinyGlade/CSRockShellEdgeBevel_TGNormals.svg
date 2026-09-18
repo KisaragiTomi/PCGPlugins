@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="980" height="720" viewBox="0 0 980 720" font-family="'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="760" viewBox="0 0 980 760" font-family="'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif">
   <defs>
     <marker id="arw" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0L7 3.5L0 7Z" fill="#475569"/></marker>
     <pattern id="buffer-owner-stripe-bg" patternUnits="userSpaceOnUse" width="10" height="10">
@@ -26,7 +26,7 @@
     </style>
   </defs>
 
-  <rect width="980" height="720" fill="#ffffff"/>
+  <rect width="980" height="760" fill="#ffffff"/>
   <text x="40" y="34" font-size="17" font-weight="700" fill="#0f172a">TG 原版：重算法线的存在形式与流转</text>
 
   <!-- ① 常驻缓冲 -->
@@ -68,7 +68,7 @@
   <text x="110" y="412" class="lane">③ 每帧消费 · 绘制 pass</text>
   <rect x="40" y="424" width="270" height="140" rx="6" class="quiet"/>
   <text x="52" y="444" class="bt">VS（非索引 draw）</text>
-  <text x="52" y="468" class="tx">只读 position；</text>
+  <text x="52" y="468" class="tx">只读 position 与 cell_id；</text>
   <text x="52" y="488" class="tx">手造重心坐标、传三角形 id；</text>
   <text x="52" y="508" class="tx">全程不碰法线 ——</text>
   <text x="52" y="528" class="tx">法线不走这条门</text>
@@ -76,10 +76,11 @@
 
   <rect x="350" y="424" width="340" height="140" rx="6" class="core"/>
   <text x="362" y="444" class="bt">PS（逐像素）</text>
-  <text x="362" y="468" class="tx">① 重心坐标选出离自己最近的边</text>
+  <text x="362" y="468" class="tx">① 取重心坐标最小分量定边（≈ 最近边）</text>
   <text x="362" y="488" class="tx">② 读 triangles[自己].normal —— 平直底色</text>
   <text x="362" y="508" class="tx">③ 经 neighbours 读 triangles[邻面].normal</text>
-  <text x="362" y="528" class="tx">④ 噪声啃边带内向邻面法线 mix 0.5</text>
+  <text x="362" y="528" class="tx">④ 按到该边的距离 d + 噪声算权重 t，</text>
+  <text x="362" y="548" class="tx">　 向邻面 mix t × 0.5（上限一半，混不满）</text>
   <path d="M545 230V422" class="flow"/>
   <path d="M585 230V422" class="flow"/>
   <line x1="310" y1="490" x2="348" y2="490" class="flow"/>
@@ -90,17 +91,20 @@
   <text x="740" y="504" class="tx">→ 延迟光照读成缺口</text>
 
   <!-- ④ 对比 -->
-  <text x="40" y="600" class="lane">④ 同一根法线在三种管线里的形式</text>
-  <rect x="40" y="612" width="290" height="90" rx="6" class="quiet"/>
+  <text x="40" y="600" class="lane">④ 同一根法线在三种管线里的形式（UE 列按 2026-09-18 代码核对）</text>
+  <rect x="40" y="612" width="250" height="130" rx="6" class="quiet"/>
   <text x="52" y="632" class="bt">常规网格</text>
   <text x="52" y="654" class="tx">顶点属性 → 插值器平滑到像素；</text>
   <text x="52" y="674" class="tx">像素只被动收自己那份</text>
-  <rect x="350" y="612" width="300" height="90" rx="6" class="quiet"/>
-  <text x="362" y="632" class="bt">TG 岩壳（本图）</text>
-  <text x="362" y="654" class="tx">逐三角 SSBO 字段：CS 每帧写、</text>
-  <text x="362" y="674" class="tx">PS 按 id 查 —— 连邻面的都查得到</text>
-  <rect x="670" y="612" width="270" height="90" rx="6" class="quiet"/>
-  <text x="682" y="632" class="bt">本项目 UE 版</text>
-  <text x="682" y="654" class="tx">顶点 Tangents 流（平直）；</text>
-  <text x="682" y="674" class="tx">邻面查不到 ⇒ 解析目标近似</text>
+  <rect x="310" y="612" width="310" height="130" rx="6" class="quiet"/>
+  <text x="322" y="632" class="bt">TG 岩壳（本图）</text>
+  <text x="322" y="654" class="tx">逐三角 SSBO 字段：CS 每帧写、</text>
+  <text x="322" y="674" class="tx">PS 按 id 查 —— 连邻面的都查得到</text>
+  <rect x="640" y="612" width="300" height="130" rx="6" class="quiet"/>
+  <text x="652" y="632" class="bt">本项目 UE 版</text>
+  <text x="652" y="654" class="tx">运行时壳 v3：自身 + 三个邻面的面法线</text>
+  <text x="652" y="674" class="tx">八面体编码进 UV3..UV6，kernel 逐趟重写；</text>
+  <text x="652" y="694" class="tx">像素按最近边取邻面 —— 也查得到</text>
+  <text x="652" y="714" class="tx">顶点法线另走 Tangents 流（默认 = 面法线）</text>
+  <text x="652" y="734" class="cap">直摆资产 v2：查不到邻面 ⇒ 假定开角近似</text>
 </svg>

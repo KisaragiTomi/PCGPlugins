@@ -1,0 +1,47 @@
+// Nanite 截面抽取（CSNaniteCut）在 C++ 与 .usf 之间共用的布局常量。
+//
+// 只含 #define：C++ 把它当普通头文件 include（ComputeShaderGenerator.Build.cs 把 Shaders/Private
+// 加进了 include 路径），.usf 用虚拟路径 include。改数不会报错、只会错位，所以两边不许各写一份。
+
+#pragma once
+
+// ---------------------------------------------------------------- 计数 pass 的输出 buffer
+//
+// 一次回读拿全：头部计数器 + 逐请求统计 + 逐 cluster 记录。
+
+#define CSNC_SLOT_QUEUE0            0   // 节点队列 0 的条目数（逐层乒乓）
+#define CSNC_SLOT_QUEUE1            1   // 节点队列 1 的条目数
+#define CSNC_SLOT_CANDIDATES        2   // 叶切片展开出的候选 cluster 数
+#define CSNC_SLOT_EMITS             3   // 选中（要写出）的 cluster 数
+#define CSNC_SLOT_OVERFLOW          4   // 位掩码：1 节点队列、2 候选、4 记录；任一位置位说明容量估错，整批作废
+#define CSNC_HEADER_UINTS           8
+
+#define CSNC_STAT_CLUSTERS          0   // 选中的三角形 cluster 数
+#define CSNC_STAT_VERTICES          1   // 这些 cluster 的顶点数之和（cluster 边界上的顶点各存一份）
+#define CSNC_STAT_TRIANGLES         2
+#define CSNC_STAT_FORCED            3   // 误差不够小、只因更细的页没驻留才被迫输出的 cluster 数；0 = 精确截面
+#define CSNC_STAT_VOXELS            4   // 选中了但没有三角形的体素 cluster（Voxelize 形状保持），跳过不写
+#define CSNC_STAT_UNLOADED_SLICES   5   // 想往下走却没驻留的叶切片数（诊断用）
+#define CSNC_STATS_UINTS            8
+
+#define CSNC_RECORD_PAGE            0   // GPU 页号：驻留槽位，只在这一次抽取期间有效
+#define CSNC_RECORD_CLUSTER         1   // 页内 cluster 号
+#define CSNC_RECORD_REQUEST         2
+#define CSNC_RECORD_KEY             3   // 稳定键，与页驻留在哪个槽位无关，见下面的位域
+#define CSNC_RECORD_VERTICES        4
+#define CSNC_RECORD_TRIANGLES       5
+#define CSNC_RECORD_UINTS           6
+
+// 稳定键 = (节点号 << 11) | (子切片号 << 9) | 切片内序号。节点号 < 2^16（NANITE_MAX_NODES_PER_PRIMITIVE_BITS），
+// 扇出 4（2 位），一个叶切片最多 511 个 cluster（NANITE_MAX_CLUSTERS_PER_GROUP_BITS = 9），合计 27 位。
+#define CSNC_KEY_CHILD_SHIFT        9
+#define CSNC_KEY_NODE_SHIFT         11
+
+// ---------------------------------------------------------------- 写出 pass
+
+#define CSNC_WRITE_FLAG_FLIP_WINDING 1u  // 翻转三角绕序：调用方要求，或变换行列式为负（镜像）
+#define CSNC_WRITE_FLAG_MIRRORED     2u  // 变换行列式为负：切线空间的手性跟着翻
+#define CSNC_WRITE_MATRIX_ROWS       8   // 每请求 8 行：4 行 LocalToWorld + 4 行 NormalToWorld
+
+#define CSNC_TRAVERSE_GROUP_SIZE    64
+#define CSNC_WRITE_GROUP_SIZE       128  // 一个线程组写一个 cluster（≤256 顶点、≤128 三角）

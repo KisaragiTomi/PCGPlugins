@@ -93,6 +93,9 @@ public class ComputeShaderGenerator : ModuleRules
 					"UnrealEd",
 					"ModelingComponentsEditorOnly",
 					"EditorScriptingUtilities",
+					// Nanite 截面 HLOD 的材质烘焙（CSNaniteCutBake）：引擎 MeshMerge 同一套。
+					"MaterialBaking",
+					"MaterialUtilities",
 				}
 			);
 		}

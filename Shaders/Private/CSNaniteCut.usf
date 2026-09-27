@@ -1,0 +1,380 @@
+// Nanite 截面抽取：把一组 Nanite 网格按网格局部空间的误差阈值（CutError）切出来，写进 UCSMesh 的常驻流。
+//
+// 选取规则与引擎 NaniteStreamOut.usf 逐条相同 —— 父级误差大于阈值才往下走（:456），cluster 自身误差小于
+// 阈值、或者更细的数据没驻留，就输出（:559-560）。与它的区别只有两处：
+//   ① 不经过 GPU Scene。请求里直接带资源的层级偏移（FResources::HierarchyOffset；Nanite 场景代理写进
+//      GPU Scene 的也是这个值，NaniteResources.cpp:262），所以资产的渲染资源就绪就能解，不需要场景里有组件。
+//   ② 除位置和索引外，还解法线、切线、UV、顶点色与逐三角材质号，填满 UCSMesh 的标准流。
+//
+// 两趟：计数趟（逐层遍历层级 → 叶切片展开成候选 cluster → 按规则挑选 → 记录）回读给 CPU，CPU 按稳定键
+// 排序、算好每个 cluster 的写出偏移、按需扩容后，写出趟再按这张计划逐 cluster 解码写出。
+// 设计与限制见插件根 NaniteClusterHLOD_Plan.md。
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ComputeShaderUtils.ush"
+#include "/Engine/Private/Nanite/NaniteDataDecode.ush"
+#include "/Engine/Private/Nanite/NaniteAttributeDecode.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/CSNaniteCutLayout.ush"
+
+// ClusterPageData / HierarchyBuffer / PageConstants 由 NaniteDataDecode.ush 声明，C++ 按同名绑定。
+
+// ============================================================================ 计数趟
+
+StructuredBuffer<uint4>   CSNC_Requests;          // x = 层级偏移（dword），y = asuint(CutError)，zw 未用
+uint                      CSNC_NumRequests;
+RWBuffer<uint>            CSNC_Output;            // 布局见 CSNaniteCutLayout.ush
+StructuredBuffer<uint2>   CSNC_NodeQueueIn;       // (请求号, 节点号)
+RWStructuredBuffer<uint2> CSNC_NodeQueueOut;
+RWStructuredBuffer<uint4> CSNC_CandidatesOut;     // (请求号, GPU 页号, 页内 cluster 号, 稳定键)
+StructuredBuffer<uint4>   CSNC_Candidates;
+RWBuffer<uint>            CSNC_DispatchArgs;
+uint                      CSNC_InSlot;            // 本层输入队列的计数器槽位
+uint                      CSNC_OutSlot;           // 本层输出队列的计数器槽位
+uint                      CSNC_NodeCapacity;
+uint                      CSNC_CandidateCapacity;
+uint                      CSNC_RecordCapacity;
+
+uint CSNC_StatsBase(uint RequestIndex)
+{
+	return CSNC_HEADER_UINTS + RequestIndex * CSNC_STATS_UINTS;
+}
+
+// 每个请求从自己的根节点（节点 0）开始。
+[numthreads(CSNC_TRAVERSE_GROUP_SIZE, 1, 1)]
+void InitTraversalCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint RequestIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, CSNC_TRAVERSE_GROUP_SIZE);
+	if (RequestIndex == 0u) CSNC_Output[CSNC_SLOT_QUEUE0] = min(CSNC_NumRequests, CSNC_NodeCapacity);
+	if (RequestIndex < CSNC_NumRequests && RequestIndex < CSNC_NodeCapacity) CSNC_NodeQueueOut[RequestIndex] = uint2(RequestIndex, 0u);
+}
+
+// 把本层输入队列的条目数换成间接派发参数（每条目 NANITE_MAX_BVH_NODE_FANOUT 个线程），并清空本层的输出队列。
+// 输出队列的槽位就是上一层的输入，此时已经读完。
+[numthreads(1, 1, 1)]
+void PrepareNodeArgsCS()
+{
+	const uint Count = min(CSNC_Output[CSNC_InSlot], CSNC_NodeCapacity);
+	CSNC_Output[CSNC_OutSlot] = 0u;
+	const uint NumGroups = (Count * NANITE_MAX_BVH_NODE_FANOUT + CSNC_TRAVERSE_GROUP_SIZE - 1u) / CSNC_TRAVERSE_GROUP_SIZE;
+	WriteDispatchIndirectArgs(CSNC_DispatchArgs, 0u, GetGroupCountWrapped(NumGroups, uint2(65535u, 65535u)));
+}
+
+// 一个线程看一个 (节点, 子切片)。与 NaniteHierarchyTraversal.ush 的 NodeCull 同一套判据：
+// 切片启用、父级误差大于阈值才算"要往下走"；没驻留的切片不走 —— 它的父 cluster 此时带
+// NANITE_CLUSTER_FLAG_STREAMING_LEAF，会在挑选时被输出，截面照样没有缝。
+[numthreads(CSNC_TRAVERSE_GROUP_SIZE, 1, 1)]
+void NodeCullCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint Thread = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, CSNC_TRAVERSE_GROUP_SIZE);
+	const uint Count = min(CSNC_Output[CSNC_InSlot], CSNC_NodeCapacity);
+	const uint ItemIndex = Thread / NANITE_MAX_BVH_NODE_FANOUT;
+	const uint ChildIndex = Thread % NANITE_MAX_BVH_NODE_FANOUT;
+	if (ItemIndex >= Count) return;
+
+	const uint2 Item = CSNC_NodeQueueIn[ItemIndex];
+	const uint4 Request = CSNC_Requests[Item.x];
+	const float CutError = asfloat(Request.y);
+
+	const FHierarchyNodeSlice Slice = GetHierarchyNodeSlice(HierarchyBuffer, GetHierarchyNodeOffset(Request.x, Item.y), ChildIndex);
+	if (!Slice.bEnabled || !(CutError < Slice.MaxParentLODError)) return;
+
+	if (!Slice.bLoaded)
+	{
+		InterlockedAdd(CSNC_Output[CSNC_StatsBase(Item.x) + CSNC_STAT_UNLOADED_SLICES], 1u);
+		return;
+	}
+
+	if (!Slice.bLeaf)
+	{
+		uint Out;
+		InterlockedAdd(CSNC_Output[CSNC_OutSlot], 1u, Out);
+		if (Out < CSNC_NodeCapacity) CSNC_NodeQueueOut[Out] = uint2(Item.x, Slice.ChildStartReference);
+		else InterlockedOr(CSNC_Output[CSNC_SLOT_OVERFLOW], 1u);
+		return;
+	}
+
+	const uint NumClusters = Slice.NumChildren;
+	if (NumClusters == 0u) return;
+
+	uint Base;
+	InterlockedAdd(CSNC_Output[CSNC_SLOT_CANDIDATES], NumClusters, Base);
+
+	const uint PageIndex = Slice.ChildStartReference >> NANITE_MAX_CLUSTERS_PER_PAGE_BITS;
+	const uint FirstCluster = Slice.ChildStartReference & NANITE_MAX_CLUSTERS_PER_PAGE_MASK;
+	const uint KeyBase = (Item.y << CSNC_KEY_NODE_SHIFT) | (ChildIndex << CSNC_KEY_CHILD_SHIFT);
+	for (uint Offset = 0u; Offset < NumClusters; ++Offset)
+	{
+		const uint Dst = Base + Offset;
+		if (Dst >= CSNC_CandidateCapacity)
+		{
+			InterlockedOr(CSNC_Output[CSNC_SLOT_OVERFLOW], 2u);
+			break;
+		}
+		CSNC_CandidatesOut[Dst] = uint4(Item.x, PageIndex, FirstCluster + Offset, KeyBase | Offset);
+	}
+}
+
+[numthreads(1, 1, 1)]
+void PrepareClusterArgsCS()
+{
+	const uint Count = min(CSNC_Output[CSNC_SLOT_CANDIDATES], CSNC_CandidateCapacity);
+	const uint NumGroups = (Count + CSNC_TRAVERSE_GROUP_SIZE - 1u) / CSNC_TRAVERSE_GROUP_SIZE;
+	WriteDispatchIndirectArgs(CSNC_DispatchArgs, 0u, GetGroupCountWrapped(NumGroups, uint2(65535u, 65535u)));
+}
+
+// 一个线程看一个候选 cluster，按 NaniteStreamOut.usf:559-560 的规则挑选并记账。
+[numthreads(CSNC_TRAVERSE_GROUP_SIZE, 1, 1)]
+void ClusterSelectCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint Index = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, CSNC_TRAVERSE_GROUP_SIZE);
+	const uint Count = min(CSNC_Output[CSNC_SLOT_CANDIDATES], CSNC_CandidateCapacity);
+	if (Index >= Count) return;
+
+	const uint4 Candidate = CSNC_Candidates[Index];
+	const float CutError = asfloat(CSNC_Requests[Candidate.x].y);
+	const FCluster Cluster = GetCluster(Candidate.y, Candidate.z);
+
+	const bool bSmallEnough = CutError > Cluster.LODError;
+	const bool bStreamingLeaf = (Cluster.Flags & NANITE_CLUSTER_FLAG_STREAMING_LEAF) != 0u;
+	if (!bSmallEnough && !bStreamingLeaf) return;
+
+	const uint StatsBase = CSNC_StatsBase(Candidate.x);
+	if (Cluster.bVoxel || Cluster.NumTris == 0u)
+	{
+		InterlockedAdd(CSNC_Output[StatsBase + CSNC_STAT_VOXELS], 1u);
+		return;
+	}
+
+	uint Record;
+	InterlockedAdd(CSNC_Output[CSNC_SLOT_EMITS], 1u, Record);
+	if (Record >= CSNC_RecordCapacity)
+	{
+		InterlockedOr(CSNC_Output[CSNC_SLOT_OVERFLOW], 4u);
+		return;
+	}
+
+	const uint RecordBase = CSNC_HEADER_UINTS + CSNC_NumRequests * CSNC_STATS_UINTS + Record * CSNC_RECORD_UINTS;
+	CSNC_Output[RecordBase + CSNC_RECORD_PAGE] = Candidate.y;
+	CSNC_Output[RecordBase + CSNC_RECORD_CLUSTER] = Candidate.z;
+	CSNC_Output[RecordBase + CSNC_RECORD_REQUEST] = Candidate.x;
+	CSNC_Output[RecordBase + CSNC_RECORD_KEY] = Candidate.w;
+	CSNC_Output[RecordBase + CSNC_RECORD_VERTICES] = Cluster.NumVerts;
+	CSNC_Output[RecordBase + CSNC_RECORD_TRIANGLES] = Cluster.NumTris;
+
+	InterlockedAdd(CSNC_Output[StatsBase + CSNC_STAT_CLUSTERS], 1u);
+	InterlockedAdd(CSNC_Output[StatsBase + CSNC_STAT_VERTICES], Cluster.NumVerts);
+	InterlockedAdd(CSNC_Output[StatsBase + CSNC_STAT_TRIANGLES], Cluster.NumTris);
+
+	// 叶 cluster（FULL_LEAF）本来就没有更细的数据，靠 STREAMING_LEAF 输出它是精确的，不算被迫。
+	// CutError = 0 时最细一级正是这样选出来的。
+	const bool bFullLeaf = (Cluster.Flags & NANITE_CLUSTER_FLAG_FULL_LEAF) != 0u;
+	if (!bSmallEnough && !bFullLeaf) InterlockedAdd(CSNC_Output[StatsBase + CSNC_STAT_FORCED], 1u);
+}
+
+// ============================================================================ 写出趟
+
+struct FCSNaniteCutPlanEntry
+{
+	uint PageIndex;
+	uint ClusterIndex;
+	uint RequestIndex;
+	uint VertexBase;     // 目标顶点号（绝对）
+	uint IndexBase;      // 目标索引号（绝对，3 的倍数）
+	uint Pad0;
+	uint Pad1;
+	uint Pad2;
+};
+
+StructuredBuffer<FCSNaniteCutPlanEntry> CSNC_Plan;
+uint                                    CSNC_NumPlanEntries;
+StructuredBuffer<float4>                CSNC_WriteMatrices;   // CSNC_WRITE_MATRIX_ROWS 行 / 请求
+StructuredBuffer<uint4>                 CSNC_WriteInfo;       // x = 材质重映射表偏移，y = 表长，z = CSNC_WRITE_FLAG_*
+Buffer<uint>                            CSNC_MaterialRemap;   // 源材质槽 → 目标材质表下标
+uint                                    CSNC_NumTexCoordSets; // 目标 UV 流每顶点几组（交错存放）
+uint                                    CSNC_VertexCapacity;
+uint                                    CSNC_IndexCapacity;
+
+RWBuffer<float> RW_Positions;    // 3 floats / vertex，世界空间
+RWBuffer<uint>  RW_Tangents;     // 2 packed 8888 SNORM / vertex (TangentX, TangentZ)
+RWBuffer<float> RW_TexCoords;    // 2 × CSNC_NumTexCoordSets floats / vertex
+RWBuffer<uint>  RW_Colors;       // packed BGRA / vertex
+RWBuffer<uint>  RW_Indices;
+RWBuffer<uint>  RW_MaterialIds;  // 1 uint / triangle
+
+// 与 CSMeshOps.usf 的 PackSnorm8888 / PackColorBGRA 逐字节相同：所有生产者喂的是同一条
+// VET_PackedNormal / VET_Color 流。
+uint CSNC_PackSnorm8888(float4 V)
+{
+	int4 I = int4(round(clamp(V, -1.0, 1.0) * 127.0));
+	return (uint(I.x) & 0xFF) | ((uint(I.y) & 0xFF) << 8) | ((uint(I.z) & 0xFF) << 16) | ((uint(I.w) & 0xFF) << 24);
+}
+
+uint CSNC_PackColorBGRA(float4 RGBA)
+{
+	uint4 I = uint4(round(saturate(RGBA) * 255.0));
+	return (I.z & 0xFF) | ((I.y & 0xFF) << 8) | ((I.x & 0xFF) << 16) | ((I.w & 0xFF) << 24);
+}
+
+float3 CSNC_SafeNormal(float3 N, float3 Fallback)
+{
+	const float LenSq = dot(N, N);
+	if (!(LenSq > 1e-12f) || any(isnan(N))) return Fallback;
+	return N * rsqrt(LenSq);
+}
+
+groupshared float3 CSNC_GS_Position[NANITE_MAX_CLUSTER_VERTICES];   // 网格局部空间
+groupshared float3 CSNC_GS_Normal[NANITE_MAX_CLUSTER_VERTICES];
+groupshared float2 CSNC_GS_UV0[NANITE_MAX_CLUSTER_VERTICES];
+groupshared float4 CSNC_GS_TangentX[NANITE_MAX_CLUSTER_VERTICES];
+groupshared uint3  CSNC_GS_Triangle[NANITE_MAX_CLUSTER_TRIANGLES];
+
+// 一个线程组写一个 cluster：① 顶点（位置 / UV / 颜色，顺手把切线要用的量放进 groupshared）
+// ② 三角（索引 / 材质号）③ 切线框架。
+[numthreads(CSNC_WRITE_GROUP_SIZE, 1, 1)]
+void WriteClustersCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint EntryIndex = GetUnWrappedDispatchGroupId(GroupId);
+	if (EntryIndex >= CSNC_NumPlanEntries) return;   // 对整个组一致，不会有半个组跳过下面的栅栏
+
+	const FCSNaniteCutPlanEntry Entry = CSNC_Plan[EntryIndex];
+	const FCluster Cluster = GetCluster(Entry.PageIndex, Entry.ClusterIndex);
+	const uint4 Info = CSNC_WriteInfo[Entry.RequestIndex];
+
+	const uint MatrixBase = Entry.RequestIndex * CSNC_WRITE_MATRIX_ROWS;
+	const float4x4 LocalToWorld = float4x4(
+		CSNC_WriteMatrices[MatrixBase + 0u], CSNC_WriteMatrices[MatrixBase + 1u],
+		CSNC_WriteMatrices[MatrixBase + 2u], CSNC_WriteMatrices[MatrixBase + 3u]);
+	const float4x4 NormalToWorld = float4x4(
+		CSNC_WriteMatrices[MatrixBase + 4u], CSNC_WriteMatrices[MatrixBase + 5u],
+		CSNC_WriteMatrices[MatrixBase + 6u], CSNC_WriteMatrices[MatrixBase + 7u]);
+	const bool bFlipWinding = (Info.z & CSNC_WRITE_FLAG_FLIP_WINDING) != 0u;
+	const float HandednessSign = ((Info.z & CSNC_WRITE_FLAG_MIRRORED) != 0u) ? -1.0f : 1.0f;
+
+	const uint NumVerts = min(Cluster.NumVerts, (uint)NANITE_MAX_CLUSTER_VERTICES);
+	const uint NumTris = min(Cluster.NumTris, (uint)NANITE_MAX_CLUSTER_TRIANGLES);
+
+	// ① 顶点
+	for (uint Vertex = GroupIndex; Vertex < NumVerts; Vertex += CSNC_WRITE_GROUP_SIZE)
+	{
+		const float3 LocalPosition = DecodePosition(Vertex, Cluster);
+
+		// 三个角填同一个顶点：显式切线原样保留；没有显式切线时 DecodeImplicitTangents 看到零 UV 差，
+		// 退回兜底切线，反正第 ③ 步会按整个 cluster 的 UV 梯度重算。不用单点版 <1>：它无条件用兜底切线
+		// 覆盖掉显式切线（NaniteAttributeDecode.ush:610）。
+		float3 Positions[3] = { LocalPosition, LocalPosition, LocalPosition };
+		FNaniteRawAttributeData Raw[3];
+		GetRawAttributeData<3>(Raw, Cluster, Positions, uint3(Vertex, Vertex, Vertex), NANITE_MAX_UVS);
+
+		CSNC_GS_Position[Vertex] = LocalPosition;
+		CSNC_GS_Normal[Vertex] = Raw[0].TangentZ;
+		CSNC_GS_UV0[Vertex] = Raw[0].TexCoords[0];
+		CSNC_GS_TangentX[Vertex] = Raw[0].TangentXAndSign;
+
+		const uint Dst = Entry.VertexBase + Vertex;
+		if (Dst >= CSNC_VertexCapacity) continue;
+
+		const float3 WorldPosition = mul(float4(LocalPosition, 1.0f), LocalToWorld).xyz;
+		RW_Positions[Dst * 3u + 0u] = WorldPosition.x;
+		RW_Positions[Dst * 3u + 1u] = WorldPosition.y;
+		RW_Positions[Dst * 3u + 2u] = WorldPosition.z;
+
+		// 超出 cluster 自带 UV 组数的那几组，Raw 里是最后一组有效 UV 的重复 —— 与 Nanite 渲染时
+		// 材质读到的一致（NaniteAttributeDecode.ush:786-799），照写。Nanite 最多 4 组，再往后写 0。
+		UNROLL
+		for (uint Set = 0u; Set < NANITE_MAX_UVS; ++Set)
+		{
+			if (Set < CSNC_NumTexCoordSets)
+			{
+				const uint UVBase = (Dst * CSNC_NumTexCoordSets + Set) * 2u;
+				RW_TexCoords[UVBase + 0u] = Raw[0].TexCoords[Set].x;
+				RW_TexCoords[UVBase + 1u] = Raw[0].TexCoords[Set].y;
+			}
+		}
+		for (uint ExtraSet = NANITE_MAX_UVS; ExtraSet < CSNC_NumTexCoordSets; ++ExtraSet)
+		{
+			const uint UVBase = (Dst * CSNC_NumTexCoordSets + ExtraSet) * 2u;
+			RW_TexCoords[UVBase + 0u] = 0.0f;
+			RW_TexCoords[UVBase + 1u] = 0.0f;
+		}
+
+		RW_Colors[Dst] = CSNC_PackColorBGRA(Raw[0].Color);
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	// ② 三角：索引是 cluster 内的顶点号，加上本 cluster 的顶点基址。绕序默认保持 Nanite 原样
+	// （与源网格渲染时一致，同 CopyFromStaticMesh），镜像变换或调用方要求时翻转。
+	for (uint Tri = GroupIndex; Tri < NumTris; Tri += CSNC_WRITE_GROUP_SIZE)
+	{
+		const uint3 Corners = DecodeTriangleIndices(Cluster, Tri);
+		CSNC_GS_Triangle[Tri] = Corners;
+
+		const uint DstIndex = Entry.IndexBase + Tri * 3u;
+		if (DstIndex + 2u >= CSNC_IndexCapacity) continue;
+
+		const uint3 Out = Entry.VertexBase + (bFlipWinding ? Corners.xzy : Corners);
+		RW_Indices[DstIndex + 0u] = Out.x;
+		RW_Indices[DstIndex + 1u] = Out.y;
+		RW_Indices[DstIndex + 2u] = Out.z;
+
+		// Nanite 的逐三角材质号就是静态网格的材质槽（NaniteResources.cpp:2365-2370），经重映射表换成目标材质表下标。
+		const uint Material = GetRelativeMaterialIndex(Cluster, Tri);
+		uint Mapped = 0u;
+		if (Info.y > 0u) Mapped = CSNC_MaterialRemap[Info.x + min(Material, Info.y - 1u)];
+		RW_MaterialIds[DstIndex / 3u] = Mapped;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	// ③ 切线框架。有显式切线用显式的；没有时 Nanite 渲染是逐三角从 UV 梯度现算（隐式切线），逐顶点的流装不下
+	// 逐三角的量，于是把顶点所在各三角的 UV 切线加起来再正交化（面积加权，同 MikkTSpace 的思路）。
+	for (uint Vertex = GroupIndex; Vertex < NumVerts; Vertex += CSNC_WRITE_GROUP_SIZE)
+	{
+		const uint Dst = Entry.VertexBase + Vertex;
+		if (Dst >= CSNC_VertexCapacity) continue;
+
+		const float3 N = CSNC_SafeNormal(CSNC_GS_Normal[Vertex], float3(0.0f, 0.0f, 1.0f));
+		float4 TangentX = CSNC_GS_TangentX[Vertex];
+		if (!Cluster.bHasTangents)
+		{
+			float3 SumT = 0.0f;
+			float3 SumB = 0.0f;
+			for (uint T = 0u; T < NumTris; ++T)
+			{
+				const uint3 C = CSNC_GS_Triangle[T];
+				if (C.x != Vertex && C.y != Vertex && C.z != Vertex) continue;
+
+				const float3 E1 = CSNC_GS_Position[C.y] - CSNC_GS_Position[C.x];
+				const float3 E2 = CSNC_GS_Position[C.z] - CSNC_GS_Position[C.x];
+				const float2 D1 = CSNC_GS_UV0[C.y] - CSNC_GS_UV0[C.x];
+				const float2 D2 = CSNC_GS_UV0[C.z] - CSNC_GS_UV0[C.x];
+				const float Det = D1.x * D2.y - D2.x * D1.y;
+				if (abs(Det) < 1e-12f) continue;
+
+				const float InvDet = 1.0f / Det;
+				SumT += (E1 * D2.y - E2 * D1.y) * InvDet;
+				SumB += (E2 * D1.x - E1 * D2.x) * InvDet;
+			}
+
+			const float3 T = SumT - N * dot(N, SumT);
+			if (dot(T, T) > 1e-12f)
+			{
+				const float3 TN = normalize(T);
+				TangentX = float4(TN, (dot(cross(N, TN), SumB) < 0.0f) ? -1.0f : 1.0f);
+			}
+			else
+			{
+				TangentX = float4(GetNaniteFallbackTangent(N), 1.0f);
+			}
+		}
+
+		// 法线走逆转置；切线跟位置一起变换后再对法线正交化（非均匀缩放会把两者拧歪）。
+		const float3 WorldNormal = CSNC_SafeNormal(mul(float4(N, 0.0f), NormalToWorld).xyz, float3(0.0f, 0.0f, 1.0f));
+		float3 WorldTangent = mul(float4(TangentX.xyz, 0.0f), LocalToWorld).xyz;
+		WorldTangent = CSNC_SafeNormal(WorldTangent - WorldNormal * dot(WorldTangent, WorldNormal), GetNaniteFallbackTangent(WorldNormal));
+		const float Sign = ((TangentX.w < 0.0f) ? -1.0f : 1.0f) * HandednessSign;
+
+		RW_Tangents[Dst * 2u + 0u] = CSNC_PackSnorm8888(float4(WorldTangent, 0.0f));
+		RW_Tangents[Dst * 2u + 1u] = CSNC_PackSnorm8888(float4(WorldNormal, Sign));
+	}
+}

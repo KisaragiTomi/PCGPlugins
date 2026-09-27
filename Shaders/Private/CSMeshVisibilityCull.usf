@@ -1,0 +1,182 @@
+// 外部可见性剔除：从网格包围球外的一圈视点看它，从来没在任何一张视图里当过"最近面"的三角形删掉。
+//
+// 每张视图两趟软件光栅（不走图形管线，直接读 UCSMesh 的常驻流）：
+//   深度趟  每个三角形覆盖到的像素中心上 InterlockedMin 深度；
+//   标记趟  同一段代码再算一遍深度，与缓冲里的值逐位相等就说明它在这个像素上是最近面 → 可见。
+// 两趟走同一个入口（CSVC_Mode 只决定拿算出来的深度干什么），深度的计算指令完全相同，逐位相等才靠得住。
+// 所有面按双面处理：背面也挡、也可以被看见（保守：宁可多留）。
+// 视图全部在包围球外，近平面 = 距离 - 半径 > 0，不需要裁剪。
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ComputeShaderUtils.ush"
+
+#define CSVC_GROUP_SIZE 64
+
+// ============================================================================ 光栅
+
+Buffer<float>            CSVC_Positions;     // xyz 交错，世界空间
+Buffer<uint>             CSVC_Indices;
+StructuredBuffer<float4> CSVC_ViewRows;      // 每视图 4 行：(P - Center, 1) → clip
+float3                   CSVC_Center;
+uint                     CSVC_NumTriangles;
+uint                     CSVC_ViewBase;      // 本批第一张视图在 CSVC_ViewRows 里的序号
+uint                     CSVC_NumViews;      // 本批视图数
+uint                     CSVC_Resolution;
+uint                     CSVC_Mode;          // 0 = 深度趟，1 = 标记趟
+RWBuffer<uint>           CSVC_Depth;         // 本批每张视图 Resolution² 个 asuint(深度)
+RWBuffer<uint>           CSVC_Visible;       // 逐三角：1 = 至少在一张视图里是最近面
+
+float3 CSVC_Project(uint VertexIndex, uint View, out bool bValid)
+{
+	const float4 P = float4(
+		CSVC_Positions[VertexIndex * 3u + 0u] - CSVC_Center.x,
+		CSVC_Positions[VertexIndex * 3u + 1u] - CSVC_Center.y,
+		CSVC_Positions[VertexIndex * 3u + 2u] - CSVC_Center.z,
+		1.0f);
+	const float4 Clip = float4(
+		dot(CSVC_ViewRows[View * 4u + 0u], P),
+		dot(CSVC_ViewRows[View * 4u + 1u], P),
+		dot(CSVC_ViewRows[View * 4u + 2u], P),
+		dot(CSVC_ViewRows[View * 4u + 3u], P));
+	bValid = Clip.w > 1e-6f;
+	const float3 Ndc = Clip.xyz / max(Clip.w, 1e-6f);
+	return float3((Ndc.xy * 0.5f + 0.5f) * float(CSVC_Resolution), Ndc.z);
+}
+
+float CSVC_Edge(float2 A, float2 B, float2 P)
+{
+	return (B.x - A.x) * (P.y - A.y) - (B.y - A.y) * (P.x - A.x);
+}
+
+[numthreads(CSVC_GROUP_SIZE, 1, 1)]
+void RasterCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint Thread = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, CSVC_GROUP_SIZE);
+	if (Thread >= CSVC_NumTriangles * CSVC_NumViews) return;
+	const uint Tri = Thread % CSVC_NumTriangles;
+	const uint LocalView = Thread / CSVC_NumTriangles;
+
+	// 标记趟：已经被别的视图看见过的不用再找。
+	if (CSVC_Mode != 0u && CSVC_Visible[Tri] != 0u) return;
+
+	const uint View = CSVC_ViewBase + LocalView;
+	bool bValid0, bValid1, bValid2;
+	float3 S0 = CSVC_Project(CSVC_Indices[Tri * 3u + 0u], View, bValid0);
+	float3 S1 = CSVC_Project(CSVC_Indices[Tri * 3u + 1u], View, bValid1);
+	float3 S2 = CSVC_Project(CSVC_Indices[Tri * 3u + 2u], View, bValid2);
+	if (!bValid0 || !bValid1 || !bValid2) return;
+
+	precise float Area = CSVC_Edge(S0.xy, S1.xy, S2.xy);
+	if (abs(Area) < 1e-8f) return;
+	if (Area < 0.0f)
+	{
+		const float3 T = S1;
+		S1 = S2;
+		S2 = T;
+		Area = -Area;
+	}
+
+	// 像素中心 (X + 0.5, Y + 0.5) 落在三角形里（含边）才算覆盖。
+	const float2 Lo = min(S0.xy, min(S1.xy, S2.xy));
+	const float2 Hi = max(S0.xy, max(S1.xy, S2.xy));
+	const int Last = int(CSVC_Resolution) - 1;
+	const int2 P0 = max(int2(ceil(Lo - 0.5f)), int2(0, 0));
+	const int2 P1 = min(int2(floor(Hi - 0.5f)), int2(Last, Last));
+	const uint Base = LocalView * CSVC_Resolution * CSVC_Resolution;
+
+	for (int Y = P0.y; Y <= P1.y; ++Y)
+	{
+		for (int X = P0.x; X <= P1.x; ++X)
+		{
+			const float2 P = float2(X, Y) + 0.5f;
+			precise float W0 = CSVC_Edge(S1.xy, S2.xy, P);
+			precise float W1 = CSVC_Edge(S2.xy, S0.xy, P);
+			precise float W2 = CSVC_Edge(S0.xy, S1.xy, P);
+			if (W0 < 0.0f || W1 < 0.0f || W2 < 0.0f) continue;
+
+			precise float Z = saturate((W0 * S0.z + W1 * S1.z + W2 * S2.z) / Area);
+			const uint ZBits = asuint(Z);
+			const uint Pixel = Base + uint(Y) * CSVC_Resolution + uint(X);
+			if (CSVC_Mode == 0u)
+			{
+				InterlockedMin(CSVC_Depth[Pixel], ZBits);
+			}
+			else if (CSVC_Depth[Pixel] == ZBits)
+			{
+				CSVC_Visible[Tri] = 1u;
+				return;
+			}
+		}
+	}
+}
+
+// ============================================================================ 保留判定
+
+Buffer<uint>   CSVC_VisibleIn;
+Buffer<uint>   CSVC_TriIndices;
+uint           CSVC_NumTris;
+uint           CSVC_KeepNeighbors;
+RWBuffer<uint> CSVC_VertexMark;
+RWBuffer<uint> CSVC_Keep;             // 1 = 可见，2 = 与可见三角共享顶点而保留，0 = 剔除
+
+// 可见三角的三个顶点打标（同值写入，竞争无害）。
+[numthreads(CSVC_GROUP_SIZE, 1, 1)]
+void MarkVerticesCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint Tri = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, CSVC_GROUP_SIZE);
+	if (Tri >= CSVC_NumTris || CSVC_VisibleIn[Tri] == 0u) return;
+	CSVC_VertexMark[CSVC_TriIndices[Tri * 3u + 0u]] = 1u;
+	CSVC_VertexMark[CSVC_TriIndices[Tri * 3u + 1u]] = 1u;
+	CSVC_VertexMark[CSVC_TriIndices[Tri * 3u + 2u]] = 1u;
+}
+
+// 细长三角可能一个像素中心都没盖住而被漏采；与可见三角共享顶点的一并留下，补这种针眼。
+[numthreads(CSVC_GROUP_SIZE, 1, 1)]
+void KeepCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint Tri = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, CSVC_GROUP_SIZE);
+	if (Tri >= CSVC_NumTris) return;
+	uint Keep = CSVC_VisibleIn[Tri] != 0u ? 1u : 0u;
+	if (Keep == 0u && CSVC_KeepNeighbors != 0u)
+	{
+		const uint Marks = CSVC_VertexMark[CSVC_TriIndices[Tri * 3u + 0u]]
+			| CSVC_VertexMark[CSVC_TriIndices[Tri * 3u + 1u]]
+			| CSVC_VertexMark[CSVC_TriIndices[Tri * 3u + 2u]];
+		if (Marks != 0u) Keep = 2u;
+	}
+	CSVC_Keep[Tri] = Keep;
+}
+
+// ============================================================================ 压实
+
+StructuredBuffer<uint> CSVC_KeptTriangles;   // 升序：压实后三角形的相对顺序不变
+uint                   CSVC_NumKept;
+Buffer<uint>           CSVC_SrcIndices;
+Buffer<uint>           CSVC_SrcMaterialIds;
+RWBuffer<uint>         CSVC_DstIndices;
+RWBuffer<uint>         CSVC_DstMaterialIds;
+
+// 源与目标不能是同一块 buffer（第 i 个线程写的位置可能正是别的线程还没读的源），所以先收进临时 buffer。
+[numthreads(CSVC_GROUP_SIZE, 1, 1)]
+void GatherCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint Index = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, CSVC_GROUP_SIZE);
+	if (Index >= CSVC_NumKept) return;
+	const uint Src = CSVC_KeptTriangles[Index];
+	CSVC_DstIndices[Index * 3u + 0u] = CSVC_SrcIndices[Src * 3u + 0u];
+	CSVC_DstIndices[Index * 3u + 1u] = CSVC_SrcIndices[Src * 3u + 1u];
+	CSVC_DstIndices[Index * 3u + 2u] = CSVC_SrcIndices[Src * 3u + 2u];
+	CSVC_DstMaterialIds[Index] = CSVC_SrcMaterialIds[Src];
+}
+
+// 临时 buffer 原样抄回常驻流的前段。
+[numthreads(CSVC_GROUP_SIZE, 1, 1)]
+void CopyBackCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint Index = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, CSVC_GROUP_SIZE);
+	if (Index >= CSVC_NumKept) return;
+	CSVC_DstIndices[Index * 3u + 0u] = CSVC_SrcIndices[Index * 3u + 0u];
+	CSVC_DstIndices[Index * 3u + 1u] = CSVC_SrcIndices[Index * 3u + 1u];
+	CSVC_DstIndices[Index * 3u + 2u] = CSVC_SrcIndices[Index * 3u + 2u];
+	CSVC_DstMaterialIds[Index] = CSVC_SrcMaterialIds[Index];
+}

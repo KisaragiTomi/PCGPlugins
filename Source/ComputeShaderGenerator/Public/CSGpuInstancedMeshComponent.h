@@ -524,6 +524,22 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS GPU Instanced Mesh|Culling", meta = (ClampMin = "0"))
 	float InstanceEndCullDistance = 0.0f;
 
+	/**
+	 * 离视点**近于**这个距离的实例不画（cm，0 = 不限）—— 与 `InstanceEndCullDistance` 配成一条距离带。
+	 * 地被的近 / 远两档就是两个组件各拿一半：近处单根草 `End = B`、远处组合草 `Start = B`（2026-09-22）。
+	 * ⚠️ 只在经典剔除路上生效；Nanite 路只转交得了 `InstanceEndCullDistance`（引擎那边没有起始距离的逐实例入口）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS GPU Instanced Mesh|Culling", meta = (ClampMin = "0"))
+	float InstanceStartCullDistance = 0.0f;
+
+	/**
+	 * 起止两道距离边界的**过渡带宽**（cm，0 = 硬边）。带内每个实例按自己的逐实例随机数（packed 行 `Origin.w`）
+	 * 在 `[边界 − 带宽, 边界]` 里取一个点当自己的边界：近侧组件越往外越稀、远侧组件越往外越密，
+	 * 两个组件用同一条带就互补，交界处不会出一道硬圈。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS GPU Instanced Mesh|Culling", meta = (ClampMin = "0"))
+	float InstanceCullFadeDistance = 0.0f;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS GPU Instanced Mesh|Culling")
 	bool bGpuFrustumCulling = true;
 

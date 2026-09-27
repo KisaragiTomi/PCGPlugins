@@ -78,7 +78,15 @@ struct FScatterParams
 	/** 散布格：原点是 (0,0) 格的角。`CellSize` = 1/√密度（换算在 `MakeGridForDensity`）。 */
 	FVector2f GridOriginXY = FVector2f::ZeroVector;
 	float CellSize = 20.0f;
+	/** 这一趟派的格数：整张网格，或近处窗口。 */
 	FIntPoint GridDims = FIntPoint(0, 0);
+	/**
+	 * **窗口散布**（2026-09-22 地被近 / 远两档：近处单根草只撒相机周围一块）：窗口左下角在整张网格里的格号，
+	 * 与整张网格的格数。随机源用整张网格里的格号 ⇒ 窗口跟着相机挪时同一格的草一株不变。
+	 * `GlobalDims` 留 (0,0) = 整张网格散布本身（偏移恒 0）—— 草、花、灌木的老路逐位不变。
+	 */
+	FIntPoint CellOffset = FIntPoint(0, 0);
+	FIntPoint GlobalDims = FIntPoint(0, 0);
 
 	/** 地面镜像格（取遮罩用；V = Y * VertsX + X）。 */
 	FVector2f GroundOriginXY = FVector2f::ZeroVector;
@@ -136,7 +144,26 @@ struct FScatterParams
 
 	FVector3f BaseSphereCentre = FVector3f::ZeroVector;
 	float BaseSphereRadius = 0.0f;
+
+	// --- 房屋环带：建筑周边灌木（`CSGroundCover.usf` 的「2.5) 房屋环带」）---
+	float RingInner = 0.0f;              // 离外皮多远才开始长（cm）
+	float RingWidth = 0.0f;              // 环带宽度（cm）；≤ 0 = 不走这道门控（草、花）
+	float RingNoiseCell = 100.0f;        // 值噪声格距（cm），TG = 1 m
+	float RingNoiseThreshold = 0.5f;     // 值噪声门槛，TG = 0.5
+	float RingMinScale = 0.4f;           // 环带缩放低于它就不长
+	/** 叠加物种：父物种长了的格子里再抽一次签（参数与盐必须和父物种逐项相同）。1 = 不抽。 */
+	float OverlayChance = 1.0f;
 };
+
+/** 房屋外皮多边形的打包布局：每栋 `BuildingStride` 个 float4（与 `CSGroundCover.usf` 同一份，经宏注入）。 */
+constexpr int32 BuildingMaxVerts = 16;
+constexpr int32 BuildingStride = 2 + BuildingMaxVerts / 2;
+
+/**
+ * 把一组**世界 XY 凸多边形**打包成 kernel 读的布局：[0] = AABB，[1].x = 顶点数，其后两个顶点一组。
+ * 顺时针的自动翻成逆时针；顶点多于 `BuildingMaxVerts` 的退成它的 AABB 矩形（保守：环带只会更大，不会漏）。
+ */
+COMPUTESHADERGENERATOR_API void PackBuildingPolygons(TConstArrayView<TArray<FVector2D>> Polygons, TArray<FVector4f>& OutPacked);
 
 /**
  * 密度 → 格距 + 格数，并保证 `GridX * GridY ≤ MaxCells`。
@@ -169,7 +196,8 @@ COMPUTESHADERGENERATOR_API bool Scatter(
 	const FCSMeshResidentRef& GroundResident,
 	const TArray<FCoverBuffers>& Buffers,
 	const TArray<FScatterParams>& Params,
-	const TArray<FVector4f>& ShaperParams);
+	const TArray<FVector4f>& ShaperParams,
+	const TArray<FVector4f>& BuildingPolygons = TArray<FVector4f>());   // PackBuildingPolygons 的产物；只有 RingWidth > 0 的物种读它
 
 COMPUTESHADERGENERATOR_API void ReleaseOnRenderThread(FCoverBuffers& Buffers);
 

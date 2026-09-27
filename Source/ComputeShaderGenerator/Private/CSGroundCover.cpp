@@ -1,5 +1,7 @@
 #include "CSGroundCover.h"
 
+#include "Algo/Reverse.h"
+
 #include "CSGpuInstancedMeshComponent.h"   // CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS
 #include "CSGpuMeshTypes.h"
 #include "CSGroundShaperField.h"
@@ -43,6 +45,8 @@ class FCSGroundCoverScatterCS : public FGlobalShader
 		SHADER_PARAMETER(FVector2f, CoverGridOriginXY)
 		SHADER_PARAMETER(float, CoverCellSize)
 		SHADER_PARAMETER(FUintVector2, CoverGridDims)
+		SHADER_PARAMETER(FIntPoint, CoverCellOffset)
+		SHADER_PARAMETER(FUintVector2, CoverGlobalDims)
 		SHADER_PARAMETER(FVector2f, CoverGroundOriginXY)
 		SHADER_PARAMETER(float, CoverGroundCellSize)
 		SHADER_PARAMETER(FUintVector2, CoverGroundVerts)
@@ -71,6 +75,14 @@ class FCSGroundCoverScatterCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, CoverMaxInstances)
 		SHADER_PARAMETER(FVector3f, CoverBaseSphereCentre)
 		SHADER_PARAMETER(float, CoverBaseSphereRadius)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, CoverBuildings)
+		SHADER_PARAMETER(uint32, CoverBuildingCount)
+		SHADER_PARAMETER(float, CoverRingInner)
+		SHADER_PARAMETER(float, CoverRingWidth)
+		SHADER_PARAMETER(float, CoverRingNoiseCell)
+		SHADER_PARAMETER(float, CoverRingNoiseThreshold)
+		SHADER_PARAMETER(float, CoverRingMinScale)
+		SHADER_PARAMETER(float, CoverOverlayChance)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -83,6 +95,8 @@ class FCSGroundCoverScatterCS : public FGlobalShader
 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
 		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), CSCover_GroupSizeX);
 		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_Y"), CSCover_GroupSizeY);
+		OutEnvironment.SetDefine(TEXT("CSCOVER_BUILDING_STRIDE"), CSGroundCover::BuildingStride);
+		OutEnvironment.SetDefine(TEXT("CSCOVER_BUILDING_MAX_VERTS"), CSGroundCover::BuildingMaxVerts);
 		// custom data 的步长与行 stride 由 .usf 自己 include CSGpuSharedLayout.ush 取得（与 C++ 是同一份
 		// #define），不再从这里注入 —— 注入会和头里的定义撞成重复定义。
 	}
@@ -167,11 +181,44 @@ bool EnsureBuffers(FCoverBuffers& Buffers, uint32 Capacity)
 	return Buffers.IsValid();
 }
 
+void PackBuildingPolygons(TConstArrayView<TArray<FVector2D>> Polygons, TArray<FVector4f>& OutPacked)
+{
+	OutPacked.Reset();
+	OutPacked.Reserve(Polygons.Num() * BuildingStride);
+	for (const TArray<FVector2D>& Polygon : Polygons)
+	{
+		if (Polygon.Num() < 3) continue;
+		FBox2D Box(ForceInit);
+		for (const FVector2D& V : Polygon) Box += V;
+
+		// 顶点太多就退成 AABB 矩形：保守（环带只会更大），而且房子的外皮本来就只有几条边。
+		TArray<FVector2D, TInlineAllocator<BuildingMaxVerts>> Verts;
+		if (Polygon.Num() > BuildingMaxVerts) Verts = { Box.Min, FVector2D(Box.Max.X, Box.Min.Y), Box.Max, FVector2D(Box.Min.X, Box.Max.Y) };
+		else Verts.Append(Polygon);
+
+		// kernel 按"逆时针 ⇒ 右手侧是外面"判内外：顺时针进来会把里外整个颠倒，灌木长进屋里。
+		double Area2 = 0.0;
+		for (int32 I = 0; I < Verts.Num(); ++I) Area2 += FVector2D::CrossProduct(Verts[I], Verts[(I + 1) % Verts.Num()]);
+		if (Area2 < 0.0) Algo::Reverse(Verts);
+
+		OutPacked.Add(FVector4f(float(Box.Min.X), float(Box.Min.Y), float(Box.Max.X), float(Box.Max.Y)));
+		OutPacked.Add(FVector4f(float(Verts.Num()), 0.0f, 0.0f, 0.0f));
+		for (int32 Pair = 0; Pair < BuildingMaxVerts / 2; ++Pair)
+		{
+			const int32 A = Pair * 2;
+			const FVector2D VA = Verts.IsValidIndex(A) ? Verts[A] : FVector2D::ZeroVector;
+			const FVector2D VB = Verts.IsValidIndex(A + 1) ? Verts[A + 1] : FVector2D::ZeroVector;
+			OutPacked.Add(FVector4f(float(VA.X), float(VA.Y), float(VB.X), float(VB.Y)));
+		}
+	}
+}
+
 bool Scatter(
 	const FCSMeshResidentRef& GroundResident,
 	const TArray<FCoverBuffers>& Buffers,
 	const TArray<FScatterParams>& Params,
-	const TArray<FVector4f>& ShaperParams)
+	const TArray<FVector4f>& ShaperParams,
+	const TArray<FVector4f>& BuildingPolygons)
 {
 	if (!GroundResident.IsValid()) return false;
 	// 长度不同 ⇒ 整趟拒绝。错位的症状是"花长成草的密度"，没有任何报错 —— 宁可一株都不长。
@@ -186,8 +233,12 @@ bool Scatter(
 	const int32 ShaperCount = UploadParams.Num() / CSGroundShaperField::Float4sPerShaper;
 	if (UploadParams.IsEmpty()) UploadParams.Add(FVector4f::Zero());   // 结构化 buffer 不能是 0 长度
 
+	TArray<FVector4f> UploadBuildings = BuildingPolygons;
+	const int32 BuildingCount = UploadBuildings.Num() / BuildingStride;
+	if (UploadBuildings.IsEmpty()) UploadBuildings.Add(FVector4f::Zero());   // 同上：一栋都没有也要绑一个
+
 	ENQUEUE_RENDER_COMMAND(CSGroundCoverScatter)(
-		[Resident = GroundResident, Work = Buffers, All = Params, UploadParams, ShaperCount](FRHICommandListImmediate& RHICmdList)
+		[Resident = GroundResident, Work = Buffers, All = Params, UploadParams, ShaperCount, UploadBuildings, BuildingCount](FRHICommandListImmediate& RHICmdList)
 		{
 			FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("CSGroundCover.Scatter"));
 
@@ -221,7 +272,9 @@ bool Scatter(
 
 			CSHelper::FRDGStructuredBufferRefs ShaperRefs = CSHelper::CreateUploadedStructuredBuffer<FVector4f>(
 				GraphBuilder, UploadParams, TEXT("CSGroundCover.ShaperParams"), false, true);
-			if (!ShaperRefs.SRV)
+			CSHelper::FRDGStructuredBufferRefs BuildingRefs = CSHelper::CreateUploadedStructuredBuffer<FVector4f>(
+				GraphBuilder, UploadBuildings, TEXT("CSGroundCover.Buildings"), false, true);
+			if (!ShaperRefs.SRV || !BuildingRefs.SRV)
 			{
 				GraphBuilder.Execute();
 				return;
@@ -257,6 +310,12 @@ bool Scatter(
 						PassParams->CoverGridOriginXY = P.GridOriginXY;
 						PassParams->CoverCellSize = P.CellSize;
 						PassParams->CoverGridDims = FUintVector2(uint32(P.GridDims.X), uint32(P.GridDims.Y));
+						// 窗口散布（近处单根草）：随机源用整张网格里的格号，窗口挪动时同一格的草不变。
+						// 没给整张网格的格数 = 整张网格散布本身（偏移 0、格数同 GridDims），与改动前逐位相同。
+						PassParams->CoverCellOffset = P.CellOffset;
+						PassParams->CoverGlobalDims = (P.GlobalDims.X > 0 && P.GlobalDims.Y > 0)
+							? FUintVector2(uint32(P.GlobalDims.X), uint32(P.GlobalDims.Y))
+							: FUintVector2(uint32(P.GridDims.X), uint32(P.GridDims.Y));
 						PassParams->CoverGroundOriginXY = P.GroundOriginXY;
 						PassParams->CoverGroundCellSize = P.GroundCellSize;
 						PassParams->CoverGroundVerts = FUintVector2(uint32(FMath::Max(P.GroundVerts.X, 0)), uint32(FMath::Max(P.GroundVerts.Y, 0)));
@@ -296,6 +355,15 @@ bool Scatter(
 						PassParams->CoverMaxInstances = Work[Index].Capacity;
 						PassParams->CoverBaseSphereCentre = P.BaseSphereCentre;
 						PassParams->CoverBaseSphereRadius = P.BaseSphereRadius;
+						PassParams->CoverBuildings = BuildingRefs.SRV;
+						PassParams->CoverBuildingCount = uint32(FMath::Max(BuildingCount, 0));
+						PassParams->CoverRingInner = FMath::Max(P.RingInner, 0.0f);
+						PassParams->CoverRingWidth = P.RingWidth;
+						// 噪声格 ≤ 0 会让 kernel 里的除法炸成 NaN（整条环带一株不长、无报错）—— 钳到 1 cm。
+						PassParams->CoverRingNoiseCell = FMath::Max(P.RingNoiseCell, 1.0f);
+						PassParams->CoverRingNoiseThreshold = FMath::Clamp(P.RingNoiseThreshold, 0.0f, 1.0f);
+						PassParams->CoverRingMinScale = FMath::Clamp(P.RingMinScale, 0.0f, 1.0f);
+						PassParams->CoverOverlayChance = FMath::Clamp(P.OverlayChance, 0.0f, 1.0f);
 
 						FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CSGroundCover.Scatter[%d]", Index), Shader, PassParams,
 							FComputeShaderUtils::GetGroupCount(FIntPoint(P.GridDims.X, P.GridDims.Y),

@@ -7,6 +7,7 @@
 #include "CSGroundStairs.h"
 #include "CSMeshOps.h"
 #include "CSTinyGlade.h"
+#include "UObject/ObjectKey.h"   // 房屋外皮登记表的键
 #include "CSGroundActor.generated.h"
 
 class ACSGroundActor;
@@ -14,6 +15,7 @@ class ACSGroundShaperActor;
 class UCSGpuInstancedMeshComponent;
 class UCSMesh;
 class UCSMeshRenderComponent;
+class UCSGroundCollisionComponent;
 class UMaterialInstanceDynamic;
 class UMaterialInterface;
 class UStaticMesh;
@@ -63,6 +65,70 @@ enum class ECSGroundCoverMaskChannel : uint8
 };
 
 /**
+ * 地被的**近 / 远两档**（2026-09-22 用户："让远处使用组合草，近处使用单根草，并且远处只有法线运动没有 WPO"；
+ * "草的数量限制上升到 100w 根"）。
+ *
+ * - **近处**：单根草（物种自己的 `Mesh` / `Material`，WPO 风），只撒在**相机周围一块窗口**里、满密度。
+ *   `MaxInstances`（≈ 100 万）从此是这块窗口的预算，而不是摊在整张 512 m 地面上 —— 以前在大地面上
+ *   密度会被自动退让到 4 株/m²，现在近处始终是 `DensityPerSqM`。相机水平走出 `RescatterDistance`
+ *   才把窗口搬过去重撒一次（GPU 上一趟 dispatch，不阻塞）；随机源用整张网格里的格号，同一格的草一株不变。
+ * - **远处**：组合草（`FarMesh`：一簇好几根低面片草叶），整张地面静态撒一次，只画在 `NearDistance` 之外。
+ *   材质 `FarMaterial` **不做 WPO**（远处整片不动顶点，省掉 WPO 那一整套代价），风只扰动法线。
+ * - 交界：两个组件共用一条过渡带（`FadeDistance`），带内逐株按随机数二选一 —— 近处渐稀、远处渐密，
+ *   不出一道硬圈（`UCSGpuInstancedMeshComponent::InstanceCullFadeDistance`）。
+ *
+ * **只有 `FarMesh` 非空才生效**：没有远处网格时退回整张地面一档散布，不会出现"远处一根草都没有"。
+ */
+USTRUCT(BlueprintType)
+struct COMPUTESHADERGENERATOR_API FCSGroundCoverLOD
+{
+	GENERATED_BODY()
+
+	/** 开关（还要 `FarMesh` 非空才生效）。草默认开（`ACSGroundActor` 构造函数里钉），花默认关。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|LOD")
+	bool bEnabled = false;
+
+	/**
+	 * 近处单根草画到离相机多远（cm）。之外交给组合草。
+	 * 窗口半宽 = 它 + `RescatterDistance`；窗口格数超过 `MaxInstances` 时窗口（连同这个距离）自动收小并打日志。
+	 * 默认 60 m：50 株/m² 时窗口约 140 m 见方、约 98 万株，正好用满 100 万的预算。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|LOD", meta = (ClampMin = "500.0", ClampMax = "50000.0"))
+	float NearDistance = 6000.0f;
+
+	/** 近 / 远交界的过渡带宽（cm）：带内逐株按随机数二选一。0 = 硬边（会看见一道圈）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|LOD", meta = (ClampMin = "0.0", ClampMax = "20000.0"))
+	float FadeDistance = 1500.0f;
+
+	/** 相机水平挪过多远才把近处窗口搬过去重撒一次（cm）。越小窗口越省（半宽 = NearDistance + 它），重撒越勤。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|LOD", meta = (ClampMin = "100.0", ClampMax = "20000.0"))
+	float RescatterDistance = 1000.0f;
+
+	/** 远处的组合草网格（一簇好几根低面片草叶，`Scripts/TinyGladeMakeGrassClump.py` 造的 `SM_TG_GrassClump`）。空 = 不分两档。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|LOD")
+	TObjectPtr<UStaticMesh> FarMesh;
+
+	/**
+	 * 远处的材质：**不做 WPO**，风只扰动法线（`MI_TG_GrassFar`）。⚠️ 同样必须勾 `bUsedWithInstancedStaticMeshes`。
+	 * 空 = 用物种自己的材质（那就带着 WPO，只剩网格换成了组合草）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|LOD")
+	TObjectPtr<UMaterialInterface> FarMaterial;
+
+	/** 远处组合草几簇 / m²（一簇约等于若干片草叶，远处看不出单根）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|LOD", meta = (ClampMin = "0.01", ClampMax = "50.0"))
+	float FarDensityPerSqM = 1.5f;
+
+	/** 远处组合草的格数天花板（同 `MaxInstances`：超了密度自动退让并打日志）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|LOD", meta = (ClampMin = "64", ClampMax = "1048576"))
+	int32 FarMaxInstances = 1048576;
+
+	/** 远处组合草的整体缩放区间（逐簇均匀取样；再叠物种的 `HeightJitter`）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|LOD")
+	FVector2D FarScaleRange = FVector2D(0.9, 1.2);
+};
+
+/**
  * 一个地被物种（草，或某一种花）。草与花共用这一份结构 —— 两者在 GPU 上跑的是**同一个
  * kernel**，只差 uniform（密度、遮罩阈值、缩放、盐），分两套参数只会在下一次调参时分叉。
  *
@@ -103,6 +169,9 @@ struct COMPUTESHADERGENERATOR_API FCSGroundCoverSpecies
 	 * 时候一个字节都不多花，只是把"自动退让"的触发点推远。
 	 *
 	 * 触发点参考：1048576 格 ≈ 50 株/m² 铺满 **145 m 见方**；真触发时每 1 万格 ≈ 0.8 MB。
+	 *
+	 * 开了近 / 远两档（`LOD`）时，它是**近处窗口**的预算（窗口满密度，不退让；装不下时窗口收小）——
+	 * 2026-09-22 用户"草的数量限制上升到 100w 根"：这 100 万根从此都落在相机周围，而不是摊在整张地面上。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover", meta = (ClampMin = "64", ClampMax = "1048576"))
 	int32 MaxInstances = 1048576;
@@ -267,6 +336,114 @@ struct COMPUTESHADERGENERATOR_API FCSGroundCoverSpecies
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover")
 	int32 Salt = 1;
+
+	/**
+	 * 近 / 远两档（见 `FCSGroundCoverLOD`）：开着且 `FarMesh` 非空时，本物种只撒相机周围一块窗口（`MaxInstances`
+	 * 是这块窗口的预算），远处交给组合草。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|LOD")
+	FCSGroundCoverLOD LOD;
+};
+
+/**
+ * 建筑周边灌木（照 TG `_garden_spawn_bushes_buildings.cs`）。
+ *
+ * 与地被共用同一个散布 kernel（`CSGroundCover.usf`），多一道**房屋环带**门控：离外皮
+ * `RingInner`–`RingInner + RingWidth` 之间、过一层值噪声门槛，尺寸按环带里的位置取鼓包。
+ * 房子只把外皮凸多边形推给地面（`ACSGroundActor::SetBuildingFootprint`），灌木归地面 ——
+ * 由**全部**房子的环带并集决定，单栋房子看不见别人（归属依据同 `CSGroundDecor.h`）。
+ *
+ * 每次输入变了就**整块地面重散**（TG 同样整体重算）：候选点按格身份哈希确定，没变的地方
+ * 逐位相同，所以不闪。房子拖动时只重散灌木，不连累草。
+ */
+USTRUCT(BlueprintType)
+struct COMPUTESHADERGENERATOR_API FCSGroundBuildingBushes
+{
+	GENERATED_BODY()
+
+	/** 灌木本体。**为空 = 整条关掉**（不建组件、不分配显存、不发 dispatch）。开了 Nanite 的资产自动走 Nanite。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes")
+	TObjectPtr<UStaticMesh> Mesh;
+
+	/** 覆盖材质；空 = 用资产自带材质。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes")
+	TObjectPtr<UMaterialInterface> Material;
+
+	/** 叠在一部分灌木上的花，与本体**同一个变换**（TG：`FlowerXform` 直接复用 `BushXform`）。空 = 不开花。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes")
+	TObjectPtr<UStaticMesh> FlowerMesh;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes")
+	TObjectPtr<UMaterialInterface> FlowerMaterial;
+
+	/** 开花的比例。TG = 0.3（`hash > 0.7`）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float FlowerChance = 0.3f;
+
+	/** 候选密度（株/m²），环带与噪声门槛之前。TG 的候选格约 2 m ⇒ 0.25。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes", meta = (ClampMin = "0.01", ClampMax = "4.0"))
+	float DensityPerSqM = 0.25f;
+
+	/** 离外皮多远才开始长（cm）。0 会让灌木心压在墙线上、半棵插进墙里。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes|Ring", meta = (ClampMin = "0.0"))
+	float RingInner = 30.0f;
+
+	/** 环带宽度（cm）。尺寸鼓包在环带 40% 处最大，两头缩到 0.2 倍。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes|Ring", meta = (ClampMin = "1.0"))
+	float RingWidth = 300.0f;
+
+	/** 值噪声格距（cm）。TG = 1 m：灌木因此成团，而不是均匀地绕房子一圈。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes|Ring", meta = (ClampMin = "1.0"))
+	float NoiseCellSize = 100.0f;
+
+	/** 值噪声门槛。TG = 0.5（约一半的候选被筛掉）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes|Ring", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float NoiseThreshold = 0.5f;
+
+	/** 环带缩放低于它就不长（TG 丢掉环带两头那些太小的）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes|Ring", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float MinRingScale = 0.4f;
+
+	/** 基础缩放区间，再乘环带鼓包（0.2–1）。`bush_body` 原件约 5 m 见方。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes|Shape")
+	FVector2D ScaleRange = FVector2D(0.45, 0.6);
+
+	/** 高度额外抖动（±），只改高矮不改粗细。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes|Shape", meta = (ClampMin = "0.0", ClampMax = "0.95"))
+	float HeightJitter = 0.25f;
+
+	/** 比这更陡的坡不长。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes|Shape", meta = (ClampMin = "0.0", ClampMax = "89.0"))
+	float MaxSlopeDegrees = 35.0f;
+
+	/** 路（顶点色 R）门控：TG 在 `path > 0.2` 处不长。Start 以下完全不受影响，End 以上完全不长。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes|Shape", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float RoadMaskStart = 0.1f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes|Shape", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float RoadMaskEnd = 0.2f;
+
+	/** 根部沉入地表（cm）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes|Shape", meta = (ClampMin = "0.0"))
+	float Sink = 10.0f;
+
+	/** 整片的世界 Z 偏移（cm，不乘缩放）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes|Shape")
+	float HeightOffset = 0.0f;
+
+	/**
+	 * 实例容量上限（本体与花各一份）。**与散布格数无关**：候选格铺满整块地面（512 m 地面约 6.5 万格），
+	 * 但只有房子周围那一圈长得出来，所以容量按"能长多少"定，不按格数 —— 越界的静默丢弃。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes", meta = (ClampMin = "64", ClampMax = "1048576"))
+	int32 MaxInstances = 8192;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes")
+	bool bCastShadow = true;
+
+	/** 灌木的盐（本体与花共用 —— 花必须落在本体同一批格子上）。与地被物种的盐分开取值。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bushes")
+	int32 Salt = 101;
 };
 
 /**
@@ -298,6 +475,14 @@ public:
 
 	/** Raised by StartVertexColorPaint(); the editor module answers it by activating the paint EdMode. */
 	static FCSGroundPaintEditorRequest OnGroundPaintEditorRequest;
+
+	/**
+	 * 任一地面完成一次全量重建（生成 / 加载 / 显式重建 / 拖动松手）后广播，参数同 `OnGroundChanged`。
+	 * 给**还没拿到地面指针**的消费者用：实例级的 `OnGroundChanged` 只发给已订阅者，地面比房子
+	 * 晚出现时，房子永远等不到这条广播。类级委托，所有世界共用 —— 订阅方自己按 World 过滤。
+	 * CSSceneDirty3D 落地后由空间拉取取代（发布方不必认识消费者，消费者也不必先拿到发布方指针）。
+	 */
+	static FCSGroundChanged OnAnyGroundRebuilt;
 
 	/**
 	 * 地面变动的直推通知（v1 架构裁决：不用 CSSceneDirty3D，任何变动必然广播，消费者
@@ -716,6 +901,23 @@ public:
 	float RockShellPatternScale = 0.35f;
 
 	/**
+	 * 岩壳图案的锚点：勾上后图案中心放在「地面原点 + RockShellPatternCentre」，不勾就是地面正中。
+	 *
+	 * 图案只有**一张**、不能平铺（边界不周期），覆盖区是以锚点为中心、边长 = 图案跨度 × PatternScale
+	 * 的正方形，外面一律无壳。地面比它大时，锚在正中会让偏在一角的塑形物整个落到覆盖区外
+	 * （09-21 演示地面从 32 / 128 m 扩到 512 m 就是这样：扩容前一条覆盖区警告都没有，扩容后全员超出）。
+	 * 这时把锚点钉到内容所在处。相对地面原点存：整块地面平移时图案跟着走。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell", meta = (InlineEditConditionToggle))
+	bool bRockShellCustomPatternCentre = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell", meta = (EditCondition = "bRockShellCustomPatternCentre"))
+	FVector2D RockShellPatternCentre = FVector2D::ZeroVector;
+
+	/** 岩壳图案中心的世界 XY（见 `RockShellPatternCentre`）。建壳、披挂、覆盖区检查共用这一个口径。 */
+	FVector2D GetRockShellPatternWorldCentre() const;
+
+	/**
 	 * 厚度（`RockShellCellRelief`）所乘的坡度 mask 的**下限**。0 = 照旧全乘 `Rock`，1 = 完全不衰减。
 	 *
 	 * ⚠️ **这一条是"壳有没有体积"的主开关，不是微调**（2026-08-31 实测）。kernel 原本写
@@ -1075,6 +1277,19 @@ public:
 	int32 GroundCoverSeed = 7;
 
 	// -------------------------------------------------------------------------
+	// 建筑周边灌木（第七条派生链，照 TG `_garden_spawn_bushes_buildings.cs`）
+	//
+	// **归地面**：环带由全部房子的外皮并集决定（两栋房的环会合并、任何一栋的内部都要排除），
+	// 单栋房子看不见别人。房子只登记外皮多边形（`SetBuildingFootprint`），地面不调任何房屋逻辑。
+	// -------------------------------------------------------------------------
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Building Bushes")
+	bool bBuildingBushesEnabled = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Building Bushes")
+	FCSGroundBuildingBushes BuildingBushes;
+
+	// -------------------------------------------------------------------------
 	// Public API
 	// -------------------------------------------------------------------------
 
@@ -1412,9 +1627,57 @@ public:
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "CS Ground|Cover")
 	void RebuildGroundCover();
 
-	/** 上一趟散布用的物种数（0 = 一个都没建组件）。诊断用，不回读 GPU。 */
+	/**
+	 * 房子登记 / 更新自己的外皮（**世界 XY 凸多边形**，逆时针或顺时针都行）。房子每次重求值都会推一遍，
+	 * 没变就当场返回；变了才重散灌木。`Key` 只当键用（通常就是房子本身），地面不调它任何东西。
+	 */
+	void SetBuildingFootprint(const UObject* Key, TConstArrayView<FVector2D> WorldPolygon);
+	void RemoveBuildingFootprint(const UObject* Key);
+
+	/** 当前登记的房屋外皮数（诊断用）。 */
+	int32 GetBuildingFootprintCount() const { return BuildingFootprints.Num(); }
+
+	/** 重散建筑周边灌木（整块地面一次，幂等：输入哈希没变就一次 enqueue 都不发）。 */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "CS Ground|Building Bushes")
+	void RebuildBuildingBushes();
+
+	/** 灌木的实例组件：0 = 本体，1 = 花（没有则 nullptr）。 */
+	UCSGpuInstancedMeshComponent* GetBuildingBushComponent(int32 Layer) const
+	{
+		return BushComponents.IsValidIndex(Layer) ? ToRawPtr(BushComponents[Layer]) : nullptr;
+	}
+
+	/** **诊断专用，阻塞**：灌木某一层（0 = 本体，1 = 花）的实例世界原点。−1 = 那一层没有组件。 */
+	int32 DebugReadBuildingBushOriginsSync(int32 Layer, TArray<FVector>& OutWorldOrigins) const;
+
+	/** 上一趟散布用的组件数（0 = 一个都没建组件；含远处组合草那几条，它们排在物种之后）。诊断用，不回读 GPU。 */
 	UFUNCTION(BlueprintPure, Category = "CS Ground|Cover")
 	int32 GetGroundCoverSpeciesCount() const { return CoverComponents.Num(); }
+
+	/**
+	 * 某个物种（0 = 草，1.. = 花）的**远处组合草**在组件表里的下标（喂 `DebugReadGroundCover*` 那一族）；
+	 * −1 = 这个物种没分两档。物种自己的下标不变（远处条目一律排在全部物种之后）。
+	 */
+	UFUNCTION(BlueprintPure, Category = "CS Ground|Cover")
+	int32 GetGroundCoverFarIndex(int32 SpeciesIndex) const { return CoverFarIndexOfSpecies.IsValidIndex(SpeciesIndex) ? CoverFarIndexOfSpecies[SpeciesIndex] : INDEX_NONE; }
+
+	/**
+	 * 钉住近处窗口的中心（世界位置，只用 XY）—— 出图 / 验收脚本用：无头进程没有视口、拿不到相机位置。
+	 * 钉住期间不跟相机；`ClearGroundCoverViewOverride` 放开。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CS Ground|Cover")
+	void SetGroundCoverViewOverride(FVector WorldLocation);
+
+	UFUNCTION(BlueprintCallable, Category = "CS Ground|Cover")
+	void ClearGroundCoverViewOverride();
+
+	/** 近处窗口此刻的中心（世界 XY，Z = 地面 actor 的 Z）。诊断用。 */
+	UFUNCTION(BlueprintPure, Category = "CS Ground|Cover")
+	FVector GetGroundCoverViewCenter() const;
+
+	/** 近处窗口跟着相机搬过几次（每次 = 重撒一趟）。诊断用。 */
+	UFUNCTION(BlueprintPure, Category = "CS Ground|Cover")
+	int32 GetGroundCoverWindowMoveCount() const { return CoverWindowMoveCount; }
 
 	/**
 	 * 画得出来吗（**不回读 GPU**，只查资产/组件/材质那几条会让画面一片灰或空白的前置条件）。
@@ -1498,6 +1761,10 @@ public:
 	UFUNCTION(BlueprintPure, Category = "CS Ground")
 	float SampleHeight(FVector2D WorldXY) const;
 
+	/** 同 `SampleHeight`，但**超出范围 / 镜像未就绪时返回 false**，不退回 actor Z。
+	 *  "脚下到底有没有地面"要靠它答 —— `SampleHeight` 在范围外给的是一块假想的无限平地。 */
+	bool TrySampleHeight(FVector2D WorldXY, float& OutWorldZ) const;
+
 	/** 镜像双线性采样：世界 XY → 道路权重（R 通道，0..1）。超出范围返回 0。 */
 	UFUNCTION(BlueprintPure, Category = "CS Ground")
 	float SampleRoadWeight(FVector2D WorldXY) const;
@@ -1515,6 +1782,9 @@ public:
 	//~ AActor interface（EndPlay / Destroyed 在基类：只调下面的 ReleaseInstancedBuffers 放生产者那一份，
 	//  组件那一份由组件销毁时自己放）
 	virtual void PostRegisterAllComponents() override;
+	/** 地被近处窗口跟相机（没有开两档的物种时什么都不做）。 */
+	virtual void Tick(float DeltaSeconds) override;
+	virtual bool ShouldTickIfViewportsOnly() const override { return true; }
 #if WITH_EDITOR
 	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
 	virtual void PostEditMove(bool bFinished) override;
@@ -1602,11 +1872,58 @@ private:
 	/** 参数打包：细节面板只暴露改观感的那几个，其余以 `CSHouseDecor::FParams` 的默认值为准。 */
 	CSHouseDecor::FParams MakeSkirtDecorParams() const;
 
+	/** 地被组件表里一条的身份：整张地面一档 / 近处窗口 / 远处组合草。 */
+	enum class ECoverRole : uint8 { Plain, Near, Far };
+
+	/** 近处窗口的几何（整张网格 + 窗口大小；窗口位置另算，见 `CoverNearWindowOffset`）。 */
+	struct FCoverNearWindow
+	{
+		FVector2f Origin = FVector2f::ZeroVector;   // 整张网格 (0,0) 格的角（世界 XY）
+		float CellSize = 1.0f;
+		FIntPoint GlobalDims = FIntPoint(0, 0);
+		FIntPoint Dims = FIntPoint(0, 0);           // 窗口格数（恒定 ⇒ 容量恒定 ⇒ 窗口挪动不交接）
+		int32 HalfCells = 0;
+		/** 近处真正画到多远（cm）：`NearDistance`，窗口被预算收小时相应收小。 */
+		float Boundary = 0.0f;
+		bool bShrunk = false;
+	};
+
+	/** 组件表里的一条：物种参数（远处条目是现组的）+ 身份 + 距离带。 */
+	struct FCoverEntry
+	{
+		FCSGroundCoverSpecies Species;
+		ECoverRole Role = ECoverRole::Plain;
+		/** 近 / 远两档共用的距离带边界与过渡带宽（cm），写到组件的剔除距离上。 */
+		float Boundary = 0.0f;
+		float Fade = 0.0f;
+		/** 近处条目的窗口几何。 */
+		FCoverNearWindow Window;
+	};
+
 	/**
-	 * 把 `Grass` + `Flowers` 收成一张按下标对齐的物种表（下标 0 恒为草）。
-	 * 网格为空的物种**整条跳过**（不占组件、不占显存），所以表长 ≠ `Flowers.Num() + 1`。
+	 * 把 `Grass` + `Flowers` 收成一张按下标对齐的组件表：下标 0 恒为草，1.. 为网格非空的花（空网格的整条跳过，
+	 * 所以表长 ≠ `Flowers.Num() + 1`）；开了两档的物种再各追加一条远处组合草，**排在全部物种之后**
+	 * （物种自己的下标因此不变，脚本里 0 = 草照旧成立）。`OutFarIndexOfSpecies` 给出物种 → 远处条目的下标。
 	 */
-	void CollectCoverSpecies(TArray<const FCSGroundCoverSpecies*>& OutSpecies) const;
+	void CollectCoverEntries(TArray<FCoverEntry>& OutEntries, TArray<int32>* OutFarIndexOfSpecies = nullptr) const;
+
+	/** 近处窗口的几何（只由参数与地面尺寸决定，与相机在哪无关）。 */
+	bool ComputeCoverNearWindow(const FCSGroundCoverSpecies& Species, FCoverNearWindow& Out) const;
+
+	/** 近处窗口此刻的左下角格号（跟着 `ResolveCoverViewXY`，夹在地面内）。 */
+	FIntPoint CoverNearWindowOffset(const FCoverNearWindow& Window) const;
+
+	/** 近处窗口的中心：钉住的位置 > 相机上一次落定的位置 > 地面中心。 */
+	FVector2D ResolveCoverViewXY() const;
+
+	/**
+	 * 相机走出重撒距离就把近处窗口搬过去（Tick 调）。
+	 *
+	 * 相机位置来自 `UWorld::ViewLocationsRenderedLastFrame`（只有透视编辑器视口与游戏视口往里填）。
+	 * ⚠️ 取**离当前窗口最近的那一项**：多视口时表里有好几项且次序随绘制次序变，取 `[0]` 会让窗口
+	 * 在两个机位之间来回跳 —— 每跳一次整窗重撒一趟，逐帧卡死且没有任何报错。
+	 */
+	void UpdateGroundCoverView();
 
 	/**
 	 * 保证地被的实例组件、GPU 缓冲与容量都就位。返回是否可以散布。
@@ -1614,7 +1931,7 @@ private:
 	 * 稳态下**零阻塞**：容量按"格数上限"一次付清（只涨不缩），组件与物种表按下标对齐，
 	 * 两者都没变时直接返回 —— 同 `EnsureRockShellMesh` / `EnsureStairComponent`。
 	 */
-	bool EnsureCoverComponents(const TArray<const FCSGroundCoverSpecies*>& Species);
+	bool EnsureCoverComponents(const TArray<FCoverEntry>& Entries);
 
 	/**
 	 * 地被的输入哈希：塑形物集合与高度场参数、地面几何配置、**落笔计数**、每个物种的配置。
@@ -1624,7 +1941,7 @@ private:
 	 * 257² 个字节，逐笔哈希整张表太贵；一个单调计数器给出同样的"变了没有"判定，代价是常数
 	 * （与岩壳那条逐字同理）。
 	 */
-	uint32 CoverInputHash(const TArray<const FCSGroundCoverSpecies*>& Species) const;
+	uint32 CoverInputHash(const TArray<FCoverEntry>& Entries) const;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UCSGpuInstancedMeshComponent> StairComponent;
@@ -1640,6 +1957,13 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UCSMeshRenderComponent> RockShellComponent;
 
+	/** 物理碰撞（gpumesh 本身不带）。编辑器拖放 / 贴地要靠它，见组件类注释。 */
+	UPROPERTY(VisibleAnywhere, Category = "CS Ground")
+	TObjectPtr<UCSGroundCollisionComponent> GroundCollision;
+
+	/** 按镜像重烘碰撞。只在高度**已提交**地变了之后调（全量重建、塑形物松手 / 改参）。 */
+	void RefreshGroundCollision();
+
 	/** `RockShellMaterial` 的动态子实例（见该属性的注释）。父材质换了才重建，缩放变了只改标量。 */
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> RockShellMaterialInstance;
@@ -1648,6 +1972,7 @@ private:
 	TWeakObjectPtr<UStaticMesh> RockShellBuiltPattern;
 	FBox2D RockShellBuiltRect = FBox2D(ForceInit);
 	float RockShellBuiltScale = 0.0f;
+	FVector2D RockShellBuiltCentre = FVector2D::ZeroVector;
 
 	/** 上次披挂时的输入哈希（0 = 还没披挂过）。 */
 	uint32 RockShellBuiltHash = 0;
@@ -1764,6 +2089,41 @@ private:
 
 	/** 上次那一趟的输入哈希（0 = 还没散过）。`RebuildGroundCover()` 的第一句就用它短路。 */
 	uint32 CoverBuiltHash = 0;
+
+	/** 物种下标 → 它的远处组合草在组件表里的下标（−1 = 没分两档）。上一趟 `RebuildGroundCover` 定的。 */
+	TArray<int32> CoverFarIndexOfSpecies;
+
+	/** 近处窗口跟着的相机位置（世界 XY）：相机走出重撒距离才更新。 */
+	FVector2D CoverViewXY = FVector2D::ZeroVector;
+	bool bCoverViewValid = false;
+	/** 脚本钉住的窗口中心（无头进程没有相机）。 */
+	TOptional<FVector2D> CoverViewOverride;
+	int32 CoverWindowMoveCount = 0;
+	/** "近处窗口被预算收小"那条日志只在窗口尺寸变了时打一次（窗口每挪一次都打会刷屏）。 */
+	FIntPoint CoverLastLoggedNearDims = FIntPoint(0, 0);
+
+	// --- 建筑周边灌木（第七条派生链）：[0] = 本体，[1] = 花（与本体同一个变换）---
+
+	/** 房屋外皮登记表（世界 XY）。Transient：房子加载 / 重求值时会重推，地面晚到时由 `OnAnyGroundRebuilt` 叫醒房子再推。 */
+	TMap<TObjectKey<UObject>, TArray<FVector2D>> BuildingFootprints;
+
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UCSGpuInstancedMeshComponent>> BushComponents;
+
+	TArray<CSGroundCover::FCoverBuffers> BushBuffers;
+
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UStaticMesh>> BushMeshesBuiltFrom;
+
+	TArray<FVector3f> BushBaseSphereCentres;
+	TArray<float> BushBaseSphereRadii;
+	CSShaperSteps::FHandoverCache BushHandover;
+	uint32 BushBuiltHash = 0;
+
+	/** 灌木要画的层（网格、材质、叠加签按层对齐）。关掉 / 没网格时为空。 */
+	void CollectBushLayers(TArray<UStaticMesh*>& OutMeshes, TArray<UMaterialInterface*>& OutMaterials, TArray<float>& OutOverlayChance) const;
+	bool EnsureBushComponents(const TArray<UStaticMesh*>& Meshes, const TArray<UMaterialInterface*>& Materials);
+	uint32 BushInputHash(const TArray<UStaticMesh*>& Meshes, const TArray<UMaterialInterface*>& Materials) const;
 
 	/** 本次 stroke 的累计世界脏盒：EndPaintStroke 判断要不要标脏包；也是将来切 dirty 系统时的区域发布素材。 */
 	FBox StrokeDirtyBounds = FBox(ForceInit);

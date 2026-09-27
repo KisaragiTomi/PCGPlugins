@@ -149,6 +149,52 @@ StaticMesh 之后没有实例了，`PerInstanceRandom` 恒为 0，整片石阶�
 
 ⚠️ `M_TinyGladeStone` 本身没动 —— 屋顶尖顶（`TinyGladeSetupRoofTiles.py`）还在用它。
 
+## 地被的近 / 远两档（2026-09-22）
+
+用户："让远处使用组合草。近处使用单根草。并且远处只有法线运动没有 WPO。" + "草的数量限制上升到 100w 根"。
+
+改之前：草**一档**，`MaxInstances`（100 万）摊在整张 512 m 见方的地面上 —— 一格一株，
+`MakeGridForDensity` 被格数上限逼着让密度退让，50 株/m² 一路退到 **4 株/m²**。近看稀得见土，
+而远处每一株仍然在跑 WPO。
+
+改之后（`FCSGroundCoverLOD`，挂在 `FCSGroundCoverSpecies::LOD` 上；草默认开、花默认关）：
+
+| | 近处 | 远处 |
+| --- | --- | --- |
+| 撒哪儿 | 相机周围一块**窗口**（默认 ±70 m）里满密度 50 株/m² | 整张地面，1.5 簇/m² |
+| 网格 | `SM_TG_GrassBlade`（单根草，10 三角） | `SM_TG_GrassClump`（一簇 18 片叶，18 三角） |
+| 材质 | `MI_TG_Grass`（WPO 风） | `MI_TG_GrassFar`：**没有 WPO**，同一份风场折进**法线** |
+| 画多远 | 0 → `NearDistance`（默认 60 m） | `NearDistance` → ∞ |
+| 数量（512 m 地面实测） | 991² = **982081 株**（窗口满格） | **39.4 万簇** |
+
+三条要点：
+
+1. **窗口跟相机，但只按"格"挪**。窗口半宽 = `NearDistance + RescatterDistance`，格数因此恒定 ⇒
+   容量恒定 ⇒ 相机挪动时只是**重撒一趟**（一张 RDG 图、不回读），永远不会走那条阻塞的
+   `SetInstanceSourceGPU` 交接。相机水平走出 `RescatterDistance`（默认 10 m）才搬一次。
+2. **随机源是整张网格里的格号**（`CoverCellOffset` 在 kernel 里加回去），不是窗口内下标 ——
+   否则窗口一挪，同一格的草会换一茬，整片草地在相机移动时"翻滚"。
+3. **交界是一条过渡带不是一道圈**。两个组件共用 `FadeDistance`（默认 15 m）：近处组件把
+   `InstanceEndCullDistance` 按逐实例随机数往里收、远处组件把 `InstanceStartCullDistance` 按
+   **同一条公式**往里收，于是带内距离 d 处近处留下 `(B−d)/Fade`、远处留下 `1−(B−d)/Fade`，两者互补。
+
+⚠️ 相机位置取的是 `UWorld::ViewLocationsRenderedLastFrame` —— **只有透视编辑器视口与游戏视口
+往里填**（`EditorEngine.cpp:2631` / `GameViewportClient.cpp:1814`），SceneCapture 不填，所以 CSSW
+那些常驻捕获不会把窗口拽走。⚠️ 取的是**离当前窗口最近的那一项，不是 `[0]`**：同一个世界开着多个
+透视视口时表里有好几项、次序随绘制次序变，取 `[0]` 会让窗口在两个机位之间来回跳，每跳一次就是整窗
+重撒一趟（逐帧卡死且不报错）。无头 / 出图脚本没有视口，要用
+`SetGroundCoverViewOverride()` 把窗口钉到机位上，否则窗口停在地面正中（这张地面 512 m 见方、
+房子在角上，镜头里会一根近处草都没有）。
+
+⚠️ `MaxInstances` 的语义变了：开着两档时它是**窗口的预算**（窗口装不下就收窗口，不再让密度退让）。
+100 万的上限对应窗口边长 1023 格；50 株/m² 时 60 m 的画距用掉 991² 格，正好吃满。
+
+远处那两样资产由 `Scripts/TinyGladeMakeGrassClump.py` 造：网格是现摆的 18 片叶，材质是
+**`M_TG_Grass` 的副本**再改两处（删掉喂 WPO 的那个节点、把同一个 `TG Wind Bend` 乘上
+`NormalWindStrength` 加进法线）。为什么是复制而不是新写一份：过渡带里两档**同框**，albedo /
+粗糙度 / sheen 差一点点，交界就会读成一条色带；`MI_TG_GrassFar` 同理是 `MI_TG_Grass` 的副本、
+只换父材质，手调过的风参数原样跟过去。
+
 ## 待办
 
 - 地被：坡度门控要不要从硬阈值改成概率拒绝（与遮罩门控同一套写法）。

@@ -47,6 +47,11 @@
 
 ⚠️ 值要烘进 **BP CDO 与关卡实例两处**：只改 C++ 默认值、或只改 CDO，关卡里已存在的实例
 一个都不会变（状态文件坑表里的那条）。
+
+近 / 远两档（2026-09-22）：草分两档 —— 近处相机周围一块窗口里撒**单根草**（满密度 50 株/m²、
+100 万根封顶），远处整张地面撒**组合草**（`SM_TG_GrassClump`，一簇 18 片叶），远处材质
+`MI_TG_GrassFar` 不做 WPO、风只扰动法线。两样远处资产由 `TinyGladeMakeGrassClump.py` 造，
+缺了就自动退回"整张地面一档"。花不分两档（数量本来就小）。
 """
 import unreal
 
@@ -55,6 +60,17 @@ ASSET = "%s/TinyGladeAsset" % PKG
 
 GRASS_MESH = "%s/Meshes/SM_TG_GrassBlade" % ASSET
 GRASS_MAT_CANDIDATES = ["%s/Materials/MI_TG_Grass" % ASSET, "%s/Materials/M_TG_Grass" % ASSET]
+
+# 远处那一档（2026-09-22 用户："让远处使用组合草。近处使用单根草。并且远处只有法线运动没有 WPO。"
+# "草的数量限制上升到 100w 根"）。两样资产由 `TinyGladeMakeGrassClump.py` 造；缺了就不分两档
+# （整张地面一档照旧，密度会被 MaxInstances 自动退让），不算失败。
+FAR_MESH = "%s/Meshes/SM_TG_GrassClump" % ASSET
+FAR_MAT_CANDIDATES = ["%s/Materials/MI_TG_GrassFar" % ASSET, "%s/Materials/M_TG_GrassFar" % ASSET]
+NEAR_DISTANCE = 6000.0      # 单根草画到 60 m：50 株/m² 时窗口约 140 m 见方 ≈ 98 万根，正好用满 100 万
+FADE_DISTANCE = 1500.0      # 交界 15 m 过渡带：带内逐株二选一，近处渐稀、远处渐密
+RESCATTER_DISTANCE = 1000.0 # 相机水平走 10 m 才搬一次窗口（搬一次 = GPU 上重撒一趟，不阻塞）
+FAR_DENSITY = 1.5           # 簇/m²（一簇 18 片草叶）
+FAR_SCALE = (0.9, 1.2)
 
 # (网格, 材质, 密度株/m², 容量, 缩放下限, 缩放上限, 倾倒角, 高度偏移 cm, 盐)
 # ⚠️ 「高度偏移」= `HeightOffset`：**网格原点就是落点**，没有自动坐底那一层。可正可负，
@@ -142,6 +158,30 @@ ensure_instanced_flag(grass_mat, "grass")
 # 草的 `SM_TG_GrassBlade` Min.Z 正好是 0，所以高度偏移给 0 就是贴地（从前开不开坐底都一样）。
 grass = make_species(grass_mesh, grass_mat, 50.0, CAP, 0.85, 1.25, 27.0, 0.0, 1, False)   # 27° = TG 的 0.3 × 90°
 
+# ---- 近 / 远两档 ----
+far_mesh = load(FAR_MESH)
+far_mat = next((m for m in (load(p) for p in FAR_MAT_CANDIDATES) if m), None)
+lod = unreal.CSGroundCoverLOD()
+if far_mesh and far_mat:
+    ensure_instanced_flag(far_mat, "grassfar")
+    lod.set_editor_property("bEnabled", True)
+    lod.set_editor_property("NearDistance", NEAR_DISTANCE)
+    lod.set_editor_property("FadeDistance", FADE_DISTANCE)
+    lod.set_editor_property("RescatterDistance", RESCATTER_DISTANCE)
+    lod.set_editor_property("FarMesh", far_mesh)
+    lod.set_editor_property("FarMaterial", far_mat)
+    lod.set_editor_property("FarDensityPerSqM", FAR_DENSITY)
+    lod.set_editor_property("FarMaxInstances", CAP)
+    lod.set_editor_property("FarScaleRange", unreal.Vector2D(*FAR_SCALE))
+    unreal.log("COVERSET 两档：近 %.0f m 单根草（%d 根封顶）+ 远处组合草 %s（%d 三角，%.1f 簇/m²）"
+               % (NEAR_DISTANCE / 100.0, CAP, far_mesh.get_name(),
+                  far_mesh.get_num_triangles(0), FAR_DENSITY))
+else:
+    # 不算失败：没有组合草时整张地面照旧撒单根草（只是远处密度会被自动退让）。
+    unreal.log_warning("COVERSET 没有远处组合草（%s / %s），退回整张地面一档"
+                       % (FAR_MESH, FAR_MAT_CANDIDATES[0]))
+grass.set_editor_property("LOD", lod)
+
 flowers = []
 for path, mat_path, density, cap, lo, hi, lean, height_offset, salt in FLOWER_SPECS:
     mesh = load(path)
@@ -195,8 +235,15 @@ for level in ("L_TerrainOpsDemo", "L_HouseGroundDemo"):
         if reason:
             unreal.log_warning("COVERSET %s 画不出来：%s" % (a.get_actor_label(), reason))
         for i in range(1 + len(flowers)):
-            unreal.log("COVERSET   物种 %d 实例数 = %s"
-                       % (i, a.call_method("DebugReadGroundCoverCountGpuSync", (i,))))
+            near = a.call_method("DebugReadGroundCoverCountGpuSync", (i,))
+            # 分两档的物种：远处那一条排在全部物种之后，下标问 actor 要（物种自己的下标不变）。
+            far_i = a.call_method("GetGroundCoverFarIndex", (i,))
+            if far_i is not None and far_i >= 0:
+                unreal.log("COVERSET   物种 %d 近处窗口 %s 株 + 远处（下标 %d）%s 簇"
+                           % (i, near, far_i,
+                              a.call_method("DebugReadGroundCoverCountGpuSync", (far_i,))))
+            else:
+                unreal.log("COVERSET   物种 %d 实例数 = %s" % (i, near))
         n += 1
     unreal.EditorLoadingAndSavingUtils.save_current_level()
     unreal.log("COVERSET %s -> %d ground actors" % (level, n))

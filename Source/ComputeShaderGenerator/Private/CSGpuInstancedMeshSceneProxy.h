@@ -170,6 +170,10 @@ private:
 	FCSGpuInstancePointSourceGPU GpuPointSource;
 
 	float EndCullDistance = 0.0f;
+	/** 近于它的实例不画（0 = 不限）；与 EndCullDistance 配成距离带（地被近 / 远两档各拿一半）。 */
+	float StartCullDistance = 0.0f;
+	/** 起止边界的过渡带宽：带内按逐实例随机数取边界，近 / 远两个组件互补（见组件同名属性）。 */
+	float CullFadeDistance = 0.0f;
 	float LodScreenSizeScale = 1.0f;
 	bool bFrustumCull = true;
 	bool bLodSelect = true;

@@ -49,9 +49,13 @@ RWBuffer<uint>   RWCoverCounter;     // [0] = 活跃实例数（只有 GPU 知�
 
 float4x4 CoverWorldToComponent;
 
-float2 CoverGridOriginXY;            // 散布格 (0,0) 角的世界 XY
+float2 CoverGridOriginXY;            // 散布格 (0,0) 角的世界 XY（整张网格的角，窗口散布也不变）
 float  CoverCellSize;                // 格边长 = 1/√密度（CPU 侧换算，见 CSGroundCover.cpp）
-uint2  CoverGridDims;                // 散布**格数**
+uint2  CoverGridDims;                // 这一趟派的**格数**：整张网格，或近处窗口（2026-09-22 地被近 / 远两档）
+// 窗口在整张网格里的起始格号。**随机源用整张网格里的格号**，不用窗口内下标 —— 窗口跟着相机挪时，
+// 同一格的草一株不变（只有窗口边缘进出的那一圈换人，而那一圈恒在近处画距之外）。整张网格散布恒 (0,0)。
+int2   CoverCellOffset;
+uint2  CoverGlobalDims;              // 整张网格的格数：窗口伸出地面的那一截格直接退掉
 
 float2 CoverGroundOriginXY;          // 地面镜像格点 (0,0) 的世界 XY —— 取遮罩用
 float  CoverGroundCellSize;
@@ -119,6 +123,30 @@ uint   CoverMaxInstances;            // 固定容量。越界静默丢弃 ——
 
 float3 CoverBaseSphereCentre;        // 基础网格局部包围球（未缩放）
 float  CoverBaseSphereRadius;
+
+// --- 房屋环带：建筑周边灌木（照 TG `_garden_spawn_bushes_buildings.cs`）-------------
+//
+// TG 在模糊后的 `buildings_mask` 边缘环带上撒灌木：建筑内部排除、再过一层 1 m 格的值噪声门槛、
+// 尺寸按环带里的位置取一个鼓包。本项目没有建筑 mask，房子把**外皮凸多边形**推给地面
+// （`ACSGroundActor::SetBuildingFootprint`），这里逐株求到最近那栋外皮的**有符号距离** ——
+// 与模糊 mask 表达的是同一件事（离墙多远），而且精确、不受 mask 分辨率限制。
+// `CoverRingWidth ≤ 0` 的物种（草、花）整段跳过，与加这道门控之前逐位相同。
+#ifndef CSCOVER_BUILDING_STRIDE
+#define CSCOVER_BUILDING_STRIDE 10
+#endif
+#ifndef CSCOVER_BUILDING_MAX_VERTS
+#define CSCOVER_BUILDING_MAX_VERTS 16
+#endif
+StructuredBuffer<float4> CoverBuildings;   // 每栋 STRIDE 个：[0] = 世界 AABB (minX, minY, maxX, maxY)，[1].x = 顶点数，[2..] = 逆时针凸多边形顶点两个一组
+uint   CoverBuildingCount;
+float  CoverRingInner;                     // 离外皮多远才开始长（cm），挡住"半棵灌木插进墙里"
+float  CoverRingWidth;                     // 环带宽度（cm）；≤ 0 = 不走环带门控
+float  CoverRingNoiseCell;                 // 值噪声格距（cm），TG = 1 m
+float  CoverRingNoiseThreshold;            // 值噪声门槛，TG = 0.5（约一半的候选被筛掉，成团而不是一圈均匀）
+float  CoverRingMinScale;                  // 环带缩放低于它就不长（TG 丢掉环带两头那些太小的）
+// 叠加物种：在父物种长了的格子里再抽一次签（TG：30% 的灌木开花，花与本体**同一个变换**）。
+// 父子两个物种的全部参数与盐相同 ⇒ 前面每一道判据逐位复现，这里只多一道签。1 = 不抽。
+float  CoverOverlayChance;
 
 /** 与 CSGpuInstancedMesh.usf:120-126 / CSGroundStairs.usf 同一份哈希的收尾段（uint → [0,1)）。 */
 float CSCover_Hash01(uint H)
@@ -192,6 +220,75 @@ float2 CSCover_GradientXY(float2 P)
 	return float2(Dx, Dy) / (2.0f * D);
 }
 
+float2 CSCover_BuildingVert(uint Base, uint I)
+{
+	const float4 Pair = CoverBuildings[Base + 2u + (I >> 1u)];
+	return (I & 1u) ? Pair.zw : Pair.xy;
+}
+
+/**
+ * 到最近那栋房子外皮的**有符号距离**（cm）：外正内负。一栋都够不着时返回一个大数（⇒ 必然落在环带外）。
+ *
+ * 凸多边形、逆时针 ⇒ 每条边的右手侧是外面。点在里面时"到最近边所在直线的距离"就是精确距离；
+ * 在外面时取到各线段的最短距离（角外那一块是到顶点的距离，环带在墙角因此是圆角，同 TG 的模糊 mask）。
+ */
+float CSCover_BuildingDistance(float2 P)
+{
+	const float Reach = CoverRingInner + CoverRingWidth;
+	float Best = 1e30f;
+	for (uint B = 0u; B < CoverBuildingCount; ++B)
+	{
+		const uint Base = B * CSCOVER_BUILDING_STRIDE;
+		const float4 Box = CoverBuildings[Base];
+		// 连包围盒都够不着：这栋不可能决定这一株在不在环带里。几十栋房子时绝大多数都在这里退掉。
+		const float2 Out = max(max(Box.xy - P, P - Box.zw), 0.0f);
+		if (dot(Out, Out) >= Reach * Reach) continue;
+
+		const uint N = min(uint(CoverBuildings[Base + 1u].x), uint(CSCOVER_BUILDING_MAX_VERTS));
+		bool bInside = true;
+		float Plane = -1e30f;
+		float Edge = 1e30f;
+		for (uint I = 0u; I < N; ++I)
+		{
+			const float2 A = CSCover_BuildingVert(Base, I);
+			const float2 E = CSCover_BuildingVert(Base, (I + 1u) % N) - A;
+			const float L2 = dot(E, E);
+			if (L2 < 1e-4f) continue;
+			const float S = dot(P - A, float2(E.y, -E.x)) * rsqrt(L2);
+			bInside = bInside && S <= 0.0f;
+			Plane = max(Plane, S);
+			Edge = min(Edge, length(P - (A + E * saturate(dot(P - A, E) / L2))));
+		}
+		Best = min(Best, bInside ? Plane : Edge);
+	}
+	return Best;
+}
+
+/** 值噪声的格点值。盐里带物种盐 ⇒ 灌木本体与叠加的花读到同一张噪声（它们共用盐，见 CoverOverlayChance）。 */
+float CSCover_NoiseLattice(int2 C)
+{
+	uint H = uint(C.x) * 0x9E3779B1u;
+	H ^= uint(C.y) * 0x85EBCA77u;
+	H ^= 61u * 0x27D4EB2Fu;
+	H ^= CoverSalt * 0xC2B2AE3Du;
+	H ^= CoverSeed * 0x9E3779B9u;
+	return CSCover_Hash01(H);
+}
+
+/** 2D 值噪声，smoothstep 插值（TG 同形：整数格点哈希 + `f²(3 − 2f)`）。用 floor，跨原点不出接缝。 */
+float CSCover_ValueNoise(float2 P)
+{
+	const float2 G = P / max(CoverRingNoiseCell, 1.0f);
+	const int2 C = int2(floor(G));
+	const float2 F = G - float2(C);
+	const float2 W = F * F * (3.0f - 2.0f * F);
+	const float V00 = CSCover_NoiseLattice(C);
+	const float V10 = CSCover_NoiseLattice(C + int2(1, 0));
+	const float V01 = CSCover_NoiseLattice(C + int2(0, 1));
+	const float V11 = CSCover_NoiseLattice(C + int2(1, 1));
+	return lerp(lerp(V00, V10, W.x), lerp(V01, V11, W.x), W.y);
+}
+
 /**
  * 簇站点：把格坐标 + R2 低差异序列抖动成一个点。R2 常数 `(0.75487, 0.56984)` 与撒叶用的是
  * **同一组**（TG 也是），所以簇的分布与叶的分布同源，不会出现"簇边界正好压在一排叶子上"。
@@ -237,7 +334,10 @@ void ScatterGroundCoverCS(uint3 Id : SV_DispatchThreadID)
 {
 	if (Id.x >= CoverGridDims.x || Id.y >= CoverGridDims.y) return;
 
-	const uint2 Cell = Id.xy;
+	// 窗口 → 整张网格的格号。整张网格散布时偏移为 0、两个格数相等，这两句逐位等于原来的 `Cell = Id.xy`。
+	const int2 GlobalCell = int2(Id.xy) + CoverCellOffset;
+	if (GlobalCell.x < 0 || GlobalCell.y < 0 || uint(GlobalCell.x) >= CoverGlobalDims.x || uint(GlobalCell.y) >= CoverGlobalDims.y) return;
+	const uint2 Cell = uint2(GlobalCell);
 
 	// 1) 稀疏抽签。**排在最前面**：花的概率可以低到 1%，先抽签能让 99% 的线程在读任何
 	//    buffer / 求任何场之前就退掉。草的概率是 1，这一句被编译成恒真，不花钱。
@@ -249,6 +349,21 @@ void ScatterGroundCoverCS(uint3 Id : SV_DispatchThreadID)
 	const float Jy = CSCover_Hash01(CSCover_CellSeed(Cell, 13u)) - 0.5f;
 	const float2 P = CellBase + (0.5f + CoverJitter * Jx) * float2(CoverCellSize, 0.0f)
 	                          + (0.5f + CoverJitter * Jy) * float2(0.0f, CoverCellSize);
+
+	// 2.5) 房屋环带（只有建筑周边灌木走这条）。排在遮罩之前：环带外的格占绝大多数，
+	//      在读色流、求高度场之前就该退掉。尺寸鼓包照 TG：环带里 0.4 处最大、两头缩到 0.2 倍。
+	float RingScale = 1.0f;
+	if (CoverRingWidth > 0.0f)
+	{
+		const float D = CSCover_BuildingDistance(P);
+		if (D <= CoverRingInner || D >= CoverRingInner + CoverRingWidth) return;
+		if (CSCover_ValueNoise(P) <= CoverRingNoiseThreshold) return;
+		const float T = (D - CoverRingInner) / CoverRingWidth;
+		const float Band = saturate(abs(T - 0.4f) / 0.3f);
+		const float Bump = 1.0f - Band * Band * (3.0f - 2.0f * Band);
+		RingScale = lerp(0.2f, 1.0f, sqrt(Bump));
+		if (RingScale < CoverRingMinScale) return;
+	}
 
 	// 3) 遮罩门控。**用概率拒绝而不是硬阈值**：硬阈值会沿等值线切出一条肉眼可见的直边，
 	//    而草的边界在自然界里是"越靠近路越稀"。抽签用的是格身份，所以边界同样是稳定的
@@ -354,7 +469,8 @@ void ScatterGroundCoverCS(uint3 Id : SV_DispatchThreadID)
 	//    与加这条之前逐位相同。
 	const float ClumpS = CSCover_Hash01(CSCover_ClumpSeed(ClumpCellId, 31u));
 	const float BladeS = CSCover_Hash01(CSCover_CellSeed(Cell, 31u));
-	const float Uniform = lerp(CoverScaleRange.x, CoverScaleRange.y, lerp(BladeS, ClumpS, CoverScaleClumpShare));
+	// 环带缩放乘在这里：粗细与高矮一起按它缩（草和花的 RingScale 恒为 1）。
+	const float Uniform = lerp(CoverScaleRange.x, CoverScaleRange.y, lerp(BladeS, ClumpS, CoverScaleClumpShare)) * RingScale;
 	float HeightScale = Uniform * (1.0f + CoverHeightJitter * (CSCover_Hash01(CSCover_CellSeed(Cell, 37u)) * 2.0f - 1.0f));
 	// 遮罩压高：TG 在路上把草高乘 (1 − path × 0.7)，路边因此是"矮草过渡"而不是一刀切。
 	HeightScale *= saturate(1.0f - Mask * CoverMaskShorten);
@@ -372,6 +488,9 @@ void ScatterGroundCoverCS(uint3 Id : SV_DispatchThreadID)
 	//    坐底修正跟着高度缩放走 —— 抖了 Z 却不抖 Rise，株底就不再钉在地面上（症状是一部分
 	//    浮起来、一部分陷进去，而且只在斜看时看得出，同石阶那条）。
 	const float Z = CoverGroundBaseZ + GroundShaperHeightAtXY(P) - CoverSink + CoverHeightOffset;
+
+	// 7.5) 叠加物种再抽一次签（通道盐独占 ⇒ 只可能是父物种那一批格子的子集）。
+	if (CoverOverlayChance < 1.0f && CSCover_Hash01(CSCover_CellSeed(Cell, 53u)) >= CoverOverlayChance) return;
 
 	// 8) 领槽位；越界静默丢弃（容量一次性定死、永不重算，这是零回读的代价与保证）。
 	uint Slot;

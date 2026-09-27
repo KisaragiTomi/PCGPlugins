@@ -108,6 +108,8 @@ public:
 		SHADER_PARAMETER(float, ScreenMultiple)
 		SHADER_PARAMETER(FVector4f, LodScreenSizes)
 		SHADER_PARAMETER(float, MaxDrawDistanceSq)
+		SHADER_PARAMETER(float, MinDrawDistance)
+		SHADER_PARAMETER(float, DrawFadeDistance)
 		SHADER_PARAMETER(uint32, NumLods)
 		SHADER_PARAMETER(uint32, NumClusters)
 		SHADER_PARAMETER(uint32, ClusterSize)
@@ -257,6 +259,8 @@ FCSGpuInstancedMeshSceneProxy::FCSGpuInstancedMeshSceneProxy(UCSGpuInstancedMesh
 	, GpuSource(Component->GetInstanceSourceGPU())
 	, GpuPointSource(Component->GetInstancePointSourceGPU())
 	, EndCullDistance(FMath::Max(Component->InstanceEndCullDistance, 0.0f))
+	, StartCullDistance(FMath::Max(Component->InstanceStartCullDistance, 0.0f))
+	, CullFadeDistance(FMath::Max(Component->InstanceCullFadeDistance, 0.0f))
 	, LodScreenSizeScale(FMath::Max(Component->LODScreenSizeScale, 0.01f))
 	, bFrustumCull(Component->bGpuFrustumCulling)
 	, bLodSelect(Component->bGpuLODSelection)
@@ -626,6 +630,9 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 		Params->ScreenMultiple = ScreenMultiple;
 		Params->LodScreenSizes = LodScreenSizes;
 		Params->MaxDrawDistanceSq = MaxDrawDistanceSq;
+		// 距离带（起始距离 + 过渡带）只在逐实例这一级判：簇级只做最大距离，恒保守（过渡带只会把边界往里收）。
+		Params->MinDrawDistance = StartCullDistance;
+		Params->DrawFadeDistance = CullFadeDistance;
 		Params->NumLods = Layout.NumLODs;
 		Params->NumClusters = Layout.NumClusters;
 		Params->ClusterSize = Layout.NumClusters > 0 ? Layout.ClusterSize : 0u;

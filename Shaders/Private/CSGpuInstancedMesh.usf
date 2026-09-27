@@ -57,6 +57,11 @@ uint   ClusterSize;           // instances per cluster (0 => no cluster level)
 uint   MaxInstancesPerLod;    // stride of one LOD's region in the visible buffers
 uint   MaxSourceInstances;    // capacity of SrcInstances, guards a stale GPU counter
 float  MaxDrawDistanceSq;     // world units squared; 0 disables the distance cull
+// 距离带（2026-09-22，地被近 / 远两档）：近于 MinDrawDistance 的不画；起止两道边界各在
+// [边界 − DrawFadeDistance, 边界] 里按逐实例随机数（Origin.w）取一个点 —— 近侧组件越往外越稀、
+// 远侧组件越往外越密，两个组件用同一条带就互补。只在逐实例这一级判（簇级只做最大距离，恒保守）。
+float  MinDrawDistance;       // world units; 0 disables
+float  DrawFadeDistance;      // world units; 0 = hard boundaries
 uint   bFrustumCull;
 uint   bLodSelect;
 
@@ -196,6 +201,17 @@ void InstanceCullCS(uint3 Id : SV_DispatchThreadID)
 	if (SrcInstances[Base + 3u].w < 0.0f) return;
 	const float4 Sphere = SrcInstances[Base + 4u];
 	if (!PassesViewTests(Sphere.xyz, Sphere.w)) return;
+
+	// 距离带：边界按逐实例随机数往里收 [0, DrawFadeDistance]。同一条带、两个组件各取一侧 ⇒
+	// 距离 d 处近侧留下 (B − d) / Fade、远侧留下 1 − (B − d) / Fade，交界处是渐变而不是一道硬圈。
+	// 随机数取 packed 行的 Origin.w（负值已在上面整条跳过；只有设了过渡带的组件才读它的语义）。
+	if (MinDrawDistance > 0.0f || DrawFadeDistance > 0.0f)
+	{
+		const float DistWorld = length(Sphere.xyz - ViewOriginLocal) * ComponentScale;
+		const float Pull = DrawFadeDistance * saturate(SrcInstances[Base + 3u].w);
+		if (MaxDrawDistanceSq > 0.0f && DistWorld > sqrt(MaxDrawDistanceSq) - Pull) return;
+		if (MinDrawDistance > 0.0f && DistWorld < MinDrawDistance - Pull) return;
+	}
 
 	uint Lod = 0u;
 	if (bLodSelect != 0 && NumLods > 1u)

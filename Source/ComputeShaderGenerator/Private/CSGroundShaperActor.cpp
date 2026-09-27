@@ -28,9 +28,13 @@ ACSGroundShaperActor::ACSGroundShaperActor()
 	SpriteComponent = CreateEditorOnlyDefaultSubobject<UBillboardComponent>(TEXT("Sprite"));
 	if (SpriteComponent)
 	{
-		static ConstructorHelpers::FObjectFinderOptional<UTexture2D> SpriteTexture(TEXT("/Engine/EditorResources/S_Actor"));
+		// 地形图标，显示尺寸是原先 S_Actor 的 3 倍（用户指定 2026-09-18）。精灵大小按**贴图像素**算
+		// （× 组件缩放 × 0.25，见引擎 FSpriteSceneProxy）：S_Terrain 256² 对 S_Actor 128²，换图本身就大了
+		// 2 倍，所以缩放取 1.5 而不是 3。
+		static ConstructorHelpers::FObjectFinderOptional<UTexture2D> SpriteTexture(TEXT("/Engine/EditorResources/S_Terrain.S_Terrain"));
 		SpriteComponent->Sprite = SpriteTexture.Get();
 		SpriteComponent->SetupAttachment(RootComponent);
+		SpriteComponent->SetRelativeScale3D(FVector(1.5));
 		SpriteComponent->bIsScreenSizeScaled = true;
 		SpriteComponent->SetHiddenInGame(true);
 	}

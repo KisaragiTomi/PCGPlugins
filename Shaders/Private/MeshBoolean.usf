@@ -13,6 +13,8 @@
 // Keep their implementation in one include so Boolean consumes them without owning
 // or duplicating their math; only classification/output policy remains in this file.
 #include "/Plugin/PCGPlugins/Shaders/Private/CSGpuTriangleUtilities.ush"
+// 焊接修补结果的读取约定（拓扑绕序、代表点位置、零面积撑开），修补后的发射核用。
+#include "/Plugin/PCGPlugins/Shaders/Private/MeshBooleanRepair.ush"
 
 // RW_Stats 槽位
 #define STAT_COPLANAR       0
@@ -1358,23 +1360,16 @@ void MeshBooleanCountKeptCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_Gro
 	InterlockedAdd(RW_MBOutKeptCounter[0], 1u);
 }
 
-// 每 fragment 一线程：解重心权重、插源属性、写进常驻流。
-[numthreads(THREADGROUPSIZE_X, 1, 1)]
-void MeshBooleanEmitToMeshCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+// 一个已定稿的三角（源三角、角点位置与绕序都已确定）：解重心权重、插源属性、写进常驻流。
+// 未修补与修补后的两个发射核共用这一份，属性重建因此只有一套。
+void MBOutEmitTriangle(uint tri, float3 p[3])
 {
-	const uint f = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
-	if (f >= MBOutFragmentCount) return;
-
-	uint tri;
-	float3 p[3];
-	if (!MBOutAcceptFragment(f, MBOutSourceTriangleCount, tri, p[0], p[1], p[2])) return;
-
 	uint dstTri;
 	InterlockedAdd(RW_MBOutTriangleCounter[0], 1u, dstTri);
 	const uint dstCorner = dstTri * 3u;
 	if ((dstCorner + 2u) >= MBOutVertexCapacity || (dstCorner + 2u) >= MBOutIndexCapacity) return;
 
-	// 被接受的 fragment 一定有合法源三角（accept 的第一条判据就是它），所以 CPU 版里
+	// 调用方保证 tri 是合法源三角（accept 的第一条判据就是它），所以 CPU 版里
 	// 「没有源」那条分支（几何法线 + 由 UV 反解切线）在这里不可达，没有移植。
 	const float3 faceNormal = MBOutSourceFaceNormal(tri);
 	const float3 Na = MBOutSafeNormal(MBOutSourceNormals[tri * 3u + 0u].xyz, float3(0.0f, 0.0f, 1.0f));
@@ -1438,6 +1433,49 @@ void MeshBooleanEmitToMeshCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_Gr
 	RW_MBOutMaterialIds[dstTri] = (SourceMaterialId >= MBOutMaterialRegistryCount)
 		? MBOutNoMaterialSlot
 		: SourceMaterialId;
+}
+
+// 每 fragment 一线程：解重心权重、插源属性、写进常驻流。
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MeshBooleanEmitToMeshCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint f = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (f >= MBOutFragmentCount) return;
+
+	uint tri;
+	float3 p[3];
+	if (!MBOutAcceptFragment(f, MBOutSourceTriangleCount, tri, p[0], p[1], p[2])) return;
+	MBOutEmitTriangle(tri, p);
+}
+
+// 焊接修补后的输出（MeshBooleanRepair.usf 算出的结果）：每个输出 fragment 与每个补缝三角
+// 一线程。位置是焊接代表点加撑开偏移，绕序取拓扑绕序 —— 它就是 accept 的约定，只是在
+// 焊接前定下，薄片被焊平也不会翻。焊接把厚 fragment 折反时仍按源法线翻回来，与 CPU 路径
+// Stage 14 同一口径；补缝三角横跨缝两侧、借的源法线未必与它自己的面一致，永远按拓扑绕序，
+// 翻了就和邻面配不上。
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MeshBooleanEmitRepairedToMeshCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint id = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (id >= MBRepFragmentCount + MBRepFillCount) return;
+	if (id < MBRepFragmentCount && !MBRepIsOutput(MBRepFlags[id])) return;
+
+	uint r0, r1, r2, tri;
+	MBRepTriangle(id, r0, r1, r2, tri);
+	if (tri >= MBOutSourceTriangleCount) return;
+
+	float3 p[3];
+	p[0] = MBRepFinalPos(r0);
+	p[1] = MBRepFinalPos(r1);
+	p[2] = MBRepFinalPos(r2);
+	const float3 facing = cross(p[1] - p[0], p[2] - p[0]);
+	if (id < MBRepFragmentCount && dot(facing, facing) > 1e-8f && dot(facing, MBOutSourceFaceNormal(tri)) > 0.0f)
+	{
+		const float3 swap = p[1];
+		p[1] = p[2];
+		p[2] = swap;
+	}
+	MBOutEmitTriangle(tri, p);
 }
 
 // 输出大小只有 GPU 知道，所以计数与 DrawIndexedIndirect 参数都从 emit 的游标里取，

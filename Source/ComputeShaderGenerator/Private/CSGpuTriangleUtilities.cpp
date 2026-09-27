@@ -140,46 +140,89 @@ namespace
 		CS_TRIANGLE_UTILITY_PERM()
 	};
 
-	class FCSVertexWeldHashCS : public FGlobalShader
+	// Parameters shared by the salted-table passes. Every kernel below reads the corner
+	// count, the participation filter and the grid; RDG binds only what each one uses.
+#define CS_VERTEX_WELD_COMMON_PARAMETERS() \
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FVector3f>, WeldOutputPositions) \
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, WeldOutputCounter) \
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, WeldTriangleFilter) \
+		RDG_BUFFER_ACCESS(WeldOutputIndirectArgs, ERHIAccess::IndirectArgs) \
+		SHADER_PARAMETER(uint32, WeldOutputMaxTriangles) \
+		SHADER_PARAMETER(uint32, WeldTriangleFilterMask) \
+		SHADER_PARAMETER(FVector3f, WeldOutputOrigin) \
+		SHADER_PARAMETER(float, WeldOutputInvCellSize) \
+		SHADER_PARAMETER(uint32, WeldSaltedTableBase) \
+		SHADER_PARAMETER(uint32, WeldSaltedTableMask) \
+		SHADER_PARAMETER(uint32, WeldSaltBase) \
+		SHADER_PARAMETER(uint32, WeldSaltCount)
+
+	class FCSVertexWeldSaltedHashCS : public FGlobalShader
 	{
-		DECLARE_GLOBAL_SHADER(FCSVertexWeldHashCS);
-		SHADER_USE_PARAMETER_STRUCT(FCSVertexWeldHashCS, FGlobalShader);
+		DECLARE_GLOBAL_SHADER(FCSVertexWeldSaltedHashCS);
+		SHADER_USE_PARAMETER_STRUCT(FCSVertexWeldSaltedHashCS, FGlobalShader);
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FVector3f>, WeldOutputPositions)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, WeldOutputCounter)
-			SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_WeldOutputBuckets)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, WeldTriangleFilter)
-			RDG_BUFFER_ACCESS(WeldOutputIndirectArgs, ERHIAccess::IndirectArgs)
-			SHADER_PARAMETER(uint32, WeldOutputMaxTriangles)
-			SHADER_PARAMETER(uint32, WeldOutputBucketMask)
-			SHADER_PARAMETER(uint32, WeldTriangleFilterMask)
-			SHADER_PARAMETER(FVector3f, WeldOutputOrigin)
-			SHADER_PARAMETER(float, WeldOutputInvCellSize)
+			CS_VERTEX_WELD_COMMON_PARAMETERS()
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_WeldSaltedBuckets)
 		END_SHADER_PARAMETER_STRUCT()
 		CS_TRIANGLE_UTILITY_PERM()
 	};
 
-	class FCSVertexWeldResolveCS : public FGlobalShader
+	class FCSVertexWeldOrphanHashCS : public FGlobalShader
 	{
-		DECLARE_GLOBAL_SHADER(FCSVertexWeldResolveCS);
-		SHADER_USE_PARAMETER_STRUCT(FCSVertexWeldResolveCS, FGlobalShader);
+		DECLARE_GLOBAL_SHADER(FCSVertexWeldOrphanHashCS);
+		SHADER_USE_PARAMETER_STRUCT(FCSVertexWeldOrphanHashCS, FGlobalShader);
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FVector3f>, WeldOutputPositions)
+			CS_VERTEX_WELD_COMMON_PARAMETERS()
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_WeldSaltedBuckets)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, WeldSaltedRepresentatives)
+		END_SHADER_PARAMETER_STRUCT()
+		CS_TRIANGLE_UTILITY_PERM()
+	};
+
+	/** Shared by both resolve rounds; only the entry point differs. */
+	BEGIN_SHADER_PARAMETER_STRUCT(FCSVertexWeldResolveParameters, )
+		CS_VERTEX_WELD_COMMON_PARAMETERS()
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, WeldSaltedBuckets)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_WeldOutputRepresentatives)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_WeldStats)
+		SHADER_PARAMETER(float, WeldOutputDistanceSq)
+	END_SHADER_PARAMETER_STRUCT()
+
+	class FCSVertexWeldSaltedResolveCS : public FGlobalShader
+	{
+		DECLARE_GLOBAL_SHADER(FCSVertexWeldSaltedResolveCS);
+		SHADER_USE_PARAMETER_STRUCT(FCSVertexWeldSaltedResolveCS, FGlobalShader);
+		using FParameters = FCSVertexWeldResolveParameters;
+		CS_TRIANGLE_UTILITY_PERM()
+	};
+
+	class FCSVertexWeldOrphanResolveCS : public FGlobalShader
+	{
+		DECLARE_GLOBAL_SHADER(FCSVertexWeldOrphanResolveCS);
+		SHADER_USE_PARAMETER_STRUCT(FCSVertexWeldOrphanResolveCS, FGlobalShader);
+		using FParameters = FCSVertexWeldResolveParameters;
+		CS_TRIANGLE_UTILITY_PERM()
+	};
+
+	class FCSVertexWeldFlattenCS : public FGlobalShader
+	{
+		DECLARE_GLOBAL_SHADER(FCSVertexWeldFlattenCS);
+		SHADER_USE_PARAMETER_STRUCT(FCSVertexWeldFlattenCS, FGlobalShader);
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 			SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, WeldOutputCounter)
-			SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_WeldOutputBuckets)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, WeldTriangleFilter)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_WeldOutputRepresentatives)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, WeldTriangleFilter)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_WeldStats)
 			RDG_BUFFER_ACCESS(WeldOutputIndirectArgs, ERHIAccess::IndirectArgs)
 			SHADER_PARAMETER(uint32, WeldOutputMaxTriangles)
-			SHADER_PARAMETER(uint32, WeldOutputBucketMask)
 			SHADER_PARAMETER(uint32, WeldTriangleFilterMask)
-			SHADER_PARAMETER(FVector3f, WeldOutputOrigin)
-			SHADER_PARAMETER(float, WeldOutputInvCellSize)
-			SHADER_PARAMETER(float, WeldOutputDistanceSq)
+			SHADER_PARAMETER(uint32, WeldFlattenPass)
+			SHADER_PARAMETER(uint32, WeldFlattenLastPass)
 		END_SHADER_PARAMETER_STRUCT()
 		CS_TRIANGLE_UTILITY_PERM()
 	};
 
+#undef CS_VERTEX_WELD_COMMON_PARAMETERS
 #undef CS_TRIANGLE_UTILITY_PERM
 }
 
@@ -194,8 +237,11 @@ IMPLEMENT_GLOBAL_SHADER(FCSLBVHFinalizeCS, "/Plugin/PCGPlugins/Shaders/Private/C
 IMPLEMENT_GLOBAL_SHADER(FCSFastWindingLeafInitCS, "/Plugin/PCGPlugins/Shaders/Private/CSGpuTriangleUtilities.usf", "WindingLeafInitCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FCSFastWindingMergeCS, "/Plugin/PCGPlugins/Shaders/Private/CSGpuTriangleUtilities.usf", "WindingMergeCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FCSVertexWeldIndirectArgsCS, "/Plugin/PCGPlugins/Shaders/Private/CSGpuTriangleUtilities.usf", "OutputWeldIndirectArgsCS", SF_Compute);
-IMPLEMENT_GLOBAL_SHADER(FCSVertexWeldHashCS, "/Plugin/PCGPlugins/Shaders/Private/CSGpuTriangleUtilities.usf", "OutputWeldHashCS", SF_Compute);
-IMPLEMENT_GLOBAL_SHADER(FCSVertexWeldResolveCS, "/Plugin/PCGPlugins/Shaders/Private/CSGpuTriangleUtilities.usf", "OutputWeldResolveCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FCSVertexWeldSaltedHashCS, "/Plugin/PCGPlugins/Shaders/Private/CSGpuTriangleUtilities.usf", "OutputWeldSaltedHashCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FCSVertexWeldSaltedResolveCS, "/Plugin/PCGPlugins/Shaders/Private/CSGpuTriangleUtilities.usf", "OutputWeldSaltedResolveCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FCSVertexWeldOrphanHashCS, "/Plugin/PCGPlugins/Shaders/Private/CSGpuTriangleUtilities.usf", "OutputWeldOrphanHashCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FCSVertexWeldOrphanResolveCS, "/Plugin/PCGPlugins/Shaders/Private/CSGpuTriangleUtilities.usf", "OutputWeldOrphanResolveCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FCSVertexWeldFlattenCS, "/Plugin/PCGPlugins/Shaders/Private/CSGpuTriangleUtilities.usf", "OutputWeldFlattenCS", SF_Compute);
 
 CSGpuTriangleUtilities::FTriangleLBVH CSGpuTriangleUtilities::AddTriangleLBVHBuildPasses(
 	FRDGBuilder& GraphBuilder,
@@ -394,17 +440,29 @@ FRDGBufferRef CSGpuTriangleUtilities::AddVertexWeldPasses(
 	const FVector3f& GridOrigin,
 	float WeldDistance,
 	FRDGBufferSRVRef TriangleFilter,
-	uint32 TriangleFilterMask)
+	uint32 TriangleFilterMask,
+	FRDGBufferUAVRef StatsUAV)
 {
+	// Two independent tables per round took cross-cell collisions to zero in the Houdini
+	// replica of this weld (Docs/meshboolean-weld-failure-cases.md); one table left 3.4% of
+	// the corners with their own cell's bucket held by another cell.
+	constexpr uint32 TablesPerRound = 2u;
+	// A chain link exists only where a representative itself picked a lower one; four
+	// jumps flatten chains of sixteen links.
+	constexpr int32 FlattenPasses = 4;
+
 	const int32 CornerCapacity = FMath::Max(1, OutputTriangleCapacity * 3);
 	const uint32 DesiredBuckets = uint32(FMath::Clamp<int64>(
 		int64(SourceTriangleCapacity) * 6ll, 1024ll, 1ll << 24));
 	uint32 BucketCount = 1u;
 	while (BucketCount < DesiredBuckets) BucketCount <<= 1u;
+	// Round 1 hashes only the orphans, a small fraction of the corners.
+	const uint32 OrphanBucketCount = FMath::Max(1024u, BucketCount / 4u);
+	const uint32 TotalBuckets = TablesPerRound * (BucketCount + OrphanBucketCount);
 
 	FRDGBufferRef Buckets = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), int32(BucketCount)),
-		TEXT("CS.VertexWeld.Buckets"));
+		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), int32(TotalBuckets)),
+		TEXT("CS.VertexWeld.SaltedBuckets"));
 	FRDGBufferRef Representatives = GraphBuilder.CreateBuffer(
 		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), CornerCapacity),
 		TEXT("CS.VertexWeld.Representatives"));
@@ -412,6 +470,7 @@ FRDGBufferRef CSGpuTriangleUtilities::AddVertexWeldPasses(
 		FRDGBufferDesc::CreateIndirectDesc<FRHIDispatchIndirectParameters>(),
 		TEXT("CS.VertexWeld.IndirectArgs"));
 	FRDGBufferUAVRef BucketUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Buckets, PF_R32_UINT));
+	FRDGBufferSRVRef BucketSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Buckets, PF_R32_UINT));
 	FRDGBufferUAVRef RepresentativeUAV =
 		GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Representatives, PF_R32_UINT));
 	FRDGBufferUAVRef IndirectArgsUAV =
@@ -421,6 +480,14 @@ FRDGBufferRef CSGpuTriangleUtilities::AddVertexWeldPasses(
 		GraphBuilder.CreateSRV(FRDGBufferSRVDesc(OutputTriangleCounter, PF_R32_UINT));
 	AddClearUAVPass(GraphBuilder, BucketUAV, 0xFFFFFFFFu);
 	AddClearUAVPass(GraphBuilder, RepresentativeUAV, 0xFFFFFFFFu);
+
+	if (!StatsUAV)
+	{
+		FRDGBufferRef Stats = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), VertexWeldStatCount), TEXT("CS.VertexWeld.Stats"));
+		StatsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Stats, PF_R32_UINT));
+		AddClearUAVPass(GraphBuilder, StatsUAV, 0u);
+	}
 
 	// RDG requires every declared resource to be bound. With filtering off the shader
 	// short-circuits on the mask before touching the buffer, so any uint SRV will do.
@@ -438,41 +505,82 @@ FRDGBufferRef CSGpuTriangleUtilities::AddVertexWeldPasses(
 			Shader, Parameters, FIntVector(1, 1, 1));
 	}
 
+	auto FillCommon = [&](auto* Parameters, uint32 TableBase, uint32 TableBucketCount, uint32 SaltBase)
 	{
-		FCSVertexWeldHashCS::FParameters* Parameters =
-			GraphBuilder.AllocParameters<FCSVertexWeldHashCS::FParameters>();
 		Parameters->WeldOutputPositions = PositionSRV;
 		Parameters->WeldOutputCounter = CounterSRV;
-		Parameters->RW_WeldOutputBuckets = BucketUAV;
 		Parameters->WeldTriangleFilter = FilterSRV;
 		Parameters->WeldOutputIndirectArgs = IndirectArgs;
 		Parameters->WeldOutputMaxTriangles = uint32(OutputTriangleCapacity);
-		Parameters->WeldOutputBucketMask = BucketCount - 1u;
 		Parameters->WeldTriangleFilterMask = FilterMask;
 		Parameters->WeldOutputOrigin = GridOrigin;
 		Parameters->WeldOutputInvCellSize = 1.0f / WeldDistance;
-		TShaderMapRef<FCSVertexWeldHashCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CS.VertexWeld.Hash"),
+		Parameters->WeldSaltedTableBase = TableBase;
+		Parameters->WeldSaltedTableMask = TableBucketCount - 1u;
+		Parameters->WeldSaltBase = SaltBase;
+		Parameters->WeldSaltCount = TablesPerRound;
+	};
+	auto FillResolve = [&](uint32 TableBase, uint32 TableBucketCount, uint32 SaltBase)
+	{
+		FCSVertexWeldResolveParameters* Parameters = GraphBuilder.AllocParameters<FCSVertexWeldResolveParameters>();
+		FillCommon(Parameters, TableBase, TableBucketCount, SaltBase);
+		Parameters->WeldSaltedBuckets = BucketSRV;
+		Parameters->RW_WeldOutputRepresentatives = RepresentativeUAV;
+		Parameters->RW_WeldStats = StatsUAV;
+		Parameters->WeldOutputDistanceSq = WeldDistance * WeldDistance;
+		return Parameters;
+	};
+
+	// Round 0: every participating corner.
+	{
+		FCSVertexWeldSaltedHashCS::FParameters* Parameters =
+			GraphBuilder.AllocParameters<FCSVertexWeldSaltedHashCS::FParameters>();
+		FillCommon(Parameters, 0u, BucketCount, 0u);
+		Parameters->RW_WeldSaltedBuckets = BucketUAV;
+		TShaderMapRef<FCSVertexWeldSaltedHashCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CS.VertexWeld.SaltedHash"),
 			Shader, Parameters, IndirectArgs, 0u);
 	}
-
 	{
-		FCSVertexWeldResolveCS::FParameters* Parameters =
-			GraphBuilder.AllocParameters<FCSVertexWeldResolveCS::FParameters>();
-		Parameters->WeldOutputPositions = PositionSRV;
+		TShaderMapRef<FCSVertexWeldSaltedResolveCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CS.VertexWeld.SaltedResolve"),
+			Shader, FillResolve(0u, BucketCount, 0u), IndirectArgs, 0u);
+	}
+
+	// Round 1: orphans only, in their own tables with fresh salts.
+	const uint32 OrphanTableBase = TablesPerRound * BucketCount;
+	{
+		FCSVertexWeldOrphanHashCS::FParameters* Parameters =
+			GraphBuilder.AllocParameters<FCSVertexWeldOrphanHashCS::FParameters>();
+		FillCommon(Parameters, OrphanTableBase, OrphanBucketCount, TablesPerRound);
+		Parameters->RW_WeldSaltedBuckets = BucketUAV;
+		Parameters->WeldSaltedRepresentatives =
+			GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Representatives, PF_R32_UINT));
+		TShaderMapRef<FCSVertexWeldOrphanHashCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CS.VertexWeld.OrphanHash"),
+			Shader, Parameters, IndirectArgs, 0u);
+	}
+	{
+		TShaderMapRef<FCSVertexWeldOrphanResolveCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CS.VertexWeld.OrphanResolve"),
+			Shader, FillResolve(OrphanTableBase, OrphanBucketCount, TablesPerRound), IndirectArgs, 0u);
+	}
+
+	for (int32 Pass = 0; Pass < FlattenPasses; ++Pass)
+	{
+		FCSVertexWeldFlattenCS::FParameters* Parameters =
+			GraphBuilder.AllocParameters<FCSVertexWeldFlattenCS::FParameters>();
 		Parameters->WeldOutputCounter = CounterSRV;
-		Parameters->RW_WeldOutputBuckets = BucketUAV;
-		Parameters->RW_WeldOutputRepresentatives = RepresentativeUAV;
 		Parameters->WeldTriangleFilter = FilterSRV;
+		Parameters->RW_WeldOutputRepresentatives = RepresentativeUAV;
+		Parameters->RW_WeldStats = StatsUAV;
 		Parameters->WeldOutputIndirectArgs = IndirectArgs;
 		Parameters->WeldOutputMaxTriangles = uint32(OutputTriangleCapacity);
-		Parameters->WeldOutputBucketMask = BucketCount - 1u;
 		Parameters->WeldTriangleFilterMask = FilterMask;
-		Parameters->WeldOutputOrigin = GridOrigin;
-		Parameters->WeldOutputInvCellSize = 1.0f / WeldDistance;
-		Parameters->WeldOutputDistanceSq = WeldDistance * WeldDistance;
-		TShaderMapRef<FCSVertexWeldResolveCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CS.VertexWeld.Resolve"),
+		Parameters->WeldFlattenPass = uint32(Pass);
+		Parameters->WeldFlattenLastPass = Pass == FlattenPasses - 1 ? 1u : 0u;
+		TShaderMapRef<FCSVertexWeldFlattenCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CS.VertexWeld.Flatten.%d", Pass),
 			Shader, Parameters, IndirectArgs, 0u);
 	}
 

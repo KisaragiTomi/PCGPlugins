@@ -1,0 +1,159 @@
+#ifndef MESH_BOOLEAN_REPAIR_USH
+#define MESH_BOOLEAN_REPAIR_USH
+
+// Read side of the GPU weld + repair of a Boolean result: flag layout, topological corner
+// order, welded and nudged positions. MeshBooleanRepair.usf computes all of it; the repaired
+// emit in MeshBoolean.usf writes the resident mesh from it. Both include this file so the
+// bits and the nudge rule cannot drift apart between the pass that decides and the pass
+// that draws.
+//
+// Triangle ids: [0, MBRepFragmentCount) are arrangement fragments, the rest index the fill
+// triangles that close slit cracks.
+
+#define MB_REPAIR_VALID       0x001u  // valid source, non-degenerate before welding
+#define MB_REPAIR_LIVE        0x002u  // kept by Stage B, or restored
+#define MB_REPAIR_COLLAPSED   0x004u  // two corners welded into one vertex
+#define MB_REPAIR_SWAP        0x008u  // topological corner order is (0, 2, 1)
+#define MB_REPAIR_DUPLICATE   0x010u  // same vertex set as a lower-numbered live fragment
+#define MB_REPAIR_RESTORED    0x020u  // deleted by Stage B, put back to close a hole
+#define MB_REPAIR_CHECK       0x040u  // restored in the last round: its own edges need a look
+#define MB_REPAIR_MARK        0x080u  // chosen for restoration in the current round
+#define MB_REPAIR_BOUNDARY0   0x100u  // topological edge k is open: MB_REPAIR_BOUNDARY0 << k
+#define MB_REPAIR_SLIT0       0x800u  // topological edge k lies on a slit: MB_REPAIR_SLIT0 << k
+#define MB_REPAIR_REJECTED    0x4000u // restoration candidate that failed the exposure test; never retried
+#define MB_REPAIR_BOUNDARY_MASK (MB_REPAIR_BOUNDARY0 * 7u)
+#define MB_REPAIR_SLIT_MASK   (MB_REPAIR_SLIT0 * 7u)
+#define MB_REPAIR_OUTPUT_MASK (MB_REPAIR_VALID | MB_REPAIR_LIVE | MB_REPAIR_COLLAPSED | MB_REPAIR_DUPLICATE)
+#define MB_REPAIR_OUTPUT      (MB_REPAIR_VALID | MB_REPAIR_LIVE)
+#define MB_REPAIR_NONE        0xFFFFFFFFu
+#define MB_REPAIR_LOOP_PENDING 0xFFFFFFFEu   // slit-loop vertex whose push is not computed yet
+
+// Same bits as MB_SRC_MASK / MB_SRC_KEEP in MeshBoolean.usf.
+#define MB_REPAIR_SOURCE_MASK 0x1fffffffu
+#define MB_REPAIR_SOURCE_KEEP 0x80000000u
+
+StructuredBuffer<float3> MBRepSoup;           // fragment soup, 3 corners per fragment
+Buffer<uint>   MBRepSource;                   // encoded source per fragment
+Buffer<float4> MBRepSourceVertices;           // source soup, 3 per source triangle
+Buffer<uint>   MBRepReps;                     // welded representative corner per corner
+Buffer<uint>   MBRepFlags;                    // MB_REPAIR_* per fragment
+Buffer<uint>   MBRepClaims;                   // per corner: lowest sliver id that nudges it
+Buffer<uint>   MBRepLoopSlots;                // per corner: slit-loop vertex push slot, or MB_REPAIR_NONE
+Buffer<float4> MBRepLoopOffsets;              // the pushes, xyz
+Buffer<uint4>  MBRepFills;                    // slit fill: 3 representatives + source triangle
+uint  MBRepFragmentCount;
+uint  MBRepFillCount;
+float MBRepNudgeDistance;                     // height a thin triangle's middle vertex is lifted to
+float MBRepSlitTolerance;                     // thinner than this counts as a crack
+
+bool MBRepIsOutput(uint flags)
+{
+	return (flags & MB_REPAIR_OUTPUT_MASK) == MB_REPAIR_OUTPUT;
+}
+
+// Topological order is the order MBOutAcceptFragment emits: cross(p1 - p0, p2 - p0) points
+// against the source normal. It is decided once from the pre-weld corners, so welding a
+// sliver flat cannot flip which way its edges run.
+uint MBRepTopoRep(uint f, uint flags, uint k)
+{
+	uint slot = ((flags & MB_REPAIR_SWAP) != 0u && k != 0u) ? 3u - k : k;
+	return MBRepReps[f * 3u + slot];
+}
+
+float3 MBRepWeldedPos(uint rep)
+{
+	return MBRepSoup[rep];
+}
+
+float3 MBRepSourceNormal(uint tri)
+{
+	const float3 A = MBRepSourceVertices[tri * 3u + 0u].xyz;
+	const float3 B = MBRepSourceVertices[tri * 3u + 1u].xyz;
+	const float3 C = MBRepSourceVertices[tri * 3u + 2u].xyz;
+	const float3 N = cross(B - A, C - A);
+	const float L = length(N);
+	return (L > 1e-12f) ? (N / L) : float3(0.0f, 0.0f, 1.0f);
+}
+
+// Representatives (topological order) and source triangle of a repaired triangle.
+void MBRepTriangle(uint id, out uint r0, out uint r1, out uint r2, out uint tri)
+{
+	if (id < MBRepFragmentCount)
+	{
+		const uint flags = MBRepFlags[id];
+		r0 = MBRepTopoRep(id, flags, 0u);
+		r1 = MBRepTopoRep(id, flags, 1u);
+		r2 = MBRepTopoRep(id, flags, 2u);
+		tri = MBRepSource[id] & MB_REPAIR_SOURCE_MASK;
+		return;
+	}
+	const uint4 fill = MBRepFills[id - MBRepFragmentCount];
+	r0 = fill.x;
+	r1 = fill.y;
+	r2 = fill.z;
+	tri = fill.w;
+}
+
+// A thin triangle's middle vertex (the one opposite the longest edge) and the offset that
+// puts it MBRepNudgeDistance off that edge, on the side the topological order asks for.
+//
+// This is how welded slivers get area: welding flattens them onto a line, and every
+// downstream consumer drops |cross| <= 1e-4 (StaticMesh build, DynamicMesh copy). Such a
+// triangle is not noise - its three edges are shared with its neighbours, so dropping it
+// reopens the crack it was closing. Lifting the middle vertex by a few float ulps inside the
+// triangle's own source plane keeps it. (Slit fills get their area from the loop-vertex
+// push instead.)
+//
+// Only thin triangles move: height below the target, and not inverted by more than a crack
+// width (those are folds, not slivers, and are left to the emit's orientation rule).
+bool MBRepThinVertex(float3 p0, float3 p1, float3 p2, float3 N, out uint middle, out float3 offset)
+{
+	middle = 0u;
+	offset = float3(0.0f, 0.0f, 0.0f);
+	const float l0 = dot(p1 - p0, p1 - p0);
+	const float l1 = dot(p2 - p1, p2 - p1);
+	const float l2 = dot(p0 - p2, p0 - p2);
+	float3 a = p0, b = p1, m = p2;
+	middle = 2u;
+	if (l1 >= l0 && l1 >= l2) { a = p1; b = p2; m = p0; middle = 0u; }
+	else if (l2 >= l0 && l2 >= l1) { a = p2; b = p0; m = p1; middle = 1u; }
+
+	const float3 ab = b - a;
+	const float len = length(ab);
+	if (!(len > 1e-4f)) return false;
+	const float3 e = ab / len;
+	float3 w = cross(N, e);
+	const float wl = length(w);
+	// An edge running along the source normal has no in-plane side to push toward.
+	if (!(wl > 0.1f)) return false;
+	w /= wl;
+	// (m, a, b) is a cyclic rotation of the triangle, and cross(b - a, m - a) . N equals
+	// len * beta * wl, so the topological convention (negative) wants beta < 0.
+	const float beta = dot(m - a, w);
+	const float height = -beta;
+	if (height >= MBRepNudgeDistance || height <= -MBRepSlitTolerance) return false;
+	offset = (-MBRepNudgeDistance - beta) * w;
+	return true;
+}
+
+// Welded position plus its nudge: a slit-loop vertex is pushed off the crack into its own
+// faces (a stored offset, since it depends on all the open edges at the vertex); any other
+// vertex takes the offset of the sliver that won it, recomputed from that sliver rather than
+// stored - one uint per corner instead of a float3.
+float3 MBRepFinalPos(uint rep)
+{
+	const float3 p = MBRepWeldedPos(rep);
+	const uint loopSlot = MBRepLoopSlots[rep];
+	if (loopSlot < MB_REPAIR_LOOP_PENDING) return p + MBRepLoopOffsets[loopSlot].xyz;
+	const uint claim = MBRepClaims[rep];
+	if (claim == MB_REPAIR_NONE) return p;
+	uint r0, r1, r2, tri;
+	MBRepTriangle(claim, r0, r1, r2, tri);
+	uint middle;
+	float3 offset;
+	if (!MBRepThinVertex(MBRepWeldedPos(r0), MBRepWeldedPos(r1), MBRepWeldedPos(r2), MBRepSourceNormal(tri), middle, offset)) return p;
+	const uint middleRep = (middle == 0u) ? r0 : ((middle == 1u) ? r1 : r2);
+	return (middleRep == rep) ? p + offset : p;
+}
+
+#endif // MESH_BOOLEAN_REPAIR_USH

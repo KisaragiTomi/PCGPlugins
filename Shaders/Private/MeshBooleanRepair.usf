@@ -1,0 +1,800 @@
+// GPU weld + repair of a Boolean result, run between the pipeline and the GPU output rebuild.
+//
+// Input is the arrangement's fragment soup with its Stage B marks and the welded corner
+// representatives (CSGpuTriangleUtilities salted weld over every fragment, dead ones
+// included, so that deleted fragments share vertices with the surface they were cut from).
+// Nothing here moves a vertex by more than the weld already did, except the slit nudge,
+// and nothing deletes a triangle the weld did not collapse to an edge. In order:
+//
+//  1. Classify: topological order, liveness, collapse.
+//  2. Vertex -> incident fragment table (count, scan, scatter) over representatives.
+//  3. Duplicates (same vertex set) are dropped, as the CPU weld does.
+//  4. Slits are marked: small open loops whose mean width is under the crack width
+//     (T-junctions and unmatched seam subdivisions left by the arrangement). They are cracks,
+//     not holes, and must not seed restoration: a cut seam with T-junctions would otherwise
+//     look open and flood the buried surface behind it back in.
+//  5. Hole restoration: at every other open edge of a live fragment, sweep around the edge
+//     from that fragment through the air; the first fragment met is the partner a closed
+//     surface needs there. If Stage B deleted it, it continues the surface within the bend
+//     limit, and part of it is exposed by Stage B's own winding test, put it back. Repeat on
+//     the fragments just restored.
+//  6. Duplicates again (for what was restored), final open edges, and slit loops are zipped
+//     closed; their vertices are pushed off the crack into their own faces so that the
+//     fills have area. What is still open after that is counted as a hole.
+//  7. Welded slivers get their middle vertex lifted off the line so that they keep a real
+//     area downstream.
+//
+// Every pass that selects among candidates breaks ties by index, so the result does not
+// depend on atomic scatter order.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/ComputeShaderUtils.ush"
+
+#ifndef THREADGROUPSIZE_X
+#define THREADGROUPSIZE_X 64
+#endif
+
+#include "/Plugin/PCGPlugins/Shaders/Private/MeshBooleanRepair.ush"
+// Stage B's fast-winding evaluation, for the restoration exposure test.
+#include "/Plugin/PCGPlugins/Shaders/Private/CSGpuTriangleUtilities.ush"
+
+// Statistics layout; mirrored by MeshBooleanRepair::EStat. The weld writes [0, 4).
+#define MB_REPAIR_STAT_VALID            4u
+#define MB_REPAIR_STAT_LIVE             5u
+#define MB_REPAIR_STAT_COLLAPSED        6u
+#define MB_REPAIR_STAT_RESTORED         7u
+#define MB_REPAIR_STAT_DUPLICATE        8u
+#define MB_REPAIR_STAT_OUTPUT_FRAGMENTS 9u
+#define MB_REPAIR_STAT_BOUNDARY         10u
+#define MB_REPAIR_STAT_SLIT_LOOPS       11u
+#define MB_REPAIR_STAT_FILLS            12u
+#define MB_REPAIR_STAT_FILL_OVERFLOW    13u
+#define MB_REPAIR_STAT_OPEN             14u
+#define MB_REPAIR_STAT_NUDGED           15u
+#define MB_REPAIR_STAT_STILL_DEGENERATE 16u
+#define MB_REPAIR_STAT_INVERTED         17u
+#define MB_REPAIR_STAT_OUTPUT_TOTAL     18u
+
+// Most open edges one slit loop may have.
+#define MB_REPAIR_LOOP_MAX 32u
+
+#define MB_REPAIR_PI  3.14159265358979f
+#define MB_REPAIR_TAU 6.28318530717959f
+
+RWBuffer<uint>  RW_MBRepFlags;
+RWBuffer<uint>  RW_MBRepStats;
+RWBuffer<uint>  RW_MBRepBoundaryCounter;    // [0] open half-edges listed by the last boundary pass
+Buffer<uint>    MBRepBoundaryCounterSRV;
+RWBuffer<uint>  RW_MBRepVertexCount;        // per representative: incident fragments (then the scatter cursor)
+Buffer<uint>    MBRepVertexCount;
+Buffer<uint>    MBRepVertexOffset;
+RWBuffer<uint>  RW_MBRepVertexEntries;      // fragment << 2 | topological corner
+Buffer<uint>    MBRepVertexEntries;
+RWBuffer<uint>  RW_MBRepBoundaryList;       // fragment << 2 | topological edge
+Buffer<uint>    MBRepBoundaryList;
+RWBuffer<uint>  RW_MBRepFillCounter;        // [0] fill triangles requested
+Buffer<uint>    MBRepFillCounter;
+RWBuffer<uint4> RW_MBRepFills;
+RWBuffer<uint>  RW_MBRepClaims;
+RWBuffer<uint>  RW_MBRepLoopSlots;
+RWBuffer<float4> RW_MBRepLoopOffsets;
+RWBuffer<uint>  RW_MBRepLoopOffsetCounter;  // [0] pushes allocated
+uint  MBRepLoopOffsetCapacity;
+RWBuffer<uint>  RW_MBRepIndirectArgs;
+uint  MBRepSourceCount;
+uint  MBRepStageB;
+uint  MBRepRound;
+float MBRepMaxBendRadians;
+uint  MBRepBoundaryCapacity;
+uint  MBRepFillCapacity;
+uint  MBRepFinalPass;                       // boundary pass: 1 = the output's, counted in the stats
+uint  MBRepSlitMarkOnly;                    // slit pass: 1 = mark host and chain edges, 0 = also fan them closed
+float MBRepWindingThreshold;                // Stage B's iso threshold on |winding|
+float MBRepExposureOffset;                  // probe distance on either side of a sample point
+
+uint MBRepThreadId(uint3 GroupId, uint GroupIndex)
+{
+	return GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+}
+
+// Live and uncollapsed, duplicate or not: what the duplicate test compares against.
+bool MBRepIsLiveSurface(uint flags)
+{
+	return (flags & (MB_REPAIR_VALID | MB_REPAIR_LIVE | MB_REPAIR_COLLAPSED)) == (MB_REPAIR_VALID | MB_REPAIR_LIVE);
+}
+
+// -----------------------------------------------------------------------------
+// 1. Classification.
+// -----------------------------------------------------------------------------
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MBRepClassifyCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint f = MBRepThreadId(GroupId, GroupIndex);
+	if (f >= MBRepFragmentCount) return;
+
+	const uint encoded = MBRepSource[f];
+	const uint tri = encoded & MB_REPAIR_SOURCE_MASK;
+	const uint cornerCount = MBRepFragmentCount * 3u;
+	const uint r0 = MBRepReps[f * 3u + 0u];
+	const uint r1 = MBRepReps[f * 3u + 1u];
+	const uint r2 = MBRepReps[f * 3u + 2u];
+	uint flags = 0u;
+	// Every corner is welded (no filter), so an out-of-range representative only means a
+	// corrupt input; such a fragment stays out of the topology rather than indexing past it.
+	if (tri < MBRepSourceCount && r0 < cornerCount && r1 < cornerCount && r2 < cornerCount)
+	{
+		const float3 p0 = MBRepSoup[f * 3u + 0u];
+		const float3 p1 = MBRepSoup[f * 3u + 1u];
+		const float3 p2 = MBRepSoup[f * 3u + 2u];
+		const float3 facing = cross(p1 - p0, p2 - p0);
+		const float facingSq = dot(facing, facing);
+		// Same acceptance as MBOutAcceptFragment (there with a compensated cross product,
+		// which only matters for parity with the CPU rebuild, not for topology).
+		if (isfinite(facingSq) && facingSq >= 1e-24f)
+		{
+			flags |= MB_REPAIR_VALID;
+			if (dot(facing, MBRepSourceNormal(tri)) > 0.0f) flags |= MB_REPAIR_SWAP;
+			if (MBRepStageB == 0u || (encoded & MB_REPAIR_SOURCE_KEEP) != 0u) flags |= MB_REPAIR_LIVE;
+			if (r0 == r1 || r1 == r2 || r0 == r2) flags |= MB_REPAIR_COLLAPSED;
+		}
+	}
+	RW_MBRepFlags[f] = flags;
+	if ((flags & MB_REPAIR_VALID) != 0u) InterlockedAdd(RW_MBRepStats[MB_REPAIR_STAT_VALID], 1u);
+	if ((flags & (MB_REPAIR_VALID | MB_REPAIR_LIVE)) == (MB_REPAIR_VALID | MB_REPAIR_LIVE))
+	{
+		InterlockedAdd(RW_MBRepStats[MB_REPAIR_STAT_LIVE], 1u);
+		if ((flags & MB_REPAIR_COLLAPSED) != 0u) InterlockedAdd(RW_MBRepStats[MB_REPAIR_STAT_COLLAPSED], 1u);
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 2. Vertex -> incident fragments. Every valid, uncollapsed fragment is listed, live or
+//    not: restoration looks for deleted neighbours through the same table.
+// -----------------------------------------------------------------------------
+bool MBRepIsListed(uint flags)
+{
+	return (flags & (MB_REPAIR_VALID | MB_REPAIR_COLLAPSED)) == MB_REPAIR_VALID;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MBRepCountCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint f = MBRepThreadId(GroupId, GroupIndex);
+	if (f >= MBRepFragmentCount) return;
+	const uint flags = MBRepFlags[f];
+	if (!MBRepIsListed(flags)) return;
+	[unroll] for (uint k = 0u; k < 3u; ++k) InterlockedAdd(RW_MBRepVertexCount[MBRepTopoRep(f, flags, k)], 1u);
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MBRepScatterCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint f = MBRepThreadId(GroupId, GroupIndex);
+	if (f >= MBRepFragmentCount) return;
+	const uint flags = MBRepFlags[f];
+	if (!MBRepIsListed(flags)) return;
+	[unroll] for (uint k = 0u; k < 3u; ++k)
+	{
+		const uint rep = MBRepTopoRep(f, flags, k);
+		uint slot;
+		InterlockedAdd(RW_MBRepVertexCount[rep], 1u, slot);
+		RW_MBRepVertexEntries[MBRepVertexOffset[rep] + slot] = (f << 2u) | k;
+	}
+}
+
+// Exclusive prefix sum in blocks of 512; the C++ side recurses over the block totals.
+#define MB_REPAIR_SCAN_BLOCK 512
+Buffer<uint>   MBRepScanInput;
+RWBuffer<uint> RW_MBRepScanOutput;
+RWBuffer<uint> RW_MBRepScanBlockSums;
+Buffer<uint>   MBRepScanBlockOffsets;
+uint MBRepScanCount;
+groupshared uint MBRepScanTemp[MB_REPAIR_SCAN_BLOCK];
+
+[numthreads(MB_REPAIR_SCAN_BLOCK, 1, 1)]
+void MBRepScanBlocksCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint i = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, MB_REPAIR_SCAN_BLOCK);
+	const uint v = (i < MBRepScanCount) ? MBRepScanInput[i] : 0u;
+	MBRepScanTemp[GroupIndex] = v;
+	GroupMemoryBarrierWithGroupSync();
+	[unroll] for (uint off = 1u; off < MB_REPAIR_SCAN_BLOCK; off <<= 1u)
+	{
+		const uint add = (GroupIndex >= off) ? MBRepScanTemp[GroupIndex - off] : 0u;
+		GroupMemoryBarrierWithGroupSync();
+		MBRepScanTemp[GroupIndex] += add;
+		GroupMemoryBarrierWithGroupSync();
+	}
+	if (i < MBRepScanCount) RW_MBRepScanOutput[i] = MBRepScanTemp[GroupIndex] - v;
+	// Wrapped dispatches round the group count up; groups past the end own no block.
+	const bool bBlockInRange = (i - GroupIndex) < MBRepScanCount;
+	if (GroupIndex == MB_REPAIR_SCAN_BLOCK - 1u && bBlockInRange) RW_MBRepScanBlockSums[i / MB_REPAIR_SCAN_BLOCK] = MBRepScanTemp[GroupIndex];
+}
+
+[numthreads(MB_REPAIR_SCAN_BLOCK, 1, 1)]
+void MBRepScanAddOffsetsCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint i = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, MB_REPAIR_SCAN_BLOCK);
+	if (i >= MBRepScanCount) return;
+	RW_MBRepScanOutput[i] += MBRepScanBlockOffsets[i / MB_REPAIR_SCAN_BLOCK];
+}
+
+// -----------------------------------------------------------------------------
+// Edge queries shared by restoration and the boundary pass. These read the flags through
+// the UAV because those passes also write them (each thread only its own fragment's word,
+// and never a bit these queries test).
+// -----------------------------------------------------------------------------
+
+// Does another output fragment run the edge v -> u (the partner of u -> v)?
+bool MBRepEdgePaired(uint f, uint u, uint v)
+{
+	const uint begin = MBRepVertexOffset[v];
+	const uint count = MBRepVertexCount[v];
+	for (uint e = 0u; e < count; ++e)
+	{
+		const uint entry = MBRepVertexEntries[begin + e];
+		const uint g = entry >> 2u;
+		if (g == f) continue;
+		const uint flags = RW_MBRepFlags[g];
+		if (!MBRepIsOutput(flags)) continue;
+		if (MBRepTopoRep(g, flags, ((entry & 3u) + 1u) % 3u) == u) return true;
+	}
+	return false;
+}
+
+// Source normal of a fragment with the component along the edge removed.
+bool MBRepEdgeNormal(uint g, float3 d, out float3 n)
+{
+	const float3 N = MBRepSourceNormal(MBRepSource[g] & MB_REPAIR_SOURCE_MASK);
+	n = N - dot(N, d) * d;
+	const float l = length(n);
+	if (!(l > 0.1f)) return false;
+	n /= l;
+	return true;
+}
+
+// The fragment an open edge u -> v of the live fragment f should be closed with, or
+// MB_REPAIR_NONE.
+//
+// Seen down the edge, every fragment on it is a ray from the edge. Start at f and rotate
+// toward f's outward normal, i.e. through the air f faces: the first ray met bounds that
+// air on the other side, so it is the partner a closed surface needs. A consistently
+// oriented partner runs the edge the other way (v -> u); its outward normal then points
+// back into the swept air by construction. If the first ray met runs u -> v instead, f's
+// air ends at a back face - the configuration is inconsistent and nothing is restored.
+//
+// Directions come from source normals, not from the third vertex, so a welded sliver
+// cannot point the sweep the wrong way.
+uint MBRepSweepPartner(uint f, uint u, uint v)
+{
+	const float3 pu = MBRepWeldedPos(u);
+	const float3 edge = MBRepWeldedPos(v) - pu;
+	const float edgeLength = length(edge);
+	if (!(edgeLength > 1e-6f)) return MB_REPAIR_NONE;
+	const float3 d = edge / edgeLength;
+	float3 nL;
+	if (!MBRepEdgeNormal(f, d, nL)) return MB_REPAIR_NONE;
+	// For u -> v in topological order the outward normal is cross(tL, d), so the direction
+	// from the edge into f is cross(d, nL).
+	const float3 tL = cross(d, nL);
+
+	uint best = MB_REPAIR_NONE;
+	float bestTheta = 1e30f;
+	bool bestOpposite = false;
+	const uint begin = MBRepVertexOffset[v];
+	const uint count = MBRepVertexCount[v];
+	for (uint e = 0u; e < count; ++e)
+	{
+		const uint entry = MBRepVertexEntries[begin + e];
+		const uint g = entry >> 2u;
+		if (g == f) continue;
+		const uint flags = RW_MBRepFlags[g];
+		if ((flags & MB_REPAIR_DUPLICATE) != 0u) continue;
+		const uint k = entry & 3u;
+		const bool bOpposite = MBRepTopoRep(g, flags, (k + 1u) % 3u) == u;
+		const bool bSame = MBRepTopoRep(g, flags, (k + 2u) % 3u) == u;
+		if (!bOpposite && !bSame) continue;
+		float3 ng;
+		if (!MBRepEdgeNormal(g, d, ng)) continue;
+		// Same rule as tL, with the edge direction reversed for a fragment running v -> u.
+		const float3 tg = bOpposite ? -cross(d, ng) : cross(d, ng);
+		float theta = atan2(dot(tg, nL), dot(tg, tL));
+		if (theta < 0.0f) theta += MB_REPAIR_TAU;
+		// Rays lying on f itself (a coincident twin or its back face) bound no air.
+		if (theta < 1e-3f || theta > MB_REPAIR_TAU - 1e-3f) continue;
+		const bool bTie = abs(theta - bestTheta) <= 1e-5f;
+		const bool bBetter = (theta < bestTheta - 1e-5f)
+			|| (bTie && ((bOpposite && !bestOpposite) || (bOpposite == bestOpposite && g < best)));
+		if (!bBetter) continue;
+		best = g;
+		bestTheta = theta;
+		bestOpposite = bOpposite;
+	}
+	if (best == MB_REPAIR_NONE || !bestOpposite) return MB_REPAIR_NONE;
+	if ((RW_MBRepFlags[best] & (MB_REPAIR_LIVE | MB_REPAIR_REJECTED)) != 0u) return MB_REPAIR_NONE;
+	if (abs(bestTheta - MB_REPAIR_PI) > MBRepMaxBendRadians) return MB_REPAIR_NONE;
+	return best;
+}
+
+// Stage B judged each fragment by its centroid alone, so a fragment it deleted can still
+// stick out of the solid elsewhere - the flush-contact case, where only part of the triangle
+// lies under the other mesh. That is what makes a restoration legitimate: some sample point
+// on the candidate has exactly one side inside, by the field and threshold Stage B used. A
+// fully buried fragment (a cut surface's part inside the other solid) has no such point and
+// stays deleted, whatever the sweep met.
+bool MBRepSampleKeeps(float3 s, float3 n)
+{
+	const bool bInPos = abs(EvaluateFastWindingAt(s + n * MBRepExposureOffset)) >= MBRepWindingThreshold;
+	const bool bInNeg = abs(EvaluateFastWindingAt(s - n * MBRepExposureOffset)) >= MBRepWindingThreshold;
+	return bInPos != bInNeg;
+}
+
+bool MBRepPartlyExposed(uint g)
+{
+	const float3 n = MBRepSourceNormal(MBRepSource[g] & MB_REPAIR_SOURCE_MASK);
+	const float3 p0 = MBRepSoup[g * 3u + 0u];
+	const float3 p1 = MBRepSoup[g * 3u + 1u];
+	const float3 p2 = MBRepSoup[g * 3u + 2u];
+	const float3 c = (p0 + p1 + p2) * (1.0f / 3.0f);
+	// Centroid, then corners and edge midpoints a quarter of the way in, so that no probe
+	// sits on the edge a neighbour shares.
+	if (MBRepSampleKeeps(c, n)) return true;
+	if (MBRepSampleKeeps(lerp(c, p0, 0.75f), n)) return true;
+	if (MBRepSampleKeeps(lerp(c, p1, 0.75f), n)) return true;
+	if (MBRepSampleKeeps(lerp(c, p2, 0.75f), n)) return true;
+	if (MBRepSampleKeeps(lerp(c, 0.5f * (p0 + p1), 0.75f), n)) return true;
+	if (MBRepSampleKeeps(lerp(c, 0.5f * (p1 + p2), 0.75f), n)) return true;
+	return MBRepSampleKeeps(lerp(c, 0.5f * (p2 + p0), 0.75f), n);
+}
+
+// -----------------------------------------------------------------------------
+// 5. Hole restoration. Round 0 looks at every output fragment; later rounds only at the
+//    fragments restored in the round before, because restoring never opens an edge that
+//    was already closed. Edges on a slit loop are cracks with a partner across them, so
+//    they never seed a restoration. A round marks the sweep partners, tests each marked
+//    fragment's exposure once (a candidate is usually the partner of several open edges,
+//    and each test is fourteen winding evaluations), then applies the survivors.
+// -----------------------------------------------------------------------------
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MBRepRestoreMarkCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint f = MBRepThreadId(GroupId, GroupIndex);
+	if (f >= MBRepFragmentCount) return;
+	const uint flags = RW_MBRepFlags[f];
+	const bool bActive = (MBRepRound == 0u) ? MBRepIsOutput(flags) : ((flags & MB_REPAIR_CHECK) != 0u);
+	if (!bActive) return;
+	[unroll] for (uint k = 0u; k < 3u; ++k)
+	{
+		if ((flags & (MB_REPAIR_SLIT0 << k)) != 0u) continue;
+		const uint u = MBRepTopoRep(f, flags, k);
+		const uint v = MBRepTopoRep(f, flags, (k + 1u) % 3u);
+		if (MBRepEdgePaired(f, u, v)) continue;
+		const uint partner = MBRepSweepPartner(f, u, v);
+		if (partner != MB_REPAIR_NONE) InterlockedOr(RW_MBRepFlags[partner], MB_REPAIR_MARK);
+	}
+}
+
+// A marked candidate that nothing of which sticks out of the solid stays deleted, and is
+// never tested again.
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MBRepRestoreExposureCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint f = MBRepThreadId(GroupId, GroupIndex);
+	if (f >= MBRepFragmentCount) return;
+	const uint flags = RW_MBRepFlags[f];
+	if ((flags & (MB_REPAIR_MARK | MB_REPAIR_LIVE)) != MB_REPAIR_MARK) return;
+	if (!MBRepPartlyExposed(f)) RW_MBRepFlags[f] = (flags & ~MB_REPAIR_MARK) | MB_REPAIR_REJECTED;
+}
+
+// Marks are applied in a separate pass so every mark decision above saw the same live set.
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MBRepRestoreApplyCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint f = MBRepThreadId(GroupId, GroupIndex);
+	if (f >= MBRepFragmentCount) return;
+	const uint flags = RW_MBRepFlags[f];
+	uint next = flags & ~(MB_REPAIR_CHECK | MB_REPAIR_MARK);
+	if ((flags & MB_REPAIR_MARK) != 0u && (flags & MB_REPAIR_LIVE) == 0u)
+	{
+		next |= MB_REPAIR_LIVE | MB_REPAIR_RESTORED | MB_REPAIR_CHECK;
+		InterlockedAdd(RW_MBRepStats[MB_REPAIR_STAT_RESTORED], 1u);
+	}
+	if (next != flags) RW_MBRepFlags[f] = next;
+}
+
+// -----------------------------------------------------------------------------
+// 3. / 6. Duplicates: the lowest-numbered live fragment of a vertex set survives, whatever
+//    the orientation of the others - the same rule as the CPU weld post-process. Runs before
+//    restoration and again after it, for the fragments restoration added.
+// -----------------------------------------------------------------------------
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MBRepDedupCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint f = MBRepThreadId(GroupId, GroupIndex);
+	if (f >= MBRepFragmentCount) return;
+	const uint flags = RW_MBRepFlags[f];
+	if (!MBRepIsLiveSurface(flags) || (flags & MB_REPAIR_DUPLICATE) != 0u) return;
+	const uint r0 = MBRepTopoRep(f, flags, 0u);
+	const uint r1 = MBRepTopoRep(f, flags, 1u);
+	const uint r2 = MBRepTopoRep(f, flags, 2u);
+	const uint begin = MBRepVertexOffset[r0];
+	const uint count = MBRepVertexCount[r0];
+	for (uint e = 0u; e < count; ++e)
+	{
+		const uint entry = MBRepVertexEntries[begin + e];
+		const uint g = entry >> 2u;
+		if (g >= f) continue;
+		const uint gFlags = RW_MBRepFlags[g];
+		if (!MBRepIsLiveSurface(gFlags)) continue;
+		const uint k = entry & 3u;
+		const uint a = MBRepTopoRep(g, gFlags, (k + 1u) % 3u);
+		const uint b = MBRepTopoRep(g, gFlags, (k + 2u) % 3u);
+		if ((a == r1 && b == r2) || (a == r2 && b == r1))
+		{
+			RW_MBRepFlags[f] = flags | MB_REPAIR_DUPLICATE;
+			InterlockedAdd(RW_MBRepStats[MB_REPAIR_STAT_DUPLICATE], 1u);
+			return;
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Open edges of the current output: before restoration (to find the slits) and after it.
+// -----------------------------------------------------------------------------
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MBRepBoundaryCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint f = MBRepThreadId(GroupId, GroupIndex);
+	if (f >= MBRepFragmentCount) return;
+	const uint flags = RW_MBRepFlags[f];
+	const uint kept = flags & ~(MB_REPAIR_BOUNDARY_MASK | MB_REPAIR_SLIT_MASK);
+	if (!MBRepIsOutput(flags))
+	{
+		if (kept != flags) RW_MBRepFlags[f] = kept;
+		return;
+	}
+	if (MBRepFinalPass != 0u) InterlockedAdd(RW_MBRepStats[MB_REPAIR_STAT_OUTPUT_FRAGMENTS], 1u);
+	uint bits = 0u;
+	[unroll] for (uint k = 0u; k < 3u; ++k)
+	{
+		const uint u = MBRepTopoRep(f, flags, k);
+		const uint v = MBRepTopoRep(f, flags, (k + 1u) % 3u);
+		if (MBRepEdgePaired(f, u, v)) continue;
+		bits |= MB_REPAIR_BOUNDARY0 << k;
+		uint slot;
+		InterlockedAdd(RW_MBRepBoundaryCounter[0], 1u, slot);
+		if (slot < MBRepBoundaryCapacity) RW_MBRepBoundaryList[slot] = (f << 2u) | k;
+		if (MBRepFinalPass != 0u) InterlockedAdd(RW_MBRepStats[MB_REPAIR_STAT_BOUNDARY], 1u);
+	}
+	if ((kept | bits) != flags) RW_MBRepFlags[f] = kept | bits;
+}
+
+[numthreads(1, 1, 1)]
+void MBRepSlitArgsCS(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint threadCount = min(MBRepBoundaryCounterSRV[0], MBRepBoundaryCapacity);
+	const uint groupCount = (threadCount + THREADGROUPSIZE_X - 1u) / THREADGROUPSIZE_X;
+	// Same wrap as GetUnWrappedDispatchThreadId (WRAPPED_GROUP_STRIDE = 128).
+	const uint groupCountX = min(groupCount, 128u);
+	RW_MBRepIndirectArgs[0] = groupCountX;
+	RW_MBRepIndirectArgs[1] = groupCountX > 0u ? (groupCount + groupCountX - 1u) / groupCountX : 1u;
+	RW_MBRepIndirectArgs[2] = 1u;
+}
+
+float MBRepLineDistance(float3 p, float3 origin, float3 d)
+{
+	const float3 q = p - origin;
+	return length(q - dot(q, d) * d);
+}
+
+// -----------------------------------------------------------------------------
+// 4. / 6. Slit loops. Each open half-edge walks its boundary loop: the open half-edge that
+//     leaves the vertex it ends at, and so on. Where several leave a vertex, the walk stays
+//     on its own crack - turning back first (a crack's end, or where two cracks touch and
+//     must come out as separate loops), else straight on (a T-vertex, where a neighbouring
+//     crack may leave at an angle), else the sharpest turn. The choice depends on the edge
+//     alone, so a loop only counts as closed when the walk returns to its first edge: then
+//     every member traces the same cycle and agrees on the owner.
+//     A closed loop within MB_REPAIR_LOOP_MAX edges whose mean width (twice its vector area
+//     over its perimeter) is under the crack width is a slit: a T-junction, interleaved ones,
+//     or the two unmatched subdivisions of a curved seam. Every member flags its own edge
+//     (restoration skips those); in fill mode the lowest member also zips the loop closed and
+//     flags its vertices for MBRepLoopPushCS - only once all its fills fit, so that nothing
+//     is ever pushed open without a fill behind it. Other threads' flags are only read for
+//     bits this pass never writes.
+// -----------------------------------------------------------------------------
+// Smaller is preferred: turning back (most back first), then straight on (straightest first),
+// then anything else (sharpest first).
+float MBRepTurnRank(float turn)
+{
+	if (turn <= -0.70710678f) return turn;
+	if (turn >= 0.70710678f) return 2.0f - turn;
+	return 3.0f + turn;
+}
+
+bool MBRepNextOpenEdge(uint cur, float3 dirIn, out uint outEdge, out uint outRep)
+{
+	outEdge = MB_REPAIR_NONE;
+	outRep = MB_REPAIR_NONE;
+	float bestRank = 1e30f;
+	const float3 pc = MBRepWeldedPos(cur);
+	const uint begin = MBRepVertexOffset[cur];
+	const uint count = MBRepVertexCount[cur];
+	for (uint e = 0u; e < count; ++e)
+	{
+		const uint entry = MBRepVertexEntries[begin + e];
+		const uint g = entry >> 2u;
+		const uint k = entry & 3u;
+		const uint gFlags = RW_MBRepFlags[g];
+		if (!MBRepIsOutput(gFlags) || (gFlags & (MB_REPAIR_BOUNDARY0 << k)) == 0u) continue;
+		const uint to = MBRepTopoRep(g, gFlags, (k + 1u) % 3u);
+		const float3 step = MBRepWeldedPos(to) - pc;
+		const float stepLength = length(step);
+		if (!(stepLength > 1e-6f)) continue;
+		const float rank = MBRepTurnRank(dot(step / stepLength, dirIn));
+		const uint id = (g << 2u) | k;
+		if (rank < bestRank - 1e-6f || (abs(rank - bestRank) <= 1e-6f && id < outEdge))
+		{
+			bestRank = rank;
+			outEdge = id;
+			outRep = to;
+		}
+	}
+	return outEdge != MB_REPAIR_NONE;
+}
+
+void MBRepEmitFill(inout uint slot, uint r0, uint r1, uint r2, uint sourceEdge)
+{
+	if (slot < MBRepFillCapacity) RW_MBRepFills[slot] = uint4(r0, r1, r2, MBRepSource[sourceEdge >> 2u] & MB_REPAIR_SOURCE_MASK);
+	++slot;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MBRepSlitLoopCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint i = MBRepThreadId(GroupId, GroupIndex);
+	if (i >= min(MBRepBoundaryCounterSRV[0], MBRepBoundaryCapacity)) return;
+	const uint h = MBRepBoundaryList[i];
+	const uint f = h >> 2u;
+	const uint flags = RW_MBRepFlags[f];
+	const uint u = MBRepTopoRep(f, flags, h & 3u);
+	const uint v = MBRepTopoRep(f, flags, ((h & 3u) + 1u) % 3u);
+	const float3 pu = MBRepWeldedPos(u);
+	float3 dirIn = MBRepWeldedPos(v) - pu;
+	const float firstLength = length(dirIn);
+	if (!(firstLength > 1e-6f)) return;
+	dirIn /= firstLength;
+
+	uint loopRep[MB_REPAIR_LOOP_MAX];
+	uint loopEdge[MB_REPAIR_LOOP_MAX];
+	loopRep[0] = u;
+	loopEdge[0] = h;
+	uint n = 1u;
+	uint minEdge = h;
+	uint cur = v;
+	bool bClosed = false;
+	[loop] for (uint step = 0u; step <= MB_REPAIR_LOOP_MAX; ++step)
+	{
+		uint nextEdge, nextRep;
+		if (!MBRepNextOpenEdge(cur, dirIn, nextEdge, nextRep)) break;
+		if (cur == u)
+		{
+			bClosed = nextEdge == h;
+			break;
+		}
+		if (n >= MB_REPAIR_LOOP_MAX) break;
+		loopRep[n] = cur;
+		loopEdge[n] = nextEdge;
+		++n;
+		minEdge = min(minEdge, nextEdge);
+		dirIn = normalize(MBRepWeldedPos(nextRep) - MBRepWeldedPos(cur));
+		cur = nextRep;
+	}
+	if (!bClosed || n < 3u) return;
+
+	// Vector area, so that a crack folded over a crease still measures thin.
+	float3 area2 = float3(0.0f, 0.0f, 0.0f);
+	float perimeter = 0.0f;
+	for (uint j = 0u; j < n; ++j)
+	{
+		const float3 a = MBRepWeldedPos(loopRep[j]) - pu;
+		const float3 b = MBRepWeldedPos(loopRep[(j + 1u) % n]) - pu;
+		area2 += cross(a, b);
+		perimeter += length(b - a);
+	}
+	if (!(length(area2) <= MBRepSlitTolerance * perimeter)) return;
+
+	InterlockedOr(RW_MBRepFlags[f], MB_REPAIR_SLIT0 << (h & 3u));
+	if (MBRepSlitMarkOnly != 0u || minEdge != h) return;
+	InterlockedAdd(RW_MBRepStats[MB_REPAIR_STAT_SLIT_LOOPS], 1u);
+
+	// Zip the loop along its long axis. C1 runs forward from the apex to the far vertex, C2
+	// backward from the apex to the same far vertex; both climb the axis, and each step adds
+	// the next vertex of whichever chain is lower. Every fill carries one reversed loop edge
+	// plus the current diagonal, which the next fill takes back reversed, so the fills pair
+	// with the loop and with each other.
+	uint ia = 0u;
+	uint ib = 1u;
+	float farSq = -1.0f;
+	for (uint p = 0u; p < n; ++p)
+	{
+		for (uint q = p + 1u; q < n; ++q)
+		{
+			const float3 dd = MBRepWeldedPos(loopRep[q]) - MBRepWeldedPos(loopRep[p]);
+			const float dSq = dot(dd, dd);
+			if (dSq > farSq) { farSq = dSq; ia = p; ib = q; }
+		}
+	}
+	const float3 apex = MBRepWeldedPos(loopRep[ia]);
+	const float3 axis = normalize(MBRepWeldedPos(loopRep[ib]) - apex);
+	const uint c1 = (ib + n - ia) % n;
+	const uint c2 = n - c1;
+	uint slot;
+	InterlockedAdd(RW_MBRepFillCounter[0], n - 2u, slot);
+	if (slot + n - 2u > MBRepFillCapacity) return;
+	for (uint j = 0u; j < n; ++j) RW_MBRepLoopSlots[loopRep[j]] = MB_REPAIR_LOOP_PENDING;
+	// V_s = loopRep[ia + s], W_s = loopRep[ia - s]; the far vertex is V_c1 = W_c2.
+	MBRepEmitFill(slot, loopRep[(ia + 1u) % n], loopRep[ia], loopRep[(ia + n - 1u) % n], loopEdge[ia]);
+	uint ci = 1u;
+	uint cj = 1u;
+	[loop] for (uint guard = 0u; guard < n; ++guard)
+	{
+		if ((ci == c1 && cj + 1u >= c2) || (cj == c2 && ci + 1u >= c1)) break;
+		const uint vi = loopRep[(ia + ci) % n];
+		const uint wj = loopRep[(ia + n - cj) % n];
+		bool bAdvanceC1 = cj == c2;
+		if (ci < c1 && cj < c2)
+		{
+			const float tV = dot(MBRepWeldedPos(loopRep[(ia + ci + 1u) % n]) - apex, axis);
+			const float tW = dot(MBRepWeldedPos(loopRep[(ia + n - cj - 1u) % n]) - apex, axis);
+			bAdvanceC1 = tV <= tW;
+		}
+		if (bAdvanceC1)
+		{
+			// Carries the reversed C1 edge vi -> vn.
+			MBRepEmitFill(slot, loopRep[(ia + ci + 1u) % n], vi, wj, loopEdge[(ia + ci) % n]);
+			++ci;
+		}
+		else
+		{
+			// Carries the reversed C2 edge wn -> wj.
+			MBRepEmitFill(slot, wj, loopRep[(ia + n - cj - 1u) % n], vi, loopEdge[(ia + n - cj - 1u) % n]);
+			++cj;
+		}
+	}
+}
+
+// A slit-loop vertex moves MBRepNudgeDistance into the faces its open edges belong to,
+// perpendicular to each edge. Both sides of a crack move apart, so the loop becomes a thin
+// strip of real area and the zipped fills - which never move on their own - get area too.
+// Where the two sides lie in one plane their pushes cancel at the crack ends, which is where
+// the sides meet and nothing needs to move.
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MBRepLoopPushCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint c = MBRepThreadId(GroupId, GroupIndex);
+	if (c >= MBRepFragmentCount * 3u) return;
+	if (RW_MBRepLoopSlots[c] != MB_REPAIR_LOOP_PENDING) return;
+	const float3 pc = MBRepWeldedPos(c);
+	float3 push = float3(0.0f, 0.0f, 0.0f);
+	const uint begin = MBRepVertexOffset[c];
+	const uint count = MBRepVertexCount[c];
+	for (uint e = 0u; e < count; ++e)
+	{
+		const uint entry = MBRepVertexEntries[begin + e];
+		const uint g = entry >> 2u;
+		const uint k = entry & 3u;
+		const uint gFlags = MBRepFlags[g];
+		if (!MBRepIsOutput(gFlags)) continue;
+		const float3 N = MBRepSourceNormal(MBRepSource[g] & MB_REPAIR_SOURCE_MASK);
+		// The open edge leaving c (topological edge k) and the one arriving (edge k + 2).
+		[unroll] for (uint side = 0u; side < 2u; ++side)
+		{
+			const uint edgeIndex = (side == 0u) ? k : (k + 2u) % 3u;
+			if ((gFlags & (MB_REPAIR_BOUNDARY0 << edgeIndex)) == 0u) continue;
+			const float3 from = MBRepWeldedPos(MBRepTopoRep(g, gFlags, edgeIndex));
+			const float3 to = MBRepWeldedPos(MBRepTopoRep(g, gFlags, (edgeIndex + 1u) % 3u));
+			const float3 d = to - from;
+			const float dl = length(d);
+			if (!(dl > 1e-6f)) continue;
+			const float3 dn = d / dl;
+			float3 n = N - dot(N, dn) * dn;
+			const float nl = length(n);
+			if (!(nl > 0.1f)) continue;
+			// Into the face, as in MBRepSweepPartner.
+			push += cross(dn, n / nl);
+		}
+	}
+	uint slot = MB_REPAIR_NONE;
+	const float pushLength = length(push);
+	if (pushLength > 1e-3f)
+	{
+		InterlockedAdd(RW_MBRepLoopOffsetCounter[0], 1u, slot);
+		if (slot < MBRepLoopOffsetCapacity)
+		{
+			RW_MBRepLoopOffsets[slot] = float4(push * (MBRepNudgeDistance / pushLength), 0.0f);
+			InterlockedAdd(RW_MBRepStats[MB_REPAIR_STAT_NUDGED], 1u);
+		}
+		else slot = MB_REPAIR_NONE;
+	}
+	RW_MBRepLoopSlots[c] = slot;
+}
+
+// Open edges no slit covers: the holes the repair could not close.
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MBRepCountOpenCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint f = MBRepThreadId(GroupId, GroupIndex);
+	if (f >= MBRepFragmentCount) return;
+	const uint flags = MBRepFlags[f];
+	if (!MBRepIsOutput(flags)) return;
+	uint open = 0u;
+	[unroll] for (uint k = 0u; k < 3u; ++k) if ((flags & (MB_REPAIR_BOUNDARY0 << k)) != 0u && (flags & (MB_REPAIR_SLIT0 << k)) == 0u) ++open;
+	if (open != 0u) InterlockedAdd(RW_MBRepStats[MB_REPAIR_STAT_OPEN], open);
+}
+
+// -----------------------------------------------------------------------------
+// 7. Welded slivers claim their middle vertex. Several may want the same vertex; the lowest
+//    fragment id wins and the rest keep whatever area that leaves them. Fills and slit-loop
+//    vertices are left to the loop push.
+// -----------------------------------------------------------------------------
+uint MBRepRepairedTriangleCount()
+{
+	return MBRepFragmentCount + min(MBRepFillCounter[0], MBRepFillCapacity);
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MBRepNudgeClaimCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint id = MBRepThreadId(GroupId, GroupIndex);
+	if (id >= MBRepFragmentCount || !MBRepIsOutput(MBRepFlags[id])) return;
+	uint r0, r1, r2, tri;
+	MBRepTriangle(id, r0, r1, r2, tri);
+	if (tri >= MBRepSourceCount) return;
+	uint middle;
+	float3 offset;
+	if (!MBRepThinVertex(MBRepWeldedPos(r0), MBRepWeldedPos(r1), MBRepWeldedPos(r2), MBRepSourceNormal(tri), middle, offset)) return;
+	const uint middleRep = (middle == 0u) ? r0 : ((middle == 1u) ? r1 : r2);
+	if (MBRepLoopSlots[middleRep] != MB_REPAIR_NONE) return;
+	InterlockedMin(RW_MBRepClaims[middleRep], id);
+}
+
+// What the downstream consumers will see: triangles a StaticMesh build would still drop,
+// and thick folds whose welded orientation disagrees with the topology.
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void MBRepFinalCheckCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint id = MBRepThreadId(GroupId, GroupIndex);
+	if (id >= MBRepRepairedTriangleCount()) return;
+	if (id < MBRepFragmentCount && !MBRepIsOutput(MBRepFlags[id])) return;
+	uint r0, r1, r2, tri;
+	MBRepTriangle(id, r0, r1, r2, tri);
+	if (tri >= MBRepSourceCount) return;
+	const float3 N = MBRepSourceNormal(tri);
+
+	uint middle;
+	float3 offset;
+	if (id < MBRepFragmentCount && MBRepThinVertex(MBRepWeldedPos(r0), MBRepWeldedPos(r1), MBRepWeldedPos(r2), N, middle, offset))
+	{
+		const uint middleRep = (middle == 0u) ? r0 : ((middle == 1u) ? r1 : r2);
+		if (MBRepClaims[middleRep] == id) InterlockedAdd(RW_MBRepStats[MB_REPAIR_STAT_NUDGED], 1u);
+	}
+
+	const float3 p0 = MBRepFinalPos(r0);
+	const float3 facing = cross(MBRepFinalPos(r1) - p0, MBRepFinalPos(r2) - p0);
+	// FVector3f::GetSafeNormal's threshold: what BuildGpuMeshDescription discards.
+	if (!(dot(facing, facing) > 1e-8f)) InterlockedAdd(RW_MBRepStats[MB_REPAIR_STAT_STILL_DEGENERATE], 1u);
+	// Fills borrow a neighbour's source normal and may straddle a crease, so only fragments
+	// can be told inverted.
+	else if (id < MBRepFragmentCount && dot(facing, N) > 0.0f) InterlockedAdd(RW_MBRepStats[MB_REPAIR_STAT_INVERTED], 1u);
+}
+
+[numthreads(1, 1, 1)]
+void MBRepFinalizeStatsCS(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint requested = MBRepFillCounter[0];
+	const uint fills = min(requested, MBRepFillCapacity);
+	RW_MBRepStats[MB_REPAIR_STAT_FILLS] = fills;
+	RW_MBRepStats[MB_REPAIR_STAT_FILL_OVERFLOW] = requested - fills;
+	RW_MBRepStats[MB_REPAIR_STAT_OUTPUT_TOTAL] = RW_MBRepStats[MB_REPAIR_STAT_OUTPUT_FRAGMENTS] + fills;
+}

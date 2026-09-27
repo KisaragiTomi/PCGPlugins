@@ -5,8 +5,12 @@
 #include "ComputeShaderMeshGenerator.h"
 #include "ComputeShaderMeshBoolean.generated.h"
 
+class ATextRenderActor;
+class UBillboardComponent;
 class UCSMesh;
 class UStaticMesh;
+class UStaticMeshComponent;
+namespace MeshBooleanRepair { struct FSettings; struct FWindingField; }
 
 /** Stage B 布尔运算。当前用 self-winding（整个 soup 一起求缠绕数）实现，见各枚举说明。 */
 UENUM(BlueprintType)
@@ -93,6 +97,23 @@ struct COMPUTESHADERGENERATOR_API FCSMeshBooleanOptions
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|PostProcess", meta = (ClampMin = "0.0"))
 	float VertexWeldDistance = 0.0f;
 
+	/** GPU path with welding: put back deleted fragments that a closed surface needs at a hole. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|PostProcess")
+	bool bRestoreHoleFragments = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|PostProcess", meta = (ClampMin = "0.0", ClampMax = "180.0"))
+	float HoleRestoreMaxBendDegrees = 45.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|PostProcess", meta = (ClampMin = "0", ClampMax = "64"))
+	int32 HoleRestoreRounds = 16;
+
+	/** GPU path with welding: fan-fill slit cracks and give zero-area triangles an area. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|PostProcess")
+	bool bFillSlitCracks = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|PostProcess", meta = (ClampMin = "0.0"))
+	float SlitNudgeDistance = 0.01f;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|Output")
 	bool bPreserveSourceMaterialSlots = true;
 
@@ -158,6 +179,22 @@ struct COMPUTESHADERGENERATOR_API FCSMeshBooleanCapture
 	/** Conservative world bound, for a consumer that has nothing better until it reduces. */
 	FBox QueryBox = FBox(ForceInit);
 
+	/**
+	 * GPU weld + repair output (MeshBooleanRepair), present when the run welded. The rebuild
+	 * then emits the repaired triangles - welded positions, restored fragments, slit fills -
+	 * instead of accepting fragments one by one, and OutputTriangleCount counts those.
+	 */
+	TRefCountPtr<FRDGPooledBuffer> RepairRepresentatives;
+	TRefCountPtr<FRDGPooledBuffer> RepairFlags;
+	TRefCountPtr<FRDGPooledBuffer> RepairClaims;
+	TRefCountPtr<FRDGPooledBuffer> RepairLoopSlots;
+	TRefCountPtr<FRDGPooledBuffer> RepairLoopOffsets;
+	TRefCountPtr<FRDGPooledBuffer> RepairFills;
+	uint32 RepairFillCount = 0;
+	float RepairNudgeDistance = 0.0f;
+	float RepairSlitTolerance = 0.0f;
+	bool bRepaired = false;
+
 	bool IsValid() const;
 };
 
@@ -178,6 +215,25 @@ class COMPUTESHADERGENERATOR_API AComputeShaderMeshBoolean : public AComputeShad
 	GENERATED_BODY()
 
 public:
+	AComputeShaderMeshBoolean();
+
+	/**
+	 * 盒子尺寸（半长，cm）。构造时写进 GeneratorBounds，示意立方体与角标跟着走 —— 原来是 BP_Boolean 的
+	 * 蓝图变量 "In Box Extent" 加一段构造脚本，2026-09-23 搬到这里（旧实例的值由 CoreRedirects 接过来）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ViewEdit")
+	FVector InBoxExtent = FVector(555.0);
+
+	/** 盒子的示意立方体：引擎 100 cm Cube + M_Bound，按 InBoxExtent / 50 缩放，正好贴住 GeneratorBounds。 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Mesh Boolean")
+	TObjectPtr<UStaticMeshComponent> BoundsCube;
+
+#if WITH_EDITORONLY_DATA
+	/** 盒子最大角上的图标（相对位置 = InBoxExtent）。 */
+	UPROPERTY()
+	TObjectPtr<UBillboardComponent> BoundsCornerBillboard;
+#endif
+
 	/**
 	 * 白名单：只有带这些标签之一的 actor 会进源三角 soup，清空则退回「盒内全收」。
 	 *
@@ -190,6 +246,14 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|Scene Filter")
 	TArray<FName> RequiredActorTags = { TEXT("Pick"), TEXT("Ref") };
+
+	/**
+	 * 面数闸门：盒内带 Pick 标签的物体面数之和达到该值时不执行 Boolean。编辑器里弹窗提示；
+	 * 弹不了窗时（无人值守、commandlet、无人值守脚本）改在本 actor 位置生成一个 TextRender 提示。
+	 * 面数按物体整体计，ISM 每个与盒相交的实例各算一份。<= 0 关闭检查。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ViewEdit", meta = (ClampMin = "0"))
+	int32 MaxPickTriangles = 2000000;
 
 	/** 是否把地形（landscape）也纳入切分的场景三角形。false 时只读 static mesh，不读地形。 */
 	UPROPERTY(BlueprintReadWrite, Category = "CS Mesh Boolean")
@@ -292,9 +356,40 @@ public:
 	 * Boolean output policy controlling whether the shared weld facility is invoked.
 	 * The distance stays here because other generators may need different seam/material
 	 * rules; only the position-to-representative algorithm is common. Zero disables it.
+	 *
+	 * > 0 时 GPU 直写路径做焊接修补：只挪点、只删被焊成一条边的三角，再按下面几项放回洞口碎片、
+	 * 补 T 缝。CPU 快照路径（RunBooleanToSnapshot）仍是旧的焊接后处理，两条路径此时结果不同。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|PostProcess", meta = (ClampMin = "0.0"))
 	float VertexWeldDistance = 0.0f;
+
+	/**
+	 * 洞口放回被删碎片（VertexWeldDistance > 0 时生效）。焊接后从每条开放边沿活面朝外的一侧绕边扫，
+	 * 碰到的第一片若被 Stage B 删了、且弯折不超过 HoleRestoreMaxBendDegrees，就放回来，再从放回的
+	 * 碎片接着扫。专治贴放/共面接触没切开、整片按质心删掉露出的洞；放回的碎片可能部分埋在另一实体里。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|PostProcess")
+	bool bRestoreHoleFragments = true;
+
+	/** 放回碎片与活面之间允许的最大弯折（度，相对平直延续）。0 = 只放回严格共面的延续，180 = 任意角度。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|PostProcess", meta = (ClampMin = "0.0", ClampMax = "180.0"))
+	float HoleRestoreMaxBendDegrees = 45.0f;
+
+	/** 放回的最大轮数；第一轮看全部开放边，之后每轮只看上一轮放回的碎片。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|PostProcess", meta = (ClampMin = "0", ClampMax = "64"))
+	int32 HoleRestoreRounds = 16;
+
+	/**
+	 * 补 T 缝并给零面积三角撑出面积（VertexWeldDistance > 0 时生效）。焊接后仍开放、所有顶点都在
+	 * 一条线附近（宽度不超过焊接距离）的边界环按扇形补面；补面和被焊平的薄片把中间那个顶点沿
+	 * 自身平面挪开 SlitNudgeDistance，StaticMesh 构建与 DynamicMesh 拷贝才不会当退化面删掉。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|PostProcess")
+	bool bFillSlitCracks = true;
+
+	/** 零面积三角中间顶点被撑开的距离（cm）。实际取值不低于查询盒坐标量级的 4 个 float ulp。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Mesh Boolean|PostProcess", meta = (ClampMin = "0.0"))
+	float SlitNudgeDistance = 0.01f;
 
 	/**
 	 * 保留源网格的材质槽结构：源 mesh 有几个槽，输出就有几个槽——即使这些槽指向同一个材质，
@@ -355,6 +450,14 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Boolean")
 	UStaticMesh* BooleanBoxScene(ECSMeshBooleanOp Op);
+
+	/**
+	 * MaxPickTriangles 闸门用的面数：GeneratorBounds 盒内带 Pick 标签的物体面数之和。
+	 * 与源三角收集走同一个枚举（标签过滤、排除自身、逐组件 / 逐 ISM 实例测盒），只计数、不提取。
+	 * 读全精度源三角时 Nanite 网格按源三角数计，因为那时它的渲染数据只剩 fallback 低模。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CS Mesh Boolean")
+	int64 CountPickTriangles() const;
 
 	/** Packs this actor's UPROPERTYs into the policy struct the pipeline actually reads. */
 	UFUNCTION(BlueprintCallable, Category = "CS Mesh Boolean")
@@ -424,18 +527,40 @@ public:
 	 * builds a deduplicated table in first-use order; the material each triangle resolves to
 	 * does not.
 	 *
-	 * Returns false — leaving Target untouched — when the pipeline produces nothing, and also
-	 * when Options.VertexWeldDistance > 0, which this path does not implement (see the comment
-	 * on the implementation). Callers that must always produce a result fall back to
-	 * RunBooleanToSnapshot. Synchronous (internal FlushRenderingCommands). Game thread only.
+	 * With Options.VertexWeldDistance > 0 the fragments are welded and repaired on the GPU
+	 * first (MeshBooleanRepair: move-only weld, hole restoration, slit fills, zero-area nudge),
+	 * which costs one more status readback. That is a different algorithm from the snapshot
+	 * path's CPU weld post-process, so the two paths deliberately disagree when welding.
+	 *
+	 * Returns false — leaving Target untouched — when the pipeline produces nothing.
+	 * Synchronous (internal FlushRenderingCommands). Game thread only.
 	 */
 	bool RunBooleanToGpuMesh(
 		ECSMeshBooleanOp Op,
 		const FCSMeshBooleanOptions& Options,
 		UCSMesh* Target);
 
+	//~ AActor interface
+	/** 盒子 / 示意立方体 / 角标按 InBoxExtent 对齐（原 BP_Boolean 构造脚本，实现在 CSBoundsVisual）。 */
+	virtual void OnConstruction(const FTransform& Transform) override;
+
 private:
 	/** Split / Boolean 的共用实现。Op 决定是否跑 Stage B 缠绕数分类。 */
 	UStaticMesh* RunBooleanInternal(ECSMeshBooleanOp Op);
+
+	/**
+	 * 在 capture 的 fragment 上跑 GPU 焊接修补，结果写回 capture 的 Repair* 字段并改写输出三角数。
+	 * Winding 是管线图留下的 Stage B winding 场，洞口放回要用它确认候选确实露在外面。
+	 */
+	bool RepairCapture(FCSMeshBooleanCapture& Capture, const MeshBooleanRepair::FSettings& Settings,
+		const MeshBooleanRepair::FWindingField& Winding);
+
+	/** MaxPickTriangles 闸门。超限时弹窗，弹不了窗就在本 actor 位置留一个 TextRender 提示。 */
+	bool PassesPickTriangleLimit();
+	void SpawnPickTriangleLimitText(int64 PickTriangles);
+	void ClearPickTriangleLimitText();
+
+	/** 上一次超限留下的提示；transient，不进关卡存档，下次运行先清掉。 */
+	TWeakObjectPtr<ATextRenderActor> PickTriangleLimitText;
 
 };

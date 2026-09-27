@@ -84,6 +84,23 @@ float EvaluateFastWindingAt(float3 query)
 // The common pass returns a corner-to-representative map. It does not merge
 // attributes or remove triangles because seam/material/winding policy belongs
 // to the mesh producer.
+//
+// A bucket keeps only the lowest corner hashed into it, so a corner whose own cell's
+// bucket is held by a corner from another cell (hash collision), or by a far corner of
+// the same cell, never sees its real partner. Three rules close those gaps:
+//  - Several tables with independent salts: a cell is invisible only if every table
+//    collides on it.
+//  - A second round over the orphans (corners that saw nobody): their competitors from
+//    round 0 are gone from the round-1 tables, so a cell holding two vertices resolves both.
+//  - The pick does not depend on the corner's own index. Accepting only candidates below
+//    the corner itself (the original rule) let two coincident corners that saw identical
+//    candidates still disagree, splitting one vertex into two positions.
+// Pointer jumping then makes the map idempotent (rep[rep[c]] == rep[c]); a corner that
+// followed a representative which itself moved on would otherwise land elsewhere.
+//
+// Only table minima are ever picked and a table minimum always sees itself, so a pick
+// never exceeds the corner that made it once that corner is pickable: chains strictly
+// decrease and flattening cannot cycle. Corner indices must stay below 2^31 (orphan bit).
 // -----------------------------------------------------------------------------
 uint WeldHashCell(int3 Cell)
 {
@@ -99,19 +116,17 @@ uint WeldHashCell(int3 Cell)
 
 StructuredBuffer<float3> WeldOutputPositions;
 Buffer<uint> WeldOutputCounter;
-RWBuffer<uint> RW_WeldOutputBuckets;
 RWBuffer<uint> RW_WeldOutputRepresentatives;
 RWBuffer<uint> RW_WeldOutputIndirectArgs;
 uint WeldOutputMaxTriangles;
-uint WeldOutputBucketMask;
 float3 WeldOutputOrigin;
 float WeldOutputInvCellSize;
 float WeldOutputDistanceSq;
 
 // Optional per-triangle participation filter. Producers that keep discarded triangles
-// resident in the soup must exclude them: a bucket stores only its lowest corner index,
-// so a dead corner with a lower index would shadow the live merge partner and silently
-// defeat welding. Mask 0 disables filtering and the buffer binding is then ignored.
+// resident in the soup can exclude them, so that dead corners neither take buckets from
+// live ones nor pull live vertices toward dead geometry. Mask 0 disables filtering and
+// the buffer binding is then ignored.
 Buffer<uint> WeldTriangleFilter;
 uint WeldTriangleFilterMask;
 
@@ -138,44 +153,152 @@ void OutputWeldIndirectArgsCS(uint3 DTid : SV_DispatchThreadID)
 	RW_WeldOutputIndirectArgs[2] = 1u;
 }
 
-[numthreads(THREADGROUPSIZE_X, 1, 1)]
-void OutputWeldHashCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+#define CS_WELD_EMPTY 0xFFFFFFFFu
+#define CS_WELD_ORPHAN_BIT 0x80000000u
+
+RWBuffer<uint> RW_WeldSaltedBuckets;   // all tables back to back, cleared to CS_WELD_EMPTY
+Buffer<uint>   WeldSaltedBuckets;      // the same buffer, read by resolve
+Buffer<uint>   WeldSaltedRepresentatives; // round-1 hash reads the orphan marks
+RWBuffer<uint> RW_WeldStats;           // [0] round-0 orphans [1] unresolved [2] chain links [3] roots
+uint WeldSaltedTableBase;              // first element of this round's tables
+uint WeldSaltedTableMask;              // bucket count per table - 1 (power of two)
+uint WeldSaltBase;                     // salt of this round's first table
+uint WeldSaltCount;                    // tables in this round
+uint WeldFlattenPass;                  // pointer-jumping pass index; 0 counts chain links
+uint WeldFlattenLastPass;              // 1 on the final pass, which counts roots
+
+uint WeldHashCellSalted(int3 Cell, uint Salt)
 {
-	uint cornerIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
-	uint cornerCount = WeldOutputCornerCount();
-	if (cornerIndex >= cornerCount) return;
-	if (!WeldCornerParticipates(cornerIndex)) return;
-	int3 cell = (int3)floor((WeldOutputPositions[cornerIndex] - WeldOutputOrigin) * WeldOutputInvCellSize);
-	uint bucket = WeldHashCell(cell) & WeldOutputBucketMask;
-	InterlockedMin(RW_WeldOutputBuckets[bucket], cornerIndex);
+	uint H = WeldHashCell(Cell);
+	if (Salt == 0u) return H;
+	H ^= Salt * 0x9e3779b9u;
+	H ^= H >> 16u;
+	H *= 0x85ebca6bu;
+	H ^= H >> 13u;
+	H *= 0xc2b2ae35u;
+	H ^= H >> 16u;
+	return H;
 }
 
-[numthreads(THREADGROUPSIZE_X, 1, 1)]
-void OutputWeldResolveCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+int3 WeldCellOf(float3 position)
 {
-	uint cornerIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
-	uint cornerCount = WeldOutputCornerCount();
-	if (cornerIndex >= cornerCount) return;
-	if (!WeldCornerParticipates(cornerIndex)) return;
+	return (int3)floor((position - WeldOutputOrigin) * WeldOutputInvCellSize);
+}
 
-	float3 position = WeldOutputPositions[cornerIndex];
-	int3 cell = (int3)floor((position - WeldOutputOrigin) * WeldOutputInvCellSize);
-	uint best = cornerIndex;
+// Lowest table minimum within the weld distance over the 27 neighbour cells of every table
+// of the current round, or CS_WELD_EMPTY.
+uint WeldSaltedLowestNeighbour(float3 position, uint cornerCount)
+{
+	int3 cell = WeldCellOf(position);
 	float limitSq = WeldOutputDistanceSq + max(1e-12f, WeldOutputDistanceSq * 1e-5f);
-	[unroll] for (int z = -1; z <= 1; ++z)
+	uint best = CS_WELD_EMPTY;
+	for (uint t = 0u; t < WeldSaltCount; ++t)
 	{
-		[unroll] for (int y = -1; y <= 1; ++y)
+		uint salt = WeldSaltBase + t;
+		uint tableBase = WeldSaltedTableBase + t * (WeldSaltedTableMask + 1u);
+		[unroll] for (int z = -1; z <= 1; ++z)
 		{
-			[unroll] for (int x = -1; x <= 1; ++x)
+			[unroll] for (int y = -1; y <= 1; ++y)
 			{
-				uint candidate = RW_WeldOutputBuckets[WeldHashCell(cell + int3(x, y, z)) & WeldOutputBucketMask];
-				if (candidate >= cornerCount || candidate >= best) continue;
-				float3 delta = WeldOutputPositions[candidate] - position;
-				if (dot(delta, delta) <= limitSq) best = candidate;
+				[unroll] for (int x = -1; x <= 1; ++x)
+				{
+					uint candidate = WeldSaltedBuckets[tableBase + (WeldHashCellSalted(cell + int3(x, y, z), salt) & WeldSaltedTableMask)];
+					if (candidate >= cornerCount || candidate >= best) continue;
+					float3 delta = WeldOutputPositions[candidate] - position;
+					if (dot(delta, delta) <= limitSq) best = candidate;
+				}
 			}
 		}
 	}
+	return best;
+}
+
+void WeldSaltedInsert(uint cornerIndex)
+{
+	int3 cell = WeldCellOf(WeldOutputPositions[cornerIndex]);
+	for (uint t = 0u; t < WeldSaltCount; ++t)
+	{
+		uint bucket = WeldHashCellSalted(cell, WeldSaltBase + t) & WeldSaltedTableMask;
+		InterlockedMin(RW_WeldSaltedBuckets[WeldSaltedTableBase + t * (WeldSaltedTableMask + 1u) + bucket], cornerIndex);
+	}
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void OutputWeldSaltedHashCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint cornerIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (cornerIndex >= WeldOutputCornerCount()) return;
+	if (!WeldCornerParticipates(cornerIndex)) return;
+	WeldSaltedInsert(cornerIndex);
+}
+
+// Round 0. A corner that sees no table minimum within the distance is marked an orphan
+// (it is then not a minimum of any table either, since a minimum sees itself).
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void OutputWeldSaltedResolveCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint cornerIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	uint cornerCount = WeldOutputCornerCount();
+	if (cornerIndex >= cornerCount) return;
+	if (!WeldCornerParticipates(cornerIndex)) return;
+	uint best = WeldSaltedLowestNeighbour(WeldOutputPositions[cornerIndex], cornerCount);
+	if (best == CS_WELD_EMPTY)
+	{
+		RW_WeldOutputRepresentatives[cornerIndex] = cornerIndex | CS_WELD_ORPHAN_BIT;
+		InterlockedAdd(RW_WeldStats[0], 1u);
+		return;
+	}
 	RW_WeldOutputRepresentatives[cornerIndex] = best;
+}
+
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void OutputWeldOrphanHashCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint cornerIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	if (cornerIndex >= WeldOutputCornerCount()) return;
+	if (!WeldCornerParticipates(cornerIndex)) return;
+	if ((WeldSaltedRepresentatives[cornerIndex] & CS_WELD_ORPHAN_BIT) == 0u) return;
+	WeldSaltedInsert(cornerIndex);
+}
+
+// Round 1: orphans against the orphan-only tables. Round-0 tables need no second look:
+// an orphan already saw nothing within the distance there.
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void OutputWeldOrphanResolveCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint cornerIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	uint cornerCount = WeldOutputCornerCount();
+	if (cornerIndex >= cornerCount) return;
+	if (!WeldCornerParticipates(cornerIndex)) return;
+	if ((RW_WeldOutputRepresentatives[cornerIndex] & CS_WELD_ORPHAN_BIT) == 0u) return;
+	uint best = WeldSaltedLowestNeighbour(WeldOutputPositions[cornerIndex], cornerCount);
+	if (best == CS_WELD_EMPTY)
+	{
+		best = cornerIndex;
+		InterlockedAdd(RW_WeldStats[1], 1u);
+	}
+	RW_WeldOutputRepresentatives[cornerIndex] = best;
+}
+
+// In-place pointer jumping. A racing read returns either the old or the new value of the
+// representative's entry; both are ancestors, so every pass only moves toward the root.
+[numthreads(THREADGROUPSIZE_X, 1, 1)]
+void OutputWeldFlattenCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	uint cornerIndex = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREADGROUPSIZE_X);
+	uint cornerCount = WeldOutputCornerCount();
+	if (cornerIndex >= cornerCount) return;
+	if (!WeldCornerParticipates(cornerIndex)) return;
+	uint rep = RW_WeldOutputRepresentatives[cornerIndex];
+	if (rep >= cornerCount) return;
+	uint next = RW_WeldOutputRepresentatives[rep];
+	if (next < cornerCount && next != rep)
+	{
+		RW_WeldOutputRepresentatives[cornerIndex] = next;
+		if (WeldFlattenPass == 0u) InterlockedAdd(RW_WeldStats[2], 1u);
+		rep = next;
+	}
+	if (WeldFlattenLastPass != 0u && rep == cornerIndex) InterlockedAdd(RW_WeldStats[3], 1u);
 }
 
 // -----------------------------------------------------------------------------

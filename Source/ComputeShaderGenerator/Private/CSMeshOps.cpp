@@ -1242,32 +1242,9 @@ UCSMesh* UCSMeshOps::ApplyMeshBoolean(
 	if (!Target || !Generator) return Target;
 
 	// The GPU path writes the result straight into the resident streams — no snapshot, no
-	// re-upload. Welding is the one thing it does not implement (the CPU post-process removes
-	// duplicate triangles, which needs a global hash table on the GPU), and that is decided
-	// here rather than by letting the GPU path fail: a failure after the fact would mean
-	// running the whole Boolean twice.
-	const bool bNeedsCpuWeld = Options.VertexWeldDistance > UE_SMALL_NUMBER;
-	if (!bNeedsCpuWeld)
-	{
-		if (Generator->RunBooleanToGpuMesh(Op, Options, Target)) return Target;
-		UE_LOG(LogCSMeshOps, Warning, TEXT("[CSMeshOps] ApplyMeshBoolean: the GPU path produced no geometry."));
-		return Target;
-	}
-
-	FCSGpuMeshCPUData Snapshot;
-	TArray<UMaterialInterface*> Materials;
-	if (!Generator->RunBooleanToSnapshot(Op, Options, Snapshot, Materials))
-	{
-		UE_LOG(LogCSMeshOps, Warning, TEXT("[CSMeshOps] ApplyMeshBoolean: the pipeline produced no geometry."));
-		return Target;
-	}
-
-	// The per-triangle ids in the snapshot are slots in this table, so it replaces whatever
-	// the target had — a Boolean is a whole-mesh replacement, not an append.
-	Target->Materials.Reset(Materials.Num());
-	for (UMaterialInterface* Material : Materials) Target->Materials.Add(Material);
-
-	CopyFromMeshSnapshot(Target, Snapshot);
+	// re-upload — and with VertexWeldDistance > 0 it also welds and repairs on the GPU.
+	if (Generator->RunBooleanToGpuMesh(Op, Options, Target)) return Target;
+	UE_LOG(LogCSMeshOps, Warning, TEXT("[CSMeshOps] ApplyMeshBoolean: the GPU path produced no geometry."));
 	return Target;
 }
 

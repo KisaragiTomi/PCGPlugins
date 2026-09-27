@@ -623,8 +623,8 @@ bool FCSMeshBooleanGpuParityTest::RunTest(const FString& Parameters)
 	// which is a lot of VRAM to allocate for 24 triangles.
 	Generator->MaxTriangles = 4096;
 	Generator->bReadLandscape = false;
-	// The GPU path does not implement welding (duplicate-triangle removal needs a global hash
-	// table); leaving it off is what keeps both paths on the same algorithm here.
+	// With welding on, the GPU path runs its own repair (MeshBooleanRepair) and deliberately
+	// departs from the CPU weld post-process; leaving it off keeps both paths on one algorithm.
 	Generator->VertexWeldDistance = 0.0f;
 	World->UpdateWorldComponents(true, false);
 	FlushRenderingCommands();

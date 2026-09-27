@@ -52,6 +52,20 @@ namespace CSGpuTriangleUtilities
 		const FTriangleLBVH& LBVH,
 		int32 TriangleCount);
 
+	/** Layout of the optional weld statistics buffer (uint32 each, caller clears to zero). */
+	enum EVertexWeldStat : uint32
+	{
+		/** Corners that saw no representative in the first round. */
+		VertexWeldStatOrphans = 0,
+		/** Orphans that still saw nobody in the second round; each stays its own vertex. */
+		VertexWeldStatUnresolved,
+		/** Corners whose representative had itself moved on and was followed. */
+		VertexWeldStatChainLinks,
+		/** Distinct representatives, i.e. welded vertex count. */
+		VertexWeldStatRepresentatives,
+		VertexWeldStatCount
+	};
+
 	/**
 	 * Computes a representative corner for every output position within WeldDistance.
 	 *
@@ -59,11 +73,17 @@ namespace CSGpuTriangleUtilities
 	 * duplicate-triangle removal, and source-winding restoration are output-policy
 	 * decisions and intentionally stay in the mesh producer.
 	 *
+	 * Representatives are flattened (pointer jumping over chains of up to 16 links), so every
+	 * corner of one welded vertex resolves to the same corner and the same position. Corners
+	 * excluded by the filter keep 0xFFFFFFFF.
+	 *
 	 * TriangleFilter optionally restricts welding to triangles whose filter word has any
 	 * TriangleFilterMask bit set, indexed by triangle. Producers that leave discarded
-	 * triangles resident in the soup must supply it: each hash bucket keeps only its
-	 * lowest corner index, so a discarded corner with a lower index would shadow the live
-	 * merge partner and silently reduce welding. Passing nullptr welds every corner.
+	 * triangles resident in the soup can supply it so dead corners neither take hash
+	 * buckets from live ones nor pull live vertices toward dead geometry. Passing nullptr
+	 * welds every corner.
+	 *
+	 * StatsUAV, when given, receives VertexWeldStatCount counters (see EVertexWeldStat).
 	 */
 	COMPUTESHADERGENERATOR_API FRDGBufferRef AddVertexWeldPasses(
 		FRDGBuilder& GraphBuilder,
@@ -74,5 +94,6 @@ namespace CSGpuTriangleUtilities
 		const FVector3f& GridOrigin,
 		float WeldDistance,
 		FRDGBufferSRVRef TriangleFilter = nullptr,
-		uint32 TriangleFilterMask = 0u);
+		uint32 TriangleFilterMask = 0u,
+		FRDGBufferUAVRef StatsUAV = nullptr);
 }

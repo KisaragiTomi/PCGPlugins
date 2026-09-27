@@ -296,9 +296,9 @@ public:
 	 * block, because the resident capacity is a CPU-side allocation and only the GPU knows how
 	 * big the result is.
 	 *
-	 * The exception is VertexWeldDistance > 0, which still goes through the CPU snapshot path:
-	 * the weld post-process removes duplicate triangles, and reproducing that on the GPU needs
-	 * a global hash table. Blocking; editor-oriented.
+	 * VertexWeldDistance > 0 welds and repairs the result on the GPU as well (hole restoration,
+	 * slit fills, see AComputeShaderMeshBoolean::RunBooleanToGpuMesh), at the price of one more
+	 * status readback. Blocking; editor-oriented.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "CS GpuMesh|Boolean")
 	static UPARAM(DisplayName = "Target") UCSMesh* ApplyMeshBoolean(

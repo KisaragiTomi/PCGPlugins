@@ -33,6 +33,7 @@ public class PCGEditorProcess : ModuleRules
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
+				"BlueprintGraph",
 				"DeveloperSettings",
 				"EditorFramework",
 				"Engine",

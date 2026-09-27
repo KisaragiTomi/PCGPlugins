@@ -1,5 +1,6 @@
 #include "SelectedActorViewportOverlayBase.h"
 
+#include "DetailsCategoryAliasCustomization.h"
 #include "Editor.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
@@ -73,31 +74,9 @@ TSharedPtr<IAssetViewport> FindOverlayViewport(FLevelEditorModule& LevelEditorMo
 	return nullptr;
 }
 
-bool DoesDetailsCategoryMatch(FName CandidateCategoryName, FName RequiredCategoryName)
-{
-	if (CandidateCategoryName.IsNone() || RequiredCategoryName.IsNone())
-	{
-		return false;
-	}
-
-	const FString CandidateCategoryString = CandidateCategoryName.ToString();
-	const FString RequiredCategoryString = RequiredCategoryName.ToString();
-	return CandidateCategoryString.Equals(RequiredCategoryString, ESearchCase::IgnoreCase)
-		|| CandidateCategoryString.StartsWith(RequiredCategoryString + TEXT("|"), ESearchCase::IgnoreCase);
-}
-
 bool DoesFieldMatchDetailsCategory(const FField* Field, FName RequiredCategoryName)
 {
-	return Field && DoesDetailsCategoryMatch(FObjectEditorUtils::GetCategoryFName(Field), RequiredCategoryName);
-}
-
-bool DoesFunctionMatchDetailsCategory(const UFunction* Function, const UClass* ActorClass, FName RequiredCategoryName)
-{
-	static const FName CallInEditorMetadataKey(TEXT("CallInEditor"));
-	return Function
-		&& Function->GetBoolMetaData(CallInEditorMetadataKey)
-		&& !FObjectEditorUtils::IsFunctionHiddenFromClass(Function, ActorClass)
-		&& DoesDetailsCategoryMatch(FObjectEditorUtils::GetCategoryFName(Function), RequiredCategoryName);
+	return Field && FDetailsCategoryAliasCustomization::DoesCategoryMatch(FObjectEditorUtils::GetCategoryFName(Field), RequiredCategoryName);
 }
 
 class SSelectedActorDetailsCategoryPanel : public SCompoundWidget
@@ -132,6 +111,13 @@ public:
 		FPropertyEditorModule& PropertyEditorModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
 		TSharedRef<IDetailsView> NewDetailsView = PropertyEditorModule.CreateDetailView(DetailsViewArgs);
 		DetailsView = NewDetailsView;
+		// 只在这个 view 里顶替引擎的 FObjectDetails，把 "ViewEdit" / "View Edit" 这类写法合成一个分类。
+		NewDetailsView->RegisterInstancedCustomPropertyLayout(
+			UObject::StaticClass(),
+			FOnGetDetailCustomizationInstance::CreateLambda([RequiredCategoryName = CategoryName]() -> TSharedRef<IDetailCustomization>
+			{
+				return MakeShared<FDetailsCategoryAliasCustomization>(RequiredCategoryName);
+			}));
 		NewDetailsView->SetIsPropertyVisibleDelegate(FIsPropertyVisible::CreateSP(this, &SSelectedActorDetailsCategoryPanel::IsPropertyVisible));
 		NewDetailsView->SetIsCustomRowVisibleDelegate(FIsCustomRowVisible::CreateSP(this, &SSelectedActorDetailsCategoryPanel::IsCustomRowVisible));
 		NewDetailsView->SetObject(Actor.Get(), true);
@@ -197,7 +183,10 @@ private:
 
 	bool IsCustomRowVisible(FName RowName, FName ParentName) const
 	{
-		return DoesDetailsCategoryMatch(RowName, CategoryName) || DoesDetailsCategoryMatch(ParentName, CategoryName);
+		// ParentName 不一定是分类的 FName：分类的「显示高级属性」那一行传的是显示名（"View Edit"），
+		// 以前按原样比较，ViewEdit 里的 AdvancedDisplay 属性在浮窗里就一直展不开。
+		return FDetailsCategoryAliasCustomization::DoesCategoryMatch(RowName, CategoryName)
+			|| FDetailsCategoryAliasCustomization::DoesCategoryMatch(ParentName, CategoryName);
 	}
 
 	TWeakObjectPtr<AActor> Actor;
@@ -258,15 +247,10 @@ bool FSelectedActorViewportOverlayBase::ActorHasDetailsCategory(const AActor* Ac
 		}
 	}
 
-	for (TFieldIterator<UFunction> It(ActorClass, EFieldIteratorFlags::IncludeSuper); It; ++It)
-	{
-		if (DoesFunctionMatchDetailsCategory(*It, ActorClass, CategoryName))
-		{
-			return true;
-		}
-	}
-
-	return false;
+	// 与浮窗实际出按钮的同一份名单：只算真能出成按钮的（无参数等），免得浮起一个空窗。
+	TArray<UFunction*> Functions;
+	FDetailsCategoryAliasCustomization::GetCallInEditorFunctions(ActorClass, CategoryName, Functions);
+	return !Functions.IsEmpty();
 }
 
 TSharedRef<SWidget> FSelectedActorViewportOverlayBase::CreateDetailsCategoryPanelWidget(TWeakObjectPtr<AActor> Actor) const

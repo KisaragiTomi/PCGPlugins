@@ -27,6 +27,19 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Editor Shortcuts", meta = (DisplayName = "Verbose Logging"))
 	bool bVerboseLogging = false;
 
+	/**
+	 * Stand a short-lived "+Tag" / "-Tag" label on top of every actor a tag call changed, as wide as its bounds.
+	 *
+	 * The corner toast says *that* something happened; this says **which actors** it happened
+	 * to, which is the part that matters when a dozen props are selected.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Editor Shortcuts|Tag Indicator")
+	bool bShowTagIndicator = true;
+
+	/** How long a label stays up. */
+	UPROPERTY(config, EditAnywhere, Category = "Editor Shortcuts|Tag Indicator", meta = (ClampMin = "0.1", ClampMax = "30.0", EditCondition = "bShowTagIndicator"))
+	float TagIndicatorSeconds = 2.0f;
+
 	UPROPERTY(config, EditAnywhere, BlueprintReadOnly, Category = "Editor Shortcuts", meta = (TitleProperty = "Label"))
 	TArray<FEditorShortcutBinding> Bindings;
 

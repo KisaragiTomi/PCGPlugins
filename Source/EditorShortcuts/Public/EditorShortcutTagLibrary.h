@@ -18,6 +18,12 @@ class AActor;
  * They exist because Modify() is not reachable from Blueprint, and without it a tag
  * change made in Blueprint would not be undoable.
  *
+ * Every actor a call changes gets a short-lived "+Tag" (green) / "-Tag" (red) label standing
+ * on top of its bounding box, as wide as the box is seen from the viewport, as the old
+ * ActorTagShortcut did; switch it off or change how long it stays in
+ * Project Settings > Plugins > Editor Shortcuts > Tag Indicator. The label is kept out of
+ * the undo transaction and never dirties the map.
+ *
  * Each returns how many actors it changed.
  */
 UCLASS()

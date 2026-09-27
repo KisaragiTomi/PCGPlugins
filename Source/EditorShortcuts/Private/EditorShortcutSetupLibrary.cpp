@@ -45,11 +45,31 @@ FEdGraphPinType MakeActorArrayPinType()
 	return PinType;
 }
 
+/** The tag library call one operation wraps, and the prefix its generated functions carry. */
+struct FTagOp
+{
+	FName Function;
+	const TCHAR* Prefix;
+};
+
+FTagOp ResolveTagOp(EEditorShortcutTagOp Op)
+{
+	switch (Op)
+	{
+	case EEditorShortcutTagOp::Add:
+		return { GET_FUNCTION_NAME_CHECKED(UEditorShortcutTagLibrary, AddTagToActors), TEXT("Add") };
+	case EEditorShortcutTagOp::Remove:
+		return { GET_FUNCTION_NAME_CHECKED(UEditorShortcutTagLibrary, RemoveTagFromActors), TEXT("Remove") };
+	default:
+		return { GET_FUNCTION_NAME_CHECKED(UEditorShortcutTagLibrary, ToggleTagOnActors), TEXT("Toggle") };
+	}
+}
+
 /**
- * Builds one function: an Actors input wired straight into ToggleTagOnActors,
+ * Builds one function: an Actors input wired straight into the tag library call,
  * with the tag written into the call's Tag pin.
  */
-bool BuildToggleFunction(UBlueprint* Blueprint, FName FunctionName, FName Tag, FString& OutError)
+bool BuildTagFunction(UBlueprint* Blueprint, FName FunctionName, FName Tag, FName TagFunction, FString& OutError)
 {
 	// Rebuild rather than duplicate when the function is already there.
 	if (UEdGraph* Existing = FindObject<UEdGraph>(Blueprint, *FunctionName.ToString())) FBlueprintEditorUtils::RemoveGraph(Blueprint, Existing);
@@ -80,9 +100,7 @@ bool BuildToggleFunction(UBlueprint* Blueprint, FName FunctionName, FName Tag, F
 	}
 
 	UK2Node_CallFunction* CallNode = NewObject<UK2Node_CallFunction>(Graph);
-	CallNode->FunctionReference.SetExternalMember(
-		GET_FUNCTION_NAME_CHECKED(UEditorShortcutTagLibrary, ToggleTagOnActors),
-		UEditorShortcutTagLibrary::StaticClass());
+	CallNode->FunctionReference.SetExternalMember(TagFunction, UEditorShortcutTagLibrary::StaticClass());
 	CallNode->CreateNewGuid();
 	CallNode->PostPlacedNewNode();
 	CallNode->SetFlags(RF_Transactional);
@@ -98,7 +116,7 @@ bool BuildToggleFunction(UBlueprint* Blueprint, FName FunctionName, FName Tag, F
 
 	if (!EntryThen || !CallExec || !CallActors || !CallTag)
 	{
-		OutError = FString::Printf(TEXT("%s: ToggleTagOnActors did not expose the expected pins"), *FunctionName.ToString());
+		OutError = FString::Printf(TEXT("%s: %s did not expose the expected pins"), *FunctionName.ToString(), *TagFunction.ToString());
 		return false;
 	}
 
@@ -110,7 +128,7 @@ bool BuildToggleFunction(UBlueprint* Blueprint, FName FunctionName, FName Tag, F
 }
 } // namespace
 
-FString UEditorShortcutSetupLibrary::CreateTagToggleLibrary(const FString& PackageName, const TArray<FName>& Tags, bool bSave)
+FString UEditorShortcutSetupLibrary::CreateTagLibrary(const FString& PackageName, const TArray<FName>& Tags, EEditorShortcutTagOp Op, bool bSave)
 {
 	if (!FPackageName::IsValidLongPackageName(PackageName))
 	{
@@ -174,21 +192,23 @@ FString UEditorShortcutSetupLibrary::CreateTagToggleLibrary(const FString& Packa
 		return FString();
 	}
 
+	const FTagOp TagOp = ResolveTagOp(Op);
+
 	int32 Built = 0;
 	for (FName Tag : Tags)
 	{
 		if (Tag.IsNone()) continue;
 
-		const FName FunctionName(*FString::Printf(TEXT("Toggle%s"), *Tag.ToString()));
+		const FName FunctionName(*FString::Printf(TEXT("%s%s"), TagOp.Prefix, *Tag.ToString()));
 
 		FString Error;
-		if (!BuildToggleFunction(Blueprint, FunctionName, Tag, Error))
+		if (!BuildTagFunction(Blueprint, FunctionName, Tag, TagOp.Function, Error))
 		{
 			UE_LOG(LogEditorShortcuts, Error, TEXT("%s"), *Error);
 			continue;
 		}
 
-		UE_LOG(LogEditorShortcuts, Log, TEXT("Generated %s -> ToggleTagOnActors(Actors, %s)"), *FunctionName.ToString(), *Tag.ToString());
+		UE_LOG(LogEditorShortcuts, Log, TEXT("Generated %s -> %s(Actors, %s)"), *FunctionName.ToString(), *TagOp.Function.ToString(), *Tag.ToString());
 		++Built;
 	}
 

@@ -42,7 +42,7 @@
 |------|----------------|------|------|
 | **ComputeShaderGenerator** | Runtime · PostConfigInit | Win64 | GPU Compute Shader 核心：CSMesh 常驻网格对象层、浅水模拟（`ACSShallowWaterCapture`）、藤蔓生成（`AVineContainer`）、体素 / 三角网格生成（`AComputeShaderMeshGenerator`）、MeshBoolean、CliffGenerate、MeshFill、场景捕获、GPU 骨架树、PointBrush、Tiny Glade 房屋与地面等。 |
 | **GeometryScriptExtraEditor** | Editor · Default | 不限（依赖 Win64-only 的 `ComputeShaderGenerator`，实际同样只能 Win64） | 扩展 Geometry Script 的蓝图函数库：OpenVDB 体素化、网格属性工具、PolyPath、Landscape 采样、Foliage 互转等。纯函数库，不含 actor / 组件。 |
-| **PCGEditorProcess** | Editor · PostConfigInit | Win64 | 编辑器工具流程：四种笔刷 EdMode（实例 / 点 / 地面顶点色 / 窗）、浅水烘焙、Landscape Edit Layer 与道路、选中 Actor 的视口叠加面板、资产处理、GPU 骨架树的骨骼网格生成、拉尺寸失选监听。 |
+| **PCGEditorProcess** | Editor · PostConfigInit | Win64 | 编辑器工具流程：四种笔刷 EdMode（实例 / 点 / 地面顶点色 / 窗）、浅水烘焙、Landscape Edit Layer 与道路、选中 Actor 的视口叠加面板、资产处理、GPU 骨架树的骨骼网格生成、拉尺寸失选监听、Nanite 截面 HLOD 构建器（`UCSNaniteCutHLODBuilder`）。 |
 | **EditorShortcuts** | Editor · Default | Win64 | 编辑器全局快捷键：按键组合 → 调用任意 UFunction（函数库里的静态函数，或逐个选中 actor 上的函数），附 Actor Tag 增删 / 切换函数库。 |
 
 > 调试宏 `PCGPLUGINS_DEBUG` 由 `ComputeShaderGenerator` / `GeometryScriptExtraEditor` / `PCGEditorProcess` 三个 Build.cs 定义，非 Shipping 为 1。**编译期**可用环境变量 `PCGPLUGINS_DEBUG=0` 关掉：它由 UBT 读取，不是运行时开关；Shipping 下 `PCGPLUGINS_DEBUG_ENABLED` 恒为 0，设成 1 也没用。头文件 `PCGPluginDebug.h` 在 `Source/ComputeShaderGenerator/` 的 `Public/` 与 `Private/` 各有一份，内容逐字相同。
@@ -121,6 +121,10 @@
 | Bounds | `ComputeWorldBoundsSync` |
 
 仅 C++（未反射的类型进不了蓝图）：`PaintVertexColorsSphereInRegion`（局部脏区重绘）、`DisplaceGroundShapers`（Tiny Glade 地形塑形物）、`CopyFromMeshSnapshot`，以及供其它翻译单元复用的 `AddXxxPasses` 系列 pass 录制器。Shader 落在 [`Shaders/Private/CSMeshOps.usf`](Shaders/Private/CSMeshOps.usf)。
+
+**Nanite 截面**在单独的函数库 `UCSNaniteCutOps`（[`CSNaniteCut.h`](Source/ComputeShaderGenerator/Public/CSNaniteCut.h)）：`AppendNaniteCuts` 按网格局部空间的误差阈值 CutError 把一组 Nanite 网格的截面写进 `UCSMesh`（GPU 遍历层级、解码位置 / 法线 / 切线 / UV / 颜色 / 材质号，不经 GPU Scene），`CutErrorForScreenError` 把"某距离上 N 像素误差"换成 CutError。与 `CopyFromStaticMesh` 的区别：后者对 Nanite 网格读到的是 fallback。WP HLOD 构建器 `UCSNaniteCutHLODBuilder`（`PCGEditorProcess`）与关卡内试验台 `ACSNaniteCutHLODActor` 都建在它上面，试验台的 `BakeHLOD` 再用 `CSNaniteCutBake`（[`CSNaniteCutBake.h`](Source/ComputeShaderGenerator/Public/CSNaniteCutBake.h)，编辑器专用）把截面烘成带 2048 BaseColor / Normal / Roughness 的 Nanite 静态网格（逐源喂图元数据，用了 WorldPosition / ObjectPosition 的材质与原来一致）；设计、限制与实测见 [`NaniteClusterHLOD_Plan.md`](NaniteClusterHLOD_Plan.md)。
+
+**外部可见性剔除** `UCSMeshVisibilityOps::CullHiddenTriangles`（[`CSMeshVisibilityCull.h`](Source/ComputeShaderGenerator/Public/CSMeshVisibilityCull.h)）：从包围球外一圈视点（斐波那契球面，每个方向一张透视 + 一张正交）用 GPU 软件光栅看一遍 `UCSMesh`，从来没当过最近面的三角形删掉并压实 —— 封闭房间里的东西、山洞深处、互相穿插的内部面。对任意 `UCSMesh` 可用，HLOD 构建器与试验台默认开着。
 
 **唯一的 CPU 例外**：`ApplyMeshBoolean` 在 `VertexWeldDistance > 0` 时仍走 CPU 快照路——焊接后处理要去掉重复三角，在 GPU 上复现需要全局哈希表。其余分支全程不回 CPU。
 
@@ -264,9 +268,18 @@ AVineContainer::GenerateVineGPU()          # 录完图即返回（"已递交"）
 
 以 Tiny Glade 为原型的交互式场景搭建：在地面上画路，房子沿路自动开门拱；堆起土台，房子跟着落座、悬空处长出承重柱；两栋房相交，交点立接缝砖柱；用窗笔刷在墙上点一下就挂上一扇窗。整套系统建在第 1 节的 CSMesh 家族上，运行时代码全部在 `ComputeShaderGenerator`；笔刷 EdMode、拉尺寸的失选监听等编辑器应答在 `PCGEditorProcess`（运行时只广播请求，零编辑器依赖，所以无头测试能走完整条交互）。
 
-![Tiny Glade — L_HouseGroundDemo 编辑器视口](Docs/TinyGladeHouseGround.png)
+![Tiny Glade — L_HouseGroundDemo 编辑器视口](Docs/Result/TinyGladeHouseGround.png)
 
 > `L_HouseGroundDemo` 编辑器视口（2026-09-10）：四坡瓦顶与尖顶、窗、门拱与门扇、藤蔓、墙面灰泥剥落、角石、承重柱，塑形物土台上的岩壳与石阶，以及摆件和草花地被。
+
+| ![样条墙 — 默认 L 形：压顶与垛口、墙端砖柱、两面爬藤](Docs/Result/TinyGladeSplineWall_L.jpg) | ![样条墙 — S 形弯墙：夹角大处是圆滑的墙，墙顶砖一段到底](Docs/Result/TinyGladeSplineWall_Curve.jpg) |
+|---|---|
+
+> 样条墙 `ACSWallActor`（2026-09-22）：左为默认 L 形（直角处是拐角，外侧出角石），右为控制点全是 Curve 的 S 形弯墙。
+
+![草的近 / 远两档](Docs/Result/TinyGladeGrassLod.jpg)
+
+> 地被的近 / 远两档（2026-09-23，关掉花只看草）：上图是改之前 —— 100 万根的预算摊在 512 m 见方的地面上，密度被自动退让到 4 株/m²，近处稀得见土；下图是改之后 —— 相机周围一块 140 m 见方的窗口里按满密度 50 株/m² 撒 98.2 万根**单根草**（跟着相机走，挪动只重撒不交接），60 m 之外换成 39.4 万簇**组合草**（`SM_TG_GrassClump`，材质不做 WPO、风只扰动法线），交界处两档按逐株随机数在 15 m 过渡带里互补，画面上看不到圈。
 
 | 类 | 角色 | 头文件 |
 |---|---|---|
@@ -278,6 +291,8 @@ AVineContainer::GenerateVineGPU()          # 录完图即返回（"已递交"）
 | `ACSHouseResizeHandleActor` / `ACSHouseHeightHandleActor` | 拉尺寸抓手：footprint 每条边一个锥子推拉墙面，外加檐口 / 房底两个高度框（改墙高 / 底动顶不动）；公共基类 `ACSHouseHandleActor`，用编辑器原生 gizmo 拖 | [`CSHouseResizeHandleActor.h`](Source/ComputeShaderGenerator/Public/CSHouseResizeHandleActor.h) |
 | `UCSHouseLibrary` | 静态函数库、无状态：房屋名单 `GetHouses`（`TActorRange` 按 GUID 升序，没有登记表）、`PickHouse` / `PickHouseNear` 解析拾取、点击放窗的执行面 `PlaceMarkerAlongRay`。取代 2026-09-16 删除的 `UCSHouseSubsystem` | [`CSHouseLibrary.h`](Source/ComputeShaderGenerator/Public/CSHouseLibrary.h) |
 | `ACSStairsActor` | 玩家绘制楼梯（TG §4.1 的 MVP）：默认带样条组件，按 50 cm 弧长重采样出级，踏步块底下按层砌砖到地面；订阅地面广播，只在变更盒与样条包围盒相交时重算 | [`CSStairsActor.h`](Source/ComputeShaderGenerator/Public/CSStairsActor.h) |
+| `ACSWallBase` | 墙的基类（[墙化计划](Docs/TinyGlade/TinyGladeWall_Plan.md)第 4 步）：`ACSWallActor` 与 `ACSHouseActor` 都派生自它。路径来源是虚函数（样条 / footprint），藤的胶水（组件、MID、快照、交接、生长相位、管子）只有这一份；墙体 / 墙顶 / 角石 / 藤的墙面都走纯函数核心 [`CSWall.h`](Source/ComputeShaderGenerator/Public/CSWall.h)（房子 = 围合墙 + 平顶 + 屋顶，画面与统一前逐位相同） | [`CSWallBase.h`](Source/ComputeShaderGenerator/Public/CSWallBase.h) |
+| `ACSWallActor` | 样条墙（TG 的 freehand 墙，[墙化计划](Docs/TinyGlade/TinyGladeWall_Plan.md)第 1 步）：墙 = 样条中线，逐点贴地，默认 3 m 高；墙顶压顶砖 + 隔块抬起的垛口、墙端与拐角角石、两面爬藤；拐角只按相邻两段的夹角判（转得缓就是圆滑的墙）。派生自 `ACSWallBase`，与房子共用墙的逻辑 | [`CSWallActor.h`](Source/ComputeShaderGenerator/Public/CSWallActor.h) |
 | `ACSSplineBlockActor` | 样条块排布：刚体块沿样条排列，只缩沿线步距、恰好占满样条（不是 SplineMesh 弯曲） | [`CSSplineBlockActor.h`](Source/ComputeShaderGenerator/Public/CSSplineBlockActor.h) |
 
 纯函数层（剖面 / 接缝 / 角石 / 包边 / 屋面 / 拉尺寸 / 门段）是 header-inline 的 `CSHouseProfile.h`、`CSHouseSeam.h`、`CSHouseQuoin.h`、`CSHouseTrim.h`、`CSHouseRoof.h`、`CSHouseResize.h`、`CSHouseDoorRuns.h`，以及玩家楼梯的 `CSStairs.h`，带逻辑单测。实例化产物各有一个打包 / 散布 kernel，直接写 `UCSGpuInstancedMeshComponent` 的 GPU 实例行：门框砖 `CSHouseFrame.usf`、瓦 `CSHouseTile.usf`、藤蔓 `CSHouseVine.usf`、摆件 `CSHouseDecor.usf`、承重柱砖 `CSHousePillar.usf`、石阶 `CSGroundStairs.usf`、地被 `CSGroundCover.usf`；岩壳则是一张 `UCSMesh`，由 `CSGroundRockShell.usf` 在常驻流上做位移、法线平均与倒角载荷。
@@ -316,9 +331,10 @@ AVineContainer::GenerateVineGPU()          # 录完图即返回（"已递交"）
 - 配置在 **Project Settings → Plugins → Editor Shortcuts**（`UEditorShortcutSettings`，存进项目的编辑器用户配置）。每条 `FEditorShortcutBinding` = `Chord` + `TargetClass` + `FunctionName`，另有 `bTransactional` / `bRequiresSelection` / `bShowNotification`。
 - 调用目标二选一：填 `TargetClass`（蓝图函数库、蓝图类或原生类，静态 / 抽象类调在 CDO 上）；留空则逐个调选中 actor 上的同名函数。参数只能是 actor 数组（收到当前选择）、单个 actor、`__WorldContext` 或带默认值的参数。
 - 每次调用包一个撤销事务，出错即取消；PIE 中、按键重复时不触发，文本框有焦点时默认也不触发。启动时对缺键、缺目标、键位冲突打警告。
-- `UEditorShortcutTagLibrary` 提供可撤销的 `AddTagToActors` / `RemoveTagFromActors` / `ToggleTagOnActors`。绑定没法传参，所以每个 tag 要一个包装函数：`UEditorShortcutSetupLibrary::CreateTagToggleLibrary(PackageName, Tags, bSave)` 生成一个 Editor Utility Blueprint，每个 tag 一个 `Toggle<Tag>(Actors)`，把返回的类路径填进 `TargetClass` 即可。
+- `UEditorShortcutTagLibrary` 提供可撤销的 `AddTagToActors` / `RemoveTagFromActors` / `ToggleTagOnActors`。绑定没法传参，所以每个 tag 要一个包装函数：`UEditorShortcutSetupLibrary::CreateTagLibrary(PackageName, Tags, Op, bSave)` 生成一个 Editor Utility Blueprint，每个 tag 一个 `Add<Tag>` / `Remove<Tag>` / `Toggle<Tag>`（`Op` 选），把返回的类路径填进 `TargetClass` 即可。资产必须是 parent 为 `EditorFunctionLibrary` 的 Editor Utility Blueprint——tag 库在 Editor 模块里，普通蓝图函数库调不了它（引擎规则：editor-only 函数只能放进**父类本身是 editor-only** 的蓝图，`K2Node_CallFunction.cpp:1443`）。手建时走 Editor Utilities → Editor Utility Blueprint，`Editor Function Library` 只出现在 Pick Parent Class 对话框**顶部的常用类**里，下面的树和搜索框都找不到它（它没有 `Blueprintable`）。
+- 三个 tag 函数每改一个 actor，就在它**包围盒的最上方**立一个临时文字：加 = 绿色 `+Tag`，删 = 红色 `-Tag`，站在包围盒顶面正中、底边贴顶面往上长，**宽度 = 包围盒**从视口方向看的宽度（等比缩放，朝向视口；带 Game show flag 的视图——含编辑器 Game View (G) 与所有 SceneCapture——看不见它，免得被 CSSW 之类的捕获拍进去），`TagIndicatorSeconds`（默认 2 s）后自毁；Project Settings → Editor Shortcuts → Tag Indicator 可关（2026-09-23 从旧 `ActorTagShortcut` 接回来）。文字 actor 是 transient、不进大纲，生成与销毁都藏在撤销事务之外 —— 绑定默认在 `FScopedTransaction` 里跑，而 `UWorld::SpawnActor` 在事务里会 `ModifyLevel`，不藏的话撤销会把已经自毁的文字连同关卡的 actor 表一起"复活"。验收脚本 `Scripts/EditorShortcutsVerifyTags.py`（21 条）。
 - 蓝图 / Python 可经 `UEditorShortcutSubsystem` 直接执行绑定（`ExecuteBindingByIndex` / `ExecuteBindingByLabel` / `RunBinding` / `ValidateAllBindings`）。
-- ⚠️ 宿主工程 UETest574_2 的 `Config/DefaultEditorPerProjectUserSettings.ini` 里有 4 条绑定（Toggle CSSW / UA / Pick / Ref），都指向 `/PCGPlugins/EditorShortcuts/BPFL_ShortcutActions`，但这个资产目前不存在（`Content/EditorShortcuts/` 是空的），要先用 `CreateTagToggleLibrary` 生成，否则这 4 条会报找不到目标类。
+- 宿主工程 UETest574_2 的 `Config/DefaultEditorPerProjectUserSettings.ini` 里有 4 条绑定（Ctrl+Alt+Shift + W / G / Q / R → Toggle CSSW / UA / Pick / Ref），2026-09-23 起全部指向 `/PCGPlugins/EditorShortcuts_BPFL/BPFL_Tags`（`ToggleCSSW` / `ToggleUA` / `TogglePick` / `ToggleRef`，由 `CreateTagLibrary` 生成）。旧的 `/PCGPlugins/EditorShortcuts/BPFL_ShortcutActions` 与 `/PCGPlugins/EditorShortcuts_BPFL/BPFL_Pick`（`AddPick`）还在，只是没有绑定指向它们了。
 
 ### 🖌️ PointBrush · 绘制点 → GPU 可直读 buffer
 
@@ -341,7 +357,7 @@ AVineContainer::GenerateVineGPU()          # 录完图即返回（"已递交"）
 
 | 溪流漫流 | 多水源侵蚀地形 |
 |:---:|:---:|
-| ![CSSW 浅水模拟 — 溪流漫流](Docs/ShallowWater0.png) | ![CSSW 浅水模拟 — 多水源侵蚀地形](Docs/ShallowWater1.png) |
+| ![CSSW 浅水模拟 — 溪流漫流](Docs/Result/ShallowWater0.png) | ![CSSW 浅水模拟 — 多水源侵蚀地形](Docs/Result/ShallowWater1.png) |
 
 - **示例蓝图**：`BP_CSSW_Capture`（捕获/求解器）、`BP_CSSW_Source`（水源，即截图中的粉色圆盘）、`BP_CSSW_Flux30` / `BP_CSSW_Flux30_CloseBound`（水流示例，即红色圆柱）
 - **运行方式**：打开关卡 → 选中 `BP_CSSW_Capture` 实例 → 调 `UCSShallowWaterProcess::StartSWSolver`（作用于当前选中的 CSSW actor，可给 `Iteration` / `TimerRate`）启动求解，`StopSWSolver` 停止（actor 本身不 Tick、细节面板上也没有启动按钮，见第 2 节）。
@@ -351,7 +367,7 @@ AVineContainer::GenerateVineGPU()          # 录完图即返回（"已递交"）
 
 > **📍 测试关卡**：[`Content/SpaceColonization/L_TestWorld.umap`](Content/SpaceColonization)（关卡内已放置 `AVineContainer` 藤蔓 Actor）
 
-![VineGenerator — ViewEdit 视口浮窗与藤蔓生成结果](Docs/VineGenerator.png)
+![VineGenerator — ViewEdit 视口浮窗与藤蔓生成结果](Docs/Result/VineGenerator.png)
 
 > 截图摄于 2026-07：左侧是 `ViewEdit` 分类浮窗；右上角那块按钮面板属于已删除的 `FVineContainerViewportOverlay`，现在已经没有了。
 
@@ -468,6 +484,14 @@ BVH 那一行标「下界」：基准里用的是节点 32 字节、叶子 4 三
 - **怀疑状态不同步**时点一次 `ReevaluateSite` 即对齐。实例化产物要落成资产，从蓝图 / Python 调 `SaveInstancedToStaticMeshes`（阻塞，离线操作，一族一张 `SM_<actor>_<family>`）；网格路走 `UCSMeshRenderComponent::SaveToStaticMesh`。
 - **回归**：两张关卡由 `Scripts/TinyGladeDemoRegression.py` 无头回归覆盖，跑法与当前基线见 [自动化测试](#自动化测试)。
 
+### 🗻 Nanite 截面 HLOD · 远处的物体群
+
+> **📍 测试关卡**：[`Content/NaniteCutHLOD/L_NaniteCutHLODTest.umap`](Content/NaniteCutHLOD)（`Scripts/NaniteCutHLODSetup.py` 生成，可重跑）
+
+- **内容**：6×6 格子群（5 种 Nanite 测试网格，3 个镜像，4 个带排除标签 `NaniteCutHLOD_Exclude` 的红色物体）+ 蛇形山洞（实心岩块里两个整波的隧道，洞口 / 弯里 / 深处各放物体）+ 房子（前屋一门两窗、后屋完全封闭，各放物体）+ 七块互相穿插的石头。
+- **运行方式**：选中 `NCH_HLOD`（子蓝图 `BP_NaniteCutHLOD` 的实例）→ 细节面板点 `BuildHLOD`（收集盒里的静态网格按切换距离 80 m 取截面、合并、剔除外面看不见的三角，显示 HLOD 并临时隐藏源），`ShowSources` / `ShowHLOD` 来回切，`ClearHLOD` 放掉；GPU 截面不存盘，重开关卡要再 Build。`BakeHLOD` 把它烘成资产（关卡同级 `AutoResult/` 下的 `SM_` / `MI_` / 三张 `T_`，StaticMeshActor 挂在 `NCH_HLOD` 下面），随关卡存盘。
+- **结果**（2026-09-22）：全精度 378,362 三角 → 截面 49,516 → 剔除后 40,919；封闭后屋与隧道深处的物体全删成 0，洞口与透过门窗看得见的物体留着；100 m 外与源物体看不出差别。烘焙 2.6 s（47 个源，图集覆盖 84%），烘完不多占显存。出图脚本 `Scripts/NaniteCutHLODShots.py` + `NaniteCutHLODCompose.py`，数字与图的说明见 [`NaniteClusterHLOD_Plan.md`](NaniteClusterHLOD_Plan.md#画面验收)。
+
 > 其它目录（如 `Content/ShallowWater/Material30`、`Content/TreeWindData`、`Content/GeneralTest` 等）为开发中/参考资产，不保证可直接运行。
 
 ---
@@ -495,7 +519,9 @@ C++ 用例 120 余条，全部是 `IMPLEMENT_SIMPLE_AUTOMATION_TEST`，位于 `S
 | `ComputeShaderGenerator.{GroundDecor, RockShell, GroundShaper, GroundStairs}` | `CSGroundDecorTests` / `CSGroundRockShellTests` / `CSGroundShaperFieldTests` / `CSGroundStairsTests` | 裙边摆件、岩壳、塑形场 CPU / GPU 对拍、石阶 |
 | `ComputeShaderGenerator.SplineBlock` | `CSSplineBlockTests` | 样条块排布 |
 | `TinyGladeHouse.Vine` | `CSHouseVineTests` | 藤管路径（与同文件其它用例的前缀不同） |
-| `PCGEditorProcess` | `CSWindowBrushEdModeTests` / `CSHouseResizeWatcherTests` / `RoadMeshSaveTests` | 窗笔刷 EdMode、拉尺寸失选监听、道路存盘 |
+| `ComputeShaderGenerator.NaniteCut` | `CSNaniteCutTests` | Nanite 截面抽取：距离换算、精确截面、根、单调、确定性、追加、镜像；关卡内 HLOD 试验台 |
+| `ComputeShaderGenerator.MeshVisibility` | `CSMeshVisibilityCullTests` | 外部可见性剔除：被封闭外壳包住的删光、外面的全留、材质号跟着压实 |
+| `PCGEditorProcess` | `CSWindowBrushEdModeTests` / `CSHouseResizeWatcherTests` / `RoadMeshSaveTests` / `CSNaniteCutHLODBuilderTests` | 窗笔刷 EdMode、拉尺寸失选监听、道路存盘、Nanite 截面 HLOD 构建器 |
 
 另有 `ComputeShaderGenerator.MeshBoolean.SourceSoupOrientation` 注册在 `ComputeShaderMeshGenerator.cpp` 里，不在 `Tests/` 目录下。
 
@@ -518,6 +544,7 @@ C++ 用例 120 余条，全部是 `IMPLEMENT_SIMPLE_AUTOMATION_TEST`，位于 `S
 | [`Docs/FrameQuotaScheduler_Plan.md`](Docs/FrameQuotaScheduler_Plan.md) | GPU 生成作业的统一帧配额（分帧）调度 | 设计基线，暂不实施 |
 | [`Docs/GpuClothSim_Plan.md`](Docs/GpuClothSim_Plan.md) | XPBD 布料模拟：常驻算子逐帧驱动 `UCSMesh` 形变 | 计划，未实施 |
 | [`Docs/GpuRigidSettle_Plan.md`](Docs/GpuRigidSettle_Plan.md) | 批量刚体沉降（粒子簇形状匹配），布料计划的姊妹篇 | 计划，未实施 |
+| [`NaniteClusterHLOD_Plan.md`](NaniteClusterHLOD_Plan.md) | 用 Nanite cluster 截面给远处的大中型物体组生成简易 HLOD（小物体归 foliage，不进 HLOD）：`UCSNaniteCutOps` 算子 + `UCSNaniteCutHLODBuilder` | 2026-09-22 落地（含关卡内试验台与外部可见性剔除），测试 5/5，测试关卡截图验收；未在 WP 关卡实跑 |
 | [`Docs/CSLandscapeLayer_Framework.md`](Docs/CSLandscapeLayer_Framework.md) | CS 地形图层编辑框架的模块关系、数据流与已知架构问题 | 2026-07-23 写成 |
 | [`Docs/InstanceBrushPaintDesign.md`](Docs/InstanceBrushPaintDesign.md) | Actor 自持的实例笔刷方案 | 2026-07-23 设计稿 |
 | [`Docs/VDBMeshFromActorPoints.md`](Docs/VDBMeshFromActorPoints.md)、[`Docs/VDBMeshFromSurfaceVoxels.md`](Docs/VDBMeshFromSurfaceVoxels.md) | VDB 网格生成的 GPU 加速方案 | 2026-07-23 写成；之后 `*ToDynamicMesh` 系列已改为 `*ToGpuMesh` |
@@ -533,12 +560,13 @@ PCGPlugins/
 ├─ PCGPlugins.uplugin        # 插件描述文件（4 个模块）
 ├─ README.md                 # 本文件
 ├─ TinyGlade_结构审查.md      # Tiny Glade 编排层的整体结构审查
+├─ NaniteClusterHLOD_Plan.md # Nanite 截面 HLOD：截面抽取算子 + 可见性剔除 + WP HLOD 构建器 + 关卡试验台
 ├─ VoxelTest.hip             # Houdini 参考文件
 ├─ Config/
 │  └─ DefaultPCGPlugins.ini  # CoreRedirects（历史命名 + AVineContainer 迁模块）
 ├─ Docs/                     # 设计文档与算法/管线流程图（SVG + 预览 PNG），见「设计文档」
 │  └─ TinyGlade/             # Tiny Glade 复刻的全部文档，入口 Docs/TinyGlade/index.md
-├─ Scripts/                  # Tiny Glade 演示搭建 / 材质建图 / 出图 / 无头回归（Python）
+├─ Scripts/                  # Tiny Glade 演示搭建 / 材质建图 / 出图 / 无头回归；NaniteCutHLOD*.py（Python）
 ├─ Shaders/Private/          # GPU 全局着色器（.usf/.ush）
 ├─ Source/
 │  ├─ ComputeShaderGenerator/    # Runtime GPU 计算 + CSMesh + 藤蔓 + Tiny Glade（Win64）
@@ -550,6 +578,7 @@ PCGPlugins/
    ├─ SpaceColonization/            # ✅ 藤蔓测试场景
    ├─ HouseTest/                    # ✅ Tiny Glade 演示关卡；TinyGladeAsset/ 为 TG 原版提取资产
    ├─ SplineBlock/                  # ✅ 样条块排布演示
+   ├─ NaniteCutHLOD/                # ✅ Nanite 截面 HLOD 测试关卡（山洞 / 房子 / 石头堆测可见性剔除）
    ├─ ShallowWater/Material30/      # 水面材质（参考）
    ├─ TreeWindData/                 # 树木风场数据（参考）
    └─ Landscape/ MeshFill/ MeshBoolean/ GPUTree/ ...  # 其它开发测试内容

@@ -1,9 +1,17 @@
 # Tiny Glade 复刻：文档索引
 
+2026-09-20 更新：[楼梯宽度把手与蓝图入口](StairsWidthHandles_20260920.md)；[屋脊收口、瓦片 VSM、楼梯子蓝图与共用拱墙](RoofVSMAndStairArches_20260920.md)。
+
 本目录集中存放 Tiny Glade 式交互房屋系统（`ACSGroundActor` / `ACSHouseActor` / `ACSGroundShaperActor` 一族）的全部设计、对照与逆向文档。
 2026-08-31 从插件根与 `Docs/` 归拢至此，同时把五份对照文档合成一卷、两轮逆向报告合成一卷。
 
 ## 从哪读起
+
+- **墙化重构（房子变成墙）/ 样条墙 `ACSWallActor`** → [`TinyGladeWall_Plan.md`](TinyGladeWall_Plan.md)（2026-09-22）：TG 只有墙没有房子的证据、`CSWall` 纯函数核心、六步计划与第 1 步验证；世界级登记处与 dirty 通道那一半在 [`../cs-scene-dirty-3d-design.md`](../cs-scene-dirty-3d-design.md)。
+
+- **楼梯端点接合露台、入口与撤销同步** → [`StairsConnections_20260920.md`](StairsConnections_20260920.md)。
+
+- **屋顶高度把手、低屋顶露台及新楼梯栏杆** → [`RoofTerraceAndStairs_20260920.md`](RoofTerraceAndStairs_20260920.md)，含本轮用户参考图、参数和验证记录。
 
 - **要改代码** → 先读 [`TinyGladeHouse_Plan.md`](TinyGladeHouse_Plan.md)：唯一的裁决记录，D1–D14 的设计与阶段验收门都在里面。
 - **要接着推进** → 读 [`TinyGlade_模块对照与进度.md` 卷零](TinyGlade_模块对照与进度.md#vol-0)：自监督循环的状态文件，含模块状态表、待拍板清单、验收门与「踩过的坑」。
@@ -23,12 +31,13 @@
 | --- | --- | --- |
 | [`TinyGladeHouse_Plan.md`](TinyGladeHouse_Plan.md) | 设计裁决主文档：D1–D14、阶段计划 P0–P9、风险、开放问题 | 原在插件根 |
 | [`TinyGlade_模块对照与进度.md`](TinyGlade_模块对照与进度.md) | 六卷合卷：完成进度（卷零）+ 模块对照（卷一～卷五） | 5 份 + 卷五新增 |
+| [`TinyGladeWall_Plan.md`](TinyGladeWall_Plan.md) | **墙化重构计划**：TG 墙模型证据（`InnerWalls` → `PublicWalls`、屋顶另挂）、`CSWall` 核心与 `ACSWallActor`、房子各模块的去向、六步计划、第 1 步验证与对照图 | *（2026-09-22 新增）* |
 | [`TinyGladeWindow.md`](TinyGladeWindow.md) | **窗户（D8）专卷**：现状速查表 + 计划 D8 整章 + TG 侧对照（原卷二 §一～§四 / §7.2 / C4）+ 时间线（原卷零四条）+ 已作废但保留的结论 + 未完成事项 | *（2026-09-06 从计划书 D8 与合卷卷零/卷二抽出，原处留存根）* |
 | [`TinyGlade_对比逆向报告.md`](TinyGlade_对比逆向报告.md) | 两卷合卷：两轮多 agent 对比逆向评审的原始报告 | 2 份 |
 | [`CSGroundShaper.md`](CSGroundShaper.md) | 地形塑形物（D9）：Houdini 原型 → UE 的逐节点对照与算法替换 | 原在 `Docs/` |
 | [`CSRockShellPattern.md`](CSRockShellPattern.md) | 披挂岩壳（D9 链 B）：烘焙件的通道契约与五条实测订正 | 原在 `Docs/` |
 | [`TinyGlade_树冠着色.md`](TinyGlade_树冠着色.md) | **树冠着色专卷**：叶卡片的 VS 变形、紧凑 G-buffer、树冠专用延迟光照，含深度浮雕与逆光旁路两条核心机制、其它叶类（藤蔓叶／灌木／背景树／落叶粒子）对照、移植到 UE 的四条缺口（**2026-09-09 已落地为 `M_TinyGladeCanopy`**，建图脚本 `TinyGladeMakeCanopyMaterial.py`、验收 `TinyGladeShotCanopy.py`） | *（2026-09-07 新增，09-09 落地）* |
-| [`CSGroundTuning.md`](CSGroundTuning.md) | 地面派生链（地被 / 石阶 / 石阶材质 / 岩壳）的默认值：2026-09-06 那轮改了什么，以及演示关卡那套岩壳覆盖值的留档 | *（2026-09-06 新增）* |
+| [`CSGroundTuning.md`](CSGroundTuning.md) | 地面派生链（地被 / 石阶 / 石阶材质 / 岩壳）的默认值：2026-09-06 那轮改了什么，演示关卡那套岩壳覆盖值的留档，以及 2026-09-22 草的近 / 远两档 | *（2026-09-22 补两档一节）* |
 | [`CSGroundMaterial.md`](CSGroundMaterial.md) | 地面三层材质（草地 / 深色土 / 浅色土路）：反编译混合公式、高度噪声控制的露土斑块、用户参考图与 UE 同机位对照；`M_TinyGladeGround` / `MI_TinyGladeGround` | *（2026-09-12 新增）* |
 | [`HouseMaterialAudit_20260912.md`](HouseMaterialAudit_20260912.md) | 房屋材质与模型修正：转角覆盖、支撑柱截面、墙面法线与贴图配对、屋顶尖饰、草材质；附 `house-audit-20260912-*` 同机位对照 | *（2026-09-12 新增）* |
 | [`MeshMaterialRepair.md`](MeshMaterialRepair.md) | 提取网格的材质槽修正：`TinyGladeAsset/Meshes` 下 483 个静态网格逐一检查，重绑 21 个网格的 23 个槽，共享植物 / 窗玻璃材质覆盖 49 个网格 | *（2026-09-12 新增）* |
@@ -80,6 +89,8 @@
 | `img/{house-audit,ground-material,quoin-reference,roof-reference}-20260912-*.png`、`img/mesh-materials-*.jpg` | 09-12 材质审计的同机位对照（before / after） | `HouseMaterialAudit_20260912.md`、`CSGroundMaterial.md`、合卷、`MeshMaterialRepair.md` |
 | [`img/tiny-glade-ref-door-in-arch.png`](img/tiny-glade-ref-door-in-arch.png) | 门在拱里的实拍：轮廓严丝合缝贴着拱圈石内缘 ⇒ **门是比洞更大的矩形，被墙切出剪影**，不是拱形网格 | 卷零「D6 续」③ |
 | [`img/tiny-glade-ref-corner-arch-passage.png`](img/tiny-glade-ref-corner-arch-passage.png) | 转角实拍：**两道拱共用一根角柱，没有木门** | 卷零「D6 续」④ |
+| [`img/tiny-glade-ref-freehand-wall-20260922.jpg`](img/tiny-glade-ref-freehand-wall-20260922.jpg) / `img/wall-20260922-*.jpg` | TG freehand 墙实拍（09-22 用户贴：灰泥墙身、压顶 + 垛口、拐角砖柱、两面爬藤）与样条墙第 1 步的同风格出图（俯视 / 贴地 / 全景 / S 形弯墙） | 墙化计划 §二、§八 |
+| [`img/tiny-glade-ref-edit-mode-handles.png`](img/tiny-glade-ref-edit-mode-handles.png) | 编辑态标识实拍（09-22 用户贴）：虚线包围盒、每面墙一只平箭头、右侧竖线串两个六边形钮（高度）、顶上屋顶箭头、底部平移四向箭头与转角旋转弧箭头 | 计划 D5「标识 = TG 原版」 |
 
 ⚠️ 两张预览 PNG 同时是脚本的**功能性输出路径**（`Scripts/BakeRockShellPattern.py` 与 `Scripts/VerifyRockShellGlb.py` 的 `DEFAULT_PREVIEW_RELPATH`），改名或再次搬动要同步改那两处常量。
 
@@ -171,5 +182,5 @@ Docs/TinyGlade/
 ├─ geo/                                  # 壳与树的源数据：rocky_terrain.json / *.glb / *.FBX；bevel/ 下为倒角烘焙件
 ├─ out/                                  # build_tree.py 的输出：树与树冠卡片的 .obj / .bgeo.sc、渲染图
 ├─ evidence/                             # 反汇编 / 着色器摘录等证据（文件名带日期）
-└─ img/                                  # 实拍参考 + 出图对照（11 张 TG 参考、1 张裁决图、19 张本项目出图）
+└─ img/                                  # 实拍参考 + 出图对照（12 张 TG 参考、1 张裁决图、19 张本项目出图）
 ```

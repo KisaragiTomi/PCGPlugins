@@ -1,0 +1,52 @@
+TG 编辑态"标识箭头"（signifier）用哪张网格 —— tiny-glade.exe 字符串表实测，2026-09-22
+================================================================================
+
+方法：Rust 把同一段代码用到的字面量与 panic Location 的源文件路径放在 .rdata 的同一簇里，
+按簇读"源文件 → 网格名 → signifier id"。偏移是 tiny-glade.exe 的文件偏移。
+符号侧交叉印证：pdb_symbols.txt 里 `rectangle::ui_modes::edit_dims::UiRectangleDimsEdit::{widget,signifier}`、
+`edit_orientation::UiRectangleOrientationEdit::{widget,signifier}`、`adjust_wall_height::adjust_wall_ui_mode::UiWallHeight::{widget,signifier}`、
+`ui_raise_shape::{ui_raise_shape,impl_raise_shape}`、`components::ArrowGizmo`、`arrow_gizmo_animation::EnableArrowGizmoStretch`。
+
+矩形房子（本项目 EditHouse / EnterResizeMode 的对应物）
+--------------------------------------------------------------------------------
+0x2c6c9a0  vertex_color_shader | dashed_line | rectangle__edit_dims_arrow_
+0x2c6ca30  crates/country-core/src/systems/wall/shapes/rectangle/ui_modes/edit_dims.rs
+0x2c6cab0  flat_arrow | flat_arrow_outline
+           ⇒ 拉尺寸（推一面墙）= flat_arrow + 描边 flat_arrow_outline。本项目的墙面锥子据此替换。
+
+0x2a91ec8  crates/country-core/src/systems/wall/shapes/rectangle/ui_modes/edit_orientation.rs
+0x2a91f50  corner_arrow | corner_arrow_outline | rectangle__rotate_
+           ⇒ 转朝向 = corner_arrow（本项目没有旋转抓手）。
+
+0x2ab2aca  crates/country-core/src/systems/ui_raise_shape.rs
+0x2ab2b30  outline_wall_bottom__
+0x2ab2be0  arrow_raise_shape_
+0x2ab2ca8  raise_wall_elevation_
+0x2ab2cd0  brush_arrow_flat | change_elevation
+0x2ab2d98  edit_height_
+0x2ab2db8  wall_height_edit_
+0x2ab2e60  crates/country-core/src/systems/wall/adjust_wall_height/adjust_wall_ui_mode.rs
+           ⇒ 抬升房底 = brush_arrow_flat（上下双箭头）；墙高那簇紧随其后，网格名字面量与抬升共用、未单独确证。
+
+0x2ad2800  edit_height_ | height_arrow_down__ | height_arrow_up_ | height_gizmo_
+           edit_elevation_ | elevation_arrow_down_ | elevation_arrow_up_ | elevation_gizmo_
+0x2ad2e98  WidgetId | hash | brush_arrow_flat_single_up
+           ⇒ 高度 / 抬升另有"上、下各一只单箭头"的一套 id（网格归属未确证）。
+
+屋顶与其它形状（对照用）
+--------------------------------------------------------------------------------
+0x2ff6310  roof_height_focused.rs 簇：roof_edit_ | height__arrow__ | edit_roof | brush_arrow_flat_single_up
+0x2ff58c0  edit_roof_ridge_length.rs 簇：edit_roof_ridge_signifier | brush_arrow_flat_single_foward | roof_ridge_edit
+0x2eb9858  roof_ridge_dir_ | roof_ridge_dir_focused | corner_arrow_switch_ridge_dir
+0x2c80a98  edit_circle_wall_focused_ | circle drag | circle_edit__arrow | brush_arrow_flat_single_foward_
+0x2abc36c  circle/ui_rotate_circle.rs 簇：corner_arrow | corner_arrow_outline | circle__rotate_
+0x2a80418  ui_focus_stairs.rs 簇：StairGraphEdge | flat_arrow | flat_arrow_outline | width_all_widget
+0x2aad090  spawn_brush_previews.rs 簇：brush_arrow（3D 箭头）、brush_4_arrows=brush_terrain_edit、brush_2_arrows=brush_flat_roof_edit
+
+网格几何（assets/meshes/*.json，TG 米、Y 朝上）
+--------------------------------------------------------------------------------
+flat_arrow          48 顶点 / 88 三角、闭合；X ±0.148（宽）、Y ±0.05（厚，朝上）、Z 0..1（尾 → 头，指 +Z）
+flat_arrow_outline  32 顶点 / 56 三角、8 条开边；X ±0.18、Y ±0.02、Z −0.02..1.02（比本体外扩一圈、更薄）
+两者绕序都是"从外看顺时针"（有符号体积 < 0），与 roof_tile-source.json 同一约定。
+源文件原样拷在同目录 flat_arrow-source.json / flat_arrow_outline-source.json，
+烘焙脚本 Scripts/TinyGladeMakeHandleArrows.py 只读这两份。

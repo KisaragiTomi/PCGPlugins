@@ -1,11 +1,17 @@
 # Tiny Glade 式交互房屋计划：csmesh 地面 + 事件驱动房屋系统
 
+2026-09-20 更新：[楼梯宽度把手与蓝图入口](StairsWidthHandles_20260920.md)；[屋脊收口、瓦片 VSM、楼梯子蓝图与共用拱墙](RoofVSMAndStairArches_20260920.md)。
+
+> **2026-09-20 楼梯续作**：[露台接合与围边入口](StairsConnections_20260920.md)，仍保留现有样条编辑方式；挂墙支撑与墙身开洞尚未接入。
+
+> **2026-09-20 已实现**：[瓦片错排、屋顶高度框和低屋顶露台；楼梯栏杆及木梯](RoofTerraceAndStairs_20260920.md)。本轮用户参考图已放入该记录；本轮状态优先于下文相应历史待办。
+
 用 `UCSMesh` 家族（对象 + 算子库 + 渲染组件，已全部落地，见 [`GpuMesh_DynamicMeshWrap_Plan.md`](../../../../GpuMesh_DynamicMeshWrap_Plan.md)）实现 Tiny Glade 式高交互房屋：gpumesh 地面 + 顶点色道路笔刷、房屋拉尺寸、道路穿墙自动开门/连拱、房屋相接自动生接缝角柱、特征标记（窗户等）由房子裁决生成、悬空自动生承重柱。所有行号为 2026-08-27 现状。
 
 ## 结论
 
 - **地面不用 Landscape**：新 `ACSGroundActor` 持有规则网格 `UCSMesh`（`CopyFromMeshSnapshot` 上传，`UCSMeshRenderComponent` 渲染），同时维护一份 **CPU 权威镜像**（高度 + 顶点色，UPROPERTY 序列化）。GPU 顶点色只是镜像的投影；所有 gameplay 查询（道路判定、柱子高度）与拾取都打镜像，不做 GPU 回读、不给 gpumesh 加碰撞。
-- **v1 通知不用 CSSceneDirty3D，全部直推**（用户裁决）：任何变动必然触发更新，不做区域过滤。地面侧经 `ACSGroundActor::OnGroundChanged` 多播委托广播（已实装：逐笔落笔、全量重建、编辑器拖动三处触发）；房/窗自身变动由根组件 `TransformUpdated` 标脏捕获（2026-09-16 起；此前是 `UCSHouseSubsystem` 每 tick 变换快扫，subsystem 已删，见 D10）。消费者收到即无条件标脏、在自己的 Tick 里重求值（09-10 / 09-11 裁决），无效唤醒被幂等哈希吸收成零成本。广播携带变更世界盒但 v1 无视——它是将来量级上来后切回 [`cs-scene-dirty-3d-design.md`](../../../../doc/cs-scene-dirty-3d-design.md)（仍为零代码设计稿，藤蔓/道路/水体的接入计划不受影响）的过滤接缝。
+- **v1 通知不用 CSSceneDirty3D，全部直推**（用户裁决）：任何变动必然触发更新，不做区域过滤。地面侧经 `ACSGroundActor::OnGroundChanged` 多播委托广播（已实装：逐笔落笔、全量重建、编辑器拖动三处触发）；房/窗自身变动由根组件 `TransformUpdated` 标脏捕获（2026-09-16 起；此前是 `UCSHouseSubsystem` 每 tick 变换快扫，subsystem 已删，见 D10）。消费者收到即无条件标脏、在自己的 Tick 里重求值（09-10 / 09-11 裁决），无效唤醒被幂等哈希吸收成零成本。广播携带变更世界盒但 v1 无视——它是将来量级上来后切回 [`cs-scene-dirty-3d-design.md`](../cs-scene-dirty-3d-design.md)（仍为零代码设计稿，藤蔓/道路/水体的接入计划不受影响）的过滤接缝。
 - **房屋 = 声明式重求值，不是事件驱动的增量补丁**：任何唤醒（移动、拉尺寸、地面直推、窗户增删移）都走同一条 `ReevaluateSite()`。"纯函数"说的是**推导那一步的形态**，不是不要 actor——门洞/柱/接触段这些目标状态由 `F(自身参数, 地面镜像, 邻居注册表, 特征标记列表)` 只读推导、不带历史不带副作用；actor 仍是目标状态的宿主与执行者（持参数、缓存哈希、比对后重建网格）。收益：N 种事件 × M 种中间状态的增量补丁矩阵收敛成一个入口，重复/自发唤醒被哈希短路——直推架构的"必然更新"因此可以粗暴而不出错；判定逻辑还能脱离场景直接进 automation 测试。
 - **开洞不走布尔：墙板按 2D 剖面直接生成带洞真几何**（用户裁决 2026-08-29「尽可能不用 MeshBoolean」，取代早先的「闭合实体 + `ApplyMeshBoolean` 减 cutter」；更早的网格跳格方案仍然作废）。三条路线权衡后的落点——按格跳面贴不住拱/圆的剪影会漏缝；布尔的洞缘精度受 cutter 三角化限制，且引擎侧至今没有"常驻房体 − 原型 cutter"的 mesh 操作数入口；而**洞的形状本来就是有限的原型集合**（拱 / 矩形 / 圆…），每种原型配一条手写 2D 剖面，`CSHouseMeshBuilder` 生成墙板时按剖面直接砌出带洞几何，洞缘精度只受剖面分段数控制、洞口内壁一并产出。当前落地的门拱（`RebuildBodyMesh` 的墙段盒 + 12 段半圆拱带）已经是这条路线的实例，D8 窗户沿用同一形态。**布尔降级为最后手段**：仅当某形状确实写不出剖面时才考虑，届时才需要重开"给 `ApplyMeshBoolean` 补 mesh 操作数入口"这条（已关闭的开放问题）。~~逐像素 clip（Tiny Glade 的做法）作为可选的精度/成本优化留在 D14，**受 GI 代理约束限制**。~~ ⚠️ **2026-08-30 用户裁决订正：避免所有真几何洞。** 剖面仍是唯一真源，但它现在喂的是 `FCSOpeningClipField` 的**逐像素判据**而不是「砌出带洞几何」——墙板是整块实心盒，洞一律在渲染层挖（顶点色或门洞那套 clip 场）。「带洞真几何」以及「另建带真洞的低模代理」都不再允许；代价（mesh SDF / 软件 Lumen / 硬件光追里拱门是实心墙）已由用户知情接受，见 D14。 ⚠️ **2026-09-05 用户裁决再次订正：挖洞策略改成 Tiny Glade 的真两层**（砖层铺满 + 灰泥面层），见 D4「墙的两层结构：砖层 + 灰泥层」。剖面 / `FCSOpeningClipField` **仍是唯一真源**，只是求值点从「整块墙板」下移到「每一块砖」；"墙板是整块实心盒"这句随之作废。
 - **接缝角柱不属于任何一个房子**（针对"归属"问题的裁决；⚠️ 2026-09-16 已改为「共享接触记录、一条缝只砌一次、无 subsystem」，见 D7 与 D10）：`UCSHouseSubsystem` 检测接触对，生成/销毁中立的 transient `ACSHouseSeamActor`，key 为两房 GUID 无序对。对称关系没有自然主从；中立宿主让"任一方移动/删除 → 重建/销毁"的生命周期单点化。备选"GUID 小者拥有"已否：owner 删除要转移、对称逻辑塞进房子内部、双方重建时序耦合。接缝不序列化——可从两房状态完全重导出，加载时重建。 ⚠️ **2026-08-30 用户裁决订正：两栋房交汇时只产生接缝砖，其它任何内容都是独立的。** `ACSHouseSeamActor` 这个 **actor 形态被否决**，接缝降成 TG 那种**纯函数**（输入两房 footprint / 朝向 / 高度，输出砖列；零共享状态、零跨房簿记、零撤销）；角柱邻近合并、接缝接受 openings、跨接缝仲裁**全部退出范围**。见 D7。
@@ -160,7 +166,7 @@ static UPARAM(DisplayName = "Target") UCSMesh* PaintVertexColorsSphere(
 
 - 消费者收到广播**无条件**重求值（09-10 / 09-11 起一律只标脏、在自己的 Tick 里兑现），不过滤变更盒——"必然更新"的语义就是全量；无效重算被结果哈希短路。**但"零成本"只有在短路发生在昂贵计算之前时才成立**——~~`ACSGroundShaperActor` 今天的短路点在 `BuildStepPlan` 之后，每次广播白跑上千次采样（见 D9）~~（那条石阶旧路已于 08-30「裁决一」删除，塑形物如今只写高度场、不订阅广播）。纪律精确为：**消费者可无条件重求值，但短路必须发生在昂贵计算之前**；做法是把哈希从"输出哈希"扩成"输入 + 输出"两级，不引入区域过滤。
 - 消费者注册/加载时先主动重求值一次；广播只覆盖之后的变化。
-- 广播频率上界 = 笔刷 tick + 拖动帧率；判定是 CPU 镜像采样，几十栋房屋量级无压力。量级上来后的升级路径是切回 [`cs-scene-dirty-3d-design.md`](../../../../doc/cs-scene-dirty-3d-design.md)：发布侧已收敛在五处 `Broadcast`，消费侧收敛在各消费者自己的 `HandleGroundChanged`（subsystem 已删），两边各换一层即可，房屋逻辑不动。CSSceneDirty3D 设计稿保留，藤蔓/道路/水体按原里程碑另行推进。
+- 广播频率上界 = 笔刷 tick + 拖动帧率；判定是 CPU 镜像采样，几十栋房屋量级无压力。量级上来后的升级路径是切回 [`cs-scene-dirty-3d-design.md`](../cs-scene-dirty-3d-design.md)：发布侧已收敛在五处 `Broadcast`，消费侧收敛在各消费者自己的 `HandleGroundChanged`（subsystem 已删），两边各换一层即可，房屋逻辑不动。CSSceneDirty3D 设计稿保留，藤蔓/道路/水体按原里程碑另行推进。
 
 ## D4 房屋：`ACSHouseActor`
 
@@ -375,8 +381,33 @@ Tiny Glade 的屋面是被瓦、梁、尖顶、雪、老虎窗**共同引用的�
 | 交互层 | [`ACSHouseResizeHandleActor`](../../Source/ComputeShaderGenerator/Public/CSHouseResizeHandleActor.h) + `EnterResizeMode` / `ExitResizeMode` / `OnResizeModeChanged` + [`FCSHouseResizeSelectionWatcher`](../../Source/PCGEditorProcess/Private/CSHouseResizeSelectionWatcher.h) | ✅ 单测 `House.ResizeHandle` 七段 |
 
 **用法**：选中房子 → 详情面板 `CS House\|Resize` 分类下点 **Enter Resize Mode**（`CallInEditor`）
-→ 四面墙外各冒出一个锥形抓手 → 选中任一个用标准 gizmo 拖，那面墙实时跟手推拉，
+→ 每面墙外各冒出一只推墙箭头 → 选中任一个用标准 gizmo 拖，那面墙实时跟手推拉，
 对侧墙纹丝不动 → 点开别处（失选）或点 **Exit Resize Mode**，抓手消失。蓝图 / Python 同名可调。
+
+**标识 = TG 原版**（2026-09-22 用户要求，替换原先的引擎锥子）：
+
+- 推墙：TG 矩形房子拉尺寸（`rectangle/ui_modes/edit_dims.rs`）画的 `flat_arrow` + 描边 `flat_arrow_outline`；
+  躺平、头朝外法线、gizmo 在箭头正中。单测 `House.ResizeHandleTGArrow`。
+- 楼梯拉宽：同一对平箭头。TG 的楼梯宽度箭头是竖起来对着相机的，这里有意与房子推墙箭头保持一致。
+- 🛑 **高度（檐口 / 房底 / 屋顶）仍是四条框**（2026-09-22 用户裁决：「调整高度的部分还不如我之前的设计，还原」）。
+  当天试过 TG 聚焦模式的版本 —— 一对 `brush_arrow_flat_single_up`（下面那只翻转）摆在房子屏幕右侧、绕竖轴对着相机、
+  到头的方向不画，屋顶一只放大 1.5 倍在屋脊上方 75 cm，相机取 `UWorld::CachedViewInfoRenderedLastFrame` 跟过去 ——
+  构建、单测、真编辑器都验过，用户看过后判不如原设计，已整体退回。**别再按 TG 改高度抓手**；
+  `brush_arrow_flat_single_up` 的烘焙条目与资产留着备用（当前无人引用）。
+
+网格由 [`Scripts/TinyGladeMakeHandleArrows.py`](../../Scripts/TinyGladeMakeHandleArrows.py) 从 TG 源 json 烘成
+`TinyGladeAsset/Meshes/` 下同名网格；字符串表与反汇编证据在
+[`evidence/edit-signifier-arrows-20260922.txt`](evidence/edit-signifier-arrows-20260922.txt)。
+
+TG 实拍（用户 2026-09-22 贴，游戏里编辑一栋平顶房）：
+
+![TG 编辑态的标识](img/tiny-glade-ref-edit-mode-handles.png)
+
+图里能认出：白色虚线包围盒；每面墙一只平箭头（前墙、右墙是实心的，左墙那只只剩描边）；房子右侧一根竖线串两个
+六边形钮（高度控件）；顶上一只大的竖箭头（屋顶高度）；平台上一只小的描边箭头；底部四向箭头（整体平移）与
+转角的弧形双箭头（转朝向）。与本项目的差别：① 高度 TG 平时是竖线 + 六边形钮、上下箭头只在悬停时出现
+（反汇编里画箭头那一段先查了控件是否处于悬停；六边形钮不在 TG 的网格资产里，是 UI 层画的），本项目按用户裁决用四条框。
+② 虚线包围盒本项目没有（TG 资产里有 `dashed_lines`）。③ 平移、转朝向本项目交给编辑器原生 gizmo，没做标识。
 
 交互的**唯一执行面**是 `ACSHouseResizeHandleActor::ConsumeDragToHost(bFinished)`，
 编辑器的 `PostEditMove` 只是它的触发器 —— 无头测试摆完位置直接调它，不需要 gizmo 也不需要 Slate。

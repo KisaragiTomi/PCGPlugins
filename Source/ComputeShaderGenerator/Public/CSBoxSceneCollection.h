@@ -106,6 +106,14 @@ struct COMPUTESHADERGENERATOR_API FCSBoxSceneCollectOptions
 	 *  留在三角形路径上。与 bUseMeshDescriptionSourceTriangles 同开时 MeshDescription 提取优先。 */
 	bool bCollectNaniteRenderComponents = false;
 
+	/** true：**所有**渲染器拍得到的组件都收进 NaniteRenderComponents，不只按 Nanite 画的那些（单腿化）。
+	 *  隐含 bCollectNaniteRenderComponents。动机是三角形路径不看材质：透明道具照样写深度（玻璃、水面片
+	 *  变实心挡板），Masked 的树叶卡片是整块矩形；引擎深度 pass 两者都按画面规则处理。代价是隐藏组件、
+	 *  LOD / cull distance / WPO 由渲染器说了算，取舍表见 Docs/cs-scene-dirty-3d-design.md。
+	 *  渲染器拍不到的（判定见 IsCapturableComponent）照旧留在三角形路径，不会从产出里消失。
+	 *  只对"拍高度图"这类消费方成立——要三角形 soup 的调用方不能开。 */
+	bool bCollectAllRenderComponents = false;
+
 	/** true keeps one registry entry per source (mesh, material slot), so a mesh with five
 	 *  slots yields five output slots even when they share a material or are all unassigned.
 	 *  false dedupes by material pointer only, giving the most compact list but losing the

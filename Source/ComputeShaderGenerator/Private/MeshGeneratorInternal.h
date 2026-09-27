@@ -130,7 +130,8 @@ FRDGTextureRef RegisterRenderTargetTexture(FRDGBuilder& GraphBuilder, FTextureRe
 
 // [game thread] 把 request 列表 resolve 成可跨线程携带的 render 资源引用 + 材质注册表。
 // 返回值仅统计 render-resolve 出的三角；Nanite 全细节源三角单独累积进 *OutNaniteTriangles。
-// OutNaniteRenderComponents 非空时，按 Nanite 画着的组件不 resolve，去重收进它（交给渲染器去拍）。
+// OutNaniteRenderComponents 非空时，按 Nanite 画着的组件不 resolve，去重收进它（交给渲染器去拍）；
+// bCollectAllRenderComponents 再把范围放宽到所有渲染器拍得到的组件（单腿化，见 CSBoxSceneCollection.h）。
 uint64 ResolveStaticMeshTriangleRequests(
 	const TArray<FCSStaticMeshTriangleRequest>& Requests,
 	const AActor* ExcludedActor,
@@ -140,7 +141,8 @@ uint64 ResolveStaticMeshTriangleRequests(
 	TArray<TObjectPtr<UMaterialInterface>>* OutMaterialRegistry = nullptr,
 	FCSNaniteSourceTriangleData* OutNaniteTriangles = nullptr,
 	bool bPreserveSourceMaterialSlots = true,
-	TArray<TWeakObjectPtr<UPrimitiveComponent>>* OutNaniteRenderComponents = nullptr);
+	TArray<TWeakObjectPtr<UPrimitiveComponent>>* OutNaniteRenderComponents = nullptr,
+	bool bCollectAllRenderComponents = false);
 
 // [game thread] 枚举 QueryBox 内的 static mesh component，生成提取 request。
 // RequiredActorTags 非空时在枚举阶段就跳过不带任一 tag 的 actor——放到 request 建完再筛，

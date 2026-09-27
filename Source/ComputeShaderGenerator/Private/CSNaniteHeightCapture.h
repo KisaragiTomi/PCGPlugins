@@ -27,9 +27,14 @@ namespace CSNaniteHeightCapture
 	/** [game thread] 这个世界现在能不能用渲染器拍（有 RHI、有场景）。不能时 Nanite 网格应留在三角形路径上。 */
 	bool IsAvailable(const UWorld* World);
 
-	/** [game thread] 组件此刻是否按 Nanite 画在场景里、并且会出现在捕获视图中。
+	/** [game thread] 组件此刻画在场景里、并且会出现在捕获视图中（**不问是不是 Nanite**）。
 	 *  没有代理（隐藏、编辑器里临时隐藏）、游戏中隐藏、排除出 scene capture 的，渲染器拍不到 ——
-	 *  返回 false 让它留在三角形路径（fallback）上，而不是从高度图里消失。 */
+	 *  返回 false 让它留在三角形路径（fallback）上，而不是从高度图里消失。
+	 *  这是"道具全走 depth pass"（单腿化）的分流判据：透明材质不写深度、Masked 逐像素裁，
+	 *  都由引擎的深度 pass 负责，而三角形路径是不看材质的。 */
+	bool IsCapturableComponent(const UStaticMeshComponent* Component);
+
+	/** [game thread] IsCapturableComponent 且代理确实是 Nanite。只按 Nanite 分流时用它。 */
 	bool IsCapturableNaniteComponent(const UStaticMeshComponent* Component);
 
 	struct FHeightmapRequest

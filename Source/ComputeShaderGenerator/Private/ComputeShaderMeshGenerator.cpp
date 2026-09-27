@@ -1412,15 +1412,16 @@ uint64 CSMeshGenInternal::ResolveStaticMeshTriangleRequests(
 	TArray<TObjectPtr<UMaterialInterface>>* OutMaterialRegistry,
 	FCSNaniteSourceTriangleData* OutNaniteTriangles,
 	bool bPreserveSourceMaterialSlots,
-	TArray<TWeakObjectPtr<UPrimitiveComponent>>* OutNaniteRenderComponents)
+	TArray<TWeakObjectPtr<UPrimitiveComponent>>* OutNaniteRenderComponents,
+	bool bCollectAllRenderComponents)
 {
 	OutResolvedRequests.Reset();
 	OutResolvedRequests.Reserve(Requests.Num());
 
 	TArray<TObjectPtr<UMaterialInterface>> MaterialRegistry;
 	TMap<FCSMaterialRegistryKey, int32> MaterialToRegistry;
-	// ISM 每个实例一个 request，而"按不按 Nanite 画"是组件级的（还要做材质审计），按组件只判一次。
-	TMap<const UStaticMeshComponent*, bool> NaniteRenderByComponent;
+	// ISM 每个实例一个 request，而"交不交给渲染器拍"是组件级的（还要做材质审计），按组件只判一次。
+	TMap<const UStaticMeshComponent*, bool> RenderByComponent;
 
 	// 返回值仅统计 render-resolve 出的三角（= OutResolvedRequests[i].TriangleCount 之和）。Nanite 全细节源三角
 	// 单独累积进 *OutNaniteTriangles（其自带 NumTriangles），容量核算在 AddResolvedStaticMeshTrianglesToRDGInternal
@@ -1446,13 +1447,18 @@ uint64 CSMeshGenInternal::ResolveStaticMeshTriangleRequests(
 #endif
 		}
 
-		// 按 Nanite 画着的组件交给渲染器去拍：这里 resolve 出来的只会是 fallback 低模。
+		// 交给渲染器去拍的组件不在这里 resolve。默认只分流"按 Nanite 画着的"（这里 resolve 出来的
+		// 只会是 fallback 低模）；bCollectAllRenderComponents 时所有拍得到的组件都走渲染器（单腿化：
+		// 三角形路径不看材质，透明道具会被当成实心写进深度图）。拍不到的照旧留在这条路上。
 		if (OutNaniteRenderComponents && Request.SourceComponent)
 		{
 			const UStaticMeshComponent* Component = Request.SourceComponent;
-			const bool* bCached = NaniteRenderByComponent.Find(Component);
-			const bool bRenderNanite = bCached ? *bCached : NaniteRenderByComponent.Add(Component, CSNaniteHeightCapture::IsCapturableNaniteComponent(Component));
-			if (bRenderNanite)
+			const bool* bCached = RenderByComponent.Find(Component);
+			const bool bRenderWithRenderer = bCached ? *bCached : RenderByComponent.Add(Component,
+				bCollectAllRenderComponents
+					? CSNaniteHeightCapture::IsCapturableComponent(Component)
+					: CSNaniteHeightCapture::IsCapturableNaniteComponent(Component));
+			if (bRenderWithRenderer)
 			{
 				OutNaniteRenderComponents->AddUnique(Request.SourceComponent.Get());
 				continue;

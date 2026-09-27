@@ -7,13 +7,16 @@
 #include "CSBoxSceneCollectionImpl.h"
 #include "CSNaniteHeightCapture.h"
 
+#include "AssetCompilingManager.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshActor.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Engine/World.h"
 #include "HAL/IConsoleManager.h"
+#include "MaterialDomain.h"
 #include "Materials/Material.h"
+#include "MaterialShared.h"
 #include "Misc/ScopeExit.h"
 #include "RenderingThread.h"
 #include "RenderUtils.h"
@@ -107,17 +110,20 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter | EAutomationTestFlags::NonNullRHI)
 
 /**
- * CSSW 高度图里 Nanite 道具交给渲染器（custom render pass）去拍的端到端判据，全部是真渲染 + 回读：
- *   ① 分流：按 Nanite 画着的交给渲染器；普通网格、隐藏的 Nanite 网格留在三角形路径，不能从图里消失；
+ * CSSW 高度图里道具交给渲染器（custom render pass）去拍的端到端判据，全部是真渲染 + 回读：
+ *   ① 分流：单腿化（bCollectAllRenderComponents，CSSW 捕获用的就是它）下所有拍得到的道具都交给渲染器，
+ *      只按 Nanite 分流（bCollectNaniteRenderComponents）时普通网格留在三角形路径；两种模式下隐藏的
+ *      道具都留在三角形路径，不能从图里消失；
  *   ② 同序：CaptureAll 之后紧接着的回读就含渲染器那份，不用多等一帧；
  *   ③ 对齐：每块的正交视锥、朝向、深度换算与三角形路径逐 texel 一致。立方体的 Nanite 几何与 fallback
  *      完全相同，所以两条路径拍同一批道具必须得到同一张图 —— 块边长压到 48，块缝上也不能差；
- *   ④ 约定：比 CameraHeight 还高的几何钳到 CameraHeight，没东西的 texel 保留清屏哨兵。
+ *   ④ 约定：比 CameraHeight 还高的几何钳到 CameraHeight，没东西的 texel 保留清屏哨兵；
+ *   ⑤ 材质：透明道具走 depth pass 时不写深度，关掉渲染器后三角形路径（不看材质）会把它写成实心。
  * 只断言 CPU 侧"pass 加进去了"证明不了任何事：朝向写反、差半个 texel、深度偏移算错，CPU 侧照样全绿。
  */
 bool FCSShallowWaterNaniteCaptureAutomationTest::RunTest(const FString& Parameters)
 {
-	TestTrue(TEXT("CSSW 默认用渲染器拍 Nanite"), GetDefault<ACSShallowWaterCapture>()->bCaptureNaniteWithRenderer);
+	TestTrue(TEXT("CSSW 默认用渲染器拍道具"), GetDefault<ACSShallowWaterCapture>()->bCaptureWithRenderer);
 
 	if (!UseNanite(GMaxRHIShaderPlatform))
 	{
@@ -192,6 +198,23 @@ bool FCSShallowWaterNaniteCaptureAutomationTest::RunTest(const FString& Paramete
 		}
 	}
 
+	// ①' 单腿化分流：CSSW 捕获实际用的模式——不问是不是 Nanite，拍得到就交给渲染器。
+	{
+		FCSBoxSceneCollectOptions Options = Water->MakeBoxSceneCollectOptions(QueryBox);
+		Options.RequiredActorTags = { FName(TEXT("CSSW")) };
+		Options.bIncludeLandscape = false;
+		Options.bCollectAllRenderComponents = true;
+		const FCSBoxScenePreparedData Prepared = CSBoxSceneCollection::CollectBoxSceneTriangles(World, Options);
+		if (!TestTrue(TEXT("收集结果有效（单腿化）"), Prepared.IsValid())) return false;
+
+		TSet<const UPrimitiveComponent*> Routed;
+		for (const TWeakObjectPtr<UPrimitiveComponent>& Component : Prepared.Impl->NaniteRenderComponents) Routed.Add(Component.Get());
+		TestTrue(TEXT("A（Nanite）交给渲染器"), Routed.Contains(A->GetStaticMeshComponent()));
+		TestTrue(TEXT("B（普通网格）单腿化后也交给渲染器"), Routed.Contains(B->GetStaticMeshComponent()));
+		TestFalse(TEXT("D（隐藏）仍留在三角形路径，不从高度图里消失"), Routed.Contains(D->GetStaticMeshComponent()));
+		TestEqual(TEXT("三角形路径上只剩 D"), Prepared.Impl->ResolvedRequests.Num(), 1);
+	}
+
 	IConsoleVariable* TileSizeCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.CSNaniteHeightCapture.MaxTileSize"));
 	if (!TestNotNull(TEXT("块边长 CVar"), TileSizeCVar)) return false;
 	const int32 PreviousTileSize = TileSizeCVar->GetInt();
@@ -212,17 +235,17 @@ bool FCSShallowWaterNaniteCaptureAutomationTest::RunTest(const FString& Paramete
 	// ④ 数值与约定（也顺带守着朝向：四个道具分在四个象限）
 	const float Base = float(CSSWNaniteTest_Origin.Z);
 	TestEqual(TEXT("A（Nanite，渲染器）顶面"), Rendered[CSSWNaniteTest_Texel(-895.0, -895.0)], Base + 150.0f, CSSWNaniteTest_Tolerance);
-	TestEqual(TEXT("B（普通网格）顶面"), Rendered[CSSWNaniteTest_Texel(1005.0, -895.0)], Base + 350.0f, CSSWNaniteTest_Tolerance);
+	TestEqual(TEXT("B（普通网格，单腿化后走渲染器）顶面"), Rendered[CSSWNaniteTest_Texel(1005.0, -895.0)], Base + 350.0f, CSSWNaniteTest_Tolerance);
 	TestEqual(TEXT("D（隐藏的 Nanite，走 fallback）没有从图里消失"), Rendered[CSSWNaniteTest_Texel(1005.0, 1005.0)], Base + 150.0f, CSSWNaniteTest_Tolerance);
 	TestEqual(TEXT("E（相机之上）钳到 CameraHeight"), Rendered[CSSWNaniteTest_Texel(-895.0, 205.0)], Base + float(CSSWNaniteTest_MaxHeight), CSSWNaniteTest_Tolerance);
 	TestEqual(TEXT("没有几何的 texel 保留清屏哨兵"), Rendered[CSSWNaniteTest_Texel(405.0, -895.0)], CSSWNaniteTest_Sentinel, 1.0f);
 
 	// ③ 与三角形路径逐 texel 对比
-	Water->bCaptureNaniteWithRenderer = false;
+	Water->bCaptureWithRenderer = false;
 	const uint64 MergedBeforeTriangles = CSNaniteHeightCapture::DebugGetMergedTileCount();
 	Water->CaptureAll();
 	const TArray<float> Triangles = CSSWNaniteTest_ReadGround(Water);
-	Water->bCaptureNaniteWithRenderer = true;
+	Water->bCaptureWithRenderer = true;
 	TestEqual(TEXT("关掉开关后不再走渲染器"), int32(CSNaniteHeightCapture::DebugGetMergedTileCount() - MergedBeforeTriangles), 0);
 	if (!TestEqual(TEXT("回读的 texel 数（三角形路径）"), Triangles.Num(), Rendered.Num())) return false;
 
@@ -261,6 +284,39 @@ bool FCSShallowWaterNaniteCaptureAutomationTest::RunTest(const FString& Paramete
 	TestEqual(TEXT("渲染器路径与三角形路径逐 texel 一致"), Mismatched, 0);
 	// 整体差半个 / 一个 texel 时，六个道具的剪影边会成排地对不上；正确对齐时只剩斜边上极个别的吸附差。
 	TestTrue(TEXT("覆盖范围一致（只容许斜边上个别 texel 的吸附差）"), CoverageMismatched <= 6);
+
+	// ⑤ 材质语义：放在逐 texel 对比之后，免得透明道具的足迹把上面的覆盖一致性判据搅了。
+	// 三角形路径是直读 index/position buffer 的，不看材质 —— 玻璃、水面片会被写成实心挡板；
+	// 走引擎 depth pass 之后由引擎的混合模式规则说了算，这正是道具捕获单腿化的动机。
+	UMaterialInterface* TranslucentMaterial = LoadObject<UMaterialInterface>(nullptr,
+		TEXT("/Engine/ArtTools/RenderToTexture/Materials/M_RadiusDebugTranslucent.M_RadiusDebugTranslucent"));
+	if (TranslucentMaterial && IsTranslucentBlendMode(*TranslucentMaterial))
+	{
+		const FVector TranslucentOffset(405.0, 1005.0, 500.0);   // 空着的第五个位置，顶 +550
+		AStaticMeshActor* T = CSSWNaniteTest_SpawnProp(World, PlainCube, TranslucentOffset, FRotator::ZeroRotator, FlatScale);
+		if (!TestNotNull(TEXT("透明道具生成"), T)) return false;
+		T->GetStaticMeshComponent()->SetMaterial(0, TranslucentMaterial);
+		// 材质没编完时渲染器会拿默认（不透明）材质顶上，那样这条断言验的就不是混合模式了。
+		FAssetCompilingManager::Get().FinishAllCompilation();
+		World->SendAllEndOfFrameUpdates();
+
+		const int32 TranslucentTexel = CSSWNaniteTest_Texel(TranslucentOffset.X, TranslucentOffset.Y);
+		Water->CaptureAll();
+		FlushRenderingCommands();   // 暖身：新材质的着色器 / 代理在第一次渲染里才就位
+		Water->CaptureAll();
+		const TArray<float> WithTranslucent = CSSWNaniteTest_ReadGround(Water);
+		TestTrue(TEXT("透明道具不写深度（引擎 depth pass 的混合模式语义）"), CSSWNaniteTest_IsEmpty(WithTranslucent[TranslucentTexel]));
+
+		Water->bCaptureWithRenderer = false;
+		Water->CaptureAll();
+		const TArray<float> TrianglesWithTranslucent = CSSWNaniteTest_ReadGround(Water);
+		Water->bCaptureWithRenderer = true;
+		TestFalse(TEXT("关掉渲染器后三角形路径不看材质：透明道具被写成实心"), CSSWNaniteTest_IsEmpty(TrianglesWithTranslucent[TranslucentTexel]));
+	}
+	else
+	{
+		AddWarning(TEXT("引擎里没找到可用的透明材质，'透明道具不写深度' 这一条验不了。"));
+	}
 
 	return true;
 }

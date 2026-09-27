@@ -62,11 +62,15 @@ FCSBoxScenePreparedData CSBoxSceneCollection::CollectBoxSceneTriangles(
 			ImplData->LandscapeTriangleData);
 	}
 
+	// 单腿化开关隐含"收渲染组件"：调用方只需要开一个。
+	const bool bCollectRenderComponents = Options.bCollectNaniteRenderComponents || Options.bCollectAllRenderComponents;
+
 	ImplData->TotalStaticMeshTriangleCount = ResolveStaticMeshTriangleRequests(
 		Requests, Options.ExcludedActor, Options.ExcludedActorTags, true, ImplData->ResolvedRequests, &ImplData->MaterialRegistry,
 		Options.bUseMeshDescriptionSourceTriangles ? &ImplData->NaniteTriangles : nullptr,
 		Options.bPreserveSourceMaterialSlots,
-		Options.bCollectNaniteRenderComponents ? &ImplData->NaniteRenderComponents : nullptr);
+		bCollectRenderComponents ? &ImplData->NaniteRenderComponents : nullptr,
+		Options.bCollectAllRenderComponents);
 
 	ImplData->ReferencePoints = Options.ReferencePoints;
 	ImplData->ReferenceFilterDistance = SafeRefDist;

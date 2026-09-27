@@ -191,16 +191,29 @@ bool CSNaniteHeightCapture::IsAvailable(const UWorld* World)
 	return World && World->Scene && FApp::CanEverRender() && !World->IsNetMode(NM_DedicatedServer);
 }
 
-bool CSNaniteHeightCapture::IsCapturableNaniteComponent(const UStaticMeshComponent* Component)
+bool CSNaniteHeightCapture::IsCapturableComponent(const UStaticMeshComponent* Component)
 {
 	if (!Component || !Component->SceneProxy || Component->bHiddenInGame || Component->bHiddenInSceneCapture) return false;
+
+	// 这个 custom render pass 只画深度：主 pass / 深度 pass 被关掉的组件它一笔都画不出来，
+	// 得留在三角形路径上，否则高度图里凭空少一块。（材质是不是透明由渲染器按混合模式判，
+	// 与这两个组件标志无关 —— 透明道具走到渲染器那边就是不写深度，这正是单腿化要的。）
+	if (!Component->bRenderInMainPass || !Component->bRenderInDepthPass) return false;
 
 	// 渲染器在捕获视图里按 Game 规则判可见：actor 级的隐藏同样画不出来。
 	const AActor* Owner = Component->GetOwner();
 	if (Owner && Owner->IsHidden()) return false;
 
+	// 代理在帧末更新里构造（调用方先推过那一次）；SceneProxy 非空时代理一定还活着。
+	return true;
+}
+
+bool CSNaniteHeightCapture::IsCapturableNaniteComponent(const UStaticMeshComponent* Component)
+{
+	if (!IsCapturableComponent(Component)) return false;
+
 	// 以实际建出来的代理为准：材质不兼容、强制关 Nanite、平台不支持时代理是 fallback 网格，三角形路径读到的就是它。
-	// 代理在帧末更新里构造（调用方先推过那一次），标志构造后不再变；SceneProxy 非空时代理一定还活着。
+	// 标志构造后不再变。
 	return Component->SceneProxy->IsNaniteMesh();
 }
 

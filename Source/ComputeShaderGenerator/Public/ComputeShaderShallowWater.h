@@ -119,11 +119,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capturer", Meta=(Priority=1000))
 	float CaptureSize = 10000;
 
-	/** Nanite 网格用渲染器拍深度（俯视正交、只画深度的 custom render pass），得到与画面一致的全精度高度。
-	 *  关掉则 Nanite 网格也走三角形光栅化，只读得到 fallback 低模，没有 fallback 的网格直接缺席。
-	 *  非 Nanite 网格与地形不受影响。 */
+	/** 带 tag 的道具用渲染器拍深度（俯视正交、只画深度的 custom render pass），得到与画面一致的高度：
+	 *  **透明材质不写深度**、Masked 逐像素裁出剪影、WPO 生效、Nanite 是全精度而不是 fallback 低模。
+	 *  渲染器拍不到的组件（隐藏、无场景代理）仍走三角形光栅化，不会从高度图里消失。
+	 *  关掉则全部道具走三角形光栅化——那条路**不看材质**：玻璃 / 水面片会被当成实心挡板写进深度图，
+	 *  树叶卡片是整块矩形，Nanite 只读得到 fallback 低模（没有 fallback 的直接缺席）。
+	 *  代价：LOD、cull distance 与 WPO 由渲染器说了算，高度图因此不再逐位可复现。地形不受影响。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capturer", Meta=(Priority=1000))
-	bool bCaptureNaniteWithRenderer = true;
+	bool bCaptureWithRenderer = true;
 
 	// -------------------------------------------------------------------------
 	// Bake System

@@ -120,7 +120,7 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 
 	const FCSHouseFootprint& Footprint = Roof.Footprint;
 	const int32 NumFaces = Footprint.NumEdges();
-	if (!Footprint.IsValidFootprint()) return;
+	if (Roof.bFlat || !Footprint.IsValidFootprint()) return;
 
 	FCSRoofSkeleton Skeleton;
 	CSHouseRoof_BuildSkeleton(Footprint, double(FMath::Max(Roof.Overhang, 0.0f)), Skeleton);
@@ -192,11 +192,15 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 			if (Width <= 1.0) continue;
 			const FVector2D RowBase = Edge.Start + Edge.In * Inset;
 
-			const int32 Columns = FMath::Clamp(FMath::RoundToInt(Width / ColumnPitch), 1, CSHouseTile_MaxColumns);
+			const bool bStagger = (Row & 1) != 0;
+			const int32 Columns = FMath::Clamp(FMath::RoundToInt(Width / ColumnPitch), 1, CSHouseTile_MaxColumns - 1);
 			const double ColumnStep = Width / double(Columns);
 
-			for (int32 Column = 0; Column < Columns; ++Column)
+			for (int32 Column = 0; Column < Columns + int32(bStagger); ++Column)
 			{
+				// 奇数排错开半片，两端用半片收齐；不能直接挪整排，否则一侧漏空、另一侧越过角脊。
+				const double Cell0 = FMath::Max(0.0, (Column - (bStagger ? 0.5 : 0.0)) * ColumnStep);
+				const double Cell1 = FMath::Min(Width, (Column + (bStagger ? 0.5 : 1.0)) * ColumnStep);
 				// 身份 = (面号, 排号, 列号, 佐料, 用户种子)。**刻意不含位置** —— 拖房子时
 				// 屋面在动，位置派生的种子会让整片瓦在拖动过程里不停重掷（同藤蔓那条纪律）。
 				const uint32 Id = CSHouseVine::IdentityHash(Side, Row, Column, 71u, Params.Seed);
@@ -209,9 +213,9 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 					CSHouseVine::IdentityHash(Side, Row, Column, 74u, Params.Seed)) - 0.5f) * 2.0f;
 
 				// 列从 T1 端起排（沿 Along = −U 走），与矩形时代「U 从 −半宽起」同序 ⇒ 身份 (面, 排, 列) 不变。
-				const FVector2D XY = RowBase + Edge.U * (T1 - (double(Column) + 0.5) * ColumnStep);
+				const FVector2D XY = RowBase + Edge.U * (T1 - (Cell0 + Cell1) * 0.5);
 				const double Z = double(Roof.EaveZ) + double(TanP) * Inset;
-				const FVector Local = FVector(XY.X, XY.Y, Z) + NormalLocal * (double(Params.StandOff) + double(LiftJ));
+				FVector Local = FVector(XY.X, XY.Y, Z) + NormalLocal * (double(Params.StandOff) + double(LiftJ));
 
 				// 绕法线抖一点朝向：(上坡, 沿排, 法线) 是右手基，绕第三根轴转 a 就是这两句。
 				const double CosY = FMath::Cos(double(YawJ)), SinY = FMath::Sin(double(YawJ));
@@ -229,8 +233,13 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 				// `SizeScale` 只乘平面内两轴：排距不动 ⇒ 瓦数不变，只是每片变大或变小。
 				// 想改瓦数请调 RowPitch / ColumnPitch，那是另一件事。
 				Sizes[AxisUp] = float(RowStep) * Params.RowOverlap * ScaleJ * SizeScale;
-				Sizes[AxisAlong] = float(ColumnStep) * Params.ColumnOverlap * ScaleJ * SizeScale;
+				Sizes[AxisAlong] = float(Cell1 - Cell0) * Params.ColumnOverlap * ScaleJ * SizeScale;
 				Sizes[AxisNormal] = Thickness;
+				const double Remaining = (double(SlopeLen) - SlopeS);
+				const double Excess = FMath::Max(double(Sizes[AxisUp]) * 0.5 - Remaining, 0.0);
+				Sizes[AxisUp] -= float(Excess);
+				Local -= UpSlopeLocal * (Excess * 0.5);
+
 
 				// 枢轴补偿：实例变换把网格顶点 v 送到 `原点 + Σ v_i · 方向_i · 缩放_i`，
 				// 所以要让**包围盒中心**落在 Local 上，原点得先把中心那一项减掉。
@@ -264,7 +273,7 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 	if (Params.RidgeCapScale > 0.0f)
 	{
 		// 一条脊线 = 起点 → 终点 + 该处两坡法线的角平分。
-		struct FRidgeLine { FVector A; FVector B; FVector Normal; };
+		struct FRidgeLine { FVector A; FVector B; FVector Normal; FVector FaceNormal[2]; };
 		TArray<FRidgeLine, TInlineAllocator<16>> Lines;
 
 		// 角平分线是闭式的：两侧坡面的外法线是 (外法线_a · sinP, cosP) 与 (外法线_b · sinP, cosP)，
@@ -277,7 +286,8 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 			Lines.Add({
 				FVector(Arc.A.X, Arc.A.Y, double(Roof.EaveZ) + Arc.InsetA * double(TanP)),
 				FVector(Arc.B.X, Arc.B.Y, double(Roof.EaveZ) + Arc.InsetB * double(TanP)),
-				N.GetSafeNormal() });
+				N.GetSafeNormal(), { FVector(-FA.In.X * SinP, -FA.In.Y * SinP, CosP),
+					FVector(-FB.In.X * SinP, -FB.In.Y * SinP, CosP) } });
 		}
 
 		const float CapPitch = CSHouseTile_ColumnPitch(Params);
@@ -299,51 +309,37 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 				// 身份用 Side = 面数 + 线号，与坡面的 (Side, Row, Column) 不会撞（矩形上就是原来的 4 + 线号）。
 				const uint32 Id = CSHouseVine::IdentityHash(NumFaces + Line, Index, 0, 71u, Params.Seed);
 				const float Random01 = CSHouseVine::Hash01(Id);
-				const float ScaleJ = 1.0f + Params.ScaleJitter * (CSHouseVine::Hash01(
-					CSHouseVine::IdentityHash(NumFaces + Line, Index, 0, 72u, Params.Seed)) - 0.5f) * 2.0f;
-
-				const FVector LocalPos = L.A + Dir * ((double(Index) + 0.5) * Step)
+				// Two leaves meet at the crest. The lifted end points DOWN each adjacent face,
+				// never along the horizontal ridge (which produced the row of upright fins).
+				const FVector Crest = L.A + Dir * ((double(Index) + 0.5) * Step)
 					+ L.Normal * double(Params.StandOff + Thickness);
-
-				// 瓦的顺坡轴沿脊搭接；宽度跨脊。中心抬一个包围盒厚度，避免坡面瓦穿出盖瓦。
-				FVector Dirs[3];
-				Dirs[Params.Axes.UpSlope] = World.TransformVectorNoScale(Dir).GetSafeNormal();
-				Dirs[Params.Axes.Normal] = World.TransformVectorNoScale(
-					L.Normal * double(Params.Axes.NormalSign)).GetSafeNormal();
-				Dirs[Params.Axes.AlongRow] = FVector::CrossProduct(
-					Dirs[Params.Axes.Normal], Dirs[Params.Axes.UpSlope]).GetSafeNormal();
-
-				// ⚠️ **基必须是右手的**，与四面循环那条 `AlongSign` 同一个理由：镜像基会让瓦
-				// 背面朝外、光照整个翻掉，而位置、瓦数、包围盒断言全绿（`House.TileOnRoof`
-				// 第一次跑就抓到 55 个左手基）。沿脊方向本来就没有正反之分（瓦沿排对称），
-				// 所以掰它最省 —— 法线与上坡向都不能动。
-				if (FVector::DotProduct(FVector::CrossProduct(Dirs[0], Dirs[1]), Dirs[2]) < 0.0)
+				for (int32 Wing = 0; Wing < 2; ++Wing)
 				{
-					Dirs[Params.Axes.AlongRow] = -Dirs[Params.Axes.AlongRow];
+					const FVector Normal = L.FaceNormal[Wing];
+					FVector Up = FVector::CrossProduct(Dir, Normal).GetSafeNormal();
+					if (FVector::DotProduct(Up, L.Normal) < 0.0) Up = -Up;
+					FVector Dirs[3];
+					Dirs[AxisUp] = World.TransformVectorNoScale(Up).GetSafeNormal();
+					Dirs[AxisNormal] = World.TransformVectorNoScale(Normal * Params.Axes.NormalSign).GetSafeNormal();
+					Dirs[AxisAlong] = FVector::CrossProduct(Dirs[AxisNormal], Dirs[AxisUp]).GetSafeNormal();
+					if (FVector::DotProduct(FVector::CrossProduct(Dirs[0], Dirs[1]), Dirs[2]) < 0.0) Dirs[AxisAlong] = -Dirs[AxisAlong];
+					float Sizes[3];
+					Sizes[AxisUp] = ColumnPitch * 0.6f * SizeScale * Params.RidgeCapScale;
+					Sizes[AxisAlong] = float(Step) * FMath::Max(Params.ColumnOverlap, 1.08f);
+					Sizes[AxisNormal] = Thickness;
+					// Slightly overlap the unlifted ends, closing the crease without hovering plates.
+					FVector Centred = World.TransformPosition(Crest - Up * (Sizes[AxisUp] * 0.5 - 2.0));
+					for (int32 Axis = 0; Axis < 3; ++Axis) Centred -= Dirs[Axis] * (double(Params.Axes.NativeCentre[Axis]) * Sizes[Axis] / FMath::Max(Params.Axes.NativeSize[Axis], 0.01f));
+					FRecord& Rec = OutTiles.AddDefaulted_GetRef();
+					Rec.WorldPos = FVector3f(Centred);
+					Rec.Random01 = Random01;
+					Rec.AxisX = FVector3f(Dirs[0]);
+					Rec.AxisY = FVector3f(Dirs[1]);
+					Rec.AxisZ = FVector3f(Dirs[2]);
+					Rec.SizeX = Sizes[0];
+					Rec.SizeY = Sizes[1];
+					Rec.SizeZ = Sizes[2];
 				}
-
-				float Sizes[3];
-				Sizes[Params.Axes.UpSlope] = float(Step) * Params.ColumnOverlap * ScaleJ * SizeScale * Params.RidgeCapScale;
-				Sizes[Params.Axes.AlongRow] = ColumnPitch * 0.80f * ScaleJ * SizeScale * Params.RidgeCapScale;
-				Sizes[Params.Axes.Normal] = Thickness;
-
-				// 枢轴补偿：与铺瓦逐字同一段（实例变换是 `原点 + Σ v_i·方向_i·缩放_i`）。
-				FVector Centred = World.TransformPosition(LocalPos);
-				for (int32 Axis = 0; Axis < 3; ++Axis)
-				{
-					const double Scale = double(Sizes[Axis]) / double(FMath::Max(Params.Axes.NativeSize[Axis], 0.01f));
-					Centred -= Dirs[Axis] * (double(Params.Axes.NativeCentre[Axis]) * Scale);
-				}
-
-				FRecord& Rec = OutTiles.AddDefaulted_GetRef();
-				Rec.WorldPos = FVector3f(Centred);
-				Rec.Random01 = Random01;
-				Rec.AxisX = FVector3f(Dirs[0]);
-				Rec.AxisY = FVector3f(Dirs[1]);
-				Rec.AxisZ = FVector3f(Dirs[2]);
-				Rec.SizeX = Sizes[0];
-				Rec.SizeY = Sizes[1];
-				Rec.SizeZ = Sizes[2];
 			}
 		}
 	}
@@ -352,7 +348,7 @@ void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& 
 int32 MaxTilesBound(const FCSRoofDesc& Roof, const FParams& InParams)
 {
 	const FCSHouseFootprint& Footprint = Roof.Footprint;
-	if (!Footprint.IsValidFootprint()) return 0;
+	if (Roof.bFlat || !Footprint.IsValidFootprint()) return 0;
 
 	const float Overhang = FMath::Max(Roof.Overhang, 0.0f);
 	FCSRoofSkeleton Skeleton;
@@ -387,7 +383,7 @@ int32 MaxTilesBound(const FCSRoofDesc& Roof, const FParams& InParams)
 		{
 			const double Length = FMath::Sqrt(FVector2D::DistSquared(Arc.A, Arc.B)
 				+ FMath::Square((Arc.InsetB - Arc.InsetA) * TanP));
-			Total += FMath::Clamp(FMath::CeilToInt(Length / double(ColumnPitch)) + 1, 1, CSHouseTile_MaxColumns);
+			Total += 2 * FMath::Clamp(FMath::CeilToInt(Length / double(ColumnPitch)) + 1, 1, CSHouseTile_MaxColumns);
 		}
 	}
 	return Total;

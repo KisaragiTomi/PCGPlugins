@@ -68,7 +68,9 @@ def build(material):
             v=original[i]
             vertices.append(unreal.Vector(*p)); normals.append(unreal.Vector(*n))
             uv.append(unreal.Vector2D(v[0], v[1]))
-            colors.append(unreal.LinearColor(v[2] + 0.5, 0.0, 0.0, 1.0))
+            # Nanite reads the asset colours directly: alpha must stay zero so
+            # PerInstanceRandom + VertexColor.A has the same seed as the classic path.
+            colors.append(unreal.LinearColor(v[2] + 0.5, 0.0, 0.0, 0.0))
         triangles.append(unreal.IntVector(base,base+1,base+2))
     assert flipped == 0, 'faces whose outward normal points at the tile centre: %d' % flipped
     buffers=unreal.GeometryScriptSimpleMeshBuffers(vertices=vertices,normals=normals,
@@ -80,10 +82,14 @@ def build(material):
         _,outcome=unreal.GeometryScript_AssetUtils.copy_mesh_to_static_mesh(dynamic,mesh,options,unreal.GeometryScriptMeshWriteLOD())
     else:
         options=unreal.GeometryScriptCreateNewStaticMeshAssetOptions(enable_recompute_normals=False,
-            enable_recompute_tangents=True,enable_collision=False,enable_nanite=False)
+            enable_recompute_tangents=True,enable_collision=False,enable_nanite=True)
         mesh,outcome=unreal.GeometryScript_NewAssetUtils.create_new_static_mesh_asset_from_mesh(dynamic,MESH,options)
     assert mesh and outcome==unreal.GeometryScriptOutcomePins.SUCCESS, str(outcome)
     mesh.set_material(0,material)
+    subsystem=unreal.get_editor_subsystem(unreal.StaticMeshEditorSubsystem)
+    settings=subsystem.get_nanite_settings(mesh)
+    settings.set_editor_property('enabled',True)
+    subsystem.set_nanite_settings(mesh,settings,True)
     unreal.EditorAssetLibrary.save_loaded_asset(mesh,False)
     unreal.log('TG roof tile baked: '+str(mesh.get_bounding_box()))
     return mesh

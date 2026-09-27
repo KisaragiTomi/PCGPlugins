@@ -62,6 +62,9 @@ struct COMPUTESHADERGENERATOR_API FCSRoofDesc
 	/** 屋檐外挑 cm（每条边都挑同样多，沿边的法线量）。 */
 	UPROPERTY() float Overhang = 25.0f;
 
+	/** 派生的露台形态；由房子按屋脊相对檐口的高度统一判定。 */
+	UPROPERTY() bool bFlat = false;
+
 	float TanPitch() const { return FMath::Tan(FMath::DegreesToRadians(FMath::Clamp(Pitch, 0.0f, 89.0f))); }
 
 	/** cos(pitch)。铺瓦时"沿坡量的长度 → 竖直/水平分量"都按它换算，别在生成器里再写一遍三角函数。 */
@@ -188,6 +191,32 @@ inline float CSHouseRoof_RidgeZ(const FCSRoofDesc& Desc)
 {
 	return Desc.EaveZ + Desc.TanPitch() * float(Desc.MaxInset());
 }
+
+/** 高度把手用厘米编辑起伏，再反算坡度；零高可逆地退化为露台。 */
+inline float CSHouseRoof_PitchFromRise(float Rise, double MaxInset)
+{
+	if (MaxInset <= UE_KINDA_SMALL_NUMBER) return 0.0f;
+	return FMath::Clamp(FMath::RadiansToDegrees(FMath::Atan(FMath::Max(Rise, 0.0f) / MaxInset)), 0.0, 70.0);
+}
+
+/** 露台矮墙/垛口的局部砖块，网格轴 X 沿边、Y 横向、Z 朝上。 */
+struct FCSRoofParapetBlock
+{
+	FVector Center = FVector::ZeroVector;
+	FVector Size = FVector::OneVector;
+	FQuat Rotation = FQuat::Identity;
+};
+
+/** 围边入口：本边起点沿 U 的弧长区间，房屋从楼梯的接合诉求现算。 */
+struct FCSRoofParapetOpening
+{
+	int32 Edge = INDEX_NONE;
+	double Start = 0.0;
+	double End = 0.0;
+};
+
+COMPUTESHADERGENERATOR_API void CSHouseRoof_BuildParapet(const FCSRoofDesc& Roof, float Thickness,
+	float Height, TArray<FCSRoofParapetBlock>& OutBlocks, TArrayView<const FCSRoofParapetOpening> Openings = {});
 
 /** 檐口外沿高（局部 Z）——外挑最外一圈。四面同高（同坡度、同外挑）。 */
 inline float CSHouseRoof_EaveOuterZ(const FCSRoofDesc& Desc)

@@ -15,23 +15,27 @@ enum class ECSHouseHeightHandleSide : uint8
 	Eave,
 	/** 房底那个框：上下拖改房底（`ACSHouseActor::PushBase`，底动顶不动）。框停在房底（actor 局部 Z = 0）。 */
 	Base,
+	/** 屋脊上方的紧凑框，只改屋顶起伏，低于阈值换成露台。 */
+	Roof,
 };
 
 /**
  * 调高度的抓手（计划 D5 的竖直自由度）：**一个横放的"窗框"**，沿上下拖它就改房子的一个高度量。
- * 一共两个（`ECSHouseHeightHandleSide`）：
+ * 一共三个（`ECSHouseHeightHandleSide`）：
  *  - **檐口框**（用户裁决 2026-09-06）：停在檐口高度，拖它改 `WallHeight` —— 往上拖房子长高、往下变矮，
  *    框始终贴着墙顶，所以它同时是"墙有多高"的读数。
  *  - **房底框**（用户裁决 2026-09-14「底动顶不动」）：停在房底，拖它改 `HeightOffset` 并反向改
  *    `WallHeight` —— 往上拖房子离地变高、墙变矮，檐口与屋顶的世界高度不动；往下反过来。
  *
+ *  - **屋顶框**（2026-09-20）：脊线上方的小框，拖动只改屋顶起伏，降到阈值切换石铺露台。
+ *
  * 观感由用户点名：**四根细长长方体首尾相接围成一个矩形框**，长宽 = footprint 包围盒 × `FrameScale`
- * （默认 1.2 倍）。两个框观感相同，只是高度不同。
+ * （墙顶 / 房底默认 1.2 倍，屋顶框为 0.35 倍）。
  * ⚠️ 房底框贴着地面，可能被 40–55 cm 的草挡住；先照逻辑位置放，要不要抬高显示待编辑器里看效果再定。
  *
  * ## 与拉尺寸抓手（`ACSHouseResizeHandleActor`）的分工
  *
- * 那些锥子（每条边一个）管**水平**（各推一面墙，改 footprint）；这两个框管**竖直**。
+ * 那些锥子（每条边一个）管**水平**（各推一面墙，改 footprint）；三个高度框管**竖直**。
  * 同属 `ACSHouseHandleActor` 一族，生命周期、宿主纪律、记账量法完全一致，
  * 只是投影轴不同：锥子投到自己那面墙的外法线上，框投到**世界 Z** 上。
  *
@@ -49,7 +53,7 @@ enum class ECSHouseHeightHandleSide : uint8
  *   处理办法也照抄锥子：偏移量取"当前位置 − 上次消费过的位置"（`LastConsumedWorld`），推完**全部抓手
  *   统一重摆**（含自己）并在重摆里重置记账量 —— 父级带走的那一截被重摆直接覆盖掉，不会被下一次事件
  *   当成用户拖的。`House.BaseHandle` 逐步钉"拖 δ 房底恰好走 δ"。
- * 记账量法两种框都留着：它同时还管着"顶在下限上时不许攒残差"这一条（与 `CSHouseResize.h` 的
+ * 记账量法三种框都留着：它同时还管着"顶在下限上时不许攒残差"这一条（与 `CSHouseResize.h` 的
  * 返回值契约同一个理由）。
  */
 UCLASS(NotBlueprintable, NotPlaceable)
@@ -82,7 +86,7 @@ public:
 	virtual void SnapToCanonical() override;
 
 	/**
-	 * **交互的唯一执行面**：把竖直位移翻成一次改高度（檐口框 → `PushHeight`，房底框 → `PushBase`）。
+	 * **交互的唯一执行面**：把竖直位移翻成一次改高度（檐口框 → `PushHeight`，房底框 → `PushBase`，屋顶框 → `PushRoofHeight`）。
 	 * 返回实际生效的变化 cm。
 	 *
 	 * 只取**世界 Z** 分量，水平分量忽略（用户把框拖歪不该改高度；歪掉的部分在回位时清掉）。
@@ -93,9 +97,9 @@ public:
 
 	/**
 	 * 框的大小 = footprint × 这个系数（用户裁决：1.2 倍）。纯观感量，不进任何判定。
-	 * 1.0 会让框正好贴在墙皮上、抓不住；小于 1 会把框埋进房子里。
+	 * 墙顶 / 房底框应大于 1；屋顶框悬在脊线上方，可以小于 1。
 	 */
-	UPROPERTY(EditAnywhere, Category = "CS House|Resize", meta = (ClampMin = "1.01"))
+	UPROPERTY(EditAnywhere, Category = "CS House|Resize", meta = (ClampMin = "0.1"))
 	float FrameScale = 1.2f;
 
 	/** 条子的粗细 cm（截面是正方形）。 */

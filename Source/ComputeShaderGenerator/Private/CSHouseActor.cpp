@@ -1,6 +1,8 @@
-﻿#include "CSHouseActor.h"
+#include "CSHouseActor.h"
 
 #include "CSGpuInstancedMeshComponent.h"
+#include "CSStairsActor.h"
+#include "CSStairsConnection.h"
 #include "CSGpuMeshTypes.h"
 #include "CSGroundActor.h"
 #include "CSHouseQuoin.h"
@@ -21,6 +23,8 @@
 #include "CSMeshRenderComponent.h"
 #include "CSHousePillar.h"   // 砖石柱（unity 构建下别指望别人替你带进来）
 #include "CSVineTube.h"   // 折线 → 管子的对外入口（unity 构建下别指望别人替你带进来）
+#include "CSWall.h"       // 墙的纯函数核心：房子是一圈围合的墙（2026-09-22「统一房子和墙的逻辑」）
+#include "CSWallMesh.h"   // FCSWallMeshWriter —— 房子与墙共用的三角形写手
 #include "EngineUtils.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialInstanceDynamic.h"
@@ -38,146 +42,14 @@ namespace
 {
 // Unity/jumbo 构建共享 TU，file-local 一律 CSHouse_ 前缀。
 
-constexpr float CSHouse_UVScale = 200.0f;   // 世界 cm → UV 的平铺周期
+constexpr float CSHouse_UVScale = CSWallMesh::UVScale;   // 世界 cm → UV 的平铺周期（与墙的写手同一个值）
 constexpr float CSHouse_MinSpring = 15.0f;  // 拱脚竖直段最低高度
 
 // 半圆拱的段数不再写死：按弦高容差自适应，见 CSHouse_ProfileSegments（CSHouseProfile.h）。
 
-/**
- * 按通道字典组一份逐顶点语义色（R = 构件色号, G = 洞 Tag, B = 洞形状 id, A = 保留）。
- *
- * ⚠️ **B 的初值必须是 255（= 这块面板没有洞），不能是 0** —— 字典里 0 是一个**合法**的形状 id
- * （`ECSOpeningShape::Arch`）。屋面板曾经直接 `Writer.Semantic = CSHouse_Semantic(Roof)`
- * 绕过 `SetPanel`，于是整片屋面的 B 恒为 0，按字典读出来正好是"这块屋面上有个拱洞"；
- * 屋面材质不消费这条通道，所以一路静默。默认值放在**安全**那一侧：漏调 `SetPanel` 的写法
- * 至少不会撒谎。真正该做的仍然是走 `SetPanel`（它还负责把裁剪场一起换掉，见下面）。
- */
-FVector4f CSHouse_Semantic(ECSHousePart Part, uint8 Tag = 0)
-{
-	return FVector4f(float(uint8(Part)) / 255.0f, float(Tag) / 255.0f, 1.0f, 0.0f);
-}
-
-/** 把三角形逐个写进快照的小写手。位置按 World 变换烘成世界空间（常驻流口径），
- *  法线/切线同旋转；面法线遵守常驻流绕序 cross(B-A, C-A)（CSMeshBuild.h）。 */
-struct FCSHouseMeshWriter
-{
-	FCSGpuMeshCPUData& S;
-	FTransform World;
-
-	/** 当前正在写的构件的逐顶点语义色（通道字典见 ACSHouseActor 类注释）。写一组几何前设一次。
-	 *  初值走 `CSHouse_Semantic` 而不是零向量：B 的安全值是 255 不是 0，理由逐字见那个函数。 */
-	FVector4f Semantic = CSHouse_Semantic(ECSHousePart::Wall);
-
-	/**
-	 * 当前面板所属墙面的框架 + 洞的裁剪场。AddTri 据此为每个顶点算 UV1 = q —— 洞由材质
-	 * 逐像素 discard 切出来，几何上不挖（Tiny Glade 原版做法，见 CSHouseProfile.h）。
-	 * 无洞面板保持 Field.bValid = false，写哨兵 (8, 8)，判据下恒保留。
-	 */
-	FVector ClipOrigin = FVector::ZeroVector;
-	FVector ClipAlong = FVector::ForwardVector;
-	FCSOpeningClipField ClipField;
-
-	/** 顶点局部位置 → UV1。S 是沿墙弧长、Z 是墙空间高度，与剖面/判据同一套坐标。 */
-	FVector2f ClipUV(const FVector& LocalP) const
-	{
-		return ClipField.Eval(float(FVector::DotProduct(LocalP - ClipOrigin, ClipAlong)), float(LocalP.Z));
-	}
-
-	/** 换一块面板：设墙框架与裁剪场，并把形状 id 写进语义色 B 通道。 */
-	void SetPanel(const FVector& Origin, const FVector& Along, const FCSOpeningClipField& Field, ECSHousePart Part, uint8 Tag)
-	{
-		ClipOrigin = Origin;
-		ClipAlong = Along;
-		ClipField = Field;
-		Semantic = CSHouse_Semantic(Part, Tag);
-		// B = 形状 id / 255；255 = 这块面板没有洞（材质据此整块保留）。
-		Semantic.Z = float(Field.bValid ? uint8(Field.Shape) : 255) / 255.0f;
-	}
-
-	void AddTri(const FVector& A, const FVector& B, const FVector& C, int32 Slot, const FVector2f& UVA, const FVector2f& UVB, const FVector2f& UVC)
-	{
-		const FVector N = FVector::CrossProduct(B - A, C - A).GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
-		const FVector T = (B - A).GetSafeNormal(UE_SMALL_NUMBER, FVector::ForwardVector);
-		const int32 Base = S.Positions.Num();
-		const FVector P[3] = { A, B, C };
-		const FVector2f UV[3] = { UVA, UVB, UVC };
-		for (int32 i = 0; i < 3; ++i)
-		{
-			S.Positions.Add(FVector3f(World.TransformPosition(P[i])));
-			S.Normals.Add(FVector3f(World.TransformVectorNoScale(N)));
-			S.Tangents.Add(FVector3f(World.TransformVectorNoScale(T)));
-			S.TexCoords().Add(FVector2f(UV[i]));
-			// UV1 = 解析裁剪场。逐顶点写，透视校正插值精确还原（q 是 (s, z) 的仿射函数）。
-			S.TexCoordChannels[1].Add(ClipUV(P[i]));
-			S.Colors.Add(Semantic);
-		}
-		// 角点 1/2 交换：法线按外法线算（上面的 cross(B-A,C-A)），但索引要按**引擎绕序**写，
-		// 否则整栋房子朝里 —— 与地面同一条口径（见 CSGroundActor::BuildSnapshotFromMirror 的注释）。
-		S.Indices.Append({ uint32(Base), uint32(Base + 2), uint32(Base + 1) });
-		S.TriangleMaterialSlots.Add(Slot);
-	}
-
-	/** 平行四边形面：角点 A、A+U、A+U+V、A+V；常驻流法线 = U×V。UV 取 (沿U, 沿V) / 平铺周期。 */
-	void AddQuad(const FVector& A, const FVector& U, const FVector& V, int32 Slot)
-	{
-		const float LU = float(U.Size()) / CSHouse_UVScale;
-		const float LV = float(V.Size()) / CSHouse_UVScale;
-		AddTri(A, A + U, A + U + V, Slot, { 0, 0 }, { LU, 0 }, { LU, LV });
-		AddTri(A, A + U + V, A + V, Slot, { 0, 0 }, { LU, LV }, { 0, LV });
-	}
-
-	/**
-	 * 实心平行六面体：O 为一角，X/Y/Z 为三条边向量。六面外法线遵守常驻流口径。
-	 * 只要求**右手**，即 (X×Y)·Z > 0，**不要求正交**（剪切过的块也吃得下）。
-	 */
-	void AddBox(const FVector& O, const FVector& X, const FVector& Y, const FVector& Z, int32 Slot)
-	{
-		AddQuad(O, Y, X, Slot);              // bottom (-Z)
-		AddQuad(O + Z, X, Y, Slot);          // top (+Z)
-		AddQuad(O, X, Z, Slot);              // front (-Y)
-		AddQuad(O + Y, Z, X, Slot);          // back (+Y)
-		AddQuad(O, Z, Y, Slot);              // left (-X)
-		AddQuad(O + X, Y, Z, Slot);          // right (+X)
-	}
-
-	/**
-	 * 任意**平面**四边形：角点按环序 P0 → P1 → P2 → P3，法线 = (P1−P0)×(P3−P0) 的方向。
-	 * 与 `AddQuad(A, U, V)` 同一套三角划分与 UV 约定（取 P0 处两条邻边的长度），
-	 * 平行四边形时两者产出相同的角点。
-	 */
-	void AddQuad4(const FVector& P0, const FVector& P1, const FVector& P2, const FVector& P3, int32 Slot)
-	{
-		const float LU = float((P1 - P0).Size()) / CSHouse_UVScale;
-		const float LV = float((P3 - P0).Size()) / CSHouse_UVScale;
-		AddTri(P0, P1, P2, Slot, { 0, 0 }, { LU, 0 }, { LU, LV });
-		AddTri(P0, P2, P3, Slot, { 0, 0 }, { LU, LV }, { 0, LV });
-	}
-
-	/**
-	 * 一段墙板：外皮 S 区间 `[SA, SB]`、内皮 S 区间 `[SAin, SBin]`、高度 `[ZLo, ZHi]`、厚 `T`。
-	 *
-	 * 这就是斜接之后的面板形状：外皮与内皮都是矩形，只有两个端面可能是斜的（沿角平分线切）。
-	 * 六个面的角点顺序与 `AddBox(Start + U·SA + Up·ZLo, U·(SB−SA), In·T, Up·(ZHi−ZLo))` 逐面对应，
-	 * 所以 `SAin == SA && SBin == SB` 时它就是原来那个盒子。
-	 */
-	void AddWallPrism(const FVector& Start, const FVector& U, const FVector& In, const FVector& Up,
-		float SA, float SB, float SAin, float SBin, float T, float ZLo, float ZHi, int32 Slot)
-	{
-		const FVector Lo = Up * ZLo, Hi = Up * ZHi, Deep = In * T;
-		const FVector O0 = Start + U * SA + Lo,           O1 = Start + U * SB + Lo;
-		const FVector I0 = Start + U * SAin + Deep + Lo,  I1 = Start + U * SBin + Deep + Lo;
-		const FVector O0t = Start + U * SA + Hi,          O1t = Start + U * SB + Hi;
-		const FVector I0t = Start + U * SAin + Deep + Hi, I1t = Start + U * SBin + Deep + Hi;
-
-		AddQuad4(O0, I0, I1, O1, Slot);        // bottom (-Z)
-		AddQuad4(O0t, O1t, I1t, I0t, Slot);    // top (+Z)
-		AddQuad4(O0, O1, O1t, O0t, Slot);      // 外皮（背离房内）
-		AddQuad4(I0, I0t, I1t, I1, Slot);      // 内皮（朝向房内）
-		AddQuad4(O0, O0t, I0t, I0, Slot);      // 起点端面（斜接时是斜的）
-		AddQuad4(O1, I1, I1t, O1t, Slot);      // 终点端面
-	}
-
-};
+// 三角形写手与语义色（通道字典）2026-09-22 起住在 `CSWallMesh.h`（`FCSWallMeshWriter` / `CSWallMesh::Semantic`），
+// 房子与样条墙共用一份 —— 原来这里的 `FCSHouseMeshWriter` / `CSHouse_Semantic` 是逐字搬过去的，画面逐位不变。
+static_assert(uint8(ECSHousePart::Wall) == CSWallMesh::PartWall, "墙的构件色号：CSWallMesh::PartWall 必须等于 ECSHousePart::Wall");
 
 // `FCSHouseEdgeFrame` / `CSHouse_GetEdge` 已上提到 `CSHouseProfile.h`：谓词（`CSHouse_QueryOpening`）
 // 与单测也要问"这面墙在哪、有多长"，而墙在哪只能有一个真源。
@@ -208,14 +80,7 @@ void CSHouse_AppendFootprintHash(TArray<int32>& H, const FCSHouseFootprint& Foot
 	Footprint.AppendQuantizedHash(H);
 }
 
-/**
- * 藤蔓管子的环半径系数。**两个调用点必须用同一个值**：`PackTubePath` 按
- * `w = 想要的半径 / (10 * CircleScale)` 反解逐点缩放，Pass C 再按
- * `半径 = 10 * CircleScale * w` 还原。取值本身是任意的（两边约掉了），
- * 所以它是个常量而不是属性 —— 暴露出去只会让人以为调它能改粗细（那是 `VineThickness`），
- * 而真正的后果是两边取不同值时管子整体差一个常数倍、且两边各自都自洽。
- */
-constexpr float CSHouseVine_TubeCircleScale = 0.2f;
+// 藤蔓管子的环半径系数 2026-09-22 起是 `CSHouseVine::TubeCircleScale`（房子与样条墙共用，理由见那里）。
 
 /**
  * 砖路**墙框架**的哈希，量在 `CSHouseFrame::Scatter` 真正写进去的那个空间（组件空间）里。
@@ -276,6 +141,8 @@ bool CSHouse_OpeningLess(const FCSWallOpening& A, const FCSWallOpening& B)
 
 ACSHouseActor::ACSHouseActor()
 {
+	FlatRoofParapetComponent = CreateDefaultSubobject<UCSGpuInstancedMeshComponent>(TEXT("FlatRoofParapet"));
+	FlatRoofParapetComponent->SetupAttachment(RootComponent);
 	// 合批唤醒的兑现点（见 `RequestReevaluate`）。基类默认 `bCanEverTick = false`，这里自己打开；
 	// 平时关着、有欠账才开。编辑器里要真的 tick，还得配 `ShouldTickIfViewportsOnly`（同特征标记）。
 	PrimaryActorTick.bCanEverTick = true;
@@ -302,7 +169,14 @@ void ACSHouseActor::ResolveGroundAndSubscribe()
 	{
 		for (TActorIterator<ACSGroundActor> It(GetWorld()); It; ++It) { Ground = *It; break; }
 	}
-	if (!Ground) return;
+	if (!Ground)
+	{
+		// 还没有地面：先挂在类级广播上等它出现。实例级订阅要先有地面指针，而地面晚于房子
+		// 出现时没人会再来叫醒这栋房子 —— 它的藤会一直按"脚下无地面 = 悬空"秃着。
+		if (!AnyGroundRebuiltHandle.IsValid()) AnyGroundRebuiltHandle = ACSGroundActor::OnAnyGroundRebuilt.AddUObject(this, &ACSHouseActor::HandleAnyGroundRebuilt);
+		return;
+	}
+	UnsubscribeAnyGroundRebuilt();   // 找到了，换成下面的实例级订阅
 	if (GroundChangedHandle.IsValid()) return;   // 已订阅（换地面场景先 Unsubscribe 再来）
 	GroundChangedHandle = Ground->OnGroundChanged.AddUObject(this, &ACSHouseActor::HandleGroundChanged);
 }
@@ -311,6 +185,39 @@ void ACSHouseActor::UnsubscribeGround()
 {
 	if (IsValid(Ground) && GroundChangedHandle.IsValid()) Ground->OnGroundChanged.Remove(GroundChangedHandle);
 	GroundChangedHandle.Reset();
+	UnsubscribeAnyGroundRebuilt();
+	// 房子不在了（卸载 / PIE 结束 / 销毁）：它周围的灌木跟着消失。
+	if (IsValid(Ground)) Ground->RemoveBuildingFootprint(this);
+}
+
+void ACSHouseActor::PublishFootprintToGround()
+{
+	if (!IsValid(Ground)) return;
+	// GetFootprint 已经是严格凸、逆时针的外皮（凹的按凸包用，同房体）。
+	const FCSHouseFootprint Footprint = GetFootprint();
+	if (!Footprint.IsValidFootprint())
+	{
+		Ground->RemoveBuildingFootprint(this);
+		return;
+	}
+	const FTransform World = GetBuildTransform();
+	TArray<FVector2D, TInlineAllocator<16>> WorldPolygon;
+	for (const FVector2D& V : Footprint.Verts) WorldPolygon.Add(FVector2D(World.TransformPosition(FVector(V, 0.0))));
+	Ground->SetBuildingFootprint(this, WorldPolygon);
+}
+
+void ACSHouseActor::UnsubscribeAnyGroundRebuilt()
+{
+	if (AnyGroundRebuiltHandle.IsValid()) ACSGroundActor::OnAnyGroundRebuilt.Remove(AnyGroundRebuiltHandle);
+	AnyGroundRebuiltHandle.Reset();
+}
+
+void ACSHouseActor::HandleAnyGroundRebuilt(ACSGroundActor* RebuiltGround, const FBox& /*ChangedBounds*/)
+{
+	// 类级广播：编辑器世界与 PIE 世界的地面都会来，只认自己世界的。
+	if (!IsValid(RebuiltGround) || RebuiltGround->GetWorld() != GetWorld()) return;
+	// 只标脏：解析地面、换订阅都在下一次 ReevaluateSite 里做，不在别人的广播途中改委托表。
+	RequestReevaluate();
 }
 
 void ACSHouseActor::HandleGroundChanged(ACSGroundActor* ChangedGround, const FBox& /*ChangedBounds*/)
@@ -824,7 +731,7 @@ uint32 ACSHouseActor::ComputeDoors()
 	TArray<int32> H;
 	CSHouse_AppendFootprintHash(H, GetFootprint());
 	H.Append({ CSHouse_Q(WallHeight, 1), CSHouse_Q(WallThickness, 0.5),
-		CSHouse_Q(RoofPitch, 0.1), CSHouse_Q(RoofOverhang, 1) });
+		CSHouse_Q(RoofPitch, 0.1), CSHouse_Q(RoofOverhang, 1), int32(IsFlatRoof()) });
 	for (const FCSWallOpening& O : CurrentOpenings)
 	{
 		H.Append({ O.EdgeIndex, int32(O.Shape), CSHouse_Q(O.CenterS, 1), CSHouse_Q(O.Width, DoorWidthQuantum),
@@ -975,6 +882,13 @@ FCSRoofDesc ACSHouseActor::GetRoofDesc() const
 	Desc.EaveZ = WallHeight + RoofHeightOffset;
 	Desc.Pitch = RoofPitch;
 	Desc.Overhang = RoofOverhang;
+	Desc.bFlat = IsFlatRoof();
+	if (Desc.bFlat)
+	{
+		Desc.EaveZ = WallHeight;
+		Desc.Pitch = 0.0f;
+		Desc.Overhang = 0.0f;
+	}
 	return Desc;
 }
 
@@ -1093,6 +1007,9 @@ void ACSHouseActor::ReevaluateSite()
 		SetActorLocation(Loc);
 	}
 
+	// ①.5 摆位定了：外皮推给地面（建筑周边灌木）。拖动的每一帧都推，地面没变就短路。
+	PublishFootprintToGround();
+
 	const uint32 PlacementHash = ComputePlacementHash();
 
 	// ② 房体（门同时依赖 Colors 与 Heights）。
@@ -1135,6 +1052,7 @@ void ACSHouseActor::ReevaluateSite()
 	//    只吃屋面 desc + 摆位，不读门、不读地面 —— 所以排在哪儿都对，放这里只是顺着"墙 → 屋面"读。
 	if (bForceFullRebuild) RoofTileDescHash = 0;
 	RebuildRoofTiles();
+	RebuildFlatRoof();
 
 	//    尖顶跟在瓦后面：它要盖住的正是瓦在脊端点上的破口，读的也是同一份屋面 desc。
 	if (bForceFullRebuild) RoofFinialDescHash = 0;
@@ -1161,6 +1079,14 @@ void ACSHouseActor::ReevaluateSite()
 
 	bForceFullRebuild = false;
 	++ReevaluateCount;   // 合批的观测量（`GetReevaluateCount`），只数真正跑完的
+	TArray<int32> TerraceInput = { int32(PlacementHash), CSHouse_Q(WallHeight, 0.01), CSHouse_Q(WallThickness, 0.01), int32(IsFlatRoof()) };
+	CSHouse_AppendFootprintHash(TerraceInput, GetFootprint());
+	const uint32 NewTerraceHash = CSHouse_Hash(TerraceInput);
+	if (NewTerraceHash != TerraceSiteHash)
+	{
+		TerraceSiteHash = NewTerraceHash;
+		OnTerraceChanged.Broadcast(this);
+	}
 }
 
 void ACSHouseActor::WarnIfFootprintShapeFixed()
@@ -1321,6 +1247,57 @@ float ACSHouseActor::PushHeight(float Offset, bool bFinished)
 	return Applied;
 }
 
+float ACSHouseActor::GetRoofRise() const
+{
+	FCSRoofDesc Roof;
+	Roof.Footprint = GetFootprint();
+	Roof.Pitch = RoofPitch;
+	return float(Roof.MaxInset()) * Roof.TanPitch();
+}
+
+bool ACSHouseActor::IsFlatRoof() const
+{
+	return GetRoofRise() <= FMath::Max(FlatRoofThreshold, 0.0f);
+}
+
+FCSHouseTerraceChanged ACSHouseActor::OnTerraceChanged;
+
+FCSStairsTerraceSite ACSHouseActor::GetStairsTerraceSite() const
+{
+	FCSStairsTerraceSite Site;
+	Site.Roof = GetRoofDesc();
+	Site.Roof.bFlat &= !IsActorBeingDestroyed();
+	Site.World = GetBuildTransform();
+	Site.WallThickness = WallThickness;
+	return Site;
+}
+
+float ACSHouseActor::PushRoofHeight(float Offset, bool bFinished)
+{
+	NoteGizmoDrag(bFinished);
+	FCSRoofDesc Roof;
+	Roof.Footprint = GetFootprint();
+	const double Inset = Roof.MaxInset();
+	const float Before = GetRoofRise();
+	const float Pitch = CSHouseRoof_PitchFromRise(Before + Offset, Inset);
+	if (Pitch == RoofPitch && !bFinished) return 0.0f;
+	Modify(); // 编辑器 gizmo 的事务必须记录宿主属性，抓手自身是 transient。
+	RoofPitch = Pitch;
+	if (bFinished) bForceFullRebuild = true;
+	ReevaluateSite();
+	return GetRoofRise() - Before;
+}
+
+ACSHouseHeightHandleActor* ACSHouseActor::GetRoofHandle() const
+{
+	for (ACSHouseHandleActor* Handle : ResizeHandles)
+	{
+		ACSHouseHeightHandleActor* Height = Cast<ACSHouseHeightHandleActor>(Handle);
+		if (IsValid(Height) && Height->GetSide() == ECSHouseHeightHandleSide::Roof) return Height;
+	}
+	return nullptr;
+}
+
 float ACSHouseActor::PushBase(float Offset, bool bFinished)
 {
 	// 抓手拖动 = 接缝冻结期（D7 09-16），松手提交；与 PostEditMove 同一对标志。
@@ -1360,7 +1337,7 @@ FCSHouseResizeModeChanged ACSHouseActor::OnResizeModeChanged;
 namespace
 {
 /**
- * 抓手的生成参数（锥子与高度框共用一份）。
+ * 抓手的生成参数（推墙箭头与高度框共用一份）。
  *
  * `RF_Transient` 不存盘（计划 D5）。**顺带丢掉 `RF_Transactional`**：抓手的位移本身没有
  * 撤销语义——真正该被撤销的是 FootprintSize / WallHeight / HeightOffset，而它们由 Push* 直接写。
@@ -1410,7 +1387,7 @@ ACSHouseHeightHandleActor* ACSHouseActor::SpawnHeightHandle(ECSHouseHeightHandle
 	Handle->InitializeHandle(this, Side);
 #if WITH_EDITOR
 	Handle->SetActorLabel(FString::Printf(TEXT("%s_%s"), *GetActorLabel(),
-		Side == ECSHouseHeightHandleSide::Base ? TEXT("BaseHandle") : TEXT("HeightHandle")));
+		Side == ECSHouseHeightHandleSide::Base ? TEXT("BaseHandle") : (Side == ECSHouseHeightHandleSide::Roof ? TEXT("RoofHandle") : TEXT("HeightHandle"))));
 #endif
 	ResizeHandles.Add(Handle);
 	return Handle;
@@ -1432,16 +1409,17 @@ void ACSHouseActor::EnterResizeMode()
 
 	// 边数 = **取完凸包之后**的 footprint 边数（用户裁决 2026-09-14："折线有多少折手柄就有多少个"）。
 	const int32 NumEdges = GetFootprint().NumEdges();
-	ResizeHandles.Reserve(NumEdges + 2);
+	ResizeHandles.Reserve(NumEdges + 3);
 
 	// ① 每面墙一个锥子：水平推拉，每条边一个独立自由度 ⇒ 每条边一个 actor（矩形四个）。
 	for (int32 Edge = 0; Edge < NumEdges; ++Edge) SpawnEdgeHandle(Edge);
 
-	// ② 两个套在房子外面的矩形框：檐口那个上下拖改墙高，房底那个上下拖改房底（底动顶不动）。
+	// ② 三个套在房子外面的矩形框：檐口那个上下拖改墙高，房底那个上下拖改房底（底动顶不动），屋顶小框改起伏。
 	//    **一个框只有一个自由度 ⇒ 一个框一个 actor**（拆成四根的话用户抓哪根都在改同一个量，
 	//    四个 gizmo 互相打架）。将来再加竖直抓手也只是在这里多调一次 `SpawnHeightHandle`。
 	SpawnHeightHandle(ECSHouseHeightHandleSide::Eave);
 	SpawnHeightHandle(ECSHouseHeightHandleSide::Base);
+	SpawnHeightHandle(ECSHouseHeightHandleSide::Roof);
 
 	if (ResizeHandles.Num() > 0)
 	{
@@ -1546,7 +1524,7 @@ void ACSHouseActor::SnapResizeHandles()
 {
 	for (const TObjectPtr<ACSHouseHandleActor>& Handle : ResizeHandles)
 	{
-		// `SnapToCanonical` 是基类虚函数：锥子摆回墙外、框摆回檐口并重算四条边。
+		// `SnapToCanonical` 是基类虚函数：推墙箭头摆回墙外、框摆回檐口并重算四条边。
 		// 房子在这里**不区分**是哪一种抓手 —— 那正是公共基类的意义。
 		if (!IsValid(Handle)) continue;
 		Handle->SnapToCanonical();
@@ -1612,189 +1590,28 @@ ACSHouseHeightHandleActor* ACSHouseActor::GetBaseHandle() const
 
 void CSHouse_BuildBodySoup(const FCSHouseBodyDesc& Desc, FCSGpuMeshCPUData& S)
 {
-	FCSHouseMeshWriter Writer{ S, Desc.World };
-
-	const float T = Desc.WallThickness, H = Desc.WallHeight;
-	// 材质槽：0 墙面（Masked，按 UV1 逐像素切洞）。槽 1 留给屋顶，但四坡改瓦以后房体里
-	// 一片屋面三角都没有 —— 瓦是独立的实例组件。洞缘同样不占槽位（门框是砖块实例）。
-	constexpr int32 SlotWall = 0;
-
-	// ---- 四面墙：一串闭合面板。洞不在几何里，由材质按 UV1 的解析判据逐像素 discard 切出 ----
+	// ---- 墙：房子是一圈**围合的墙**（外皮 = footprint），走墙的面板规划 + `Faceted` 出面 ----
 	//
-	// 这是 Tiny Glade 原版的开洞方式：CPU 只提供解析参数，洞形在像素阶段成立。洞缘因此是
-	// 解析精确曲线（无限分辨率），而不是受弦高容差限制的折线。代价是 discard 只丢像素、
-	// 不生成表面 —— 洞缘的厚度断口由门框砖块填满，见下面的说明。
-	for (int32 Edge = 0; Edge < Desc.Footprint.NumEdges(); ++Edge)
+	// 2026-09-22「统一房子和墙的逻辑」：原来这里逐边的那一整套（洞按格切面板、墩跨度、接缝段合并、斜接棱柱、窗台盒、房底）
+	// 逐字搬进了 `CSWall::BuildBody`，样条墙走同一个面板规划器（`Continuous` 出面）。房子这边的画面逐位不变 ——
+	// `Wall.HouseBodyMatchesLegacy` 拿冻结的旧实现逐个 float 对照。墙顶是**平顶**（墙体自己的顶面，TG 的房子墙没有压顶 /
+	// 垛口，见 `CSWall::FTopParams::Plain`）；平屋顶的露台垛口归屋顶（`RebuildFlatRoof`）。
+	FCSWallPath Ring;
+	FCSWallSkins Skins;
+	if (CSWall::BuildEnclosureRing(Desc.Footprint, Desc.WallThickness, 0.0, double(Desc.WallHeight), Ring, Skins))
 	{
-		const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Desc.Footprint, T);
-		const FVector U(F.U.X, F.U.Y, 0), In(F.In.X, F.In.Y, 0), Up(0, 0, 1);
-		const FVector Start(F.Start.X, F.Start.Y, 0);
-
-		TArray<FCSWallOpening> Openings;
-		for (const FCSWallOpening& O : Desc.Openings) if (O.EdgeIndex == Edge) Openings.Add(O);
-		Openings.Sort([](const FCSWallOpening& A, const FCSWallOpening& B) { return A.CenterS < B.CenterS; });
-
-		// D7 接缝在这条边上要抹掉的段。**必须先排序再并掉重叠的**：一块面板只带一个裁剪场，
-		// 两刀重叠时后一刀会静默丢失（症状是三栋房挤在一起时少裁一段墙，而砖照常立着）。
-		// 并的是**并集包围**，宁可多裁一点也不留一片穿进邻居房间的墙。
-		TArray<FCSWallCut> Cuts;
-		for (const FCSWallCut& C : Desc.SeamCuts) if (C.EdgeIndex == Edge && C.IsValid()) Cuts.Add(C);
-		Cuts.Sort([](const FCSWallCut& A, const FCSWallCut& B) { return A.MinS < B.MinS; });
-		for (int32 K = Cuts.Num() - 1; K > 0; --K)
-		{
-			FCSWallCut& Prev = Cuts[K - 1];
-			if (Cuts[K].MinS > Prev.MaxS) continue;
-			Prev.MaxS = FMath::Max(Prev.MaxS, Cuts[K].MaxS);
-			Prev.TopZ = FMath::Max(Prev.TopZ, Cuts[K].TopZ);
-			Prev.BottomZ = FMath::Min(Prev.BottomZ, Cuts[K].BottomZ);
-			Cuts.RemoveAt(K);
-		}
-
-		// 一块面板：从 Z0 到墙顶（洞在其中被 clip 掉），Z0 以下那截是实心窗台盒。
-		//
-		// ⚠️ **任何情况下都不许靠"不生成面板"来开洞**（2026-08-30 裁决三，全项目架构不变量）：
-		// 想让某一片墙消失，砌出实心盒再用裁剪场把它 discard 掉 —— 墩就是这么做的，见下面。
-		// 斜接：面板贴着转角的那一端，内皮要沿角平分线让出 `Inset`（凹角为负，内皮反而伸出去）。
-		// 只有真正**顶到墙端**的面板才吃这个量；从墙中间起止的面板两端都是直的。被接缝切在斜接区
-		// 里面的那种少见情况取 max / min，保证内皮区间不越过斜接面、不与邻边的面板重叠。
-		auto InnerSpan = [&F](float SA, float SB, float& OutSAin, float& OutSBin)
-		{
-			OutSAin = (SA <= 0.5f) ? F.InsetStart : FMath::Max(SA, F.InsetStart);
-			OutSBin = (SB >= F.Len - 0.5f) ? (F.Len - F.InsetEnd) : FMath::Min(SB, F.Len - F.InsetEnd);
-			// 整块面板都落在斜接区里时内皮会反向：压成零长，棱台退化成三棱柱，面不翻。
-			OutSBin = FMath::Max(OutSBin, OutSAin);
-		};
-
-		auto AddPanel = [&](float SA, float SB, float Z0, const FCSOpeningClipField& Field, uint8 Tag)
-		{
-			// H − Z0 也要判：Z0 被参数推到墙顶以上时盒子会退化成反向挤出（面全朝里）。
-			if (SB - SA < 0.5f || H - Z0 < 0.5f) return;
-			float SAin = SA, SBin = SB;
-			InnerSpan(SA, SB, SAin, SBin);
-			Writer.SetPanel(Start, U, Field, ECSHousePart::Wall, Tag);
-			Writer.AddWallPrism(Start, U, In, Up, SA, SB, SAin, SBin, T, Z0, H, SlotWall);
-			if (Z0 > 0.5f)
-			{
-				// 窗台：真几何而不是 clip 的下界 —— 判据因此只需两个 float（见 CSHouseProfile.h）。
-				Writer.SetPanel(Start, U, FCSOpeningClipField(), ECSHousePart::Wall, 0);
-				Writer.AddWallPrism(Start, U, In, Up, SA, SB, SAin, SBin, T, 0.0f, Z0, SlotWall);
-			}
-		};
-
-		// 洞与洞之间那段实心墙。接缝把它再切成 [实心 | 接缝裁掉 | 实心 …]，因为**一块面板只带
-		// 一个裁剪场** —— 想让一段墙消失就得让它单独成为一块面板（裁决三：绝不靠"不生成面板"开洞）。
-		//
-		// 墩跨度与接缝落在同一段时取**接缝**那个场：接缝整条 Z 都裁，是墩场（只裁起拱线以下）
-		// 的超集，反过来取就会在接缝里留一截起拱线以上的墙。
-		auto AddRun = [&](float SA, float SB, bool bPierSpan, float SpanTopZ)
-		{
-			auto RunField = [&](float A, float B) { return bPierSpan ? CSHouse_PierClipField(A, B, SpanTopZ) : FCSOpeningClipField(); };
-			float At = SA;
-			for (const FCSWallCut& C : Cuts)
-			{
-				const float C0 = FMath::Max(C.MinS, SA);
-				const float C1 = FMath::Min(C.MaxS, SB);
-				if (C1 - C0 < 0.5f) continue;
-				AddPanel(At, C0, 0.0f, RunField(At, C0), 0);
-				AddPanel(C0, C1, 0.0f, CSHouse_SeamClipField(C0, C1, C.BottomZ, C.TopZ), 0);
-				At = C1;
-			}
-			AddPanel(At, SB, 0.0f, RunField(At, SB), 0);
-		};
-
-		float Cursor = 0;
-		// 上一个**真砌出来了**的洞。跳过某个洞（装不下）就必须清空它：否则下一轮会拿隔了
-		// 一个洞的两端去配墩，把中间那一整块墙当跨度抹掉。宁可多砌灰泥，不许少砌。
-		const FCSWallOpening* Prev = nullptr;
-		for (const FCSWallOpening& O : Openings)
-		{
-			if (!O.IsValid()) { Prev = nullptr; continue; }
-			float CellMin = 0, CellMax = 0;
-			CSHouse_OpeningCell(O, Desc.PierWidth, CellMin, CellMax);
-			// 墩侧把格**收回到洞缘再多咬 CSHouse_PierCutMargin 的十分之一**：这一侧要抹掉的
-			// 灰泥是格伸进跨度的那半个墩宽（端盖），不是格与格之间那块实心段 —— 默认参数下
-			// 拱宽 = 段距 − 墩宽，两格首尾相接，那块段本来就是零宽，只跳过它等于什么都没做
-			// （CSHouseProfile.h 记着这条）。
-			// 多咬那 0.1 是为了把端盖推到拱判据的**洞内**一侧：正好收到洞缘时 |q.x| 是浮点的
-			// 1.0，保不保由 `x * (1/x)` 的舍入决定 —— 一旦被保住，跨度两端就各立起一片贯穿
-			// 墙厚的灰泥薄片。被它咬掉的那 1 mm 拱缘由墩跨度那块面板顶上（起拱线以上照常是灰泥）。
-			const float PierBite = CSHouse_PierCutMargin * 0.1f;
-			if (O.StyleFlags & CSHouse_StylePierBefore) CellMin = O.S0() + PierBite;
-			if (O.StyleFlags & CSHouse_StylePierAfter) CellMax = O.S1() - PierBite;
-			// 夹进这面墙、且不吃掉前一块面板 —— 洞挨得太近时宁可让墩变窄，也不让面板反向。
-			CellMin = FMath::Clamp(CellMin, Cursor, F.Len);
-			CellMax = FMath::Clamp(CellMax, CellMin, F.Len);
-			// 1 cm 余量：墩侧的格是 S1() − S0() 再各让一点，浮点上不会逐位等于 Width，
-			// 而真正的"装不下"是厘米量级的事。
-			// 要求按**洞落在这面墙里的那一截**算，不是名义 `O.Width`：端点可能被量化推到墙外
-			// （`ComputeDoors` 已经夹过一次，这里是第二道闸），墙外那一截任何面板都盖不到，
-			// 拿名义宽去比就会把整个洞判成"装不下" ⇒ 砖拱砌好了、墙没挖洞，一声不吭。
-			const float VisibleWidth = FMath::Min(O.S1(), F.Len) - FMath::Max(O.S0(), 0.0f);
-			if (CellMax - CellMin < VisibleWidth - 1.0f) continue;   // 装不下这个洞的面板，这一洞放弃
-
-			// 洞之间的实心段。判为墩的跨度这一块**照样砌成实心盒**，只是起拱线以下整片交给
-			// 裁剪场在像素阶段裁掉（裁决三：避免所有真几何洞）—— 观感上起拱线以下就没有"墙"
-			// 这个表面了，只剩两侧门樘砖自己站着，正是实拍 Docs/TinyGlade/img/TG_continuous_arches.png
-			// 里"墙没了、只剩墩"的那一截。
-			float SpanZ0 = 0.0f, SpanWidth = 0.0f;
-			const bool bPierSpan = Prev != nullptr
-				&& (Prev->StyleFlags & CSHouse_StylePierAfter) != 0
-				&& (O.StyleFlags & CSHouse_StylePierBefore) != 0
-				&& CSHouse_PierSpanBetween(*Prev, O, SpanWidth, SpanZ0);
-			AddRun(Cursor, CellMin, bPierSpan, SpanZ0);
-			// **洞面板不吃接缝裁剪**（裁决二明写的退出范围："接缝接受 openings" 不做）：
-			// 它自带的裁剪场是洞形，一块面板容不下第二个场，而"两个场怎么合"正是被划出去的那件事。
-			// 落进接缝里的门窗因此还是完整的门窗 —— 观感上不对，但它是**声明过的**不对。
-			AddPanel(CellMin, CellMax, O.Z0, CSHouse_ComputeClipField(O), O.Tag);
-			Cursor = CellMax;
-			Prev = &O;
-		}
-		AddRun(Cursor, F.Len, false, 0.0f);
-
-		// 洞口的厚度**不产扫掠面**（用户裁决）：断口由门框砖块填满 —— 与 TG 同构，
-		// 它的拱/楣也是与墙砖并列的真实构件（flags&32：按拱高压扁贴合曲线 + 免拱裁剪），
-		// 而不是一圈扫掠出来的内壁。门框沿 CSHouse_ComputeClipField 那条解析洞缘铺砖
-		// （`BuildFrameArches` -> `CSHouseFrame::BuildEdgeElements`），与 clip 判据同源。
+		CSWall::FBodyParams Body;
+		Body.Surface = ECSWallSurface::Faceted;
+		Body.World = Desc.World;
+		Body.Openings = Desc.Openings;
+		Body.SeamCuts = Desc.SeamCuts;
+		Body.PierWidth = Desc.PierWidth;
+		Body.bInteriorFloor = Desc.bBottomFace;   // 2026-09-17「房子产生底面」：墙内皮围出的那块，朝下的单面
+		CSWall::BuildBody(Ring, Skins, Body, S);
 	}
 
-	// ---- 底面（2026-09-17 用户要求「房子产生底面」）----
-	//
-	// 只铺**墙内皮**围出的那块：墙板自己的底已由 `AddWallPrism` 封住，外皮到内皮这一圈再铺一层会与之共面打架。
-	// 内皮角点 = 外角沿角平分线内缩到墙厚 T（`PointAtDepth`，与斜接墙板同一个真源），footprint 取凸包 ⇒ 内皮也凸，扇形即可。
-	// **朝下的单面**：墙材质不双面，从屋里往下看是背面、被剔除 —— 平地上房底正好压在地形上，双面就会透过门洞闪烁。
-	// 不带裁剪场（UV1 哨兵，恒保留），语义色按墙面，UV0 按局部 XY 平铺（与墙面同一个周期）。
-	if (Desc.bBottomFace)
-	{
-		const int32 NumCorners = Desc.Footprint.NumEdges();
-		TArray<FVector> Inner;
-		Inner.Reserve(NumCorners);
-		for (int32 Corner = 0; Corner < NumCorners; ++Corner)
-		{
-			const FVector2D P = CSHouse_GetCorner(Corner, Desc.Footprint).PointAtDepth(T);
-			Inner.Add(FVector(P.X, P.Y, 0.0));
-		}
-		// 墙厚大于房子一半时内皮会翻过来（有向面积 <= 0）：那时屋里本来就没有空腔，不铺。
-		double TwiceArea = 0.0;
-		for (int32 K = 0; K < Inner.Num(); ++K)
-		{
-			const FVector& A = Inner[K];
-			const FVector& B = Inner[(K + 1) % Inner.Num()];
-			TwiceArea += A.X * B.Y - B.X * A.Y;
-		}
-		if (Inner.Num() >= 3 && TwiceArea > 1.0)
-		{
-			Writer.SetPanel(FVector::ZeroVector, FVector::ForwardVector, FCSOpeningClipField(), ECSHousePart::Wall, 0);
-			auto FloorUV = [](const FVector& P) { return FVector2f(float(P.X) / CSHouse_UVScale, float(P.Y) / CSHouse_UVScale); };
-			for (int32 K = 1; K + 1 < Inner.Num(); ++K)
-			{
-				// 内皮环是逆时针（俯视）：按 0 → K+1 → K 反着连，面法线 cross(B−A, C−A) 才朝 −Z。
-				const FVector& A = Inner[0];
-				const FVector& B = Inner[K + 1];
-				const FVector& C = Inner[K];
-				Writer.AddTri(A, B, C, SlotWall, FloorUV(A), FloorUV(B), FloorUV(C));
-			}
-		}
-	}
+	FCSWallMeshWriter Writer{ S, Desc.World };
+	const float H = Desc.WallHeight;
 
 	// ---- 屋顶：四坡 + 全瓦片。房体三角汤里**一片屋面都不产**（2026-08-31）。 ----
 	//
@@ -1807,6 +1624,22 @@ void CSHouse_BuildBodySoup(const FCSHouseBodyDesc& Desc, FCSGpuMeshCPUData& S)
 	// 屋面几何改由**瓦片实例**承担（`Content/HouseTest/TinyGladeAsset/Meshes/roof_tile`），走 GPU 实例组件那条路
 	// （与藤蔓 / 门框砖同构），不进这份三角汤。屋面方程仍然只有 `CSHouseRoof.h` 一份真源：
 	// 铺瓦、铺梁、尖顶、雪、以及 D8「落屋顶 → 不生成」谓词全部调它。
+
+	if (Desc.bFlatRoof)
+	{
+		Writer.SetPanel(FVector::ZeroVector, FVector::ForwardVector, FCSOpeningClipField(), ECSHousePart::Roof, 0);
+		auto DeckPoint = [&](int32 Corner)
+		{
+			const FVector2D XY = CSHouse_GetCorner(Corner, Desc.Footprint).Point;
+			return FVector(XY.X, XY.Y, H + 0.5f); // 避开墙板上沿的共面三角。
+		};
+		auto DeckUV = [](const FVector& P) { return FVector2f(float(P.X) / CSHouse_UVScale, float(P.Y) / CSHouse_UVScale); };
+		for (int32 K = 1; K + 1 < Desc.Footprint.NumEdges(); ++K)
+		{
+			const FVector A = DeckPoint(0), B = DeckPoint(K), C = DeckPoint(K + 1);
+			Writer.AddTri(A, B, C, 1, DeckUV(A), DeckUV(B), DeckUV(C));
+		}
+	}
 
 	S.SourceSpace = FCSGpuMeshCPUData::ESpace::World;
 	S.AttrLayout = FCSGpuMeshCPUData::EAttrLayout::PerVertex;
@@ -1823,6 +1656,7 @@ void ACSHouseActor::RebuildBodyMesh()
 	Desc.Openings = CurrentOpenings;
 	Desc.SeamCuts = CurrentSeamCuts;
 	Desc.bBottomFace = bBottomFace;
+	Desc.bFlatRoof = IsFlatRoof();
 	Desc.World = GetBuildTransform();
 
 	FCSGpuMeshCPUData S;
@@ -1840,7 +1674,7 @@ void ACSHouseActor::SubmitBodyMesh(TSharedPtr<FCSGpuMeshCPUData, ESPMode::Thread
 	FCSMeshSlotUpload Upload;
 	// ⚠️ 槽 1（屋顶）现在**一个三角都没有**（四坡改瓦片实例）—— 空分段只是画不出东西，无害；
 	// 槽位留着是为了不动这张 P2 冻结的槽表，`RoofMaterial` 本身归瓦片那条路用。
-	Upload.Materials = { WallMaterial, RoofMaterial };
+	Upload.Materials = { WallMaterial, FlatRoofMaterial ? FlatRoofMaterial : WallMaterial };
 	Upload.NumTexCoordSets = 2;   // UV1 传裁剪场
 	Upload.bSortSections = true;
 	SubmitMeshSlotAsync(TinyGladeMeshComponent, TinyGladeMesh, BodySlot, Snapshot, Upload, [this]() { OnBodyEditComplete(); });
@@ -1986,7 +1820,7 @@ void ACSHouseActor::RebuildPillarMesh(const TArray<FVector>& Centers, const TArr
 
 	FCSGpuMeshCPUData S;
 	const FTransform BuildTransform = GetBuildTransform();
-	FCSHouseMeshWriter Writer{ S, BuildTransform };
+	FCSWallMeshWriter Writer{ S, BuildTransform };
 	// 柱子也走 `SetPanel` —— 写法只留一种，下一个人就不会再把 B 通道漏成 0（= 合法形状 id
 	// `Arch`）。这里的写手是新的，裁剪场本来就是无洞哨兵，所以这一句纯粹是把口径钉死。
 	Writer.SetPanel(FVector::ZeroVector, FVector::ForwardVector, FCSOpeningClipField(),
@@ -2071,127 +1905,8 @@ void ACSHouseActor::OnPillarEditComplete()
 	if (ApplyPillarPlacement()) PillarSlot.PlacementHash = ComputePlacementHash();
 }
 
-void ACSHouseActor::ResolveVineSpawnTimes(const CSHouseVine::FPlan& Plan, TArray<float>& OutSpawnTimes)
-{
-	OutSpawnTimes.Reset(Plan.Strands.Num());
-
-	const float Now = GetWorld() ? float(GetWorld()->GetTimeSeconds()) : 0.0f;
-	const float Speed = FMath::Max(VineGrowSpeed, 1.0f);
-	// 从没长过的哨兵：足够早，材质算出来的前沿远超任何弧长 ⇒ 第一帧就是长成的。
-	const float GrownSentinel = -1.0e6f;
-
-	TMap<uint32, FVineStrandHistory> NextHistory;
-	NextHistory.Reserve(Plan.Strands.Num());
-
-	for (const CSHouseVine::FStrand& Strand : Plan.Strands)
-	{
-		const FVineStrandHistory* Prev = VineStrandHistory.Find(Strand.RootKey);
-		float Spawn;
-
-		if (!Prev)
-		{
-			// 全新的一根（第一次生成、或跨过藤位间距新增的那根）。
-			Spawn = bVineGrowOnLoad ? Now : GrownSentinel;
-		}
-		else
-		{
-			// 第一个不同的点。⚠️ 逐点比较用**墙面参数坐标 + 所在墙**，容差取 0.5 cm ——
-			// 比它更严会把浮点噪声判成"变了"，于是每次重求值都重新长一遍。
-			int32 Diverge = 0;
-			const int32 Common = FMath::Min(Prev->PointsSZ.Num(), Strand.Points.Num());
-			while (Diverge < Common)
-			{
-				const CSHouseVine::FStrandPoint& P = Strand.Points[Diverge];
-				const bool bSame = Prev->Edges.IsValidIndex(Diverge)
-					&& Prev->Edges[Diverge] == P.EdgeIndex
-					&& (Prev->PointsSZ[Diverge] - P.WallSZ).IsNearlyZero(0.5f);
-				if (!bSame) break;
-				++Diverge;
-			}
-
-			const bool bIdentical = (Diverge == Common)
-				&& Prev->PointsSZ.Num() == Strand.Points.Num();
-			if (bIdentical)
-			{
-				Spawn = Prev->SpawnTime;
-			}
-			else
-			{
-				// 变化点的弧长。`Diverge` 是"第一个不同的点"，它之前那一截与上一轮逐点相同，
-				// 所以那一截已经长出来的部分应当留着。
-				const int32 ArcIndex = FMath::Clamp(Diverge, 0, Strand.Arc.Num() - 1);
-				const float DivergeArc = Strand.Arc.IsValidIndex(ArcIndex) ? Strand.Arc[ArcIndex] : 0.0f;
-				const float Front = (Now - Prev->SpawnTime) * Speed;
-
-				// 前沿还没长到变化点 ⇒ 那段变化对它不可见，相位不用动。
-				// 越过了 ⇒ 把前沿拉回变化点（等价于 SpawnTime 往后挪），从那里接着长。
-				Spawn = (Front > DivergeArc) ? (Now - DivergeArc / Speed) : Prev->SpawnTime;
-			}
-		}
-
-		OutSpawnTimes.Add(Spawn);
-
-		FVineStrandHistory Entry;
-		Entry.SpawnTime = Spawn;
-		Entry.PointsSZ.Reserve(Strand.Points.Num());
-		Entry.Edges.Reserve(Strand.Points.Num());
-		for (const CSHouseVine::FStrandPoint& P : Strand.Points)
-		{
-			Entry.PointsSZ.Add(P.WallSZ);
-			Entry.Edges.Add(P.EdgeIndex);
-		}
-		NextHistory.Add(Strand.RootKey, MoveTemp(Entry));
-	}
-
-	// ⚠️ **整表替换而不是往里塞**：房子反复改尺寸会让键不断变化，只加不删的话这张表
-	// 会随编辑次数无界增长，而且泄漏得毫无症状（每根藤还带着一份折线副本）。
-	VineStrandHistory = MoveTemp(NextHistory);
-}
-
-void ACSHouseActor::SubmitVineTube(TSharedPtr<CSHouseVine::FTubePath, ESPMode::ThreadSafe> Path)
-{
-	if (!Path.IsValid() || !VineTubeComponent) return;
-
-	EnsureSlotMesh(VineTubeComponent, VineTubeMesh);   // 归藤管组件所有：组件销毁时它自己还显存
-	// 走 MID 而不是材质资产本身：`VineGrowSpeed` 要下推（见 VineBranchGrowMID 的注释）。
-	UMaterialInterface* TubeMaterial = VineBranchGrowMID
-		? static_cast<UMaterialInterface*>(VineBranchGrowMID) : ToRawPtr(VineBranchMaterial);
-	BindMeshSlotMaterials(VineTubeComponent, VineTubeMesh, { TubeMaterial });
-
-	// 在途被拒 ⇒ 只留**最新**那一份（不是排队）。拖尺寸时每 tick 都会来一次，排队的话
-	// 松手后要把整段拖动重放一遍；只留最新则最多落后一帧。同基类的网格槽。
-	if (ParkIfInFlight(VineTubeMesh, PendingVineTubePath, Path)) return;
-
-	VineTubeComponent->SetGpuMesh(VineTubeMesh);
-
-	CSVineTube::FParams TubeParams;
-	TubeParams.ProfileCount = uint32(FMath::Clamp(VineTubeSegments, 3, 24));
-	// ⚠️ 与下面 PackTubePath 传的必须是**同一个** CircleScale：环半径 =
-	// 10 * CircleScale * Points[i].w，而那个 .w 正是按这个式子反解出来的。
-	TubeParams.CircleScale = CSHouseVine_TubeCircleScale;
-
-	TWeakObjectPtr<ACSHouseActor> WeakThis(this);
-	const bool bIssued = CSVineTube::BuildTubeIntoMesh(
-		VineTubeMesh, Path->Points, Path->Axes, Path->PointMeta, Path->SegmentMeta, Path->Growth, TubeParams,
-		[WeakThis](bool /*bBuilt*/)
-		{
-			if (ACSHouseActor* House = WeakThis.Get()) House->OnVineTubeEditComplete();
-		});
-
-	if (!bIssued)
-	{
-		// 递交失败**不重试**：多半是折线自相矛盾或容量被拒，重试只会每帧再失败一次。
-		// 留一行日志，让"有折线却没有藤"这件事在日志里看得见（而不是画面上一片空白）。
-		UE_LOG(LogTinyGladeHouse, Warning,
-			TEXT("[TinyGladeHouse] %s vine tube submit refused: points=%d segs=%d"),
-			*GetName(), Path->Points.Num(), Path->SegmentMeta.Num());
-	}
-}
-
-void ACSHouseActor::OnVineTubeEditComplete()
-{
-	if (const TSharedPtr<CSHouseVine::FTubePath, ESPMode::ThreadSafe> Next = TakePending(PendingVineTubePath)) SubmitVineTube(Next);
-}
+// 藤的生长相位（`CSHouseVine::ResolveSpawnTimes`）、管子递交（`SubmitVineTube` / `OnVineTubeEditComplete`）
+// 2026-09-22 起在墙的基类 `ACSWallBase` 里，房子与样条墙共用一份（原文逐字搬过去了）。
 
 bool ACSHouseActor::ApplyPillarPlacement()
 {
@@ -3125,224 +2840,115 @@ FString ACSHouseActor::GetWindowUndrawableReason() const
 // 藤蔓（D13）
 // -----------------------------------------------------------------------------
 
+bool ACSHouseActor::GetWallPath(FCSWallPath& OutPath, FCSWallSkins& OutSkins, FTransform& OutWorld) const
+{
+	// 房子的墙 = footprint（外皮）围成的一圈，局部空间：墙脚 0、墙顶 WallHeight。与房体面板 / 角石 / 藤同一个真源。
+	OutWorld = GetBuildTransform();
+	return CSWall::BuildEnclosureRing(GetFootprint(), WallThickness, 0.0, double(WallHeight), OutPath, OutSkins);
+}
+
+FCSWallVineSettings ACSHouseActor::GetVineSettings() const
+{
+	// 38 个平铺属性逐个对到结构体上（2026-09-22 统一时不迁数据）。加字段时两边一起加，漏一个就是"房子的藤不认这个参数"。
+	FCSWallVineSettings V;
+	V.bEnabled = bVineEnabled;
+	V.BranchMesh = VineBranchMesh;
+	V.LeafMesh = VineLeafMesh;
+	V.FlowerMesh = VineFlowerMesh;
+	V.BranchMaterial = VineBranchMaterial;
+	V.LeafMaterial = VineLeafMaterial;
+	V.FlowerMaterial = VineFlowerMaterial;
+	V.Season = VineSeason;
+	V.StrandSpacing = VineStrandSpacing;
+	V.SegmentLength = VineSegmentLength;
+	V.MaxSegments = VineMaxSegments;
+	V.Wander = VineWander;
+	V.MaxLean = VineMaxLean;
+	V.MaxTurn = VineMaxTurn;
+	V.Bloat = VineBloat;
+	V.Thickness = VineThickness;
+	V.StandOff = VineStandOff;
+	V.HoleClearance = VineHoleClearance;
+	V.LeafChance = VineLeafChance;
+	V.LeafSize = VineLeafSize;
+	V.LeafSizeJitter = VineLeafSizeJitter;
+	V.FlowerChance = VineFlowerChance;
+	V.FlowerFromFrac = VineFlowerFromFrac;
+	V.FlowerSize = VineFlowerSize;
+	V.JumpChance = VineJumpChance;
+	V.bUseTube = bVineUseTube;
+	V.TubeSegments = VineTubeSegments;
+	V.TubeSubdivide = VineTubeSubdivide;
+	V.GrowSpeed = VineGrowSpeed;
+	V.LeafGrowDelay = VineLeafGrowDelay;
+	V.FlowerGrowDelay = VineFlowerGrowDelay;
+	V.GrowFadeSeconds = VineGrowFadeSeconds;
+	V.bGrowOnLoad = bVineGrowOnLoad;
+	V.TipTaperLength = VineTipTaperLength;
+	V.TipTaperMin = VineTipTaperMin;
+	V.MaxGroundGap = VineMaxGroundGap;
+	V.GroundSampleSpacing = VineGroundSampleSpacing;
+	V.Seed = VineSeed;
+	return V;
+}
+
 void ACSHouseActor::BuildVineStrips(TArray<CSHouseVine::FWallStrip>& OutStrips) const
 {
+	// 藤的墙面 = 围合墙（`ECSWallKind::Enclosure`）的墙面：外皮逐边一条平面带，屋里不长藤。2026-09-22 起与样条墙
+	// 同一个 `CSWall::BuildVineStrips`（原来这里的那一份逐字搬过去了，逐位不变）；路径来源与房体面板同一个（`GetWallPath`）。
 	OutStrips.Reset();
-	// **与房体面板同一份 `CSHouse_GetEdge`**：墙在哪儿只能有一个真源。各抄一份的症状是
-	// "藤悬在离墙半个墙厚的空中"，而且只在改过 WallThickness 之后才显形。
-	const FTransform World = GetBuildTransform();
-	const FCSHouseFootprint Footprint = GetFootprint();
-	for (int32 EdgeIndex = 0; EdgeIndex < Footprint.NumEdges(); ++EdgeIndex)
-	{
-		const FCSHouseEdgeFrame F = CSHouse_GetEdge(EdgeIndex, Footprint, WallThickness);
-		if (F.Len <= UE_KINDA_SMALL_NUMBER) continue;
+	FCSWallPath Ring;
+	FCSWallSkins Skins;
+	FTransform World;
+	if (!GetWallPath(Ring, Skins, World)) return;
 
-		CSHouseVine::FWallStrip Strip;
-		Strip.EdgeIndex = EdgeIndex;
-		Strip.Origin = World.TransformPosition(FVector(F.Start.X, F.Start.Y, 0.0));
-		Strip.U = World.TransformVectorNoScale(FVector(F.U.X, F.U.Y, 0.0)).GetSafeNormal();
-		Strip.Up = World.TransformVectorNoScale(FVector::UpVector).GetSafeNormal();
-		// `In` 指向体内，藤长在**外**皮上。
-		Strip.N = -World.TransformVectorNoScale(FVector(F.In.X, F.In.Y, 0.0)).GetSafeNormal();
-		Strip.Length = F.Len;
-		Strip.Height = WallHeight;
-
-		// 地面空隙采样：与承重柱**同一个量**（`Gap = 房底 Z − SampleHeight`，见 ComputePillars），
-		// 只是采样点跟着墙走而不是跟着柱距走。没有地面时留空数组 ⇒ `SampleGroundGap` 返回 0
-		// ⇒ 按贴地处理：没有地面的场景（纯单测、还没落座）不该因此秃掉。
-		if (Ground && F.Len > UE_KINDA_SMALL_NUMBER)
-		{
-			const int32 SampleCount = FMath::Clamp(
-				FMath::CeilToInt(F.Len / FMath::Max(VineGroundSampleSpacing, 10.0f)) + 1, 2, 64);
-			Strip.GroundGaps.SetNumUninitialized(SampleCount);
-			const double BaseZ = GetActorLocation().Z;
-			for (int32 K = 0; K < SampleCount; ++K)
-			{
-				const FVector P = Strip.Origin + Strip.U * (F.Len * double(K) / double(SampleCount - 1));
-				Strip.GroundGaps[K] = float(BaseZ - Ground->SampleHeight(FVector2D(P.X, P.Y)));
-			}
-		}
-
-		OutStrips.Add(Strip);
-	}
+	CSWall::FVineStripParams Params;
+	Params.Kind = GetWallKind();
+	Params.World = World;
+	// 地面空隙与承重柱**同一个量**（`Gap = 房底 Z − 地面高度`，见 ComputePillars）。
+	Params.GroundRefZ = GetActorLocation().Z;
+	Params.GroundSampleSpacing = VineGroundSampleSpacing;
+	// ⚠️ 必须用 `TrySampleHeight`：`SampleHeight` 在范围外退回地面 actor 的 Z，等于在房子底下凭空垫一块无限大的平地
+	// （脚下没有地面 ⇒ 悬空、这段墙不长藤，用户裁决 2026-09-21）。
+	CSWall::BuildVineStrips(Ring, Skins, Params,
+		[this](const FVector2D& XY, float& OutZ) { return Ground && Ground->TrySampleHeight(XY, OutZ); }, OutStrips);
 }
 
 CSShaperSteps::EHandoverResult ACSHouseActor::EnsureVineComponents()
 {
-	// 新组件身上没有基础网格快照。三条按下标对齐，任一条是新的就整批重建。
-	auto EnsureOne = [this](TObjectPtr<UCSGpuInstancedMeshComponent>& Component)
+	// 组件 / 季节与生长 MID / 基础网格快照 / 交接：墙的基类 `ACSWallBase::EnsureVineRig`（房子与样条墙共用一份）。
+	// 这里只给房子自己的两样：常驻容量与交接包围盒（按 footprint 周长、屋脊高算）。
+	return EnsureVineRig(GetVineSettings(), [this](uint32& OutMaxRecords, FBox& OutLocalBounds)
 	{
-		if (CSShaperSteps::EnsureInstancedComponent(this, Component)) bVineBaseMeshReady = false;
-	};
-	EnsureOne(VineBranchComponent);
-	EnsureOne(VineLeafComponent);
-	EnsureOne(VineFlowerComponent);
-	VineBranchComponent->InstanceMaterial = VineBranchMaterial;
+		// 容量按**配置上限**一次付清，之后永不扩容（零阻塞纪律）。上限是纯配置量：
+		// 四面墙的总周长 / 间距 × 每根最多几段。规划真的排超了就在 kernel 里截断 ——
+		// 少画几段藤，远好过在拖动的某一帧上付一次设备同步。
+		const FCSHouseFootprint Footprint = GetFootprint();
+		const double Perimeter = Footprint.GetPerimeter();
+		const int32 MaxStrands = FMath::CeilToInt(Perimeter / FMath::Max(VineStrandSpacing, 20.0f)) + Footprint.NumEdges();
+		// ⚠️ **必须再走一次 `CSShaperSteps::ReserveCount` 的台阶**，不能把这个数直接喂给 ReserveCapacity。
+		// 上限本身是 FootprintSize 的**连续函数**（周长 / 间距），而 ReserveCapacity 只对齐到 64 ——
+		// 拖尺寸时每涨过一根藤的间距就重新分配一次，实测每次 **5 次阻塞刷新**，一段拖动累计 21 次。
+		// 这与门框砖包围盒那条是同一个失败模式（"值连续变 ⇒ 资源每帧重来"），解法也同一个：
+		// 留 50% 余量 + 对齐到 4096。代价是显存多留一点（一行 80 B，4096 行 = 320 KB）。
+		const uint32 MaxRecords = uint32(FMath::Clamp(
+			CSShaperSteps::ReserveCount(MaxStrands * FMath::Clamp(VineMaxSegments, 1, 128)), 64, 1 << 16));
 
-	// 三季叶：只写母材质上的 `Season` 标量，**不换材质资产**（理由见 `ECSVineSeason`）。
-	// ⚠️ MID 的父换了必须重建 —— 在细节面板里换掉 `VineLeafMaterial` 时旧 MID 仍然有效，
-	// 于是"换了材质但画面没变"，与 `VineBranchMeshBuiltFrom` 那条是同一个失败模式。
-	if (VineLeafMaterial)
-	{
-		if (!VineLeafSeasonMID || VineLeafSeasonMID->Parent != VineLeafMaterial)
-		{
-			VineLeafSeasonMID = UMaterialInstanceDynamic::Create(VineLeafMaterial, this);
-		}
-		if (VineLeafSeasonMID) VineLeafSeasonMID->SetScalarParameterValue(TEXT("Season"), float(uint8(VineSeason)));
-	}
-	else
-	{
-		VineLeafSeasonMID = nullptr;
-	}
-	// 退回母材质而不是留空：留空的话组件会画成引擎默认灰，而 `GetVineUndrawableReason`
-	// 只查"材质非空"就放行了 —— 那正是石阶那个坑的形状。
-	VineLeafComponent->InstanceMaterial = VineLeafSeasonMID
-		? static_cast<UMaterialInterface*>(VineLeafSeasonMID) : ToRawPtr(VineLeafMaterial);
-
-	// 枝 / 花的 MID：只为把 `VineGrowSpeed` 下推过去。父换了必须重建 —— 在细节面板里
-	// 换掉材质资产时旧 MID 仍然有效，于是"换了材质但画面没变"（同 VineLeafSeasonMID 那条）。
-	// 秒 → 弧长 cm。材质侧的前沿是按弧长推的，而面板上给的是秒（"延迟"问的就是时间）。
-	// ⚠️ 这三行是**唯一**的换算点：别在材质里再折算一次，两处各算一份的症状是
-	// "改速度时延迟莫名其妙地平方级变化"，而两边各自都自洽。
-	const float Speed = FMath::Max(VineGrowSpeed, 1.0f);
-	const float FadeCm = FMath::Max(VineGrowFadeSeconds, 0.01f) * Speed;
-	const float LeafLagCm = FMath::Max(VineLeafGrowDelay, 0.0f) * Speed;
-	const float FlowerLagCm = FMath::Max(VineFlowerGrowDelay, 0.0f) * Speed;
-
-	auto EnsureGrowMID = [this, Speed, FadeCm](TObjectPtr<UMaterialInstanceDynamic>& MID, UMaterialInterface* Parent)
-	{
-		if (!Parent) { MID = nullptr; return; }
-		if (!MID || MID->Parent != Parent) MID = UMaterialInstanceDynamic::Create(Parent, this);
-		if (!MID) return;
-		MID->SetScalarParameterValue(TEXT("VineGrowSpeed"), Speed);
-		MID->SetScalarParameterValue(TEXT("VineGrowFade"), FadeCm);
-	};
-	EnsureGrowMID(VineBranchGrowMID, VineBranchMaterial);
-	EnsureGrowMID(VineFlowerGrowMID, VineFlowerMaterial);
-	// 叶子那张复用季节 MID —— 同一张上再写一个标量即可，不必多建一个。
-	if (VineLeafSeasonMID)
-	{
-		VineLeafSeasonMID->SetScalarParameterValue(TEXT("VineGrowSpeed"), Speed);
-		VineLeafSeasonMID->SetScalarParameterValue(TEXT("VineGrowFade"), FadeCm);
-	}
-
-	// 叶 / 花相对枝的延时。**参数名两张材质是同一个**（`instance_growth_nodes` 建的那个），
-	// 但它们是两张不同的材质、两个不同的 MID，所以可以各写各的值。
-	// ⚠️ 枝那张**不要**写：它没有这个参数（枝的前沿就是基准），写进去只是个没人读的标量，
-	// 但会让"这个数到底影响谁"变得不好查。
-	if (VineLeafSeasonMID) VineLeafSeasonMID->SetScalarParameterValue(TEXT("VineLeafLag"), LeafLagCm);
-	if (VineFlowerGrowMID) VineFlowerGrowMID->SetScalarParameterValue(TEXT("VineLeafLag"), FlowerLagCm);
-
-	VineFlowerComponent->InstanceMaterial = VineFlowerGrowMID
-		? static_cast<UMaterialInterface*>(VineFlowerGrowMID) : ToRawPtr(VineFlowerMaterial);
-
-	if (VineGpuBuffers.Num() != CSHouseVine::Palette_Num)
-	{
-		CSShaperSteps::ReleaseOnRenderThread(VineGpuBuffers);
-		VineGpuBuffers.SetNum(CSHouseVine::Palette_Num);
-		VineHandover.Capacities.Reset();
-		bVineBaseMeshReady = false;
-	}
-
-	// 基础网格快照只在第一次（或组件被重建后）建一次：它要读 LOD0 顶点、补法线与 UV，
-	// 不是每帧该做的事。⚠️ **不能改用 `SetBaseMesh`** —— `ivy_branch` 的切线流是空的，
-	// 那条路会把一份零长法线原样搬进快照，画出来是一条黑剪影（见 CSHouseVine::BuildBaseMesh）。
-	// 换过网格资产就必须重建快照（见 VineBranchMeshBuiltFrom 的字段注释）。
-	if (VineBranchMeshBuiltFrom != VineBranchMesh || VineLeafMeshBuiltFrom != VineLeafMesh
-		|| VineFlowerMeshBuiltFrom != VineFlowerMesh)
-	{
-		bVineBaseMeshReady = false;
-	}
-
-	if (!bVineBaseMeshReady)
-	{
-		FCSGpuMeshCPUData BranchData;
-		FCSGpuMeshCPUData LeafData;
-		FCSGpuMeshCPUData FlowerData;
-		// 长度轴：`ivy_branch` 实测 min=(-50,-86.6,0) max=(100,86.6,100) ⇒ 长度在 +Z；
-		// `ivy_leaf` 实测 min=(-33.3,0,-13) max=(33.3,70,8.5) ⇒ 长度在 +Y；
-		// `ivy_flower` 实测 min=(-36,-39,0) max=(40,39,38.4) ⇒ 底面在 Z=0、簇沿 +Z 张开，换轴取恒等。
-		const bool bBranchOk = CSHouseVine::BuildBaseMesh(VineBranchMesh, 2, BranchData);
-		const bool bLeafOk = CSHouseVine::BuildBaseMesh(VineLeafMesh, 1, LeafData);
-		const bool bFlowerOk = CSHouseVine::BuildBaseMesh(VineFlowerMesh, 2, FlowerData);
-		if (bBranchOk) VineBranchComponent->SetBaseMeshFromGpuData(BranchData);
-		if (bLeafOk) VineLeafComponent->SetBaseMeshFromGpuData(LeafData);
-		if (bFlowerOk) VineFlowerComponent->SetBaseMeshFromGpuData(FlowerData);
-		// 花是**可选**的（网格留空 = 不长花），所以它不进 `bVineBaseMeshReady` 的与 ——
-		// 进了的话没配花的房子会连枝带叶一起消失。
-		// 管子模式下枝不进实例路，它的基础网格快照建不出来也无所谓。
-		bVineBaseMeshReady = (bVineUseTube || bBranchOk) && bLeafOk;
-		VineBranchMeshBuiltFrom = bBranchOk ? VineBranchMesh : nullptr;
-		VineLeafMeshBuiltFrom = bLeafOk ? VineLeafMesh : nullptr;
-		VineFlowerMeshBuiltFrom = bFlowerOk ? VineFlowerMesh : nullptr;
-
-		// 块尺寸从**换轴之后**的快照量，不从资产的包围盒量 —— 两者的轴是不同的。
-		auto SetBlock = [](CSShaperSteps::FPaletteBuffers& Buffers, const FCSGpuMeshCPUData& Data, float CrossSection)
-		{
-			FBox3f Local(ForceInit);
-			for (const FVector3f& P : Data.Positions) Local += P;
-			const FVector3f Size = Local.IsValid ? Local.GetSize() : FVector3f(1.0f, 1.0f, 1.0f);
-			Buffers.BaseSphereCentre = Local.IsValid ? Local.GetCenter() : FVector3f::ZeroVector;
-			Buffers.BaseSphereRadius = Local.IsValid ? Local.GetExtent().Size() : 0.0f;
-			// z 只放 1/网格长度：记录里的 LengthScale 直接就是**想要的世界长度**（cm），
-			// 这样每一段可以有不同的长度，而不必回头改 BlockSize。
-			Buffers.BlockSize = FVector3f(
-				CrossSection / FMath::Max(Size.X, 1.0f),
-				CrossSection / FMath::Max(Size.Y, 1.0f),
-				1.0f / FMath::Max(Size.Z, 1.0f));
-		};
-		if (bBranchOk) SetBlock(VineGpuBuffers[CSHouseVine::Palette_Branch], BranchData, FMath::Max(VineThickness, 1.0f));
-		// 叶片按"长度 = 宽度"等比放：记录的 LengthScale 与 SizeScale 带同一个抖动系数。
-		if (bLeafOk) SetBlock(VineGpuBuffers[CSHouseVine::Palette_Leaf], LeafData, FMath::Max(VineLeafSize, 2.0f));
-		// 花的截面是**宽度**、长度轴是**高度**，两者由 `FParams::FlowerAspect` 联系起来。
-		if (bFlowerOk) SetBlock(VineGpuBuffers[CSHouseVine::Palette_Flower], FlowerData, FMath::Max(VineFlowerSize, 2.0f));
-	}
-
-	if (!bVineBaseMeshReady) return CSShaperSteps::EHandoverResult::UpToDate;
-
-	// 容量按**配置上限**一次付清，之后永不扩容（零阻塞纪律）。上限是纯配置量：
-	// 四面墙的总周长 / 间距 × 每根最多几段。规划真的排超了就在 kernel 里截断 ——
-	// 少画几段藤，远好过在拖动的某一帧上付一次设备同步。
-	const FCSHouseFootprint Footprint = GetFootprint();
-	const double Perimeter = Footprint.GetPerimeter();
-	const int32 MaxStrands = FMath::CeilToInt(Perimeter / FMath::Max(VineStrandSpacing, 20.0f)) + Footprint.NumEdges();
-	// ⚠️ **必须再走一次 `CSShaperSteps::ReserveCount` 的台阶**，不能把这个数直接喂给 ReserveCapacity。
-	// 上限本身是 FootprintSize 的**连续函数**（周长 / 间距），而 ReserveCapacity 只对齐到 64 ——
-	// 拖尺寸时每涨过一根藤的间距就重新分配一次，实测每次 **5 次阻塞刷新**，一段拖动累计 21 次。
-	// 这与门框砖包围盒那条是同一个失败模式（"值连续变 ⇒ 资源每帧重来"），解法也同一个：
-	// 留 50% 余量 + 对齐到 4096。代价是显存多留一点（一行 80 B，4096 行 = 320 KB）。
-	const uint32 MaxRecords = uint32(FMath::Clamp(
-		CSShaperSteps::ReserveCount(MaxStrands * FMath::Clamp(VineMaxSegments, 1, 128)), 64, 1 << 16));
-	// 三个调色板同容量。花远少于枝，但 `ReserveCapacity` 是逐调色板同一个下限的接口，
-	// 而多留的那一份是 4096 行 × 80 B = 320 KB —— 为省它去开一条"逐调色板容量"的口子，
-	// 换来的是一处只在花特别多时才会显形的截断，不划算。
-	CSShaperSteps::ReserveCapacity(VineGpuBuffers, MaxRecords);
-
-	// 交接包围盒：量化 + 只涨不缩，理由与门框砖那段逐字相同（拖尺寸时 1 cm 阈值会让
-	// 每帧都重走一次阻塞的 SetInstanceSourceGPU）。藤爬满整面墙，所以取整个 footprint。
-	const double Reach = CSShaperSteps::QuantizeUp(Footprint.GetCenteredSpan() * 0.6
-		+ FMath::Max(VineLeafSize, VineFlowerSize) + VineStandOff);
-	// ⚠️ 上界取**屋脊高**而不是墙高：藤自己只爬到檐口，但瓦 / 尖顶那一层将来也吃这只盒子，
-	// 停在墙高的话斜看时会成片被剔掉（症状是"转个视角就闪没"，最难复现的那一类）。
-	// `CSShaperSteps::QuantizeUp` 只涨不缩，所以这一项不是每帧变的量。
-	const double Top = CSShaperSteps::QuantizeUp(CSHouseRoof_RidgeZ(GetRoofDesc())
-		+ FMath::Max(VineLeafSize, VineFlowerSize));
-	FBox LocalBounds(FVector(-Reach, -Reach, -VineLeafSize), FVector(Reach, Reach, Top));
-	// 三个调色板的组件是同一棵挂接树上的兄弟、变换相同，取叶那一个即可（藤没有叶就不会走到这里）。
-	LocalBounds = CSHouse_BuildBoundsToComponent(GetBuildTransform(), VineLeafComponent.Get(), LocalBounds);
-	LocalBounds = CSShaperSteps::MergeHandoverBounds(LocalBounds, VineHandover, bForceFullRebuild);
-
-	UCSGpuInstancedMeshComponent* Components[CSHouseVine::Palette_Num] =
-		{ VineBranchComponent, VineLeafComponent, VineFlowerComponent };
-	TArray<CSShaperSteps::FHandoverSource, TInlineAllocator<CSHouseVine::Palette_Num>> Sources;
-	for (int32 Index = 0; Index < CSHouseVine::Palette_Num; ++Index)
-	{
-		// 叶/花的生长动画靠 custom data（枝走管子，不吃这条，但三条一起交省一个分支）。
-		// 漏传的症状是材质里的 `Per Instance Custom Data` 恒读 0 ⇒ 叶子一出现就是长成的，
-		// 而不报任何错。
-		Sources.Add(CSShaperSteps::MakeHandoverSource(Components[Index], VineGpuBuffers[Index], /*bWithCustomData*/ true));
-	}
-	return CSShaperSteps::HandOverInstanceSources(Sources, LocalBounds, VineHandover);
+		// 交接包围盒：量化 + 只涨不缩，理由与门框砖那段逐字相同（拖尺寸时 1 cm 阈值会让
+		// 每帧都重走一次阻塞的 SetInstanceSourceGPU）。藤爬满整面墙，所以取整个 footprint。
+		const double Reach = CSShaperSteps::QuantizeUp(Footprint.GetCenteredSpan() * 0.6
+			+ FMath::Max(VineLeafSize, VineFlowerSize) + VineStandOff);
+		// ⚠️ 上界取**屋脊高**而不是墙高：藤自己只爬到檐口，但瓦 / 尖顶那一层将来也吃这只盒子，
+		// 停在墙高的话斜看时会成片被剔掉（症状是"转个视角就闪没"，最难复现的那一类）。
+		// `CSShaperSteps::QuantizeUp` 只涨不缩，所以这一项不是每帧变的量。
+		const double Top = CSShaperSteps::QuantizeUp(CSHouseRoof_RidgeZ(GetRoofDesc())
+			+ FMath::Max(VineLeafSize, VineFlowerSize));
+		FBox LocalBounds(FVector(-Reach, -Reach, -VineLeafSize), FVector(Reach, Reach, Top));
+		// 三个调色板的组件是同一棵挂接树上的兄弟、变换相同，取叶那一个即可（藤没有叶就不会走到这里）。
+		LocalBounds = CSHouse_BuildBoundsToComponent(GetBuildTransform(), VineLeafComponent.Get(), LocalBounds);
+		OutMaxRecords = MaxRecords;
+		OutLocalBounds = LocalBounds;
+	}, bForceFullRebuild);
 }
 
 void ACSHouseActor::RebuildVine()
@@ -3353,17 +2959,8 @@ void ACSHouseActor::RebuildVine()
 	{
 		if (CurrentVineSegmentCount != 0 || CurrentVineLeafCount != 0 || CurrentVineFlowerCount != 0)
 		{
-			// ⚠️ **撤实例源之前必须先把 counter 清零**（与 `RebuildFrame` 那条同源，
-			// 门框砖已经因此在画面上留过 12 层砖）：撤掉之后 `VineHandover` 被清空，
-			// 下一次 `EnsureVineComponents` 会把同一批 buffer 交回组件。这条路上的窗口是
-			// **重新打开藤之后 `bVineBaseMeshReady` 为假**那一次 —— 那时交接已经发生，
-			// 而 `CSHouseVine::Pack`（它自己的空表分支会清零）根本走不到。
-			CSShaperSteps::ZeroCounters(VineGpuBuffers);
-			ClearMeshSlot(VineTubeComponent, VineTubeMesh, PendingVineTubePath);   // 下次有藤时重建，别让空网格留在组件上
-			if (VineBranchComponent) VineBranchComponent->ClearInstanceSourceGPU();
-			if (VineLeafComponent) VineLeafComponent->ClearInstanceSourceGPU();
-			if (VineFlowerComponent) VineFlowerComponent->ClearInstanceSourceGPU();
-			VineHandover.Reset();
+			// 先清 counter 再撤实例源、管子与交接缓存（顺序的理由见 `ACSWallBase::ClearVineRig`）。
+			ClearVineRig();
 			CurrentVineSegmentCount = 0;
 			CurrentVineLeafCount = 0;
 			CurrentVineFlowerCount = 0;
@@ -3378,30 +2975,9 @@ void ACSHouseActor::RebuildVine()
 	TArray<CSHouseVine::FWallStrip> Strips;
 	BuildVineStrips(Strips);
 
-	CSHouseVine::FParams Params;
-	Params.StrandSpacing = VineStrandSpacing;
-	Params.SegmentLength = VineSegmentLength;
-	Params.MaxSegments = VineMaxSegments;
-	Params.Wander = VineWander;
-	Params.MaxLean = VineMaxLean;
-	Params.MaxTurn = VineMaxTurn;
-	Params.Bloat = VineBloat;
-	Params.Thickness = VineThickness;
-	Params.StandOff = VineStandOff;
-	Params.HoleClearance = VineHoleClearance;
-	Params.LeafChance = VineLeafChance;
-	Params.LeafSize = VineLeafSize;
-	Params.LeafSizeJitter = VineLeafSizeJitter;
-	// 没配花网格时把概率钉成 0：否则规划器照排记录，而 counter 指向一个没有基础网格的组件 ——
-	// 症状是"实例数对得上但屏幕上什么都没有"，与"材质被静默换掉"一样查不出来。
-	Params.FlowerChance = VineFlowerMesh ? VineFlowerChance : 0.0f;
-	Params.FlowerFromFrac = VineFlowerFromFrac;
-	Params.FlowerSize = VineFlowerSize;
-	Params.JumpChance = VineJumpChance;
-	Params.TipTaperLength = VineTipTaperLength;
-	Params.TipTaperMin = VineTipTaperMin;
-	Params.MaxGroundGap = VineMaxGroundGap;
-	Params.Seed = VineSeed;
+	// 参数表与样条墙同一份（`FCSWallVineSettings` → `FParams`，花网格没配时花的概率钉 0）。
+	const FCSWallVineSettings Vine = GetVineSettings();
+	const CSHouseVine::FParams Params = MakeVineParams(Vine);
 
 	CSHouseVine::FPlan Plan;
 	CSHouseVine::BuildPlan(Strips, CurrentOpenings, Params, Plan);
@@ -3440,11 +3016,7 @@ void ACSHouseActor::RebuildVine()
 	CSHouse_AppendFootprintHash(FootprintHash, GetFootprint());
 	const uint32 NewHash = HashCombine(CSHouse_Hash(HashInput), CSHouse_Hash(FootprintHash));
 
-	bool bBuffersReady = VineGpuBuffers.Num() == CSHouseVine::Palette_Num;
-	for (int32 Index = 0; bBuffersReady && Index < CSHouseVine::Palette_Num; ++Index)
-	{
-		bBuffersReady = VineGpuBuffers[Index].IsValid();
-	}
+	const bool bBuffersReady = AreVineBuffersReady();
 	// 刚交接过（扩容换了清零的新 buffer / 包围盒变了）就必须重打包，哈希没变也不能早退（审查 B1）。
 	const bool bMustRepack = VineHandoverResult == CSShaperSteps::EHandoverResult::HandedOver;
 	if (!bMustRepack && NewHash == VineDescHash && VineHandover.Capacities.Num() == CSHouseVine::Palette_Num && bBuffersReady) return;
@@ -3454,59 +3026,9 @@ void ACSHouseActor::RebuildVine()
 	CurrentVineLeafCount = Plan.Leaf.Num();
 	CurrentVineFlowerCount = Plan.Flower.Num();
 
-	// 世界 → 组件。⚠️ **用组件自己的变换求逆**，不用 actor 的：已删的门框旧路混用
-	// `GetBuildTransform()`（只取 yaw）与 actor 的完整逆变换，正是状态文件「已知潜伏问题」
-	// 里那条 —— 房子一旦被 pitch/roll 或缩放就错位。这里不重复它。
-	const FMatrix44f WorldToComponent = FMatrix44f(
-		VineBranchComponent->GetComponentTransform().ToInverseMatrixWithScale());
-	// ⚠️ **管子模式下枝不能再走实例**，否则管子与分段实例同时画（用户实测："连续的管子和
-	// 分段似乎同时存在"）。摘掉记录而不是"不画"：`Pack` 的空表分支会 `AddClearUAVPass`
-	// 把 counter 清零，而单纯跳过打包会让 counter **停在上一次的值** —— 那正是重影的成因。
-	// 计数（CurrentVineSegmentCount）在上面已经取过，日志与哈希都不受影响；
-	// `PackTubePath` 只读 `Plan.Strands`，也不受影响。
-	// SpawnTime：老藤沿用、新藤记当前时刻、消失的藤从表里删掉。
-	// ⚠️ 必须**先删后加**地重建，不能只往里塞：房子反复改尺寸会让键不断变化，
-	// 只加不删的话这张表会随编辑次数无界增长（而且泄漏得毫无症状）。
-	// ⚠️ 位置在 `Pack` **之前**、且在管子分支**之外** —— 枝（管子）与叶花（实例）
-	// 两条路共用同一份相位，同一根藤的枝与叶必须同时长出来。放进管子分支里的后果是
-	// 叶子的 SpawnTime 恒为 0（一出现就长成），而管子长得好好的。
-	TArray<float> SpawnTimes;
-	ResolveVineSpawnTimes(Plan, SpawnTimes);
-
-	// 回填叶/花记录的相位。**必须在 Pack 之前** —— Pack 会把记录拍平上传，之后再改
-	// 只是改了一份没人读的 CPU 副本，而画面上叶子的相位恒为 0。
-	auto FillSpawn = [&SpawnTimes](TArray<CSHouseVine::FRecord>& Records)
-	{
-		for (CSHouseVine::FRecord& R : Records)
-		{
-			R.SpawnTime = SpawnTimes.IsValidIndex(R.StrandIndex) ? SpawnTimes[R.StrandIndex] : 0.0f;
-		}
-	};
-	FillSpawn(Plan.Leaf);
-	FillSpawn(Plan.Flower);
-
-	if (bVineUseTube) Plan.Branch.Reset();
-	CSHouseVine::Pack(Plan, VineGpuBuffers, WorldToComponent);
-
-	// 枝：折线 → 管子。叶与花仍走上面那两个调色板（2026-09-06 裁决 5）。
-	if (bVineUseTube)
-	{
-		TSharedPtr<CSHouseVine::FTubePath, ESPMode::ThreadSafe> Path =
-			MakeShared<CSHouseVine::FTubePath, ESPMode::ThreadSafe>();
-		CSHouseVine::PackTubePath(Strips, Plan, Params, VineTubeSubdivide,
-			CSHouseVine_TubeCircleScale, SpawnTimes, *Path);
-		if (Path->IsEmpty())
-		{
-			// 一根藤都没有（悬空、或墙太矮）：把组件上的网格撤掉，别让上一次的管子留在画面上。
-			// 这与 `Pack` 那边"空表也要走一趟清零 counter"是同一条纪律的两半。
-			if (VineTubeComponent) VineTubeComponent->SetGpuMesh(nullptr);
-			PendingVineTubePath.Reset();
-		}
-		else
-		{
-			SubmitVineTube(Path);
-		}
-	}
+	// 生长相位 → 叶 / 花回填 → 打包实例 → 枝的管子：墙的基类 `ACSWallBase::PackVine`（样条墙同一份）。
+	// 计数（CurrentVineSegmentCount）在上面已经取过 —— 管子模式下它会把枝记录摘掉，日志与哈希都不受影响。
+	PackVine(Vine, Params, Strips, Plan);
 
 	UE_LOG(LogTinyGladeHouse, Log, TEXT("[TinyGladeHouse] %s vine packed: strips=%d strands=%d branches=%d leaves=%d flowers=%d"),
 		*GetName(), Strips.Num(), Plan.Strands.Num(), CurrentVineSegmentCount, CurrentVineLeafCount, CurrentVineFlowerCount);
@@ -3537,7 +3059,8 @@ bool ACSHouseActor::IsVineSuppressedByGroundGap() const
 	float MinGap = TNumericLimits<float>::Max();
 	for (const CSHouseVine::FWallStrip& S : Strips)
 	{
-		// 空采样 = 不知道 = 按贴地处理（同 `FWallStrip::SampleGroundGap` 的口径）。
+		// 空采样 = 不知道 = 按贴地处理（同 `FWallStrip::SampleGroundGap` 的口径）。`BuildVineStrips`
+		// 如今总会填满（无地面处写 `NoGroundGap`），这条只剩防御意义。
 		if (S.GroundGaps.IsEmpty()) return false;
 		for (float G : S.GroundGaps) MinGap = FMath::Min(MinGap, G);
 	}
@@ -3696,7 +3219,7 @@ CSShaperSteps::EHandoverResult ACSHouseActor::EnsureRoofTileComponent()
 {
 	// 新组件身上没有基础网格快照，得重建。
 	if (CSShaperSteps::EnsureInstancedComponent(this, RoofTileComponent)) bRoofTileBaseMeshReady = false;
-	RoofTileComponent->InstanceMaterial = RoofMaterial;
+	RoofTileComponent->SetInstanceMaterial(RoofMaterial);
 
 	if (RoofTileGpuBuffers.Num() != 1)
 	{
@@ -3712,17 +3235,14 @@ CSShaperSteps::EHandoverResult ACSHouseActor::EnsureRoofTileComponent()
 
 	if (!bRoofTileBaseMeshReady)
 	{
-		FCSGpuMeshCPUData Data;
-		// **复用藤蔓那份读取器**：它判"法线/UV 读出来合不合法"（有流不等于有数据）、缺了就现补、
-		// 并把顶点色搬进快照。长度轴传 2 = **不换轴** —— 瓦的朝向由记录自带的整组基决定，
-		// 网格一个顶点都不用动（见 `CSHouseTile::FMeshAxes` 的注释）。
-		const bool bOk = CSHouseVine::BuildBaseMesh(RoofTileMesh, 2, Data);
+		// Preserve the asset and its Nanite resources so GPU instances participate in VSM.
+		const bool bOk = IsValid(RoofTileMesh);
 		if (bOk)
 		{
-			RoofTileComponent->SetBaseMeshFromGpuData(Data);
+			RoofTileComponent->SetBaseMesh(RoofTileMesh);
+			RoofTileComponent->SetCastShadow(true);
 
-			FBox3f Local(ForceInit);
-			for (const FVector3f& P : Data.Positions) Local += P;
+			const FBox3f Local(RoofTileMesh->GetBoundingBox());
 			const FVector3f Size = Local.IsValid ? Local.GetSize() : FVector3f(1.0f, 1.0f, 1.0f);
 
 			CSShaperSteps::FPaletteBuffers& Buffers = RoofTileGpuBuffers[0];
@@ -3799,9 +3319,59 @@ CSShaperSteps::EHandoverResult ACSHouseActor::EnsureRoofTileComponent()
 		LocalBounds, RoofTileHandover);
 }
 
+void ACSHouseActor::RebuildFlatRoof()
+{
+	if (!FlatRoofParapetComponent) return;
+	TArray<FCSRoofParapetBlock> Blocks;
+	TArray<FCSRoofParapetOpening> Openings;
+	if (IsFlatRoof())
+	{
+		for (TActorIterator<ACSStairsActor> It(GetWorld()); It; ++It)
+		{
+			TArray<FCSStairsTerraceLink> Links;
+			It->GetTerraceConnections(Links);
+			for (const FCSStairsTerraceLink& Link : Links) if (Link.House.Get() == this) Openings.Add(Link.Connection.Opening);
+		}
+		if (FrameBrickMesh) CSHouseRoof_BuildParapet(GetRoofDesc(), WallThickness, FlatRoofParapetHeight, Blocks, Openings);
+	}
+	CurrentTerraceEntranceCount = Openings.Num();
+	TArray<int32> HashInput;
+	HashInput.Append({ int32(GetTypeHash(FrameBrickMesh)), int32(GetTypeHash(FrameMaterial)), Blocks.Num() });
+	const FTransform World = GetBuildTransform();
+	const FTransform Component = FlatRoofParapetComponent->GetComponentTransform();
+	for (const FTransform& T : { World, Component })
+	{
+		for (const FVector& V : { T.GetLocation(), T.GetRotation().Euler(), T.GetScale3D() })
+		{
+			HashInput.Append({ CSHouse_Q(V.X, 0.001), CSHouse_Q(V.Y, 0.001), CSHouse_Q(V.Z, 0.001) });
+		}
+	}
+	TArray<FTransform> Transforms;
+	if (FrameBrickMesh)
+	{
+		const FBox Box = FrameBrickMesh->GetBoundingBox();
+		const FVector MeshSize = Box.GetSize().ComponentMax(FVector(0.01));
+		for (const FCSRoofParapetBlock& B : Blocks)
+		{
+			const FVector Scale = B.Size / MeshSize;
+			Transforms.Add(FTransform(B.Rotation, B.Center - B.Rotation.RotateVector(Box.GetCenter() * Scale), Scale) * World);
+			HashInput.Append({ CSHouse_Q(B.Center.X, 0.01), CSHouse_Q(B.Center.Y, 0.01), CSHouse_Q(B.Center.Z, 0.01),
+				CSHouse_Q(B.Size.X, 0.01), CSHouse_Q(B.Size.Y, 0.01), CSHouse_Q(B.Size.Z, 0.01), CSHouse_Q(B.Rotation.GetAngle(), 0.001) });
+		}
+	}
+	const uint32 Hash = CSHouse_Hash(HashInput);
+	if (Hash == FlatRoofParapetHash && FlatRoofParapetComponent->GetInstanceCount() == Transforms.Num()
+		&& FlatRoofParapetComponent->BaseMesh == FrameBrickMesh) return;
+	FlatRoofParapetHash = Hash;
+	FlatRoofParapetComponent->SetBaseMesh(FrameBrickMesh);
+	FlatRoofParapetComponent->SetInstanceMaterial(FrameMaterial);
+	if (Transforms.IsEmpty()) FlatRoofParapetComponent->ClearInstances();
+	else FlatRoofParapetComponent->SetInstances(Transforms, true);
+}
+
 void ACSHouseActor::RebuildRoofTiles()
 {
-	if (!bRoofTilesEnabled || !RoofTileMesh)
+	if (IsFlatRoof() || !bRoofTilesEnabled || !RoofTileMesh)
 	{
 		if (CurrentRoofTileCount != 0)
 		{
@@ -3869,6 +3439,7 @@ void ACSHouseActor::RebuildRoofTiles()
 
 FString ACSHouseActor::GetRoofTileUndrawableReason() const
 {
+	if (IsFlatRoof()) return TEXT("露台形态不铺瓦");
 	FlushPendingReevaluate();
 	// 逐环检查渲染那一侧 —— readback 断言对这些一个字都说不了（见头文件里那段教训）。
 	if (!bRoofTilesEnabled) return TEXT("bRoofTilesEnabled 关着");
@@ -3879,23 +3450,13 @@ FString ACSHouseActor::GetRoofTileUndrawableReason() const
 	if (!RoofTileComponent->IsRegistered()) return TEXT("渲染组件没注册");
 	if (!RoofTileComponent->IsVisible()) return TEXT("渲染组件不可见");
 	if (!RoofTileComponent->HasInstanceSourceGPU()) return TEXT("实例源没交接");
-	if (RoofTileComponent->GetBaseMeshSnapshot().Positions.Num() < 3) return TEXT("基础网格快照是空的");
-	if (!RoofTileComponent->GetGpuMesh()) return TEXT("GPU 网格没分配");
-
-	// **这一条就是石阶那个坑**：材质为空时组件仍然会画，只是退回引擎默认表面材质 ——
-	// 画面上是一片灰，而所有 readback 断言照绿。
-	const UMaterialInterface* Material = RoofTileComponent->InstanceMaterial;
-	if (!Material) return TEXT("没有绑材质（会用引擎默认表面材质画成一片灰）");
-	// ⚠️ 多一环：没勾 `bUsedWithInstancedStaticMeshes` 的材质在实例路径上会被引擎**静默替换**成
-	// 默认材质，症状与"没绑材质"逐像素相同。现成的 `MI_roof_*` 全挂在 `M_TG_Texture` 下，
-	// 而它恰恰没勾 —— 这是本模块最容易中的一枪。
-	const UMaterial* Base = Material->GetMaterial();
-	if (!Base || !Base->bUsedWithInstancedStaticMeshes)
+	if (RoofTileComponent->IsNaniteRenderPath())
 	{
-		return FString::Printf(
-			TEXT("材质 '%s' 的母材质没有勾 bUsedWithInstancedStaticMeshes（引擎会静默换成默认材质）"),
-			*Material->GetName());
+		if (!RoofTileComponent->GetNaniteComponent()) return TEXT("屋瓦 Nanite 替身未创建");
 	}
+	else if (!RoofTileComponent->GetGpuMesh()) return TEXT("GPU 网格没分配");
+	const FString MaterialReason = RoofTileComponent->GetMaterialUndrawableReason();
+	if (!MaterialReason.IsEmpty()) return MaterialReason;
 	return FString();
 }
 
@@ -3911,7 +3472,7 @@ void ACSHouseActor::RebuildRoofFinials()
 		}
 	};
 
-	if (!RoofFinialMesh)
+	if (IsFlatRoof() || !RoofFinialMesh)
 	{
 		if (CurrentRoofFinialCount != 0 || RoofFinialComponents.Num() != 0)
 		{
@@ -4620,6 +4181,7 @@ void ACSHouseActor::GetInstancedFamilies(TArray<FCSInstancedFamily>& OutFamilies
 	OutFamilies.Add({ VineFlowerComponent, TEXT("藤花"), TEXT("VineFlower"), CurrentVineFlowerCount > 0 });
 	for (int32 Index = 0; Index < DecorComponents.Num(); ++Index) OutFamilies.Add({ DecorComponents[Index], FString::Printf(TEXT("摆件[%d]"), Index), FString::Printf(TEXT("Decor%d"), Index), CurrentDecorInstanceCount > 0 });
 	OutFamilies.Add({ RoofTileComponent, TEXT("屋瓦"), TEXT("RoofTiles"), CurrentRoofTileCount > 0 });
+	OutFamilies.Add({ FlatRoofParapetComponent, TEXT("露台垛口"), TEXT("FlatRoofParapet"), IsFlatRoof() && FlatRoofParapetComponent && FlatRoofParapetComponent->GetInstanceCount() > 0 });
 	OutFamilies.Add({ PillarBrickComponent, TEXT("柱砖"), TEXT("PillarBricks"), bPillarUseBricks && PillarBrickMesh && CurrentPillarCount > 0 });
 }
 
@@ -4741,14 +4303,14 @@ void ACSHouseActor::DebugSetVineBranchInstancesHidden(bool bHideInstances)
 
 void ACSHouseActor::BindHouseMaterials()
 {
-	BindTinyGladeMaterials({ WallMaterial, RoofMaterial });
+	BindTinyGladeMaterials({ WallMaterial, FlatRoofMaterial ? FlatRoofMaterial : WallMaterial });
 	// 瓦与房体的屋顶槽共用 `RoofMaterial`：它们是同一样东西的两半（槽 1 现在没有三角，
 	// 屋面全在瓦上）。⚠️ 实例路径要求母材质勾了 `bUsedWithInstancedStaticMeshes`，
 	// 没勾会被引擎**静默换成默认材质** —— `GetRoofTileUndrawableReason` 专门查这一条。
 	// 与下面门框砖同理：代理构造时抄走了材质，换 RoofMaterial 要自己脏一次渲染状态。
 	if (IsValid(RoofTileComponent) && RoofTileComponent->InstanceMaterial != RoofMaterial)
 	{
-		RoofTileComponent->InstanceMaterial = RoofMaterial;
+		RoofTileComponent->SetInstanceMaterial(RoofMaterial);
 		RoofTileComponent->MarkRenderStateDirty();
 	}
 	if (PillarMesh) BindMeshSlotMaterials(PillarMeshComponent, PillarMesh, { CSHouse_PillarBoxMaterial(*this) });
@@ -4758,6 +4320,7 @@ void ACSHouseActor::BindHouseMaterials()
 	// 代理在构造时就把每段的材质抄走了，光写属性不重建代理是看不出变化的 —— `SetInstanceMaterial`
 	// 变了才写、变了才脏一次渲染状态；传空 = 退回各自网格资产的材质。
 	if (IsValid(FrameComponent)) FrameComponent->SetInstanceMaterial(FrameMaterial);
+	if (IsValid(FlatRoofParapetComponent)) FlatRoofParapetComponent->SetInstanceMaterial(FrameMaterial);
 	if (IsValid(PillarBrickComponent)) PillarBrickComponent->SetInstanceMaterial(PillarMaterial);
 	for (const TObjectPtr<UCSGpuInstancedMeshComponent>& Component : DecorComponents)
 	{
@@ -4825,12 +4388,15 @@ void ACSHouseActor::PostRegisterAllComponents()
 
 void ACSHouseActor::Destroyed()
 {
+	OnTerraceChanged.Broadcast(this);
 	// **编辑器 world 里只有这一条会来**（那个 world 没有 begun play，`DestroyActor` 不发
 	// `EndPlay`）。漏掉它的症状是"删掉房子，四个锥子还浮在原地" —— 而抓手的宿主弱引用
 	// 此刻已经失效，它们既不认识任何房子又能被选中拖动，纯粹的噪声。
 	// 接缝（D7 09-16）：删除时对每个旧对端发空 —— 对端下一帧清掉涉及我的记录、重砌不含这条缝的砖。
 	DetachContacts();
 	ExitResizeMode();
+	// 编辑器里删房子只走这里（没有 EndPlay）：周围的灌木跟着消失；撤销删除时重求值会再推回来。
+	if (IsValid(Ground)) Ground->RemoveBuildingFootprint(this);
 	Super::Destroyed();
 }
 
@@ -4866,6 +4432,7 @@ void ACSHouseActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChange
 	const FName Name = PropertyChangedEvent.GetPropertyName();
 	if (Name == GET_MEMBER_NAME_CHECKED(ACSHouseActor, WallMaterial)
 		|| Name == GET_MEMBER_NAME_CHECKED(ACSHouseActor, RoofMaterial)
+		|| Name == GET_MEMBER_NAME_CHECKED(ACSHouseActor, FlatRoofMaterial)
 		|| Name == GET_MEMBER_NAME_CHECKED(ACSHouseActor, PillarMaterial)
 		|| Name == GET_MEMBER_NAME_CHECKED(ACSHouseActor, FrameMaterial)
 		|| Name == GET_MEMBER_NAME_CHECKED(ACSHouseActor, DecorMaterial))

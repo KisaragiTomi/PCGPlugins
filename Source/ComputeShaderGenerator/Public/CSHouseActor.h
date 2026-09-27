@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "CoreMinimal.h"
 #include "CSGroundShaperSteps.h"
@@ -15,9 +15,11 @@
 #include "CSHouseTrim.h"
 #include "CSHouseVine.h"
 #include "CSTinyGlade.h"
+#include "CSWallBase.h"   // 房子 = 围合的墙 + 屋顶：墙的基类（2026-09-22「统一房子和墙的逻辑」）
 #include "CSHouseActor.generated.h"
 
 class ACSGroundActor;
+struct FCSStairsTerraceSite;
 struct FCSHouseContact;
 class ACSHouseFeatureMarker;
 class ACSHouseHandleActor;
@@ -39,6 +41,7 @@ enum class ECSHouseHeightHandleSide : uint8;   // CSHouseHeightHandleActor.h —
  * 失选监听。房子这一侧因此零编辑器依赖，无头测试也能完整走完整条模式。
  */
 DECLARE_MULTICAST_DELEGATE_TwoParams(FCSHouseResizeModeChanged, ACSHouseActor*, bool /*bEntered*/);
+DECLARE_MULTICAST_DELEGATE_OneParam(FCSHouseTerraceChanged, ACSHouseActor*);
 
 /**
  * `StartWindowBrush()` 广播它，编辑器模块（`PCGEditorProcess`）应答成激活窗笔刷 EdMode。
@@ -97,6 +100,7 @@ struct FCSHouseBodyDesc
 
 	/** 铺不铺底面（墙内皮围出的那块、朝下的单面，见 `CSHouse_BuildBodySoup`）。 */
 	bool bBottomFace = true;
+	bool bFlatRoof = false;
 };
 
 /**
@@ -190,20 +194,7 @@ struct COMPUTESHADERGENERATOR_API FCSHouseWindow
 	bool operator!=(const FCSHouseWindow& Other) const { return !(*this == Other); }
 };
 
-/**
- * 叶子的季节（TG 的 `MI_{summer,autumn,winter}_ivy_leaf_color` 三张齐全，见对照文档 §7）。
- *
- * ⚠️ **切季节不换材质资产**：换资产会在实例路上换一次材质绑定，而季节是会被反复来回切的量；
- * 落地做法是母材质里三张贴图按一个 `Season` 标量混、actor 缓存一个 MID 只写那个标量
- * （见 `ACSHouseActor::EnsureVineComponents`）。三张贴图恒定采样的代价换掉了 shader 重绑。
- */
-UENUM(BlueprintType)
-enum class ECSVineSeason : uint8
-{
-	Summer UMETA(DisplayName = "Summer"),
-	Autumn UMETA(DisplayName = "Autumn"),
-	Winter UMETA(DisplayName = "Winter"),
-};
+// `ECSVineSeason`（叶子的季节）2026-09-22 挪到了 `CSWallBase.h`：墙的基类要用，房子与样条墙同一个枚举。
 
 /**
  * Tiny Glade 式房屋（TinyGladeHouse_Plan.md D4/D6/D9 的"房子×地面交互"纵切片）。
@@ -247,7 +238,7 @@ enum class ECSVineSeason : uint8
  * fetch 的 SRV，理由见该分支的注释。
  */
 UCLASS(Blueprintable, BlueprintType)
-class COMPUTESHADERGENERATOR_API ACSHouseActor : public ACSTinyGlade
+class COMPUTESHADERGENERATOR_API ACSHouseActor : public ACSWallBase
 {
 	GENERATED_BODY()
 
@@ -309,9 +300,20 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House")
 	bool bBottomFace = true;
 
-	/** 双坡屋顶坡度（度）。 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House", meta = (ClampMin = "5.0", ClampMax = "70.0"))
+	/** 四坡屋顶坡度（度）；屋顶把手反算此值，低起伏自动切换为露台。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House", meta = (ClampMin = "0.0", ClampMax = "70.0"))
 	float RoofPitch = 35.0f;
+
+	/** 屋脊相对檐口低于此高度（cm）时，瓦片替换成石铺露台。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Flat Roof", meta = (ClampMin = "0.0"))
+	float FlatRoofThreshold = 20.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Flat Roof", meta = (ClampMin = "0.0", ClampMax = "200.0"))
+	float FlatRoofParapetHeight = 55.0f;
+
+	/** 露台铺地材质；未指定时沿用墙面材质。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Flat Roof")
+	TObjectPtr<UMaterialInterface> FlatRoofMaterial;
 
 	/**
 	 * 屋面整体的**竖直偏移** cm，加在檐口高（= `WallHeight`）上。
@@ -367,9 +369,9 @@ public:
 	/**
 	 * 角斜脊 / 屋脊上盖瓦的尺寸系数。≤ 0 = 不铺脊瓦。
 	 *
-	 * 交汇处两坡的瓦是**对切**的，接缝一眼看得见；盖瓦骑在缝上、法线取两坡法线的角平分把它遮住。
-	 * 使用已适配原版顶点变形的 SM_TinyGladeRoofTile；顺坡轴沿脊搭接、宽度轴跨脊。
-	 * 盖瓦中心抬一个瓦片包围盒厚度，避免坡面瓦穿出。该收口排布是参考图的 UE 适配。
+	 * 交汇处两坡的瓦是**对切**的，接缝一眼看得见；两侧盖瓦在共同脊线上相接，法线分别贴合两侧坡面。
+	 * 使用 SM_TinyGladeRoofTile 成对贴两侧坡面，未翘起的上端在脊顶搭接；翘端朝坡下。
+	 * 公共脊线抬一个瓦片包围盒厚度，避免坡面瓦穿出。该收口排布是参考图的 UE 适配。
 	 * roof_tile_lod1 / backface 是原版的简化/背面通道，不能当作随机瓦型或专用脊瓦。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile", meta = (ClampMin = "0.0", ClampMax = "3.0"))
@@ -1463,6 +1465,16 @@ public:
 	/** 声明式重求值：落座 → 门拱 → 柱，两份 desc 各自哈希守卫。幂等，可被高频调用。 */
 	virtual void ReevaluateSite() override;
 
+	//~ ACSWallBase —— 房子是一圈**围合的墙**（外皮 = footprint）+ 屋顶
+	virtual ECSWallKind GetWallKind() const override { return ECSWallKind::Enclosure; }
+	/** footprint 围成的环（局部空间，墙脚 0、墙顶 `WallHeight`），`OutWorld = GetBuildTransform()`。 */
+	virtual bool GetWallPath(FCSWallPath& OutPath, FCSWallSkins& OutSkins, FTransform& OutWorld) const override;
+	/**
+	 * 藤的参数：从本类那 38 个 `Vine*` 平铺属性**现组**（2026-09-22 统一时刻意不迁数据 —— 蓝图 / 关卡里的覆盖值、
+	 * 脚本里的 `vine_*` 属性名都不动）。字段一一对应，见 `FCSWallVineSettings`。
+	 */
+	virtual FCSWallVineSettings GetVineSettings() const override;
+
 	/**
 	 * **合批唤醒：只标脏，由本栋房子自己的 `Tick` 兑现。** 一帧里会被同一栋房子收到很多次的
 	 * 那些通知（标记登记 / 注销、地面广播）走这条，不要直接调 `ReevaluateSite()`。
@@ -1579,6 +1591,26 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "CS House")
 	float PushHeight(float Offset, bool bFinished = false);
 
+	/** 只改屋脊相对檐口的起伏，不改变墙高或房底。返回实际变化 cm。 */
+	UFUNCTION(BlueprintCallable, Category = "CS House|Roof")
+	float PushRoofHeight(float Offset, bool bFinished = false);
+
+	UFUNCTION(BlueprintPure, Category = "CS House|Roof")
+	float GetRoofRise() const;
+
+	UFUNCTION(BlueprintPure, Category = "CS House|Roof")
+	bool IsFlatRoof() const;
+
+	/** 楼梯只读露台诉求输入。避免查询时兑现房屋更新而重入彼此的重建。 */
+	FCSStairsTerraceSite GetStairsTerraceSite() const;
+	static FCSHouseTerraceChanged OnTerraceChanged;
+
+	UFUNCTION(BlueprintPure, Category = "CS House|Flat Roof")
+	int32 GetTerraceEntranceCount() const { FlushPendingReevaluate(); return CurrentTerraceEntranceCount; }
+
+	UFUNCTION(BlueprintPure, Category = "CS House|Resize")
+	ACSHouseHeightHandleActor* GetRoofHandle() const;
+
 	/**
 	 * 改房底（与 `PushHeight` 对称的第三个自由度，用户裁决 2026-09-14「底动顶不动」）：
 	 * `HeightOffset += Offset`、`WallHeight -= Offset`，**同一次调用里两个量一起改完**再重求值。
@@ -1611,17 +1643,17 @@ public:
 	static FCSHouseResizeModeChanged OnResizeModeChanged;
 
 	/**
-	 * 生成 N + 2 个抓手 actor：footprint 的每条边一个**锥子**（水平推拉那面墙；N = `GetFootprint()`
-	 * 的边数，也就是**取完凸包之后**的边数），外加两个套在房子外面的**矩形框**
-	 * （`ACSHouseHeightHandleActor`，画的是包围盒）：檐口那个上下拖改墙高、房底那个上下拖改房底
-	 * （`PushBase`，底动顶不动）。选中任一个用编辑器原生 gizmo 拖即可。
+	 * 生成 N + 3 个抓手 actor：footprint 的每条边一个**推墙箭头**（水平推拉那面墙；N = `GetFootprint()`
+	 * 的边数，也就是**取完凸包之后**的边数；观感是 TG 原版 `flat_arrow` + 描边，2026-09-22），外加墙顶、房底、
+	 * 屋顶三个高度**矩形框**（`ACSHouseHeightHandleActor`，画的是包围盒）：檐口那个上下拖改墙高、房底那个上下拖改房底
+	 * （`PushBase`，底动顶不动），屋顶小框改起伏（`PushRoofHeight`）。选中任一个用编辑器原生 gizmo 拖即可。
 	 *
 	 * 这就是"点一个蓝图函数，冒出几个能拖的把手"的那个函数：`CallInEditor` 让它直接出现在
 	 * 房子详情面板上，`BlueprintCallable` 让蓝图 / Python 也能调。**幂等** —— 已经在模式里
 	 * 再调一次只把锥子数对齐边数、把抓手摆回规范位置，不会生出第二组。
 	 *
 	 * 在模式里改了边数（改 `FootprintShape`、撤销等）时，锥子在下一次重求值里按新边数对齐
-	 * （`SyncEdgeHandlesToFootprint`），两个框不动。
+	 * （`SyncEdgeHandlesToFootprint`），三个高度框不重建。
 	 *
 	 * 抓手是 `RF_Transient` 的，不存盘、不进 outliner 的保存路径；房子被删或调
 	 * `ExitResizeMode()` 即销毁。
@@ -2182,7 +2214,7 @@ private:
 	 *
 	 * **复用而不是整组重建**：按边号排好，前 min(旧, 新) 个锥子改认 0..k-1 号边，只销毁多出来的、
 	 * 只补生缺的 —— 被选中的锥子因此多半留得住，编辑器侧的失选监听（选中集里没有归属者就退模式）
-	 * 不会因为改了一下形状就把模式退掉。两个框不动。
+	 * 不会因为改了一下形状就把模式退掉。三个高度框不重建。
 	 */
 	void SyncEdgeHandlesToFootprint();
 
@@ -2204,10 +2236,19 @@ private:
 	/** 材质三槽重绑（房体墙/顶 + 柱），不碰几何 —— 计划 D14「纯外观量绝不进 desc 哈希」。 */
 	void BindHouseMaterials();
 
-	/** Ground 为空时自动解析；顺带完成 OnGroundChanged 的订阅/换订阅。 */
+	/** Ground 为空时自动解析；顺带完成 OnGroundChanged 的订阅/换订阅。
+	 *  解析不到地面时改挂 `ACSGroundActor::OnAnyGroundRebuilt`，等地面出现再来一次。 */
 	void ResolveGroundAndSubscribe();
-	void UnsubscribeGround();
+	void UnsubscribeGround();   // 连同类级那条一起撤
+	void UnsubscribeAnyGroundRebuilt();
 	void HandleGroundChanged(ACSGroundActor* ChangedGround, const FBox& ChangedBounds);
+	void HandleAnyGroundRebuilt(ACSGroundActor* RebuiltGround, const FBox& ChangedBounds);
+
+	/**
+	 * 把外皮凸多边形（世界 XY）推给地面 —— 建筑周边灌木的唯一输入。地面没变就当场返回，
+	 * 所以每次重求值都推也不花钱。房子不知道灌木的存在，只是登记数据（同塑形物登记高度场）。
+	 */
+	void PublishFootprintToGround();
 
 	/** 落座目标：max(footprint 全域地面高度) + HeightOffset。无地面时返回当前 Z（不动）。 */
 	double ComputeSeatZ() const;
@@ -2399,6 +2440,7 @@ private:
 
 	/** 排布 + 录一趟打包 pass（幂等哈希短路无效唤醒）。 */
 	void RebuildRoofTiles();
+	void RebuildFlatRoof();
 
 	/** 尖顶：脊端点各立一根。走**普通** `UStaticMeshComponent`（一两根而已，不值得再复制一套
 	 *  palette / 容量 / 交接机器）。 */
@@ -2432,20 +2474,8 @@ private:
 	void SubmitBodyMesh(TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> Snapshot);
 	void SubmitPillarMesh(TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> Snapshot);
 
-	/** 折线 → 管子，递交给 `CSVineTube::BuildTubeIntoMesh`。在途被拒时入 `PendingVineTubePath`。 */
-	/**
-	 * 逐藤解出这一轮的 `SpawnTime`，并把历史刷新成本轮形状。
-	 *
-	 * 三种情形：**没见过**这根 → 记当前时刻（从零长）；**形状没变** → 沿用旧相位；
-	 * **形状变了** → 若生长前沿**已经越过**变化点，把前沿拉回变化点、从那里继续长
-	 * （等价于把 SpawnTime 往后挪），否则不动（前沿还没长到那儿，变化对它不可见）。
-	 */
-	void ResolveVineSpawnTimes(const CSHouseVine::FPlan& Plan, TArray<float>& OutSpawnTimes);
-
-	void SubmitVineTube(TSharedPtr<CSHouseVine::FTubePath, ESPMode::ThreadSafe> Path);
-
-	/** 管子构建完成：有挂起的折线就补发一次。 */
-	void OnVineTubeEditComplete();
+	// 藤的生长相位（`CSHouseVine::ResolveSpawnTimes`）、管子递交（`SubmitVineTube` / `OnVineTubeEditComplete`）与打包
+	// （`PackVine`）2026-09-22 起在墙的基类 `ACSWallBase` 里，房子与样条墙共用一份。
 
 	/** 异步编辑的游戏线程尾巴（分段表已由基类发布）：有 pending 就补发，否则补上被推迟的摆位增量。 */
 	void OnBodyEditComplete();
@@ -2479,17 +2509,8 @@ private:
 	/** 砖石柱：备容量 / 交接实例源（与 `EnsureFrameComponent` 同型，阻塞的活都在这里一次付清）。 */
 	void EnsurePillarBrickComponent();
 
-	/**
-	 * 藤蔓管子（枝）的网格宿主。**与 `PillarMeshComponent` 同型**：几何在世界空间产出，
-	 * 组件钉在恒等世界变换上（`UCSMeshRenderComponent` 的构造函数已把变换标成绝对）。
-	 * 叶与花**不走这里** —— 它们仍是实例，挂在那三个 `UCSGpuInstancedMeshComponent` 上。
-	 */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS House", meta = (AllowPrivateAccess = "true"))
-	TObjectPtr<UCSMeshRenderComponent> VineTubeComponent;
-
-	/** 藤蔓管子的网格对象。Transient：派生物，加载后由 ReevaluateSite 重建。 */
-	UPROPERTY(Transient)
-	TObjectPtr<UCSMesh> VineTubeMesh;
+	// 藤蔓管子（枝）的网格宿主 `VineTubeComponent` / `VineTubeMesh` 在基类 `ACSWallBase` 上（默认子对象仍由本类构造函数建，
+	// 名字仍是 `VineTubeMesh`，存档不受影响）。**与 `PillarMeshComponent` 同型**：几何在世界空间产出，组件钉在恒等世界变换上。
 
 	/**
 	 * 当前生效的洞（房体形状 desc 的一部分）。门由道路推导、窗由特征标记注册，两者同表 ——
@@ -2604,66 +2625,24 @@ private:
 	int32 CurrentBrickWallBrickCount = 0;
 	int32 CurrentBrickWallCourseCount = 0;
 
-	/** 藤蔓的两个 GPU 实例宿主：0 = 枝、1 = 叶。分两个组件是因为它们是两张网格、两份材质。 */
-	UPROPERTY(Transient)
-	TObjectPtr<UCSGpuInstancedMeshComponent> VineBranchComponent;
-
-	UPROPERTY(Transient)
-	TObjectPtr<UCSGpuInstancedMeshComponent> VineLeafComponent;
-
-	UPROPERTY(Transient)
-	TObjectPtr<UCSGpuInstancedMeshComponent> VineFlowerComponent;
-
-	/** 三季叶用的 MID（父 = `VineLeafMaterial`）。缓存在 actor 上而不是每次重建 ——
-	 *  蓝图重跑构造脚本会销毁组件，MID 活在 actor 上才不会跟着一起没。 */
-	UPROPERTY(Transient)
-	TObjectPtr<class UMaterialInstanceDynamic> VineLeafSeasonMID;
-
-	/**
-	 * 枝（管子）与花的生长参数 MID。存在的唯一理由是 `VineGrowSpeed` 必须**只有一个真源** ——
-	 * CPU 拿它判断"前沿有没有越过变化点"（`ResolveVineSpawnTimes`），材质拿它推前沿。
-	 * 两边取不同值的症状是：改门之后藤跳一段或倒退一段，而两边各自都自洽。
-	 * 叶子那张复用 `VineLeafSeasonMID`（它本来就为季节存在），不必多建一个。
-	 */
-	UPROPERTY(Transient)
-	TObjectPtr<class UMaterialInstanceDynamic> VineBranchGrowMID;
-
-	UPROPERTY(Transient)
-	TObjectPtr<class UMaterialInstanceDynamic> VineFlowerGrowMID;
-
-	/** 实例行与计数的 pooled buffer（[0] = 枝、[1] = 叶）。容量按**配置上限**一次预留，
-	 *  规划结果再多也只截断不扩容 —— 交互期一次设备同步都不许有。 */
-	TArray<CSShaperSteps::FPaletteBuffers> VineGpuBuffers;
-
-	/** 上次交给组件的容量/包围盒：只有它们真变了才需要再走一次阻塞的 SetInstanceSourceGPU。 */
-	CSShaperSteps::FHandoverCache VineHandover;
-
+	// 藤的三个 GPU 实例宿主、三张 MID、调色板缓冲与交接缓存、基础网格快照的就绪位与"从哪张资产建的"
+	// 2026-09-22 起都在墙的基类 `ACSWallBase` 上（房子与样条墙共用一份胶水，见 `ACSWallBase::EnsureVineRig`）。
 	uint32 VineDescHash = 0;
 	int32 CurrentVineSegmentCount = 0;
 	int32 CurrentVineLeafCount = 0;
 	int32 CurrentVineFlowerCount = 0;
-	/** 基础网格快照建成过没有。⚠️ 它是"材质有没有可用 UV/法线"那条判据的另一半：
-	 *  快照没建成时组件画的是**上一次**的网格，而不是什么都不画。 */
-	bool bVineBaseMeshReady = false;
-
-	/** 快照是从哪两张网格建的。⚠️ **不能只靠 `bVineBaseMeshReady` 一个 bool**：
-	 *  在细节面板里换掉 `VineBranchMesh` 时组件不一定被重建，那时候 bool 仍是 true，
-	 *  画面上还是旧网格 —— 症状是"换了资产但什么都没发生"，与坑表里
-	 *  "CDO 默认值不传播到已存在实例"同一族的静默失效。 */
-	UPROPERTY(Transient)
-	TObjectPtr<UStaticMesh> VineBranchMeshBuiltFrom;
-
-	UPROPERTY(Transient)
-	TObjectPtr<UStaticMesh> VineLeafMeshBuiltFrom;
-
-	UPROPERTY(Transient)
-	TObjectPtr<UStaticMesh> VineFlowerMeshBuiltFrom;
 
 	// ---- 屋面瓦 ----
 
 	/** 屋面瓦的 GPU 实例宿主（一张网格 ⇒ 一个组件）。 */
 	UPROPERTY(Transient)
 	TObjectPtr<UCSGpuInstancedMeshComponent> RoofTileComponent;
+
+	UPROPERTY(VisibleAnywhere, Category = "CS House|Flat Roof")
+	TObjectPtr<UCSGpuInstancedMeshComponent> FlatRoofParapetComponent;
+	uint32 FlatRoofParapetHash = 0;
+	uint32 TerraceSiteHash = 0;
+	int32 CurrentTerraceEntranceCount = 0;
 
 	/** 实例行与计数的 pooled buffer。**恒 1 条**，用数组只是为了直接吃 `CSShaperSteps` 那几个
 	 *  批量接口（ReserveCapacity / ZeroCounters / ReleaseOnRenderThread）。 */
@@ -2740,39 +2719,8 @@ private:
 	/** 下一次重求值强制全量重建：手动强刷，以及拖动松手时清掉增量变换攒下的浮点误差。 */
 	bool bForceFullRebuild = false;
 
-	/** 藤蔓管子在途时挂起的最新折线。与 `BodySlot.Pending` 同一条纪律：被拒即入槽，完成回调里补发。 */
-	TSharedPtr<CSHouseVine::FTubePath, ESPMode::ThreadSafe> PendingVineTubePath;
-
-	/**
-	 * 每根藤**首次出现**时的 `GameTime`，键 = `FStrand::RootKey`（身份哈希，不含位置也不含长宽）。
-	 *
-	 * 它是 **memo 而不是模拟状态**：只决定生长动画的相位，不进 `VineDescHash`、不影响任何几何。
-	 * 所以"声明式重求值 + 哈希守卫"那条架构不受影响 —— 同一份世界状态重求值多少次，
-	 * 几何逐位相同，只是藤不会重新长一遍。
-	 *
-	 * ⚠️ 键里**没有位置** ⇒ 拖房子 / 拉尺寸期间键不变 ⇒ **不重播生长**。跨过一个藤位间距
-	 * 新增的那一根从 0 长、其余不动，正是想要的。
-	 */
-	/**
-	 * 一根藤的生长历史：相位 + 上一轮的折线形状。
-	 *
-	 * 存形状是为了回答"这一轮它从哪儿开始变了" —— 门一开，藤要绕开新洞，整条重解，
-	 * 而**变化点之前那一截和上一轮逐点相同**。没有形状就只能二选一：整根重新长（一开门
-	 * 满墙的藤全缩回去重来），或者整根沿用旧相位（变化的那段直接以长成状态弹出来）。
-	 * 两个都不对，所以必须记形状。
-	 *
-	 * ⚠️ 存的是**墙面参数坐标**而不是世界坐标：拖房子时世界坐标整体在动，逐点比较会
-	 * 判成"处处都变了"，于是每拖一帧整根藤重新长一遍。
-	 */
-	struct FVineStrandHistory
-	{
-		float SpawnTime = 0.0f;
-		TArray<FVector2f> PointsSZ;
-		TArray<int32> Edges;
-	};
-
-	/** 逐藤的生长历史，键 = `FStrand::RootKey`。transient：相位不该跨关卡保留。 */
-	TMap<uint32, FVineStrandHistory> VineStrandHistory;
+	// 管子在途时挂起的最新折线（`PendingVineTubePath`）与逐藤的生长历史（`VineStrandHistory`，存墙面参数坐标、
+	// 键 = 身份哈希不含位置 ⇒ 拖房子不重播生长）在基类 `ACSWallBase` 上。
 
 	/**
 	 * 稳定身份，随关卡序列化；首次注册时生成。
@@ -2803,6 +2751,7 @@ private:
 	int32 WallSConvention = 0;
 
 	FDelegateHandle GroundChangedHandle;
+	FDelegateHandle AnyGroundRebuiltHandle;   // 仅在"还没找到地面"期间有效
 	bool bInReevaluate = false; // SetActorZ 落座引发的重入保护
 
 	/** `GetReevaluateCount` 读。 */

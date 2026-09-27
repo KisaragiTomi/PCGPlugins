@@ -108,40 +108,12 @@ inline bool IsQuoinCorner(const FCSHouseCornerFrame& Corner)
  *
  * ⚠️ **退化 footprint 直接不出**：任一边的外皮放不下两头的斜接让出量时，相邻两角互相吃掉，
  * 柱心会跑到房子外面去（矩形上就是「任一边短于两个墙厚」）。
+ *
+ * 2026-09-22「统一房子和墙的逻辑」起，实现是围合墙（`ECSWallKind::Enclosure`）的 `CSWall::BuildQuoins`
+ * （定义在 `CSWall.cpp`）：房子的角石与样条墙的角石是同一份代码，规矩（出哪些角、角号、退化判据）逐位不变。
  */
-inline int32 BuildQuoins(const FTransform& World, const FCSHouseFootprint& Footprint, float WallThickness,
-	float BaseZ, float WallHeight, float Inset, TArray<FQuoin>& Out)
-{
-	if (!Footprint.IsValidFootprint() || WallHeight <= 0.0f) return 0;
-	const float T = FMath::Max(WallThickness, 0.0f);
-	const int32 N = Footprint.NumEdges();
-	for (int32 Edge = 0; Edge < N; ++Edge)
-	{
-		const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Footprint, T);
-		if (F.Len <= 0.0f || F.Len < FMath::Max(F.InsetStart, 0.0f) + FMath::Max(F.InsetEnd, 0.0f)) return 0;
-	}
-
-	const int32 Before = Out.Num();
-	for (int32 Corner = 0; Corner < N; ++Corner)
-	{
-		const FCSHouseCornerFrame C = CSHouse_GetCorner(Corner, Footprint);
-		if (!IsQuoinCorner(C)) continue;
-		const FVector2D LocalCorner = C.Point - C.Outward * double(Inset);
-
-		const FVector WorldPoint = World.TransformPosition(FVector(LocalCorner.X, LocalCorner.Y, 0.0));
-		const FVector WorldOut = World.TransformVectorNoScale(FVector(C.Outward.X, C.Outward.Y, 0.0));
-
-		FQuoin Q;
-		Q.Point = FVector2D(WorldPoint.X, WorldPoint.Y);
-		Q.Outward = FVector2D(WorldOut.X, WorldOut.Y).GetSafeNormal();
-		Q.BottomZ = BaseZ;
-		Q.TopZ = BaseZ + WallHeight;
-		Q.CornerIndex = Corner;
-		Q.HalfTurnCos = float(C.HalfTurnCos);
-		Out.Add(Q);
-	}
-	return Out.Num() - Before;
-}
+COMPUTESHADERGENERATOR_API int32 BuildQuoins(const FTransform& World, const FCSHouseFootprint& Footprint, float WallThickness,
+	float BaseZ, float WallHeight, float Inset, TArray<FQuoin>& Out);
 
 /** 矩形口径的便捷重载，走同一个核（单测的老夹具都是 `FVector2D` 尺寸）。 */
 inline int32 BuildQuoins(const FTransform& World, const FVector2D& Footprint, float WallThickness,

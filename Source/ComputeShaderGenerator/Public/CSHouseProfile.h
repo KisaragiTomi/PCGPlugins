@@ -153,6 +153,7 @@ struct COMPUTESHADERGENERATOR_API FCSWallOpening
 		const float Want = (ArchRise > UE_KINDA_SMALL_NUMBER) ? ArchRise : HalfWidth();
 		return FMath::Clamp(Want, UE_KINDA_SMALL_NUMBER, Full);
 	}
+	float SpringZ() const { return Z1 - Rise(); }
 	float S0() const { return CenterS - Width * 0.5f; }
 	float S1() const { return CenterS + Width * 0.5f; }
 	bool IsValid() const { return Width > UE_KINDA_SMALL_NUMBER && Z1 > Z0 + UE_KINDA_SMALL_NUMBER; }
@@ -239,7 +240,7 @@ inline void CSHouse_SampleOpeningProfile(const FCSWallOpening& Opening, float Ch
 		// 矩形下身（Z0 → 拱脚）+ **椭圆**顶：半轴 = (半宽, Rise)。`ArchRise` 为 0 时 Rise = 半宽，
 		// 退化成原来的正半圆，逐位不变。拱脚高 = 洞顶 − Rise。
 		const float Rise = Opening.Rise();
-		const float SpringZ = FMath::Max(Opening.Z1 - Rise, Opening.Z0);
+		const float SpringZ = Opening.SpringZ();
 		// 段数按**较长**那根半轴取：扁拱的 S 向仍然很长，按 Rise 取会在两肩上欠采样。
 		const int32 N = CSHouse_ProfileSegments(FMath::Max(R, Rise), ChordTolerance);
 		// 外接补偿逐轴各做一次（弦高补偿是等比缩放，两轴不同尺度时不能共用一个系数）。
@@ -333,7 +334,7 @@ inline FCSOpeningClipField CSHouse_ComputeClipField(const FCSWallOpening& Openin
 		// 竖直尺度是 **Rise 而不是半宽**（2026-09-04）：两者相等时就是原来的正半圆。
 		// 这一行是"拱高与洞宽解耦"的全部实现 —— 判据与材质 HLSL 都只看归一化后的 q，不必改。
 		const float Rise = Opening.Rise();
-		Field.RefZ = Opening.Z1 - Rise;  // 拱脚
+		Field.RefZ = Opening.SpringZ();  // 拱脚
 		Field.InvScaleZ = 1.0f / Rise;
 		break;
 	}
@@ -544,7 +545,7 @@ inline bool CSHouse_PierSpanBetween(const FCSWallOpening& Left, const FCSWallOpe
 	if (Span < 0.0f) return false;   // 洞重叠（谓词本该挡住）：不是跨度，别当墩
 
 	OutSpan = Span;
-	OutTopZ = FMath::Max(FMath::Min(Left.Z1 - Left.HalfWidth(), Right.Z1 - Right.HalfWidth()), 0.0f);
+	OutTopZ = FMath::Max(FMath::Min(Left.SpringZ(), Right.SpringZ()), 0.0f);
 	return true;
 }
 

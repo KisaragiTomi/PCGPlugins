@@ -33,6 +33,7 @@ def build():
     if MEL.get_num_material_expressions(mat):
         raise RuntimeError('Could not clear old brick material expressions')
     mat.set_editor_property('used_with_instanced_static_meshes', True)
+    mat.set_editor_property('used_with_nanite', True)
     mat.set_editor_property('blend_mode', unreal.BlendMode.BLEND_MASKED)
     mat.set_editor_property('shading_model', unreal.MaterialShadingModel.MSM_DEFAULT_LIT)
     mat.set_editor_property('opacity_mask_clip_value', 0.5)

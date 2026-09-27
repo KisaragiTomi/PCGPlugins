@@ -325,7 +325,12 @@ void BuildPlan(const TArray<FWallStrip>& Strips, const TArray<FCSWallOpening>& O
 						// ⚠️ **收尾是有意的，而且与 TG 同构**：TG 的 `ivy_grower` 在
 						// `next.along < 0 || > wall.length` 时直接 return，而它的方向是位置的函数
 						// ⇒ 下一帧提出来的还是同一个方向，等于永久停在墙端。原来那句镜像才是外加的。
-						if (CandS < Margin || CandS > Wall->Length - Margin)
+						// 闭合的折线墙（样条墙一面整圈）没有墙端：S 越过两端就绕回来，接着长。
+						if (Wall->bLoop && Wall->HasPath())
+						{
+							CandS = Wall->WrapS(CandS);
+						}
+						else if (CandS < Margin || CandS > Wall->Length - Margin)
 						{
 							if (!bJumpDraw) continue;
 							const bool bForward = CandS > Wall->Length - Margin;
@@ -368,13 +373,19 @@ void BuildPlan(const TArray<FWallStrip>& Strips, const TArray<FCSWallOpening>& O
 				// 所以是"先在预算内扫，扫不出来才停"。
 				if (!NextWall) break;
 
-				const FVector A = Wall->Origin + Wall->U * S + Wall->Up * Z + Wall->N * Params.StandOff;
-				const FVector B = NextWall->Origin + NextWall->U * NextS + NextWall->Up * NextZ + NextWall->N * Params.StandOff;
+				// 折线墙（样条墙）走 `PathToWorld`；平面墙保留原式，房子的藤逐位不变。
+				const FVector A = Wall->HasPath() ? Wall->PathToWorld(S, Z, Params.StandOff)
+					: Wall->Origin + Wall->U * S + Wall->Up * Z + Wall->N * Params.StandOff;
+				const FVector B = NextWall->HasPath() ? NextWall->PathToWorld(NextS, NextZ, Params.StandOff)
+					: NextWall->Origin + NextWall->U * NextS + NextWall->Up * NextZ + NextWall->N * Params.StandOff;
 				const FVector Delta = B - A;
 				const float Len = float(Delta.Size());
 				// 跨墙那一段横跨两个墙平面，截面基取**两面墙法线的平均**：取任一面都会让那一段
 				// 的截面斜插进另一面墙里，而转角恰恰是最显眼的位置。同墙时它逐位等于 Wall->N。
-				const FVector SegNormal = (Wall->N + NextWall->N).GetSafeNormal(UE_SMALL_NUMBER, Wall->N);
+				// 折线墙的法线随 S 变，取两个端点处的那两根。
+				const FVector NormalA = Wall->HasPath() ? Wall->PathNormal(S) : Wall->N;
+				const FVector NormalB = NextWall->HasPath() ? NextWall->PathNormal(NextS) : NextWall->N;
+				const FVector SegNormal = (NormalA + NormalB).GetSafeNormal(UE_SMALL_NUMBER, NormalA);
 				if (Len > UE_KINDA_SMALL_NUMBER)
 				{
 					FRecord Rec;
@@ -497,6 +508,7 @@ void PackTubePath(const TArray<FWallStrip>& Strips, const FPlan& Plan, const FPa
 	{
 		const FWallStrip* W = FindStrip(P.EdgeIndex);
 		if (!W) return FVector::ZeroVector;
+		if (W->HasPath()) return W->PathToWorld(P.WallSZ.X, P.WallSZ.Y, Params.StandOff);
 		return W->Origin + W->U * double(P.WallSZ.X) + W->Up * double(P.WallSZ.Y) + W->N * Params.StandOff;
 	};
 
@@ -865,5 +877,81 @@ bool Pack(const FPlan& Plan, const TArray<CSShaperSteps::FPaletteBuffers>& Palet
 		});
 
 	return true;
+}
+void ResolveSpawnTimes(TMap<uint32, FStrandHistory>& History, const FPlan& Plan,
+	float Now, float GrowSpeed, bool bGrowOnLoad, TArray<float>& OutSpawnTimes)
+{
+	OutSpawnTimes.Reset(Plan.Strands.Num());
+
+	const float Speed = FMath::Max(GrowSpeed, 1.0f);
+	// 从没长过的哨兵：足够早，材质算出来的前沿远超任何弧长 ⇒ 第一帧就是长成的。
+	const float GrownSentinel = -1.0e6f;
+
+	TMap<uint32, FStrandHistory> NextHistory;
+	NextHistory.Reserve(Plan.Strands.Num());
+
+	for (const FStrand& Strand : Plan.Strands)
+	{
+		const FStrandHistory* Prev = History.Find(Strand.RootKey);
+		float Spawn;
+
+		if (!Prev)
+		{
+			// 全新的一根（第一次生成、或跨过藤位间距新增的那根）。
+			Spawn = bGrowOnLoad ? Now : GrownSentinel;
+		}
+		else
+		{
+			// 第一个不同的点。⚠️ 逐点比较用**墙面参数坐标 + 所在墙**，容差取 0.5 cm ——
+			// 比它更严会把浮点噪声判成"变了"，于是每次重求值都重新长一遍。
+			int32 Diverge = 0;
+			const int32 Common = FMath::Min(Prev->PointsSZ.Num(), Strand.Points.Num());
+			while (Diverge < Common)
+			{
+				const FStrandPoint& P = Strand.Points[Diverge];
+				const bool bSame = Prev->Edges.IsValidIndex(Diverge)
+					&& Prev->Edges[Diverge] == P.EdgeIndex
+					&& (Prev->PointsSZ[Diverge] - P.WallSZ).IsNearlyZero(0.5f);
+				if (!bSame) break;
+				++Diverge;
+			}
+
+			const bool bIdentical = (Diverge == Common)
+				&& Prev->PointsSZ.Num() == Strand.Points.Num();
+			if (bIdentical)
+			{
+				Spawn = Prev->SpawnTime;
+			}
+			else
+			{
+				// 变化点的弧长。`Diverge` 是"第一个不同的点"，它之前那一截与上一轮逐点相同，
+				// 所以那一截已经长出来的部分应当留着。
+				const int32 ArcIndex = FMath::Clamp(Diverge, 0, Strand.Arc.Num() - 1);
+				const float DivergeArc = Strand.Arc.IsValidIndex(ArcIndex) ? Strand.Arc[ArcIndex] : 0.0f;
+				const float Front = (Now - Prev->SpawnTime) * Speed;
+
+				// 前沿还没长到变化点 ⇒ 那段变化对它不可见，相位不用动。
+				// 越过了 ⇒ 把前沿拉回变化点（等价于 SpawnTime 往后挪），从那里接着长。
+				Spawn = (Front > DivergeArc) ? (Now - DivergeArc / Speed) : Prev->SpawnTime;
+			}
+		}
+
+		OutSpawnTimes.Add(Spawn);
+
+		FStrandHistory Entry;
+		Entry.SpawnTime = Spawn;
+		Entry.PointsSZ.Reserve(Strand.Points.Num());
+		Entry.Edges.Reserve(Strand.Points.Num());
+		for (const FStrandPoint& P : Strand.Points)
+		{
+			Entry.PointsSZ.Add(P.WallSZ);
+			Entry.Edges.Add(P.EdgeIndex);
+		}
+		NextHistory.Add(Strand.RootKey, MoveTemp(Entry));
+	}
+
+	// ⚠️ **整表替换而不是往里塞**：房子反复改尺寸会让键不断变化，只加不删的话这张表
+	// 会随编辑次数无界增长，而且泄漏得毫无症状（每根藤还带着一份折线副本）。
+	History = MoveTemp(NextHistory);
 }
 }

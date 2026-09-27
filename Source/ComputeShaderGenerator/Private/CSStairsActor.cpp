@@ -2,6 +2,8 @@
 
 #include "CSGpuInstancedMeshComponent.h"
 #include "CSGroundActor.h"
+#include "CSHouseActor.h"
+#include "CSHouseLibrary.h"
 #include "Components/SplineComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
@@ -11,10 +13,46 @@
 
 DEFINE_LOG_CATEGORY_STATIC(LogTinyGladeStairs, Log, All);
 
+namespace
+{
+void CSStairsActor_UploadPieces(UCSGpuInstancedMeshComponent* Component, UStaticMesh* Mesh, UMaterialInterface* Material,
+	const TArray<CSStairs::FBrick>& Pieces, uint32& LastHash)
+{
+	if (!Component) return;
+	TArray<FTransform> Transforms;
+	TArray<int32> HashInput;
+	HashInput.Append({ int32(GetTypeHash(Mesh)), int32(GetTypeHash(Material)) });
+	auto Q = [](double V) { return int32(FMath::RoundToDouble(V * 1000.0)); };
+	const FTransform WorldToLocal = Component->GetComponentTransform().Inverse();
+	if (Mesh)
+	{
+		const FBox Box = Mesh->GetBoundingBox();
+		const FVector Size = Box.GetSize().ComponentMax(FVector(0.01));
+		for (const CSStairs::FBrick& B : Pieces)
+		{
+			const FVector Scale = B.Size / Size;
+			const FVector Location = B.Center - B.Rotation.RotateVector(Box.GetCenter() * Scale);
+			const FTransform T = FTransform(B.Rotation, Location, Scale) * WorldToLocal;
+			Transforms.Add(T);
+			for (const FVector& V : { T.GetLocation(), T.GetRotation().Euler(), T.GetScale3D() }) HashInput.Append({ Q(V.X), Q(V.Y), Q(V.Z) });
+		}
+	}
+	const uint32 Hash = FCrc::MemCrc32(HashInput.GetData(), HashInput.Num() * sizeof(int32));
+	if (LastHash == Hash && Component->BaseMesh == Mesh && Component->GetInstanceCount() == Transforms.Num()) return;
+	LastHash = Hash;
+	Component->SetBaseMesh(Mesh);
+	Component->SetInstanceMaterial(Material);
+	if (Transforms.IsEmpty()) Component->ClearInstances();
+	else Component->SetInstances(Transforms, false);
+}
+}
+
 const TCHAR* ACSStairsActor::DefaultBrickMeshPath = TEXT("/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/brick");
 
 ACSStairsActor::ACSStairsActor()
 {
+	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.bStartWithTickEnabled = false;
 	// 楼梯路径（用户 2026-09-16："默认 actor 中添加 spline component"）。默认一条上行的三点样条：
 	// 水平约 520 cm、升 250 cm，坡度 ≈ 0.48 —— 落在踏步档（0.25 < s ≤ 2.5）里，放进关卡不调参就出楼梯。
 	Spline = CreateDefaultSubobject<USplineComponent>(TEXT("Spline"));
@@ -29,6 +67,12 @@ ACSStairsActor::ACSStairsActor()
 	// （基类 `FCSInstancedFamily` 那段注释说的正是 NewObject 自动命名会让资产名漂移）。
 	BrickComponent = CreateDefaultSubobject<UCSGpuInstancedMeshComponent>(TEXT("StairBricks"));
 	BrickComponent->SetupAttachment(RootComponent);
+	RailingComponent = CreateDefaultSubobject<UCSGpuInstancedMeshComponent>(TEXT("StairRailing"));
+	RailingComponent->SetupAttachment(RootComponent);
+	LadderComponent = CreateDefaultSubobject<UCSGpuInstancedMeshComponent>(TEXT("StairLadders"));
+	LadderComponent->SetupAttachment(RootComponent);
+	static ConstructorHelpers::FObjectFinderOptional<UStaticMesh> WoodAsset(TEXT("/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/wooden_plank"));
+	WoodMesh = WoodAsset.Get();
 
 	// `FObjectFinderOptional`：找不到只是没有默认砖，不会把 CDO 构造带崩（同 `ACSWindowMarker`）。
 	static ConstructorHelpers::FObjectFinderOptional<UStaticMesh> BrickAsset(DefaultBrickMeshPath);
@@ -44,6 +88,9 @@ CSStairs::FParams ACSStairsActor::MakeParams() const
 	Params.BuryTolerance = BuryTolerance;
 	Params.TreadClearance = TreadClearance;
 	Params.bSolidToGround = bSolidToGround;
+	Params.bArchedSupport = bArchedSupport;
+	Params.Railing = Railing;
+	Params.bNarrowByRailing = Railing != ECSStairsRailing::None;
 	return Params;
 }
 
@@ -53,6 +100,39 @@ CSStairs::FGroundSampler ACSStairsActor::MakeGroundSampler() const
 	// 同步用完即弃（`RebuildStairs` 一次调用之内），裸指针不会活过地面本身。
 	const ACSGroundActor* G = Ground;
 	return [G](const FVector2D& XY) { return G->SampleHeight(XY); };
+}
+
+void ACSStairsActor::GetTerraceConnections(TArray<FCSStairsTerraceLink>& OutLinks) const
+{
+	OutLinks.Reset();
+	if (!bConnectTerraces || bConnectionsDisabled || IsActorBeingDestroyed() || !Spline || Spline->IsClosedLoop() || Spline->GetNumberOfSplinePoints() < 2) return;
+	TArray<ACSHouseActor*> Houses;
+	UCSHouseLibrary::GetHouses(GetWorld(), Houses);
+	const int32 Last = Spline->GetNumberOfSplinePoints() - 1;
+	for (int32 Point : { 0, Last })
+	{
+		const FVector P = Spline->GetLocationAtSplinePoint(Point, ESplineCoordinateSpace::World);
+		const FVector N = Spline->GetLocationAtSplinePoint(Point == 0 ? 1 : Last - 1, ESplineCoordinateSpace::World);
+		const float W = FMath::Max(Width * float(FMath::Abs(Spline->GetScaleAtSplinePoint(Point).Y)), 30.0f);
+		FCSStairsTerraceLink Best;
+		Best.PointIndex = Point;
+		for (ACSHouseActor* House : Houses)
+		{
+			const FCSStairsTerraceConnection Candidate = CSStairs_ConnectTerrace(House->GetStairsTerraceSite(), P, N, W, TerraceSnapDistance, TerraceSnapHeight);
+			if (!Candidate.bConnected || Candidate.DistanceSquared >= Best.Connection.DistanceSquared) continue;
+			Best.Connection = Candidate;
+			Best.House = House;
+		}
+		if (Best.House.IsValid()) OutLinks.Add(Best);
+	}
+}
+
+int32 ACSStairsActor::GetTerraceConnectionCount() const
+{
+	FlushPendingReevaluate();
+	TArray<FCSStairsTerraceLink> Links;
+	GetTerraceConnections(Links);
+	return Links.Num();
 }
 
 void ACSStairsActor::BuildRuns(TArray<CSStairs::FRun>& OutRuns) const
@@ -67,6 +147,13 @@ void ACSStairsActor::BuildRuns(TArray<CSStairs::FRun>& OutRuns) const
 	const CSStairs::FGroundSampler GroundSampler = MakeGroundSampler();
 	const bool bClosed = Spline->IsClosedLoop();
 	const int32 NumSegments = bClosed ? NumPoints : NumPoints - 1;
+	TArray<FCSStairsTerraceLink> Connections;
+	GetTerraceConnections(Connections);
+	auto EndpointShift = [&](int32 Point)
+	{
+		for (const FCSStairsTerraceLink& Link : Connections) if (Link.PointIndex == Point) return Link.Connection.Position - Spline->GetLocationAtSplinePoint(Point, ESplineCoordinateSpace::World);
+		return FVector::ZeroVector;
+	};
 
 	CSStairs::FRun Current;
 	for (int32 Segment = 0; Segment < NumSegments; ++Segment)
@@ -75,8 +162,9 @@ void ACSStairsActor::BuildRuns(TArray<CSStairs::FRun>& OutRuns) const
 		const int32 I1 = (Segment + 1) % NumPoints;
 		const float D0 = Spline->GetDistanceAlongSplineAtSplinePoint(I0);
 		const float D1 = (bClosed && I1 == 0) ? Spline->GetSplineLength() : Spline->GetDistanceAlongSplineAtSplinePoint(I1);
-		const FVector P0 = Spline->GetLocationAtSplinePoint(I0, ESplineCoordinateSpace::World);
-		const FVector P1 = Spline->GetLocationAtSplinePoint(I1, ESplineCoordinateSpace::World);
+		const FVector Shift0 = EndpointShift(I0), Shift1 = EndpointShift(I1);
+		const FVector P0 = Spline->GetLocationAtSplinePoint(I0, ESplineCoordinateSpace::World) + Shift0;
+		const FVector P1 = Spline->GetLocationAtSplinePoint(I1, ESplineCoordinateSpace::World) + Shift1;
 		// 节点宽 = 属性宽 × 该点缩放的 Y：视口里缩放样条点就是调这一端的宽度（TG 逐节点的 `width`）。
 		const float W0 = Width * float(FMath::Abs(Spline->GetScaleAtSplinePoint(I0).Y));
 		const float W1 = Width * float(FMath::Abs(Spline->GetScaleAtSplinePoint(I1).Y));
@@ -91,8 +179,9 @@ void ACSStairsActor::BuildRuns(TArray<CSStairs::FRun>& OutRuns) const
 		{
 			const float T = float(K) / float(Divisions);
 			const float Distance = FMath::Lerp(D0, D1, T);
-			const FVector OnSpline = Spline->GetLocationAtDistanceAlongSpline(Distance, ESplineCoordinateSpace::World);
-			FVector2D Dir = FVector2D(Spline->GetTangentAtDistanceAlongSpline(Distance, ESplineCoordinateSpace::World)).GetSafeNormal();
+			const FVector OnSpline = Spline->GetLocationAtDistanceAlongSpline(Distance, ESplineCoordinateSpace::World) + FMath::Lerp(Shift0, Shift1, double(T));
+			FVector2D Dir = (FVector2D(Spline->GetDirectionAtDistanceAlongSpline(Distance, ESplineCoordinateSpace::World))
+				+ FVector2D(Shift1 - Shift0) / FMath::Max(double(SegmentLength), 1.0)).GetSafeNormal();
 			if (Dir.IsNearlyZero()) Dir = FVector2D(P1 - P0).GetSafeNormal();
 			if (Dir.IsNearlyZero()) Dir = FVector2D(1.0, 0.0);
 
@@ -137,9 +226,28 @@ void ACSStairsActor::BuildRuns(TArray<CSStairs::FRun>& OutRuns) const
 
 void ACSStairsActor::RebuildStairs()
 {
-	if (IsTemplate() || !GetWorld() || !BrickComponent) return;
+	if (bInRebuild || bConnectionsDisabled || IsTemplate() || !GetWorld() || !BrickComponent) return;
+	TGuardValue<bool> Guard(bInRebuild, true);
+	bReevaluatePending = false;
+	SetActorTickEnabled(false);
+	SubscribeChanges();
 
 	ResolveGroundAndSubscribe();
+	SnapResizeHandles();
+	TArray<FCSStairsTerraceLink> Connections;
+	GetTerraceConnections(Connections);
+	TArray<int32> ConnectionInput;
+	for (const FCSStairsTerraceLink& Link : Connections)
+	{
+		ConnectionInput.Append({ int32(GetTypeHash(Link.House)), Link.PointIndex, Link.Connection.Opening.Edge,
+			int32(FMath::RoundToInt(Link.Connection.Opening.Start * 100.0)), int32(FMath::RoundToInt(Link.Connection.Opening.End * 100.0)) });
+	}
+	const uint32 NewConnectionHash = FCrc::MemCrc32(ConnectionInput.GetData(), ConnectionInput.Num() * sizeof(int32));
+	if (ConnectionHash != NewConnectionHash)
+	{
+		ConnectionHash = NewConnectionHash;
+		NotifyTerraces();
+	}
 
 	TArray<CSStairs::FRun> Runs;
 	BuildRuns(Runs);
@@ -148,28 +256,48 @@ void ACSStairsActor::RebuildStairs()
 	const CSStairs::FGroundSampler GroundSampler = MakeGroundSampler();
 
 	TArray<CSStairs::FBrick> Bricks;
+	TArray<CSStairs::FBrick> Rails, Ladders;
 	int32 Steps = 0;
 	int32 LadderRuns = 0;
+	int32 LadderRungs = 0;
 	for (int32 RunIndex = 0; RunIndex < Runs.Num(); ++RunIndex)
 	{
-		// 梯子段（坡度 > 2.5）TG 出的是木梯（`construct_ladder`），本项目没有对位资产 ⇒ **不出几何、出声**，
-		// 而不是硬按踏步砌：68° 以上的"踏步"每级 46 高 19 深，看着像一堵锯齿墙（附录 D §9.3）。
+		// 梯子段（坡度 > 2.5）用木板装配边梁与横档，踏步砖和普通栏杆只处理缓坡段。
 		if (Runs[RunIndex].Type == CSStairs::ESegmentType::Ladder)
 		{
 			++LadderRuns;
+			LadderRungs += CSStairs::BuildLadder(Runs[RunIndex], Params, Ladders);
 			continue;
 		}
 		// 种子按 run 分开：前一段多一级，不该把后面每一段的切砖全部重掷一遍。
 		const uint32 RunSeed = HashCombine(GetTypeHash(Seed), GetTypeHash(RunIndex));
-		Steps += CSStairs::BuildRunBricks(Runs[RunIndex], Params, GroundSampler, RunSeed, Bricks);
-	}
-	if (LadderRuns > 0)
-	{
-		UE_LOG(LogTinyGladeStairs, Warning,
-			TEXT("[TinyGladeStairs] %s: %d 段坡度超过 %.2f（TG 在这里出梯子），本项目不出梯子 —— 这几段留空。把样条点拉开或降低高差。"),
-			*GetName(), LadderRuns, Params.LadderMinSlope);
+		const int32 FirstBrick = Bricks.Num();
+		const int32 RunSteps = CSStairs::BuildRunBricks(Runs[RunIndex], Params, GroundSampler, RunSeed, Bricks);
+		Steps += RunSteps;
+		for (const FCSStairsTerraceLink& Link : Connections)
+		{
+			const auto& Samples = Runs[RunIndex].Samples;
+			const int32 TerminalStep = Samples[0].Position.Equals(Link.Connection.Position, 0.05) ? 0
+				: (Samples.Last().Position.Equals(Link.Connection.Position, 0.05) ? RunSteps - 1 : INDEX_NONE);
+			if (TerminalStep == INDEX_NONE) continue;
+			for (int32 I = FirstBrick; I < Bricks.Num(); ++I)
+			{
+				CSStairs::FBrick& B = Bricks[I];
+				if (B.StepIndex != TerminalStep || !FMath::IsNearlyEqual(B.Center.Z + B.Size.Z * 0.5, Link.Connection.Position.Z, 0.05) || B.Size.Z <= 1.0) continue;
+				// 接口逻辑齐平，砖顶压低 1 cm；伸进露台的部分由石板覆盖，避免两个顶面共面闪烁。
+				B.Center.Z -= 0.5;
+				B.Size.Z -= 1.0;
+			}
+		}
+		CSStairs::BuildRunRails(Runs[RunIndex], Params, GroundSampler, Rails);
 	}
 	CurrentLadderRunCount = LadderRuns;
+	CurrentLadderRungCount = WoodMesh ? LadderRungs : 0;
+	const bool bWoodRailing = Railing == ECSStairsRailing::Wooden;
+	UStaticMesh* RailMesh = bWoodRailing ? WoodMesh.Get() : BrickMesh.Get();
+	CurrentRailingCount = RailMesh ? Rails.Num() : 0;
+	CSStairsActor_UploadPieces(RailingComponent, RailMesh, bWoodRailing ? WoodMaterial.Get() : BrickMaterial.Get(), Rails, RailingHash);
+	CSStairsActor_UploadPieces(LadderComponent, WoodMesh, WoodMaterial, Ladders, LadderHash);
 
 	// 砖 → 实例变换。**按网格自己的包围盒换算**，不假定它就是 100 cm 居中立方体：换一张砖资产也摆得对。
 	TArray<FTransform> Transforms;
@@ -196,7 +324,7 @@ void ACSStairsActor::RebuildStairs()
 	HashInput.Add(int32(GetTypeHash(BrickMaterial.Get())));
 	const FTransform ComponentTransform = BrickComponent->GetComponentTransform();
 	auto Q = [](double V) { return int32(FMath::RoundToDouble(V * 10.0)); };
-	for (const FVector& V : { ComponentTransform.GetLocation(), ComponentTransform.GetRotation().Euler() }) HashInput.Append({ Q(V.X), Q(V.Y), Q(V.Z) });
+	for (const FVector& V : { ComponentTransform.GetLocation(), ComponentTransform.GetRotation().Euler(), ComponentTransform.GetScale3D() }) HashInput.Append({ Q(V.X), Q(V.Y), Q(V.Z) });
 	for (const FTransform& T : Transforms)
 	{
 		const FVector L = T.GetLocation();
@@ -238,11 +366,17 @@ void ACSStairsActor::ReevaluateSite()
 void ACSStairsActor::GetInstancedFamilies(TArray<FCSInstancedFamily>& OutFamilies) const
 {
 	OutFamilies.Add({ BrickComponent, TEXT("楼梯砖"), TEXT("StairBricks"), CurrentStepCount > 0 });
+	OutFamilies.Add({ RailingComponent, TEXT("楼梯栏杆"), TEXT("StairRailing"), CurrentRailingCount > 0 });
+	OutFamilies.Add({ LadderComponent, TEXT("木梯"), TEXT("StairLadders"), CurrentLadderRungCount > 0 });
 }
 
 void ACSStairsActor::ResolveGroundAndSubscribe()
 {
-	if (!bFollowGround) return;
+	if (!bFollowGround)
+	{
+		UnsubscribeGround();
+		return;
+	}
 	if (!IsValid(Ground) && GetWorld())
 	{
 		// 与房子同一口径：场景里第一块地面。换地面场景先退订再来。
@@ -261,24 +395,149 @@ void ACSStairsActor::UnsubscribeGround()
 
 void ACSStairsActor::HandleGroundChanged(ACSGroundActor* ChangedGround, const FBox& ChangedBounds)
 {
-	// 变化区域与楼梯的包围盒不相交就不必重算（笔刷每帧广播，大多数楼梯离它很远）。
-	// 包围盒取样条的世界包围盒，再往外扩一个宽度 —— 贴地判据看的是左右各 1/4 宽处的地面。
-	if (Spline && ChangedBounds.IsValid)
-	{
-		const FBox SplineBox = Spline->Bounds.GetBox().ExpandBy(FVector(Width, Width, 1.0e6));
-		if (!SplineBox.Intersect(ChangedBounds)) return;
-	}
-	RebuildStairs();
+	RequestReevaluate();
 }
 
 void ACSStairsActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	bConnectionsDisabled = true;
+	ExitResizeMode();
+	UnsubscribeChanges();
 	UnsubscribeGround();
+	NotifyTerraces();
 	Super::EndPlay(EndPlayReason);
 }
 
 void ACSStairsActor::Destroyed()
 {
+	bConnectionsDisabled = true;
+	ExitResizeMode();
+	UnsubscribeChanges();
 	UnsubscribeGround();
+	NotifyTerraces();
 	Super::Destroyed();
 }
+
+void ACSStairsActor::RequestReevaluate()
+{
+	if (bConnectionsDisabled || IsTemplate() || !GetWorld()) return;
+	bReevaluatePending = true;
+	SetActorTickEnabled(true);
+#if WITH_EDITOR
+	// LEVELTICK_TimeOnly / Slate 拖动节流可能完全跳过 actor tick。Core ticker 只挂一次，
+	// 在完整的样条编辑操作结束后消费通知，兼容非实时视口及无头编辑器。
+	if (!GetWorld()->IsGameWorld() && !EditorRebuildTicker.IsValid())
+	{
+		EditorRebuildTicker = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateWeakLambda(this, [this](float)
+		{
+			EditorRebuildTicker.Reset();
+			FlushPendingReevaluate();
+			return false;
+		}));
+	}
+#endif
+}
+
+void ACSStairsActor::FlushPendingReevaluate() const
+{
+	if (bReevaluatePending && !bInRebuild) const_cast<ACSStairsActor*>(this)->RebuildStairs();
+}
+
+void ACSStairsActor::Tick(float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+	FlushPendingReevaluate();
+	SetActorTickEnabled(bReevaluatePending);
+}
+
+void ACSStairsActor::SubscribeChanges()
+{
+	if (!TerraceChangedHandle.IsValid()) TerraceChangedHandle = ACSHouseActor::OnTerraceChanged.AddUObject(this, &ACSStairsActor::HandleTerraceChanged);
+	if (USceneComponent* Root = GetRootComponent(); Root && !RootTransformChangedHandle.IsValid()) RootTransformChangedHandle = Root->TransformUpdated.AddUObject(this, &ACSStairsActor::HandleComponentTransformChanged);
+	// 蓝图重实例化/撤销可能替换组件；从旧对象解绑后再订阅当前对象，不能只检查句柄有效。
+	if (ObservedSpline.Get() == Spline.Get()) return;
+	UnsubscribeSplineChanges();
+	ObservedSpline = Spline;
+	if (!Spline) return;
+	// UE 5.7 原生通知：Updated 覆盖可视化器直接改曲线后 UpdateSpline；Changed 也覆盖组件独立撤销。
+	// 只入队，不能在 setter 尚未结束或组件重建途中同步重建楼梯。
+PRAGMA_DISABLE_EXPERIMENTAL_WARNINGS
+	SplineChangedHandle = Spline->GetOnSplineChanged().AddUObject(this, &ACSStairsActor::RequestReevaluate);
+	SplineUpdatedHandle = Spline->GetOnSplineUpdated().AddUObject(this, &ACSStairsActor::RequestReevaluate);
+PRAGMA_ENABLE_EXPERIMENTAL_WARNINGS
+	SplineTransformChangedHandle = Spline->TransformUpdated.AddUObject(this, &ACSStairsActor::HandleComponentTransformChanged);
+}
+
+void ACSStairsActor::UnsubscribeChanges()
+{
+#if WITH_EDITOR
+	FTSTicker::RemoveTicker(EditorRebuildTicker);
+	EditorRebuildTicker.Reset();
+#endif
+	UnsubscribeSplineChanges();
+	ACSHouseActor::OnTerraceChanged.Remove(TerraceChangedHandle);
+	TerraceChangedHandle.Reset();
+	if (USceneComponent* Root = GetRootComponent(); Root && RootTransformChangedHandle.IsValid()) Root->TransformUpdated.Remove(RootTransformChangedHandle);
+	RootTransformChangedHandle.Reset();
+}
+
+void ACSStairsActor::UnsubscribeSplineChanges()
+{
+	if (USplineComponent* Previous = ObservedSpline.Get())
+	{
+PRAGMA_DISABLE_EXPERIMENTAL_WARNINGS
+		Previous->GetOnSplineChanged().Remove(SplineChangedHandle);
+		Previous->GetOnSplineUpdated().Remove(SplineUpdatedHandle);
+PRAGMA_ENABLE_EXPERIMENTAL_WARNINGS
+		Previous->TransformUpdated.Remove(SplineTransformChangedHandle);
+	}
+	ObservedSpline.Reset();
+	SplineChangedHandle.Reset();
+	SplineUpdatedHandle.Reset();
+	SplineTransformChangedHandle.Reset();
+}
+
+void ACSStairsActor::NotifyTerraces() const
+{
+	TArray<ACSHouseActor*> Houses;
+	UCSHouseLibrary::GetHouses(GetWorld(), Houses);
+	for (ACSHouseActor* House : Houses) if (!House->IsActorBeingDestroyed()) House->RequestReevaluate();
+}
+
+void ACSStairsActor::HandleTerraceChanged(ACSHouseActor* House)
+{
+	if (House && House->GetWorld() == GetWorld()) RequestReevaluate();
+}
+
+void ACSStairsActor::HandleComponentTransformChanged(USceneComponent* Component, EUpdateTransformFlags Flags, ETeleportType Teleport)
+{
+	RequestReevaluate();
+}
+
+void ACSStairsActor::PostRegisterAllComponents()
+{
+	Super::PostRegisterAllComponents();
+	if (IsTemplate() || !GetWorld()) return;
+	bConnectionsDisabled = false;
+	SubscribeChanges();
+	RequestReevaluate();
+}
+
+#if WITH_EDITOR
+void ACSStairsActor::PostEditMove(bool bFinished)
+{
+	Super::PostEditMove(bFinished);
+	// Spline visualizer 每次控制点/切线拖动都会发 PostEditMove(false)。原生类及关闭
+	// Run Construction Script on Drag 的蓝图也要跟手，不能只依赖 OnConstruction。
+	RequestReevaluate();
+	if (bFinished) FlushPendingReevaluate();
+}
+
+void ACSStairsActor::PostEditUndo()
+{
+	Super::PostEditUndo();
+	bConnectionsDisabled = false;
+	RebuildStairs();
+	NotifyTerraces();
+}
+#endif

@@ -5,14 +5,16 @@
 #include "CSHouseHandleActor.generated.h"
 
 class ACSHouseActor;
+class UMaterialInterface;
 class UPrimitiveComponent;
+class UStaticMesh;
 
 /**
  * **所有房屋控制抓手的公共基类**（计划 D5 / D8 的交互层）。
  *
  * "抓手"在本项目里的定义很窄：一个挂在（或吸附到）房子上的**辅助 actor**，用户用编辑器
  * 原生 transform gizmo 拖它，拖动本身就是对宿主房的一次通知。它自己**不产任何游戏内几何**
- * —— 可见的东西要么归宿主房产出（窗洞、窗台），要么只是编辑器示意道具（箭头锥）。
+ * —— 可见的东西要么归宿主房产出（窗洞、窗台），要么只是编辑器示意道具（TG 箭头、高度框）。
  * 现有两族：`ACSHouseResizeHandleActor`（推拉墙）与 `ACSHouseFeatureMarker`（窗等特征）。
  *
  * ⚠️ **`ACSGroundShaperActor` 不在这一族里**，虽然它也是"拖着改地形"的道具：它是
@@ -125,6 +127,20 @@ public:
 	 */
 	static void ApplyHighlightMaterial(UPrimitiveComponent* Component);
 
+	/**
+	 * 描边用的**压暗**版：同一张 `M_CSHandleHighlight` 的动态实例，`Intensity` 归零，只剩它近黑的底色。
+	 * 给 TG 原版箭头的 `flat_arrow_outline` 用 —— TG 就是"亮的本体 + 一圈暗边"，暗边让箭头在亮地面上也读得出来。
+	 * 缺资产时同样什么都不做。不另建材质资产：参数本来就暴露着，多一张就多一处要跟着改。
+	 */
+	static void ApplyOutlineMaterial(UPrimitiveComponent* Component);
+
+	/**
+	 * TG 原版编辑箭头网格：`Scripts/TinyGladeMakeHandleArrows.py` 从 TG 源 json 烘到
+	 * `/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/<Name>`（与其余 TG 网格同目录、同名）。
+	 * 惰性加载，理由同 `ApplyHighlightMaterial`；缺资产返回 nullptr，调用方留自己的兜底网格。
+	 */
+	static UStaticMesh* LoadTGArrowMesh(const TCHAR* Name);
+
 protected:
 	/**
 	 * 子类实现：这一次拖动意味着什么。返回**是否仍有有效宿主** —— 返回 false 且 `bFinished`
@@ -150,6 +166,9 @@ protected:
 	TWeakObjectPtr<ACSHouseActor> Host;
 
 private:
+	/** 惰性加载 `M_CSHandleHighlight`（理由见 `ApplyHighlightMaterial`）。缺资产返回 nullptr。 */
+	static UMaterialInterface* LoadHighlightMaterial();
+
 	/**
 	 * 已经过了"落地"这一关吗 —— **这一位是防自杀的**（纪律 ③，2026-08-31 被演示回归抓住）。
 	 * spawn 之后的第一次 `bFinished=true` 一律**降级成非最终裁决**，真正的松手从第二次起才算。

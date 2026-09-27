@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "CSArchCurve.ush"
 #include "CSGroundShaperSteps.h"   // FPaletteBuffers —— 实例源的容器，与石阶/藤/摆件同一份
 #include "CSHouseProfile.h"        // FCSWallOpening / FCSOpeningClipField
 #include "Templates/TypeHash.h"   // HashCombine —— 柱类砖路的逐实例随机数基
@@ -41,7 +42,7 @@
  *   `CenterS`      → 圆弧的横向圆心（也是竖直段的对称中心）
  *   `1/InvHalfWidth` → 拱/圆的半径；矩形洞的半宽
  *   `RefZ`         → 拱 = 起拱线；圆 = 圆心；矩形 = 洞中
- *   `1/InvScaleZ`  → 矩形洞的半高（拱与圆恒等于半宽，所以那两种不需要它）
+ *   `1/InvScaleZ`  → 矩形洞的半高 / 拱的竖向半径（圆洞等于半宽）
  *
  * 定向同样是闭式的：路径切向 `T` 在墙空间 (S, Z) 里直接可导，**面内朝外法线 = T 逆时针转 90°**
  * （`(-T.z, T.s)`）。旧 kernel 要靠「减去曲线中心求径向 + 投影掉平面法线 + 判号翻转」三步才
@@ -53,12 +54,12 @@
  * 一条砖路（`FPath`）最多三段，按弧长首尾相接，三段都可缺席：
  *
  *   ① 左竖直段：S = `LeftS`，Z 从 `BaseZ` 升到 `TopZ`，切向 (0, +1)
- *   ② 中段：圆弧（θ 从 0 扫到 `MidSweep`，S = Cs − R·cosθ、Z = TopZ + R·sinθ）
+ *   ② 中段：圆弧（θ 从 0 扫到 `MidSweep`，S = Cs − R·cosθ、Z = TopZ + Rise·sinθ）
  *          或水平段（矩形洞的平顶，长 `FlatLen`，切向 (+1, 0)）
  *   ③ 右竖直段：S = `RightS`，Z 从 `TopZ` 降回 `BaseZ`，切向 (0, −1)
  *
  * 洞型与段的对应：
- *   · 门（落地的拱）= 左樘 + 半圆（Sweep = π，R = 半宽，圆心在起拱线）+ 右樘
+ *   · 门（落地的拱）= 左樘 + 半圆（Sweep = π，横半径 = 半宽，竖半径 = Rise，中心在起拱线）+ 右樘
  *   · 圆   = 只有中段，Sweep = 2π（一圈砖，起点在最左）
  *   · 窗**不走这里**：洞缘由附属物自带的预制框盖住，`BuildEdgeElements` 对窗一块砖都不出。
  *     窗周围的砖头补全（曾经沿洞底补的「窗台底边」第四段）已于 2026-09-10 按用户裁决整条删除。
@@ -103,7 +104,7 @@ namespace CSHouseFrame
 enum class EMidKind : uint8
 {
 	None,
-	/** 圆弧：θ ∈ [0, MidSweep]，S = CenterS − R·cosθ，Z = TopZ + R·sinθ。 */
+	/** 圆弧：θ ∈ [0, MidSweep]，S = CenterS − R·cosθ，Z = TopZ + Rise·sinθ。 */
 	Arc,
 	/** 水平直段（矩形洞的平顶）：从 LeftS 走到 RightS，长 FlatLen。 */
 	Flat,
@@ -112,7 +113,7 @@ enum class EMidKind : uint8
 /**
  * 一条砖路的**解析**描述。所有量都在墙空间 (S = 沿边弧长, Z = 从房底起算的高度)。
  *
- * 这个结构体就是 GPU 侧逐路常量的 CPU 原本 —— `CSHouseFrame.usf` 里的六行 float4 与它逐字对应，
+ * 这个结构体就是 GPU 侧逐路常量的 CPU 原本 —— `CSHouseFrame.usf` 里的八行 float4 与它逐字对应，
  * 两处必须一起改。
  */
 struct FPath
@@ -129,6 +130,8 @@ struct FPath
 	float CenterS = 0.0f;
 	/** 圆弧半径（= clip 场的 1/InvHalfWidth）。 */
 	float Radius = 0.0f;
+	/** Vertical radius from the opening profile; zero keeps circular callers compatible. */
+	float ArcRise = 0.0f;
 	/** 圆弧扫过的角度：拱 = π，圆 = 2π。 */
 	float MidSweep = 0.0f;
 	/** 水平中段的长度（`EMidKind::Flat` 时才有意义）。 */
@@ -145,7 +148,7 @@ struct FPath
 	{
 		switch (MidKind)
 		{
-		case EMidKind::Arc:  return FMath::Max(Radius, 0.0f) * MidSweep;
+		case EMidKind::Arc:  return CSArch_Length(FMath::Max(Radius, 0.0f), ArcRise, MidSweep);
 		case EMidKind::Flat: return FMath::Max(FlatLen, 0.0f);
 		default:             return 0.0f;
 		}
@@ -179,10 +182,11 @@ inline void EvalPath(const FPath& Path, float Arc, FVector2f& OutSZ, FVector2f& 
 		const float T = FMath::Min(A - L0, L1);
 		if (Path.MidKind == EMidKind::Arc)
 		{
-			const float Theta = Path.Radius > UE_KINDA_SMALL_NUMBER ? T / Path.Radius : 0.0f;
+			const float Rise = CSArch_Rise(Path.Radius, Path.ArcRise);
+			const float Theta = CSArch_Angle(Path.Radius, Rise, Path.MidSweep, T);
 			const float C = FMath::Cos(Theta), S = FMath::Sin(Theta);
-			OutSZ = FVector2f(Path.CenterS - Path.Radius * C, Path.TopZ + Path.Radius * S);
-			OutTangent = FVector2f(S, C);   // d/dθ 的单位化：θ=0 → (0,1)，θ=π → (0,−1)
+			OutSZ = FVector2f(Path.CenterS - Path.Radius * C, Path.TopZ + Rise * S);
+			OutTangent = FVector2f(Path.Radius * S, Rise * C).GetSafeNormal();   // d/dθ 的单位化：θ=0 → (0,1)，θ=π → (0,−1)
 		}
 		else
 		{
@@ -408,6 +412,9 @@ namespace EPathFamily
 	 * 再加新家族时从 `0x42574C00u` 之后另起，别插进这段里。
 	 */
 	static constexpr uint32 BrickWall = 0x4257414Cu;
+	/** 'WCOP' / 'WMRL' —— 样条墙（`CSWall::BuildTopElements`）墙顶的压顶砖与垛口。 */
+	static constexpr uint32 WallCoping = 0x57434F50u;
+	static constexpr uint32 WallMerlon = 0x574D524Cu;
 }
 
 /**

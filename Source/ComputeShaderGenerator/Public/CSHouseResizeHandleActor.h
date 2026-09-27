@@ -14,14 +14,20 @@ class UStaticMeshComponent;
  * 用户裁决：不做自定义 EdMode / HitProxy。抓手是真实的 actor，所以点选、框选、Ctrl+Z、
  * 多视口、VR 编辑这些全部白拿 —— 代价只是四个 `RF_Transient` actor。
  *
- * 它**不是** `ACSTinyGlade`：没有 `UCSMesh`、没有快照、不参与任何重求值。可见的只有一根
- * 编辑器示意长条（`bIsEditorOnly`），与地形塑形物的圆柱同一路数。
+ * 它**不是** `ACSTinyGlade`：没有 `UCSMesh`、没有快照、不参与任何重求值。可见的只有一只
+ * 编辑器示意箭头（`bIsEditorOnly`），与地形塑形物的圆柱同一路数。
  *
- * ## 观感：一根指向房外的锥子
+ * ## 观感：TG 原版的推墙箭头
  *
- * 每个抓手画一根沿自己那面墙外法线指出去的锥子，落在墙外皮再往外 `HandleOffset` 处 ——
- * 一眼能看出"抓这个往外拉，这面墙就往外走"。高亮自发光材质由
- * `Scripts/TinyGladeMakeHandleMaterial.py` 建，运行时惰性加载，缺了也只是退成默认材质。
+ * 每个抓手画一只**躺平**、沿自己那面墙外法线指出去的箭头，箭头中心落在墙外皮再往外
+ * `HandleOffset` 处 —— 一眼能看出"抓这个往外拉，这面墙就往外走"。
+ *
+ * 网格就是 TG 矩形房子拉尺寸时画的那一对（`rectangle/ui_modes/edit_dims.rs`）：本体 `flat_arrow`
+ * + 外扩一圈、更薄的描边 `flat_arrow_outline`，由 `Scripts/TinyGladeMakeHandleArrows.py` 从 TG 源 json
+ * 烘成 `TinyGladeAsset/Meshes/` 下的同名网格（证据 `Docs/TinyGlade/evidence/edit-signifier-arrows-20260922.txt`）。
+ * 本体挂高亮自发光材质（`Scripts/TinyGladeMakeHandleMaterial.py`），描边挂它的压暗版。
+ * 网格与材质都在 `InitializeHandle` 里**惰性加载**，缺了网格就退回引擎锥子（照样看得见、点得着），
+ * 缺了材质就退成默认材质 —— 交互都不受影响。
  *
  * ⚠️ **调高度是另一个抓手**（`ACSHouseHeightHandleActor`，那个才是四根横条围成的"窗框"）。
  * 本类只管**水平**推拉，四个一组、一面墙一个。
@@ -104,13 +110,20 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "CS House|Resize")
 	float ConsumeDragToHost(bool bFinished);
 
-	/** 锥子离墙外皮多远 cm。纯观感量，不进任何判定。 */
+	/** 箭头中心（也是 gizmo 所在处）离墙外皮多远 cm。纯观感量，不进任何判定。 */
 	UPROPERTY(EditAnywhere, Category = "CS House|Resize", meta = (ClampMin = "0.0"))
 	float HandleOffset = 80.0f;
 
-	/** 锥子挂在墙高的百分之几处。0 = 墙脚，1 = 檐口。 */
+	/** 箭头挂在墙高的百分之几处。0 = 墙脚，1 = 檐口。 */
 	UPROPERTY(EditAnywhere, Category = "CS House|Resize", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float HandleHeightFraction = 0.5f;
+
+	/**
+	 * TG 箭头相对原大的倍数：1 = TG 原尺寸（长 100 cm、宽 30 cm、厚 10 cm）。纯观感量。
+	 * 下一次归位（任何一次推拉、`SnapResizeHandles`）生效。退回引擎锥子时不用它。
+	 */
+	UPROPERTY(EditAnywhere, Category = "CS House|Resize", meta = (ClampMin = "0.1"))
+	float ArrowScale = 1.0f;
 
 	// ⚠️ **刻意不 override `PostRegisterAllComponents`**（踩过）：它在 `SpawnActor` 期间就跑，
 	// 早于 `EnterResizeMode` 调 `InitializeHandle` —— 在那里写"宿主为空就自毁"的兜底，
@@ -136,7 +149,23 @@ private:
 	/** 本次 `ConsumeDragToHost` 实际生效的位移，供公开 API 返回。 */
 	float LastAppliedOffset = 0.0f;
 
-	/** 编辑器示意锥，沿外法线指向房外。游戏里不存在。 */
+	/**
+	 * 按外法线（局部，Z 恒 0）摆箭头：朝向、缩放、以及让包围盒中心落在 actor 原点上。
+	 * 描边挂在本体下面，跟着走。`SnapToCanonical` 里调。
+	 */
+	void UpdateArrowPose(const FVector& OuterLocal);
+
+	/**
+	 * 编辑器示意箭头的本体，沿外法线指向房外。游戏里不存在。
+	 * TG 箭头（`bTGArrow`）头指网格局部 +Y、躺平；退回的引擎锥子尖指局部 +Z。
+	 */
 	UPROPERTY(Transient)
 	TObjectPtr<UStaticMeshComponent> ArrowComponent;
+
+	/** TG 箭头的描边，挂在本体下（同一套网格局部坐标，零相对变换）。退回锥子时没有网格。 */
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> ArrowOutlineComponent;
+
+	/** 本体装上的是 TG 箭头（而不是兜底锥子）。决定 `UpdateArrowPose` 用哪条轴当"指向"。 */
+	bool bTGArrow = false;
 };

@@ -3,13 +3,25 @@
 #include "CoreMinimal.h"
 #include "CSTinyGlade.h"
 #include "CSStairs.h"
+#include "CSStairsConnection.h"
+#include "Components/SceneComponent.h"
+#include "Containers/Ticker.h"
 #include "CSStairsActor.generated.h"
 
 class ACSGroundActor;
+class ACSHouseActor;
 class UCSGpuInstancedMeshComponent;
 class UMaterialInterface;
 class USplineComponent;
 class UStaticMesh;
+class ACSStairsWidthHandleActor;
+
+struct FCSStairsTerraceLink
+{
+	TWeakObjectPtr<ACSHouseActor> House;
+	int32 PointIndex = INDEX_NONE;
+	FCSStairsTerraceConnection Connection;
+};
 
 /**
  * 玩家绘制楼梯（TG §4.1 `playermade`，2026-09-16 用户："默认 actor 中添加 spline component"）。
@@ -24,8 +36,8 @@ class UStaticMesh;
  *
  * ## 什么时候重建
  *
- * 基类 `OnConstruction → ReevaluateSite` 是唯一入口：改属性、拖样条点（组件改动会重跑构造脚本）、
- * 挪完 actor 松手、撤销都会来；地面变了（塑形物、笔刷）由订阅的 `OnGroundChanged` 补一次。
+ * 构造脚本、样条数据/组件变换通知、编辑器拖动和地面变化统一唤醒既有重建队列。
+ * 样条拖动不依赖构造脚本重跑：通知在下一帧合并消费，松手补齐尚未消费的改动。
  * 实例是**组件局部**的，拖 actor 的途中楼梯整体跟着走，地面贴合等松手那次重建再对齐。
  *
  * ⚠️ `SetInstances` 带一次阻塞的渲染刷新，所以重建前先比砖表哈希，没变就不上传
@@ -33,10 +45,9 @@ class UStaticMesh;
  *
  * ## 与 TG 的取舍（附录 D §9.3）
  *
- * - **支撑**：TG 楼梯底下由墙构造器砌拱墙 / 柱 / 托架（§3），离地触发阈值没查清 ⇒ MVP 在踏步块底下按层砌砖到地面
- *   （`bSolidToGround`），高处读作一段实心的砖砌台基。
- * - **梯子**：坡度 > 2.5 的段 TG 出木梯，本项目没有对位资产 ⇒ 留空并告警（`GetLadderRunCount`）。
- * - **还没做**：栏杆（§5）、挂墙节点与穿墙开洞（§4）、分叉的图（§1.2，这里只有一条开链或闭环）。
+ * - **支撑**：沿样条规划拱洞，复用墙体剖面和排砖，按实际空间决定拱高；托架仍未接入。
+ * - **梯子**：坡度 > 2.5 的段 TG 出木梯，本项目复用木板网格生成边梁与横档（`GetLadderRunCount`）。
+ * - **还没做**：挂墙节点与穿墙开洞（§4）、分叉的图（§1.2，这里只有一条开链或闭环）。
  */
 UCLASS(Blueprintable, BlueprintType)
 class COMPUTESHADERGENERATOR_API ACSStairsActor : public ACSTinyGlade
@@ -56,6 +67,16 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Stairs", meta = (ClampMin = "45.0", ClampMax = "400.0"))
 	float Width = 150.0f;
+
+	/** 开放样条两端自动对齐附近的平屋顶，并给露台围边留入口；不改原始样条。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Stairs|Connection")
+	bool bConnectTerraces = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Stairs|Connection", meta = (ClampMin = "0.0", EditCondition = "bConnectTerraces"))
+	float TerraceSnapDistance = 80.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Stairs|Connection", meta = (ClampMin = "0.0", EditCondition = "bConnectTerraces"))
+	float TerraceSnapHeight = 100.0f;
 
 	/**
 	 * 一级踏步的斜边长 cm（TG `Curve::try_resample(0.5)`）。**TG 没有踏高 / 踏深参数**：
@@ -87,17 +108,27 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Stairs", meta = (ClampMin = "0.0", EditCondition = "bFollowGround"))
 	float TreadClearance = 15.0f;
 
-	/**
-	 * 踏步块底下按层砌砖到地面（**MVP 支撑**）：离地高的楼梯读作一段实心的砖砌台基，而不是悬在半空的一串砖。
-	 * TG 的做法是楼梯底下由墙构造器砌拱墙 / 柱（附录 D §3），触发高度没查清，先用这个替。
-	 * 层高 `CSStairs::FParams::SupportCourseHeight`（40 cm），层缝按世界 Z 对齐。
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Stairs", meta = (EditCondition = "bFollowGround"))
+	/** 沿楼梯路径砌到地面的支撑墙，复用房屋砖和拱洞剖面。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Stairs|Support", meta = (EditCondition = "bFollowGround", DisplayName = "Grounded Supports"))
 	bool bSolidToGround = true;
+
+	/** 有足够离地空间时生成贯穿拱洞；关闭时为实心支撑墙。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Stairs|Support", meta = (EditCondition = "bSolidToGround"))
+	bool bArchedSupport = true;
 
 	/** 横向切砖、进深随机数的种子。同参数同结果（拖样条时不闪）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Stairs")
 	int32 Seed = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Stairs|Railing")
+	ECSStairsRailing Railing = ECSStairsRailing::Wooden;
+
+	/** 木栏杆与陡段梯子共用，按资产包围盒适配尺寸。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Stairs|Railing")
+	TObjectPtr<UStaticMesh> WoodMesh;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Stairs|Railing")
+	TObjectPtr<UMaterialInterface> WoodMaterial;
 
 	// -------------------------------------------------------------------------
 	// 砖
@@ -122,6 +153,35 @@ public:
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "CS Stairs")
 	void RebuildStairs();
 
+	/** 与房屋同名的蓝图入口：在楼梯中段两侧生成临时宽度把手；重复调用只归位。 */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "CS Stairs|Resize")
+	void EnterResizeMode();
+
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "CS Stairs|Resize")
+	void ExitResizeMode();
+
+	UFUNCTION(BlueprintPure, Category = "CS Stairs|Resize")
+	bool IsInResizeMode() const;
+
+	UFUNCTION(BlueprintPure, Category = "CS Stairs|Resize")
+	TArray<ACSStairsWidthHandleActor*> GetResizeHandles() const;
+
+	/** 设置整体宽度（45–400 cm），立即重建踏步、支撑、栏杆及露台接口；返回生效宽度。 */
+	UFUNCTION(BlueprintCallable, Category = "CS Stairs|Resize")
+	float SetStairWidth(float NewWidth);
+
+	/** 使用 BuildRuns 的已解析路径，保持接地、露台吸附和逐点缩宽的同一口径。 */
+	bool GetWidthHandleFrame(FVector& Center, FVector& Right, float& WidthScale) const;
+	void SnapResizeHandles();
+	void NotifyResizeHandleDestroyed(ACSStairsWidthHandleActor* Handle);
+
+	/** 只读查询，同一份输入同时供楼梯落点与房屋围边入口使用。 */
+	void GetTerraceConnections(TArray<FCSStairsTerraceLink>& OutLinks) const;
+	void FlushPendingReevaluate() const;
+
+	UFUNCTION(BlueprintPure, Category = "CS Stairs|Connection")
+	int32 GetTerraceConnectionCount() const;
+
 	UFUNCTION(BlueprintPure, Category = "CS Stairs")
 	USplineComponent* GetSpline() const { return Spline; }
 
@@ -130,22 +190,28 @@ public:
 
 	/** 上一次重建出了几级踏步。 */
 	UFUNCTION(BlueprintPure, Category = "CS Stairs")
-	int32 GetStepCount() const { return CurrentStepCount; }
+	int32 GetStepCount() const { FlushPendingReevaluate(); return CurrentStepCount; }
 
 	/** 上一次重建出了几块砖（一级可以横向切成几块）。 */
 	UFUNCTION(BlueprintPure, Category = "CS Stairs")
-	int32 GetBrickCount() const { return CurrentBricks.Num(); }
+	int32 GetBrickCount() const { FlushPendingReevaluate(); return CurrentBricks.Num(); }
 
 	/** 上一次重建真的上传了几次（砖表哈希短路的观测量，单测用）。 */
 	UFUNCTION(BlueprintPure, Category = "CS Stairs")
-	int32 GetUploadCount() const { return UploadCount; }
+	int32 GetUploadCount() const { FlushPendingReevaluate(); return UploadCount; }
 
-	/** 上一次重建有几段因为太陡（TG 出梯子）被留空。 */
+	/** 上一次重建识别出的木梯分段数。 */
 	UFUNCTION(BlueprintPure, Category = "CS Stairs")
-	int32 GetLadderRunCount() const { return CurrentLadderRunCount; }
+	int32 GetLadderRunCount() const { FlushPendingReevaluate(); return CurrentLadderRunCount; }
+
+	UFUNCTION(BlueprintPure, Category = "CS Stairs")
+	int32 GetRailingPieceCount() const { FlushPendingReevaluate(); return CurrentRailingCount; }
+
+	UFUNCTION(BlueprintPure, Category = "CS Stairs")
+	int32 GetLadderRungCount() const { FlushPendingReevaluate(); return CurrentLadderRungCount; }
 
 	/** 上一次重建的砖表（世界空间）。脚本与单测读它对答案，不必回读 GPU。 */
-	const TArray<CSStairs::FBrick>& GetBricks() const { return CurrentBricks; }
+	const TArray<CSStairs::FBrick>& GetBricks() const { FlushPendingReevaluate(); return CurrentBricks; }
 
 	/**
 	 * 把样条 + 地面翻成纯函数层的输入：逐段密采样、夹地、按坡度分类、同类合并成 run。
@@ -162,11 +228,22 @@ public:
 	//~ AActor
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void Destroyed() override;
+	virtual void PostRegisterAllComponents() override;
+	virtual void Tick(float DeltaSeconds) override;
+	virtual bool ShouldTickIfViewportsOnly() const override { return true; }
+#if WITH_EDITOR
+	virtual void PostEditMove(bool bFinished) override;
+	virtual void PostEditUndo() override;
+#endif
 
 protected:
 	virtual void GetInstancedFamilies(TArray<FCSInstancedFamily>& OutFamilies) const override;
 
 private:
+	/** UI 状态不存盘、不复制，也不随宽度撤销复活已删除的临时把手。 */
+	UPROPERTY(Transient, DuplicateTransient, NonTransactional)
+	TArray<TObjectPtr<ACSStairsWidthHandleActor>> ResizeHandles;
+
 	/** 楼梯的路径 —— **默认子对象**，放进关卡就带着一条三点的上行样条。 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Stairs", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<USplineComponent> Spline;
@@ -174,6 +251,17 @@ private:
 	/** 踏步砖的实例组件（CPU 数组路；楼梯是几十到几百块的量级）。 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Stairs", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UCSGpuInstancedMeshComponent> BrickComponent;
+
+	UPROPERTY(VisibleAnywhere, Category = "CS Stairs|Railing")
+	TObjectPtr<UCSGpuInstancedMeshComponent> RailingComponent;
+
+	UPROPERTY(VisibleAnywhere, Category = "CS Stairs|Railing")
+	TObjectPtr<UCSGpuInstancedMeshComponent> LadderComponent;
+
+	uint32 RailingHash = 0;
+	uint32 LadderHash = 0;
+	int32 CurrentRailingCount = 0;
+	int32 CurrentLadderRungCount = 0;
 
 	/** 订阅着的地面。Transient：每次重建按需重新找。 */
 	UPROPERTY(Transient)
@@ -186,6 +274,27 @@ private:
 	int32 CurrentLadderRunCount = 0;
 	uint32 BrickHash = 0;
 	int32 UploadCount = 0;
+	uint32 ConnectionHash = 0;
+	bool bReevaluatePending = false;
+	bool bInRebuild = false;
+	bool bConnectionsDisabled = false;
+	FDelegateHandle TerraceChangedHandle;
+	FDelegateHandle RootTransformChangedHandle;
+	TWeakObjectPtr<USplineComponent> ObservedSpline;
+	FDelegateHandle SplineChangedHandle;
+	FDelegateHandle SplineUpdatedHandle;
+	FDelegateHandle SplineTransformChangedHandle;
+#if WITH_EDITOR
+	/** 非实时/被节流的视口不跑 actor tick，使用仅在有变化时登记的一次性编辑器刷新。 */
+	FTSTicker::FDelegateHandle EditorRebuildTicker;
+#endif
+	void RequestReevaluate();
+	void SubscribeChanges();
+	void UnsubscribeChanges();
+	void UnsubscribeSplineChanges();
+	void NotifyTerraces() const;
+	void HandleTerraceChanged(ACSHouseActor* House);
+	void HandleComponentTransformChanged(USceneComponent* Component, EUpdateTransformFlags Flags, ETeleportType Teleport);
 
 	void ResolveGroundAndSubscribe();
 	void UnsubscribeGround();

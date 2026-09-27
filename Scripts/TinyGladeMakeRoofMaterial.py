@@ -265,7 +265,7 @@ def build(name='M_TinyGladeRoof',save=True):
     # |WPO| <= 3 cm lift (along the normal) + |(3, 3)| cm wobble = 7.3 cm, per axis <= 3 + 3 = 6 cm. Engine proxies
     # that pass this value clamp WPO per axis with it (static mesh / Nanite; our instanced proxy passes 0 = no
     # clamp), so it must stay above the bound.
-    for k,v in dict(used_with_instanced_static_meshes=True,two_sided=False,tangent_space_normal=False,
+    for k,v in dict(used_with_instanced_static_meshes=True,used_with_nanite=True,two_sided=False,tangent_space_normal=False,
         blend_mode=unreal.BlendMode.BLEND_OPAQUE,shading_model=unreal.MaterialShadingModel.MSM_DEFAULT_LIT,
         max_world_position_offset_displacement=8.0).items():mat.set_editor_property(k,v)
     def node(cls,**props):

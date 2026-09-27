@@ -1,5 +1,62 @@
 #include "CSHouseRoof.h"
 
+void CSHouseRoof_BuildParapet(const FCSRoofDesc& Roof, float Thickness, float Height, TArray<FCSRoofParapetBlock>& OutBlocks,
+	TArrayView<const FCSRoofParapetOpening> Openings)
+{
+	OutBlocks.Reset();
+	if (!Roof.bFlat || !Roof.Footprint.IsValidFootprint() || Height <= 0.0f) return;
+	const double Depth = FMath::Clamp(double(Thickness), 12.0, FMath::Max(12.0, Roof.MaxInset() * 0.5));
+	const double CourseHeight = double(Height) * 0.5;
+	for (int32 Edge = 0; Edge < Roof.Footprint.NumEdges(); ++Edge)
+	{
+		const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Roof.Footprint, 0.0f);
+		double T0 = 0.0, T1 = 0.0;
+		if (!CSHouseRoof_FaceSpanAtInset(Roof.Footprint, Edge, Depth * 0.5, T0, T1)) continue;
+		const double Length = T1 - T0;
+		const int32 Count = FMath::Clamp(FMath::RoundToInt(Length / 65.0), 1, 512);
+		const double Step = Length / Count;
+		const FQuat Rotation(FVector::UpVector, FMath::Atan2(F.U.Y, F.U.X));
+		// 转角整砖盖住两条围边端面之间的缺口，顶面与垛口齐平。
+		const FVector2D Corner = F.Start + F.In * (Depth * 0.5) + F.U * T0;
+		OutBlocks.Add({ FVector(Corner.X, Corner.Y, Roof.EaveZ + Height * 0.5), FVector(Depth, Depth, Height), Rotation });
+		auto AddBlock = [&](double Along, double Width, double Z)
+		{
+			TArray<FVector2D> Spans = { FVector2D(Along - Width * 0.5, Along + Width * 0.5) };
+			for (const FCSRoofParapetOpening& Opening : Openings)
+			{
+				if (Opening.Edge != Edge || Opening.End <= Opening.Start) continue;
+				TArray<FVector2D> Remaining;
+				for (const FVector2D& Span : Spans)
+				{
+					if (Opening.End <= Span.X || Opening.Start >= Span.Y) Remaining.Add(Span);
+					else
+					{
+						if (Opening.Start > Span.X) Remaining.Add(FVector2D(Span.X, Opening.Start));
+						if (Opening.End < Span.Y) Remaining.Add(FVector2D(Opening.End, Span.Y));
+					}
+				}
+				Spans = MoveTemp(Remaining);
+			}
+			for (const FVector2D& Span : Spans)
+			{
+				if (Span.Y - Span.X < 1.0) continue;
+				const FVector2D XY = F.Start + F.In * (Depth * 0.5) + F.U * ((Span.X + Span.Y) * 0.5);
+				OutBlocks.Add({ FVector(XY.X, XY.Y, Z), FVector(Span.Y - Span.X, Depth, CourseHeight), Rotation });
+			}
+		};
+		for (int32 K = 0; K < Count; ++K) AddBlock(T0 + (K + 0.5) * Step, Step + 1.0, Roof.EaveZ + CourseHeight * 0.5);
+		// 半砖垛在每条边两端接成转角，中间隔一个空档；无随机计数，尺寸拖动时稳定。
+		const int32 Merlons = FMath::Clamp(FMath::RoundToInt(Length / 110.0), 1, 256);
+		for (int32 K = 0; K <= Merlons; ++K)
+		{
+			const double Half = FMath::Min(Length / Merlons * 0.24, 28.0);
+			const double A = FMath::Max(T0, T0 + Length * K / Merlons - Half);
+			const double B = FMath::Min(T1, T0 + Length * K / Merlons + Half);
+			AddBlock((A + B) * 0.5, B - A + 1.0, Roof.EaveZ + CourseHeight * 1.5);
+		}
+	}
+}
+
 namespace
 {
 // Unity/jumbo 构建共享 TU，file-local 一律 CSHouseRoof_ 前缀。

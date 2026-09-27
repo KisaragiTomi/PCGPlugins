@@ -220,6 +220,7 @@ void BuildAnchors(const FSite& Site, const FParams& Params, TArray<FAnchor>& Out
 	// ⚠️ 高度**一律从 `CSHouseRoof.h` 的求值器取**，这里一条屋顶方程都不写（计划 D4：
 	// 屋面方程一旦散开，铺瓦 / 铺梁 / 落窗谓词就会各写一份，彼此差一点点就穿帮）。
 	// -------------------------------------------------------------------------
+	if (!Site.Roof.bFlat)
 	{
 		const FCSRoofDesc& Roof = Site.Roof;
 		const float EaveZ = CSHouseRoof_EaveOuterZ(Roof) + Params.RoofStandOff;

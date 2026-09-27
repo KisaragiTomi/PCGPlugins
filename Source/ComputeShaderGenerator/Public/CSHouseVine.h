@@ -34,6 +34,16 @@ struct FCSWallOpening;
  */
 namespace CSHouseVine
 {
+/**
+ * 采样点下面**根本没有地面**时写进 `FWallStrip::GroundGaps` 的空隙（cm）：按悬空处理，这段墙不长藤
+ * （用户裁决 2026-09-21：收不到地面通知的藤直接清掉，留着只会是永远不刷新的陈旧结果）。
+ *
+ * ⚠️ 不能用 +∞ 或 `TNumericLimits<float>::Max()`：`SampleGroundGap` 在相邻两个采样间 `Lerp`，
+ * ∞ − ∞ = NaN，而 `NaN > MaxGroundGap` 为假 ⇒ 藤反而长出来；空隙摘要还要过 `CSHouse_Q` 的 int32
+ * 量化进哈希，float 上限会溢出。10 km 远超任何 `MaxGroundGap`，插值与量化都安全。
+ */
+inline constexpr float NoGroundGap = 1.0e6f;
+
 /** 一面墙的外皮矩形。原点在墙脚外棱，U 沿墙、Up 向上、N 朝屋外，三者右手正交。 */
 struct FWallStrip
 {
@@ -54,7 +64,8 @@ struct FWallStrip
 	 *
 	 * ⚠️ **空数组 = 不知道，按贴地处理**，不是按悬空处理。判据是纯函数的入参，而单测里
 	 * 的墙没有地面可采 —— 缺省成"悬空"会让既有的十几条几何断言一次全红，而且红得毫无信息。
-	 * 采样点数由调用方定；`ACSHouseActor::BuildVineStrips` 按 `VineGroundSampleSpacing` 取。
+	 * 采样点数由调用方定；`ACSHouseActor::BuildVineStrips` 按 `VineGroundSampleSpacing` 取，
+	 * 并且**总会填满**：脚下没有地面的点写 `NoGroundGap`（悬空），不留空数组。
 	 */
 	TArray<float> GroundGaps;
 
@@ -68,6 +79,74 @@ struct FWallStrip
 		const float T = FMath::Clamp(S / Length, 0.0f, 1.0f) * float(SampleCount - 1);
 		const int32 Index = FMath::Clamp(int32(T), 0, SampleCount - 2);
 		return FMath::Lerp(GroundGaps[Index], GroundGaps[Index + 1], T - float(Index));
+	}
+
+	/**
+	 * 可选：**沿墙折线**（2026-09-22，样条墙 `ACSWallActor`）。非空（≥ 2 点）时这面墙不是平面矩形，而是
+	 * 一条竖直的带：(S, Z) → 世界 = 墙脚折线在弧长 S 处的点 + Up·Z，外法线也按 S 在相邻两点之间插值。
+	 * 弯墙的一面就是这样一条带 —— 拆成几十面半米长的短墙的话，藤每走半米就撞一次"墙角"。
+	 *
+	 * 空 = 平面矩形（房子的四面墙）：`Origin / U / N` 照旧生效，两处映射都保留原式，**逐位不变**。
+	 * 三个数组等长：`PathBase[i]` 是墙脚那条线上的点（世界），`PathS[i]` 是它的累计弧长
+	 * （首 0、末 = `Length`），`PathN[i]` 是该点的墙面外法线（单位、水平）。
+	 */
+	TArray<FVector> PathBase;
+	TArray<float> PathS;
+	TArray<FVector> PathN;
+
+	/**
+	 * 这面墙首尾相接（闭合样条墙的一面）：藤走过 S 的两端就绕回来，而不是去找隔壁那面墙。
+	 * 只对带折线的墙生效（平面墙没有"绕回来"这回事）。
+	 */
+	bool bLoop = false;
+
+	bool HasPath() const
+	{
+		return PathBase.Num() >= 2 && PathS.Num() == PathBase.Num() && PathN.Num() == PathBase.Num();
+	}
+
+	/** 闭合带把 S 绕回 [0, Length)；其余原样返回。 */
+	float WrapS(float S) const
+	{
+		if (!bLoop || Length <= UE_KINDA_SMALL_NUMBER) return S;
+		S = FMath::Fmod(S, Length);
+		return S < 0.0f ? S + Length : S;
+	}
+
+	/** 弧长 S 落在折线的第几段、段内比例多少（S 先绕回、再夹进 [0, Length]）。 */
+	void LocatePath(float S, int32& OutIndex, float& OutAlpha) const
+	{
+		const float Clamped = FMath::Clamp(WrapS(S), 0.0f, PathS.Last());
+		// 二分：弯墙的一面有几十到几百个点，藤的每一步都要问一次。
+		int32 Lo = 0, Hi = PathS.Num() - 1;
+		while (Hi - Lo > 1)
+		{
+			const int32 Mid = (Lo + Hi) / 2;
+			if (PathS[Mid] <= Clamped) Lo = Mid; else Hi = Mid;
+		}
+		const float Span = PathS[Hi] - PathS[Lo];
+		OutIndex = Lo;
+		OutAlpha = Span > UE_KINDA_SMALL_NUMBER ? FMath::Clamp((Clamped - PathS[Lo]) / Span, 0.0f, 1.0f) : 0.0f;
+	}
+
+	/** 折线墙：(S, Z) → 世界（含离墙 `StandOff`）。**平面墙不走这里** —— 两个调用点对平面墙保留原式。 */
+	FVector PathToWorld(float S, float Z, float StandOff) const
+	{
+		int32 Index = 0;
+		float Alpha = 0.0f;
+		LocatePath(S, Index, Alpha);
+		const FVector Base = FMath::Lerp(PathBase[Index], PathBase[Index + 1], double(Alpha));
+		const FVector Normal = FMath::Lerp(PathN[Index], PathN[Index + 1], double(Alpha)).GetSafeNormal(UE_SMALL_NUMBER, PathN[Index]);
+		return Base + Up * double(Z) + Normal * double(StandOff);
+	}
+
+	/** 折线墙在弧长 S 处的外法线（相邻两点之间插值）。 */
+	FVector PathNormal(float S) const
+	{
+		int32 Index = 0;
+		float Alpha = 0.0f;
+		LocatePath(S, Index, Alpha);
+		return FMath::Lerp(PathN[Index], PathN[Index + 1], double(Alpha)).GetSafeNormal(UE_SMALL_NUMBER, PathN[Index]);
 	}
 };
 
@@ -268,6 +347,38 @@ struct FTubePath
 	bool IsEmpty() const { return Points.IsEmpty() || SegmentMeta.IsEmpty(); }
 	void Reset() { Points.Reset(); Axes.Reset(); PointMeta.Reset(); SegmentMeta.Reset(); Growth.Reset(); }
 };
+
+/**
+ * 管子的环半径系数。**两个调用点必须用同一个值**：`PackTubePath` 按 `w = 想要的半径 / (10 * CircleScale)` 反解逐点缩放，
+ * Pass C 再按 `半径 = 10 * CircleScale * w` 还原。取值本身是任意的（两边约掉了），所以它是个常量而不是属性 —— 暴露出去
+ * 只会让人以为调它能改粗细（那是 `Thickness`），而真正的后果是两边取不同值时管子整体差一个常数倍、且两边各自都自洽。
+ * 房子与样条墙共用这一个（2026-09-22 之前各抄一份 `CSHouseVine_TubeCircleScale` / `CSWallActor_TubeCircleScale`）。
+ */
+inline constexpr float TubeCircleScale = 0.2f;
+
+/**
+ * 一根藤上一轮的生长记录（`ResolveSpawnTimes` 的记忆，键 = `FStrand::RootKey`）。
+ *
+ * ⚠️ 存的是**墙面参数坐标**而不是世界坐标：拖房子 / 拖墙时世界坐标整体在动，逐点比较会判成"处处都变了"，
+ * 于是每拖一帧整根藤重新长一遍。
+ */
+struct FStrandHistory
+{
+	float SpawnTime = 0.0f;
+	TArray<FVector2f> PointsSZ;
+	TArray<int32> Edges;
+};
+
+/**
+ * 生长相位（**纯函数**，房子与样条墙共用 —— 2026-09-22 之前两边各抄一份）：
+ *   · 全新的一根（第一次生成、或跨过藤位间距新增的那根）：`bGrowOnLoad ? Now : 长成`；
+ *   · 与上一轮逐点相同（墙面参数坐标 + 所在墙，容差 0.5 cm —— 更严会把浮点噪声判成"变了"，每次重求值都重新长一遍）：沿用；
+ *   · 改过的：前沿还没长到第一个不同的点 ⇒ 相位不动；越过了 ⇒ 把前沿拉回变化点，从那里接着长。
+ * `History` **整表替换**成这一轮的（只加不删会随编辑次数无界增长，而且泄漏得毫无症状）。
+ * `OutSpawnTimes` 与 `Plan.Strands` 一一对应。
+ */
+COMPUTESHADERGENERATOR_API void ResolveSpawnTimes(TMap<uint32, FStrandHistory>& History, const FPlan& Plan,
+	float Now, float GrowSpeed, bool bGrowOnLoad, TArray<float>& OutSpawnTimes);
 
 /** 调色板序号。**与 `ACSHouseActor::VineGpuBuffers` / `Pack` 的下标是同一套**，别各写各的。 */
 enum EPalette : int32 { Palette_Branch = 0, Palette_Leaf = 1, Palette_Flower = 2, Palette_Num = 3 };

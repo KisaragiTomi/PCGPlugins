@@ -1,7 +1,128 @@
 #include "CSStairs.h"
+#include "CSStairsSupport.h"
 
 namespace CSStairs
 {
+namespace
+{
+void CSStairs_AddBeam(const FVector& A, const FVector& B, double Width, double Depth, TArray<FBrick>& Out)
+{
+	const FVector Delta = B - A;
+	if (Delta.SizeSquared() < 0.01) return;
+	FBrick& Brick = Out.AddDefaulted_GetRef();
+	Brick.Center = (A + B) * 0.5;
+	Brick.Rotation = FRotationMatrix::MakeFromX(Delta.GetSafeNormal()).ToQuat();
+	Brick.Size = FVector(Delta.Size() + 2.0, Width, Depth);
+}
+
+void CSStairs_ResampleRun(const FRun& Run, float Spacing, TArray<FSample>& Out)
+{
+	TArray<FVector> Input, Points;
+	TArray<TPair<int32, float>> Source;
+	for (const FSample& S : Run.Samples) Input.Add(S.Position);
+	ResamplePolyline(Input, Spacing, Points, Source);
+	for (int32 I = 0; I < Points.Num(); ++I)
+	{
+		const FSample& A = Run.Samples[Source[I].Key];
+		const FSample& B = Run.Samples[Source[I].Key + 1];
+		FSample S;
+		S.Position = Points[I];
+		S.Width = FMath::Lerp(A.Width, B.Width, Source[I].Value);
+		S.Dir = FMath::Lerp(A.Dir, B.Dir, double(Source[I].Value)).GetSafeNormal();
+		if (S.Dir.IsNearlyZero()) S.Dir = A.Dir;
+		if (S.Dir.IsNearlyZero()) S.Dir = FVector2D(1.0, 0.0);
+		Out.Add(S);
+	}
+}
+}
+
+void BuildRunRails(const FRun& Run, const FParams& Params, const FGroundSampler& Ground, TArray<FBrick>& OutRails)
+{
+	if (Params.Railing == ECSStairsRailing::None || Run.Type == ESegmentType::Ladder) return;
+	TArray<FSample> Samples;
+	CSStairs_ResampleRun(Run, Params.StepLength, Samples);
+	if (Samples.Num() < 2) return;
+	const bool bLiftWalkway = Run.Type == ESegmentType::Walkway && bool(Ground);
+	for (FSample& S : Samples) if (bLiftWalkway) S.Position.Z = FMath::Max(S.Position.Z, double(Ground(FVector2D(S.Position)) + Params.TreadClearance));
+	const bool bWood = Params.Railing == ECSStairsRailing::Wooden;
+	const double Height = Params.Railing == ECSStairsRailing::Low ? 45.0 : 90.0;
+	const double Thick = bWood ? 9.0 : 20.0;
+	TArray<double> Treads;
+	for (int32 I = 0; I + 1 < Samples.Num(); ++I)
+	{
+		double Z = FMath::Max(Samples[I].Position.Z, Samples[I + 1].Position.Z);
+		const FVector Mid = (Samples[I].Position + Samples[I + 1].Position) * 0.5;
+		if (Ground) Z = FMath::Max(Z, double(Ground(FVector2D(Mid)) + Params.TreadClearance));
+		Treads.Add(Z);
+	}
+	for (const double Side : { -1.0, 1.0 })
+	{
+		TArray<FVector> Edge;
+		for (int32 I = 0; I < Samples.Num(); ++I)
+		{
+			const FSample& S = Samples[I];
+			const double Half = FMath::Max(double(S.Width - (Params.bNarrowByRailing ? Params.RailingNarrow : 0.0f)), double(Params.MinWidth)) * 0.5;
+			const FVector2D XY = FVector2D(S.Position) + FVector2D(-S.Dir.Y, S.Dir.X) * (Side * FMath::Max(Half - Thick * 0.5, 0.0));
+			// 踏步交界取两级较高者：木柱必须坐在踏步内，不悬浮，也不穿出栏杆顶面。
+			const double Z = FMath::Max(Treads[FMath::Max(I - 1, 0)], Treads[FMath::Min(I, Treads.Num() - 1)]);
+			Edge.Add(FVector(XY.X, XY.Y, Z));
+		}
+		for (int32 I = 0; I + 1 < Edge.Num(); ++I)
+		{
+			if (bWood)
+			{
+				CSStairs_AddBeam(Edge[I] + FVector(0, 0, Height), Edge[I + 1] + FVector(0, 0, Height), Thick, 8.0, OutRails);
+				CSStairs_AddBeam(Edge[I] + FVector(0, 0, Height * 0.48), Edge[I + 1] + FVector(0, 0, Height * 0.48), Thick, 7.0, OutRails);
+			}
+			else
+			{
+				const FVector Delta = Edge[I + 1] - Edge[I];
+				const int32 Courses = Params.Railing == ECSStairsRailing::High ? 2 : 1;
+				for (int32 C = 0; C < Courses; ++C)
+				{
+					FBrick& B = OutRails.AddDefaulted_GetRef();
+					B.Center = (Edge[I] + Edge[I + 1]) * 0.5;
+					B.Center.Z = Treads[I] + Height * (C + 0.5) / Courses;
+					B.Size = FVector(FVector2D(Delta).Size() * 1.08, Thick, Height / Courses);
+					B.Rotation = FQuat(FVector::UpVector, FMath::Atan2(Delta.Y, Delta.X));
+				}
+			}
+		}
+		if (!bWood) continue;
+		double SincePost = 100.0;
+		for (int32 I = 0; I < Edge.Num(); ++I)
+		{
+			if (I > 0) SincePost += FVector::Distance(Edge[I - 1], Edge[I]);
+			if (SincePost < 100.0 && I + 1 < Edge.Num()) continue;
+			CSStairs_AddBeam(Edge[I] - FVector(0, 0, 5.0), Edge[I] + FVector(0, 0, Height + 7.0), 12.0, 12.0, OutRails);
+			SincePost = 0.0;
+		}
+	}
+}
+
+int32 BuildLadder(const FRun& Run, const FParams& Params, TArray<FBrick>& OutWood)
+{
+	if (Run.Type != ESegmentType::Ladder) return 0;
+	TArray<FSample> Samples;
+	CSStairs_ResampleRun(Run, 30.0f, Samples);
+	if (Samples.Num() < 2) return 0;
+	TArray<FVector> Left, Right;
+	for (const FSample& S : Samples)
+	{
+		const double Half = FMath::Clamp(double(S.Width) * 0.5, 22.5, 65.0);
+		const FVector Perp(-S.Dir.Y, S.Dir.X, 0.0);
+		Left.Add(S.Position - Perp * Half);
+		Right.Add(S.Position + Perp * Half);
+	}
+	for (int32 I = 0; I + 1 < Samples.Num(); ++I)
+	{
+		CSStairs_AddBeam(Left[I], Left[I + 1], 10.0, 12.0, OutWood);
+		CSStairs_AddBeam(Right[I], Right[I + 1], 10.0, 12.0, OutWood);
+	}
+	for (int32 I = 0; I < Samples.Num(); ++I) CSStairs_AddBeam(Left[I], Right[I], 9.0, 9.0, OutWood);
+	return Samples.Num();
+}
+
 ESegmentType ClassifySegment(float DeltaHeight, float HorizontalChord, const FParams& Params)
 {
 	// 竖直段（水平弦为零）没有坡度可言，按最陡那一档走。
@@ -269,36 +390,10 @@ int32 BuildRunBricks(const FRun& Run, const FParams& Params, const FGroundSample
 		};
 		EmitCourse(TreadZ, TreadZ - Height, Pieces, JitterWidth);
 
-		// MVP 支撑（`FParams::bSolidToGround`）：踏步块底到地面之间砌成一层层的砖，层缝落在世界 Z 的
-		// `SupportCourseHeight` 整数倍上 —— 相邻两级各砌各的，水平缝照样对齐。
-		if (Params.bSolidToGround && Ground)
-		{
-			const float SupportBottom = Ground(Mid2) - Params.BuryTolerance;
-			const float Course = FMath::Max(Params.SupportCourseHeight, 5.0f);
-			float Top = TreadZ - Height;
-			while (Top - SupportBottom > 0.5f)
-			{
-				// 下一条层缝：Top 以下最近的整数倍；贴着上一层太薄（不到半层）就再往下一条，免得出一片薄砖。
-				float Bottom = FMath::FloorToFloat(Top / Course) * Course;
-				if (Top - Bottom < Course * 0.5f) Bottom -= Course;
-				// 最底一层同理：剩下不到半层就并进这一层，一直砌到地面。
-				if (Bottom - SupportBottom < Course * 0.5f) Bottom = SupportBottom;
-				// 支撑砖比踏步砖长一档：同样的块数定档，宽楼梯按砖长切。
-				int32 CoursePieces = 1;
-				float CourseJitter = Params.SplitJitterWidth;
-				if (Width >= Params.SingleBrickMaxWidth)
-				{
-					const float BrickLength = FMath::SmoothStep(0.0f, 1.0f, Rand.FRand()) * (Params.BrickLengthWide - Params.BrickLengthNarrow)
-						+ Params.BrickLengthNarrow;
-					CoursePieces = FMath::Max(1, FMath::RoundToInt(Width / BrickLength));
-					CourseJitter = FMath::Max(0.3f * BrickLength, Params.SplitJitterWidth);
-				}
-				EmitCourse(Top, Bottom, CoursePieces, CourseJitter);
-				Top = Bottom;
-			}
-		}
+
 		++Emitted;
 	}
+	BuildRunSupports(Run, Params, Ground, Seed, OutBricks);
 	return Emitted;
 }
 }

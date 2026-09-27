@@ -94,9 +94,9 @@ void CSHouseFrame_Flatten(const TArray<CSHouseFrame::FElement>& In, TArray<FVect
 		Out.Add(FVector4f(E.CullBelowZ,
 			E.QuoinScale > 0.0f ? E.QuoinMeshInvSize.X : E.ShearAtS0,
 			E.QuoinScale > 0.0f ? E.QuoinMeshInvSize.Y : E.ShearAtS1, E.Jitter));
-		// [7] 分层抖动幅度（cm，≤ 0 = 等分）| 本条路的总弧长（kernel 拿它把 cm 归一化）| 角石比例 | 角石的 cos(转角/2)。
+		// [7] 分层抖动 | 总弧长 | 角石比例 | 角石 cos(转角/2) 或拱的竖向半径（互斥）。
 		Out.Add(FVector4f(E.SplitJitter, E.Path.TotalLen(), E.QuoinScale,
-			E.QuoinScale > 0.0f ? E.QuoinHalfTurnCos : 0.0f));
+			E.QuoinScale > 0.0f ? E.QuoinHalfTurnCos : E.Path.ArcRise));
 	}
 }
 }
@@ -144,6 +144,7 @@ bool MakeOpeningPath(const FCSWallOpening& Opening, FPath& OutPath)
 	case ECSOpeningShape::Arch:
 	default:
 		OutPath.Radius = HW;
+		OutPath.ArcRise = Opening.Rise();
 		// ⚠️ 起拱线要**夹到洞底以上**：clip 场的 `RefZ = Z1 − 半宽` 没有这个夹（拱的判据在
 		// 拱脚线以下本来就无下界，见 FCSOpeningClipField 的注释），而砖路必须与
 		// `CSHouse_SampleOpeningProfile` 的 `SpringZ = max(Z1 − R, Z0)` 同口径 ——

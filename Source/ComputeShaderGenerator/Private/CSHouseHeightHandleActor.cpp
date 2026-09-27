@@ -30,6 +30,11 @@ void ACSHouseHeightHandleActor::InitializeHandle(ACSHouseActor* InHost, ECSHouse
 {
 	SetHost(InHost);
 	Side = InSide;
+	if (Side == ECSHouseHeightHandleSide::Roof)
+	{
+		FrameScale = 0.35f;
+		FrameThickness = 10.0f;
+	}
 
 	for (UStaticMeshComponent* Bar : BarComponents) ApplyHighlightMaterial(Bar);
 
@@ -44,7 +49,9 @@ FVector ACSHouseHeightHandleActor::ComputeCanonicalWorldLocation() const
 
 	// 房心正上方：檐口框在檐口高度（它因此同时是"墙有多高"的读数），房底框在房底（局部 Z = 0，
 	// 与檐口框的算法只差这一个高度）。
-	const double LocalZ = (Side == ECSHouseHeightHandleSide::Base) ? 0.0 : double(H->WallHeight);
+	const double LocalZ = Side == ECSHouseHeightHandleSide::Roof
+		? double(H->WallHeight + H->RoofHeightOffset + H->GetRoofRise() + 85.0f)
+		: (Side == ECSHouseHeightHandleSide::Base ? 0.0 : double(H->WallHeight));
 	return H->GetActorTransform().TransformPosition(FVector(0.0, 0.0, LocalZ));
 }
 
@@ -127,7 +134,7 @@ bool ACSHouseHeightHandleActor::OnHandleDrag(bool bFinished)
 
 	const float Applied = (Side == ECSHouseHeightHandleSide::Base)
 		? H->PushBase(Offset, bFinished)
-		: H->PushHeight(Offset, bFinished);
+		: (Side == ECSHouseHeightHandleSide::Roof ? H->PushRoofHeight(Offset, bFinished) : H->PushHeight(Offset, bFinished));
 
 	// 全部抓手统一重摆（含自己）：改墙高会让拉尺寸锥子的规范高度一起变（它们挂在
 	// `WallHeight × HandleHeightFraction` 上）、改房底会让房子整体抬降，不重摆就会留在原来的高度上。

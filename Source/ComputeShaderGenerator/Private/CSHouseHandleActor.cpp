@@ -3,6 +3,8 @@
 #include "CSHouseActor.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/SceneComponent.h"
+#include "Engine/StaticMesh.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
 
 ACSHouseHandleActor::ACSHouseHandleActor()
@@ -32,15 +34,34 @@ void ACSHouseHandleActor::MakeEditorGizmoProp(UPrimitiveComponent* Component)
 	Component->bIsEditorOnly = true;
 }
 
+UMaterialInterface* ACSHouseHandleActor::LoadHighlightMaterial()
+{
+	static const TCHAR* const HighlightPath = TEXT("/PCGPlugins/HouseTest/M_CSHandleHighlight.M_CSHandleHighlight");
+	return LoadObject<UMaterialInterface>(nullptr, HighlightPath);
+}
+
 void ACSHouseHandleActor::ApplyHighlightMaterial(UPrimitiveComponent* Component)
 {
 	if (!Component) return;
+	if (UMaterialInterface* Highlight = LoadHighlightMaterial()) Component->SetMaterial(0, Highlight);
+}
 
-	static const TCHAR* const HighlightPath = TEXT("/PCGPlugins/HouseTest/M_CSHandleHighlight.M_CSHandleHighlight");
-	if (UMaterialInterface* Highlight = LoadObject<UMaterialInterface>(nullptr, HighlightPath))
-	{
-		Component->SetMaterial(0, Highlight);
-	}
+void ACSHouseHandleActor::ApplyOutlineMaterial(UPrimitiveComponent* Component)
+{
+	if (!Component) return;
+	UMaterialInterface* Highlight = LoadHighlightMaterial();
+	if (!Highlight) return;
+
+	// 参数名是 `Scripts/TinyGladeMakeHandleMaterial.py` 定的：Emissive = HighlightColor × Intensity，
+	// BaseColor 近黑。强度归零即"一圈暗边"。
+	UMaterialInstanceDynamic* Outline = UMaterialInstanceDynamic::Create(Highlight, Component);
+	Outline->SetScalarParameterValue(TEXT("Intensity"), 0.0f);
+	Component->SetMaterial(0, Outline);
+}
+
+UStaticMesh* ACSHouseHandleActor::LoadTGArrowMesh(const TCHAR* Name)
+{
+	return LoadObject<UStaticMesh>(nullptr, *FString::Printf(TEXT("/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/%s.%s"), Name, Name));
 }
 
 bool ACSHouseHandleActor::HandleDrag(bool bFinished)

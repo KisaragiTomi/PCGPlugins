@@ -2,6 +2,16 @@
 
 #include "CoreMinimal.h"
 #include "Math/RandomStream.h"   // RandomSplits 的入参 —— 别指望 unity 构建替你带进来
+#include "CSStairs.generated.h"
+
+UENUM(BlueprintType)
+enum class ECSStairsRailing : uint8
+{
+	None,
+	Low,
+	High,
+	Wooden,
+};
 
 /**
  * 玩家绘制楼梯的纯函数层（TG §4.1 `playermade` 的对位物，2026-09-16）。
@@ -25,11 +35,10 @@
  * -----------------------------------------------------------------------------
  * - 节点高度是**样条点的世界 Z**，不是 TG 的「地形 + 偏移」：UE 里直接在视口拖样条点最顺手，
  *   而"不许低于地面 10 cm"那条夹子照样保证楼梯不会整段埋进土里。
- * - 梯子（坡度 > 2.5）不出几何：分类照 TG 给出 `Ladder`，由 `ACSStairsActor` 留空并告警
- *   （TG `construct_ladder` 没有对位资产）。
+ * - 梯子（坡度 > 2.5）复用木板网格装配边梁和横档；三种栏杆随踏步路径生成。尺寸为本项目适配。
  * - 顶面四角的随机起伏（`sin_deform_y`，±5 cm）不做：那是 TG 砖顶点着色器里的形变，
  *   本项目的实例组件画的是刚体单位盒。
- * - 支撑：TG 的拱墙 / 柱 / 托架（附录 D §3）不做，MVP 用 `FParams::bSolidToGround` 在踏步块底下按层砌砖到地面顶替；栏杆（§5）不做。
+ * - 支撑：`CSStairsSupport` 规划拱洞，复用房屋的洞剖面、横带切分和拱圈排砖；托架尚未接入。
  * - 门前踏步（§4.0）在这一层（`BuildDoorSteps`），由窗贴墙脚变成的门调用。
  */
 namespace CSStairs
@@ -41,7 +50,7 @@ enum class ESegmentType : uint8
 	Walkway = 1,
 	/** 0.25 < 坡度 ≤ 2.5：踏步。 */
 	Steps = 2,
-	/** 坡度 > 2.5：TG 出梯子；本项目按踏步出（见文件头）。 */
+	/** 坡度 > 2.5：生成木梯边梁与横档。 */
 	Ladder = 3,
 };
 
@@ -83,17 +92,12 @@ struct FParams
 	 * ⚠️ 这不是"最窄一片"：TG 的 `random_splits` 是近似等分 + 分界抖动（附录 D §6.4）。
 	 */
 	float SplitJitterWidth = 32.0f;
-	/**
-	 * 踏步块底下**砌到地面**（再埋 `BuryTolerance`）。**本项目的 MVP 支撑**（附录 D §9.3）：TG 楼梯底下的
-	 * 拱 / 墙 / 柱是墙构造器整套砌出来的、离地阈值没查清，先让高处的踏步读作一段实心的砖砌台基。没有地面时不起作用。
-	 *
-	 * ⚠️ **砌成一层层的砖，不是把踏步块拉长**：`brick` 带倒角，竖向拉到 3–5 倍之后倒角跟着拉成一条条竖棱，
-	 * 整段读作一排木桩（2026-09-16 出图抓到）。改成 `SupportCourseHeight` 一层的砖，层缝落在**全局统一的高度**上，
-	 * 相邻两级的水平缝对得齐，读作砌体。
-	 */
+	/** Enable grounded masonry using the shared wall profile and brick layout. */
 	bool bSolidToGround = true;
-	/** 支撑砌体一层的名义高度 cm。层缝按世界 Z 的整数倍对齐；贴着踏步块的那半层太薄时并进下一层。 */
-	float SupportCourseHeight = 40.0f;
+	/** Fit through arches wherever the stair clearance permits; false produces a solid wall. */
+	bool bArchedSupport = true;
+	float SupportCourseHeight = 25.0f;
+	ECSStairsRailing Railing = ECSStairsRailing::None;
 };
 
 /**
@@ -204,6 +208,11 @@ COMPUTESHADERGENERATOR_API void ResamplePolyline(TArrayView<const FVector> Point
  */
 COMPUTESHADERGENERATOR_API int32 BuildRunBricks(const FRun& Run, const FParams& Params, const FGroundSampler& Ground,
 	uint32 Seed, TArray<FBrick>& OutBricks);
+
+/** 沿踏步两侧生成栏杆，梯子另出两根边梁与等距横档；输出尺寸以 cm 计。 */
+COMPUTESHADERGENERATOR_API void BuildRunRails(const FRun& Run, const FParams& Params, const FGroundSampler& Ground,
+	TArray<FBrick>& OutRails);
+COMPUTESHADERGENERATOR_API int32 BuildLadder(const FRun& Run, const FParams& Params, TArray<FBrick>& OutWood);
 
 /**
  * 切分（TG `utils::random_splits(n, jitter)`，附录 D §6.4）：把 [0, 1] **近似等分**成 `Count` 片，

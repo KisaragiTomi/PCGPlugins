@@ -3,6 +3,7 @@
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 
 #include "CSGpuMeshTypes.h"
+#include "CSGroundActor.h"      // (18) 脚下有没有地面
 #include "CSGroundShaperSteps.h"  // (17) CSShaperSteps::CapacityStep —— 管子容量的台阶
 #include "CSHouseActor.h"
 #include "CSHouseProfile.h"
@@ -12,6 +13,8 @@
 #include "Math/NumericLimits.h"
 #include "RenderingThread.h"    // (17) FlushRenderingCommands —— 泵异步编辑的游戏线程尾巴
 #include "UObject/Package.h"    // (17) GetTransientPackage
+#include "Engine/World.h"
+#include "Tests/AutomationEditorCommon.h"
 
 // -----------------------------------------------------------------------------
 // 墙面藤蔓（D13）的验收。
@@ -1191,6 +1194,87 @@ bool FCSHouseVineTubeRegrowthZeroFlushTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("顶点容量没有被重新分配"), Mesh->GetVertexCapacity(), VertexCapacity);
 	TestEqual(TEXT("索引容量没有被重新分配"), Mesh->GetIndexCapacity(), IndexCapacity);
 	TestTrue(TEXT("第二根管子的异步编辑已落地"), Settle());
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// (18) 脚下没有地面的墙不长藤（用户裁决 2026-09-21）
+//
+// 收不到地面通知的藤直接清掉：`BuildVineStrips` 在无地面处写 `NoGroundGap`，走的是既有的
+// "悬空不长藤"判据。两条：纯 CPU 那条钉住哨兵值与插值（∞ 会插出 NaN、NaN 不大于阈值 ⇒ 藤反而
+// 长出来）；actor 那条钉住三种"房下什么都没有"——场景里没有地面、地面后出现、房子在地面范围外。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseVineNoGroundSentinelTest,
+	"PCGPlugins.ComputeShaderGenerator.House.VineSkipsWallsWithoutGround",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseVineNoGroundSentinelTest::RunTest(const FString& Parameters)
+{
+	const CSHouseVine::FParams Params = CSVineTest_MakeParams();
+	const float NoGround = CSHouseVine::NoGroundGap;
+
+	// 哨兵之间、哨兵与贴地之间的插值都必须仍然判成悬空，不能是 NaN。
+	CSHouseVine::FWallStrip Probe = CSVineTest_MakeStrip();
+	Probe.GroundGaps = { NoGround, NoGround };
+	TestTrue(TEXT("两个无地面采样之间插值仍是悬空"), Probe.SampleGroundGap(CSVineTest_Length * 0.37f) > Params.MaxGroundGap);
+	Probe.GroundGaps = { 0.0f, NoGround };
+	TestTrue(TEXT("贴地 → 无地面之间插值是有限值"), FMath::IsFinite(Probe.SampleGroundGap(CSVineTest_Length * 0.5f)));
+
+	auto CountStrands = [&Params](const TArray<float>& Gaps)
+	{
+		TArray<CSHouseVine::FWallStrip> Strips;
+		Strips.Add(CSVineTest_MakeStrip());
+		Strips[0].GroundGaps = Gaps;
+		CSHouseVine::FPlan Plan;
+		CSHouseVine::BuildPlan(Strips, TArray<FCSWallOpening>(), Params, Plan);
+		return Plan.Strands.Num();
+	};
+
+	const int32 Grounded = CountStrands({ 0.0f, 0.0f, 0.0f, 0.0f });
+	const int32 NoGroundAtAll = CountStrands({ NoGround, NoGround, NoGround, NoGround });
+	const int32 HalfOnGround = CountStrands({ 0.0f, 0.0f, NoGround, NoGround });
+	AddInfo(FString::Printf(TEXT("藤根数：贴地 %d / 半边无地面 %d / 全无地面 %d"), Grounded, HalfOnGround, NoGroundAtAll));
+	TestTrue(TEXT("贴地的墙排得出藤（否则下面两条是空对空）"), Grounded > 2);
+	TestEqual(TEXT("整面墙脚下都没有地面：一根藤都不长"), NoGroundAtAll, 0);
+	TestTrue(TEXT("半边没有地面：只有贴地那半边长藤"), HalfOnGround > 0 && HalfOnGround < Grounded);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseVineNeedsGroundUnderneathTest,
+	"PCGPlugins.ComputeShaderGenerator.House.VineNeedsGroundUnderneath",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter | EAutomationTestFlags::NonNullRHI)
+
+bool FCSHouseVineNeedsGroundUnderneathTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	// ① 场景里没有地面：以前按"不知道 = 贴地"照长，现在整栋按悬空。
+	// 默认地面 64×64 格 × 50 cm，从原点铺到 (3200, 3200)；这栋房子等下会落在它正中。
+	ACSHouseActor* Early = World->SpawnActor<ACSHouseActor>(FVector(1600.0, 1600.0, 0.0), FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("先于地面出现的房子"), Early)) return false;
+	Early->FlushPendingReevaluate();
+	TestTrue(TEXT("场景里没有地面：零藤是合法状态"), Early->IsVineSuppressedByGroundGap());
+
+	// ② 地面后出现：它的全量重建要叫醒这栋还没拿到地面指针的房子，否则藤永远秃着。
+	const int64 ReevaluatesBefore = Early->GetReevaluateCount();
+	ACSGroundActor* Ground = World->SpawnActor<ACSGroundActor>(FVector::ZeroVector, FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("Ground actor"), Ground)) return false;
+	Ground->StairMesh = nullptr;   // 本用例只看高度场，石阶那条路不参与
+	Ground->RebuildGroundMesh();
+	TestTrue(TEXT("地面重建叫醒了还没找到地面的房子"), Early->IsReevaluatePending() || Early->GetReevaluateCount() > ReevaluatesBefore);
+	Early->FlushPendingReevaluate();
+	TestTrue(TEXT("房子确实重求值过"), Early->GetReevaluateCount() > ReevaluatesBefore);
+	TestFalse(TEXT("地面就在脚下：藤回来了"), Early->IsVineSuppressedByGroundGap());
+
+	// ③ 有地面，但房子在地面范围外：`SampleHeight` 会在这里垫一块假想平地，必须不被它骗。
+	ACSHouseActor* OffGround = World->SpawnActor<ACSHouseActor>(FVector(20000.0, 20000.0, 0.0), FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("地面范围外的房子"), OffGround)) return false;
+	OffGround->FlushPendingReevaluate();
+	TestTrue(TEXT("地面范围外：脚下什么都没有，零藤"), OffGround->IsVineSuppressedByGroundGap());
 	return true;
 }
 

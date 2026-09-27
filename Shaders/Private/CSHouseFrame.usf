@@ -24,7 +24,7 @@
 //   [6] CullBelowZ（世界 Z 低于它的砖写负值随机数 ⇒ 实例组件把它藏掉；≤ 0 = 不剔）
 //       | ShearAtS0 | ShearAtS1 | Jitter；角石分支下 yz = 1 / 基础网格的 X、Z 尺寸
 //   [7] SplitJitter（分层抖动幅度 cm，≤ 0 = 等分）| 本条路的总弧长（kernel 拿它把 cm 归一化）| QuoinScale（> 0 = 按相邻墙面包角）
-//       | 角石所在角的 cos(转角/2)（≤ 0 = 直角）
+//       | 角石 cos(转角/2) 或拱竖向半径 ArcRise（互斥；0 = 正圆）
 //
 // packed 行布局照抄 CSGpuInstancedMesh.usf：前三行是被缩放过的基（**矩阵的行**），第 4 行是
 // 原点 + 每实例随机数，第 5 行是剔除球（必须包住变换后的基础网格，否则实例会在视锥边缘闪掉）。
@@ -36,6 +36,7 @@
 //        法线朝里、光照当场坏掉）
 
 #include "/Engine/Public/Platform.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/CSArchCurve.ush"
 
 #ifndef THREADGROUPSIZE_X
 #define THREADGROUPSIZE_X 64
@@ -79,7 +80,7 @@ float FrameInstanceRandom(uint Index)
  * （只有中段的圆洞 / 只有左段的墩）因此不会掉进后面那段的公式里去算出一个看着合理的错位置。
  */
 void FrameEvalPath(uint Flags, float BaseZ, float TopZ, float LeftS, float RightS,
-	float CenterS, float Radius, float MidMeasure, float Arc,
+	float CenterS, float Radius, float Rise, float MidMeasure, float Arc,
 	out float2 OutSZ, out float2 OutTangent)
 {
 	const float JambLen = max(TopZ - BaseZ, 0.0f);
@@ -88,7 +89,7 @@ void FrameEvalPath(uint Flags, float BaseZ, float TopZ, float LeftS, float Right
 	const float L0 = bLeft ? JambLen : 0.0f;
 	const float L2 = bRight ? JambLen : 0.0f;
 	float L1 = 0.0f;
-	if (Flags & FRAME_FLAG_MID_ARC)  L1 = max(Radius, 0.0f) * MidMeasure;
+	if (Flags & FRAME_FLAG_MID_ARC)  L1 = CSArch_Length(max(Radius, 0.0f), Rise, MidMeasure);
 	if (Flags & FRAME_FLAG_MID_FLAT) L1 = max(MidMeasure, 0.0f);
 
 	const float Total = L0 + L1 + L2;
@@ -105,11 +106,12 @@ void FrameEvalPath(uint Flags, float BaseZ, float TopZ, float LeftS, float Right
 		const float T = min(A - L0, L1);
 		if (Flags & FRAME_FLAG_MID_ARC)
 		{
-			const float Theta = Radius > 1e-4f ? T / Radius : 0.0f;
+			Rise = CSArch_Rise(Radius, Rise);
+			const float Theta = CSArch_Angle(Radius, Rise, MidMeasure, T);
 			float SinT, CosT;
 			sincos(Theta, SinT, CosT);
-			OutSZ = float2(CenterS - Radius * CosT, TopZ + Radius * SinT);
-			OutTangent = float2(SinT, CosT);   // θ=0 → (0,1)，θ=π → (0,−1)：与两侧竖直段切向连续
+			OutSZ = float2(CenterS - Radius * CosT, TopZ + Rise * SinT);
+			OutTangent = normalize(float2(Radius * SinT, Rise * CosT));   // θ=0 → (0,1)，θ=π → (0,−1)：与两侧竖直段切向连续
 		}
 		else
 		{
@@ -228,7 +230,7 @@ void ScatterHouseFrameCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	}
 
 	float2 SZ, TangentSZ;
-	FrameEvalPath(Flags, R3.x, R2.w, R3.y, R3.z, R0.w, R1.w, R3.w, Arc, SZ, TangentSZ);
+	FrameEvalPath(Flags, R3.x, R2.w, R3.y, R3.z, R0.w, R1.w, R7.w, R3.w, Arc, SZ, TangentSZ);
 
 	// 面内朝外法线 = 切向逆时针转 90°。旧 kernel 要靠"减去曲线中心求径向 + 投影掉平面法线
 	// + 判号翻转"三步才得到同一个方向，那三步在拱心退化时会翻错号；这里没有可翻错的号。

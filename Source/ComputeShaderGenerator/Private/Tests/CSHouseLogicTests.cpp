@@ -5213,8 +5213,8 @@ bool FCSHouseResizeHandleTest::RunTest(const FString& Parameters)
 	House->EnterResizeMode();
 	TestTrue(TEXT("Entering resize mode reports the mode is on"), House->IsInResizeMode());
 
-	// 六个抓手：四个水平锥子 + 檐口框 + 房底框（2026-09-14 加房底框：N + 2）。
-	TestEqual(TEXT("Six handles: four cones plus the eave frame and the base frame"), House->GetResizeHandles().Num(), 6);
+	// 七个抓手：四个水平锥子 + 檐口框 + 房底框 + 屋顶框。
+	TestEqual(TEXT("Seven handles: four cones plus eave, base and roof frames"), House->GetResizeHandles().Num(), 7);
 	TestNotNull(TEXT("The eave frame is there"), House->GetHeightHandle());
 	TestNotNull(TEXT("The base frame is there"), House->GetBaseHandle());
 	TestTrue(TEXT("The eave frame and the base frame are two different actors"), House->GetHeightHandle() != House->GetBaseHandle());
@@ -5256,7 +5256,7 @@ bool FCSHouseResizeHandleTest::RunTest(const FString& Parameters)
 
 	// 幂等：再进一次不许生出第二组（详情面板上的按钮会被连点）。
 	House->EnterResizeMode();
-	TestEqual(TEXT("Re-entering resize mode does not spawn a second set"), House->GetResizeHandles().Num(), 6);
+	TestEqual(TEXT("Re-entering resize mode does not spawn a second set"), House->GetResizeHandles().Num(), 7);
 
 	// ---- ② 拖 1 m 墙恰好走 1 m：父子回路那个 2x 缺陷的钉子 ----
 	ACSHouseResizeHandleActor* East = nullptr;
@@ -5363,7 +5363,7 @@ bool FCSHouseResizeHandleTest::RunTest(const FString& Parameters)
 		House->EnterResizeMode();
 		TArray<TWeakObjectPtr<ACSHouseHandleActor>> Weak;
 		for (ACSHouseHandleActor* Handle : House->GetResizeHandles()) Weak.Add(Handle);
-		if (!TestEqual(TEXT("Handles for the destroy pass"), Weak.Num(), 6)) return false;
+		if (!TestEqual(TEXT("Handles for the destroy pass"), Weak.Num(), 7)) return false;
 
 		World->DestroyActor(House);
 		for (const TWeakObjectPtr<ACSHouseHandleActor>& Handle : Weak)
@@ -5373,6 +5373,97 @@ bool FCSHouseResizeHandleTest::RunTest(const FString& Parameters)
 		}
 	}
 
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// 推墙抓手画的是 TG 原版箭头（`flat_arrow` + 描边）：躺平、头朝房外、gizmo 在箭头正中
+// -----------------------------------------------------------------------------
+//
+// 2026-09-22 起 EditHouse 的墙面标识换成 TG 矩形房子拉尺寸画的那一对（`rectangle/ui_modes/edit_dims.rs`）。
+// 几何是 TG 源 json 原样换轴烘的（`Scripts/TinyGladeMakeHandleArrows.py`），这里钉的是**摆法**：
+// 网格头指局部 +Y、+Z 是厚度，摆错的症状是"箭头竖着插在墙外"或"指向墙里"，而别的单测全绿。
+// 六边形 + 带 yaw：外法线不沿轴，yaw=0 的矩形测不出把局部量当世界量用的错误。
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseResizeHandleTGArrowTest,
+	"PCGPlugins.ComputeShaderGenerator.House.ResizeHandleTGArrow",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseResizeHandleTGArrowTest::RunTest(const FString& Parameters)
+{
+	UStaticMesh* Arrow = LoadObject<UStaticMesh>(nullptr, TEXT("/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/flat_arrow.flat_arrow"));
+	UStaticMesh* Outline = LoadObject<UStaticMesh>(nullptr, TEXT("/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/flat_arrow_outline.flat_arrow_outline"));
+	if (!TestNotNull(TEXT("TG arrow asset (run Scripts/TinyGladeMakeHandleArrows.py)"), Arrow)) return false;
+	if (!TestNotNull(TEXT("TG arrow outline asset"), Outline)) return false;
+
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	constexpr float Yaw = 37.0f;
+	ACSHouseActor* House = World->SpawnActor<ACSHouseActor>(FVector(1000.0, 2000.0, 0.0), FRotator(0.0f, Yaw, 0.0f));
+	if (!TestNotNull(TEXT("House"), House)) return false;
+	House->Windows.Reset();
+	House->FootprintShape = CSHouseTest_RegularPolygon(6, 1.0);
+	House->FootprintSize = FVector2D(600.0, 519.6152422706632);
+	House->ReevaluateSite();
+	House->EnterResizeMode();
+
+	const TArray<ACSHouseResizeHandleActor*> Handles = House->GetEdgeHandles();
+	if (!TestEqual(TEXT("one arrow per hexagon edge"), Handles.Num(), 6)) return false;
+
+	auto CheckArrow = [this](ACSHouseResizeHandleActor* Handle, const TCHAR* Stage)
+	{
+		UStaticMeshComponent* Body = nullptr;
+		UStaticMeshComponent* Rim = nullptr;
+		TArray<UStaticMeshComponent*> Components;
+		Handle->GetComponents(Components);
+		for (UStaticMeshComponent* Component : Components)
+		{
+			if (Component->GetFName() == TEXT("Arrow")) Body = Component;
+			else if (Component->GetFName() == TEXT("ArrowOutline")) Rim = Component;
+		}
+		const int32 Edge = Handle->GetEdgeIndex();
+		if (!TestNotNull(*FString::Printf(TEXT("%s edge %d: arrow body"), Stage, Edge), Body)) return;
+		if (!TestNotNull(*FString::Printf(TEXT("%s edge %d: arrow outline"), Stage, Edge), Rim)) return;
+		TestEqual(*FString::Printf(TEXT("%s edge %d: the body is TG's flat_arrow"), Stage, Edge),
+			Body->GetStaticMesh()->GetPathName(), FString(TEXT("/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/flat_arrow.flat_arrow")));
+		TestEqual(*FString::Printf(TEXT("%s edge %d: the rim is TG's flat_arrow_outline"), Stage, Edge),
+			Rim->GetStaticMesh()->GetPathName(), FString(TEXT("/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/flat_arrow_outline.flat_arrow_outline")));
+
+		const FTransform& X = Body->GetComponentTransform();
+		const FVector Outer = Handle->GetOuterNormalWorld();
+		TestTrue(*FString::Printf(TEXT("%s edge %d: the head (mesh +Y) points out of the house"), Stage, Edge),
+			X.GetUnitAxis(EAxis::Y).Equals(Outer, 1.0e-4));
+		TestTrue(*FString::Printf(TEXT("%s edge %d: the arrow lies flat (mesh +Z is up)"), Stage, Edge),
+			X.GetUnitAxis(EAxis::Z).Equals(FVector::UpVector, 1.0e-4));
+		TestTrue(*FString::Printf(TEXT("%s edge %d: scaled by ArrowScale"), Stage, Edge),
+			X.GetScale3D().Equals(FVector(Handle->ArrowScale), 1.0e-4));
+		// gizmo 就在 actor 原点 ⇒ 箭头的包围盒中心必须落在那儿。
+		TestTrue(*FString::Printf(TEXT("%s edge %d: the gizmo sits in the middle of the arrow"), Stage, Edge),
+			Body->Bounds.Origin.Equals(Handle->GetActorLocation(), 0.05));
+		// 箭尾 → 箭头沿外法线恰好一只箭头长（TG 原大 100 cm）。
+		const double Reach = FVector::DotProduct(X.TransformPosition(FVector(0.0, 100.0, 0.0)) - X.GetLocation(), Outer);
+		TestEqual(*FString::Printf(TEXT("%s edge %d: tail to head is 100 cm x ArrowScale"), Stage, Edge),
+			Reach, 100.0 * Handle->ArrowScale, 1.0e-2);
+		TestTrue(*FString::Printf(TEXT("%s edge %d: the rim rides the body"), Stage, Edge),
+			Rim->GetComponentTransform().Equals(X, 1.0e-4));
+	};
+
+	for (ACSHouseResizeHandleActor* Handle : Handles) CheckArrow(Handle, TEXT("hexagon"));
+
+	// 推一面墙之后全体重摆，箭头照样对：推拉改的是 footprint 与房心，attach 只保相对位置。
+	ACSHouseResizeHandleActor* Pushed = Handles[0];
+	Pushed->SetActorLocation(Pushed->GetActorLocation() + Pushed->GetOuterNormalWorld() * 50.0);
+	Pushed->ConsumeDragToHost(true);
+	for (ACSHouseResizeHandleActor* Handle : House->GetEdgeHandles()) CheckArrow(Handle, TEXT("after a push"));
+
+	// 缩放是纯观感量，下一次归位生效，gizmo 仍在箭头正中。
+	Pushed->ArrowScale = 2.0f;
+	Pushed->SnapToCanonical();
+	CheckArrow(Pushed, TEXT("ArrowScale 2"));
+
+	House->ExitResizeMode();
 	return true;
 }
 
@@ -5403,7 +5494,7 @@ bool FCSHouseResizeHandlePolylineTest::RunTest(const FString& Parameters)
 	if (!TestEqual(TEXT("the shaped house really is a hexagon"), Before.NumEdges(), 6)) return false;
 
 	House->EnterResizeMode();
-	TestEqual(TEXT("eight handles: six cones plus the eave frame and the base frame"), House->GetResizeHandles().Num(), 8);
+	TestEqual(TEXT("nine handles: six cones plus eave, base and roof frames"), House->GetResizeHandles().Num(), 9);
 	TArray<ACSHouseResizeHandleActor*> Handles = House->GetEdgeHandles();
 	if (!TestEqual(TEXT("one cone per hexagon edge"), Handles.Num(), 6)) return false;
 
@@ -5472,7 +5563,7 @@ bool FCSHouseResizeHandlePolylineTest::RunTest(const FString& Parameters)
 //
 // 此前锥子只在 `EnterResizeMode` 那一刻按边数生成一次：模式开着时把矩形改成六边形，锥子还是四个，
 // 五、六号边根本拖不动；反过来从六边形改回矩形，多出来的两个锥子认着不存在的边号悬在原地。
-// 边数按**凸包之后**算（凹形输入按凸包的边数）。两个高度框不受影响、不许被重建。
+// 边数按**凸包之后**算（凹形输入按凸包的边数）。三个高度框不受影响、不许被重建。
 // -----------------------------------------------------------------------------
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -5493,14 +5584,14 @@ bool FCSHouseResizeHandlesFollowEdgeCountTest::RunTest(const FString& Parameters
 	House->MinFootprint = 200.0f;
 	House->ReevaluateSite();
 
-	// 一个阶段的完整判据：边数、锥子数、N + 2、边号铺满 0..N-1、每个锥子都在自己那面墙外的规范位置上。
+	// 一个阶段的完整判据：边数、锥子数、N + 3、边号铺满 0..N-1、每个锥子都在自己那面墙外的规范位置上。
 	auto CheckCones = [this, House](const TCHAR* Stage, int32 WantEdges)
 	{
 		const FCSHouseFootprint Footprint = House->GetFootprint();
 		if (!TestEqual(FString::Printf(TEXT("%s: the footprint has %d edges"), Stage, WantEdges), Footprint.NumEdges(), WantEdges)) return false;
 		const TArray<ACSHouseResizeHandleActor*> Cones = House->GetEdgeHandles();
 		if (!TestEqual(FString::Printf(TEXT("%s: one cone per edge"), Stage), Cones.Num(), WantEdges)) return false;
-		TestEqual(FString::Printf(TEXT("%s: N + 2 handles in all"), Stage), House->GetResizeHandles().Num(), WantEdges + 2);
+		TestEqual(FString::Printf(TEXT("%s: N + 3 handles in all"), Stage), House->GetResizeHandles().Num(), WantEdges + 3);
 		TestTrue(FString::Printf(TEXT("%s: still in resize mode"), Stage), House->IsInResizeMode());
 
 		TSet<int32> Edges;

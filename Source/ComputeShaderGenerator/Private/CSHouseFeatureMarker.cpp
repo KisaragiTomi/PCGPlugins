@@ -53,7 +53,7 @@ ACSHouseFeatureMarker::ACSHouseFeatureMarker()
 
 #if WITH_EDITORONLY_DATA
 	// 编辑器拾取件：被拒时三件网格全藏，没有它就点不中这个 actor 了（见声明处）。
-	// 配法与 `ACSGroundShaperActor` 的 sprite 逐字相同 —— 那六行没理由各写一遍。
+	// 配法与 `ACSGroundShaperActor` 的 sprite 同形（那边 2026-09-18 换成 S_Terrain 并放大，这里仍是 S_Actor）。
 	PickSprite = CreateEditorOnlyDefaultSubobject<UBillboardComponent>(TEXT("PickSprite"));
 	if (PickSprite)
 	{

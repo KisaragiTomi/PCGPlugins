@@ -10,20 +10,24 @@
 
 ACSHouseResizeHandleActor::ACSHouseResizeHandleActor()
 {
-	// 根组件、不 tick、Movable 都由基类构造好了。这边只加自己的示意锥。
+	// 根组件、不 tick、Movable 都由基类构造好了。这边只加自己的示意箭头。
 	// （宿主是生成时就钉死的，不像特征标记要在拖拽期逐帧重解析，所以照旧不 tick。）
 
-	// 示意锥：编辑器里"抓这儿推墙"的提示，游戏里不存在。与地形塑形物的示意圆柱同一路数。
+	// 示意箭头：编辑器里"抓这儿推墙"的提示，游戏里不存在。与地形塑形物的示意圆柱同一路数。
 	ArrowComponent = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Arrow"));
 	ArrowComponent->SetupAttachment(RootComponent);
 	MakeEditorGizmoProp(ArrowComponent);
 
+	// 描边挂在本体下：两张网格同一套局部坐标（TG 原样），朝向 / 缩放 / 居中只摆本体一处。
+	ArrowOutlineComponent = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("ArrowOutline"));
+	ArrowOutlineComponent->SetupAttachment(ArrowComponent);
+	MakeEditorGizmoProp(ArrowOutlineComponent);
+
+	// 先装引擎锥子兜底；TG 箭头在 `InitializeHandle` 里惰性换上。**不能**也用 ConstructorHelpers 找
+	// TG 箭头：它是脚本烘的资产，CDO 构造时还没烘的那次启动会把"找不到"一直缓存到重启
+	// （与 `ApplyHighlightMaterial` 同一条理由）。
 	static ConstructorHelpers::FObjectFinderOptional<UStaticMesh> ConeMesh(TEXT("/Engine/BasicShapes/Cone.Cone"));
-	if (UStaticMesh* Mesh = ConeMesh.Get())
-	{
-		ArrowComponent->SetStaticMesh(Mesh);
-		ArrowComponent->SetRelativeScale3D(FVector(0.35, 0.35, 0.5));
-	}
+	if (UStaticMesh* Mesh = ConeMesh.Get()) ArrowComponent->SetStaticMesh(Mesh);
 }
 
 void ACSHouseResizeHandleActor::InitializeHandle(ACSHouseActor* InHost, int32 InEdgeIndex)
@@ -33,7 +37,15 @@ void ACSHouseResizeHandleActor::InitializeHandle(ACSHouseActor* InHost, int32 In
 	// `CSHouse_GetEdge` 里给出零长框架，抓手原地不动、推拉不生效。
 	EdgeIndex = InEdgeIndex;
 
-	if (ArrowComponent) ApplyHighlightMaterial(ArrowComponent);
+	// TG 矩形房子拉尺寸画的那一对。本体缺了就整对不用，留构造里的锥子 —— 只有描边没有本体的箭头是个空框。
+	if (UStaticMesh* TGArrow = LoadTGArrowMesh(TEXT("flat_arrow")))
+	{
+		ArrowComponent->SetStaticMesh(TGArrow);
+		ArrowOutlineComponent->SetStaticMesh(LoadTGArrowMesh(TEXT("flat_arrow_outline")));
+		ApplyOutlineMaterial(ArrowOutlineComponent);
+		bTGArrow = true;
+	}
+	ApplyHighlightMaterial(ArrowComponent);
 
 	SnapToCanonical();
 }
@@ -73,25 +85,40 @@ void ACSHouseResizeHandleActor::SnapToCanonical()
 	const FVector Canonical = ComputeCanonicalWorldLocation();
 	SetActorLocation(Canonical);
 
-	// 朝向也一并归位：用户拿 gizmo 转过抓手的话，锥子会指歪。我们从不读 actor 的旋转，
+	// 朝向也一并归位：用户拿 gizmo 转过抓手的话，箭头会指歪。我们从不读 actor 的旋转，
 	// 所以转它无害 —— 但看起来像坏了。
 	if (const ACSHouseActor* H = Host.Get())
 	{
 		SetActorRotation(H->GetActorRotation());
 
-		// 锥子指向房外：把它的 +Z 转到**局部**外法线上。用局部量而不是世界量，房子整体旋转时
-		// attach 会自动带着走。每次归位都重算 —— 异形房子推一条边，相邻边不动但形状变了，
-		// 改的是 `FootprintShape` 而边号不变，外法线仍可能因为有人在详情面板里改了形状而变。
+		// 箭头指向房外：用**局部**外法线，房子整体旋转时 attach 会自动带着走。每次归位都重算 ——
+		// 异形房子推一条边，相邻边不动但形状变了，改的是 `FootprintShape` 而边号不变，外法线仍可能
+		// 因为有人在详情面板里改了形状而变。
 		const FCSHouseEdgeFrame F = CSHouse_GetEdge(EdgeIndex, H->GetFootprint(), H->WallThickness);
-		if (ArrowComponent && F.Len > 0.0f)
-		{
-			ArrowComponent->SetRelativeRotation(FRotationMatrix::MakeFromZ(FVector(-F.In.X, -F.In.Y, 0.0)).Rotator());
-		}
+		if (F.Len > 0.0f) UpdateArrowPose(FVector(-F.In.X, -F.In.Y, 0.0));
 	}
 
 	// 记账量与摆位**必须一起更新**：只摆位不重置，下一次 PostEditMove 会把程序刚制造的
 	// 这段位移当成用户拖的，墙会自己跳一下（而且跳的量恰好是上一次的残差，极难归因）。
 	LastConsumedWorld = GetActorLocation();
+}
+
+void ACSHouseResizeHandleActor::UpdateArrowPose(const FVector& OuterLocal)
+{
+	const UStaticMesh* Mesh = ArrowComponent ? ArrowComponent->GetStaticMesh() : nullptr;
+	if (!Mesh) return;
+
+	// TG 箭头头指网格局部 +Y、+Z 是厚度 ⇒ 局部 +Y 转到外法线、+Z 保持朝上，箭头就躺平指向房外。
+	// 兜底锥子尖指 +Z ⇒ 只转 +Z（换 TG 箭头之前的摆法与缩放）。
+	const FRotator Rotation = bTGArrow
+		? FRotationMatrix::MakeFromYZ(OuterLocal, FVector::UpVector).Rotator()
+		: FRotationMatrix::MakeFromZ(OuterLocal).Rotator();
+	const FVector Scale = bTGArrow ? FVector(ArrowScale) : FVector(0.35, 0.35, 0.5);
+
+	// 包围盒中心放到 actor 原点上，gizmo 因此在箭头正中。TG 的原点在箭尾，不挪的话整只箭头都在
+	// gizmo 外侧 —— 离墙远出半只箭头，而且点中箭头时 gizmo 看起来"没对上"。
+	const FVector Centre = Rotation.RotateVector(Mesh->GetBounds().Origin * Scale);
+	ArrowComponent->SetRelativeTransform(FTransform(Rotation, -Centre, Scale));
 }
 
 float ACSHouseResizeHandleActor::ConsumeDragToHost(bool bFinished)

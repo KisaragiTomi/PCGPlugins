@@ -3,6 +3,7 @@
 
 #include "Components/PrimitiveComponent.h"
 #include "ComponentRecreateRenderStateContext.h"   // r.CSGpuMesh.SurfaceCache: batches and cards are registered at scene add
+#include "Engine/Engine.h"                          // GEngine->WireframeMaterial：线框视图模式
 #include "Materials/Material.h"
 #include "MeshCardBuild.h"                          // FCardRepresentationData; MeshCardRepresentation::SetCardsFromBounds
 #include "Materials/MaterialRenderProxy.h"
@@ -164,6 +165,25 @@ void FCSGpuMeshSceneProxy::SubmitGpuBufferDraw(
 		Mesh.DepthPriorityGroup = SDPG_World;
 		Mesh.bCanApplyViewModeOverrides = false;
 		Mesh.CastShadow = bCastShadow;
+
+#if !UE_BUILD_TEST
+		// 线框视图模式：上面关掉了引擎的通用视图模式覆盖，线框这一项得自己接，否则线框模式下
+		// 整块画成黑色实体。写法同 ApplyViewModeOverrides（PrimitiveDrawingUtils.cpp:1627）：
+		// 材质改顶点位置（WPO）时不能整个换成线框材质，否则线框跟不上形变。
+		const FEngineShowFlags& ShowFlags = Views[ViewIndex]->Family->EngineShowFlags;
+		if (!bShadowDepthView && ShowFlags.Wireframe && AllowDebugViewmodes())
+		{
+			const FLinearColor WireColor = GetSelectionColor(ShowFlags.ActorColoration ? SceneProxy.GetPrimitiveColor() : SceneProxy.GetWireframeColor(),
+				SceneProxy.IsSelected(), SceneProxy.IsHovered(), false);
+			const bool bModifiesPosition = MaterialProxy.GetIncompleteMaterialWithFallback(Views[ViewIndex]->GetFeatureLevel()).MaterialModifiesMeshPosition_RenderThread();
+			FMaterialRenderProxy* WireframeProxy = bModifiesPosition
+				? static_cast<FMaterialRenderProxy*>(new FOverrideSelectionColorMaterialRenderProxy(&MaterialProxy, WireColor))
+				: static_cast<FMaterialRenderProxy*>(new FColoredMaterialRenderProxy(GEngine->WireframeMaterial->GetRenderProxy(), WireColor));
+			Collector.RegisterOneFrameMaterialProxy(WireframeProxy);
+			Mesh.MaterialRenderProxy = WireframeProxy;
+			Mesh.bWireframe = true;
+		}
+#endif
 
 		FMeshBatchElement& BatchElement = Mesh.Elements[0];
 		BatchElement.IndexBuffer = &IndexBuffer;

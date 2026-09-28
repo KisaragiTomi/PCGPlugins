@@ -124,6 +124,8 @@
 
 **Nanite 截面**在单独的函数库 `UCSNaniteCutOps`（[`CSNaniteCut.h`](Source/ComputeShaderGenerator/Public/CSNaniteCut.h)）：`AppendNaniteCuts` 按网格局部空间的误差阈值 CutError 把一组 Nanite 网格的截面写进 `UCSMesh`（GPU 遍历层级、解码位置 / 法线 / 切线 / UV / 颜色 / 材质号，不经 GPU Scene），`CutErrorForScreenError` 把"某距离上 N 像素误差"换成 CutError。与 `CopyFromStaticMesh` 的区别：后者对 Nanite 网格读到的是 fallback。WP HLOD 构建器 `UCSNaniteCutHLODBuilder`（`PCGEditorProcess`）与关卡内试验台 `ACSNaniteCutHLODActor` 都建在它上面，试验台的 `BakeHLOD` 再用 `CSNaniteCutBake`（[`CSNaniteCutBake.h`](Source/ComputeShaderGenerator/Public/CSNaniteCutBake.h)，编辑器专用）把截面烘成带 2048 BaseColor / Normal / Roughness 的 Nanite 静态网格（逐源喂图元数据，用了 WorldPosition / ObjectPosition 的材质与原来一致）；设计、限制与实测见 [`NaniteClusterHLOD_Plan.md`](NaniteClusterHLOD_Plan.md)。
 
+收集盒的示意件 —— 最大角上的图标与贴着盒子的 100 cm 立方体 —— 由 [`CSBoundsVisual.h`](Source/ComputeShaderGenerator/Public/CSBoundsVisual.h) 统一摆放：`ACSNaniteCutHLODActor` 与 `AComputeShaderMeshBoolean` 共用同一份，`BP_Boolean` 原先那段逐节点连的构造脚本 2026-09-23 已上提 C++（盒子尺寸改由 `InBoxExtent` 驱动），蓝图侧不再留第二份实现。
+
 **外部可见性剔除** `UCSMeshVisibilityOps::CullHiddenTriangles`（[`CSMeshVisibilityCull.h`](Source/ComputeShaderGenerator/Public/CSMeshVisibilityCull.h)）：从包围球外一圈视点（斐波那契球面，每个方向一张透视 + 一张正交）用 GPU 软件光栅看一遍 `UCSMesh`，从来没当过最近面的三角形删掉并压实 —— 封闭房间里的东西、山洞深处、互相穿插的内部面。对任意 `UCSMesh` 可用，HLOD 构建器与试验台默认开着。
 
 **唯一的 CPU 例外**：`ApplyMeshBoolean` 在 `VertexWeldDistance > 0` 时仍走 CPU 快照路——焊接后处理要去掉重复三角，在 GPU 上复现需要全局哈希表。其余分支全程不回 CPU。
@@ -490,6 +492,7 @@ BVH 那一行标「下界」：基准里用的是节点 32 字节、叶子 4 三
 
 - **内容**：6×6 格子群（5 种 Nanite 测试网格，3 个镜像，4 个带排除标签 `NaniteCutHLOD_Exclude` 的红色物体）+ 蛇形山洞（实心岩块里两个整波的隧道，洞口 / 弯里 / 深处各放物体）+ 房子（前屋一门两窗、后屋完全封闭，各放物体）+ 七块互相穿插的石头。
 - **运行方式**：选中 `NCH_HLOD`（子蓝图 `BP_NaniteCutHLOD` 的实例）→ 细节面板点 `BuildHLOD`（收集盒里的静态网格按切换距离 80 m 取截面、合并、剔除外面看不见的三角，显示 HLOD 并临时隐藏源），`ShowSources` / `ShowHLOD` 来回切，`ClearHLOD` 放掉；GPU 截面不存盘，重开关卡要再 Build。`BakeHLOD` 把它烘成资产（关卡同级 `AutoResult/` 下的 `SM_` / `MI_` / 三张 `T_`，StaticMeshActor 挂在 `NCH_HLOD` 下面），随关卡存盘。
+- **收谁不收谁**：`ExcludeTag`（带标签的不进，默认 `NaniteCutHLOD_Exclude`）与 `PickTag`（正向挑选：填了就只收带它的，留空 = 盒里全收，建议名 `NaniteCutHLOD_Pick`）。两个都填是先挑后排。标签比较忽略空格 / 下划线 / 连字符与大小写，手输写法不一致也认。收集盒最大角上有个图标标出盒子范围，改盒子尺寸或挪动 actor 时跟着走。
 - **结果**（2026-09-22）：全精度 378,362 三角 → 截面 49,516 → 剔除后 40,919；封闭后屋与隧道深处的物体全删成 0，洞口与透过门窗看得见的物体留着；100 m 外与源物体看不出差别。烘焙 2.6 s（47 个源，图集覆盖 84%），烘完不多占显存。出图脚本 `Scripts/NaniteCutHLODShots.py` + `NaniteCutHLODCompose.py`，数字与图的说明见 [`NaniteClusterHLOD_Plan.md`](NaniteClusterHLOD_Plan.md#画面验收)。
 
 > 其它目录（如 `Content/ShallowWater/Material30`、`Content/TreeWindData`、`Content/GeneralTest` 等）为开发中/参考资产，不保证可直接运行。
